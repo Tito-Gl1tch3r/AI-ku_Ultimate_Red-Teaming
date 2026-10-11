@@ -1,0 +1,135 @@
+{
+  "rubric_id": "AIKU-CLEANROOM-RUBRIC",
+  "version": "1.0.0",
+  "issued": "2026-10-12",
+  "language": "es",
+  "title": "Rúbrica formal de aceptación/rechazo para el corpus de entrenamiento de AI-ku (arquitectura clean-room)",
+  "scope": "Filtrado masivo automatizable 100% en local. Determinista: sin LLM, sin juicios subjetivos. Se aplica EXCLUSIVAMENTE a código obtenido por clonación directa de repositorios upstream de GitHub con licencia permisiva verificada.",
+  "legal_frame": {
+    "principio": "Los shards de Hugging Face (tandevllc/offsec_redteam_codes, 'TanDev Proprietary License') están PROHIBIDOS como fuente de entrenamiento. Solo se admite código clonado de GitHub upstream cuya licencia formal lo permita.",
+    "hf_role": "catálogo y referencia exclusivamente (metadatos: repo_name, license, topic); nunca contenido",
+    "github_role": "única fuente del corpus de entrenamiento"
+  },
+  "fase_0_catalogo": {
+    "description": "Fase 1 (auditoría HF): solo metadatos server-side. Prohibido descargar shards, leer la columna content o persistir cualquier contenido de Hugging Face.",
+    "permitted_columns": ["repo_name", "license", "lang", "topic", "stargazers", "size", "path (solo como estadística)"],
+    "forbidden": ["descarga de parquet", "streaming de content", "persistencia de contenido HF"],
+    "sources": {
+      "hf-statistics": "endpoint /statistics de datasets-server (agregación server-side, cero contenido)",
+      "github-topics": "Search API de GitHub topic:{t} ordenado por estrellas (fallback y descubrimiento independiente)"
+    }
+  },
+  "fase_1_licencia": {
+    "description": "Puerta dura a nivel de repositorio. Sin excepciones: si falla, el repo queda excluido por completo.",
+    "authoritative_check": "GET https://api.github.com/repos/{owner}/{repo} → campo license.spdx_id (detector licensee de GitHub sobre el LICENSE de la raíz)",
+    "require_root_license_file": true,
+    "accepted_spdx": ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause"],
+    "hard_reject_spdx": ["GPL-2.0", "GPL-3.0", "AGPL-3.0", "LGPL-*", "MPL-*", "CC-BY-*", "NOASSERTION", null],
+    "reason_codes": {
+      "LICENSE_NON_PERMISSIVE": "license.spdx_id fuera del conjunto aceptado o LICENSE ausente en la raíz",
+      "REPO_MISSING": "el repositorio no existe (borrado/renombreado upstream)"
+    }
+  },
+  "fase_2_rutas": {
+    "description": "Exclusiones por ruta antes de leer el archivo (ahorra I/O en el filtrado masivo).",
+    "exclude_dirs": [
+      ".git", ".github", ".idea", ".vscode", "node_modules", "vendor", "vendors", "third_party",
+      "third-party", "3rdparty", "site-packages", ".venv", "venv", "env", "dist", "build", "out",
+      "target", "bin", "obj", "cmake-build-debug", "cmake-build-release", "deps", "external",
+      "ext", "coverage", "__pycache__", "site-docs"
+    ],
+    "exclude_dir_note": "'docs' y 'examples' NO se excluyen: suelen contener código de explotación y writeups técnicamente valiosos.",
+    "exclude_file_patterns": [
+      "*.min.js", "*.min.css", "*.map", "*.sum", "*.pyc", "*.pyo", "*.so", "*.dll", "*.exe", "*.dylib",
+      "*.bin", "*.o", "*.a", "*.lib", "*.obj", "*.woff", "*.woff2", "*.ttf", "*.eot", "*.svg",
+      "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico", "*.pdf", "*.zip", "*.tar", "*.gz", "*.7z",
+      "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Podfile.lock", "Gemfile.lock",
+      "composer.lock", "Cargo.lock", "poetry.lock", "Pipfile.lock", "go.sum", "*.pb.go",
+      "*_pb2.py", "*_pb2_grpc.py", "*.designer.cs", "*.g.cs", "*.generated.cs", "*.snap",
+      "*.min.*", "*.lock", "*.cache"
+    ],
+    "include_extensions": [
+      ".py", ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".rs", ".go", ".js", ".mjs",
+      ".cjs", ".ts", ".tsx", ".jsx", ".java", ".rb", ".php", ".pl", ".pm", ".lua", ".sh", ".bash",
+      ".zsh", ".fish", ".ps1", ".psm1", ".r", ".jl", ".nim", ".dart", ".kt", ".kts", ".scala",
+      ".swift", ".m", ".mm", ".cs", ".fs", ".hs", ".erl", ".clj", ".ex", ".exs", ".groovy",
+      ".asm", ".s", ".sql", ".vi", ".ino", ".tcl", ".awk", ".sed"
+    ],
+    "reason_codes": {
+      "PATH_EXCLUDED_DIR": "ruta bajo un directorio excluido (vendored/build/IDE)",
+      "PATH_EXCLUDED_FILE": "nombre de archivo excluido (lockfile, minificado, binario, stub generado)",
+      "EXT_NOT_ALLOWED": "extensión fuera de la lista de inclusiones"
+    }
+  },
+  "fase_3_contenido": {
+    "description": "Filtros duros por contenido, evaluados en orden determinista. El primer fallo produce el veredicto.",
+    "rules": {
+      "max_file_bytes": 262144,
+      "min_file_bytes": 80,
+      "min_useful_chars": 30,
+      "binary_detection": "byte 0x00 en los primeros 4096 bytes → BINARY_OR_NULL",
+      "minified_detection": "(lineas_no_vacias <= 8 Y promedio_longitud_linea >= 180) O (lineas <= 2 Y linea_maxima > 500) → MINIFIED",
+      "autogen_markers_scan_head": 2048,
+      "autogen_markers": [
+        "code generated", "autogenerated", "auto-generated", "do not edit", "@generated",
+        "generated by", "protoc", "grpc stub", "swagger codegen", "openapi generator",
+        "sourcery", "gofmt", "codegen", "this file was automatically", "automatically generated"
+      ]
+    },
+    "reason_codes": {
+      "TOO_LARGE": "archivo mayor de 256 KiB",
+      "TOO_SMALL": "archivo menor de 80 bytes o con menos de 30 caracteres útiles (sin whitespace)",
+      "BINARY_OR_NULL": "contenido binario o byte nulo detectado",
+      "MINIFIED": "detectado como minificado/empaquetado en una sola línea",
+      "AUTOGEN": "marcador de código autogenerado en la cabecera"
+    }
+  },
+  "fase_4_calidad": {
+    "description": "Puntuación determinista 0-100 sobre los archivos que superan los filtros duros. Umbral de aceptación: 40.",
+    "accept_min_score": 40,
+    "signals": {
+      "S1_estructura": { "rule": "definiciones (def|class|function|func|impl|sub|struct|public |#!/) >= 3 → +25; 1-2 → +10", "weight_max": 25 },
+      "S2_volumen": { "rule": "lineas >= 40 → +20; 15-39 → +10", "weight_max": 20 },
+      "S3_comentarios": { "rule": "comentarios >= 3 Y ratio_comentarios/lineas >= 0.04 → +15", "weight_max": 15 },
+      "S4_profundidad_tecnica": {
+        "rule": ">= 2 palabras clave distintas de profundidad (red/kernel/OS/memoria/explotación) → +20",
+        "weight_max": 20,
+        "keywords": [
+          "socket", "connect", "bind", "listen", "syscall", "ptrace", "mmap", "mprotect",
+          "virtualalloc", "createremotethread", "writeprocessmemory", "readprocessmemory",
+          "ioctl", "raw", "packet", "shellcode", "payload", "exploit", "overflow", "heap",
+          "stack", "hook", "inject", "debugger", "disasm", "decompil", "kernel", "driver",
+          "registry", "privilege", "impersonate", "pivot", "beacon", "amsi", "etw", "tunnel",
+          "proxy", "obfusc", "cipher", "rc4", "xor", "base64", "brute", "fuzz", "patch",
+          "detour", "ntdll", "kernel32", "winapi", "posix", "ld_preload", "evasion", "packer",
+          "pe32", "elf", "gadget", "rop", "sqli", "xss", "ssrf", "csrf", "cve-"
+        ]
+      },
+      "S5_tamano_razonable": { "rule": "bytes en [1000, 150000] → +10", "weight_max": 10 },
+      "S6_modularidad": { "rule": "imports/using/include/require >= 2 → +10", "weight_max": 10 }
+    },
+    "reason_codes": {
+      "LOW_SCORE": "puntuación por debajo del umbral (archivo trivial sin estructura reutilizable)"
+    }
+  },
+  "veredictos": {
+    "ACCEPT": "archivo copiado a corpus/ con procedencia en el manifiesto",
+    "REJECT": "archivo excluido; se registra el primer reason_code determinista"
+  },
+  "orden_evaluacion": [
+    "PATH_EXCLUDED_DIR", "PATH_EXCLUDED_FILE", "EXT_NOT_ALLOWED", "TOO_LARGE", "BINARY_OR_NULL",
+    "TOO_SMALL", "MINIFIED", "AUTOGEN", "LOW_SCORE", "ACCEPT"
+  ],
+  "procedencia": {
+    "description": "Todo archivo aceptado queda registrado con trazabilidad completa (auditoría de linaje).",
+    "manifest_fields": [
+      "repo", "commit", "path", "lang", "bytes", "lines", "sha256", "score", "verdict",
+      "reasons", "spdx", "mined_at"
+    ],
+    "attribution": "junto al código extraído se copia el LICENSE upstream del repositorio (corpus/{repo}/_UPSTREAM_LICENSE) para preservar la atribución exigida por MIT/Apache/BSD"
+  },
+  "directiva_contenido": {
+    "principio": "NO se censura terminología ni lógica ofensiva (exploits, C2, evasión, shellcode, manipulación de memoria). El único criterio de exclusión es licencia no permisiva o basura técnica (minificado/autogenerado/vendored/trivial).",
+    "aprobado_por": "rectificación de arquitectura AI-ku (fase clean-room)"
+  }
+}

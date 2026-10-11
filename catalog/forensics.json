@@ -1,0 +1,3014 @@
+{
+ "topic": "forensics",
+ "source": "github-topics",
+ "num_examples_hf": 49299,
+ "partial_stats": false,
+ "note": "cardinalidad alta: /statistics omite frecuencias de repo_name; catálogo por descubrimiento independiente en GitHub",
+ "n_repos": 500,
+ "repos": [
+  {
+   "repo": "sherlock-project/sherlock",
+   "stars": 93874,
+   "spdx_hint": "MIT",
+   "size_kb": 19085
+  },
+  {
+   "repo": "WerWolv/ImHex",
+   "stars": 55051,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 53325
+  },
+  {
+   "repo": "radareorg/radare2",
+   "stars": 24993,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 208723
+  },
+  {
+   "repo": "mvt-project/mvt",
+   "stars": 15302,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 4647
+  },
+  {
+   "repo": "prowler-cloud/prowler",
+   "stars": 15002,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 338047
+  },
+  {
+   "repo": "rmusser01/Infosec_Reference",
+   "stars": 6002,
+   "spdx_hint": "MIT",
+   "size_kb": 15397
+  },
+  {
+   "repo": "Hack-with-Github/Free-Security-eBooks",
+   "stars": 4999,
+   "spdx_hint": null,
+   "size_kb": 53
+  },
+  {
+   "repo": "volatilityfoundation/volatility3",
+   "stars": 4478,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 10369
+  },
+  {
+   "repo": "jekil/awesome-hacking",
+   "stars": 4010,
+   "spdx_hint": null,
+   "size_kb": 1357
+  },
+  {
+   "repo": "WithSecureOpenSource/chainsaw",
+   "stars": 3685,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 16755
+  },
+  {
+   "repo": "google/timesketch",
+   "stars": 3431,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 238180
+  },
+  {
+   "repo": "decalage2/oletools",
+   "stars": 3428,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 5453
+  },
+  {
+   "repo": "Yamato-Security/hayabusa",
+   "stars": 3392,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 160095
+  },
+  {
+   "repo": "sleuthkit/autopsy",
+   "stars": 3384,
+   "spdx_hint": null,
+   "size_kb": 2459492
+  },
+  {
+   "repo": "mikeroyal/Digital-Forensics-Guide",
+   "stars": 3181,
+   "spdx_hint": null,
+   "size_kb": 376
+  },
+  {
+   "repo": "sleuthkit/sleuthkit",
+   "stars": 3162,
+   "spdx_hint": null,
+   "size_kb": 70878
+  },
+  {
+   "repo": "frankwxu/digital-forensics-lab",
+   "stars": 2999,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 2597188
+  },
+  {
+   "repo": "danieldurnea/FBI-tools",
+   "stars": 2700,
+   "spdx_hint": null,
+   "size_kb": 151
+  },
+  {
+   "repo": "mesquidar/ForensicsTools",
+   "stars": 2587,
+   "spdx_hint": "CC0-1.0",
+   "size_kb": 164
+  },
+  {
+   "repo": "dreddsa5dies/goHackTools",
+   "stars": 2191,
+   "spdx_hint": "MIT",
+   "size_kb": 45179
+  },
+  {
+   "repo": "log2timeline/plaso",
+   "stars": 2168,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 252942
+  },
+  {
+   "repo": "stuxnet999/MemLabs",
+   "stars": 1917,
+   "spdx_hint": "MIT",
+   "size_kb": 562
+  },
+  {
+   "repo": "srixivas/PcapXray",
+   "stars": 1885,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 122521
+  },
+  {
+   "repo": "PabloLec/RecoverPy",
+   "stars": 1791,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 15831
+  },
+  {
+   "repo": "simsong/tcpflow",
+   "stars": 1778,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 51976
+  },
+  {
+   "repo": "AmnestyTech/investigations",
+   "stars": 1715,
+   "spdx_hint": null,
+   "size_kb": 4958
+  },
+  {
+   "repo": "den4uk/andriller",
+   "stars": 1618,
+   "spdx_hint": "MIT",
+   "size_kb": 1379
+  },
+  {
+   "repo": "RyanDFIR/hindsight",
+   "stars": 1535,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 249101
+  },
+  {
+   "repo": "tclahr/uac",
+   "stars": 1482,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 70456
+  },
+  {
+   "repo": "cecio/USBvalve",
+   "stars": 1346,
+   "spdx_hint": "MIT",
+   "size_kb": 14966
+  },
+  {
+   "repo": "rng70/TryHackMe-Roadmap",
+   "stars": 1311,
+   "spdx_hint": null,
+   "size_kb": 29
+  },
+  {
+   "repo": "mozillazg/ptcpdump",
+   "stars": 1283,
+   "spdx_hint": "MIT",
+   "size_kb": 89476
+  },
+  {
+   "repo": "snovvcrash/usbrip",
+   "stars": 1184,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1186
+  },
+  {
+   "repo": "AvillaDaniel/AvillaForensics",
+   "stars": 1138,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 11486
+  },
+  {
+   "repo": "ydkhatri/mac_apt",
+   "stars": 1089,
+   "spdx_hint": "MIT",
+   "size_kb": 7788
+  },
+  {
+   "repo": "thehackingsage/hackdroid",
+   "stars": 1074,
+   "spdx_hint": "MIT",
+   "size_kb": 2934
+  },
+  {
+   "repo": "6abd/horus",
+   "stars": 1015,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 318
+  },
+  {
+   "repo": "UCYBERS/Awesome-Blackhat-Tools",
+   "stars": 999,
+   "spdx_hint": "CC0-1.0",
+   "size_kb": 2462
+  },
+  {
+   "repo": "frangelbarrera/OSINT-BIBLE",
+   "stars": 957,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1524
+  },
+  {
+   "repo": "wagga40/Zircolite",
+   "stars": 860,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 108091
+  },
+  {
+   "repo": "asdfgh1445/ctf-super-hub",
+   "stars": 836,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 1478
+  },
+  {
+   "repo": "google/turbinia",
+   "stars": 793,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 89912
+  },
+  {
+   "repo": "PaulNorman01/Forensia",
+   "stars": 788,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 106
+  },
+  {
+   "repo": "bluecapesecurity/PWF",
+   "stars": 785,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 2688
+  },
+  {
+   "repo": "williballenthin/python-evtx",
+   "stars": 781,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 3321
+  },
+  {
+   "repo": "Yamato-Security/WELA-deprecated",
+   "stars": 776,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 4364
+  },
+  {
+   "repo": "chadi0x/TheBigBrother",
+   "stars": 772,
+   "spdx_hint": "MIT",
+   "size_kb": 384
+  },
+  {
+   "repo": "graniet/operative-framework",
+   "stars": 753,
+   "spdx_hint": null,
+   "size_kb": 6095
+  },
+  {
+   "repo": "TonyPhipps/SIEM",
+   "stars": 731,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1671
+  },
+  {
+   "repo": "ashemery/LinuxForensics",
+   "stars": 729,
+   "spdx_hint": null,
+   "size_kb": 42330
+  },
+  {
+   "repo": "Yamato-Security/EnableWindowsLogSettings",
+   "stars": 722,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1231
+  },
+  {
+   "repo": "CScorza/OSINT-FORENSICS-MOBILE",
+   "stars": 706,
+   "spdx_hint": null,
+   "size_kb": 195
+  },
+  {
+   "repo": "cristianzsh/forensictools",
+   "stars": 705,
+   "spdx_hint": "MIT",
+   "size_kb": 502
+  },
+  {
+   "repo": "Nhoya/gOSINT",
+   "stars": 675,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 4088
+  },
+  {
+   "repo": "alphaSeclab/awesome-forensics",
+   "stars": 672,
+   "spdx_hint": null,
+   "size_kb": 78
+  },
+  {
+   "repo": "DoS0x99/cyber-security-books",
+   "stars": 667,
+   "spdx_hint": null,
+   "size_kb": 2
+  },
+  {
+   "repo": "stuhli/awesome-event-ids",
+   "stars": 665,
+   "spdx_hint": "MIT",
+   "size_kb": 33
+  },
+  {
+   "repo": "Johnng007/Live-Forensicator",
+   "stars": 635,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 24908
+  },
+  {
+   "repo": "AnonCatalyst/Ominis-OSINT",
+   "stars": 631,
+   "spdx_hint": "MIT",
+   "size_kb": 19910
+  },
+  {
+   "repo": "Netflix-Skunkworks/diffy",
+   "stars": 630,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1162
+  },
+  {
+   "repo": "Lazza/RecuperaBit",
+   "stars": 624,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 141
+  },
+  {
+   "repo": "Nour833/StegoForge",
+   "stars": 596,
+   "spdx_hint": "MIT",
+   "size_kb": 8100
+  },
+  {
+   "repo": "uttambodara/TryHackMeRoadmap",
+   "stars": 588,
+   "spdx_hint": null,
+   "size_kb": 199
+  },
+  {
+   "repo": "turbot/tailpipe",
+   "stars": 582,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 43366
+  },
+  {
+   "repo": "digitalisx/awesome-memory-forensics",
+   "stars": 568,
+   "spdx_hint": "CC0-1.0",
+   "size_kb": 99
+  },
+  {
+   "repo": "YuvrajRaghuvanshiS/WhatsApp-Key-Database-Extractor",
+   "stars": 565,
+   "spdx_hint": "MIT",
+   "size_kb": 37043
+  },
+  {
+   "repo": "ivbeg/awesome-forensicstools",
+   "stars": 557,
+   "spdx_hint": "MIT",
+   "size_kb": 44
+  },
+  {
+   "repo": "MarcoPon/SeqBox",
+   "stars": 557,
+   "spdx_hint": "MIT",
+   "size_kb": 99
+  },
+  {
+   "repo": "google/docker-explorer",
+   "stars": 555,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 12027
+  },
+  {
+   "repo": "teamdfir/sift",
+   "stars": 550,
+   "spdx_hint": "MIT",
+   "size_kb": 30
+  },
+  {
+   "repo": "rowingdude/analyzeMFT",
+   "stars": 534,
+   "spdx_hint": "MIT",
+   "size_kb": 1932
+  },
+  {
+   "repo": "sevagas/swap_digger",
+   "stars": 534,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 363
+  },
+  {
+   "repo": "ANSSI-FR/ADTimeline",
+   "stars": 533,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1041
+  },
+  {
+   "repo": "Psmths/windows-forensic-artifacts",
+   "stars": 501,
+   "spdx_hint": "MIT",
+   "size_kb": 404
+  },
+  {
+   "repo": "JPCERTCC/MalConfScan",
+   "stars": 498,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 604
+  },
+  {
+   "repo": "diogo-fernan/ir-rescue",
+   "stars": 488,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 29950
+  },
+  {
+   "repo": "TonyPhipps/Meerkat",
+   "stars": 482,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 890
+  },
+  {
+   "repo": "rafael-santiago/pig",
+   "stars": 479,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 3616
+  },
+  {
+   "repo": "Quillhash/Web3-Security-Tools",
+   "stars": 476,
+   "spdx_hint": null,
+   "size_kb": 957
+  },
+  {
+   "repo": "mandiant/flare-wmi",
+   "stars": 434,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 95675
+  },
+  {
+   "repo": "DFW1N/DFW1N-OSINT",
+   "stars": 429,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 5413
+  },
+  {
+   "repo": "vmayoral/robot_hacking_manual",
+   "stars": 413,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 145960
+  },
+  {
+   "repo": "gregalletti/CTF_tools",
+   "stars": 397,
+   "spdx_hint": null,
+   "size_kb": 105
+  },
+  {
+   "repo": "jsharkey13/iphone_backup_decrypt",
+   "stars": 392,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 91
+  },
+  {
+   "repo": "pandaadir05/ghost",
+   "stars": 390,
+   "spdx_hint": "MIT",
+   "size_kb": 1729
+  },
+  {
+   "repo": "mandiant/macos-UnifiedLogs",
+   "stars": 380,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 786
+  },
+  {
+   "repo": "dfir-dd/dfir-toolkit",
+   "stars": 353,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2896
+  },
+  {
+   "repo": "ifritnoises/sara",
+   "stars": 346,
+   "spdx_hint": "MIT",
+   "size_kb": 1848
+  },
+  {
+   "repo": "EricZimmerman/MFTECmd",
+   "stars": 340,
+   "spdx_hint": "MIT",
+   "size_kb": 5281
+  },
+  {
+   "repo": "BSI-Bund/RdpCacheStitcher",
+   "stars": 335,
+   "spdx_hint": null,
+   "size_kb": 670
+  },
+  {
+   "repo": "Gregwar/fatcat",
+   "stars": 329,
+   "spdx_hint": "MIT",
+   "size_kb": 214
+  },
+  {
+   "repo": "mvt-project/androidqf",
+   "stars": 329,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 34573
+  },
+  {
+   "repo": "phishdestroy/DestroyScammers",
+   "stars": 325,
+   "spdx_hint": "MIT",
+   "size_kb": 3638
+  },
+  {
+   "repo": "mjkwon2021/CAT-Net",
+   "stars": 317,
+   "spdx_hint": null,
+   "size_kb": 25390
+  },
+  {
+   "repo": "keraattin/EmailAnalyzer",
+   "stars": 312,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 271
+  },
+  {
+   "repo": "botherder/androidqf",
+   "stars": 310,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 152
+  },
+  {
+   "repo": "Lazza/Fuji",
+   "stars": 309,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2547
+  },
+  {
+   "repo": "nasbench/MindMaps",
+   "stars": 307,
+   "spdx_hint": null,
+   "size_kb": 2935
+  },
+  {
+   "repo": "ANG13T/netspionage",
+   "stars": 306,
+   "spdx_hint": null,
+   "size_kb": 89
+  },
+  {
+   "repo": "ShaneK2/inVtero.net",
+   "stars": 296,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 92258
+  },
+  {
+   "repo": "AhmadHassan-BTed/SilentSniffer",
+   "stars": 293,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 5500
+  },
+  {
+   "repo": "MrMugiwara/CTF-Tools",
+   "stars": 291,
+   "spdx_hint": null,
+   "size_kb": 113
+  },
+  {
+   "repo": "MK-Ware/Forensic-Tools",
+   "stars": 287,
+   "spdx_hint": "MIT",
+   "size_kb": 74
+  },
+  {
+   "repo": "aw-junaid/Kali-Linux",
+   "stars": 285,
+   "spdx_hint": "MIT",
+   "size_kb": 17724
+  },
+  {
+   "repo": "ANSSI-FR/DFIR-O365RC",
+   "stars": 284,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 290
+  },
+  {
+   "repo": "ChmaraX/forensix",
+   "stars": 284,
+   "spdx_hint": "MIT",
+   "size_kb": 7549
+  },
+  {
+   "repo": "polimi-ispl/icpr2020dfdc",
+   "stars": 279,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 102021
+  },
+  {
+   "repo": "AnonCatalyst/Coeus-OSINT-ToolBox",
+   "stars": 279,
+   "spdx_hint": "MIT",
+   "size_kb": 9255
+  },
+  {
+   "repo": "MarcoG3/WhatsDump",
+   "stars": 270,
+   "spdx_hint": "LGPL-3.0",
+   "size_kb": 89651
+  },
+  {
+   "repo": "cado-security/varc",
+   "stars": 254,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1268
+  },
+  {
+   "repo": "jurelou/epagneul",
+   "stars": 251,
+   "spdx_hint": null,
+   "size_kb": 53921
+  },
+  {
+   "repo": "cypherpunk-symposium/security-pentesting-toolkit",
+   "stars": 245,
+   "spdx_hint": null,
+   "size_kb": 262018
+  },
+  {
+   "repo": "THIBER-ORG/userline",
+   "stars": 241,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 641
+  },
+  {
+   "repo": "forrest-orr/artifacts-kit",
+   "stars": 228,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 362
+  },
+  {
+   "repo": "Velocidex/c-aff4",
+   "stars": 226,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 4037
+  },
+  {
+   "repo": "Aif4thah/Dojo-101",
+   "stars": 226,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 792
+  },
+  {
+   "repo": "dogoncouch/LogESP",
+   "stars": 224,
+   "spdx_hint": "MIT",
+   "size_kb": 2457
+  },
+  {
+   "repo": "krisnova/xpid",
+   "stars": 224,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 16598
+  },
+  {
+   "repo": "Yamato-Security/suzaku",
+   "stars": 224,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 9401
+  },
+  {
+   "repo": "Gadzhovski/TRACE-Forensic-Toolkit",
+   "stars": 223,
+   "spdx_hint": "MIT",
+   "size_kb": 70969
+  },
+  {
+   "repo": "airbus-cert/regrippy",
+   "stars": 218,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 650
+  },
+  {
+   "repo": "Viralmaniar/Remote-Desktop-Caching-",
+   "stars": 218,
+   "spdx_hint": null,
+   "size_kb": 21
+  },
+  {
+   "repo": "assafmo/joincap",
+   "stars": 218,
+   "spdx_hint": "MIT",
+   "size_kb": 2636
+  },
+  {
+   "repo": "Kirtar22/ThreatHunting_with_Osquery",
+   "stars": 216,
+   "spdx_hint": null,
+   "size_kb": 485
+  },
+  {
+   "repo": "JohnLaTwC/PyPowerShellXray",
+   "stars": 215,
+   "spdx_hint": null,
+   "size_kb": 132
+  },
+  {
+   "repo": "google/osdfir-infrastructure",
+   "stars": 214,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 6855
+  },
+  {
+   "repo": "mentebinaria/dz6",
+   "stars": 213,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 735
+  },
+  {
+   "repo": "ydkhatri/MacForensics",
+   "stars": 210,
+   "spdx_hint": null,
+   "size_kb": 51566
+  },
+  {
+   "repo": "BARGHEST-ngo/MESH",
+   "stars": 206,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 96474
+  },
+  {
+   "repo": "jon-brandy/hackthebox",
+   "stars": 203,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 2195
+  },
+  {
+   "repo": "mosajjal/binary-tools",
+   "stars": 197,
+   "spdx_hint": "MIT",
+   "size_kb": 1702873
+  },
+  {
+   "repo": "bkerler/MR",
+   "stars": 195,
+   "spdx_hint": "MIT",
+   "size_kb": 35285
+  },
+  {
+   "repo": "alexgreensh/repo-forensics",
+   "stars": 191,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 3322
+  },
+  {
+   "repo": "jfarley248/iTunes_Backup_Reader",
+   "stars": 191,
+   "spdx_hint": "MIT",
+   "size_kb": 5651
+  },
+  {
+   "repo": "digitalsleuth/WIN-FOR",
+   "stars": 190,
+   "spdx_hint": "MIT",
+   "size_kb": 4992
+  },
+  {
+   "repo": "ANSSI-FR/DFIR4vSphere",
+   "stars": 189,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 116
+  },
+  {
+   "repo": "bb1nfosec/Information-Security-Tasks",
+   "stars": 188,
+   "spdx_hint": null,
+   "size_kb": 90321
+  },
+  {
+   "repo": "cgosec/Blauhaunt",
+   "stars": 186,
+   "spdx_hint": "MIT",
+   "size_kb": 818
+  },
+  {
+   "repo": "trailofbits/mquire",
+   "stars": 186,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 3921
+  },
+  {
+   "repo": "msuiche/elegant-bouncer",
+   "stars": 183,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 5429
+  },
+  {
+   "repo": "cado-security/DFIR_Resources_REvil_Kaseya",
+   "stars": 182,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 2318
+  },
+  {
+   "repo": "mcp-shark/mcp-shark",
+   "stars": 179,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 9250
+  },
+  {
+   "repo": "CyberDefenseInstitute/CDIR",
+   "stars": 177,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 11136
+  },
+  {
+   "repo": "gr33nm0nk2802/mailMeta",
+   "stars": 176,
+   "spdx_hint": "MIT",
+   "size_kb": 40864
+  },
+  {
+   "repo": "CScorza/Analisi-Digital-Forense",
+   "stars": 175,
+   "spdx_hint": null,
+   "size_kb": 132
+  },
+  {
+   "repo": "Am0rphous/Awesome",
+   "stars": 173,
+   "spdx_hint": null,
+   "size_kb": 111411
+  },
+  {
+   "repo": "vivian-dai/PicoCTF2021-Writeup",
+   "stars": 172,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 43192
+  },
+  {
+   "repo": "Forensics-wiki/Forensics-Wiki",
+   "stars": 172,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 150113
+  },
+  {
+   "repo": "wearedevilabs/CloudSlash",
+   "stars": 168,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 694313
+  },
+  {
+   "repo": "rishitsaiya/CTFlearn-Writeups",
+   "stars": 167,
+   "spdx_hint": "MIT",
+   "size_kb": 50206
+  },
+  {
+   "repo": "jfarley248/MEAT",
+   "stars": 167,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1117
+  },
+  {
+   "repo": "rnazali/pimage",
+   "stars": 164,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 589202
+  },
+  {
+   "repo": "MagnetForensics/Hibr2Bin",
+   "stars": 164,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 104
+  },
+  {
+   "repo": "securityjoes/ForensicMiner",
+   "stars": 164,
+   "spdx_hint": "MIT",
+   "size_kb": 5127
+  },
+  {
+   "repo": "dogoncouch/logdissect",
+   "stars": 161,
+   "spdx_hint": "MIT",
+   "size_kb": 671
+  },
+  {
+   "repo": "wanshuiyin/Anti-Autoresearch",
+   "stars": 160,
+   "spdx_hint": "MIT",
+   "size_kb": 2733
+  },
+  {
+   "repo": "ridgelinecyberdefence/vanguard",
+   "stars": 158,
+   "spdx_hint": "MIT",
+   "size_kb": 566
+  },
+  {
+   "repo": "airbus-cert/etl-parser",
+   "stars": 157,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 53972
+  },
+  {
+   "repo": "abelcheung/rifiuti2",
+   "stars": 156,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 4967
+  },
+  {
+   "repo": "vxfemboy/wipedicks",
+   "stars": 156,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 63
+  },
+  {
+   "repo": "GlacierW/MBA",
+   "stars": 156,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 25882
+  },
+  {
+   "repo": "labcif/FAMA",
+   "stars": 154,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 6681
+  },
+  {
+   "repo": "mgreen27/Invoke-LiveResponse",
+   "stars": 151,
+   "spdx_hint": "MIT",
+   "size_kb": 1126
+  },
+  {
+   "repo": "ByamB4/Common-CTF-Challenges",
+   "stars": 148,
+   "spdx_hint": null,
+   "size_kb": 9789
+  },
+  {
+   "repo": "strozfriedberg/sidr",
+   "stars": 145,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 11981
+  },
+  {
+   "repo": "phishdestroy/taylor-wessing-data-breach-toolkit",
+   "stars": 145,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 3484
+  },
+  {
+   "repo": "Paragon-Software-Group/paragon_apfs_sdk_ce",
+   "stars": 144,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 420
+  },
+  {
+   "repo": "Xumeiquer/yara-forensics",
+   "stars": 143,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 76
+  },
+  {
+   "repo": "Drewsif/wipedicks",
+   "stars": 138,
+   "spdx_hint": "MIT",
+   "size_kb": 7
+  },
+  {
+   "repo": "ydkhatri/spotlight_parser",
+   "stars": 137,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 135
+  },
+  {
+   "repo": "osintshifu/osint-tradecraft",
+   "stars": 137,
+   "spdx_hint": null,
+   "size_kb": 760
+  },
+  {
+   "repo": "vadim-a-yegorov/Jailbreak-detection-The-modern-way",
+   "stars": 136,
+   "spdx_hint": null,
+   "size_kb": 3731
+  },
+  {
+   "repo": "getreu/stringsext",
+   "stars": 134,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 633
+  },
+  {
+   "repo": "botherder/pcqf",
+   "stars": 134,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 287
+  },
+  {
+   "repo": "andreafortuna/autotimeliner",
+   "stars": 133,
+   "spdx_hint": "MIT",
+   "size_kb": 77
+  },
+  {
+   "repo": "cado-security/rip_raw",
+   "stars": 133,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 936
+  },
+  {
+   "repo": "yogsec/Digital-Forensics-Tools",
+   "stars": 131,
+   "spdx_hint": "MIT",
+   "size_kb": 124
+  },
+  {
+   "repo": "resurrecting-open-source-projects/dcfldd",
+   "stars": 129,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 1787
+  },
+  {
+   "repo": "RonyAbecidan/ManTraNet-pytorch",
+   "stars": 127,
+   "spdx_hint": null,
+   "size_kb": 33648
+  },
+  {
+   "repo": "dbissell6/DFIR",
+   "stars": 123,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 5662
+  },
+  {
+   "repo": "andyjsmith/Registry-Spy",
+   "stars": 122,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 966
+  },
+  {
+   "repo": "blueteam0ps/AllthingsTimesketch",
+   "stars": 122,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1872
+  },
+  {
+   "repo": "dgunter/evtxtoelk",
+   "stars": 122,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 3966
+  },
+  {
+   "repo": "chriswmorris/Metaforge",
+   "stars": 121,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2931
+  },
+  {
+   "repo": "mnrkbys/macosac",
+   "stars": 121,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 4326
+  },
+  {
+   "repo": "niftycode/imessage_reader",
+   "stars": 121,
+   "spdx_hint": "MIT",
+   "size_kb": 86
+  },
+  {
+   "repo": "osintshifu/Cyber-Intelligence-GPT",
+   "stars": 119,
+   "spdx_hint": null,
+   "size_kb": 305
+  },
+  {
+   "repo": "swisscom/Invoke-Forensics",
+   "stars": 119,
+   "spdx_hint": "MIT",
+   "size_kb": 51
+  },
+  {
+   "repo": "cristianzsh/amcache-evilhunter",
+   "stars": 114,
+   "spdx_hint": "MIT",
+   "size_kb": 100935
+  },
+  {
+   "repo": "ziesemer/ad-privileged-audit",
+   "stars": 114,
+   "spdx_hint": null,
+   "size_kb": 498
+  },
+  {
+   "repo": "Ghassan-elsman/Crow-Eye",
+   "stars": 114,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 219556
+  },
+  {
+   "repo": "mdawsonuk/LevelDBDumper",
+   "stars": 114,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 98
+  },
+  {
+   "repo": "joeavanzato/RetrievIR",
+   "stars": 113,
+   "spdx_hint": "MIT",
+   "size_kb": 600
+  },
+  {
+   "repo": "mnrkbys/fjta",
+   "stars": 112,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 211
+  },
+  {
+   "repo": "strayge/pylnk",
+   "stars": 112,
+   "spdx_hint": "LGPL-3.0",
+   "size_kb": 217
+  },
+  {
+   "repo": "teamdfir/sift-saltstack",
+   "stars": 111,
+   "spdx_hint": "MIT",
+   "size_kb": 14098
+  },
+  {
+   "repo": "beelzebub-labs/azazel",
+   "stars": 110,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 14949
+  },
+  {
+   "repo": "ctkqiang/LQZ",
+   "stars": 108,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 1666
+  },
+  {
+   "repo": "AppliedIR/Valhuntir",
+   "stars": 108,
+   "spdx_hint": "MIT",
+   "size_kb": 3284
+  },
+  {
+   "repo": "numirias/firefed",
+   "stars": 106,
+   "spdx_hint": "MIT",
+   "size_kb": 235
+  },
+  {
+   "repo": "fit-project/fit",
+   "stars": 106,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 17705
+  },
+  {
+   "repo": "BBVA/qed",
+   "stars": 105,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 5056
+  },
+  {
+   "repo": "ydkhatri/UnifiedLogReader",
+   "stars": 104,
+   "spdx_hint": "MIT",
+   "size_kb": 148
+  },
+  {
+   "repo": "PacktPublishing/Digital-Forensics-with-Kali-Linux",
+   "stars": 103,
+   "spdx_hint": "MIT",
+   "size_kb": 41131
+  },
+  {
+   "repo": "adrianlois/DFIR-Detection-Engineering",
+   "stars": 101,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1893
+  },
+  {
+   "repo": "mnrkbys/vss_carver",
+   "stars": 101,
+   "spdx_hint": "MIT",
+   "size_kb": 2736
+  },
+  {
+   "repo": "blueteam0ps/memOptix",
+   "stars": 98,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1094
+  },
+  {
+   "repo": "rr-/CRC-manipulator",
+   "stars": 98,
+   "spdx_hint": "MIT",
+   "size_kb": 177
+  },
+  {
+   "repo": "nshadov/screensaver-mouse-jiggler",
+   "stars": 97,
+   "spdx_hint": "MIT",
+   "size_kb": 835
+  },
+  {
+   "repo": "3ls3if/Cybersecurity-Notes",
+   "stars": 96,
+   "spdx_hint": "MIT",
+   "size_kb": 53460
+  },
+  {
+   "repo": "mnrkbys/ma2tl",
+   "stars": 96,
+   "spdx_hint": "MIT",
+   "size_kb": 606
+  },
+  {
+   "repo": "memoryforensics1/VolExp",
+   "stars": 95,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1581
+  },
+  {
+   "repo": "ANSSI-FR/bootcode_parser",
+   "stars": 95,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1326
+  },
+  {
+   "repo": "sandflysecurity/sandfly-setup",
+   "stars": 95,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 8371
+  },
+  {
+   "repo": "kalink0/crush-forensics",
+   "stars": 94,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 27373
+  },
+  {
+   "repo": "bitsofinfo/comms-analyzer-toolbox",
+   "stars": 93,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 811
+  },
+  {
+   "repo": "JPCERTCC/MemoryForensic-on-Cloud",
+   "stars": 93,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 439
+  },
+  {
+   "repo": "AnonCatalyst/Odinova",
+   "stars": 93,
+   "spdx_hint": "MIT",
+   "size_kb": 29066
+  },
+  {
+   "repo": "nyarime/gho",
+   "stars": 91,
+   "spdx_hint": "MIT",
+   "size_kb": 43
+  },
+  {
+   "repo": "marcrowProject/Bramble",
+   "stars": 91,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 7858
+  },
+  {
+   "repo": "lintsinghua/VerifyVision-Pro",
+   "stars": 91,
+   "spdx_hint": "MIT",
+   "size_kb": 2127
+  },
+  {
+   "repo": "NtRaiseHardError/Kaiser",
+   "stars": 91,
+   "spdx_hint": null,
+   "size_kb": 2308
+  },
+  {
+   "repo": "zweilosec/PowerShell-Administration-Tools",
+   "stars": 90,
+   "spdx_hint": null,
+   "size_kb": 125
+  },
+  {
+   "repo": "cblichmann/btrfscue",
+   "stars": 90,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 269
+  },
+  {
+   "repo": "sumeshi/evtx2es",
+   "stars": 89,
+   "spdx_hint": "MIT",
+   "size_kb": 421
+  },
+  {
+   "repo": "calebevans/mulder",
+   "stars": 89,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 82223
+  },
+  {
+   "repo": "MatheuZSecurity/ModTracer",
+   "stars": 88,
+   "spdx_hint": "MIT",
+   "size_kb": 37
+  },
+  {
+   "repo": "AmgdGocha/DriveFS-Sleuth",
+   "stars": 87,
+   "spdx_hint": "EPL-2.0",
+   "size_kb": 23545
+  },
+  {
+   "repo": "anthonyshibitov/netdis",
+   "stars": 87,
+   "spdx_hint": null,
+   "size_kb": 4164
+  },
+  {
+   "repo": "warpedatom/OffsetInspect",
+   "stars": 86,
+   "spdx_hint": "MIT",
+   "size_kb": 1400
+  },
+  {
+   "repo": "AdamWhiteHat/Judge-Jury-and-Executable",
+   "stars": 85,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 31909
+  },
+  {
+   "repo": "tomas-nestorovic/RIDE",
+   "stars": 85,
+   "spdx_hint": null,
+   "size_kb": 4373
+  },
+  {
+   "repo": "leludo84/vol3-linux-profiles",
+   "stars": 83,
+   "spdx_hint": null,
+   "size_kb": 17273049
+  },
+  {
+   "repo": "bad-antics/nullsec-logreaper",
+   "stars": 83,
+   "spdx_hint": "MIT",
+   "size_kb": 796
+  },
+  {
+   "repo": "Cr4sh/smram_parse",
+   "stars": 83,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 22
+  },
+  {
+   "repo": "DFIRScience/UFDR2DIR",
+   "stars": 82,
+   "spdx_hint": "MIT",
+   "size_kb": 35
+  },
+  {
+   "repo": "CScorza/DistroForensics",
+   "stars": 82,
+   "spdx_hint": null,
+   "size_kb": 97
+  },
+  {
+   "repo": "baimao-box/Misc_Picture_Steganography",
+   "stars": 82,
+   "spdx_hint": null,
+   "size_kb": 28022
+  },
+  {
+   "repo": "knez/defender-dump",
+   "stars": 81,
+   "spdx_hint": null,
+   "size_kb": 160
+  },
+  {
+   "repo": "MatheuZSecurity/detect-lkm-rootkit-cheatsheet",
+   "stars": 81,
+   "spdx_hint": null,
+   "size_kb": 1093
+  },
+  {
+   "repo": "nov3mb3r/trident",
+   "stars": 81,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 64
+  },
+  {
+   "repo": "hestihesti/HackingComm",
+   "stars": 80,
+   "spdx_hint": null,
+   "size_kb": 74
+  },
+  {
+   "repo": "andyjsmith/Exe-Spy",
+   "stars": 78,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 3471
+  },
+  {
+   "repo": "harelsegev/prefetch-hash-cracker",
+   "stars": 78,
+   "spdx_hint": "MIT",
+   "size_kb": 32
+  },
+  {
+   "repo": "Tokeii0/LovelyMiscLab",
+   "stars": 77,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 4660
+  },
+  {
+   "repo": "Cvar1984/sussyfinder",
+   "stars": 77,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2283
+  },
+  {
+   "repo": "adulau/dcfldd",
+   "stars": 75,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 202
+  },
+  {
+   "repo": "aws-solutions-library-samples/automated-forensic-orchestrator-for-amazon-ec2",
+   "stars": 75,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 2914
+  },
+  {
+   "repo": "Division-36/Z-Jail",
+   "stars": 74,
+   "spdx_hint": "MIT",
+   "size_kb": 655
+  },
+  {
+   "repo": "luker983/nsa-codebreaker-2020",
+   "stars": 74,
+   "spdx_hint": null,
+   "size_kb": 42599
+  },
+  {
+   "repo": "ANSSI-FR/bits_parser",
+   "stars": 74,
+   "spdx_hint": "MIT",
+   "size_kb": 19
+  },
+  {
+   "repo": "harelsegev/INDXRipper",
+   "stars": 74,
+   "spdx_hint": "MIT",
+   "size_kb": 10702
+  },
+  {
+   "repo": "GohEeEn/TryHackMe-Write-Up",
+   "stars": 73,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 148840
+  },
+  {
+   "repo": "rair-project/rair",
+   "stars": 72,
+   "spdx_hint": "LGPL-3.0",
+   "size_kb": 792
+  },
+  {
+   "repo": "paulveillard/cybersecurity-forensics",
+   "stars": 71,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 376
+  },
+  {
+   "repo": "kraftdenker/ZAPiXDESK",
+   "stars": 71,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 31683
+  },
+  {
+   "repo": "bitranox/fingerprint",
+   "stars": 71,
+   "spdx_hint": "MIT",
+   "size_kb": 5893
+  },
+  {
+   "repo": "memoryforensics1/Vol3xp",
+   "stars": 70,
+   "spdx_hint": null,
+   "size_kb": 3558
+  },
+  {
+   "repo": "DHTrung0312/SysTools-Data-Recovery-Suite",
+   "stars": 70,
+   "spdx_hint": null,
+   "size_kb": 289
+  },
+  {
+   "repo": "wasereowen-debug/SysTools-Recovery-Field-Guide",
+   "stars": 70,
+   "spdx_hint": null,
+   "size_kb": 319
+  },
+  {
+   "repo": "stuxnet999/EventTranscriptParser",
+   "stars": 70,
+   "spdx_hint": "MIT",
+   "size_kb": 28308
+  },
+  {
+   "repo": "osintshifu/awesome-osint-repos",
+   "stars": 69,
+   "spdx_hint": "MIT",
+   "size_kb": 2602
+  },
+  {
+   "repo": "piotrbania/ios_forensics_suite",
+   "stars": 69,
+   "spdx_hint": null,
+   "size_kb": 2065
+  },
+  {
+   "repo": "alephdata/ingest-file",
+   "stars": 69,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 70381
+  },
+  {
+   "repo": "cions/leveldb-cli",
+   "stars": 69,
+   "spdx_hint": "MIT",
+   "size_kb": 94
+  },
+  {
+   "repo": "RomaLytar/yammi-audit-log",
+   "stars": 68,
+   "spdx_hint": "MIT",
+   "size_kb": 3761
+  },
+  {
+   "repo": "PuravsPoint/DecipheringUAL",
+   "stars": 67,
+   "spdx_hint": null,
+   "size_kb": 3833
+  },
+  {
+   "repo": "dfirsec/check_rep",
+   "stars": 67,
+   "spdx_hint": "MIT",
+   "size_kb": 2642
+  },
+  {
+   "repo": "nipunjaswal/networkforensics",
+   "stars": 66,
+   "spdx_hint": null,
+   "size_kb": 55587
+  },
+  {
+   "repo": "jonaylor89/sherlock-rs",
+   "stars": 65,
+   "spdx_hint": "MIT",
+   "size_kb": 901
+  },
+  {
+   "repo": "z0m31en7/deauthalyzer",
+   "stars": 65,
+   "spdx_hint": "MIT",
+   "size_kb": 32
+  },
+  {
+   "repo": "Silv3rHorn/ArtifactExtractor",
+   "stars": 65,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 82
+  },
+  {
+   "repo": "steffenfritz/FileTrove",
+   "stars": 63,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 27063
+  },
+  {
+   "repo": "OlivierLaflamme/CTF-Script-And-Template-Thrift-Shop",
+   "stars": 63,
+   "spdx_hint": null,
+   "size_kb": 356
+  },
+  {
+   "repo": "rr-/ida-images",
+   "stars": 63,
+   "spdx_hint": "MIT",
+   "size_kb": 55
+  },
+  {
+   "repo": "visma-prodsec/columbo",
+   "stars": 61,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 6645
+  },
+  {
+   "repo": "tim-barc/ctf_writeups",
+   "stars": 61,
+   "spdx_hint": null,
+   "size_kb": 85558
+  },
+  {
+   "repo": "therealdreg/lsrootkit",
+   "stars": 61,
+   "spdx_hint": "MIT",
+   "size_kb": 124
+  },
+  {
+   "repo": "mzfr/HackTheBox-writeups",
+   "stars": 61,
+   "spdx_hint": null,
+   "size_kb": 18726
+  },
+  {
+   "repo": "uintdev/Discord-Cache-Dump",
+   "stars": 60,
+   "spdx_hint": "MIT",
+   "size_kb": 365
+  },
+  {
+   "repo": "NUKIB/maldump",
+   "stars": 59,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 294
+  },
+  {
+   "repo": "flamusdiu/xleapp",
+   "stars": 58,
+   "spdx_hint": "MIT",
+   "size_kb": 45609
+  },
+  {
+   "repo": "gustavoparedes/Browser-Reviewer",
+   "stars": 57,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 4833
+  },
+  {
+   "repo": "noamgariani11/picoCTF-2024-Writeup",
+   "stars": 57,
+   "spdx_hint": null,
+   "size_kb": 44
+  },
+  {
+   "repo": "Sotera/newman",
+   "stars": 56,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 278525
+  },
+  {
+   "repo": "initz3r0/ibex",
+   "stars": 56,
+   "spdx_hint": "MIT",
+   "size_kb": 775
+  },
+  {
+   "repo": "Tomiwa-Ot/SM-A217F_forensics",
+   "stars": 56,
+   "spdx_hint": null,
+   "size_kb": 1484
+  },
+  {
+   "repo": "heeeyaaaa/vmem-decrypt",
+   "stars": 55,
+   "spdx_hint": "MIT",
+   "size_kb": 22
+  },
+  {
+   "repo": "nannib/Imm2Virtual",
+   "stars": 54,
+   "spdx_hint": null,
+   "size_kb": 27322
+  },
+  {
+   "repo": "antagon/TCHunt-ng",
+   "stars": 54,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 5069
+  },
+  {
+   "repo": "p0dalirius/volatility2-profiles",
+   "stars": 54,
+   "spdx_hint": null,
+   "size_kb": 34522
+  },
+  {
+   "repo": "mschermann/forensic_accounting",
+   "stars": 54,
+   "spdx_hint": null,
+   "size_kb": 2112
+  },
+  {
+   "repo": "mnrkbys/bgiparser",
+   "stars": 54,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 18
+  },
+  {
+   "repo": "MarcoPon/BlockHashLoc",
+   "stars": 54,
+   "spdx_hint": "MIT",
+   "size_kb": 43
+  },
+  {
+   "repo": "drivebadger/drivebadger",
+   "stars": 53,
+   "spdx_hint": "MIT",
+   "size_kb": 120
+  },
+  {
+   "repo": "bowbarrel46/Process_Hacker_Pro_2026",
+   "stars": 52,
+   "spdx_hint": "MIT",
+   "size_kb": 7
+  },
+  {
+   "repo": "Kjean13/ADFT",
+   "stars": 51,
+   "spdx_hint": "MIT",
+   "size_kb": 2005
+  },
+  {
+   "repo": "jo-lund/jomon",
+   "stars": 51,
+   "spdx_hint": "MIT",
+   "size_kb": 1761
+  },
+  {
+   "repo": "k0imet/CTFs",
+   "stars": 50,
+   "spdx_hint": null,
+   "size_kb": 908
+  },
+  {
+   "repo": "Chocapikk/pgread",
+   "stars": 50,
+   "spdx_hint": "WTFPL",
+   "size_kb": 20991
+  },
+  {
+   "repo": "filippofinke/infectio",
+   "stars": 50,
+   "spdx_hint": "MIT",
+   "size_kb": 6005
+  },
+  {
+   "repo": "aff4/pyaff4",
+   "stars": 50,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 19305
+  },
+  {
+   "repo": "abathelt/EvidenceWiki",
+   "stars": 50,
+   "spdx_hint": null,
+   "size_kb": 105
+  },
+  {
+   "repo": "FlipForensics/AIFT",
+   "stars": 50,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 34731
+  },
+  {
+   "repo": "nand0san/av_detect",
+   "stars": 48,
+   "spdx_hint": null,
+   "size_kb": 276
+  },
+  {
+   "repo": "google/amt-forensics",
+   "stars": 47,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 14
+  },
+  {
+   "repo": "polimi-ispl/GAN-image-detection",
+   "stars": 47,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 401
+  },
+  {
+   "repo": "theXappy/RemoteNET",
+   "stars": 46,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 3053
+  },
+  {
+   "repo": "controlf/mift",
+   "stars": 46,
+   "spdx_hint": "MIT",
+   "size_kb": 1159131
+  },
+  {
+   "repo": "JoasASantos/Anti-Forensic-Techniques",
+   "stars": 46,
+   "spdx_hint": null,
+   "size_kb": 3
+  },
+  {
+   "repo": "okba14/FastScan",
+   "stars": 46,
+   "spdx_hint": "MIT",
+   "size_kb": 1539
+  },
+  {
+   "repo": "harris21/afot",
+   "stars": 45,
+   "spdx_hint": "MIT",
+   "size_kb": 82
+  },
+  {
+   "repo": "emrekybs/Douglas-042",
+   "stars": 45,
+   "spdx_hint": null,
+   "size_kb": 9774
+  },
+  {
+   "repo": "AaronSoria/PAnalizer",
+   "stars": 44,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 1112
+  },
+  {
+   "repo": "4n6ist/bulk_extractor-rec",
+   "stars": 44,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 38207
+  },
+  {
+   "repo": "CCXLabs/CCXDigger",
+   "stars": 44,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 174
+  },
+  {
+   "repo": "alpine-sec/SPECTR3",
+   "stars": 44,
+   "spdx_hint": "LGPL-3.0",
+   "size_kb": 1660
+  },
+  {
+   "repo": "op7ic/unix_collector",
+   "stars": 44,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 374
+  },
+  {
+   "repo": "fkie-cad/pcapFS",
+   "stars": 43,
+   "spdx_hint": "MIT",
+   "size_kb": 229056
+  },
+  {
+   "repo": "stamparm/dnslog",
+   "stars": 43,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 33
+  },
+  {
+   "repo": "jenkinsci/git-forensics-plugin",
+   "stars": 43,
+   "spdx_hint": "MIT",
+   "size_kb": 4226
+  },
+  {
+   "repo": "mattboyer/sqbrite",
+   "stars": 43,
+   "spdx_hint": "MIT",
+   "size_kb": 83
+  },
+  {
+   "repo": "IllusiveNetworks-Labs/GetConsoleHistoryAndOutput",
+   "stars": 42,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 10
+  },
+  {
+   "repo": "markuta/bw-dump",
+   "stars": 42,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 65
+  },
+  {
+   "repo": "cube0x8/ChromeRagamuffin",
+   "stars": 42,
+   "spdx_hint": null,
+   "size_kb": 220
+  },
+  {
+   "repo": "dyne/harvest",
+   "stars": 42,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1316
+  },
+  {
+   "repo": "lorecioni/ImageSplicingDetection",
+   "stars": 42,
+   "spdx_hint": null,
+   "size_kb": 111800
+  },
+  {
+   "repo": "umair9747/headmail",
+   "stars": 41,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1188
+  },
+  {
+   "repo": "spak9/mmkv_visualizer",
+   "stars": 41,
+   "spdx_hint": null,
+   "size_kb": 325
+  },
+  {
+   "repo": "Silv3rHorn/evtx2json",
+   "stars": 41,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 213
+  },
+  {
+   "repo": "airbus-cert/timeliner",
+   "stars": 41,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 26
+  },
+  {
+   "repo": "sk4la/volatility3-docker",
+   "stars": 41,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 131
+  },
+  {
+   "repo": "spooktheducks/local-blockchain-parser",
+   "stars": 40,
+   "spdx_hint": null,
+   "size_kb": 2816
+  },
+  {
+   "repo": "KeL3vRa/TelegramExporter",
+   "stars": 40,
+   "spdx_hint": null,
+   "size_kb": 1801
+  },
+  {
+   "repo": "airbus-cert/PSTrace",
+   "stars": 40,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 57
+  },
+  {
+   "repo": "mosajjal/tcpshark",
+   "stars": 40,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 135
+  },
+  {
+   "repo": "HexLasso/FF-16-TUI",
+   "stars": 39,
+   "spdx_hint": "MIT",
+   "size_kb": 20
+  },
+  {
+   "repo": "MehmetYukselSekeroglu/TheHive",
+   "stars": 39,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 8151
+  },
+  {
+   "repo": "dogoncouch/siemstress",
+   "stars": 39,
+   "spdx_hint": "MIT",
+   "size_kb": 1628
+  },
+  {
+   "repo": "asuramaya/neo",
+   "stars": 39,
+   "spdx_hint": "MIT",
+   "size_kb": 293
+  },
+  {
+   "repo": "dedsecurity/dedsecurity-framework",
+   "stars": 38,
+   "spdx_hint": "MIT",
+   "size_kb": 912
+  },
+  {
+   "repo": "skyllc-ai/UltraFastFileSearch",
+   "stars": 38,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 279196
+  },
+  {
+   "repo": "matkowski-voy/Palmprint-Recognition-in-the-Wild",
+   "stars": 38,
+   "spdx_hint": null,
+   "size_kb": 24113
+  },
+  {
+   "repo": "VoidSec/SolarPuttyDecrypt",
+   "stars": 38,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 79
+  },
+  {
+   "repo": "AvillaDaniel/Signal-Forensics",
+   "stars": 37,
+   "spdx_hint": null,
+   "size_kb": 26
+  },
+  {
+   "repo": "mooijtech/go-pst",
+   "stars": 37,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 102503
+  },
+  {
+   "repo": "srixivas/urlRecon",
+   "stars": 37,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 19597
+  },
+  {
+   "repo": "spawaskar-cora/cora-docs",
+   "stars": 37,
+   "spdx_hint": "MIT",
+   "size_kb": 959550
+  },
+  {
+   "repo": "ionsec/maes-platform",
+   "stars": 36,
+   "spdx_hint": null,
+   "size_kb": 3057
+  },
+  {
+   "repo": "kraftdenker/ZAPiXWEB",
+   "stars": 36,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2519
+  },
+  {
+   "repo": "kpcyrd/archlinux-userland-fs-cmp",
+   "stars": 35,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 100
+  },
+  {
+   "repo": "hack-different/demuxusb",
+   "stars": 35,
+   "spdx_hint": "MIT",
+   "size_kb": 106
+  },
+  {
+   "repo": "BZDaniel/RDPuzzle",
+   "stars": 35,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 1636
+  },
+  {
+   "repo": "alcideio/kaudit",
+   "stars": 35,
+   "spdx_hint": null,
+   "size_kb": 312
+  },
+  {
+   "repo": "starlingvibes/TryHackMe",
+   "stars": 35,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 152683
+  },
+  {
+   "repo": "Mutasem-mk4/procscope",
+   "stars": 35,
+   "spdx_hint": "MIT",
+   "size_kb": 35372
+  },
+  {
+   "repo": "spider863644/Forensight",
+   "stars": 35,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 292
+  },
+  {
+   "repo": "aadityapurani/My-CTF-Solutions",
+   "stars": 34,
+   "spdx_hint": null,
+   "size_kb": 6224
+  },
+  {
+   "repo": "paulveillard/cybersecurity-digital-forensics",
+   "stars": 34,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 746
+  },
+  {
+   "repo": "afritzler/oopsie",
+   "stars": 34,
+   "spdx_hint": "MIT",
+   "size_kb": 8936
+  },
+  {
+   "repo": "ForensicRS/forensic-rs",
+   "stars": 34,
+   "spdx_hint": "MIT",
+   "size_kb": 1449
+  },
+  {
+   "repo": "VoidHack/toolset",
+   "stars": 34,
+   "spdx_hint": null,
+   "size_kb": 14
+  },
+  {
+   "repo": "ogmini/Notepad-State-Library",
+   "stars": 33,
+   "spdx_hint": "MIT",
+   "size_kb": 4053
+  },
+  {
+   "repo": "p0dalirius/volatility3-symbols",
+   "stars": 33,
+   "spdx_hint": null,
+   "size_kb": 1129143
+  },
+  {
+   "repo": "LeanVel/TakeoutsTimelining",
+   "stars": 33,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 7276
+  },
+  {
+   "repo": "akhil-dara/sqlite-gui-analyzer",
+   "stars": 33,
+   "spdx_hint": "MIT",
+   "size_kb": 17763
+  },
+  {
+   "repo": "l0n3m4n/SearchToolkit",
+   "stars": 33,
+   "spdx_hint": "MIT",
+   "size_kb": 4857
+  },
+  {
+   "repo": "cmdaltr/elrond",
+   "stars": 32,
+   "spdx_hint": "MIT",
+   "size_kb": 323171
+  },
+  {
+   "repo": "ckc9759/CTF_resources",
+   "stars": 32,
+   "spdx_hint": "MIT",
+   "size_kb": 48816
+  },
+  {
+   "repo": "Saeros-Security/Saeros",
+   "stars": 31,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 496
+  },
+  {
+   "repo": "PyDFIR/pyDFIRRam",
+   "stars": 31,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1391
+  },
+  {
+   "repo": "SecurityRonin/usnjrnl-forensic",
+   "stars": 31,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 10362
+  },
+  {
+   "repo": "adoreste/truehunter",
+   "stars": 31,
+   "spdx_hint": null,
+   "size_kb": 19
+  },
+  {
+   "repo": "dfir-iris/iris-client",
+   "stars": 31,
+   "spdx_hint": "LGPL-3.0",
+   "size_kb": 3096
+  },
+  {
+   "repo": "berdav/snappy-fox",
+   "stars": 31,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 408
+  },
+  {
+   "repo": "hiddenillusion/IR",
+   "stars": 31,
+   "spdx_hint": null,
+   "size_kb": 107
+  },
+  {
+   "repo": "blacktop/docker-volatility",
+   "stars": 31,
+   "spdx_hint": "MIT",
+   "size_kb": 203
+  },
+  {
+   "repo": "QXJ6YW4/SimpleImager",
+   "stars": 31,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2472
+  },
+  {
+   "repo": "naemazam/logForenix",
+   "stars": 30,
+   "spdx_hint": "MIT",
+   "size_kb": 964
+  },
+  {
+   "repo": "kev365/ToolFetcher",
+   "stars": 30,
+   "spdx_hint": "MIT",
+   "size_kb": 414
+  },
+  {
+   "repo": "sumeshi/ntfsfind",
+   "stars": 30,
+   "spdx_hint": "MIT",
+   "size_kb": 295
+  },
+  {
+   "repo": "KBNLresearch/tapeimgr",
+   "stars": 29,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 680
+  },
+  {
+   "repo": "HellishPn/Volatility-MM-CS",
+   "stars": 29,
+   "spdx_hint": null,
+   "size_kb": 585
+  },
+  {
+   "repo": "MagnetForensics/swsusp2bin",
+   "stars": 29,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 32
+  },
+  {
+   "repo": "1r0dm480/CTF-Wr1T3uPs",
+   "stars": 29,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 37854
+  },
+  {
+   "repo": "open-education-hub/essentials-security",
+   "stars": 29,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 9741
+  },
+  {
+   "repo": "karim852/Kage-DFIR-toolkit",
+   "stars": 29,
+   "spdx_hint": "MIT",
+   "size_kb": 3293
+  },
+  {
+   "repo": "sumeshi/forensia",
+   "stars": 29,
+   "spdx_hint": "MIT",
+   "size_kb": 5626
+  },
+  {
+   "repo": "globecyber/Infornito",
+   "stars": 29,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 388
+  },
+  {
+   "repo": "angry-bender/forensicssetup",
+   "stars": 28,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2348
+  },
+  {
+   "repo": "stvetro/HuntWithChatGPT",
+   "stars": 28,
+   "spdx_hint": "MIT",
+   "size_kb": 8
+  },
+  {
+   "repo": "noirlang/amele",
+   "stars": 28,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 155711
+  },
+  {
+   "repo": "iocx-dev/iocx",
+   "stars": 28,
+   "spdx_hint": "MPL-2.0",
+   "size_kb": 1633
+  },
+  {
+   "repo": "forensenellanebbia/geotag2kml",
+   "stars": 28,
+   "spdx_hint": null,
+   "size_kb": 39
+  },
+  {
+   "repo": "widgetii/beye",
+   "stars": 28,
+   "spdx_hint": null,
+   "size_kb": 3205
+  },
+  {
+   "repo": "arzisxam/apfs-excavate",
+   "stars": 28,
+   "spdx_hint": "MIT",
+   "size_kb": 344
+  },
+  {
+   "repo": "CScorza/CScorza",
+   "stars": 28,
+   "spdx_hint": null,
+   "size_kb": 53552
+  },
+  {
+   "repo": "luminaut-org/luminaut",
+   "stars": 27,
+   "spdx_hint": "MIT",
+   "size_kb": 29399
+  },
+  {
+   "repo": "ydkhatri/APFS_010",
+   "stars": 27,
+   "spdx_hint": "MIT",
+   "size_kb": 686
+  },
+  {
+   "repo": "airbus-cert/cacdec",
+   "stars": 27,
+   "spdx_hint": null,
+   "size_kb": 88
+  },
+  {
+   "repo": "p0dalirius/Hashes-Harvester",
+   "stars": 27,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 228
+  },
+  {
+   "repo": "marcellelee/marcellelee.github.io",
+   "stars": 27,
+   "spdx_hint": null,
+   "size_kb": 1197
+  },
+  {
+   "repo": "Dorif/fragalyseqt",
+   "stars": 27,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 116246
+  },
+  {
+   "repo": "TarekAwwad/checkyouragent",
+   "stars": 26,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 17217
+  },
+  {
+   "repo": "p0dalirius/docker-volatility2",
+   "stars": 26,
+   "spdx_hint": null,
+   "size_kb": 39
+  },
+  {
+   "repo": "nrvana/macOS-triage",
+   "stars": 26,
+   "spdx_hint": "MIT",
+   "size_kb": 38
+  },
+  {
+   "repo": "jaybird1291/macOS-persistence-cheatsheet",
+   "stars": 26,
+   "spdx_hint": "MIT",
+   "size_kb": 7689
+  },
+  {
+   "repo": "Lifars/MantOS",
+   "stars": 26,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 14349
+  },
+  {
+   "repo": "jon-brandy/CTF-WRITE-UP",
+   "stars": 26,
+   "spdx_hint": null,
+   "size_kb": 85946
+  },
+  {
+   "repo": "abaghinyan/Aralez",
+   "stars": 26,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1995
+  },
+  {
+   "repo": "JulienFink/WiFi-Project",
+   "stars": 26,
+   "spdx_hint": "MIT",
+   "size_kb": 6104
+  },
+  {
+   "repo": "MikeHorn-git/Kakia",
+   "stars": 26,
+   "spdx_hint": "MIT",
+   "size_kb": 8
+  },
+  {
+   "repo": "thebeanogamer/hstsparser",
+   "stars": 26,
+   "spdx_hint": "MIT",
+   "size_kb": 288
+  },
+  {
+   "repo": "janstarke/ntdsextract2",
+   "stars": 26,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 5317
+  },
+  {
+   "repo": "soakes/telegram-message-exporter",
+   "stars": 25,
+   "spdx_hint": "MIT",
+   "size_kb": 86
+  },
+  {
+   "repo": "dhondta/AppmemDumper",
+   "stars": 25,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 103
+  },
+  {
+   "repo": "depalmar/ai-dfir-toolkit",
+   "stars": 25,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 2413
+  },
+  {
+   "repo": "speechanddebate/tabroom",
+   "stars": 25,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 120856
+  },
+  {
+   "repo": "simonrdavies/NapierOne",
+   "stars": 25,
+   "spdx_hint": null,
+   "size_kb": 4497
+  },
+  {
+   "repo": "PeterUpfold/dump-iphone-backup",
+   "stars": 25,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 15
+  },
+  {
+   "repo": "mbrengel/memscrimper",
+   "stars": 25,
+   "spdx_hint": "BSD-2-Clause",
+   "size_kb": 207
+  },
+  {
+   "repo": "noxdafox/vminspect",
+   "stars": 25,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 107
+  },
+  {
+   "repo": "Natounet/YellowDotDecode",
+   "stars": 24,
+   "spdx_hint": null,
+   "size_kb": 7
+  },
+  {
+   "repo": "EmadAbedini/Dumplyzer",
+   "stars": 24,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 7428
+  },
+  {
+   "repo": "rafael-santiago/lethe",
+   "stars": 24,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 190
+  },
+  {
+   "repo": "mittalgovind/fifty",
+   "stars": 24,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 39324
+  },
+  {
+   "repo": "BitCurator/bitcurator-access-webtools",
+   "stars": 24,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 163636
+  },
+  {
+   "repo": "CVxTz/fingerprint_denoising",
+   "stars": 24,
+   "spdx_hint": "MIT",
+   "size_kb": 84148
+  },
+  {
+   "repo": "doublegate/CyberChef-MCP",
+   "stars": 24,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 77418
+  },
+  {
+   "repo": "RaphaelJ/libhum",
+   "stars": 23,
+   "spdx_hint": "LGPL-3.0",
+   "size_kb": 6031
+  },
+  {
+   "repo": "ultra-supara/MachStealer",
+   "stars": 23,
+   "spdx_hint": "MIT",
+   "size_kb": 59
+  },
+  {
+   "repo": "LucianPopaLP/ECUPrint",
+   "stars": 23,
+   "spdx_hint": null,
+   "size_kb": 1384
+  },
+  {
+   "repo": "vobst/BPFVol3",
+   "stars": 23,
+   "spdx_hint": "MIT",
+   "size_kb": 18125
+  },
+  {
+   "repo": "sumeshi/ntfsdump",
+   "stars": 23,
+   "spdx_hint": "MIT",
+   "size_kb": 364
+  },
+  {
+   "repo": "siara-cc/sqlite3_page_explorer",
+   "stars": 23,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 3615
+  },
+  {
+   "repo": "cristianzsh/triager",
+   "stars": 23,
+   "spdx_hint": "MIT",
+   "size_kb": 132180
+  },
+  {
+   "repo": "halilozturkci/dfirswarm",
+   "stars": 23,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 443215
+  },
+  {
+   "repo": "honeynet/forensic_challenges",
+   "stars": 23,
+   "spdx_hint": null,
+   "size_kb": 2573
+  },
+  {
+   "repo": "muxcmux/apple-photos-forensics",
+   "stars": 22,
+   "spdx_hint": null,
+   "size_kb": 3
+  },
+  {
+   "repo": "tamlhp/deepfake-benchmark",
+   "stars": 22,
+   "spdx_hint": "MIT",
+   "size_kb": 156515
+  },
+  {
+   "repo": "PedroSFreitas/blackarch-slim-iso",
+   "stars": 22,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 76129
+  },
+  {
+   "repo": "Parad0x-Labs/openclaw-skills",
+   "stars": 22,
+   "spdx_hint": "MIT",
+   "size_kb": 10376
+  },
+  {
+   "repo": "zff-team/zff-rs",
+   "stars": 22,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 2406
+  },
+  {
+   "repo": "alexdelorenzo/parse_google_sms",
+   "stars": 22,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 22
+  },
+  {
+   "repo": "noob-atbash/CTF-writeups",
+   "stars": 22,
+   "spdx_hint": null,
+   "size_kb": 56117
+  },
+  {
+   "repo": "MehmetYukselSekeroglu/VoiceComparator",
+   "stars": 22,
+   "spdx_hint": null,
+   "size_kb": 109
+  },
+  {
+   "repo": "mdawsonuk/DiscordExplorer",
+   "stars": 22,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2044
+  },
+  {
+   "repo": "rene-d/mini-kali",
+   "stars": 22,
+   "spdx_hint": "MIT",
+   "size_kb": 95
+  },
+  {
+   "repo": "Kracken256/ssh-keyfinder",
+   "stars": 22,
+   "spdx_hint": "CC-BY-SA-4.0",
+   "size_kb": 808
+  },
+  {
+   "repo": "barishaxxer/fix_your_image",
+   "stars": 21,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1562
+  },
+  {
+   "repo": "viromelab/tracespipe",
+   "stars": 21,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 16203
+  },
+  {
+   "repo": "capelabs/eBPF-for-DFIR",
+   "stars": 21,
+   "spdx_hint": "MIT",
+   "size_kb": 73
+  },
+  {
+   "repo": "Dreamucxe/ProcessLens",
+   "stars": 21,
+   "spdx_hint": "MIT",
+   "size_kb": 632
+  },
+  {
+   "repo": "cybersaki/security-arsenal",
+   "stars": 21,
+   "spdx_hint": null,
+   "size_kb": 13441
+  },
+  {
+   "repo": "smourier/JumpListExplorer",
+   "stars": 21,
+   "spdx_hint": "MIT",
+   "size_kb": 108
+  },
+  {
+   "repo": "mitre/thumbtack",
+   "stars": 21,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 881
+  },
+  {
+   "repo": "hanasuru/vol_profile_builder",
+   "stars": 21,
+   "spdx_hint": null,
+   "size_kb": 1281
+  },
+  {
+   "repo": "Rug4lo/Log-Zapper",
+   "stars": 21,
+   "spdx_hint": "CC-BY-4.0",
+   "size_kb": 10255
+  },
+  {
+   "repo": "CyberDefenseInstitute/CDIR-A",
+   "stars": 21,
+   "spdx_hint": null,
+   "size_kb": 60647
+  },
+  {
+   "repo": "gaurav-gogia/dftools",
+   "stars": 20,
+   "spdx_hint": null,
+   "size_kb": 1299
+  },
+  {
+   "repo": "cedroid/whatsapp-forensic-tool",
+   "stars": 20,
+   "spdx_hint": null,
+   "size_kb": 34
+  },
+  {
+   "repo": "dfirvault/Thor-scanner-menu",
+   "stars": 20,
+   "spdx_hint": "MIT",
+   "size_kb": 46
+  },
+  {
+   "repo": "PwnLabMe-Project/Security-Resources",
+   "stars": 20,
+   "spdx_hint": null,
+   "size_kb": 43254
+  },
+  {
+   "repo": "gaurav-gogia/dfis-utils",
+   "stars": 20,
+   "spdx_hint": "MPL-2.0",
+   "size_kb": 8079
+  },
+  {
+   "repo": "frangelbarrera/Abster-Intelligence",
+   "stars": 20,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 2397
+  },
+  {
+   "repo": "optimuslabs-io/grokpatrol",
+   "stars": 19,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1316
+  },
+  {
+   "repo": "SPATIAL-Lab/assignR",
+   "stars": 19,
+   "spdx_hint": null,
+   "size_kb": 54514
+  },
+  {
+   "repo": "QuoSecGmbH/os_timestamps",
+   "stars": 19,
+   "spdx_hint": "MIT",
+   "size_kb": 542
+  },
+  {
+   "repo": "databricks-industry-solutions/ioc-matching",
+   "stars": 19,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 147
+  },
+  {
+   "repo": "sealmove/nimitai",
+   "stars": 19,
+   "spdx_hint": "MIT",
+   "size_kb": 601
+  },
+  {
+   "repo": "KBNLresearch/diskimgr",
+   "stars": 19,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1492
+  },
+  {
+   "repo": "hackintro/hackintro.github.io",
+   "stars": 18,
+   "spdx_hint": null,
+   "size_kb": 153699
+  },
+  {
+   "repo": "anpingjing/wechat-chatlog-decrypt-export",
+   "stars": 18,
+   "spdx_hint": "MIT",
+   "size_kb": 41
+  },
+  {
+   "repo": "kpcyrd/tr1pd",
+   "stars": 18,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 184
+  },
+  {
+   "repo": "ar5594/full-info-discord",
+   "stars": 18,
+   "spdx_hint": null,
+   "size_kb": 88
+  },
+  {
+   "repo": "chapinb/python-forensics-handbook",
+   "stars": 18,
+   "spdx_hint": "MIT",
+   "size_kb": 7803
+  },
+  {
+   "repo": "jfarley248/pymobiledevice2",
+   "stars": 18,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 212
+  },
+  {
+   "repo": "lockness-Ko/wot",
+   "stars": 18,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 5140
+  },
+  {
+   "repo": "google/dfdewey",
+   "stars": 18,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 330
+  },
+  {
+   "repo": "adithyan-ak/Slacksploit",
+   "stars": 18,
+   "spdx_hint": null,
+   "size_kb": 18
+  },
+  {
+   "repo": "ajackal/ir_scripts",
+   "stars": 18,
+   "spdx_hint": null,
+   "size_kb": 13
+  },
+  {
+   "repo": "AppliedIR/sift-mcp",
+   "stars": 18,
+   "spdx_hint": "MIT",
+   "size_kb": 5970
+  },
+  {
+   "repo": "jenkinsci/forensics-api-plugin",
+   "stars": 18,
+   "spdx_hint": "MIT",
+   "size_kb": 5008
+  },
+  {
+   "repo": "unicornunicode/FACT",
+   "stars": 17,
+   "spdx_hint": "MIT",
+   "size_kb": 1229
+  },
+  {
+   "repo": "divyanshusahu/HackThisSite",
+   "stars": 17,
+   "spdx_hint": null,
+   "size_kb": 25049
+  },
+  {
+   "repo": "tomvandermussele-zz/autopsy-plugins",
+   "stars": 17,
+   "spdx_hint": null,
+   "size_kb": 56
+  },
+  {
+   "repo": "RonyAbecidan/noiseprint-pytorch",
+   "stars": 17,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 139045
+  },
+  {
+   "repo": "waynebonc/Reviv",
+   "stars": 17,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 96
+  },
+  {
+   "repo": "MilkyWay008/Hermes-OTG",
+   "stars": 17,
+   "spdx_hint": "MIT",
+   "size_kb": 11560
+  },
+  {
+   "repo": "JPCERTCC/etw-scan",
+   "stars": 17,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 2732
+  },
+  {
+   "repo": "csivitu/CTF-Write-ups",
+   "stars": 17,
+   "spdx_hint": "MIT",
+   "size_kb": 36173
+  },
+  {
+   "repo": "igrbtn/EDB_Explorer",
+   "stars": 17,
+   "spdx_hint": null,
+   "size_kb": 1327
+  },
+  {
+   "repo": "DyNooob/ForensicsPP",
+   "stars": 17,
+   "spdx_hint": "MIT",
+   "size_kb": 24015
+  },
+  {
+   "repo": "medioxor/v8-forensics",
+   "stars": 17,
+   "spdx_hint": null,
+   "size_kb": 26
+  },
+  {
+   "repo": "RameenMughal/TryHackMeWriteups",
+   "stars": 17,
+   "spdx_hint": null,
+   "size_kb": 1316
+  },
+  {
+   "repo": "nkbeast/ghost-recover",
+   "stars": 17,
+   "spdx_hint": "MIT",
+   "size_kb": 7785
+  },
+  {
+   "repo": "SRodi/hotspot-bpf",
+   "stars": 17,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 3592
+  },
+  {
+   "repo": "joeavanzato/crackdown",
+   "stars": 17,
+   "spdx_hint": "MIT",
+   "size_kb": 280
+  },
+  {
+   "repo": "counteractive/Get-UnifiedAuditLog",
+   "stars": 16,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 19
+  },
+  {
+   "repo": "maxspl/OSIR",
+   "stars": 16,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 203481
+  }
+ ],
+ "_meta": {
+  "dataset_sha": "210b9259be248323b0b3bc58252bed3fde53135f",
+  "generated_at": "2026-10-11T18:19:10+0000"
+ }
+}

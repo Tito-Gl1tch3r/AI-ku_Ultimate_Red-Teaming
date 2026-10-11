@@ -1,0 +1,3014 @@
+{
+ "topic": "redteam",
+ "source": "github-topics",
+ "num_examples_hf": 46864,
+ "partial_stats": false,
+ "note": "cardinalidad alta: /statistics omite frecuencias de repo_name; catálogo por descubrimiento independiente en GitHub",
+ "n_repos": 500,
+ "repos": [
+  {
+   "repo": "sherlock-project/sherlock",
+   "stars": 93875,
+   "spdx_hint": "MIT",
+   "size_kb": 19085
+  },
+  {
+   "repo": "swisskyrepo/PayloadsAllTheThings",
+   "stars": 81662,
+   "spdx_hint": "MIT",
+   "size_kb": 23345
+  },
+  {
+   "repo": "soxoj/maigret",
+   "stars": 38751,
+   "spdx_hint": "MIT",
+   "size_kb": 30425
+  },
+  {
+   "repo": "bettercap/bettercap",
+   "stars": 20129,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 26620
+  },
+  {
+   "repo": "laramies/theHarvester",
+   "stars": 17891,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 12667
+  },
+  {
+   "repo": "maurosoria/dirsearch",
+   "stars": 14940,
+   "spdx_hint": null,
+   "size_kb": 25101
+  },
+  {
+   "repo": "GTFOBins/GTFOBins.github.io",
+   "stars": 13739,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1196
+  },
+  {
+   "repo": "edoardottt/awesome-hacker-search-engines",
+   "stars": 11285,
+   "spdx_hint": "MIT",
+   "size_kb": 695
+  },
+  {
+   "repo": "samratashok/nishang",
+   "stars": 10140,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 11154
+  },
+  {
+   "repo": "A-poc/RedTeam-Tools",
+   "stars": 9820,
+   "spdx_hint": null,
+   "size_kb": 158
+  },
+  {
+   "repo": "sjzar/chatlog",
+   "stars": 9186,
+   "spdx_hint": null,
+   "size_kb": 1
+  },
+  {
+   "repo": "LOLBAS-Project/LOLBAS",
+   "stars": 8866,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2218
+  },
+  {
+   "repo": "yeyintminthuhtut/Awesome-Red-Teaming",
+   "stars": 8122,
+   "spdx_hint": "MIT",
+   "size_kb": 205
+  },
+  {
+   "repo": "yaklang/yakit",
+   "stars": 7801,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 203177
+  },
+  {
+   "repo": "SnailSploit/Claude-Red",
+   "stars": 7418,
+   "spdx_hint": "MIT",
+   "size_kb": 2427
+  },
+  {
+   "repo": "LasCC/HackTools",
+   "stars": 7082,
+   "spdx_hint": null,
+   "size_kb": 40543
+  },
+  {
+   "repo": "elder-plinius/T3MP3ST",
+   "stars": 6482,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 2947
+  },
+  {
+   "repo": "madhuakula/kubernetes-goat",
+   "stars": 5906,
+   "spdx_hint": "MIT",
+   "size_kb": 130233
+  },
+  {
+   "repo": "ffffffff0x/1earn",
+   "stars": 5730,
+   "spdx_hint": null,
+   "size_kb": 63309
+  },
+  {
+   "repo": "FunnyWolf/Viper",
+   "stars": 5324,
+   "spdx_hint": null,
+   "size_kb": 71425
+  },
+  {
+   "repo": "nicocha30/ligolo-ng",
+   "stars": 5066,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 444
+  },
+  {
+   "repo": "mantvydasb/RedTeaming-Tactics-and-Techniques",
+   "stars": 4713,
+   "spdx_hint": null,
+   "size_kb": 360974
+  },
+  {
+   "repo": "jonaslejon/malicious-pdf",
+   "stars": 4469,
+   "spdx_hint": "BSD-2-Clause",
+   "size_kb": 199
+  },
+  {
+   "repo": "t3l3machus/Villain",
+   "stars": 4468,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 615
+  },
+  {
+   "repo": "zer0yu/Awesome-CobaltStrike",
+   "stars": 4456,
+   "spdx_hint": null,
+   "size_kb": 258
+  },
+  {
+   "repo": "lcvvvv/kscan",
+   "stars": 4298,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 84314
+  },
+  {
+   "repo": "PeiQi0/PeiQi-WIKI-Book",
+   "stars": 4126,
+   "spdx_hint": null,
+   "size_kb": 901571
+  },
+  {
+   "repo": "snooppr/snoop",
+   "stars": 4040,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 73645
+  },
+  {
+   "repo": "edoardottt/cariddi",
+   "stars": 3784,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 692
+  },
+  {
+   "repo": "ibnaleem/gosearch",
+   "stars": 3734,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2304
+  },
+  {
+   "repo": "S3cur3Th1sSh1t/WinPwn",
+   "stars": 3700,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 435778
+  },
+  {
+   "repo": "vaib25vicky/awesome-mobile-security",
+   "stars": 3557,
+   "spdx_hint": null,
+   "size_kb": 363
+  },
+  {
+   "repo": "matro7sh/BypassAV",
+   "stars": 3473,
+   "spdx_hint": null,
+   "size_kb": 9318
+  },
+  {
+   "repo": "ph4ntonn/Stowaway",
+   "stars": 3423,
+   "spdx_hint": "MIT",
+   "size_kb": 48106
+  },
+  {
+   "repo": "mgeeky/Penetration-Testing-Tools",
+   "stars": 3024,
+   "spdx_hint": "MIT",
+   "size_kb": 17555
+  },
+  {
+   "repo": "kurogai/100-redteam-projects",
+   "stars": 2920,
+   "spdx_hint": null,
+   "size_kb": 2706
+  },
+  {
+   "repo": "opsdisk/the_cyber_plumbers_handbook",
+   "stars": 2890,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 5302
+  },
+  {
+   "repo": "gloxec/CrossC2",
+   "stars": 2575,
+   "spdx_hint": null,
+   "size_kb": 660290
+  },
+  {
+   "repo": "r0eXpeR/redteam_vul",
+   "stars": 2526,
+   "spdx_hint": null,
+   "size_kb": 51
+  },
+  {
+   "repo": "Idov31/Nidhogg",
+   "stars": 2525,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1133
+  },
+  {
+   "repo": "nil0x42/phpsploit",
+   "stars": 2496,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 3474
+  },
+  {
+   "repo": "m0nad/Diamorphine",
+   "stars": 2470,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 42
+  },
+  {
+   "repo": "hisxo/gitGraber",
+   "stars": 2447,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 94
+  },
+  {
+   "repo": "swisskyrepo/InternalAllTheThings",
+   "stars": 2441,
+   "spdx_hint": null,
+   "size_kb": 19582
+  },
+  {
+   "repo": "tr0uble-mAker/POC-bomber",
+   "stars": 2371,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 53753
+  },
+  {
+   "repo": "ssl/ezXSS",
+   "stars": 2343,
+   "spdx_hint": "MIT",
+   "size_kb": 5062
+  },
+  {
+   "repo": "MegaManSec/SSH-Snake",
+   "stars": 2340,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2574
+  },
+  {
+   "repo": "sevagas/macro_pack",
+   "stars": 2304,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1070
+  },
+  {
+   "repo": "kgretzky/pwndrop",
+   "stars": 2277,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 7826
+  },
+  {
+   "repo": "Dliv3/Venom",
+   "stars": 2165,
+   "spdx_hint": "MIT",
+   "size_kb": 1049
+  },
+  {
+   "repo": "zhzyker/dismap",
+   "stars": 2164,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 430
+  },
+  {
+   "repo": "chainreactors/gogo",
+   "stars": 2141,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 3899
+  },
+  {
+   "repo": "nettitude/PoshC2",
+   "stars": 2140,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 121219
+  },
+  {
+   "repo": "phra/PEzor",
+   "stars": 2138,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 227
+  },
+  {
+   "repo": "tom0li/collection-document",
+   "stars": 2118,
+   "spdx_hint": null,
+   "size_kb": 31930
+  },
+  {
+   "repo": "api0cradle/UltimateAppLockerByPassList",
+   "stars": 2086,
+   "spdx_hint": null,
+   "size_kb": 695
+  },
+  {
+   "repo": "zer0yu/CyberSecurityRSS",
+   "stars": 1977,
+   "spdx_hint": null,
+   "size_kb": 1084
+  },
+  {
+   "repo": "mthcht/awesome-lists",
+   "stars": 1935,
+   "spdx_hint": "MIT",
+   "size_kb": 52807624
+  },
+  {
+   "repo": "ihebski/A-Red-Teamer-diaries",
+   "stars": 1934,
+   "spdx_hint": null,
+   "size_kb": 444
+  },
+  {
+   "repo": "joaoviictorti/RustRedOps",
+   "stars": 1904,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 2677
+  },
+  {
+   "repo": "Yvesssn/DetectDee",
+   "stars": 1830,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 3184
+  },
+  {
+   "repo": "wgpsec/fofa_viewer",
+   "stars": 1811,
+   "spdx_hint": "MIT",
+   "size_kb": 17489
+  },
+  {
+   "repo": "wgpsec/AboutSecurity",
+   "stars": 1778,
+   "spdx_hint": null,
+   "size_kb": 28616
+  },
+  {
+   "repo": "jm33-m0/emp3r0r",
+   "stars": 1777,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 156417
+  },
+  {
+   "repo": "WADComs/WADComs.github.io",
+   "stars": 1734,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 364
+  },
+  {
+   "repo": "veo/vscan",
+   "stars": 1629,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 18458
+  },
+  {
+   "repo": "api0cradle/LOLBAS",
+   "stars": 1614,
+   "spdx_hint": null,
+   "size_kb": 991
+  },
+  {
+   "repo": "tkmru/awesome-edr-bypass",
+   "stars": 1591,
+   "spdx_hint": null,
+   "size_kb": 50
+  },
+  {
+   "repo": "SofianeHamlaoui/Lockdoor-Framework",
+   "stars": 1564,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 144176
+  },
+  {
+   "repo": "BlackSnufkin/LitterBox",
+   "stars": 1546,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 102341
+  },
+  {
+   "repo": "xiecat/goblin",
+   "stars": 1542,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 4754
+  },
+  {
+   "repo": "mufeedvh/moonwalk",
+   "stars": 1490,
+   "spdx_hint": "MIT",
+   "size_kb": 35
+  },
+  {
+   "repo": "urbanadventurer/username-anarchy",
+   "stars": 1485,
+   "spdx_hint": "MIT",
+   "size_kb": 17221
+  },
+  {
+   "repo": "skyw4tch3r/RootKits-List-Download",
+   "stars": 1481,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 34
+  },
+  {
+   "repo": "lengjibo/RedTeamTools",
+   "stars": 1471,
+   "spdx_hint": "MIT",
+   "size_kb": 151005
+  },
+  {
+   "repo": "QAX-A-Team/BrowserGhost",
+   "stars": 1455,
+   "spdx_hint": null,
+   "size_kb": 991
+  },
+  {
+   "repo": "boku7/BokuLoader",
+   "stars": 1437,
+   "spdx_hint": "MIT",
+   "size_kb": 6028
+  },
+  {
+   "repo": "Hacking-Notes/Hacker-Roadmap",
+   "stars": 1339,
+   "spdx_hint": null,
+   "size_kb": 160
+  },
+  {
+   "repo": "PlumHound/PlumHound",
+   "stars": 1325,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 6313
+  },
+  {
+   "repo": "RistBS/Awesome-RedTeam-Cheatsheet",
+   "stars": 1306,
+   "spdx_hint": "MIT",
+   "size_kb": 793
+  },
+  {
+   "repo": "wddadk/Offensive-OSINT-Tools",
+   "stars": 1296,
+   "spdx_hint": null,
+   "size_kb": 112
+  },
+  {
+   "repo": "qwqdanchun/Pillager",
+   "stars": 1294,
+   "spdx_hint": "MIT",
+   "size_kb": 309
+  },
+  {
+   "repo": "W01fh4cker/VcenterKit",
+   "stars": 1275,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 117
+  },
+  {
+   "repo": "mbrg/power-pwn",
+   "stars": 1260,
+   "spdx_hint": "MIT",
+   "size_kb": 3513
+  },
+  {
+   "repo": "xchwarze/wifi-pineapple-cloner",
+   "stars": 1258,
+   "spdx_hint": null,
+   "size_kb": 1639
+  },
+  {
+   "repo": "bitquark/shortscan",
+   "stars": 1227,
+   "spdx_hint": "MIT",
+   "size_kb": 3883
+  },
+  {
+   "repo": "blackarrowsec/redteam-research",
+   "stars": 1218,
+   "spdx_hint": null,
+   "size_kb": 3136
+  },
+  {
+   "repo": "t3l3machus/PowerShell-Obfuscation-Bible",
+   "stars": 1210,
+   "spdx_hint": "MIT",
+   "size_kb": 373
+  },
+  {
+   "repo": "Viralmaniar/I-See-You",
+   "stars": 1208,
+   "spdx_hint": null,
+   "size_kb": 17
+  },
+  {
+   "repo": "ayoubfathi/leaky-paths",
+   "stars": 1195,
+   "spdx_hint": null,
+   "size_kb": 102
+  },
+  {
+   "repo": "mvelazc0/defcon27_csharp_workshop",
+   "stars": 1194,
+   "spdx_hint": null,
+   "size_kb": 5603
+  },
+  {
+   "repo": "NH-RED-TEAM/RustHound",
+   "stars": 1178,
+   "spdx_hint": "MIT",
+   "size_kb": 12885
+  },
+  {
+   "repo": "Zeyad-Azima/Offensive-Resources",
+   "stars": 1175,
+   "spdx_hint": null,
+   "size_kb": 21687
+  },
+  {
+   "repo": "0xsha/CloudBrute",
+   "stars": 1151,
+   "spdx_hint": "MIT",
+   "size_kb": 275
+  },
+  {
+   "repo": "S1ckB0y1337/Cobalt-Strike-CheatSheet",
+   "stars": 1139,
+   "spdx_hint": "MIT",
+   "size_kb": 331
+  },
+  {
+   "repo": "JoasASantos/Cloud-Security-Attacks",
+   "stars": 1132,
+   "spdx_hint": null,
+   "size_kb": 14
+  },
+  {
+   "repo": "D00Movenok/BounceBack",
+   "stars": 1117,
+   "spdx_hint": "MIT",
+   "size_kb": 694
+  },
+  {
+   "repo": "chAng-L19/codex-redteam-mode",
+   "stars": 1108,
+   "spdx_hint": "MIT",
+   "size_kb": 22839
+  },
+  {
+   "repo": "mgeeky/cobalt-arsenal",
+   "stars": 1107,
+   "spdx_hint": "MIT",
+   "size_kb": 7182
+  },
+  {
+   "repo": "sysdream/chashell",
+   "stars": 1084,
+   "spdx_hint": null,
+   "size_kb": 141
+  },
+  {
+   "repo": "safebuffer/sam-the-admin",
+   "stars": 1069,
+   "spdx_hint": null,
+   "size_kb": 18
+  },
+  {
+   "repo": "chainreactors/spray",
+   "stars": 1065,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 16648
+  },
+  {
+   "repo": "nshalabi/ATTACK-Tools",
+   "stars": 1055,
+   "spdx_hint": null,
+   "size_kb": 452409
+  },
+  {
+   "repo": "WyAtu/Perun",
+   "stars": 1052,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1186
+  },
+  {
+   "repo": "nickvourd/Supernova",
+   "stars": 1046,
+   "spdx_hint": "MIT",
+   "size_kb": 15772
+  },
+  {
+   "repo": "SaadAhla/FilelessPELoader",
+   "stars": 1041,
+   "spdx_hint": "MIT",
+   "size_kb": 693
+  },
+  {
+   "repo": "W01fh4cker/LearnJavaMemshellFromZero",
+   "stars": 1019,
+   "spdx_hint": null,
+   "size_kb": 129
+  },
+  {
+   "repo": "BlackSnufkin/BYOVD",
+   "stars": 971,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1535
+  },
+  {
+   "repo": "cdxiaodong/cain-agent",
+   "stars": 962,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1397
+  },
+  {
+   "repo": "cfalta/MicrosoftWontFixList",
+   "stars": 953,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 35
+  },
+  {
+   "repo": "Pizz33/GobypassAV-shellcode",
+   "stars": 932,
+   "spdx_hint": null,
+   "size_kb": 88
+  },
+  {
+   "repo": "Esc4iCEscEsc/skanuvaty",
+   "stars": 931,
+   "spdx_hint": null,
+   "size_kb": 1251
+  },
+  {
+   "repo": "NyDubh3/CuiRi",
+   "stars": 921,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 3602
+  },
+  {
+   "repo": "QAX-A-Team/LuWu",
+   "stars": 847,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 12384
+  },
+  {
+   "repo": "n0kovo/n0kovo_subdomains",
+   "stars": 845,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 27128
+  },
+  {
+   "repo": "stivenhacker/GhostStrike",
+   "stars": 826,
+   "spdx_hint": "MIT",
+   "size_kb": 6
+  },
+  {
+   "repo": "scythe-io/purple-team-exercise-framework",
+   "stars": 825,
+   "spdx_hint": "MIT",
+   "size_kb": 16082
+  },
+  {
+   "repo": "Aetsu/OffensivePipeline",
+   "stars": 820,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 394
+  },
+  {
+   "repo": "Mehdi0x90/Web_Hacking",
+   "stars": 819,
+   "spdx_hint": null,
+   "size_kb": 921
+  },
+  {
+   "repo": "Idov31/Sandman",
+   "stars": 819,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 272
+  },
+  {
+   "repo": "efchatz/pandora",
+   "stars": 798,
+   "spdx_hint": "MIT",
+   "size_kb": 30247
+  },
+  {
+   "repo": "infobyte/emploleaks",
+   "stars": 797,
+   "spdx_hint": null,
+   "size_kb": 437
+  },
+  {
+   "repo": "PaulNorman01/Forensia",
+   "stars": 788,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 106
+  },
+  {
+   "repo": "praetorian-inc/PortBender",
+   "stars": 788,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 159
+  },
+  {
+   "repo": "emtunc/SlackPirate",
+   "stars": 779,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 349
+  },
+  {
+   "repo": "utkusen/socialhunter",
+   "stars": 775,
+   "spdx_hint": "MIT",
+   "size_kb": 23
+  },
+  {
+   "repo": "MattKeeley/Spoofy",
+   "stars": 775,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 1126
+  },
+  {
+   "repo": "chadi0x/TheBigBrother",
+   "stars": 772,
+   "spdx_hint": "MIT",
+   "size_kb": 384
+  },
+  {
+   "repo": "mhaskar/Octopus",
+   "stars": 768,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 4173
+  },
+  {
+   "repo": "brimstone/go-shellcode",
+   "stars": 761,
+   "spdx_hint": null,
+   "size_kb": 12
+  },
+  {
+   "repo": "lengjibo/FourEye",
+   "stars": 759,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 2453
+  },
+  {
+   "repo": "Print3M/DllShimmer",
+   "stars": 756,
+   "spdx_hint": null,
+   "size_kb": 6978
+  },
+  {
+   "repo": "Taonn/EmailAll",
+   "stars": 750,
+   "spdx_hint": null,
+   "size_kb": 451
+  },
+  {
+   "repo": "RoseSecurity/Anti-Virus-Evading-Payloads",
+   "stars": 749,
+   "spdx_hint": null,
+   "size_kb": 35
+  },
+  {
+   "repo": "cyberark/PipeViewer",
+   "stars": 749,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 17926
+  },
+  {
+   "repo": "ZishanAdThandar/pentest",
+   "stars": 744,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 8368
+  },
+  {
+   "repo": "JoasASantos/Red-Team-Exercises",
+   "stars": 729,
+   "spdx_hint": null,
+   "size_kb": 160
+  },
+  {
+   "repo": "r1cksec/cheatsheets",
+   "stars": 707,
+   "spdx_hint": null,
+   "size_kb": 1151
+  },
+  {
+   "repo": "u21h2/nacs",
+   "stars": 701,
+   "spdx_hint": null,
+   "size_kb": 18558
+  },
+  {
+   "repo": "enomothem/Whoamifuck",
+   "stars": 701,
+   "spdx_hint": null,
+   "size_kb": 347
+  },
+  {
+   "repo": "S3N4T0R-0X0/BEAR-C2",
+   "stars": 699,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 6514
+  },
+  {
+   "repo": "ffffffff0x/BerylEnigma",
+   "stars": 696,
+   "spdx_hint": "MIT",
+   "size_kb": 39999
+  },
+  {
+   "repo": "rek7/fireELF",
+   "stars": 683,
+   "spdx_hint": "MIT",
+   "size_kb": 146
+  },
+  {
+   "repo": "ch33r10/EnterprisePurpleTeaming",
+   "stars": 680,
+   "spdx_hint": "MIT",
+   "size_kb": 2910
+  },
+  {
+   "repo": "mthcht/ThreatHunting-Keywords",
+   "stars": 677,
+   "spdx_hint": null,
+   "size_kb": 226258
+  },
+  {
+   "repo": "Ptkatz/OrcaC2",
+   "stars": 674,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 106106
+  },
+  {
+   "repo": "ph4ntonn/Impost3r",
+   "stars": 661,
+   "spdx_hint": "MIT",
+   "size_kb": 17816
+  },
+  {
+   "repo": "tijme/dittobytes",
+   "stars": 650,
+   "spdx_hint": "MPL-2.0",
+   "size_kb": 22871
+  },
+  {
+   "repo": "mdecrevoisier/EVTX-to-MITRE-Attack",
+   "stars": 644,
+   "spdx_hint": "CC0-1.0",
+   "size_kb": 3291
+  },
+  {
+   "repo": "spellshift/realm",
+   "stars": 639,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 404112
+  },
+  {
+   "repo": "ovotech/gitoops",
+   "stars": 639,
+   "spdx_hint": "MIT",
+   "size_kb": 2131
+  },
+  {
+   "repo": "Frissi0n/GTFONow",
+   "stars": 639,
+   "spdx_hint": "MIT",
+   "size_kb": 77
+  },
+  {
+   "repo": "qsecure-labs/overlord",
+   "stars": 639,
+   "spdx_hint": "MIT",
+   "size_kb": 24358
+  },
+  {
+   "repo": "Pizz33/JoJoLoader",
+   "stars": 634,
+   "spdx_hint": null,
+   "size_kb": 793
+  },
+  {
+   "repo": "lintstar/About-Attack",
+   "stars": 634,
+   "spdx_hint": "MIT",
+   "size_kb": 32918
+  },
+  {
+   "repo": "Idov31/Cronos",
+   "stars": 627,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 21500
+  },
+  {
+   "repo": "Kudaes/Elevator",
+   "stars": 627,
+   "spdx_hint": "MIT",
+   "size_kb": 90
+  },
+  {
+   "repo": "DavidProbinsky/RedTeam-Physical-Tools",
+   "stars": 614,
+   "spdx_hint": "MIT",
+   "size_kb": 5443
+  },
+  {
+   "repo": "Symph0nia/CyberEdge",
+   "stars": 613,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 793
+  },
+  {
+   "repo": "ffffffff0x/Pentest101",
+   "stars": 610,
+   "spdx_hint": null,
+   "size_kb": 365
+  },
+  {
+   "repo": "praetorian-inc/ChromeAlone",
+   "stars": 606,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 7841
+  },
+  {
+   "repo": "wh0amitz/SharpADWS",
+   "stars": 606,
+   "spdx_hint": null,
+   "size_kb": 42682
+  },
+  {
+   "repo": "piiperxyz/AniYa",
+   "stars": 604,
+   "spdx_hint": "MIT",
+   "size_kb": 11533
+  },
+  {
+   "repo": "Marshall-Hallenbeck/red_team_attack_lab",
+   "stars": 596,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1570
+  },
+  {
+   "repo": "AlteredSecurity/365-Stealer",
+   "stars": 589,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 7507
+  },
+  {
+   "repo": "rek7/mXtract",
+   "stars": 587,
+   "spdx_hint": "MIT",
+   "size_kb": 1553
+  },
+  {
+   "repo": "WiPi-Hunter/PiDense",
+   "stars": 567,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 111
+  },
+  {
+   "repo": "SecNN/AiScan-N",
+   "stars": 560,
+   "spdx_hint": null,
+   "size_kb": 188783
+  },
+  {
+   "repo": "knight0x07/ImpulsiveDLLHijack",
+   "stars": 555,
+   "spdx_hint": null,
+   "size_kb": 2205
+  },
+  {
+   "repo": "tobor88/PowerShell-Red-Team",
+   "stars": 551,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 576
+  },
+  {
+   "repo": "infosecB/LOOBins",
+   "stars": 550,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 610
+  },
+  {
+   "repo": "d4t4s3c/OffensiveReverseShellCheatSheet",
+   "stars": 546,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 10388
+  },
+  {
+   "repo": "esidate/pentesting-active-directory",
+   "stars": 545,
+   "spdx_hint": null,
+   "size_kb": 10976
+  },
+  {
+   "repo": "mgeeky/Stracciatella",
+   "stars": 544,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 12511
+  },
+  {
+   "repo": "v4d1/Dome",
+   "stars": 544,
+   "spdx_hint": null,
+   "size_kb": 603
+  },
+  {
+   "repo": "ttpreport/ligolo-mp",
+   "stars": 536,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 122456
+  },
+  {
+   "repo": "SaumyajeetDas/GodGenesis",
+   "stars": 533,
+   "spdx_hint": "MIT",
+   "size_kb": 24
+  },
+  {
+   "repo": "zux0x3a/0xsp-Mongoose",
+   "stars": 533,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 27658
+  },
+  {
+   "repo": "sysdream/hershell",
+   "stars": 530,
+   "spdx_hint": null,
+   "size_kb": 26
+  },
+  {
+   "repo": "xaitax/CVE-2024-6387_Check",
+   "stars": 527,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 64
+  },
+  {
+   "repo": "wh0amitz/KRBUACBypass",
+   "stars": 511,
+   "spdx_hint": null,
+   "size_kb": 3899
+  },
+  {
+   "repo": "pwnfoo/NTLMRecon",
+   "stars": 510,
+   "spdx_hint": "MIT",
+   "size_kb": 89
+  },
+  {
+   "repo": "nnsee/fileless-elf-exec",
+   "stars": 507,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 108
+  },
+  {
+   "repo": "0xn1k5/Red-Teaming",
+   "stars": 501,
+   "spdx_hint": null,
+   "size_kb": 90
+  },
+  {
+   "repo": "aydinnyunus/exifLooter",
+   "stars": 498,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 7755
+  },
+  {
+   "repo": "Whitecat18/Powershell-Scripts-for-Hackers-and-Pentesters",
+   "stars": 493,
+   "spdx_hint": "MIT",
+   "size_kb": 2110
+  },
+  {
+   "repo": "idnahacks/GoodHound",
+   "stars": 488,
+   "spdx_hint": null,
+   "size_kb": 4245
+  },
+  {
+   "repo": "0xsyr0/Red-Team-Playbooks",
+   "stars": 479,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 4234
+  },
+  {
+   "repo": "Unclecheng-li/DeepSec",
+   "stars": 476,
+   "spdx_hint": "MIT",
+   "size_kb": 53497
+  },
+  {
+   "repo": "redeye-framework/Redeye",
+   "stars": 471,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 56931
+  },
+  {
+   "repo": "wh0amitz/PetitPotato",
+   "stars": 464,
+   "spdx_hint": null,
+   "size_kb": 141234
+  },
+  {
+   "repo": "burpheart/koko-moni",
+   "stars": 461,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 176
+  },
+  {
+   "repo": "RedTeamOperations/PivotSuite",
+   "stars": 459,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 581
+  },
+  {
+   "repo": "owl234/ARL-Next",
+   "stars": 454,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 90661
+  },
+  {
+   "repo": "Leo4j/Amnesiac",
+   "stars": 453,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 39116
+  },
+  {
+   "repo": "Acceis/leakScraper",
+   "stars": 449,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 216
+  },
+  {
+   "repo": "Inf0secRabbit/BadAssMacros",
+   "stars": 445,
+   "spdx_hint": null,
+   "size_kb": 3209
+  },
+  {
+   "repo": "b1-team/superman",
+   "stars": 439,
+   "spdx_hint": "MIT",
+   "size_kb": 2432
+  },
+  {
+   "repo": "dsssssssm/Pinkerton",
+   "stars": 439,
+   "spdx_hint": "MIT",
+   "size_kb": 1093
+  },
+  {
+   "repo": "sundowndev/covermyass",
+   "stars": 436,
+   "spdx_hint": "MIT",
+   "size_kb": 108
+  },
+  {
+   "repo": "Pizz33/Qianji",
+   "stars": 428,
+   "spdx_hint": null,
+   "size_kb": 89
+  },
+  {
+   "repo": "sneakerhax/TTPs",
+   "stars": 422,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1485
+  },
+  {
+   "repo": "vari-sh/RedTeamGrimoire",
+   "stars": 419,
+   "spdx_hint": "MIT",
+   "size_kb": 39315
+  },
+  {
+   "repo": "phink-team/Cobaltstrike-MS17-010",
+   "stars": 417,
+   "spdx_hint": null,
+   "size_kb": 244
+  },
+  {
+   "repo": "andreisss/KslDump",
+   "stars": 416,
+   "spdx_hint": "MIT",
+   "size_kb": 83
+  },
+  {
+   "repo": "elddy/NimScan",
+   "stars": 410,
+   "spdx_hint": "MIT",
+   "size_kb": 2982
+  },
+  {
+   "repo": "cyberark/RPCMon",
+   "stars": 406,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 40567
+  },
+  {
+   "repo": "PaperMtn/slack-watchman",
+   "stars": 405,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2707
+  },
+  {
+   "repo": "wh0amitz/S4UTomato",
+   "stars": 401,
+   "spdx_hint": null,
+   "size_kb": 3698
+  },
+  {
+   "repo": "Zjackky/CodeScan",
+   "stars": 400,
+   "spdx_hint": null,
+   "size_kb": 3864
+  },
+  {
+   "repo": "brandonprry/gray_hat_csharp_code",
+   "stars": 396,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 13688
+  },
+  {
+   "repo": "Krypteria/AtlasLdr",
+   "stars": 396,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 46
+  },
+  {
+   "repo": "Idov31/Venom",
+   "stars": 395,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 173
+  },
+  {
+   "repo": "scipag/nac_bypass",
+   "stars": 390,
+   "spdx_hint": "MIT",
+   "size_kb": 67
+  },
+  {
+   "repo": "hypnguyen1209/offensive-claude",
+   "stars": 389,
+   "spdx_hint": "MIT",
+   "size_kb": 1791
+  },
+  {
+   "repo": "nickvourd/COM-Hunter",
+   "stars": 387,
+   "spdx_hint": "MIT",
+   "size_kb": 561
+  },
+  {
+   "repo": "chainreactors/zombie",
+   "stars": 385,
+   "spdx_hint": null,
+   "size_kb": 2067
+  },
+  {
+   "repo": "ricardojoserf/SAMDump",
+   "stars": 385,
+   "spdx_hint": null,
+   "size_kb": 175
+  },
+  {
+   "repo": "safedv/RustiveDump",
+   "stars": 385,
+   "spdx_hint": "MIT",
+   "size_kb": 84
+  },
+  {
+   "repo": "XORbit01/webpalm",
+   "stars": 383,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 5315
+  },
+  {
+   "repo": "pwn1sher/frostbyte",
+   "stars": 381,
+   "spdx_hint": null,
+   "size_kb": 291
+  },
+  {
+   "repo": "pumpbin/pumpbin",
+   "stars": 380,
+   "spdx_hint": "MIT",
+   "size_kb": 2425
+  },
+  {
+   "repo": "nodauf/Girsh",
+   "stars": 359,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 1127
+  },
+  {
+   "repo": "Kudaes/EPI",
+   "stars": 354,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 518
+  },
+  {
+   "repo": "Yeti-791/Awesome-Offensive-AI-Agentic-Landscape",
+   "stars": 352,
+   "spdx_hint": "MIT",
+   "size_kb": 437
+  },
+  {
+   "repo": "vectra-ai-research/Halberd",
+   "stars": 347,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 3388
+  },
+  {
+   "repo": "andreiverse/grc2",
+   "stars": 345,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 14758
+  },
+  {
+   "repo": "lolc2/lolc2.github.io",
+   "stars": 344,
+   "spdx_hint": null,
+   "size_kb": 50866
+  },
+  {
+   "repo": "cr0nx/awesome-linux-attack-forensics-purplelabs",
+   "stars": 341,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 98
+  },
+  {
+   "repo": "naksyn/PythonMemoryModule",
+   "stars": 338,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1212
+  },
+  {
+   "repo": "yutianqaq/AVEvasionCraftOnline",
+   "stars": 334,
+   "spdx_hint": "MIT",
+   "size_kb": 1907
+  },
+  {
+   "repo": "blackhatethicalhacking/TerminatorZ",
+   "stars": 334,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 165
+  },
+  {
+   "repo": "3CORESec/MAL-CL",
+   "stars": 332,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 50954
+  },
+  {
+   "repo": "Encod3d-Sec/TORCH",
+   "stars": 330,
+   "spdx_hint": "MIT",
+   "size_kb": 3318
+  },
+  {
+   "repo": "reconness/reconness",
+   "stars": 327,
+   "spdx_hint": "MIT",
+   "size_kb": 12535
+  },
+  {
+   "repo": "no-one-sec/code-phish",
+   "stars": 326,
+   "spdx_hint": null,
+   "size_kb": 4370
+  },
+  {
+   "repo": "dn9uy3n/Modern-Red-Team-Infrastructure",
+   "stars": 324,
+   "spdx_hint": null,
+   "size_kb": 4700
+  },
+  {
+   "repo": "Sh0ckFR/DLLirant",
+   "stars": 322,
+   "spdx_hint": "MIT",
+   "size_kb": 15462
+  },
+  {
+   "repo": "chainreactors/cyber-harness",
+   "stars": 319,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 22070
+  },
+  {
+   "repo": "BlessedRebuS/OSCP-Pentesting-Cheatsheet",
+   "stars": 318,
+   "spdx_hint": "MIT",
+   "size_kb": 3465
+  },
+  {
+   "repo": "Dviros/CredsLeaker",
+   "stars": 317,
+   "spdx_hint": "MIT",
+   "size_kb": 194
+  },
+  {
+   "repo": "BlackSnufkin/GhostDriver",
+   "stars": 316,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 186
+  },
+  {
+   "repo": "hasherezade/thread_namecalling",
+   "stars": 310,
+   "spdx_hint": null,
+   "size_kb": 102
+  },
+  {
+   "repo": "KCarretto/paragon",
+   "stars": 306,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 272786
+  },
+  {
+   "repo": "ZephrFish/OmniProx",
+   "stars": 303,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 89
+  },
+  {
+   "repo": "sspsec/Scan-Spring-GO",
+   "stars": 303,
+   "spdx_hint": "MIT",
+   "size_kb": 154
+  },
+  {
+   "repo": "lexfo/sshimpanzee",
+   "stars": 294,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 144
+  },
+  {
+   "repo": "nccgroup/GTFOBLookup",
+   "stars": 292,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 96
+  },
+  {
+   "repo": "joaoviictorti/hypnus",
+   "stars": 290,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 244
+  },
+  {
+   "repo": "kyxiaxiang/GateSentinel",
+   "stars": 287,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 800
+  },
+  {
+   "repo": "praetorian-inc/goffloader",
+   "stars": 285,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 135
+  },
+  {
+   "repo": "mantvydasb/Red-Team-Infrastructure-Automation",
+   "stars": 282,
+   "spdx_hint": null,
+   "size_kb": 47
+  },
+  {
+   "repo": "rb-x/pwnflow",
+   "stars": 281,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 11734
+  },
+  {
+   "repo": "sneakerhax/PyPhisher",
+   "stars": 279,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 52
+  },
+  {
+   "repo": "xk11z/unauthorized",
+   "stars": 278,
+   "spdx_hint": null,
+   "size_kb": 51
+  },
+  {
+   "repo": "kleiton0x00/RedditC2",
+   "stars": 278,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 3831
+  },
+  {
+   "repo": "ineesdv/Tangled",
+   "stars": 275,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1227
+  },
+  {
+   "repo": "reveng007/reveng_rtkit",
+   "stars": 272,
+   "spdx_hint": "MIT",
+   "size_kb": 7151
+  },
+  {
+   "repo": "n0dec/MalwLess",
+   "stars": 271,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 254
+  },
+  {
+   "repo": "tlsbollei/KittyLoader",
+   "stars": 269,
+   "spdx_hint": null,
+   "size_kb": 359
+  },
+  {
+   "repo": "hasherezade/waiting_thread_hijacking",
+   "stars": 267,
+   "spdx_hint": null,
+   "size_kb": 133
+  },
+  {
+   "repo": "rootcathacking/catspin",
+   "stars": 267,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 73470
+  },
+  {
+   "repo": "r0binak/MTKPI",
+   "stars": 266,
+   "spdx_hint": "MIT",
+   "size_kb": 8773
+  },
+  {
+   "repo": "SaadAhla/dark-kill",
+   "stars": 265,
+   "spdx_hint": null,
+   "size_kb": 16
+  },
+  {
+   "repo": "blackhatethicalhacking/Nucleimonst3r",
+   "stars": 265,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 106
+  },
+  {
+   "repo": "florylsk/RecycledInjector",
+   "stars": 265,
+   "spdx_hint": null,
+   "size_kb": 2240
+  },
+  {
+   "repo": "BlackSnufkin/NovaLdr",
+   "stars": 264,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 150
+  },
+  {
+   "repo": "reveng007/SharpGmailC2",
+   "stars": 264,
+   "spdx_hint": "MIT",
+   "size_kb": 20959
+  },
+  {
+   "repo": "nettitude/ETWHash",
+   "stars": 259,
+   "spdx_hint": null,
+   "size_kb": 10
+  },
+  {
+   "repo": "AnLoMinus/Diablo",
+   "stars": 258,
+   "spdx_hint": "MIT",
+   "size_kb": 219
+  },
+  {
+   "repo": "seajaysec/cypheroth",
+   "stars": 256,
+   "spdx_hint": "BSD-2-Clause",
+   "size_kb": 882
+  },
+  {
+   "repo": "STMCyber/boobsnail",
+   "stars": 255,
+   "spdx_hint": "MIT",
+   "size_kb": 322
+  },
+  {
+   "repo": "Ziconius/FudgeC2",
+   "stars": 253,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 926
+  },
+  {
+   "repo": "NetSPI/BOF-PE",
+   "stars": 249,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 215
+  },
+  {
+   "repo": "Kudaes/Fiber",
+   "stars": 246,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 94
+  },
+  {
+   "repo": "JoasASantos/ShadowPhish",
+   "stars": 245,
+   "spdx_hint": null,
+   "size_kb": 352
+  },
+  {
+   "repo": "samratashok/Deploy-Deception",
+   "stars": 245,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 18
+  },
+  {
+   "repo": "CnHack3r/Goby_PoC_RedTeam",
+   "stars": 244,
+   "spdx_hint": null,
+   "size_kb": 1742
+  },
+  {
+   "repo": "maxDcb/DreamWalkers",
+   "stars": 243,
+   "spdx_hint": null,
+   "size_kb": 469
+  },
+  {
+   "repo": "edoardottt/secfiles",
+   "stars": 243,
+   "spdx_hint": "MIT",
+   "size_kb": 111904
+  },
+  {
+   "repo": "28Zaaky/khaos-c2",
+   "stars": 243,
+   "spdx_hint": "MIT",
+   "size_kb": 2579
+  },
+  {
+   "repo": "Red-Hex-Consulting/Ankou",
+   "stars": 242,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 14794
+  },
+  {
+   "repo": "Idov31/Jormungandr",
+   "stars": 241,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 50
+  },
+  {
+   "repo": "taielab/Taie-RedTeam-OS",
+   "stars": 240,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 25719
+  },
+  {
+   "repo": "10cks/fofaEX",
+   "stars": 239,
+   "spdx_hint": "MIT",
+   "size_kb": 382
+  },
+  {
+   "repo": "tasooshi/brutas",
+   "stars": 236,
+   "spdx_hint": null,
+   "size_kb": 196415
+  },
+  {
+   "repo": "twelvesec/passcat",
+   "stars": 236,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2231
+  },
+  {
+   "repo": "Whispergate/Erebus",
+   "stars": 232,
+   "spdx_hint": "BSD-2-Clause",
+   "size_kb": 4263
+  },
+  {
+   "repo": "0x4D31/airt",
+   "stars": 231,
+   "spdx_hint": null,
+   "size_kb": 738
+  },
+  {
+   "repo": "Print3M/ByteCaster",
+   "stars": 230,
+   "spdx_hint": null,
+   "size_kb": 10759
+  },
+  {
+   "repo": "Hacking-Notes/RedTeam",
+   "stars": 230,
+   "spdx_hint": null,
+   "size_kb": 50217
+  },
+  {
+   "repo": "DamonMohammadbagher/NativePayloads",
+   "stars": 229,
+   "spdx_hint": null,
+   "size_kb": 171675
+  },
+  {
+   "repo": "CrossC2/CrossC2Kit",
+   "stars": 228,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 18150
+  },
+  {
+   "repo": "R3DRUN3/sploitcraft",
+   "stars": 226,
+   "spdx_hint": "Unlicense",
+   "size_kb": 29293
+  },
+  {
+   "repo": "Enelg52/KittyStager",
+   "stars": 226,
+   "spdx_hint": "MIT",
+   "size_kb": 28310
+  },
+  {
+   "repo": "QAX-A-Team/PandaSniper",
+   "stars": 221,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 523
+  },
+  {
+   "repo": "joaoviictorti/uwd",
+   "stars": 220,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 240
+  },
+  {
+   "repo": "EncodeGroup/BOF-RegSave",
+   "stars": 220,
+   "spdx_hint": null,
+   "size_kb": 6
+  },
+  {
+   "repo": "aw-junaid/bug-bounty",
+   "stars": 220,
+   "spdx_hint": "MIT",
+   "size_kb": 3763
+  },
+  {
+   "repo": "florylsk/NtRemoteLoad",
+   "stars": 219,
+   "spdx_hint": null,
+   "size_kb": 13
+  },
+  {
+   "repo": "r00t-3xp10it/redpill",
+   "stars": 218,
+   "spdx_hint": null,
+   "size_kb": 77933
+  },
+  {
+   "repo": "Viralmaniar/Remote-Desktop-Caching-",
+   "stars": 218,
+   "spdx_hint": null,
+   "size_kb": 21
+  },
+  {
+   "repo": "FreeZeroDays/GoPhish-Templates",
+   "stars": 214,
+   "spdx_hint": null,
+   "size_kb": 107
+  },
+  {
+   "repo": "d1nfinite/go-icmpshell",
+   "stars": 213,
+   "spdx_hint": null,
+   "size_kb": 10
+  },
+  {
+   "repo": "xpn/RandomTSScripts",
+   "stars": 213,
+   "spdx_hint": null,
+   "size_kb": 270
+  },
+  {
+   "repo": "umair9747/Genzai",
+   "stars": 213,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 17183
+  },
+  {
+   "repo": "jonaslejon/ad-autopwn",
+   "stars": 211,
+   "spdx_hint": "MIT",
+   "size_kb": 4735
+  },
+  {
+   "repo": "b1tg/cobaltstrike-beacon-rust",
+   "stars": 209,
+   "spdx_hint": null,
+   "size_kb": 58
+  },
+  {
+   "repo": "DarkSpaceSecurity/RunAs-Stealer",
+   "stars": 208,
+   "spdx_hint": "MIT",
+   "size_kb": 30
+  },
+  {
+   "repo": "0x09AL/DNS-Persist",
+   "stars": 207,
+   "spdx_hint": "MIT",
+   "size_kb": 178
+  },
+  {
+   "repo": "PaperMtn/gitlab-watchman",
+   "stars": 207,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 303
+  },
+  {
+   "repo": "Hagrid29/DuplicateDump",
+   "stars": 206,
+   "spdx_hint": null,
+   "size_kb": 8504
+  },
+  {
+   "repo": "eksperience/KnockOutlook",
+   "stars": 206,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 46
+  },
+  {
+   "repo": "mthcht/Purpleteam",
+   "stars": 205,
+   "spdx_hint": null,
+   "size_kb": 41429
+  },
+  {
+   "repo": "W01fh4cker/CVE-2023-46747-RCE",
+   "stars": 205,
+   "spdx_hint": null,
+   "size_kb": 77
+  },
+  {
+   "repo": "RedSiege/CIMplant",
+   "stars": 204,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 55225
+  },
+  {
+   "repo": "D00Movenok/HTMLSmuggler",
+   "stars": 204,
+   "spdx_hint": "MIT",
+   "size_kb": 1819
+  },
+  {
+   "repo": "HackingLZ/IndicatorOfCanary",
+   "stars": 200,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 495
+  },
+  {
+   "repo": "praetorian-inc/swarmer",
+   "stars": 199,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 80
+  },
+  {
+   "repo": "oldkingcone/BYOSI",
+   "stars": 198,
+   "spdx_hint": "MIT",
+   "size_kb": 42
+  },
+  {
+   "repo": "sharsil/favicorn",
+   "stars": 196,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 434
+  },
+  {
+   "repo": "wgpsec/redc",
+   "stars": 195,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 46436
+  },
+  {
+   "repo": "RESETHACKER-COMMUNITY/Pentesting-Bugbounty",
+   "stars": 195,
+   "spdx_hint": "CC0-1.0",
+   "size_kb": 5530
+  },
+  {
+   "repo": "stivenhacker/EchoStrike",
+   "stars": 194,
+   "spdx_hint": "MIT",
+   "size_kb": 17
+  },
+  {
+   "repo": "Cherno-x/dataBrawl",
+   "stars": 194,
+   "spdx_hint": null,
+   "size_kb": 23339
+  },
+  {
+   "repo": "praetorian-inc/ADFSRelay",
+   "stars": 191,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 38
+  },
+  {
+   "repo": "op7ic/BlueTeam.Lab",
+   "stars": 191,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 1759
+  },
+  {
+   "repo": "bb1nfosec/Information-Security-Tasks",
+   "stars": 188,
+   "spdx_hint": null,
+   "size_kb": 90321
+  },
+  {
+   "repo": "EncodeGroup/UAC-SilentClean",
+   "stars": 187,
+   "spdx_hint": null,
+   "size_kb": 9
+  },
+  {
+   "repo": "Sh0ckFR/InlineWhispers2",
+   "stars": 186,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 134
+  },
+  {
+   "repo": "GTekSD/SUASS",
+   "stars": 186,
+   "spdx_hint": "MIT",
+   "size_kb": 165727
+  },
+  {
+   "repo": "HaxL0p4/L0p4-Toolkit",
+   "stars": 186,
+   "spdx_hint": "MIT",
+   "size_kb": 47123
+  },
+  {
+   "repo": "safedv/Rustic64",
+   "stars": 186,
+   "spdx_hint": "MIT",
+   "size_kb": 19
+  },
+  {
+   "repo": "ManuelBerrueta/FlowAnalyzer",
+   "stars": 184,
+   "spdx_hint": "MIT",
+   "size_kb": 37
+  },
+  {
+   "repo": "jkramarz/TheTick",
+   "stars": 183,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 10879
+  },
+  {
+   "repo": "t3l3machus/wwwtree",
+   "stars": 182,
+   "spdx_hint": "MIT",
+   "size_kb": 40
+  },
+  {
+   "repo": "AvasDream/pentesting-dockerfiles",
+   "stars": 178,
+   "spdx_hint": null,
+   "size_kb": 128
+  },
+  {
+   "repo": "darmado/Atomic-Red-Team-C2",
+   "stars": 178,
+   "spdx_hint": null,
+   "size_kb": 16398
+  },
+  {
+   "repo": "AleksaMCode/Preferred-Network-List-Sniffer",
+   "stars": 178,
+   "spdx_hint": "MIT",
+   "size_kb": 10880
+  },
+  {
+   "repo": "Macmod/flashingestor",
+   "stars": 177,
+   "spdx_hint": "MIT",
+   "size_kb": 13034
+  },
+  {
+   "repo": "KKingZero/Zypheron-CLI",
+   "stars": 176,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 34708
+  },
+  {
+   "repo": "evilashz/NimFileBinder",
+   "stars": 176,
+   "spdx_hint": null,
+   "size_kb": 15
+  },
+  {
+   "repo": "Noz2/RootHound",
+   "stars": 174,
+   "spdx_hint": null,
+   "size_kb": 402
+  },
+  {
+   "repo": "martinsohn/Office-phish-templates",
+   "stars": 173,
+   "spdx_hint": null,
+   "size_kb": 2160
+  },
+  {
+   "repo": "mlcsec/Graphpython",
+   "stars": 172,
+   "spdx_hint": null,
+   "size_kb": 7862
+  },
+  {
+   "repo": "ashirt-ops/ashirt-server",
+   "stars": 171,
+   "spdx_hint": "MIT",
+   "size_kb": 11980
+  },
+  {
+   "repo": "theteatoast/local-vuln-research-pipeline",
+   "stars": 170,
+   "spdx_hint": null,
+   "size_kb": 328
+  },
+  {
+   "repo": "JoasASantos/Offensive-Windows-Drivers-Development",
+   "stars": 168,
+   "spdx_hint": null,
+   "size_kb": 684
+  },
+  {
+   "repo": "7h3w4lk3r/THE_HIVE",
+   "stars": 168,
+   "spdx_hint": null,
+   "size_kb": 70610
+  },
+  {
+   "repo": "mytechnotalent/turbo-attack",
+   "stars": 168,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 12964
+  },
+  {
+   "repo": "EddieIvan01/memexec",
+   "stars": 167,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 35
+  },
+  {
+   "repo": "CodeXTF2/WebcamBOF",
+   "stars": 167,
+   "spdx_hint": "MIT",
+   "size_kb": 425
+  },
+  {
+   "repo": "pinecone-wifi/pinecone",
+   "stars": 163,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 351
+  },
+  {
+   "repo": "blackhatethicalhacking/SQLMutant",
+   "stars": 163,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2460
+  },
+  {
+   "repo": "aaaddress1/wowInjector",
+   "stars": 163,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 753
+  },
+  {
+   "repo": "m4lwhere/profilehound",
+   "stars": 163,
+   "spdx_hint": "MIT",
+   "size_kb": 1041
+  },
+  {
+   "repo": "brosck/Reaper",
+   "stars": 163,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 10805
+  },
+  {
+   "repo": "infosecn1nja/VeilTransfer",
+   "stars": 162,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 80
+  },
+  {
+   "repo": "BlackSnufkin/Rusty-Playground",
+   "stars": 162,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 268
+  },
+  {
+   "repo": "notdodo/LocalAdminSharp",
+   "stars": 159,
+   "spdx_hint": null,
+   "size_kb": 10
+  },
+  {
+   "repo": "g0h4n/REC2",
+   "stars": 159,
+   "spdx_hint": "MIT",
+   "size_kb": 315
+  },
+  {
+   "repo": "xk11z/unauthorized_com",
+   "stars": 158,
+   "spdx_hint": null,
+   "size_kb": 65
+  },
+  {
+   "repo": "Zerx0r/dvenom",
+   "stars": 158,
+   "spdx_hint": "MIT",
+   "size_kb": 18
+  },
+  {
+   "repo": "kh4sh3i/smartrecon",
+   "stars": 158,
+   "spdx_hint": "CC0-1.0",
+   "size_kb": 178
+  },
+  {
+   "repo": "dsssssssm/Apepe",
+   "stars": 156,
+   "spdx_hint": "MIT",
+   "size_kb": 51
+  },
+  {
+   "repo": "joaoviictorti/rustclr",
+   "stars": 155,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 255
+  },
+  {
+   "repo": "W01fh4cker/CVE-2024-27198-RCE",
+   "stars": 154,
+   "spdx_hint": null,
+   "size_kb": 29
+  },
+  {
+   "repo": "0x727/AggressorScripts_0x727",
+   "stars": 153,
+   "spdx_hint": "MIT",
+   "size_kb": 49552
+  },
+  {
+   "repo": "tomcarver16/BOF-DLL-Inject",
+   "stars": 151,
+   "spdx_hint": null,
+   "size_kb": 20
+  },
+  {
+   "repo": "t3l3machus/ACEshark",
+   "stars": 151,
+   "spdx_hint": "BSD-2-Clause",
+   "size_kb": 90
+  },
+  {
+   "repo": "Kudaes/RustChain",
+   "stars": 151,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 82
+  },
+  {
+   "repo": "DMontgomery40/pentest-mcp",
+   "stars": 149,
+   "spdx_hint": "MIT",
+   "size_kb": 8945
+  },
+  {
+   "repo": "jxroot/ZeroPulse",
+   "stars": 149,
+   "spdx_hint": "MIT",
+   "size_kb": 2818
+  },
+  {
+   "repo": "mbrg/genai-attacks",
+   "stars": 149,
+   "spdx_hint": null,
+   "size_kb": 560
+  },
+  {
+   "repo": "tasooshi/pentesting-cookbook",
+   "stars": 148,
+   "spdx_hint": null,
+   "size_kb": 1501
+  },
+  {
+   "repo": "TangGolang/TangGo",
+   "stars": 148,
+   "spdx_hint": null,
+   "size_kb": 167
+  },
+  {
+   "repo": "praetorian-inc/trident",
+   "stars": 147,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 699
+  },
+  {
+   "repo": "CodeXTF2/cobaltstrike-headless",
+   "stars": 147,
+   "spdx_hint": null,
+   "size_kb": 266
+  },
+  {
+   "repo": "nettitude/CLR-Stomp",
+   "stars": 146,
+   "spdx_hint": null,
+   "size_kb": 29
+  },
+  {
+   "repo": "sh3d0ww01f/WaterDragon",
+   "stars": 146,
+   "spdx_hint": null,
+   "size_kb": 2444
+  },
+  {
+   "repo": "leftp/DPAPISnoop",
+   "stars": 146,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 54
+  },
+  {
+   "repo": "joaoviictorti/coffeeldr",
+   "stars": 145,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 203
+  },
+  {
+   "repo": "t0thkr1s/gtfobins-cli",
+   "stars": 145,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 730
+  },
+  {
+   "repo": "redteamguides/redteamguides.github.io",
+   "stars": 145,
+   "spdx_hint": null,
+   "size_kb": 23806
+  },
+  {
+   "repo": "kh4sh3i/exchange-penetration-testing",
+   "stars": 145,
+   "spdx_hint": "CC0-1.0",
+   "size_kb": 6553
+  },
+  {
+   "repo": "dsecuredcom/ffufPostprocessing",
+   "stars": 144,
+   "spdx_hint": null,
+   "size_kb": 42
+  },
+  {
+   "repo": "MrM8BRH/CRLJ",
+   "stars": 144,
+   "spdx_hint": "MPL-2.0",
+   "size_kb": 796
+  },
+  {
+   "repo": "audibleblink/doxycannon",
+   "stars": 144,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 57
+  },
+  {
+   "repo": "emmaunel/DiscordGo",
+   "stars": 144,
+   "spdx_hint": null,
+   "size_kb": 19223
+  },
+  {
+   "repo": "mav8557/Father",
+   "stars": 144,
+   "spdx_hint": "Unlicense",
+   "size_kb": 49
+  },
+  {
+   "repo": "NeoTheCapt/RedteamAgent",
+   "stars": 143,
+   "spdx_hint": null,
+   "size_kb": 7453
+  },
+  {
+   "repo": "Yeti-791/Tsec-Salon",
+   "stars": 142,
+   "spdx_hint": null,
+   "size_kb": 646661
+  },
+  {
+   "repo": "t3l3machus/Synergy-httpx",
+   "stars": 140,
+   "spdx_hint": "BSD-2-Clause",
+   "size_kb": 85
+  },
+  {
+   "repo": "ariary/notionterm",
+   "stars": 138,
+   "spdx_hint": "Unlicense",
+   "size_kb": 8529
+  },
+  {
+   "repo": "mrexodia/lolbin-poc",
+   "stars": 138,
+   "spdx_hint": null,
+   "size_kb": 6
+  },
+  {
+   "repo": "DarkSpaceSecurity/SpyAI",
+   "stars": 138,
+   "spdx_hint": "MIT",
+   "size_kb": 20721
+  },
+  {
+   "repo": "orlyjamie/asnrecon",
+   "stars": 138,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 344
+  },
+  {
+   "repo": "EncodeGroup/AggressiveProxy",
+   "stars": 137,
+   "spdx_hint": null,
+   "size_kb": 20
+  },
+  {
+   "repo": "W01fh4cker/CVE-2024-22120-RCE",
+   "stars": 136,
+   "spdx_hint": null,
+   "size_kb": 16
+  },
+  {
+   "repo": "jackmichalak/phishim",
+   "stars": 136,
+   "spdx_hint": null,
+   "size_kb": 52
+  },
+  {
+   "repo": "wunderwuzzi23/ropci",
+   "stars": 136,
+   "spdx_hint": "MIT",
+   "size_kb": 142
+  },
+  {
+   "repo": "exploitoverload/PwNixOS",
+   "stars": 136,
+   "spdx_hint": "MIT",
+   "size_kb": 1526
+  },
+  {
+   "repo": "nairuzabulhul/R3d-Buck3T",
+   "stars": 135,
+   "spdx_hint": null,
+   "size_kb": 2092
+  },
+  {
+   "repo": "Print3M/epic",
+   "stars": 135,
+   "spdx_hint": null,
+   "size_kb": 286
+  },
+  {
+   "repo": "blackhatethicalhacking/SSRFPwned",
+   "stars": 135,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 67
+  },
+  {
+   "repo": "audibleblink/passdb-frontend",
+   "stars": 134,
+   "spdx_hint": null,
+   "size_kb": 6333
+  },
+  {
+   "repo": "joaoviictorti/rustbof",
+   "stars": 134,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 69
+  },
+  {
+   "repo": "shantanu561993/SharpLoginPrompt",
+   "stars": 133,
+   "spdx_hint": null,
+   "size_kb": 389
+  },
+  {
+   "repo": "Kudaes/Bin-Finder",
+   "stars": 133,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 106
+  },
+  {
+   "repo": "r00t-3xp10it/resource_files",
+   "stars": 132,
+   "spdx_hint": null,
+   "size_kb": 14548
+  },
+  {
+   "repo": "mikeprivette/NIST-to-Tech",
+   "stars": 132,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 76
+  },
+  {
+   "repo": "darkweak/rudy",
+   "stars": 131,
+   "spdx_hint": "MIT",
+   "size_kb": 24
+  },
+  {
+   "repo": "xk11z/dirxk",
+   "stars": 131,
+   "spdx_hint": null,
+   "size_kb": 6387
+  },
+  {
+   "repo": "arceuzvx/Cybersecurity_resources",
+   "stars": 131,
+   "spdx_hint": null,
+   "size_kb": 1187
+  },
+  {
+   "repo": "s7safe/Rad-Team-tools",
+   "stars": 130,
+   "spdx_hint": null,
+   "size_kb": 41
+  },
+  {
+   "repo": "W01fh4cker/CVE-2024-21683-RCE",
+   "stars": 128,
+   "spdx_hint": null,
+   "size_kb": 12
+  },
+  {
+   "repo": "govindasamyarun/c2-cloud",
+   "stars": 128,
+   "spdx_hint": "MIT",
+   "size_kb": 1965
+  },
+  {
+   "repo": "TestingPens/MalwarePersistenceScripts",
+   "stars": 127,
+   "spdx_hint": null,
+   "size_kb": 4
+  },
+  {
+   "repo": "irgoncalves/smbclient_cheatsheet",
+   "stars": 124,
+   "spdx_hint": null,
+   "size_kb": 9
+  },
+  {
+   "repo": "DarkCoderSc/SharpShellPipe",
+   "stars": 124,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1174
+  },
+  {
+   "repo": "Static-Flow/CloudCopy",
+   "stars": 124,
+   "spdx_hint": null,
+   "size_kb": 43314
+  },
+  {
+   "repo": "Kudaes/rust_tips_and_tricks",
+   "stars": 123,
+   "spdx_hint": null,
+   "size_kb": 128
+  },
+  {
+   "repo": "dsnezhkov/deepsea",
+   "stars": 122,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 10511
+  },
+  {
+   "repo": "DonatoReis/Secbuild",
+   "stars": 122,
+   "spdx_hint": "MIT",
+   "size_kb": 2131
+  },
+  {
+   "repo": "Tzohar/PassLLM",
+   "stars": 122,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 8303
+  },
+  {
+   "repo": "ezra-buckingham/terry-the-terraformer",
+   "stars": 120,
+   "spdx_hint": "MIT",
+   "size_kb": 7150
+  },
+  {
+   "repo": "ariary/volana",
+   "stars": 120,
+   "spdx_hint": "Unlicense",
+   "size_kb": 89
+  },
+  {
+   "repo": "mikeryan/uberducky",
+   "stars": 120,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 31
+  },
+  {
+   "repo": "Viralmaniar/MurMurHash",
+   "stars": 120,
+   "spdx_hint": "MIT",
+   "size_kb": 17
+  },
+  {
+   "repo": "yutianqaq/BypassAV-Online",
+   "stars": 120,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 11115
+  },
+  {
+   "repo": "BlackSnufkin/Maverick",
+   "stars": 119,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 7749
+  },
+  {
+   "repo": "osintshifu/Cyber-Intelligence-GPT",
+   "stars": 119,
+   "spdx_hint": null,
+   "size_kb": 305
+  },
+  {
+   "repo": "EgeBalci/WSAAcceptBackdoor",
+   "stars": 118,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 493
+  },
+  {
+   "repo": "X-3306/Project-Onyx",
+   "stars": 118,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 9663
+  },
+  {
+   "repo": "satan1a/RedBook",
+   "stars": 117,
+   "spdx_hint": null,
+   "size_kb": 17881
+  },
+  {
+   "repo": "wh0amitz/SharpRODC",
+   "stars": 117,
+   "spdx_hint": null,
+   "size_kb": 1708
+  },
+  {
+   "repo": "Mowokuma/vm_str.hpp",
+   "stars": 117,
+   "spdx_hint": "MIT",
+   "size_kb": 23
+  },
+  {
+   "repo": "praetorian-inc/NTLMRecon",
+   "stars": 116,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 40
+  },
+  {
+   "repo": "DamonMohammadbagher/Some_Pentesters_SecurityResearchers_RedTeamers",
+   "stars": 116,
+   "spdx_hint": null,
+   "size_kb": 7163
+  },
+  {
+   "repo": "dipakpanchal05/CVE-2022-23808",
+   "stars": 115,
+   "spdx_hint": null,
+   "size_kb": 23
+  },
+  {
+   "repo": "Peco602/cobaltstrike-aggressor-scripts",
+   "stars": 115,
+   "spdx_hint": "MIT",
+   "size_kb": 197
+  },
+  {
+   "repo": "R3DRUN3/magnet",
+   "stars": 113,
+   "spdx_hint": "Unlicense",
+   "size_kb": 13862
+  },
+  {
+   "repo": "W01fh4cker/ScreenConnect-AuthBypass-RCE",
+   "stars": 113,
+   "spdx_hint": null,
+   "size_kb": 39
+  },
+  {
+   "repo": "sneakerhax/Arsenal",
+   "stars": 112,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 745
+  },
+  {
+   "repo": "landoncrabtree/awesome-cyber",
+   "stars": 111,
+   "spdx_hint": null,
+   "size_kb": 288
+  },
+  {
+   "repo": "KCarretto/Arsenal",
+   "stars": 110,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 469
+  },
+  {
+   "repo": "WeaponizedVSCode/Script",
+   "stars": 110,
+   "spdx_hint": "MIT",
+   "size_kb": 2121
+  },
+  {
+   "repo": "aaaddress1/wowGrail",
+   "stars": 110,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1252
+  },
+  {
+   "repo": "h0ny/MobaXtermDecryptor",
+   "stars": 109,
+   "spdx_hint": "MIT",
+   "size_kb": 28
+  },
+  {
+   "repo": "BrAmaral/Purple-Team-Resources",
+   "stars": 108,
+   "spdx_hint": null,
+   "size_kb": 212
+  },
+  {
+   "repo": "DeathShotXD/0xM0nCrush",
+   "stars": 108,
+   "spdx_hint": "MIT",
+   "size_kb": 2304
+  },
+  {
+   "repo": "DamonMohammadbagher/NativePayload_ReverseShell",
+   "stars": 108,
+   "spdx_hint": null,
+   "size_kb": 10
+  },
+  {
+   "repo": "jusot99/jusotlabs",
+   "stars": 107,
+   "spdx_hint": "MIT",
+   "size_kb": 417200
+  },
+  {
+   "repo": "ibnaleem/instatracker",
+   "stars": 106,
+   "spdx_hint": "MIT",
+   "size_kb": 219
+  },
+  {
+   "repo": "nickvourd/CS-Aggressor-Kit",
+   "stars": 106,
+   "spdx_hint": "MIT",
+   "size_kb": 3100
+  },
+  {
+   "repo": "Mah3Sec/ForgeGuardian",
+   "stars": 106,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 6658
+  },
+  {
+   "repo": "iDigitalFlame/XMT",
+   "stars": 105,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 4551
+  },
+  {
+   "repo": "joaoviictorti/dinvk",
+   "stars": 105,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 176
+  },
+  {
+   "repo": "tdeerenberg/InlineWhispers3",
+   "stars": 105,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 211
+  },
+  {
+   "repo": "nickvourd/SkyFall-Pack",
+   "stars": 104,
+   "spdx_hint": "MIT",
+   "size_kb": 3520
+  },
+  {
+   "repo": "nettitude/TokenCert",
+   "stars": 104,
+   "spdx_hint": null,
+   "size_kb": 12
+  },
+  {
+   "repo": "ricardojoserf/SharpCovertTube",
+   "stars": 102,
+   "spdx_hint": null,
+   "size_kb": 225
+  },
+  {
+   "repo": "x0reaxeax/PageSplit",
+   "stars": 102,
+   "spdx_hint": "MIT",
+   "size_kb": 11
+  },
+  {
+   "repo": "Abhinandan-Khurana/MY-CRTP-Notes",
+   "stars": 101,
+   "spdx_hint": "MIT",
+   "size_kb": 5749
+  },
+  {
+   "repo": "yassirlaaouissi/EZEA",
+   "stars": 101,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 985
+  },
+  {
+   "repo": "Krypteria/Neo4LDAP",
+   "stars": 101,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 202
+  },
+  {
+   "repo": "EncodeGroup/AggressiveGadgetToJScript",
+   "stars": 101,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 25
+  },
+  {
+   "repo": "KhaelK138/authfinder",
+   "stars": 101,
+   "spdx_hint": "MIT",
+   "size_kb": 33
+  },
+  {
+   "repo": "RootUp/SmuggleShield",
+   "stars": 101,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 637
+  },
+  {
+   "repo": "dev-angelist/Certified-Red-Team-Professional-CRTP---Notes",
+   "stars": 100,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 120128
+  },
+  {
+   "repo": "R3DRUN3/vermilion",
+   "stars": 99,
+   "spdx_hint": "Unlicense",
+   "size_kb": 6640
+  },
+  {
+   "repo": "DarkSpaceSecurity/DocEx",
+   "stars": 99,
+   "spdx_hint": "MIT",
+   "size_kb": 22
+  },
+  {
+   "repo": "Print3M/Google-Hack-Search",
+   "stars": 99,
+   "spdx_hint": null,
+   "size_kb": 55
+  },
+  {
+   "repo": "dkyazzentwatwa/Cyber-Claude",
+   "stars": 99,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 20611
+  },
+  {
+   "repo": "zet235/black-hat-cpp",
+   "stars": 98,
+   "spdx_hint": "MIT",
+   "size_kb": 45
+  },
+  {
+   "repo": "zweilosec/Infosec-Notes",
+   "stars": 98,
+   "spdx_hint": null,
+   "size_kb": 1743
+  },
+  {
+   "repo": "VirtualAlllocEx/CS-EDR-Enumeration",
+   "stars": 97,
+   "spdx_hint": null,
+   "size_kb": 203
+  },
+  {
+   "repo": "1N3/PowerExfil",
+   "stars": 96,
+   "spdx_hint": null,
+   "size_kb": 3
+  },
+  {
+   "repo": "ZeroDayEvil/CVE-2026-41096-PoC",
+   "stars": 96,
+   "spdx_hint": "MIT",
+   "size_kb": 3937
+  },
+  {
+   "repo": "bL34cHig0/Pentest-Resources-Cheat-Sheets",
+   "stars": 96,
+   "spdx_hint": "CC-BY-4.0",
+   "size_kb": 190
+  },
+  {
+   "repo": "yutianqaq/CSx3Ldr",
+   "stars": 94,
+   "spdx_hint": "MIT",
+   "size_kb": 404
+  },
+  {
+   "repo": "EncodeGroup/Gopher",
+   "stars": 94,
+   "spdx_hint": null,
+   "size_kb": 62
+  },
+  {
+   "repo": "CodeXTF2/HavocNotion",
+   "stars": 94,
+   "spdx_hint": null,
+   "size_kb": 4
+  },
+  {
+   "repo": "RedSection/Red-Team-Challenge-Questions",
+   "stars": 93,
+   "spdx_hint": null,
+   "size_kb": 237
+  },
+  {
+   "repo": "thecybermafia/OffensiveActiveDirectory",
+   "stars": 93,
+   "spdx_hint": null,
+   "size_kb": 14
+  },
+  {
+   "repo": "0xflux/Rust-Hells-Gate",
+   "stars": 93,
+   "spdx_hint": null,
+   "size_kb": 72
+  },
+  {
+   "repo": "limbenjamin/ReverseShellDll",
+   "stars": 92,
+   "spdx_hint": null,
+   "size_kb": 28951
+  },
+  {
+   "repo": "jordanpotti/OffensiveCloudDistribution",
+   "stars": 92,
+   "spdx_hint": "MIT",
+   "size_kb": 52
+  },
+  {
+   "repo": "t3l3machus/CVE-2023-22960",
+   "stars": 91,
+   "spdx_hint": "MIT",
+   "size_kb": 19
+  },
+  {
+   "repo": "DarkCoderSc/SharpFtpC2",
+   "stars": 91,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1833
+  },
+  {
+   "repo": "ScriptIdiot/SysmonQuiet",
+   "stars": 91,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 65
+  },
+  {
+   "repo": "zweilosec/PowerShell-Administration-Tools",
+   "stars": 90,
+   "spdx_hint": null,
+   "size_kb": 125
+  },
+  {
+   "repo": "zer0yu/RedTeam_CheetSheets",
+   "stars": 90,
+   "spdx_hint": null,
+   "size_kb": 467
+  },
+  {
+   "repo": "netsecurity-as/recon365",
+   "stars": 89,
+   "spdx_hint": null,
+   "size_kb": 120
+  },
+  {
+   "repo": "JrM2628/httpworker",
+   "stars": 89,
+   "spdx_hint": null,
+   "size_kb": 6388
+  },
+  {
+   "repo": "i014n/RightHand-Persistence",
+   "stars": 89,
+   "spdx_hint": null,
+   "size_kb": 49265
+  },
+  {
+   "repo": "chainski/PandaLoader",
+   "stars": 89,
+   "spdx_hint": "MIT",
+   "size_kb": 304
+  },
+  {
+   "repo": "audibleblink/gorsh",
+   "stars": 88,
+   "spdx_hint": null,
+   "size_kb": 9652
+  },
+  {
+   "repo": "SecNN/SecNN-Wiki",
+   "stars": 88,
+   "spdx_hint": null,
+   "size_kb": 1841864
+  },
+  {
+   "repo": "gbiagomba/Sherlock",
+   "stars": 88,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 27236
+  }
+ ],
+ "_meta": {
+  "dataset_sha": "210b9259be248323b0b3bc58252bed3fde53135f",
+  "generated_at": "2026-10-11T18:22:19+0000"
+ }
+}

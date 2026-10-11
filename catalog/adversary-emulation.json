@@ -1,0 +1,139 @@
+{
+ "topic": "adversary-emulation",
+ "source": "hf-statistics",
+ "num_examples_hf": 6686,
+ "partial_stats": false,
+ "hf_license_distribution": {
+  "NOASSERTION": 2904,
+  "MIT": 23,
+  "GPL-3.0": 1148,
+  "Apache-2.0": 700
+ },
+ "n_repos": 30,
+ "repos": [
+  {
+   "repo": "OpenAEV-Platform/openaev",
+   "n_files": 2868
+  },
+  {
+   "repo": "gbikram/CTI-Automation-Platform",
+   "n_files": 1811
+  },
+  {
+   "repo": "guardicore/monkey",
+   "n_files": 942
+  },
+  {
+   "repo": "armadoinc/abilities",
+   "n_files": 187
+  },
+  {
+   "repo": "Magier/Ran",
+   "n_files": 182
+  },
+  {
+   "repo": "hckops/hckctl",
+   "n_files": 165
+  },
+  {
+   "repo": "DataDog/stratus-red-team",
+   "n_files": 143
+  },
+  {
+   "repo": "darmado/attack-macOS",
+   "n_files": 107
+  },
+  {
+   "repo": "JimBenna/Academy-Caldera",
+   "n_files": 48
+  },
+  {
+   "repo": "grisuno/beacon",
+   "n_files": 41
+  },
+  {
+   "repo": "S3N4T0R-0X0/APTs-Adversary-Simulation",
+   "n_files": 35
+  },
+  {
+   "repo": "maddev-engenuity/AdversaryEmulation",
+   "n_files": 34
+  },
+  {
+   "repo": "mitre/iec61850",
+   "n_files": 25
+  },
+  {
+   "repo": "NVISOsecurity/cyber-security-llm-agents",
+   "n_files": 19
+  },
+  {
+   "repo": "Thanh-WuTan/standa",
+   "n_files": 19
+  },
+  {
+   "repo": "mitre/emu",
+   "n_files": 15
+  },
+  {
+   "repo": "byt3n33dl3/JackRipper",
+   "n_files": 8
+  },
+  {
+   "repo": "AutomoxSecurity/iShelly",
+   "n_files": 7
+  },
+  {
+   "repo": "center-for-threat-informed-defense/m3tid",
+   "n_files": 5
+  },
+  {
+   "repo": "schoi1337/exploit-automation-lab",
+   "n_files": 4
+  },
+  {
+   "repo": "Manticore-Platform/public-threats",
+   "n_files": 3
+  },
+  {
+   "repo": "Sam0x90/CTI",
+   "n_files": 3
+  },
+  {
+   "repo": "chandraktrivedi/PurpleHawkS",
+   "n_files": 3
+  },
+  {
+   "repo": "desimic/Ronin_OSINT",
+   "n_files": 3
+  },
+  {
+   "repo": "activex37b/Gh0stCourier",
+   "n_files": 2
+  },
+  {
+   "repo": "caliskanfurkan/c2test",
+   "n_files": 2
+  },
+  {
+   "repo": "jwillyamz/ezEmu",
+   "n_files": 2
+  },
+  {
+   "repo": "NerdChip/AtomicThreatProfile",
+   "n_files": 1
+  },
+  {
+   "repo": "Offs3cOps/execcmd",
+   "n_files": 1
+  },
+  {
+   "repo": "marksowell/caldera-report-generator",
+   "n_files": 1
+  }
+ ],
+ "_meta": {
+  "dataset_sha": "210b9259be248323b0b3bc58252bed3fde53135f",
+  "generated_at": "2026-10-11T18:16:34+0000"
+ }
+}

@@ -1,0 +1,580 @@
+{
+ "topic": "command-and-control",
+ "source": "hf-statistics",
+ "num_examples_hf": 2864,
+ "partial_stats": false,
+ "hf_license_distribution": {
+  "AGPL-3.0": 251,
+  "Apache-2.0": 117,
+  "EUPL-1.2": 84,
+  "NOASSERTION": 172,
+  "GPL-2.0": 43,
+  "MIT": 613,
+  "Unlicense": 31,
+  "BSD-3-Clause": 381,
+  "GPL-3.0": 570
+ },
+ "n_repos": 139,
+ "repos": [
+  {
+   "repo": "braineering/ares",
+   "n_files": 219
+  },
+  {
+   "repo": "ksel172/Meduza",
+   "n_files": 180
+  },
+  {
+   "repo": "tiglate/Curupira",
+   "n_files": 157
+  },
+  {
+   "repo": "activecm/rita",
+   "n_files": 122
+  },
+  {
+   "repo": "utoni/w32miller",
+   "n_files": 116
+  },
+  {
+   "repo": "CroodSolutions/BeaconatorC2",
+   "n_files": 113
+  },
+  {
+   "repo": "evandigby/lunar-cmd",
+   "n_files": 104
+  },
+  {
+   "repo": "PhoenixC2/PhoenixC2",
+   "n_files": 99
+  },
+  {
+   "repo": "SitinCloud/Owlyshield",
+   "n_files": 84
+  },
+  {
+   "repo": "Tomiwa-Ot/moukthar",
+   "n_files": 82
+  },
+  {
+   "repo": "justvmexit/vaev",
+   "n_files": 79
+  },
+  {
+   "repo": "noneandundefined/icu",
+   "n_files": 64
+  },
+  {
+   "repo": "lawndoc/commander",
+   "n_files": 47
+  },
+  {
+   "repo": "Yyax13/TheDarkMark",
+   "n_files": 46
+  },
+  {
+   "repo": "Yuragy/P2P-Worm",
+   "n_files": 44
+  },
+  {
+   "repo": "Salmanasr939/rustc2",
+   "n_files": 42
+  },
+  {
+   "repo": "SomnathDas/RainC2",
+   "n_files": 42
+  },
+  {
+   "repo": "daanzu/kaldi-active-grammar",
+   "n_files": 36
+  },
+  {
+   "repo": "leJBP/adaptative-ransomware",
+   "n_files": 34
+  },
+  {
+   "repo": "seqre/rast",
+   "n_files": 33
+  },
+  {
+   "repo": "mauricelambert/ReverseShell",
+   "n_files": 32
+  },
+  {
+   "repo": "realaravinth/athena",
+   "n_files": 32
+  },
+  {
+   "repo": "ik5/distributed_test",
+   "n_files": 31
+  },
+  {
+   "repo": "calkoe/MqttCommander",
+   "n_files": 28
+  },
+  {
+   "repo": "faisalthaheem/surveillance-simulator",
+   "n_files": 28
+  },
+  {
+   "repo": "HieuHQ2005/orbit-agent",
+   "n_files": 25
+  },
+  {
+   "repo": "Kav-K/CNCCommandModule",
+   "n_files": 24
+  },
+  {
+   "repo": "looCiprian/GC2-sheet",
+   "n_files": 24
+  },
+  {
+   "repo": "musurca/envoy",
+   "n_files": 24
+  },
+  {
+   "repo": "Sparx-Foundation/actrax",
+   "n_files": 23
+  },
+  {
+   "repo": "mbwika/Command-and-Control-Server",
+   "n_files": 23
+  },
+  {
+   "repo": "Raffy27/Plague",
+   "n_files": 22
+  },
+  {
+   "repo": "billx00/kraken1",
+   "n_files": 22
+  },
+  {
+   "repo": "orgurar/orbit-agent",
+   "n_files": 22
+  },
+  {
+   "repo": "jkingsec/potluck",
+   "n_files": 21
+  },
+  {
+   "repo": "oriavsapir/Command-And-Control-PHP",
+   "n_files": 20
+  },
+  {
+   "repo": "Oliverwebdev/FrameWorm",
+   "n_files": 19
+  },
+  {
+   "repo": "0x1a8510f2/E",
+   "n_files": 18
+  },
+  {
+   "repo": "0xEr3bus/ShadowForgeC2",
+   "n_files": 18
+  },
+  {
+   "repo": "tanc7/dark-lord-obama",
+   "n_files": 18
+  },
+  {
+   "repo": "teler-sh/sebel",
+   "n_files": 18
+  },
+  {
+   "repo": "Zeeshan12340/RustC2",
+   "n_files": 17
+  },
+  {
+   "repo": "nemuelw/Windows-Malware-Techniques",
+   "n_files": 16
+  },
+  {
+   "repo": "averagesecurityguy/c2",
+   "n_files": 15
+  },
+  {
+   "repo": "delltaxa/bull",
+   "n_files": 15
+  },
+  {
+   "repo": "orgurar/doraemon",
+   "n_files": 15
+  },
+  {
+   "repo": "theophane-droid/KedavraC2",
+   "n_files": 15
+  },
+  {
+   "repo": "0x1CA3/Net",
+   "n_files": 14
+  },
+  {
+   "repo": "ItsMonish/scythe",
+   "n_files": 14
+  },
+  {
+   "repo": "xRET2pwn/PickleC2",
+   "n_files": 14
+  },
+  {
+   "repo": "Patrick-DE/C2-logparser",
+   "n_files": 13
+  },
+  {
+   "repo": "PushpenderIndia/nekros",
+   "n_files": 13
+  },
+  {
+   "repo": "Raffy27/OrionPanel",
+   "n_files": 13
+  },
+  {
+   "repo": "Think-A-Move/SPEAR-SDK-Python-Linux",
+   "n_files": 13
+  },
+  {
+   "repo": "xfox64x/VBShell",
+   "n_files": 13
+  },
+  {
+   "repo": "cxnturi0n/convoC2",
+   "n_files": 12
+  },
+  {
+   "repo": "martinkubecka/C2Detective",
+   "n_files": 12
+  },
+  {
+   "repo": "webdragon63/Eclipse_C2",
+   "n_files": 12
+  },
+  {
+   "repo": "Jasper-27/NiceC2",
+   "n_files": 11
+  },
+  {
+   "repo": "Suryah07/Stealth-Ruler",
+   "n_files": 11
+  },
+  {
+   "repo": "Think-A-Move/SPEAR-SDK-Java-Android",
+   "n_files": 11
+  },
+  {
+   "repo": "h0rv4th/c2matrix-analyzer",
+   "n_files": 11
+  },
+  {
+   "repo": "xXIamNoOneXx/Concussion",
+   "n_files": 11
+  },
+  {
+   "repo": "b3d3c/BDsploit",
+   "n_files": 10
+  },
+  {
+   "repo": "youlha1/hiddencave",
+   "n_files": 10
+  },
+  {
+   "repo": "3ct0s/dystopia-c2",
+   "n_files": 9
+  },
+  {
+   "repo": "BEND0US/redcrox",
+   "n_files": 9
+  },
+  {
+   "repo": "calinux-py/EphemeralRMM",
+   "n_files": 9
+  },
+  {
+   "repo": "delltaxa/iron",
+   "n_files": 9
+  },
+  {
+   "repo": "desultory/loranger",
+   "n_files": 9
+  },
+  {
+   "repo": "rainbowpigeon/Einstein",
+   "n_files": 9
+  },
+  {
+   "repo": "0xGhazy/fateh-framework",
+   "n_files": 8
+  },
+  {
+   "repo": "CaptainRepus/LummaC2-Stealer",
+   "n_files": 8
+  },
+  {
+   "repo": "KINGSABRI/chkdfront",
+   "n_files": 8
+  },
+  {
+   "repo": "Think-A-Move/SPEAR-SDK-Java-Linux",
+   "n_files": 8
+  },
+  {
+   "repo": "x86byte/LummaC2-Stealer",
+   "n_files": 8
+  },
+  {
+   "repo": "0xvpr/Snake-Pit",
+   "n_files": 7
+  },
+  {
+   "repo": "Sayan690/Weaponised-DFE",
+   "n_files": 7
+  },
+  {
+   "repo": "alexfrancow/badusb_botnet",
+   "n_files": 7
+  },
+  {
+   "repo": "barleybobs/DisTrace",
+   "n_files": 7
+  },
+  {
+   "repo": "martinkubecka/C2Hunter",
+   "n_files": 7
+  },
+  {
+   "repo": "neox41/go-smbshell",
+   "n_files": 7
+  },
+  {
+   "repo": "ricardojoserf/covert-control",
+   "n_files": 7
+  },
+  {
+   "repo": "HK-Transfield/python-c2-server",
+   "n_files": 6
+  },
+  {
+   "repo": "HappyStoic/PythonBotnet",
+   "n_files": 6
+  },
+  {
+   "repo": "Raffy27/OrionServer",
+   "n_files": 6
+  },
+  {
+   "repo": "Terraminator/cloudstrike",
+   "n_files": 6
+  },
+  {
+   "repo": "Think-A-Move/SPEAR-SDK-Java-Windows",
+   "n_files": 6
+  },
+  {
+   "repo": "cyberkaida/wasp-controller",
+   "n_files": 6
+  },
+  {
+   "repo": "gelven4sec/nanosploit",
+   "n_files": 6
+  },
+  {
+   "repo": "im4kv/Malicious-Traffic-Research",
+   "n_files": 6
+  },
+  {
+   "repo": "mython-dev/MythosR4T",
+   "n_files": 6
+  },
+  {
+   "repo": "p4p1/havoc-store",
+   "n_files": 6
+  },
+  {
+   "repo": "st3rven/fronthunter",
+   "n_files": 6
+  },
+  {
+   "repo": "ELMERIKH/TelecordC2",
+   "n_files": 5
+  },
+  {
+   "repo": "EyupErgin/HuntRisePro",
+   "n_files": 5
+  },
+  {
+   "repo": "KylerCondran/RemoteAdminTool",
+   "n_files": 5
+  },
+  {
+   "repo": "RainMaker1707/C2FrameworkDetector",
+   "n_files": 5
+  },
+  {
+   "repo": "mvondracek/VR-MitR-C2-Bigscreen",
+   "n_files": 5
+  },
+  {
+   "repo": "0x4F776C/PowerShell-Ransomware",
+   "n_files": 4
+  },
+  {
+   "repo": "CES-PROJECTS/C2-Server-over-Covert-Channels",
+   "n_files": 4
+  },
+  {
+   "repo": "D1se0/c2-panel-malware-education",
+   "n_files": 4
+  },
+  {
+   "repo": "dc401/goslowc2",
+   "n_files": 4
+  },
+  {
+   "repo": "ricardojoserf/covert-tube",
+   "n_files": 4
+  },
+  {
+   "repo": "0x1CA3/Reaper",
+   "n_files": 3
+  },
+  {
+   "repo": "AnnaNovin/Cyber_Security_Project_Reddit_Bot",
+   "n_files": 3
+  },
+  {
+   "repo": "EyupErgin/HuntRthys",
+   "n_files": 3
+  },
+  {
+   "repo": "Kubashok/malicious-c2-infrastructure",
+   "n_files": 3
+  },
+  {
+   "repo": "Lucas310302/C4",
+   "n_files": 3
+  },
+  {
+   "repo": "NotSooShariff/hog-c2",
+   "n_files": 3
+  },
+  {
+   "repo": "Sayan690/HTTPSBackdoor",
+   "n_files": 3
+  },
+  {
+   "repo": "bergmpet/cnc-telegram",
+   "n_files": 3
+  },
+  {
+   "repo": "bin3xish477/Red-C-C",
+   "n_files": 3
+  },
+  {
+   "repo": "seadog007/crontab_botnet",
+   "n_files": 3
+  },
+  {
+   "repo": "17tayyy/SkyNet",
+   "n_files": 2
+  },
+  {
+   "repo": "90N45-d3v/BlueBunny",
+   "n_files": 2
+  },
+  {
+   "repo": "alphaSeclab/awesome-rat",
+   "n_files": 2
+  },
+  {
+   "repo": "cflems/pk",
+   "n_files": 2
+  },
+  {
+   "repo": "duhow/blocklist-ipsets",
+   "n_files": 2
+  },
+  {
+   "repo": "gmolveau/go_port_sniffer",
+   "n_files": 2
+  },
+  {
+   "repo": "heinricitorgau/Experimental-C2-Architecture-and-Cyber-Defense-Analysis",
+   "n_files": 2
+  },
+  {
+   "repo": "maxschmittlaurin/command-and-control-server",
+   "n_files": 2
+  },
+  {
+   "repo": "ricardojoserf/BOF_Files",
+   "n_files": 2
+  },
+  {
+   "repo": "Asko7779/discord-c-c",
+   "n_files": 1
+  },
+  {
+   "repo": "Jul10l1r4/botnet-ghost",
+   "n_files": 1
+  },
+  {
+   "repo": "Kracken256/CommandAndControlServer",
+   "n_files": 1
+  },
+  {
+   "repo": "LvMalware/vbshell",
+   "n_files": 1
+  },
+  {
+   "repo": "OddDevelopment/PasteBin-Botnet",
+   "n_files": 1
+  },
+  {
+   "repo": "Raffy27/OrionBot",
+   "n_files": 1
+  },
+  {
+   "repo": "Tomiwa-Ot/telegram-c2",
+   "n_files": 1
+  },
+  {
+   "repo": "dc401/icmp-bindshell",
+   "n_files": 1
+  },
+  {
+   "repo": "eremit4/cs-discovery",
+   "n_files": 1
+  },
+  {
+   "repo": "ericyoc/simple_server_client_poc",
+   "n_files": 1
+  },
+  {
+   "repo": "firehol/blocklist-ipsets",
+   "n_files": 1
+  },
+  {
+   "repo": "michalswi/github-c2",
+   "n_files": 1
+  },
+  {
+   "repo": "redr0nin/badgerDAPS",
+   "n_files": 1
+  },
+  {
+   "repo": "ricardojoserf/DoubleTeam",
+   "n_files": 1
+  },
+  {
+   "repo": "varppi/dnsnet",
+   "n_files": 1
+  },
+  {
+   "repo": "yuziiiiiiiiii/ThreatBook-C2",
+   "n_files": 1
+  }
+ ],
+ "_meta": {
+  "dataset_sha": "210b9259be248323b0b3bc58252bed3fde53135f",
+  "generated_at": "2026-10-11T18:17:06+0000"
+ }
+}

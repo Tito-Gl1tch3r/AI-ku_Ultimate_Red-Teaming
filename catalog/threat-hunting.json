@@ -1,0 +1,1929 @@
+{
+ "topic": "threat-hunting",
+ "source": "hf-statistics",
+ "num_examples_hf": 52454,
+ "partial_stats": false,
+ "hf_license_distribution": {
+  "EUPL-1.2": 81,
+  "Apache-2.0": 1564,
+  "BSD-2-Clause": 9,
+  "AGPL-3.0": 6114,
+  "CC-BY-4.0": 2,
+  "GPL-3.0": 5165,
+  "MIT": 16459,
+  "MPL-2.0": 13,
+  "LGPL-3.0": 48,
+  "Unlicense": 16,
+  "NOASSERTION": 6749,
+  "GPL-2.0": 1939,
+  "BSD-3-Clause": 55,
+  "CC0-1.0": 359
+ },
+ "n_repos": 475,
+ "repos": [
+  {
+   "repo": "mthcht/awesome-lists",
+   "n_files": 11170
+  },
+  {
+   "repo": "mthcht/ThreatHunting-Keywords-sigma-rules",
+   "n_files": 5091
+  },
+  {
+   "repo": "ajaykumarkk/asset_based_threat_management",
+   "n_files": 3123
+  },
+  {
+   "repo": "2O0K/Sentinel-Rules",
+   "n_files": 2983
+  },
+  {
+   "repo": "utmstack/UTMStack",
+   "n_files": 2610
+  },
+  {
+   "repo": "elastic/detection-rules",
+   "n_files": 2032
+  },
+  {
+   "repo": "anvilogic-forge/armory",
+   "n_files": 1893
+  },
+  {
+   "repo": "OISF/suricata",
+   "n_files": 1651
+  },
+  {
+   "repo": "intelowlproject/IntelOwl",
+   "n_files": 1221
+  },
+  {
+   "repo": "opencybersecurityalliance/stix-shifter",
+   "n_files": 1107
+  },
+  {
+   "repo": "sublime-security/sublime-rules",
+   "n_files": 1046
+  },
+  {
+   "repo": "mthcht/ThreatIntel-Reports",
+   "n_files": 1044
+  },
+  {
+   "repo": "Infinit3i/hunt-ai",
+   "n_files": 851
+  },
+  {
+   "repo": "docintelapp/DocIntel",
+   "n_files": 672
+  },
+  {
+   "repo": "romanchaa997/Audityzer",
+   "n_files": 641
+  },
+  {
+   "repo": "MISP/MISP",
+   "n_files": 634
+  },
+  {
+   "repo": "StamusNetworks/scirius",
+   "n_files": 576
+  },
+  {
+   "repo": "Cyb3rWard0g/HELK",
+   "n_files": 550
+  },
+  {
+   "repo": "bobby-tablez/TTP-Threat-Feeds",
+   "n_files": 532
+  },
+  {
+   "repo": "Security-Onion-Solutions/securityonion",
+   "n_files": 417
+  },
+  {
+   "repo": "mdecrevoisier/SIGMA-detection-rules",
+   "n_files": 352
+  },
+  {
+   "repo": "ninoseki/mihari",
+   "n_files": 346
+  },
+  {
+   "repo": "KasperskyLab/klara",
+   "n_files": 337
+  },
+  {
+   "repo": "GokbakarE/RuleSetRAT",
+   "n_files": 318
+  },
+  {
+   "repo": "matanolabs/matano",
+   "n_files": 289
+  },
+  {
+   "repo": "alvin-tosh/Infosec-and-Hacking-Scripts",
+   "n_files": 288
+  },
+  {
+   "repo": "yeti-platform/yeti",
+   "n_files": 280
+  },
+  {
+   "repo": "chainguard-dev/osquery-defense-kit",
+   "n_files": 277
+  },
+  {
+   "repo": "dev-lu/osint_toolkit",
+   "n_files": 272
+  },
+  {
+   "repo": "eshlomo1/Microsoft-Sentinel-SecOps",
+   "n_files": 258
+  },
+  {
+   "repo": "ION28/BLUESPAWN",
+   "n_files": 257
+  },
+  {
+   "repo": "AdamWhiteHat/Judge-Jury-and-Executable",
+   "n_files": 249
+  },
+  {
+   "repo": "Patrowl/PatrowlHears",
+   "n_files": 216
+  },
+  {
+   "repo": "41vi4p/Echo-ATTACK",
+   "n_files": 211
+  },
+  {
+   "repo": "digisquad-repo/kunai-rules",
+   "n_files": 211
+  },
+  {
+   "repo": "mrheinen/lophiid",
+   "n_files": 205
+  },
+  {
+   "repo": "thalesgroup-cert/Watcher",
+   "n_files": 204
+  },
+  {
+   "repo": "Patrowl/PatrowlManager",
+   "n_files": 189
+  },
+  {
+   "repo": "cybledev/odin-sdk-go",
+   "n_files": 180
+  },
+  {
+   "repo": "mentat-is/gulp",
+   "n_files": 159
+  },
+  {
+   "repo": "yampelo/beagle",
+   "n_files": 159
+  },
+  {
+   "repo": "WithSecureLabs/chainsaw",
+   "n_files": 155
+  },
+  {
+   "repo": "kunai-project/kunai",
+   "n_files": 155
+  },
+  {
+   "repo": "MISP/misp-galaxy",
+   "n_files": 148
+  },
+  {
+   "repo": "Patrowl/PatrowlEngines",
+   "n_files": 148
+  },
+  {
+   "repo": "RegSeek/regseek.github.io",
+   "n_files": 143
+  },
+  {
+   "repo": "mentat-is/gulpui-web",
+   "n_files": 139
+  },
+  {
+   "repo": "joeavanzato/velociraptor-timeline-creator",
+   "n_files": 138
+  },
+  {
+   "repo": "mthcht/Purpleteam",
+   "n_files": 135
+  },
+  {
+   "repo": "activecm/rita",
+   "n_files": 122
+  },
+  {
+   "repo": "matamorphosis/Scrummage",
+   "n_files": 112
+  },
+  {
+   "repo": "utkusen/baitroute",
+   "n_files": 111
+  },
+  {
+   "repo": "0xrawsec/whids",
+   "n_files": 110
+  },
+  {
+   "repo": "fish-not-phish/open-vbrowser",
+   "n_files": 110
+  },
+  {
+   "repo": "opencybersecurityalliance/kestrel-lang",
+   "n_files": 100
+  },
+  {
+   "repo": "cyansure1983/CyberBlue",
+   "n_files": 94
+  },
+  {
+   "repo": "brunos3d/crysknife",
+   "n_files": 93
+  },
+  {
+   "repo": "hellasleeper108/malware-detection",
+   "n_files": 89
+  },
+  {
+   "repo": "fish-not-phish/pixurebyte",
+   "n_files": 83
+  },
+  {
+   "repo": "SitinCloud/Owlyshield",
+   "n_files": 81
+  },
+  {
+   "repo": "ThisIsLibra/m3",
+   "n_files": 81
+  },
+  {
+   "repo": "ManuelBerrueta/BST",
+   "n_files": 80
+  },
+  {
+   "repo": "binalyze/tigma",
+   "n_files": 78
+  },
+  {
+   "repo": "Yamato-Security/hayabusa",
+   "n_files": 77
+  },
+  {
+   "repo": "cyberdefenders/DetectionLabELK",
+   "n_files": 75
+  },
+  {
+   "repo": "darkquasar/propagami",
+   "n_files": 74
+  },
+  {
+   "repo": "opencybersecurityalliance/firepit",
+   "n_files": 72
+  },
+  {
+   "repo": "AUX-441/SecuSploitX",
+   "n_files": 70
+  },
+  {
+   "repo": "enock-niyonsaba/safe_shield_DTP",
+   "n_files": 70
+  },
+  {
+   "repo": "hm-seclab/YAFRA",
+   "n_files": 70
+  },
+  {
+   "repo": "sbousseaden/macOS-ATTACK-DATASET",
+   "n_files": 66
+  },
+  {
+   "repo": "sgInnora/sharpeye",
+   "n_files": 65
+  },
+  {
+   "repo": "stanfrbd/cyberbro",
+   "n_files": 64
+  },
+  {
+   "repo": "InQuest/ThreatIngestor",
+   "n_files": 62
+  },
+  {
+   "repo": "Peco602/rusthunter",
+   "n_files": 61
+  },
+  {
+   "repo": "Loginsoft-LLC/threat-detection-rules",
+   "n_files": 60
+  },
+  {
+   "repo": "Qvineox/domain-threat-intelligence-api-mirror",
+   "n_files": 59
+  },
+  {
+   "repo": "eshlomo1/CloudSec",
+   "n_files": 53
+  },
+  {
+   "repo": "thremulation-station/thremulation-station",
+   "n_files": 52
+  },
+  {
+   "repo": "TonyPhipps/Meerkat",
+   "n_files": 51
+  },
+  {
+   "repo": "soufianetahiri/Valkyrie",
+   "n_files": 50
+  },
+  {
+   "repo": "basht0p/Threat-Farmer",
+   "n_files": 49
+  },
+  {
+   "repo": "dyussekeyev/thamara",
+   "n_files": 49
+  },
+  {
+   "repo": "fhightower/ioc-finder",
+   "n_files": 48
+  },
+  {
+   "repo": "muchdogesec/obstracts",
+   "n_files": 48
+  },
+  {
+   "repo": "yukh1402/cti-stix-diamond-activity-attack-graph",
+   "n_files": 48
+  },
+  {
+   "repo": "jurelou/epagneul",
+   "n_files": 47
+  },
+  {
+   "repo": "zerber0s/BF-ELK",
+   "n_files": 46
+  },
+  {
+   "repo": "StamusNetworks/Clear-NDR-templates",
+   "n_files": 43
+  },
+  {
+   "repo": "tatsuiman/rpot2",
+   "n_files": 41
+  },
+  {
+   "repo": "databricks-industry-solutions/context-graph-analytics",
+   "n_files": 40
+  },
+  {
+   "repo": "OpenIxia/kube-bro-configmaptemplate",
+   "n_files": 39
+  },
+  {
+   "repo": "hpthreatresearch/subcrawl",
+   "n_files": 38
+  },
+  {
+   "repo": "spkatragadda/intelliHunt",
+   "n_files": 38
+  },
+  {
+   "repo": "AndreSantagati/ETNA",
+   "n_files": 37
+  },
+  {
+   "repo": "Qvineox/domain-threat-intelligence-agent-mirror",
+   "n_files": 37
+  },
+  {
+   "repo": "decal/werdlists",
+   "n_files": 37
+  },
+  {
+   "repo": "cryptwareapps/Malware-Database",
+   "n_files": 36
+  },
+  {
+   "repo": "deepfence/YaraHunter",
+   "n_files": 36
+  },
+  {
+   "repo": "0xrawsec/gene",
+   "n_files": 35
+  },
+  {
+   "repo": "RoomaSec/RmEye",
+   "n_files": 35
+  },
+  {
+   "repo": "cloudtracer/ThreatPinchLookup",
+   "n_files": 35
+  },
+  {
+   "repo": "Loginsoft-LLC/Linux-Exploit-Detection",
+   "n_files": 34
+  },
+  {
+   "repo": "OTRF/ThreatHunter-Playbook",
+   "n_files": 34
+  },
+  {
+   "repo": "darkquasar/purplerepo",
+   "n_files": 34
+  },
+  {
+   "repo": "f-bader/AzSentinelQueries",
+   "n_files": 34
+  },
+  {
+   "repo": "it-bgk/cdc-plattform",
+   "n_files": 33
+  },
+  {
+   "repo": "Jack-McDowell/DEEPGLASS",
+   "n_files": 32
+  },
+  {
+   "repo": "darkquasar/AzureHunter",
+   "n_files": 32
+  },
+  {
+   "repo": "JPCERTCC/YAMAGoya",
+   "n_files": 31
+  },
+  {
+   "repo": "christophetd/Adaz",
+   "n_files": 31
+  },
+  {
+   "repo": "conway87/HEG-BeefEater",
+   "n_files": 31
+  },
+  {
+   "repo": "sk4la/plast",
+   "n_files": 31
+  },
+  {
+   "repo": "ivan-sincek/chad",
+   "n_files": 30
+  },
+  {
+   "repo": "boringtools/git-alerts",
+   "n_files": 28
+  },
+  {
+   "repo": "codeyourweb/fastfinder",
+   "n_files": 28
+  },
+  {
+   "repo": "op7ic/amphunt",
+   "n_files": 28
+  },
+  {
+   "repo": "wisepythagoras/honeyshell",
+   "n_files": 28
+  },
+  {
+   "repo": "nbarrap/RedOpsToolkit",
+   "n_files": 27
+  },
+  {
+   "repo": "ibrahmsql/CloudVault",
+   "n_files": 26
+  },
+  {
+   "repo": "intelowlproject/go-intelowl",
+   "n_files": 26
+  },
+  {
+   "repo": "osintbrazuca/osint-brazuca-nuclei-templates",
+   "n_files": 26
+  },
+  {
+   "repo": "CrowdStrike/MISP-tools",
+   "n_files": 25
+  },
+  {
+   "repo": "ninoseki/apullo",
+   "n_files": 25
+  },
+  {
+   "repo": "phishing-hunter/proxypot",
+   "n_files": 25
+  },
+  {
+   "repo": "tomwechsler/Active_Directory_Advanced_Threat_Hunting",
+   "n_files": 25
+  },
+  {
+   "repo": "Khadinxc/siem_detection_rules",
+   "n_files": 24
+  },
+  {
+   "repo": "alexandreborges/malwoverview",
+   "n_files": 24
+  },
+  {
+   "repo": "conway87/HEG-3.0",
+   "n_files": 24
+  },
+  {
+   "repo": "ecstatic-nobel/OSweep",
+   "n_files": 24
+  },
+  {
+   "repo": "KernelCaleb/Kustonomicon",
+   "n_files": 23
+  },
+  {
+   "repo": "LeoAlb208/CyberLogML",
+   "n_files": 23
+  },
+  {
+   "repo": "ez3r0sec/JamfProThreatHunting",
+   "n_files": 23
+  },
+  {
+   "repo": "mf1d3l/Splunk4DFIR",
+   "n_files": 23
+  },
+  {
+   "repo": "tylabs/dovehawk_lambda",
+   "n_files": 23
+  },
+  {
+   "repo": "ControlCompass/ControlCompass.github.io",
+   "n_files": 22
+  },
+  {
+   "repo": "josedacosta/shai-hulud-detector",
+   "n_files": 22
+  },
+  {
+   "repo": "lab52io/Syspce",
+   "n_files": 22
+  },
+  {
+   "repo": "pogzyb/certificate.stream",
+   "n_files": 22
+  },
+  {
+   "repo": "sophos/sophos-central-api-connector",
+   "n_files": 22
+  },
+  {
+   "repo": "GrcHenry/ThreatHunting-Playbook",
+   "n_files": 21
+  },
+  {
+   "repo": "WHots/RosaryAC-rs",
+   "n_files": 21
+  },
+  {
+   "repo": "airbus-cert/ntTraceControl",
+   "n_files": 21
+  },
+  {
+   "repo": "lo-chr/pivot-track",
+   "n_files": 20
+  },
+  {
+   "repo": "zestyraiden/Azure-Power-BI-SEIM",
+   "n_files": 20
+  },
+  {
+   "repo": "0rx1/DomainMon",
+   "n_files": 19
+  },
+  {
+   "repo": "4R9UN/fastmcp-threatintel",
+   "n_files": 19
+  },
+  {
+   "repo": "atenreiro/opensquat",
+   "n_files": 19
+  },
+  {
+   "repo": "deathlabs/deathlabs",
+   "n_files": 19
+  },
+  {
+   "repo": "melihi/ocr_miner",
+   "n_files": 19
+  },
+  {
+   "repo": "ChiefGyk3D/typo-sniper",
+   "n_files": 18
+  },
+  {
+   "repo": "databricks-industry-solutions/ioc-matching",
+   "n_files": 18
+  },
+  {
+   "repo": "MrezaDorudian/HunterBee",
+   "n_files": 17
+  },
+  {
+   "repo": "PAST2212/domainthreat",
+   "n_files": 17
+  },
+  {
+   "repo": "jwashek/veCTIon",
+   "n_files": 17
+  },
+  {
+   "repo": "laurenelizabethroberts/weblog-threat-hunter",
+   "n_files": 17
+  },
+  {
+   "repo": "Imaljonur/null-privacy-security-suite",
+   "n_files": 16
+  },
+  {
+   "repo": "codeyourweb/irma",
+   "n_files": 16
+  },
+  {
+   "repo": "ecstatic-nobel/pOSINT",
+   "n_files": 16
+  },
+  {
+   "repo": "kaansk/hivelime",
+   "n_files": 16
+  },
+  {
+   "repo": "MISP/mail_to_misp",
+   "n_files": 15
+  },
+  {
+   "repo": "StamusNetworks/Clear-NDR-ISO",
+   "n_files": 15
+  },
+  {
+   "repo": "ahmedkhlief/APT-Hunter",
+   "n_files": 15
+  },
+  {
+   "repo": "censys/censys-recon-ng",
+   "n_files": 15
+  },
+  {
+   "repo": "ilostmypassword/Melissae",
+   "n_files": 15
+  },
+  {
+   "repo": "kraven-security/python-threat-hunting-tools",
+   "n_files": 15
+  },
+  {
+   "repo": "mvelazc0/Oriana",
+   "n_files": 15
+  },
+  {
+   "repo": "AmnestyTech/investigations",
+   "n_files": 14
+  },
+  {
+   "repo": "HuntDownProject/HEDnsExtractor",
+   "n_files": 14
+  },
+  {
+   "repo": "JakePeralta7/HiveAnalyzer",
+   "n_files": 14
+  },
+  {
+   "repo": "MII-Cybersec/Threat-Hunting-Notebook",
+   "n_files": 14
+  },
+  {
+   "repo": "aleprada/weblog_triage",
+   "n_files": 14
+  },
+  {
+   "repo": "blackorbird/APT_REPORT",
+   "n_files": 13
+  },
+  {
+   "repo": "fyankov96/agentic-soc-analyst",
+   "n_files": 13
+  },
+  {
+   "repo": "kevlo-cyber/threat-hunting-scenario-ransomware-pre-staging-activity",
+   "n_files": 13
+  },
+  {
+   "repo": "Cybersight-Security/Global-Threat-Map",
+   "n_files": 12
+  },
+  {
+   "repo": "DrPwner/FortiLucyFox",
+   "n_files": 12
+  },
+  {
+   "repo": "ErenIzyat/Sysmon-Threat-Analyzer",
+   "n_files": 12
+  },
+  {
+   "repo": "MonaxGT/brofor",
+   "n_files": 12
+  },
+  {
+   "repo": "THORCollective/threat-hunting-mcp-server",
+   "n_files": 12
+  },
+  {
+   "repo": "cybagard/nsrllookup",
+   "n_files": 12
+  },
+  {
+   "repo": "cyber-evangelists/ioc-mircoservice",
+   "n_files": 12
+  },
+  {
+   "repo": "pogzyb/czdsdump",
+   "n_files": 12
+  },
+  {
+   "repo": "qeeqbox/chameleon",
+   "n_files": 12
+  },
+  {
+   "repo": "slrbl/SANS-KringleCon-Holiday-Hack-Challenge-2019",
+   "n_files": 12
+  },
+  {
+   "repo": "ssnkhan/infrastructure-hunting",
+   "n_files": 12
+  },
+  {
+   "repo": "Aris-haryanto/SecretAgent",
+   "n_files": 11
+  },
+  {
+   "repo": "BrsDincer/Ransomware-Gang-Identifier-From-Message",
+   "n_files": 11
+  },
+  {
+   "repo": "EthicalGT/BOSS-FE",
+   "n_files": 11
+  },
+  {
+   "repo": "elvidence/MISP",
+   "n_files": 11
+  },
+  {
+   "repo": "ethack/tht",
+   "n_files": 11
+  },
+  {
+   "repo": "hashlookup/hashlookup-gui",
+   "n_files": 11
+  },
+  {
+   "repo": "iomoath/yara-scanner",
+   "n_files": 11
+  },
+  {
+   "repo": "lion-gu/ioc-explorer",
+   "n_files": 11
+  },
+  {
+   "repo": "xn-twist/xn-twist",
+   "n_files": 11
+  },
+  {
+   "repo": "yannickboog/ransomwatch",
+   "n_files": 11
+  },
+  {
+   "repo": "TonyPhipps/SIEM",
+   "n_files": 10
+  },
+  {
+   "repo": "kmsec-uk/azure-osint.kmsec.uk",
+   "n_files": 10
+  },
+  {
+   "repo": "maxabaumgarten/FireELK",
+   "n_files": 10
+  },
+  {
+   "repo": "msdirtbag/ADXFlowmaster",
+   "n_files": 10
+  },
+  {
+   "repo": "tvfischer/ps-srum-hunting",
+   "n_files": 10
+  },
+  {
+   "repo": "0xshaft03/Meta-Blue",
+   "n_files": 9
+  },
+  {
+   "repo": "Deilis/py-mitre-attack-scraper",
+   "n_files": 9
+  },
+  {
+   "repo": "LaresLLC/SysmonConfigPusher",
+   "n_files": 9
+  },
+  {
+   "repo": "Mheboobkhan/threathuntingwithpython",
+   "n_files": 9
+  },
+  {
+   "repo": "Tarique-B-DevOps/MISP-Kubernetes",
+   "n_files": 9
+  },
+  {
+   "repo": "byfranke/IPDefender",
+   "n_files": 9
+  },
+  {
+   "repo": "codewhitesec/apollon",
+   "n_files": 9
+  },
+  {
+   "repo": "darkquasar/book.threathunterz.com",
+   "n_files": 9
+  },
+  {
+   "repo": "dubs3c/dnsIntel",
+   "n_files": 9
+  },
+  {
+   "repo": "iomoath/file_watchtower",
+   "n_files": 9
+  },
+  {
+   "repo": "mthcht/ThreatHunting-Keywords",
+   "n_files": 9
+  },
+  {
+   "repo": "mvelazc0/msInvader",
+   "n_files": 9
+  },
+  {
+   "repo": "op7ic/meraki-hunting",
+   "n_files": 9
+  },
+  {
+   "repo": "prodaft/malware-ioc",
+   "n_files": 9
+  },
+  {
+   "repo": "sbousseaden/EVTX-ATTACK-SAMPLES",
+   "n_files": 9
+  },
+  {
+   "repo": "BHCyber/FortiSandbox-Client",
+   "n_files": 8
+  },
+  {
+   "repo": "Cipherkrish69x/SOC-Analyst-Project",
+   "n_files": 8
+  },
+  {
+   "repo": "DART-Laboratory/Flash-IDS",
+   "n_files": 8
+  },
+  {
+   "repo": "LeakIX/YaraStream",
+   "n_files": 8
+  },
+  {
+   "repo": "OpenIxia/kube-bro-helm-chart",
+   "n_files": 8
+  },
+  {
+   "repo": "SUALBA/red-blue-team-attack-defense-conceptos",
+   "n_files": 8
+  },
+  {
+   "repo": "atiilla/sysmon-ai",
+   "n_files": 8
+  },
+  {
+   "repo": "dafneb/ansible-collection-wazuh",
+   "n_files": 8
+  },
+  {
+   "repo": "davincico/Threat-Intel-Tools",
+   "n_files": 8
+  },
+  {
+   "repo": "hrtywhy/Hanoman",
+   "n_files": 8
+  },
+  {
+   "repo": "jsutch/c2_beacon_analysis",
+   "n_files": 8
+  },
+  {
+   "repo": "miladaslaner/ThreatHunt",
+   "n_files": 8
+  },
+  {
+   "repo": "olafhartong/ThreatHunting",
+   "n_files": 8
+  },
+  {
+   "repo": "svch0stz/TheThreatHuntLibrary",
+   "n_files": 8
+  },
+  {
+   "repo": "webamon-org/webamon-cli",
+   "n_files": 8
+  },
+  {
+   "repo": "BurnyMack/DeepWatch-AI",
+   "n_files": 7
+  },
+  {
+   "repo": "Dentrax/falco-gpt",
+   "n_files": 7
+  },
+  {
+   "repo": "Ebryx/aws-threathunting",
+   "n_files": 7
+  },
+  {
+   "repo": "Matt-C-G/sentinel-labs",
+   "n_files": 7
+  },
+  {
+   "repo": "Ojasveer955/Cowrie-ELK-honeypot",
+   "n_files": 7
+  },
+  {
+   "repo": "Te-k/pybinaryedge",
+   "n_files": 7
+  },
+  {
+   "repo": "eremit4/favihunter",
+   "n_files": 7
+  },
+  {
+   "repo": "izm1chael/wuodan",
+   "n_files": 7
+  },
+  {
+   "repo": "jstnk9/MISP",
+   "n_files": 7
+  },
+  {
+   "repo": "martinkubecka/C2Hunter",
+   "n_files": 7
+  },
+  {
+   "repo": "mthcht/ThreatHunting-Keywords-yara-rules",
+   "n_files": 7
+  },
+  {
+   "repo": "oldkingcone/SpyGlass",
+   "n_files": 7
+  },
+  {
+   "repo": "qeeqbox/raven",
+   "n_files": 7
+  },
+  {
+   "repo": "rizalex/threat-hunt_log",
+   "n_files": 7
+  },
+  {
+   "repo": "9b/boxcar",
+   "n_files": 6
+  },
+  {
+   "repo": "Arcanna-AI/narratives",
+   "n_files": 6
+  },
+  {
+   "repo": "Farhan-himel-malik/sharpeye",
+   "n_files": 6
+  },
+  {
+   "repo": "LOLESXi-Project/LOLESXi",
+   "n_files": 6
+  },
+  {
+   "repo": "Patrowl/PatrowlDocs",
+   "n_files": 6
+  },
+  {
+   "repo": "aashishrbhandari/SOC-Analyze",
+   "n_files": 6
+  },
+  {
+   "repo": "blurrySignature/threat_hunting",
+   "n_files": 6
+  },
+  {
+   "repo": "cleverparrot95/P-EDR-Arch",
+   "n_files": 6
+  },
+  {
+   "repo": "codewhitesec/daphne",
+   "n_files": 6
+  },
+  {
+   "repo": "devfoundsec/BRIntelcollector",
+   "n_files": 6
+  },
+  {
+   "repo": "eremit4/Akamaru",
+   "n_files": 6
+  },
+  {
+   "repo": "jacobdjwilson/awesome-annual-security-reports",
+   "n_files": 6
+  },
+  {
+   "repo": "jason-p-nguyen/threat-hunting-projects",
+   "n_files": 6
+  },
+  {
+   "repo": "montysecurity/C2-Tracker",
+   "n_files": 6
+  },
+  {
+   "repo": "yaron4u/SentinelFusion",
+   "n_files": 6
+  },
+  {
+   "repo": "yours-cyber-buddy/SysHawk",
+   "n_files": 6
+  },
+  {
+   "repo": "3c7/infrastructure-tracking-schema",
+   "n_files": 5
+  },
+  {
+   "repo": "A3sal0n/CyberThreatHunting",
+   "n_files": 5
+  },
+  {
+   "repo": "ClearLotus-git/Attack-Forecaster",
+   "n_files": 5
+  },
+  {
+   "repo": "DamonMohammadbagher/ETWNetMonv3",
+   "n_files": 5
+  },
+  {
+   "repo": "DrPwner/FortiLucene",
+   "n_files": 5
+  },
+  {
+   "repo": "FIRSTdotorg/automation-sig-www",
+   "n_files": 5
+  },
+  {
+   "repo": "Status-418/nsrl-api",
+   "n_files": 5
+  },
+  {
+   "repo": "bitlogik/robot-recover",
+   "n_files": 5
+  },
+  {
+   "repo": "byfranke/viper",
+   "n_files": 5
+  },
+  {
+   "repo": "chadpierce/beacon-analysis",
+   "n_files": 5
+  },
+  {
+   "repo": "fukusuket/THuntLab",
+   "n_files": 5
+  },
+  {
+   "repo": "kaiiyer/bsides-edmonton-workshop",
+   "n_files": 5
+  },
+  {
+   "repo": "olafhartong/ATTACKdatamap",
+   "n_files": 5
+  },
+  {
+   "repo": "olafhartong/sysmon-modular",
+   "n_files": 5
+  },
+  {
+   "repo": "paulzroe/vtutil",
+   "n_files": 5
+  },
+  {
+   "repo": "ravenastar-js/shortlinks-scams",
+   "n_files": 5
+  },
+  {
+   "repo": "secureworks/taegis-threat-hunting-tutorials",
+   "n_files": 5
+  },
+  {
+   "repo": "thebitdoodler/DomainSentry",
+   "n_files": 5
+  },
+  {
+   "repo": "thremulation-station/docs",
+   "n_files": 5
+  },
+  {
+   "repo": "zdhenard42/SOC-Multitool",
+   "n_files": 5
+  },
+  {
+   "repo": "zp-4/hunting_scripts",
+   "n_files": 5
+  },
+  {
+   "repo": "3CORESec/S2AN",
+   "n_files": 4
+  },
+  {
+   "repo": "Bugs-B0unt3r/google-sheets-hunting-bad-domains",
+   "n_files": 4
+  },
+  {
+   "repo": "DomainTools/DomainCAT",
+   "n_files": 4
+  },
+  {
+   "repo": "Harpooners/harpoon",
+   "n_files": 4
+  },
+  {
+   "repo": "Javierop20/active-mapper",
+   "n_files": 4
+  },
+  {
+   "repo": "M507/RandMalware",
+   "n_files": 4
+  },
+  {
+   "repo": "Neo23x0/signature-base",
+   "n_files": 4
+  },
+  {
+   "repo": "PolitoInc/ELK-Hunting",
+   "n_files": 4
+  },
+  {
+   "repo": "connervieira/Sentry",
+   "n_files": 4
+  },
+  {
+   "repo": "cyberarber/honeypot-defense-system",
+   "n_files": 4
+  },
+  {
+   "repo": "cybersecurity-laboratory/feed",
+   "n_files": 4
+  },
+  {
+   "repo": "jackaduma/SecBERT",
+   "n_files": 4
+  },
+  {
+   "repo": "kaiiyer/rajappan",
+   "n_files": 4
+  },
+  {
+   "repo": "laurenelizabethroberts/ics-honeypot-ids",
+   "n_files": 4
+  },
+  {
+   "repo": "lubiedo/threatintel",
+   "n_files": 4
+  },
+  {
+   "repo": "mattnotmax/hash_hunter",
+   "n_files": 4
+  },
+  {
+   "repo": "mattnotmax/tiny-python-snippets",
+   "n_files": 4
+  },
+  {
+   "repo": "mitzep0x1/c-137labs.mitzep.com",
+   "n_files": 4
+  },
+  {
+   "repo": "mortuja001/splunk-brute-force-detector",
+   "n_files": 4
+  },
+  {
+   "repo": "ndr-repo/investigators-toolkit",
+   "n_files": 4
+  },
+  {
+   "repo": "pe3zx/mthc",
+   "n_files": 4
+  },
+  {
+   "repo": "petstuk/SigmaEye",
+   "n_files": 4
+  },
+  {
+   "repo": "stairwell-inc/threat-research",
+   "n_files": 4
+  },
+  {
+   "repo": "usethisname1419/ThreatFeed",
+   "n_files": 4
+  },
+  {
+   "repo": "vu3scd/ECU-Audit-Log",
+   "n_files": 4
+  },
+  {
+   "repo": "xakepnz/BLUELAY",
+   "n_files": 4
+  },
+  {
+   "repo": "5Fingers/DNSTrafficAnalyzer",
+   "n_files": 3
+  },
+  {
+   "repo": "Avengers7/ThreatExchange",
+   "n_files": 3
+  },
+  {
+   "repo": "ClearLotus-git/StegoScope",
+   "n_files": 3
+  },
+  {
+   "repo": "CodeByHarri/Incident-Response-and-Threat-Hunting",
+   "n_files": 3
+  },
+  {
+   "repo": "Hacks4Snacks/windows-event-forwarding",
+   "n_files": 3
+  },
+  {
+   "repo": "Jaxon1111/siem_the_nightowl",
+   "n_files": 3
+  },
+  {
+   "repo": "LuCamachoJr/DFIR-Labs",
+   "n_files": 3
+  },
+  {
+   "repo": "Mahir-Ali-khan/Sigma-Rules",
+   "n_files": 3
+  },
+  {
+   "repo": "N4SOC/O365-ThreatHunting",
+   "n_files": 3
+  },
+  {
+   "repo": "SecEngineerX/soc-smart-work",
+   "n_files": 3
+  },
+  {
+   "repo": "ThePicpixel/Sparassidae",
+   "n_files": 3
+  },
+  {
+   "repo": "Viralmaniar/DDWPasteRecon",
+   "n_files": 3
+  },
+  {
+   "repo": "ail-project/ail-feeder-leak",
+   "n_files": 3
+  },
+  {
+   "repo": "ajackal/ir_scripts",
+   "n_files": 3
+  },
+  {
+   "repo": "elceef/dnstwist",
+   "n_files": 3
+  },
+  {
+   "repo": "fukusuket/ThreatfeedCollector",
+   "n_files": 3
+  },
+  {
+   "repo": "ion-storm/sigmaX",
+   "n_files": 3
+  },
+  {
+   "repo": "ivan-sincek/bot-safe-agents",
+   "n_files": 3
+  },
+  {
+   "repo": "ivan-sincek/nagooglesearch",
+   "n_files": 3
+  },
+  {
+   "repo": "izm1chael/Anomy",
+   "n_files": 3
+  },
+  {
+   "repo": "kube-tarian/tarian-policy-engine",
+   "n_files": 3
+  },
+  {
+   "repo": "mf1d3l/HayabusaToWinEventLog",
+   "n_files": 3
+  },
+  {
+   "repo": "rafiqnur007/blackops",
+   "n_files": 3
+  },
+  {
+   "repo": "reveal79/BEC-Detection-Toolkit",
+   "n_files": 3
+  },
+  {
+   "repo": "swisscom/PowerGRR",
+   "n_files": 3
+  },
+  {
+   "repo": "ventz/docker-cif",
+   "n_files": 3
+  },
+  {
+   "repo": "vincenzocaputo/sigma-lookup",
+   "n_files": 3
+  },
+  {
+   "repo": "401trg/utilities",
+   "n_files": 2
+  },
+  {
+   "repo": "AyoobAli/ransomwatch-cli",
+   "n_files": 2
+  },
+  {
+   "repo": "Bert-JanP/Open-Source-Threat-Intel-Feeds",
+   "n_files": 2
+  },
+  {
+   "repo": "ITsHURRICAN3/VT-TH",
+   "n_files": 2
+  },
+  {
+   "repo": "ItsmeGSG/osquery_hunter",
+   "n_files": 2
+  },
+  {
+   "repo": "LasCC/SentinelOne-Userscript",
+   "n_files": 2
+  },
+  {
+   "repo": "MilanDanilovic/net-vulnerability",
+   "n_files": 2
+  },
+  {
+   "repo": "NemesisCyberForce/Palantir-Threat-Detection",
+   "n_files": 2
+  },
+  {
+   "repo": "P3t3rp4rk3r/phishdomain_slack",
+   "n_files": 2
+  },
+  {
+   "repo": "PAST2212/certthreat",
+   "n_files": 2
+  },
+  {
+   "repo": "ReconInfoSec/rhq",
+   "n_files": 2
+  },
+  {
+   "repo": "Red-Labs-Cloud/Threat-Intelligence-Lab",
+   "n_files": 2
+  },
+  {
+   "repo": "RogueCyberSecurityChannel/PyCanary-Python-Canary-Token-Alternative",
+   "n_files": 2
+  },
+  {
+   "repo": "T0pCyber/hawk.github.io",
+   "n_files": 2
+  },
+  {
+   "repo": "TracecatHQ/hunts",
+   "n_files": 2
+  },
+  {
+   "repo": "VirusFriendly/SSHapendoes",
+   "n_files": 2
+  },
+  {
+   "repo": "Xanderux/C2watcher",
+   "n_files": 2
+  },
+  {
+   "repo": "aishee/Yukio",
+   "n_files": 2
+  },
+  {
+   "repo": "an-sh7/Correlated-Threat-Analysis",
+   "n_files": 2
+  },
+  {
+   "repo": "ashwin-patil/threat-hunting-with-notebooks",
+   "n_files": 2
+  },
+  {
+   "repo": "b3b0/snipehunt",
+   "n_files": 2
+  },
+  {
+   "repo": "bartblaze/Yara-rules",
+   "n_files": 2
+  },
+  {
+   "repo": "blwhit/ThreatHunter",
+   "n_files": 2
+  },
+  {
+   "repo": "byfranke/AI-Hunting",
+   "n_files": 2
+  },
+  {
+   "repo": "codernate92/OSINTChat",
+   "n_files": 2
+  },
+  {
+   "repo": "colleybrb/Azure-flow-logs",
+   "n_files": 2
+  },
+  {
+   "repo": "colleybrb/elk-index-fuzzy-matching",
+   "n_files": 2
+  },
+  {
+   "repo": "d3m0n4l3x/yyj-ctf-webgrep",
+   "n_files": 2
+  },
+  {
+   "repo": "darkquasar/AIMOD2",
+   "n_files": 2
+  },
+  {
+   "repo": "dfirsec/ioc_finder",
+   "n_files": 2
+  },
+  {
+   "repo": "drb-ra/C2IntelFeeds",
+   "n_files": 2
+  },
+  {
+   "repo": "ecstatic-nobel/Not-Anti-Virus",
+   "n_files": 2
+  },
+  {
+   "repo": "faisal6me/Powershell-Forensic-Analysis",
+   "n_files": 2
+  },
+  {
+   "repo": "fish-not-phish/cb-inspector",
+   "n_files": 2
+  },
+  {
+   "repo": "frknaykc/Dragon-ThreatResearchHQ",
+   "n_files": 2
+  },
+  {
+   "repo": "gbikram/ThreatTrack",
+   "n_files": 2
+  },
+  {
+   "repo": "haroonawanofficial/XSSInspector-SecurityToolkit",
+   "n_files": 2
+  },
+  {
+   "repo": "idhin/certdrip",
+   "n_files": 2
+  },
+  {
+   "repo": "izm1chael/MHN-Dionaea-Deployment",
+   "n_files": 2
+  },
+  {
+   "repo": "jayzheng98/Mapping-Sysmonlogs-to-ATTACK",
+   "n_files": 2
+  },
+  {
+   "repo": "jepayneMSFT/WEFFLES",
+   "n_files": 2
+  },
+  {
+   "repo": "jipegit/dfir-ioc-ut",
+   "n_files": 2
+  },
+  {
+   "repo": "lukejjh/MicrosoftSentinel",
+   "n_files": 2
+  },
+  {
+   "repo": "m4pol/hunting-rules-repository",
+   "n_files": 2
+  },
+  {
+   "repo": "migros/migros-threat-feeds",
+   "n_files": 2
+  },
+  {
+   "repo": "momohuntergh/momoscamalert",
+   "n_files": 2
+  },
+  {
+   "repo": "olafhartong/TA-Sysmon-deploy",
+   "n_files": 2
+  },
+  {
+   "repo": "op7ic/Invoke-DomainHasher",
+   "n_files": 2
+  },
+  {
+   "repo": "phishing-hunter/auto-hunter",
+   "n_files": 2
+  },
+  {
+   "repo": "rodanmaharjan/ThreatIntelligence",
+   "n_files": 2
+  },
+  {
+   "repo": "sgabe/docker-scirius",
+   "n_files": 2
+  },
+  {
+   "repo": "skull-ttl/DLaL",
+   "n_files": 2
+  },
+  {
+   "repo": "spydisec/spydithreatintel",
+   "n_files": 2
+  },
+  {
+   "repo": "ssnkhan/CyberChef",
+   "n_files": 2
+  },
+  {
+   "repo": "ssnkhan/mihari-maltego-transform",
+   "n_files": 2
+  },
+  {
+   "repo": "t4d/PhishingKitHunter",
+   "n_files": 2
+  },
+  {
+   "repo": "vrikodar/DiaLog",
+   "n_files": 2
+  },
+  {
+   "repo": "webamon-org/MISP-Connector",
+   "n_files": 2
+  },
+  {
+   "repo": "zruvv/IR",
+   "n_files": 2
+  },
+  {
+   "repo": "0x4D31/fatt",
+   "n_files": 1
+  },
+  {
+   "repo": "3gbCyber/User_Accounts_Hunting",
+   "n_files": 1
+  },
+  {
+   "repo": "401trg/detections",
+   "n_files": 1
+  },
+  {
+   "repo": "Bert-JanP/Hunting-Queries-Detection-Rules",
+   "n_files": 1
+  },
+  {
+   "repo": "Br3thren-Org/Artifact-Collection",
+   "n_files": 1
+  },
+  {
+   "repo": "CausticKirbyZ/crystal-otx",
+   "n_files": 1
+  },
+  {
+   "repo": "Cyb3r-Monk/RITA-J",
+   "n_files": 1
+  },
+  {
+   "repo": "Cyb3r-Monk/Threat-Hunting-and-Detection",
+   "n_files": 1
+  },
+  {
+   "repo": "Deon-Trevor/Phishing-Threat-Hunting-Engine",
+   "n_files": 1
+  },
+  {
+   "repo": "Deon-Trevor/registrar-and-hosting-provider-twitter-list",
+   "n_files": 1
+  },
+  {
+   "repo": "EdwardsCP/HuntExes",
+   "n_files": 1
+  },
+  {
+   "repo": "Fadavvi/Yara-Repo",
+   "n_files": 1
+  },
+  {
+   "repo": "FullTang/hunters_flare",
+   "n_files": 1
+  },
+  {
+   "repo": "Hacks4Snacks/linux-auditd",
+   "n_files": 1
+  },
+  {
+   "repo": "HuntDownProject/hunt-for-fun-profit",
+   "n_files": 1
+  },
+  {
+   "repo": "InQuest/awesome-yara",
+   "n_files": 1
+  },
+  {
+   "repo": "InQuest/yara-rules",
+   "n_files": 1
+  },
+  {
+   "repo": "JavierMun/WhoIsWhoAPT",
+   "n_files": 1
+  },
+  {
+   "repo": "Karneades/awesome-malware-persistence",
+   "n_files": 1
+  },
+  {
+   "repo": "KaygusuzAbdal/mitm-guard",
+   "n_files": 1
+  },
+  {
+   "repo": "LearningKijo/SecurityResearcher-Note",
+   "n_files": 1
+  },
+  {
+   "repo": "MADx00/CBTaskBulker",
+   "n_files": 1
+  },
+  {
+   "repo": "Mahir-Ali-khan/Remote-Management-Monitoring-RMM",
+   "n_files": 1
+  },
+  {
+   "repo": "Mheboobkhan/twitter_cti",
+   "n_files": 1
+  },
+  {
+   "repo": "Micahs0Day/micahs0day.github.io",
+   "n_files": 1
+  },
+  {
+   "repo": "Mozart4242/SIEMELK",
+   "n_files": 1
+  },
+  {
+   "repo": "NerdChip/AtomicThreatProfile",
+   "n_files": 1
+  },
+  {
+   "repo": "RandomRhythm/Vendor-Threat-Triage-Lookup",
+   "n_files": 1
+  },
+  {
+   "repo": "Ravenwingz/cyber-lab-notes-Ravenwingz-Portfolio",
+   "n_files": 1
+  },
+  {
+   "repo": "SCS-Labs/TheWatchList",
+   "n_files": 1
+  },
+  {
+   "repo": "SOC-CyberART/CARTI-Feeds",
+   "n_files": 1
+  },
+  {
+   "repo": "Shantnu-Kumar/bulk_iocs_validator.py",
+   "n_files": 1
+  },
+  {
+   "repo": "activecm/save_json_stream",
+   "n_files": 1
+  },
+  {
+   "repo": "ajitpanja22/DeepSeek-Pentest-AI",
+   "n_files": 1
+  },
+  {
+   "repo": "ajread4/prefetcher",
+   "n_files": 1
+  },
+  {
+   "repo": "akeemclarke/detect-anomalous-logons",
+   "n_files": 1
+  },
+  {
+   "repo": "alt3kx/wafparan01d3",
+   "n_files": 1
+  },
+  {
+   "repo": "bfuzzy/auditd-attack",
+   "n_files": 1
+  },
+  {
+   "repo": "caliskanfurkan/quick-ir",
+   "n_files": 1
+  },
+  {
+   "repo": "colleybrb/AWS-Flow-Logs",
+   "n_files": 1
+  },
+  {
+   "repo": "colleybrb/falcon-prime-bulk-ip",
+   "n_files": 1
+  },
+  {
+   "repo": "corvus0x/HashHunter0x",
+   "n_files": 1
+  },
+  {
+   "repo": "dalejrenner/threatintelligence",
+   "n_files": 1
+  },
+  {
+   "repo": "dc401/cybercounterintel",
+   "n_files": 1
+  },
+  {
+   "repo": "dfirvault/Chainsaw-scanner-menu",
+   "n_files": 1
+  },
+  {
+   "repo": "dfirvault/Hayabusa-scanner-menu",
+   "n_files": 1
+  },
+  {
+   "repo": "ecstatic-nobel/Google-Indicator-Search",
+   "n_files": 1
+  },
+  {
+   "repo": "egrzeszczak/kql",
+   "n_files": 1
+  },
+  {
+   "repo": "emrekybs/Douglas-042",
+   "n_files": 1
+  },
+  {
+   "repo": "eremit4/cs-discovery",
+   "n_files": 1
+  },
+  {
+   "repo": "frankgraziano/Okta_Threat_Hunting_Notebook",
+   "n_files": 1
+  },
+  {
+   "repo": "grizzsec/HuntLG",
+   "n_files": 1
+  },
+  {
+   "repo": "idiom/EmerSearch",
+   "n_files": 1
+  },
+  {
+   "repo": "iyonr/fortianalyzer-log-parser",
+   "n_files": 1
+  },
+  {
+   "repo": "jayzheng98/Syslog-Graph",
+   "n_files": 1
+  },
+  {
+   "repo": "jemik/processhunter",
+   "n_files": 1
+  },
+  {
+   "repo": "jordanjoewatson/swi2",
+   "n_files": 1
+  },
+  {
+   "repo": "jstrosch/shodan-scan-wrapper",
+   "n_files": 1
+  },
+  {
+   "repo": "jwashek/TTPMap",
+   "n_files": 1
+  },
+  {
+   "repo": "jymcheong/SysmonResources",
+   "n_files": 1
+  },
+  {
+   "repo": "kfallahi/WinAuthLogParser",
+   "n_files": 1
+  },
+  {
+   "repo": "lawndoc/AdvancedHuntingQueries",
+   "n_files": 1
+  },
+  {
+   "repo": "litolito54/CVE-2025-11001",
+   "n_files": 1
+  },
+  {
+   "repo": "m-wentz/magnify",
+   "n_files": 1
+  },
+  {
+   "repo": "medmac01/mitre_attack_neo4j",
+   "n_files": 1
+  },
+  {
+   "repo": "meghabyte-og/SEIM",
+   "n_files": 1
+  },
+  {
+   "repo": "nikolozsec/webr",
+   "n_files": 1
+  },
+  {
+   "repo": "op7ic/GeoIPPlotter",
+   "n_files": 1
+  },
+  {
+   "repo": "osintbrazuca/osint-brazuca-regex",
+   "n_files": 1
+  },
+  {
+   "repo": "osnolanarf/reputator",
+   "n_files": 1
+  },
+  {
+   "repo": "reportsmishing/knowledgebase",
+   "n_files": 1
+  },
+  {
+   "repo": "reportsmishing/public_code",
+   "n_files": 1
+  },
+  {
+   "repo": "rpfilomeno/darahata",
+   "n_files": 1
+  },
+  {
+   "repo": "sachinoliver/BlackIP-Rep",
+   "n_files": 1
+  },
+  {
+   "repo": "sbousseaden/Slides",
+   "n_files": 1
+  },
+  {
+   "repo": "securedbymia/AI-Threat-Hunter",
+   "n_files": 1
+  },
+  {
+   "repo": "spmedia/Telegram-Channel-Joiner",
+   "n_files": 1
+  },
+  {
+   "repo": "tatsui-geek/pastehunter-install",
+   "n_files": 1
+  },
+  {
+   "repo": "themalwarenews/AbuseIPdb",
+   "n_files": 1
+  },
+  {
+   "repo": "tjames192/ThreatManagementExplorer",
+   "n_files": 1
+  },
+  {
+   "repo": "vitorallo/KQL-sentinel-mdr-reference",
+   "n_files": 1
+  }
+ ],
+ "_meta": {
+  "dataset_sha": "210b9259be248323b0b3bc58252bed3fde53135f",
+  "generated_at": "2026-10-11T18:23:23+0000"
+ }
+}

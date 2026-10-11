@@ -1,0 +1,84 @@
+{
+ "topic": "adversary-simulation",
+ "source": "hf-statistics",
+ "num_examples_hf": 297,
+ "partial_stats": false,
+ "hf_license_distribution": {
+  "MIT": 44,
+  "CC0-1.0": 6,
+  "BSD-3-Clause": 47,
+  "Apache-2.0": 9,
+  "NOASSERTION": 17
+ },
+ "n_repos": 16,
+ "repos": [
+  {
+   "repo": "Vith0r/dr4ke-c2",
+   "n_files": 60
+  },
+  {
+   "repo": "WesleyWong420/OPSEC-Tradecraft",
+   "n_files": 53
+  },
+  {
+   "repo": "WesleyWong420/Build-Your-Own-LOLBins",
+   "n_files": 38
+  },
+  {
+   "repo": "mvelazc0/PurpleSharp",
+   "n_files": 34
+  },
+  {
+   "repo": "redcanaryco/chain-reactor",
+   "n_files": 22
+  },
+  {
+   "repo": "CyberStackPro/wraithmarked",
+   "n_files": 17
+  },
+  {
+   "repo": "credibleforce/adversary-simulation-workshop",
+   "n_files": 16
+  },
+  {
+   "repo": "mvelazc0/PurpleSpray",
+   "n_files": 13
+  },
+  {
+   "repo": "joeavanzato/goexec",
+   "n_files": 9
+  },
+  {
+   "repo": "mvelazc0/msInvader",
+   "n_files": 9
+  },
+  {
+   "repo": "mzet-/z-field-manual",
+   "n_files": 6
+  },
+  {
+   "repo": "zarkones/ControlACCESS",
+   "n_files": 6
+  },
+  {
+   "repo": "tijme/amd-ryzen-master-driver-v17-exploit",
+   "n_files": 4
+  },
+  {
+   "repo": "zarkones/ControlABILITY",
+   "n_files": 4
+  },
+  {
+   "repo": "credibleforce/ansible-invoke-atomic-redteam",
+   "n_files": 3
+  },
+  {
+   "repo": "tijme/blackout-reloaded",
+   "n_files": 3
+  }
+ ],
+ "_meta": {
+  "dataset_sha": "210b9259be248323b0b3bc58252bed3fde53135f",
+  "generated_at": "2026-10-11T18:16:35+0000"
+ }
+}

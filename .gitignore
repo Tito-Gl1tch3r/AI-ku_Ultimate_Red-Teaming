@@ -1,0 +1,18 @@
+# Artefactos locales generados por el pipeline (NO se versionan)
+corpus/
+.workspace/
+catalog/github/_checkpoint.json
+results/**/manifest.jsonl.tmp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secretos — nunca versionar tokens
+.env
+*token*
+.secrets/
+
+# OS
+.DS_Store

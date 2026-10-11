@@ -1,0 +1,294 @@
+{
+ "dataset": "tandevllc/offsec_redteam_codes",
+ "sha": "210b9259be248323b0b3bc58252bed3fde53135f",
+ "gated": "manual",
+ "generated_at": "2026-10-11T18:16:34+0000",
+ "hf_license_note": "compilación TanDev Proprietary — solo catálogo, contenido prohibido",
+ "topics": {
+  "adversary-emulation": {
+   "config": true,
+   "shards": 1,
+   "rows_hf": 6686,
+   "catalog_source": "hf-statistics",
+   "n_repos": 30,
+   "partial_stats": false
+  },
+  "adversary-simulation": {
+   "config": true,
+   "shards": 1,
+   "rows_hf": 297,
+   "catalog_source": "hf-statistics",
+   "n_repos": 16,
+   "partial_stats": false
+  },
+  "binary-exploitation": {
+   "config": true,
+   "shards": 1,
+   "rows_hf": 3760,
+   "catalog_source": "hf-statistics",
+   "n_repos": 96,
+   "partial_stats": false
+  },
+  "bug-bounty": {
+   "config": true,
+   "shards": 1,
+   "rows_hf": 14020,
+   "catalog_source": "hf-statistics",
+   "n_repos": 484,
+   "partial_stats": false
+  },
+  "bugbounty": {
+   "config": true,
+   "shards": 4,
+   "rows_hf": 283694,
+   "catalog_source": "github-topics",
+   "n_repos": 500,
+   "partial_stats": false
+  },
+  "c2": {
+   "config": true,
+   "shards": 1,
+   "rows_hf": 6075,
+   "catalog_source": "hf-statistics",
+   "n_repos": 211,
+   "partial_stats": false
+  },
+  "command-and-control": {
+   "config": true,
+   "shards": 1,
+   "rows_hf": 2864,
+   "catalog_source": "hf-statistics",
+   "n_repos": 139,
+   "partial_stats": false
+  },
+  "ctf": {
+   "config": true,
+   "shards": 10,
+   "rows_hf": 288417,
+   "catalog_source": "github-topics",
+   "n_repos": 500,
+   "partial_stats": false
+  },
+  "ethical-hacking": {
+   "config": true,
+   "shards": 1,
+   "rows_hf": 20317,
+   "catalog_source": "github-topics",
+   "n_repos": 500,
+   "partial_stats": false
+  },
+  "exploit": {
+   "config": true,
+   "shards": 8,
+   "rows_hf": 530182,
+   "catalog_source": "github-topics",
+   "n_repos": 500,
+   "partial_stats": false
+  },
+  "exploitation": {
+   "config": true,
+   "shards": 1,
+   "rows_hf": 25221,
+   "catalog_source": "hf-statistics",
+   "n_repos": 270,
+   "partial_stats": false
+  },
+  "forensics": {
+   "config": true,
+   "shards": 3,
+   "rows_hf": 49299,
+   "catalog_source": "github-topics",
+   "n_repos": 500,
+   "partial_stats": false
+  },
+  "lateral-movement": {
+   "config": true,
+   "shards": 1,
+   "rows_hf": 357,
+   "catalog_source": "hf-statistics",
+   "n_repos": 25,
+   "partial_stats": false
+  },
+  "malware-analysis": {
+   "config": true,
+   "shards": 8,
+   "rows_hf": 74275,
+   "catalog_source": "github-topics",
+   "n_repos": 500,
+   "partial_stats": false
+  },
+  "offensive-security": {
+   "config": true,
+   "shards": 1,
+   "rows_hf": 18641,
+   "catalog_source": "hf-statistics",
+   "n_repos": 387,
+   "partial_stats": false
+  },
+  "osint": {
+   "config": true,
+   "shards": 38,
+   "rows_hf": 382956,
+   "catalog_source": "github-topics",
+   "n_repos": 500,
+   "partial_stats": false
+  },
+  "penetration-testing": {
+   "config": true,
+   "shards": 3,
+   "rows_hf": 72373,
+   "catalog_source": "github-topics",
+   "n_repos": 500,
+   "partial_stats": false
+  },
+  "pentesting": {
+   "config": true,
+   "shards": 11,
+   "rows_hf": 406119,
+   "catalog_source": "github-topics",
+   "n_repos": 500,
+   "partial_stats": false
+  },
+  "persistence": {
+   "config": true,
+   "shards": 2,
+   "rows_hf": 71027,
+   "catalog_source": "hf-statistics",
+   "n_repos": 855,
+   "partial_stats": false
+  },
+  "post-exploitation": {
+   "config": true,
+   "shards": 1,
+   "rows_hf": 6984,
+   "catalog_source": "hf-statistics",
+   "n_repos": 128,
+   "partial_stats": false
+  },
+  "privilege-escalation": {
+   "config": true,
+   "shards": 1,
+   "rows_hf": 3436,
+   "catalog_source": "hf-statistics",
+   "n_repos": 222,
+   "partial_stats": false
+  },
+  "pwn": {
+   "config": true,
+   "shards": 1,
+   "rows_hf": 10070,
+   "catalog_source": "hf-statistics",
+   "n_repos": 128,
+   "partial_stats": false
+  },
+  "recon": {
+   "config": true,
+   "shards": 1,
+   "rows_hf": 20041,
+   "catalog_source": "hf-statistics",
+   "n_repos": 560,
+   "partial_stats": false
+  },
+  "reconnaissance": {
+   "config": true,
+   "shards": 4,
+   "rows_hf": 233813,
+   "catalog_source": "github-topics",
+   "n_repos": 500,
+   "partial_stats": false
+  },
+  "red-team": {
+   "config": true,
+   "shards": 2,
+   "rows_hf": 30587,
+   "catalog_source": "hf-statistics",
+   "n_repos": 691,
+   "partial_stats": false
+  },
+  "redteam": {
+   "config": true,
+   "shards": 2,
+   "rows_hf": 46864,
+   "catalog_source": "github-topics",
+   "n_repos": 500,
+   "partial_stats": false
+  },
+  "reverse-engineering": {
+   "config": true,
+   "shards": 42,
+   "rows_hf": 356459,
+   "catalog_source": "github-topics",
+   "n_repos": 500,
+   "partial_stats": true
+  },
+  "security": {
+   "config": true,
+   "shards": 40,
+   "rows_hf": 794250,
+   "catalog_source": "github-topics",
+   "n_repos": 500,
+   "partial_stats": true
+  },
+  "threat-hunting": {
+   "config": true,
+   "shards": 4,
+   "rows_hf": 52454,
+   "catalog_source": "hf-statistics",
+   "n_repos": 475,
+   "partial_stats": false
+  },
+  "webhacking": {
+   "config": true,
+   "shards": 1,
+   "rows_hf": 2144,
+   "catalog_source": "hf-statistics",
+   "n_repos": 47,
+   "partial_stats": false
+  },
+  "raw": {
+   "config": false,
+   "shards": 0,
+   "rows_hf": null,
+   "catalog_source": "none",
+   "note": "config inexistente en la revisión actual (sha 210b925); sin catálogo. Cubierto semánticamente por configs afines (exploit/pwn/ctf)."
+  }
+ },
+ "summary": {
+  "configs": 30,
+  "total_shards": 196,
+  "repos_unicos_union": 9576,
+  "por_fuente": {
+   "adversary-emulation": "hf-statistics",
+   "adversary-simulation": "hf-statistics",
+   "binary-exploitation": "hf-statistics",
+   "bug-bounty": "hf-statistics",
+   "bugbounty": "github-topics",
+   "c2": "hf-statistics",
+   "command-and-control": "hf-statistics",
+   "ctf": "github-topics",
+   "ethical-hacking": "github-topics",
+   "exploit": "github-topics",
+   "exploitation": "hf-statistics",
+   "forensics": "github-topics",
+   "lateral-movement": "hf-statistics",
+   "malware-analysis": "github-topics",
+   "offensive-security": "hf-statistics",
+   "osint": "github-topics",
+   "penetration-testing": "github-topics",
+   "pentesting": "github-topics",
+   "persistence": "hf-statistics",
+   "post-exploitation": "hf-statistics",
+   "privilege-escalation": "hf-statistics",
+   "pwn": "hf-statistics",
+   "recon": "hf-statistics",
+   "reconnaissance": "github-topics",
+   "red-team": "hf-statistics",
+   "redteam": "github-topics",
+   "reverse-engineering": "github-topics",
+   "security": "github-topics",
+   "threat-hunting": "hf-statistics",
+   "webhacking": "hf-statistics",
+   "raw": "none"
+  }
+ }
+}

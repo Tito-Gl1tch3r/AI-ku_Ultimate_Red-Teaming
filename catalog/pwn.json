@@ -1,0 +1,535 @@
+{
+ "topic": "pwn",
+ "source": "hf-statistics",
+ "num_examples_hf": 10070,
+ "partial_stats": false,
+ "hf_license_distribution": {
+  "NOASSERTION": 320,
+  "GPL-3.0": 117,
+  "MPL-2.0": 1359,
+  "GPL-2.0": 32,
+  "MIT": 385,
+  "CC-BY-4.0": 71,
+  "AGPL-3.0": 2,
+  "Apache-2.0": 93
+ },
+ "n_repos": 128,
+ "repos": [
+  {
+   "repo": "drtychai/browser-exploitation",
+   "n_files": 3775
+  },
+  {
+   "repo": "bernie6401/CTF",
+   "n_files": 1552
+  },
+  {
+   "repo": "zyazhb/Writeups",
+   "n_files": 1359
+  },
+  {
+   "repo": "bash-c/pwn_repo",
+   "n_files": 336
+  },
+  {
+   "repo": "dnsdudrla97/pwn",
+   "n_files": 334
+  },
+  {
+   "repo": "jayofelony/pwnagotchi",
+   "n_files": 318
+  },
+  {
+   "repo": "david942j/ctf-writeups",
+   "n_files": 240
+  },
+  {
+   "repo": "un1c0rn-the-pwnie/FSOPAgain",
+   "n_files": 231
+  },
+  {
+   "repo": "L1B0/CTF",
+   "n_files": 109
+  },
+  {
+   "repo": "ivanmedina/Pwning",
+   "n_files": 81
+  },
+  {
+   "repo": "PoCInnovation/Pool2020",
+   "n_files": 80
+  },
+  {
+   "repo": "0x4m4/BloodCodeCTF",
+   "n_files": 76
+  },
+  {
+   "repo": "xairy/easy-linux-pwn",
+   "n_files": 71
+  },
+  {
+   "repo": "47c/pwn-plusplus",
+   "n_files": 67
+  },
+  {
+   "repo": "bernie6401/NTU_CS",
+   "n_files": 67
+  },
+  {
+   "repo": "AlBovo/CTF-Writeups",
+   "n_files": 56
+  },
+  {
+   "repo": "0xricksanchez/AFL_Runner",
+   "n_files": 53
+  },
+  {
+   "repo": "Strabox/PWN-Compiler",
+   "n_files": 51
+  },
+  {
+   "repo": "thelikes/rejig",
+   "n_files": 51
+  },
+  {
+   "repo": "D4mianWayne/roppy",
+   "n_files": 49
+  },
+  {
+   "repo": "tj-oconnor/undergrad-vr",
+   "n_files": 49
+  },
+  {
+   "repo": "Scorpion197/PWN",
+   "n_files": 42
+  },
+  {
+   "repo": "Coldwave96/PwnProjects",
+   "n_files": 41
+  },
+  {
+   "repo": "warsztatywww/linux-pwning",
+   "n_files": 41
+  },
+  {
+   "repo": "RobinHsieh/CaptureTheFlag",
+   "n_files": 40
+  },
+  {
+   "repo": "Younesfdj/MCTF-Challenges",
+   "n_files": 32
+  },
+  {
+   "repo": "ant4g0nist/lisa.py",
+   "n_files": 31
+  },
+  {
+   "repo": "0xSoEasY/ROPemporium",
+   "n_files": 28
+  },
+  {
+   "repo": "0x4a47/Sectalks-MEL0x14-CTF",
+   "n_files": 26
+  },
+  {
+   "repo": "geoffrey-diederichs/ROP_Emporium",
+   "n_files": 26
+  },
+  {
+   "repo": "th3happybit/protostar-docker",
+   "n_files": 26
+  },
+  {
+   "repo": "yuawn/AIS3-2019-pre-exam",
+   "n_files": 25
+  },
+  {
+   "repo": "Arusekk/pwn-school",
+   "n_files": 23
+  },
+  {
+   "repo": "tjcaul/writeups",
+   "n_files": 22
+  },
+  {
+   "repo": "wangray/pwnable_kr",
+   "n_files": 22
+  },
+  {
+   "repo": "zzcentury/pwnstudy",
+   "n_files": 22
+  },
+  {
+   "repo": "gbrls/pwn",
+   "n_files": 21
+  },
+  {
+   "repo": "alpkeskin/mosint",
+   "n_files": 20
+  },
+  {
+   "repo": "kyle65463/CS2021",
+   "n_files": 20
+  },
+  {
+   "repo": "l-iberty/Overflow",
+   "n_files": 19
+  },
+  {
+   "repo": "FrancescoLucarini/pwnable.kr-exploits",
+   "n_files": 17
+  },
+  {
+   "repo": "hugsy/ropgadget-rs",
+   "n_files": 17
+  },
+  {
+   "repo": "Anthares101/omega",
+   "n_files": 16
+  },
+  {
+   "repo": "ntiger1024/easy-android-pwn",
+   "n_files": 16
+  },
+  {
+   "repo": "TomQunChao/pwn_envs_docker",
+   "n_files": 15
+  },
+  {
+   "repo": "arthubhub/PWN_HackUTT",
+   "n_files": 15
+  },
+  {
+   "repo": "0000000O0Oo/BinaryExploitation",
+   "n_files": 14
+  },
+  {
+   "repo": "arthubhub/Multiarch-PwnBox",
+   "n_files": 14
+  },
+  {
+   "repo": "geowrgetudor/wifi-pwner",
+   "n_files": 14
+  },
+  {
+   "repo": "skyepodium/protostar-writeup",
+   "n_files": 14
+  },
+  {
+   "repo": "0xaww/awd-submit-flag",
+   "n_files": 13
+  },
+  {
+   "repo": "FrancescoLucarini/Linux-Kernel-CTF-exploits",
+   "n_files": 13
+  },
+  {
+   "repo": "0xShad3/cybersec-writeups",
+   "n_files": 12
+  },
+  {
+   "repo": "cheaterdxd/Auth0_CTF_2021",
+   "n_files": 12
+  },
+  {
+   "repo": "do9dark/CTF",
+   "n_files": 12
+  },
+  {
+   "repo": "plusls/pwn-server",
+   "n_files": 12
+  },
+  {
+   "repo": "zteeed/OverTheWire-AutoSolves",
+   "n_files": 11
+  },
+  {
+   "repo": "4ngel2769/pwnagotchi-generator",
+   "n_files": 10
+  },
+  {
+   "repo": "Protosec-Research/PwnBERT",
+   "n_files": 10
+  },
+  {
+   "repo": "goorkamateusz/AVRExample",
+   "n_files": 10
+  },
+  {
+   "repo": "sundaysec/pwn3r",
+   "n_files": 10
+  },
+  {
+   "repo": "FDlucifer/FDlucifer.github.io",
+   "n_files": 9
+  },
+  {
+   "repo": "Mhackiori/CVE-2021-3156",
+   "n_files": 9
+  },
+  {
+   "repo": "Ro0tk1t/LibcSearcher3",
+   "n_files": 9
+  },
+  {
+   "repo": "blahcat/blahcat.github.io",
+   "n_files": 9
+  },
+  {
+   "repo": "drtychai/Intro-to-Chrome-Exploitation",
+   "n_files": 9
+  },
+  {
+   "repo": "ret2p4nda/ret2p4nda.github.io",
+   "n_files": 9
+  },
+  {
+   "repo": "santaclz/ARM_vs_x86",
+   "n_files": 9
+  },
+  {
+   "repo": "KanekiWeb/Email-Osint",
+   "n_files": 8
+  },
+  {
+   "repo": "cyclone-github/phantom_pwn",
+   "n_files": 8
+  },
+  {
+   "repo": "mcieno/pwnable.tw",
+   "n_files": 8
+  },
+  {
+   "repo": "sShaAanGg/ADC-projects",
+   "n_files": 8
+  },
+  {
+   "repo": "xyzz/f00d",
+   "n_files": 8
+  },
+  {
+   "repo": "AlBovo/ROPEmporium",
+   "n_files": 7
+  },
+  {
+   "repo": "TralseDev/BAF",
+   "n_files": 7
+  },
+  {
+   "repo": "publicqi/one_fmt",
+   "n_files": 7
+  },
+  {
+   "repo": "Byzero512/peda-windows",
+   "n_files": 6
+  },
+  {
+   "repo": "andreami96/ACT-challs",
+   "n_files": 6
+  },
+  {
+   "repo": "cyclone-github/atomic_pwn",
+   "n_files": 6
+  },
+  {
+   "repo": "lhitori/raycharles",
+   "n_files": 6
+  },
+  {
+   "repo": "Jaycelation/PWN",
+   "n_files": 5
+  },
+  {
+   "repo": "NikitaFoxze/Offensive-Core",
+   "n_files": 5
+  },
+  {
+   "repo": "geoffrey-diederichs/Hack_in_2025",
+   "n_files": 5
+  },
+  {
+   "repo": "higorpo/samp-h1z1br",
+   "n_files": 5
+  },
+  {
+   "repo": "sigpwny/pwn-docker",
+   "n_files": 5
+  },
+  {
+   "repo": "hnts/goelftools",
+   "n_files": 4
+  },
+  {
+   "repo": "link1nk/VulnerabilityWalkthrough",
+   "n_files": 4
+  },
+  {
+   "repo": "polishing-labs/patchup",
+   "n_files": 4
+  },
+  {
+   "repo": "0xSoEasY/HTB-University-CTF-2021",
+   "n_files": 3
+  },
+  {
+   "repo": "Asuri-Team/ctf-xinetd",
+   "n_files": 3
+  },
+  {
+   "repo": "ScriptKiddieTutorials/Bypass-UAC",
+   "n_files": 3
+  },
+  {
+   "repo": "SouleEater99/libasm",
+   "n_files": 3
+  },
+  {
+   "repo": "admeder/awsome-pwnozoic-era",
+   "n_files": 3
+  },
+  {
+   "repo": "arthubhub/PoE_pwnbox",
+   "n_files": 3
+  },
+  {
+   "repo": "giantbranch/pwn_deploy_chroot",
+   "n_files": 3
+  },
+  {
+   "repo": "higorpo/samp-mcrpg",
+   "n_files": 3
+  },
+  {
+   "repo": "itehax/experiments",
+   "n_files": 3
+  },
+  {
+   "repo": "lancet-sec/daily-pwn",
+   "n_files": 3
+  },
+  {
+   "repo": "sagittarius-a/guidra",
+   "n_files": 3
+  },
+  {
+   "repo": "0xricksanchez/Shellcoder",
+   "n_files": 2
+  },
+  {
+   "repo": "Denloob/gdb-pwn-manager",
+   "n_files": 2
+  },
+  {
+   "repo": "Lynk4/pwnable.kr",
+   "n_files": 2
+  },
+  {
+   "repo": "NexiusTailer/ByFly-GTA-SA-GangWar",
+   "n_files": 2
+  },
+  {
+   "repo": "NexiusTailer/Ultimate-Creator",
+   "n_files": 2
+  },
+  {
+   "repo": "SergeyIvanovDevelop/Buffer-Overflow-Attack",
+   "n_files": 2
+  },
+  {
+   "repo": "Srakai/shellcodes",
+   "n_files": 2
+  },
+  {
+   "repo": "alireza-87/TopplerPatch",
+   "n_files": 2
+  },
+  {
+   "repo": "cr4sh-me2/blackout",
+   "n_files": 2
+  },
+  {
+   "repo": "cyclone-github/metamask_pwn",
+   "n_files": 2
+  },
+  {
+   "repo": "gauthammk/TryHackMe-Writeups",
+   "n_files": 2
+  },
+  {
+   "repo": "kimusan/pkwner",
+   "n_files": 2
+  },
+  {
+   "repo": "wangray/pwnable_tw",
+   "n_files": 2
+  },
+  {
+   "repo": "yikesoftware/d3ctf-2021-pwn-d3dev",
+   "n_files": 2
+  },
+  {
+   "repo": "AngelKitty/Computer-Virus",
+   "n_files": 1
+  },
+  {
+   "repo": "ChaChaNop-Slide/ptrfind",
+   "n_files": 1
+  },
+  {
+   "repo": "Coldwave96/LibcOffset",
+   "n_files": 1
+  },
+  {
+   "repo": "Eigensystem/Glibc_Dynamic_Debugging",
+   "n_files": 1
+  },
+  {
+   "repo": "FrancescoLucarini/FrancescoLucarini.github.io",
+   "n_files": 1
+  },
+  {
+   "repo": "RICARDOCRC735/NavicatPwn",
+   "n_files": 1
+  },
+  {
+   "repo": "SeniorAm/BanSystem",
+   "n_files": 1
+  },
+  {
+   "repo": "asgerfv/ctf-writeup_2017__bfs-ekoparty-challenge",
+   "n_files": 1
+  },
+  {
+   "repo": "giridharprasath/scripts",
+   "n_files": 1
+  },
+  {
+   "repo": "itsmehacker/CardPwn",
+   "n_files": 1
+  },
+  {
+   "repo": "lebr0nli/pwndocker-automator",
+   "n_files": 1
+  },
+  {
+   "repo": "mirawara/pwn-check",
+   "n_files": 1
+  },
+  {
+   "repo": "natumn/test-exploit",
+   "n_files": 1
+  },
+  {
+   "repo": "thelinuxuser-choice/pwn",
+   "n_files": 1
+  },
+  {
+   "repo": "yikesoftware/d3ctf-2022-pwn-d3guard",
+   "n_files": 1
+  }
+ ],
+ "_meta": {
+  "dataset_sha": "210b9259be248323b0b3bc58252bed3fde53135f",
+  "generated_at": "2026-10-11T18:21:14+0000"
+ }
+}

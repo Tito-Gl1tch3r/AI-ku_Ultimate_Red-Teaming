@@ -1,0 +1,49 @@
+{
+ "total": 759,
+ "accepted": 301,
+ "rejected": 458,
+ "by_reason": {
+  "LICENSE_NON_PERMISSIVE": 436,
+  "accepted": 301,
+  "REPO_MISSING": 21,
+  "DMCA_BLOCKED": 1
+ },
+ "accepted_by_topic": {
+  "ethical-hacking": 19,
+  "security": 18,
+  "persistence": 18,
+  "red-team": 17,
+  "reconnaissance": 16,
+  "recon": 15,
+  "bugbounty": 15,
+  "exploit": 15,
+  "reverse-engineering": 15,
+  "ctf": 14,
+  "adversary-emulation": 13,
+  "bug-bounty": 13,
+  "privilege-escalation": 13,
+  "penetration-testing": 12,
+  "osint": 12,
+  "pentesting": 12,
+  "webhacking": 12,
+  "malware-analysis": 12,
+  "c2": 11,
+  "forensics": 11,
+  "offensive-security": 10,
+  "threat-hunting": 10,
+  "command-and-control": 9,
+  "lateral-movement": 9,
+  "post-exploitation": 9,
+  "adversary-simulation": 8,
+  "redteam": 8,
+  "pwn": 6,
+  "exploitation": 5,
+  "binary-exploitation": 3
+ },
+ "spdx_accepted_list": [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause"
+ ]
+}

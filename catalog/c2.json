@@ -1,0 +1,869 @@
+{
+ "topic": "c2",
+ "source": "hf-statistics",
+ "num_examples_hf": 6075,
+ "partial_stats": false,
+ "hf_license_distribution": {
+  "BSD-3-Clause": 123,
+  "Apache-2.0": 766,
+  "AGPL-3.0": 74,
+  "NOASSERTION": 75,
+  "CC0-1.0": 1,
+  "GPL-2.0": 4,
+  "GPL-3.0": 1573,
+  "MIT": 1414,
+  "Unlicense": 3,
+  "BSD-2-Clause": 8
+ },
+ "n_repos": 211,
+ "repos": [
+  {
+   "repo": "chainreactors/malice-network",
+   "n_files": 445
+  },
+  {
+   "repo": "SaturnsVoid/Project-Whis",
+   "n_files": 424
+  },
+  {
+   "repo": "dickriding/Ddos-Archive",
+   "n_files": 407
+  },
+  {
+   "repo": "byt3n33dl3/C2sliver",
+   "n_files": 353
+  },
+  {
+   "repo": "killswitch-GUI/flask_appengine_redirector",
+   "n_files": 228
+  },
+  {
+   "repo": "chainreactors/malefic",
+   "n_files": 221
+  },
+  {
+   "repo": "Laster-dev/AVAS",
+   "n_files": 209
+  },
+  {
+   "repo": "byt3n33dl3/thc-AdaptixC2",
+   "n_files": 192
+  },
+  {
+   "repo": "cbrnrd/maliketh",
+   "n_files": 180
+  },
+  {
+   "repo": "tassoneroberto/botnet-manager",
+   "n_files": 130
+  },
+  {
+   "repo": "r3nt0n/zombiegang",
+   "n_files": 118
+  },
+  {
+   "repo": "nu11zy/rscc",
+   "n_files": 114
+  },
+  {
+   "repo": "kabartsjc/boomslang-c2-sim",
+   "n_files": 111
+  },
+  {
+   "repo": "parasomni/paralyze",
+   "n_files": 99
+  },
+  {
+   "repo": "sweatyrocket/Cordite",
+   "n_files": 93
+  },
+  {
+   "repo": "LittleAtariXE/Draconus",
+   "n_files": 91
+  },
+  {
+   "repo": "dobin/antnium",
+   "n_files": 80
+  },
+  {
+   "repo": "APT16/CS-Artifact-kit-7",
+   "n_files": 79
+  },
+  {
+   "repo": "Maclow42/EpiRootkit",
+   "n_files": 79
+  },
+  {
+   "repo": "postmannen/ctrl",
+   "n_files": 74
+  },
+  {
+   "repo": "Code-Barru/icarus",
+   "n_files": 65
+  },
+  {
+   "repo": "ElJaviLuki/CobaltStrike_OpenBeacon",
+   "n_files": 65
+  },
+  {
+   "repo": "INotGreen/XiebroC2",
+   "n_files": 65
+  },
+  {
+   "repo": "TryGOTry/C2_Demo",
+   "n_files": 60
+  },
+  {
+   "repo": "TryZeroOne/Contagio",
+   "n_files": 58
+  },
+  {
+   "repo": "TryZeroOne/Contagio-closed",
+   "n_files": 58
+  },
+  {
+   "repo": "D13Xian/CobaltStrike-KunKun",
+   "n_files": 54
+  },
+  {
+   "repo": "skylerknecht/connect",
+   "n_files": 53
+  },
+  {
+   "repo": "BC-SECURITY/Starkiller",
+   "n_files": 49
+  },
+  {
+   "repo": "Cr4sh/MicroBackdoor",
+   "n_files": 39
+  },
+  {
+   "repo": "julecko/Watcher",
+   "n_files": 39
+  },
+  {
+   "repo": "duonghaipham/c2-group",
+   "n_files": 38
+  },
+  {
+   "repo": "youlha1/thebear",
+   "n_files": 37
+  },
+  {
+   "repo": "0xvpr/Malicious-Software-Research",
+   "n_files": 36
+  },
+  {
+   "repo": "tetsuyanh/c2c-demo",
+   "n_files": 36
+  },
+  {
+   "repo": "arhadnane/C2SimulationFramework",
+   "n_files": 34
+  },
+  {
+   "repo": "shadow-workers/shadow-workers",
+   "n_files": 34
+  },
+  {
+   "repo": "tfdahlin/gothmog",
+   "n_files": 33
+  },
+  {
+   "repo": "byt3n33dl3/WinCobaltExec",
+   "n_files": 32
+  },
+  {
+   "repo": "enigma522/C2-framework",
+   "n_files": 32
+  },
+  {
+   "repo": "pjsacchet/Windows-RAT",
+   "n_files": 32
+  },
+  {
+   "repo": "JoelGMSec/Kitsune",
+   "n_files": 31
+  },
+  {
+   "repo": "PipelinePhantom/sec.pphantom.core",
+   "n_files": 31
+  },
+  {
+   "repo": "alberdjuniawan/c2-server",
+   "n_files": 31
+  },
+  {
+   "repo": "Erarnitox/GhettoC2",
+   "n_files": 30
+  },
+  {
+   "repo": "Wolf-dot/r-proxy-rat-blog",
+   "n_files": 29
+  },
+  {
+   "repo": "weird1337/Stanley",
+   "n_files": 29
+  },
+  {
+   "repo": "1Birdo/Mirai-Variant",
+   "n_files": 27
+  },
+  {
+   "repo": "Termindiego25/enyxma",
+   "n_files": 27
+  },
+  {
+   "repo": "sensepost/godoh",
+   "n_files": 27
+  },
+  {
+   "repo": "4lxprime/PhyNet",
+   "n_files": 26
+  },
+  {
+   "repo": "BeatHubmann/atlas",
+   "n_files": 26
+  },
+  {
+   "repo": "Wybu/Keylogger101",
+   "n_files": 26
+  },
+  {
+   "repo": "ken3009le/GavedUP_c2",
+   "n_files": 26
+  },
+  {
+   "repo": "censys-workshop/threatfox-censys",
+   "n_files": 25
+  },
+  {
+   "repo": "herwonowr/slackhell",
+   "n_files": 25
+  },
+  {
+   "repo": "maxDcb/C2TeamServer",
+   "n_files": 25
+  },
+  {
+   "repo": "GuiEpi/Omniscient",
+   "n_files": 24
+  },
+  {
+   "repo": "Mangofang/EasyContral",
+   "n_files": 24
+  },
+  {
+   "repo": "CirqueiraDev/KryptonC2",
+   "n_files": 23
+  },
+  {
+   "repo": "c2lang/c2compiler",
+   "n_files": 23
+  },
+  {
+   "repo": "Angluca/sokol-c2",
+   "n_files": 22
+  },
+  {
+   "repo": "montcao/rusty-pinger",
+   "n_files": 22
+  },
+  {
+   "repo": "kensh1ro/Willie-C2",
+   "n_files": 21
+  },
+  {
+   "repo": "pop-ecx/rango",
+   "n_files": 21
+  },
+  {
+   "repo": "pooman42069/pooc2",
+   "n_files": 20
+  },
+  {
+   "repo": "17Chad/prototype-c2",
+   "n_files": 19
+  },
+  {
+   "repo": "Ayantaker/SpyderC2",
+   "n_files": 19
+  },
+  {
+   "repo": "coremedic/xShell",
+   "n_files": 18
+  },
+  {
+   "repo": "CirqueiraDev/OverburstC2",
+   "n_files": 17
+  },
+  {
+   "repo": "Qu3b411/Cryptor",
+   "n_files": 17
+  },
+  {
+   "repo": "SWORDIntel/c2-enum-toolkit",
+   "n_files": 17
+  },
+  {
+   "repo": "c2lang/examples",
+   "n_files": 16
+  },
+  {
+   "repo": "NixWasHere/NebulaC2",
+   "n_files": 15
+  },
+  {
+   "repo": "SpenserCai/DRat",
+   "n_files": 15
+  },
+  {
+   "repo": "nonepork/py-SS-Discord-Rat",
+   "n_files": 14
+  },
+  {
+   "repo": "Lord-of-the-IoT/BlackOps-Armarda",
+   "n_files": 13
+  },
+  {
+   "repo": "jonifon/ExtRSC",
+   "n_files": 13
+  },
+  {
+   "repo": "17Chad/Phantom-C2",
+   "n_files": 12
+  },
+  {
+   "repo": "3lvin-Kc/RustC2-main",
+   "n_files": 12
+  },
+  {
+   "repo": "GB102/Metamorpheus",
+   "n_files": 12
+  },
+  {
+   "repo": "slipperysquid/SquidNet",
+   "n_files": 12
+  },
+  {
+   "repo": "1Birdo/BotnetGoV2",
+   "n_files": 11
+  },
+  {
+   "repo": "ClickCyber/0neSPY",
+   "n_files": 11
+  },
+  {
+   "repo": "HackWidMaddy/DarkControl",
+   "n_files": 10
+  },
+  {
+   "repo": "davoodya/C2-YakuzaDesign",
+   "n_files": 10
+  },
+  {
+   "repo": "s-b-repo/firec2",
+   "n_files": 10
+  },
+  {
+   "repo": "st4inl3s5/kizagan",
+   "n_files": 10
+  },
+  {
+   "repo": "t94j0/ansible-role-mythic",
+   "n_files": 10
+  },
+  {
+   "repo": "1Birdo/GoFlood",
+   "n_files": 9
+  },
+  {
+   "repo": "akacdev/IocLists",
+   "n_files": 9
+  },
+  {
+   "repo": "grisuno/BlackObsidianC2",
+   "n_files": 9
+  },
+  {
+   "repo": "iinsertNameHere/Pilotica",
+   "n_files": 9
+  },
+  {
+   "repo": "kw-soft/QuicC2Py",
+   "n_files": 9
+  },
+  {
+   "repo": "lp-db/lp-db",
+   "n_files": 9
+  },
+  {
+   "repo": "AadyaSrivastava/ServerSecurityProject",
+   "n_files": 8
+  },
+  {
+   "repo": "EzoomE/BlackJoker",
+   "n_files": 8
+  },
+  {
+   "repo": "Lucho00Cuba/c2-toy",
+   "n_files": 8
+  },
+  {
+   "repo": "crake7/TrojanC2",
+   "n_files": 8
+  },
+  {
+   "repo": "dickriding/C2-API",
+   "n_files": 8
+  },
+  {
+   "repo": "jsutch/c2_beacon_analysis",
+   "n_files": 8
+  },
+  {
+   "repo": "lorenabez/DNS_Tunneling_Detection_on_AWS",
+   "n_files": 8
+  },
+  {
+   "repo": "0x4meliorate/toxnet",
+   "n_files": 7
+  },
+  {
+   "repo": "17tayyy/Horus",
+   "n_files": 7
+  },
+  {
+   "repo": "FabioSmuu/SDK_PluginC2",
+   "n_files": 7
+  },
+  {
+   "repo": "Queered/FUD-ReverseShell",
+   "n_files": 7
+  },
+  {
+   "repo": "Quema100/TroyCon",
+   "n_files": 7
+  },
+  {
+   "repo": "brat-volk/MagiaBaiserC2",
+   "n_files": 7
+  },
+  {
+   "repo": "exfil0/phantom_whisper",
+   "n_files": 7
+  },
+  {
+   "repo": "imscruz/GyatC2",
+   "n_files": 7
+  },
+  {
+   "repo": "j3ssie/c2s",
+   "n_files": 7
+  },
+  {
+   "repo": "skyler-ferrante/CipherShell",
+   "n_files": 7
+  },
+  {
+   "repo": "1Birdo/BotnetGo",
+   "n_files": 6
+  },
+  {
+   "repo": "AgeOfMarcus/RTC2",
+   "n_files": 6
+  },
+  {
+   "repo": "Envcc/RAT",
+   "n_files": 6
+  },
+  {
+   "repo": "Project-Prismatica/Prismatica",
+   "n_files": 6
+  },
+  {
+   "repo": "RibasSu/dnSpyre",
+   "n_files": 6
+  },
+  {
+   "repo": "Scav-engeR/SilverwolF",
+   "n_files": 6
+  },
+  {
+   "repo": "cybermads/FSOCIETY-RAT",
+   "n_files": 6
+  },
+  {
+   "repo": "declangray/Rogue-Electron",
+   "n_files": 6
+  },
+  {
+   "repo": "echo01409/Sliver-C2-Forensics",
+   "n_files": 6
+  },
+  {
+   "repo": "zcrew0x/kylebot",
+   "n_files": 6
+  },
+  {
+   "repo": "1Birdo/Gostress-Optimized",
+   "n_files": 5
+  },
+  {
+   "repo": "YDHCUI/manjusaka",
+   "n_files": 5
+  },
+  {
+   "repo": "burpheart/dnsc2",
+   "n_files": 5
+  },
+  {
+   "repo": "chadpierce/beacon-analysis",
+   "n_files": 5
+  },
+  {
+   "repo": "jconwell/secret_handshake",
+   "n_files": 5
+  },
+  {
+   "repo": "riesha/tiny-botnet",
+   "n_files": 5
+  },
+  {
+   "repo": "xelroth/KeyLogger",
+   "n_files": 5
+  },
+  {
+   "repo": "1Birdo/Better-Golang-Net",
+   "n_files": 4
+  },
+  {
+   "repo": "Primusinterp/PrimusRedir",
+   "n_files": 4
+  },
+  {
+   "repo": "ProcessusT/Venoma",
+   "n_files": 4
+  },
+  {
+   "repo": "TMH-Sec/AtlasC2-docked",
+   "n_files": 4
+  },
+  {
+   "repo": "WiredTurtle/Slacked",
+   "n_files": 4
+  },
+  {
+   "repo": "albertoscala/minimalistic-c2",
+   "n_files": 4
+  },
+  {
+   "repo": "batuafk/PYNet",
+   "n_files": 4
+  },
+  {
+   "repo": "hazemkya/DIVE",
+   "n_files": 4
+  },
+  {
+   "repo": "zile42O/panda-c2",
+   "n_files": 4
+  },
+  {
+   "repo": "BenzoXdev/PSRansom",
+   "n_files": 3
+  },
+  {
+   "repo": "Hex1629/BotnetC2",
+   "n_files": 3
+  },
+  {
+   "repo": "RasterSec/pint-c2",
+   "n_files": 3
+  },
+  {
+   "repo": "ac0d3r/pingser",
+   "n_files": 3
+  },
+  {
+   "repo": "aplyc1a/DNShell",
+   "n_files": 3
+  },
+  {
+   "repo": "demonsec666/muddyc3_golang",
+   "n_files": 3
+  },
+  {
+   "repo": "elliotwutingfeng/ThreatFox-IOC-IPs",
+   "n_files": 3
+  },
+  {
+   "repo": "jm33-m0/go-cdn2proxy",
+   "n_files": 3
+  },
+  {
+   "repo": "jplesperance/Shad0wBridge",
+   "n_files": 3
+  },
+  {
+   "repo": "lesnuages/yuna",
+   "n_files": 3
+  },
+  {
+   "repo": "montysecurity/cryptshell",
+   "n_files": 3
+  },
+  {
+   "repo": "php-guy55/wave32b",
+   "n_files": 3
+  },
+  {
+   "repo": "swlacy/DiscordShell",
+   "n_files": 3
+  },
+  {
+   "repo": "the-gabe/Azure-DNS-Whitelist-Generator",
+   "n_files": 3
+  },
+  {
+   "repo": "valencanfly/discord-bot-ddos",
+   "n_files": 3
+  },
+  {
+   "repo": "vgg-dev/py_c2",
+   "n_files": 3
+  },
+  {
+   "repo": "vpanal/smbshell",
+   "n_files": 3
+  },
+  {
+   "repo": "zessu/google-calendar-c2server",
+   "n_files": 3
+  },
+  {
+   "repo": "0undefined/decentralized_c2",
+   "n_files": 2
+  },
+  {
+   "repo": "1Birdo/Golang-Net",
+   "n_files": 2
+  },
+  {
+   "repo": "1Birdo/Gostress-Tor-V2",
+   "n_files": 2
+  },
+  {
+   "repo": "Bert-JanP/Open-Source-Threat-Intel-Feeds",
+   "n_files": 2
+  },
+  {
+   "repo": "Bhanunamikaze/Light-C2",
+   "n_files": 2
+  },
+  {
+   "repo": "CirqueiraDev/SentinelaNet",
+   "n_files": 2
+  },
+  {
+   "repo": "DiMarcoSK/shellby",
+   "n_files": 2
+  },
+  {
+   "repo": "JoelGMSec/PSRansom",
+   "n_files": 2
+  },
+  {
+   "repo": "LukeBob-zz/C2-Pwn",
+   "n_files": 2
+  },
+  {
+   "repo": "MatheuZSecurity/RingReaper",
+   "n_files": 2
+  },
+  {
+   "repo": "NovexTheRizzler/Quorix-Fake-DDoS",
+   "n_files": 2
+  },
+  {
+   "repo": "ProfessionallyEvil/C4",
+   "n_files": 2
+  },
+  {
+   "repo": "Tw1sm/HTTPS-MalleableC2-Config",
+   "n_files": 2
+  },
+  {
+   "repo": "breachlabs-org/RobineC2",
+   "n_files": 2
+  },
+  {
+   "repo": "errorfiathck/C2-backdoor",
+   "n_files": 2
+  },
+  {
+   "repo": "had-nu/Go-ServerC2-Payload",
+   "n_files": 2
+  },
+  {
+   "repo": "killswitch-GUI/flask_heroku_redirector",
+   "n_files": 2
+  },
+  {
+   "repo": "l0n3m4n/bin2shell",
+   "n_files": 2
+  },
+  {
+   "repo": "marcostolosa/RebelC2",
+   "n_files": 2
+  },
+  {
+   "repo": "marlospomin/node-redirector",
+   "n_files": 2
+  },
+  {
+   "repo": "monsifhmouri/SpyEye-botnet",
+   "n_files": 2
+  },
+  {
+   "repo": "p4p1/havoc-bloodhound",
+   "n_files": 2
+  },
+  {
+   "repo": "rodanmaharjan/ThreatIntelligence",
+   "n_files": 2
+  },
+  {
+   "repo": "s0ld13rr/GhostShell",
+   "n_files": 2
+  },
+  {
+   "repo": "spydisec/spydithreatintel",
+   "n_files": 2
+  },
+  {
+   "repo": "17Chad/CRANK-ShodanRouterFinder",
+   "n_files": 1
+  },
+  {
+   "repo": "AptAmoeba/HavocC2-Installer",
+   "n_files": 1
+  },
+  {
+   "repo": "Creatures-Developer-Network/awesome-creatures-development-resources",
+   "n_files": 1
+  },
+  {
+   "repo": "Kovax00/C2-DISCORD-PoC",
+   "n_files": 1
+  },
+  {
+   "repo": "LonelyIDA/Pegasus-C2",
+   "n_files": 1
+  },
+  {
+   "repo": "Malwareman007/SyncRAT",
+   "n_files": 1
+  },
+  {
+   "repo": "MrSanZz/RevengeC2",
+   "n_files": 1
+  },
+  {
+   "repo": "Vczz0/Cerberos-C2",
+   "n_files": 1
+  },
+  {
+   "repo": "aplyc1a/NTPShell",
+   "n_files": 1
+  },
+  {
+   "repo": "blue0x1/Clover",
+   "n_files": 1
+  },
+  {
+   "repo": "bolesnikid/BOTNETS",
+   "n_files": 1
+  },
+  {
+   "repo": "chiyoluvzu/NyxSploit",
+   "n_files": 1
+  },
+  {
+   "repo": "giovannicolonna/c2point",
+   "n_files": 1
+  },
+  {
+   "repo": "hexa-decim8/girltalk",
+   "n_files": 1
+  },
+  {
+   "repo": "joeavanzato/socgholish_c2_unpacker",
+   "n_files": 1
+  },
+  {
+   "repo": "jofaval/word-counter",
+   "n_files": 1
+  },
+  {
+   "repo": "jordanjoewatson/swi2",
+   "n_files": 1
+  },
+  {
+   "repo": "kensh1ro/NimTeleBackdoor",
+   "n_files": 1
+  },
+  {
+   "repo": "killswitch-GUI/flask_pythonanywhere_redirector",
+   "n_files": 1
+  },
+  {
+   "repo": "kishwordulal1234/ShellDrop",
+   "n_files": 1
+  },
+  {
+   "repo": "luvremz/Danger-MultiTool",
+   "n_files": 1
+  },
+  {
+   "repo": "nltt-br/ArchitectC2",
+   "n_files": 1
+  },
+  {
+   "repo": "p4p1/havoc-ligolo",
+   "n_files": 1
+  },
+  {
+   "repo": "p4p1/havoc-privkit",
+   "n_files": 1
+  },
+  {
+   "repo": "spinof/TILEDIT",
+   "n_files": 1
+  },
+  {
+   "repo": "vpanal/RevShellRelay",
+   "n_files": 1
+  },
+  {
+   "repo": "vpanal/http2revshell",
+   "n_files": 1
+  },
+  {
+   "repo": "wahyuhadi/beacon-c2-go",
+   "n_files": 1
+  },
+  {
+   "repo": "wearetyomsmnv/ec_encoder_cpp",
+   "n_files": 1
+  },
+  {
+   "repo": "whatotter/azamuku",
+   "n_files": 1
+  }
+ ],
+ "_meta": {
+  "dataset_sha": "210b9259be248323b0b3bc58252bed3fde53135f",
+  "generated_at": "2026-10-11T18:17:06+0000"
+ }
+}

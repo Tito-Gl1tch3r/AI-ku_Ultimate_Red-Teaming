@@ -1,0 +1,209 @@
+{
+ "topic": "webhacking",
+ "source": "hf-statistics",
+ "num_examples_hf": 2144,
+ "partial_stats": false,
+ "hf_license_distribution": {
+  "MS-PL": 219,
+  "Unlicense": 3,
+  "MIT": 1023,
+  "GPL-3.0": 44,
+  "CC0-1.0": 2,
+  "NOASSERTION": 1
+ },
+ "n_repos": 47,
+ "repos": [
+  {
+   "repo": "hahwul/WebHackersWeapons",
+   "n_files": 422
+  },
+  {
+   "repo": "manuel-miglietta/vulnerabilityscan",
+   "n_files": 404
+  },
+  {
+   "repo": "9aylas/Webshell-Pack.old",
+   "n_files": 296
+  },
+  {
+   "repo": "alvin-tosh/Infosec-and-Hacking-Scripts",
+   "n_files": 290
+  },
+  {
+   "repo": "sil3ntH4ck3r/WebVulnLab",
+   "n_files": 242
+  },
+  {
+   "repo": "netsquare/BrowserBruter",
+   "n_files": 219
+  },
+  {
+   "repo": "meta-hyphen123/Shiter-Attack-Tools",
+   "n_files": 50
+  },
+  {
+   "repo": "luigiurbano/Reinforced-Wavsep",
+   "n_files": 38
+  },
+  {
+   "repo": "adeadfed/PwnFox-For-Chromium",
+   "n_files": 24
+  },
+  {
+   "repo": "with-developer/Web_Hacking_and_Response_by_Nodejs",
+   "n_files": 23
+  },
+  {
+   "repo": "ckswls56/DreamHack",
+   "n_files": 14
+  },
+  {
+   "repo": "ryujm1828/Security",
+   "n_files": 13
+  },
+  {
+   "repo": "sookyeongyeom/lord-of-sql-injection",
+   "n_files": 12
+  },
+  {
+   "repo": "AnonymousVenezuela/Shells",
+   "n_files": 8
+  },
+  {
+   "repo": "intrudir/BypassFuzzer",
+   "n_files": 7
+  },
+  {
+   "repo": "staphysec/blog1",
+   "n_files": 7
+  },
+  {
+   "repo": "MitNy/Python-Web-Hacking",
+   "n_files": 6
+  },
+  {
+   "repo": "ToberoCat/TypewriterBot",
+   "n_files": 6
+  },
+  {
+   "repo": "animotto/webhacking-kr",
+   "n_files": 6
+  },
+  {
+   "repo": "nimacpp/cats",
+   "n_files": 6
+  },
+  {
+   "repo": "decryptable/domain-grabber-cli",
+   "n_files": 5
+  },
+  {
+   "repo": "Yshmehtaa/Web-Applications",
+   "n_files": 4
+  },
+  {
+   "repo": "soulofgod009/WebDavSOG",
+   "n_files": 4
+  },
+  {
+   "repo": "HACKE-RC/webdork",
+   "n_files": 3
+  },
+  {
+   "repo": "Jerr279/AllTheWebShells",
+   "n_files": 3
+  },
+  {
+   "repo": "ShubhamTuts/ShubhamWebScript-Website-vulnerability-Checker",
+   "n_files": 3
+  },
+  {
+   "repo": "Symbolexe/OWNBURP",
+   "n_files": 3
+  },
+  {
+   "repo": "BEND0US/webshells",
+   "n_files": 2
+  },
+  {
+   "repo": "KaanBicaklar/Swarmrecon",
+   "n_files": 2
+  },
+  {
+   "repo": "TheNewAttacker64/TheAttackerScanner",
+   "n_files": 2
+  },
+  {
+   "repo": "anger/voyager-js",
+   "n_files": 2
+  },
+  {
+   "repo": "eye-cracker-project/eye-cracker",
+   "n_files": 2
+  },
+  {
+   "repo": "whxitte/white-dav",
+   "n_files": 2
+  },
+  {
+   "repo": "Ckrielle/Forgerer",
+   "n_files": 1
+  },
+  {
+   "repo": "Fadavvi/BurpPro-FastCrawler",
+   "n_files": 1
+  },
+  {
+   "repo": "JakeHukari/PyRecker",
+   "n_files": 1
+  },
+  {
+   "repo": "MRHackerx00/Web_hacking-",
+   "n_files": 1
+  },
+  {
+   "repo": "MadExploits/madrawler",
+   "n_files": 1
+  },
+  {
+   "repo": "Resxarcher/paramprobe",
+   "n_files": 1
+  },
+  {
+   "repo": "TheNewAttacker64/Shodan-Bruter",
+   "n_files": 1
+  },
+  {
+   "repo": "aatharvauti/burpsuite",
+   "n_files": 1
+  },
+  {
+   "repo": "alienwhatever/Admin-Scanner",
+   "n_files": 1
+  },
+  {
+   "repo": "begininvoke/DirectoryListenFinder",
+   "n_files": 1
+  },
+  {
+   "repo": "begininvoke/backupfinder",
+   "n_files": 1
+  },
+  {
+   "repo": "r9in/scannerhook",
+   "n_files": 1
+  },
+  {
+   "repo": "root4031/host-injector",
+   "n_files": 1
+  },
+  {
+   "repo": "slab/safeurl-elixir",
+   "n_files": 1
+  }
+ ],
+ "_meta": {
+  "dataset_sha": "210b9259be248323b0b3bc58252bed3fde53135f",
+  "generated_at": "2026-10-11T18:23:23+0000"
+ }
+}

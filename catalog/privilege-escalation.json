@@ -1,0 +1,914 @@
+{
+ "topic": "privilege-escalation",
+ "source": "hf-statistics",
+ "num_examples_hf": 3436,
+ "partial_stats": false,
+ "hf_license_distribution": {
+  "AGPL-3.0": 13,
+  "GPL-2.0": 63,
+  "Apache-2.0": 705,
+  "BSD-3-Clause": 32,
+  "BSD-2-Clause": 1,
+  "LGPL-3.0": 11,
+  "NOASSERTION": 215,
+  "Unlicense": 15,
+  "GPL-3.0": 128,
+  "MIT": 1170,
+  "MPL-2.0": 9
+ },
+ "n_repos": 222,
+ "repos": [
+  {
+   "repo": "Integration-IT/Active-Directory-Exploitation-Cheat-Sheet",
+   "n_files": 662
+  },
+  {
+   "repo": "Metarget/metarget",
+   "n_files": 516
+  },
+  {
+   "repo": "p0dalirius/windows-coerced-authentication-methods",
+   "n_files": 262
+  },
+  {
+   "repo": "calebstewart/pwncat",
+   "n_files": 147
+  },
+  {
+   "repo": "cdk-team/CDK",
+   "n_files": 124
+  },
+  {
+   "repo": "Skiller9090/Lucifer",
+   "n_files": 117
+  },
+  {
+   "repo": "Walleza1/TowerOfHell",
+   "n_files": 72
+  },
+  {
+   "repo": "MuhaibShamsher/BuggyBuy",
+   "n_files": 65
+  },
+  {
+   "repo": "Semperis/GoldenDMSA",
+   "n_files": 56
+  },
+  {
+   "repo": "p0dalirius/Coercer",
+   "n_files": 56
+  },
+  {
+   "repo": "am0nsec/exploit",
+   "n_files": 45
+  },
+  {
+   "repo": "ipa-lab/benchmark-privesc-linux",
+   "n_files": 44
+  },
+  {
+   "repo": "quentinhardy/odat",
+   "n_files": 38
+  },
+  {
+   "repo": "evyatar9/Writeups",
+   "n_files": 37
+  },
+  {
+   "repo": "sergiLopez/Flanders-Trojan",
+   "n_files": 37
+  },
+  {
+   "repo": "quentinhardy/pytmipe",
+   "n_files": 36
+  },
+  {
+   "repo": "liamg/traitor",
+   "n_files": 34
+  },
+  {
+   "repo": "xorganic/ShadowToken",
+   "n_files": 34
+  },
+  {
+   "repo": "itm4n/PrivescCheck",
+   "n_files": 32
+  },
+  {
+   "repo": "MizaruIT/BREAKADAY",
+   "n_files": 29
+  },
+  {
+   "repo": "nickvourd/Windows-Local-Privilege-Escalation-Cookbook",
+   "n_files": 29
+  },
+  {
+   "repo": "M507/RamiGPT",
+   "n_files": 27
+  },
+  {
+   "repo": "k8gege/K8tools",
+   "n_files": 27
+  },
+  {
+   "repo": "containerscrew/rootisnaked",
+   "n_files": 26
+  },
+  {
+   "repo": "brant-ruan/IDF4APEV",
+   "n_files": 24
+  },
+  {
+   "repo": "PaloAltoNetworks/IAM-Deescalate",
+   "n_files": 22
+  },
+  {
+   "repo": "arctil/arctil-vulnerabile-web-application",
+   "n_files": 21
+  },
+  {
+   "repo": "quentinhardy/msdat",
+   "n_files": 21
+  },
+  {
+   "repo": "stealthcopter/deepce",
+   "n_files": 21
+  },
+  {
+   "repo": "ucsb-seclab/chainreactor",
+   "n_files": 20
+  },
+  {
+   "repo": "NLXZ/PwnBook",
+   "n_files": 19
+  },
+  {
+   "repo": "gunh0/linux-system-programming",
+   "n_files": 19
+  },
+  {
+   "repo": "The-Lynx-Team/OSCP",
+   "n_files": 18
+  },
+  {
+   "repo": "lmriccardo/redex",
+   "n_files": 17
+  },
+  {
+   "repo": "nconklindev/groot",
+   "n_files": 17
+  },
+  {
+   "repo": "0x00pf/esther",
+   "n_files": 16
+  },
+  {
+   "repo": "TheBotlyNoob/Rust-Privesc",
+   "n_files": 15
+  },
+  {
+   "repo": "ohpe/juicy-potato",
+   "n_files": 15
+  },
+  {
+   "repo": "bb107/WinSudo",
+   "n_files": 14
+  },
+  {
+   "repo": "nconklindev/wayup",
+   "n_files": 14
+  },
+  {
+   "repo": "xorganic/TSM",
+   "n_files": 14
+  },
+  {
+   "repo": "zinebac/Rainfall",
+   "n_files": 14
+  },
+  {
+   "repo": "J4sutin/prism-attack",
+   "n_files": 13
+  },
+  {
+   "repo": "Jasutinn/Reverse-Shell",
+   "n_files": 13
+  },
+  {
+   "repo": "karma9874/AuthInspector",
+   "n_files": 13
+  },
+  {
+   "repo": "lypd0/DeadPotato",
+   "n_files": 12
+  },
+  {
+   "repo": "A-Mahla/Security-Pentest-Part-II",
+   "n_files": 11
+  },
+  {
+   "repo": "Lelezinski/buffer-overflow-demo",
+   "n_files": 11
+  },
+  {
+   "repo": "cyberark/DLLSpy",
+   "n_files": 11
+  },
+  {
+   "repo": "d2cy/OSCP",
+   "n_files": 11
+  },
+  {
+   "repo": "sujayadkesar/Linux-Privilege-Escalation",
+   "n_files": 11
+  },
+  {
+   "repo": "xairy/kernel-exploits",
+   "n_files": 11
+  },
+  {
+   "repo": "BeichenDream/BadPotato",
+   "n_files": 10
+  },
+  {
+   "repo": "dharanivarma/Pentesting-Tools",
+   "n_files": 10
+  },
+  {
+   "repo": "rwfpl/rewolf-pcausa-exploit",
+   "n_files": 10
+  },
+  {
+   "repo": "A-Mahla/Security-Pentest-Part-III",
+   "n_files": 9
+  },
+  {
+   "repo": "A-Mahla/Security-Pentest-Part-IV",
+   "n_files": 9
+  },
+  {
+   "repo": "Jacoblightning/capscalate",
+   "n_files": 9
+  },
+  {
+   "repo": "SomnathDas/pwnNotes",
+   "n_files": 9
+  },
+  {
+   "repo": "A-Mahla/Security-Pentest-Part-I",
+   "n_files": 8
+  },
+  {
+   "repo": "g3tsyst3m/elevationstation",
+   "n_files": 8
+  },
+  {
+   "repo": "kkent030315/libinject",
+   "n_files": 8
+  },
+  {
+   "repo": "AzAgarampur/byeintegrity8-uac",
+   "n_files": 7
+  },
+  {
+   "repo": "Dol3v/TrueSightDemolisher",
+   "n_files": 7
+  },
+  {
+   "repo": "HighEscalation/PEScanTool",
+   "n_files": 7
+  },
+  {
+   "repo": "Markus-Stuppnig/Phanto",
+   "n_files": 7
+  },
+  {
+   "repo": "kkent030315/anyelevate",
+   "n_files": 7
+  },
+  {
+   "repo": "werdl/surs",
+   "n_files": 7
+  },
+  {
+   "repo": "Archips/boot2root",
+   "n_files": 6
+  },
+  {
+   "repo": "TheKevinWang/UACHooker",
+   "n_files": 6
+  },
+  {
+   "repo": "ctfhacks/CyberTOOLS",
+   "n_files": 6
+  },
+  {
+   "repo": "sailay1996/delete2SYSTEM",
+   "n_files": 6
+  },
+  {
+   "repo": "sufyandaredevil/EHRSRC_ZTM",
+   "n_files": 6
+  },
+  {
+   "repo": "tr3sp4ss3rexe/Windows-Kernel-Exploitation",
+   "n_files": 6
+  },
+  {
+   "repo": "Divinemonk/linux_privesc_cheatsheet",
+   "n_files": 5
+  },
+  {
+   "repo": "g0ubu1i/up0x",
+   "n_files": 5
+  },
+  {
+   "repo": "gaearrow/windows-lpe-lite",
+   "n_files": 5
+  },
+  {
+   "repo": "nikhil1232/IAM-Flaws",
+   "n_files": 5
+  },
+  {
+   "repo": "parazyd/sup",
+   "n_files": 5
+  },
+  {
+   "repo": "paulveillard/cybersecurity-pam",
+   "n_files": 5
+  },
+  {
+   "repo": "piotreknow02/privesc-toolkit-manager",
+   "n_files": 5
+  },
+  {
+   "repo": "pokitoz/ioctl_driver",
+   "n_files": 5
+  },
+  {
+   "repo": "yismaili/Boot2root",
+   "n_files": 5
+  },
+  {
+   "repo": "AzAgarampur/byeintegrity-uac",
+   "n_files": 4
+  },
+  {
+   "repo": "bunchizmus/leidenfrost",
+   "n_files": 4
+  },
+  {
+   "repo": "diego-treitos/linux-smart-enumeration",
+   "n_files": 4
+  },
+  {
+   "repo": "lu4p/go-escalate",
+   "n_files": 4
+  },
+  {
+   "repo": "morgenm/sudo-chroot-CVE-2025-32463",
+   "n_files": 4
+  },
+  {
+   "repo": "oddlama/elewrap",
+   "n_files": 4
+  },
+  {
+   "repo": "provrb/libprocman",
+   "n_files": 4
+  },
+  {
+   "repo": "rexpository/linux-privilege-escalation",
+   "n_files": 4
+  },
+  {
+   "repo": "xerosic/leidenfrost",
+   "n_files": 4
+  },
+  {
+   "repo": "yardenshafir/CVE-2020-1034",
+   "n_files": 4
+  },
+  {
+   "repo": "0xKiewicz/useful-pentesting-scripts",
+   "n_files": 3
+  },
+  {
+   "repo": "Anon-Exploiter/SUID3NUM",
+   "n_files": 3
+  },
+  {
+   "repo": "AzAgarampur/byeintegrity5-uac",
+   "n_files": 3
+  },
+  {
+   "repo": "Jewel591/Privilege-Escalation",
+   "n_files": 3
+  },
+  {
+   "repo": "Lucas310302/StrayNet",
+   "n_files": 3
+  },
+  {
+   "repo": "MizaruIT/BREAKADAY_BASH",
+   "n_files": 3
+  },
+  {
+   "repo": "MohamedKarrab/CVE-2025-32463",
+   "n_files": 3
+  },
+  {
+   "repo": "RadeelAhmad/Sym-Link",
+   "n_files": 3
+  },
+  {
+   "repo": "ReKon64/PEASS-Parsers",
+   "n_files": 3
+  },
+  {
+   "repo": "TuEmb/privilege-rs",
+   "n_files": 3
+  },
+  {
+   "repo": "m0rt1c/oracledb-privs",
+   "n_files": 3
+  },
+  {
+   "repo": "rcallaby/Hacking-Study-Guide",
+   "n_files": 3
+  },
+  {
+   "repo": "scottyrichardson/olyn_sudo",
+   "n_files": 3
+  },
+  {
+   "repo": "y4ney/CVE-2025-32463-lab",
+   "n_files": 3
+  },
+  {
+   "repo": "0xInfection/EPScalate",
+   "n_files": 2
+  },
+  {
+   "repo": "AIex-3/confluence-hack",
+   "n_files": 2
+  },
+  {
+   "repo": "AzAgarampur/byeintegrity4-uac",
+   "n_files": 2
+  },
+  {
+   "repo": "C0deInBlack/CVE-2024-32019-poc",
+   "n_files": 2
+  },
+  {
+   "repo": "EvanDesR/removingLSASS_ProcessProtection",
+   "n_files": 2
+  },
+  {
+   "repo": "Jsmoreira02/Windows-Hacking",
+   "n_files": 2
+  },
+  {
+   "repo": "LucaBarile/DLL-Hijacking",
+   "n_files": 2
+  },
+  {
+   "repo": "NishanthAnand21/RCSCTF24",
+   "n_files": 2
+  },
+  {
+   "repo": "Nowafen/CVE-2025-32463",
+   "n_files": 2
+  },
+  {
+   "repo": "Sdelsaz/PIN-for-Admin",
+   "n_files": 2
+  },
+  {
+   "repo": "SeanPesce/SELinux-Kernel-Module-Bypass",
+   "n_files": 2
+  },
+  {
+   "repo": "Srakai/spoof-sudo",
+   "n_files": 2
+  },
+  {
+   "repo": "Stuub/Sticky",
+   "n_files": 2
+  },
+  {
+   "repo": "TanishkaMarrott/Mitigating-Privilege-Escalation-with-IAM-Permission-Boundaries-and-SCPs-",
+   "n_files": 2
+  },
+  {
+   "repo": "Werneror/WindowsPrivilegeEscalationSet",
+   "n_files": 2
+  },
+  {
+   "repo": "WizzzStark/PyGTFO",
+   "n_files": 2
+  },
+  {
+   "repo": "achnouri/Editor-CTF-writre-up",
+   "n_files": 2
+  },
+  {
+   "repo": "bakassarinad/HTB_machines",
+   "n_files": 2
+  },
+  {
+   "repo": "cybersnippets/PayloadsAllTheThings",
+   "n_files": 2
+  },
+  {
+   "repo": "dfinnis/SnowCrash",
+   "n_files": 2
+  },
+  {
+   "repo": "dyne/sud",
+   "n_files": 2
+  },
+  {
+   "repo": "flast101/docker-privesc",
+   "n_files": 2
+  },
+  {
+   "repo": "im-hanzou/MSAPer",
+   "n_files": 2
+  },
+  {
+   "repo": "initstring/dirty_sock",
+   "n_files": 2
+  },
+  {
+   "repo": "jchene/42-boot-2-root",
+   "n_files": 2
+  },
+  {
+   "repo": "jnx23/CVE-2025-XXXX",
+   "n_files": 2
+  },
+  {
+   "repo": "joaoviictorti/SeDebugAbuse-rs",
+   "n_files": 2
+  },
+  {
+   "repo": "josemlwdf/ClamAV_Privilege_Escalation",
+   "n_files": 2
+  },
+  {
+   "repo": "lypd0/SUIDump",
+   "n_files": 2
+  },
+  {
+   "repo": "m3m0o/portabilis-ieducar-user-type-privilege-escalation",
+   "n_files": 2
+  },
+  {
+   "repo": "mathisvickie/CVE-2021-27965",
+   "n_files": 2
+  },
+  {
+   "repo": "mistrustt/PAM-UDisks-PrivEsc-Metasploit",
+   "n_files": 2
+  },
+  {
+   "repo": "rainestorme/ez-admin",
+   "n_files": 2
+  },
+  {
+   "repo": "stealthcopter/CVE-2020-28243",
+   "n_files": 2
+  },
+  {
+   "repo": "vel2006/ErroxPerms",
+   "n_files": 2
+  },
+  {
+   "repo": "xnand/WindowsPOCs",
+   "n_files": 2
+  },
+  {
+   "repo": "0x4D-5A/Invoke-SeRestoreAbuse",
+   "n_files": 1
+  },
+  {
+   "repo": "0xGhazy/Impersonate",
+   "n_files": 1
+  },
+  {
+   "repo": "4m3rr0r/ZombifyDocker",
+   "n_files": 1
+  },
+  {
+   "repo": "5H311-1NJ3C706/local-root-exploits",
+   "n_files": 1
+  },
+  {
+   "repo": "Aviksaikat/LinGhost",
+   "n_files": 1
+  },
+  {
+   "repo": "AzAgarampur/byeintegrity-lite",
+   "n_files": 1
+  },
+  {
+   "repo": "AzAgarampur/byeintegrity2-uac",
+   "n_files": 1
+  },
+  {
+   "repo": "AzAgarampur/byeintegrity3-uac",
+   "n_files": 1
+  },
+  {
+   "repo": "BenzoXdev/Fuck-Windows-Security",
+   "n_files": 1
+  },
+  {
+   "repo": "C0deInBlack/apache2_malicious_module",
+   "n_files": 1
+  },
+  {
+   "repo": "CharminDoge/tcb-lpe",
+   "n_files": 1
+  },
+  {
+   "repo": "Chocapikk/CVE-2023-22515",
+   "n_files": 1
+  },
+  {
+   "repo": "Compcode1/ioc10-hidden-parameter-injection",
+   "n_files": 1
+  },
+  {
+   "repo": "Dk0n9/linux_exploit",
+   "n_files": 1
+  },
+  {
+   "repo": "EvilBytecode/Enable-All-Tokens",
+   "n_files": 1
+  },
+  {
+   "repo": "FrancescoDiSalesGithub/windows-hacking-path",
+   "n_files": 1
+  },
+  {
+   "repo": "HOEUN-Visai/CVE-2025-27591-below-",
+   "n_files": 1
+  },
+  {
+   "repo": "IamVanLord/NSecSoftBYOVD",
+   "n_files": 1
+  },
+  {
+   "repo": "J4sutin/red-python",
+   "n_files": 1
+  },
+  {
+   "repo": "Jaycelation/Linux-Privilege-Escalation",
+   "n_files": 1
+  },
+  {
+   "repo": "Jenderal92/CVE-2024-6624",
+   "n_files": 1
+  },
+  {
+   "repo": "JohnRyk/Exploitable_SUID_Binary_Suggester",
+   "n_files": 1
+  },
+  {
+   "repo": "Jsmoreira02/CatBinaries",
+   "n_files": 1
+  },
+  {
+   "repo": "K3ysTr0K3R/CVE-2025-32463-EXPLOIT",
+   "n_files": 1
+  },
+  {
+   "repo": "MAAYTHM/CVE-2025-32462_32463-Lab",
+   "n_files": 1
+  },
+  {
+   "repo": "MIISTERC/BashScan",
+   "n_files": 1
+  },
+  {
+   "repo": "Mr-DJ/CVE-2024-48990",
+   "n_files": 1
+  },
+  {
+   "repo": "NullArray/MIDA-Multitool",
+   "n_files": 1
+  },
+  {
+   "repo": "NullArray/RootHelper",
+   "n_files": 1
+  },
+  {
+   "repo": "PercussiveElbow/Clippy",
+   "n_files": 1
+  },
+  {
+   "repo": "RandomiaGaming/godo",
+   "n_files": 1
+  },
+  {
+   "repo": "RichardAlmeyda/3asyPr1vs",
+   "n_files": 1
+  },
+  {
+   "repo": "S1lkys/Suidsploit",
+   "n_files": 1
+  },
+  {
+   "repo": "SweetIceLolly/Disable_Ctrl_Alt_Del",
+   "n_files": 1
+  },
+  {
+   "repo": "TanayTyagi/exploit-tracker",
+   "n_files": 1
+  },
+  {
+   "repo": "YanivHaliwa/linpeas-report-processor",
+   "n_files": 1
+  },
+  {
+   "repo": "Yiidiir/removable-read-only",
+   "n_files": 1
+  },
+  {
+   "repo": "alirezac0/CVE-2022-27502",
+   "n_files": 1
+  },
+  {
+   "repo": "anrbn/GCP-Attack-Defense",
+   "n_files": 1
+  },
+  {
+   "repo": "b3rito/yodo",
+   "n_files": 1
+  },
+  {
+   "repo": "bikashdash/Kernel-exploit_2.4.22-version",
+   "n_files": 1
+  },
+  {
+   "repo": "blwhit/BadSuccessor-dMSA-Scanner",
+   "n_files": 1
+  },
+  {
+   "repo": "c0brabaghdad1/Wconsole",
+   "n_files": 1
+  },
+  {
+   "repo": "clnath/clnath.github.io-THM_CTF_EasyPeasy",
+   "n_files": 1
+  },
+  {
+   "repo": "codershiyar/WinPrivilegeEscalation",
+   "n_files": 1
+  },
+  {
+   "repo": "contisimone99/Penetration-Testing-on-Open5Gs",
+   "n_files": 1
+  },
+  {
+   "repo": "dietcokesec/seeker",
+   "n_files": 1
+  },
+  {
+   "repo": "djefferson-saintilus/gtosearch",
+   "n_files": 1
+  },
+  {
+   "repo": "dollarboysushil/CVE-2024-32019-Netdata-ndsudo-PATH-Vulnerability-Privilege-Escalation",
+   "n_files": 1
+  },
+  {
+   "repo": "dollarboysushil/CVE-2024-47533-Cobbler-XMLRPC-Authentication-Bypass-RCE-Exploit-POC",
+   "n_files": 1
+  },
+  {
+   "repo": "dr4xp/sudo-chroot",
+   "n_files": 1
+  },
+  {
+   "repo": "etc5had0w/suider",
+   "n_files": 1
+  },
+  {
+   "repo": "f4T1H21/CVE-2021-3560-Polkit-DBus",
+   "n_files": 1
+  },
+  {
+   "repo": "fborsani/windows-rev-shell",
+   "n_files": 1
+  },
+  {
+   "repo": "geniuszly/CVE-2022-44149",
+   "n_files": 1
+  },
+  {
+   "repo": "glowbase/Get-MSOLCredentials.ps1",
+   "n_files": 1
+  },
+  {
+   "repo": "incommatose/CVE-2025-27591-PoC",
+   "n_files": 1
+  },
+  {
+   "repo": "invelsec/Shark",
+   "n_files": 1
+  },
+  {
+   "repo": "isPique/Fuck-Windows-Security",
+   "n_files": 1
+  },
+  {
+   "repo": "itaymigdal/GetSystem",
+   "n_files": 1
+  },
+  {
+   "repo": "liamromanis101/AWS-IAM-Policy-Audit",
+   "n_files": 1
+  },
+  {
+   "repo": "mariovata/AutoShellDown",
+   "n_files": 1
+  },
+  {
+   "repo": "mauricelambert/LabAutomationCVE-2021-43798",
+   "n_files": 1
+  },
+  {
+   "repo": "megadimenex/MegaHiDocker",
+   "n_files": 1
+  },
+  {
+   "repo": "mismailzz/LinuxBinaries-",
+   "n_files": 1
+  },
+  {
+   "repo": "nav7neeet/PrivilegeEscalation",
+   "n_files": 1
+  },
+  {
+   "repo": "pr0v3rbs/CVE-2025-32463_chwoot",
+   "n_files": 1
+  },
+  {
+   "repo": "r-x-s/enumeration",
+   "n_files": 1
+  },
+  {
+   "repo": "rvizx/CVE-2025-27591",
+   "n_files": 1
+  },
+  {
+   "repo": "rvizx/bbot-privesc",
+   "n_files": 1
+  },
+  {
+   "repo": "safebuffer/PE-Linux",
+   "n_files": 1
+  },
+  {
+   "repo": "sailay1996/cve-2022-21882-poc",
+   "n_files": 1
+  },
+  {
+   "repo": "sinatamari/PrivEscCOM_Detection",
+   "n_files": 1
+  },
+  {
+   "repo": "ssstonebraker/Pentest-Service-Enumeration",
+   "n_files": 1
+  },
+  {
+   "repo": "t3l3machus/eviltree",
+   "n_files": 1
+  },
+  {
+   "repo": "umutcamliyurt/CVE-2025-27591",
+   "n_files": 1
+  },
+  {
+   "repo": "usdAG/SharpLink",
+   "n_files": 1
+  },
+  {
+   "repo": "x86shell/Elevat0r",
+   "n_files": 1
+  },
+  {
+   "repo": "ze3ter/zpriv",
+   "n_files": 1
+  }
+ ],
+ "_meta": {
+  "dataset_sha": "210b9259be248323b0b3bc58252bed3fde53135f",
+  "generated_at": "2026-10-11T18:21:14+0000"
+ }
+}

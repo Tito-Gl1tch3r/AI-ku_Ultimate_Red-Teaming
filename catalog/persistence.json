@@ -1,0 +1,3455 @@
+{
+ "topic": "persistence",
+ "source": "hf-statistics",
+ "num_examples_hf": 71027,
+ "partial_stats": false,
+ "hf_license_distribution": {
+  "ISC": 90,
+  "Unlicense": 215,
+  "GPL-2.0": 388,
+  "NCSA": 10,
+  "LGPL-3.0": 258,
+  "BSD-3-Clause": 500,
+  "EUPL-1.1": 20,
+  "CC0-1.0": 573,
+  "Apache-2.0": 32379,
+  "OSL-3.0": 596,
+  "AGPL-3.0": 1240,
+  "BSD-2-Clause": 2,
+  "MPL-2.0": 605,
+  "GPL-3.0": 2791,
+  "EPL-2.0": 1021,
+  "LGPL-2.1": 131,
+  "WTFPL": 7,
+  "MIT": 13567,
+  "NOASSERTION": 2983,
+  "EPL-1.0": 7
+ },
+ "n_repos": 855,
+ "repos": [
+  {
+   "repo": "hibernate/hibernate-orm",
+   "n_files": 16341
+  },
+  {
+   "repo": "xcesco/kripton",
+   "n_files": 4087
+  },
+  {
+   "repo": "exedio/persistence",
+   "n_files": 2003
+  },
+  {
+   "repo": "AnghelLeonard/Hibernate-SpringBoot",
+   "n_files": 1456
+  },
+  {
+   "repo": "BetterTyped/hyper-fetch",
+   "n_files": 1196
+  },
+  {
+   "repo": "apache/fory",
+   "n_files": 1178
+  },
+  {
+   "repo": "simolus3/drift",
+   "n_files": 1031
+  },
+  {
+   "repo": "ballerina-platform/persist-tools",
+   "n_files": 999
+  },
+  {
+   "repo": "permazen/permazen",
+   "n_files": 953
+  },
+  {
+   "repo": "ventoy/Ventoy",
+   "n_files": 948
+  },
+  {
+   "repo": "eclipse-store/store",
+   "n_files": 944
+  },
+  {
+   "repo": "datanucleus/datanucleus-core",
+   "n_files": 940
+  },
+  {
+   "repo": "cojen/TuplDB",
+   "n_files": 824
+  },
+  {
+   "repo": "Nozbe/WatermelonDB",
+   "n_files": 737
+  },
+  {
+   "repo": "apache/gora",
+   "n_files": 723
+  },
+  {
+   "repo": "yahoo/jafar",
+   "n_files": 716
+  },
+  {
+   "repo": "QxOrm/QxOrm",
+   "n_files": 710
+  },
+  {
+   "repo": "noreasonprojects/ModernAVPlayer",
+   "n_files": 647
+  },
+  {
+   "repo": "appserver-io/appserver",
+   "n_files": 596
+  },
+  {
+   "repo": "requery/requery",
+   "n_files": 582
+  },
+  {
+   "repo": "metio/yosql",
+   "n_files": 564
+  },
+  {
+   "repo": "RCommon-Team/RCommon",
+   "n_files": 534
+  },
+  {
+   "repo": "atlanmod/NeoEMF",
+   "n_files": 514
+  },
+  {
+   "repo": "pbatard/rufus",
+   "n_files": 482
+  },
+  {
+   "repo": "galhavivi/cofi",
+   "n_files": 479
+  },
+  {
+   "repo": "itsharppro/Paralax",
+   "n_files": 453
+  },
+  {
+   "repo": "marabesi/xamarin",
+   "n_files": 443
+  },
+  {
+   "repo": "dadrus/jpa-unit",
+   "n_files": 413
+  },
+  {
+   "repo": "mmccroskey/Mist",
+   "n_files": 382
+  },
+  {
+   "repo": "willywood/ObjectFile",
+   "n_files": 369
+  },
+  {
+   "repo": "datanucleus/datanucleus-geospatial",
+   "n_files": 349
+  },
+  {
+   "repo": "qwlabs/doraemon",
+   "n_files": 324
+  },
+  {
+   "repo": "indeedeng/iwf",
+   "n_files": 307
+  },
+  {
+   "repo": "ampatspell/ember-cli-documents",
+   "n_files": 297
+  },
+  {
+   "repo": "koculu/ZoneTree",
+   "n_files": 295
+  },
+  {
+   "repo": "nftstorage/nft.storage",
+   "n_files": 279
+  },
+  {
+   "repo": "EixoX/jetfuel",
+   "n_files": 268
+  },
+  {
+   "repo": "hao117/bee-apm",
+   "n_files": 262
+  },
+  {
+   "repo": "MoqeethKhanCodes/Daily-Challenge-Java",
+   "n_files": 259
+  },
+  {
+   "repo": "BandiM/Data_pipeline",
+   "n_files": 257
+  },
+  {
+   "repo": "Miha-x64/Lychee",
+   "n_files": 257
+  },
+  {
+   "repo": "ar27111994/National-Criminals-Database",
+   "n_files": 253
+  },
+  {
+   "repo": "Pseudomanifold/Aleph",
+   "n_files": 252
+  },
+  {
+   "repo": "yinqiwen/ardb",
+   "n_files": 238
+  },
+  {
+   "repo": "oracle/soda-for-java",
+   "n_files": 236
+  },
+  {
+   "repo": "ampatspell/ember-cli-zuglet",
+   "n_files": 226
+  },
+  {
+   "repo": "datanucleus/javax.jdo",
+   "n_files": 226
+  },
+  {
+   "repo": "mbusb/multibootusb",
+   "n_files": 201
+  },
+  {
+   "repo": "ojplg/hrorm",
+   "n_files": 201
+  },
+  {
+   "repo": "datanucleus/javax.persistence",
+   "n_files": 190
+  },
+  {
+   "repo": "danij/Forum",
+   "n_files": 189
+  },
+  {
+   "repo": "pharo-nosql/voyage",
+   "n_files": 185
+  },
+  {
+   "repo": "atk4/data",
+   "n_files": 180
+  },
+  {
+   "repo": "smooks/smooks-persistence-cartridge",
+   "n_files": 180
+  },
+  {
+   "repo": "laurent85v/archuseriso",
+   "n_files": 177
+  },
+  {
+   "repo": "jinahya/mysql-employees-persistence",
+   "n_files": 176
+  },
+  {
+   "repo": "nuradinnur/eyeoftheherald",
+   "n_files": 173
+  },
+  {
+   "repo": "i-rtfsc/LiteGithub",
+   "n_files": 172
+  },
+  {
+   "repo": "roadtoagility/dflow",
+   "n_files": 172
+  },
+  {
+   "repo": "fastnsilver/grivet",
+   "n_files": 171
+  },
+  {
+   "repo": "ampatspell/ember-cli-models",
+   "n_files": 167
+  },
+  {
+   "repo": "diego-schivo/janilla",
+   "n_files": 167
+  },
+  {
+   "repo": "Bernardo-MG/jpa-example",
+   "n_files": 163
+  },
+  {
+   "repo": "pointfreeco/sqlite-data",
+   "n_files": 160
+  },
+  {
+   "repo": "jeanvillete/fiap-stock-ecommerce",
+   "n_files": 159
+  },
+  {
+   "repo": "fajarnugraha37/kvstore-ts",
+   "n_files": 154
+  },
+  {
+   "repo": "Borislavv/adv-cache",
+   "n_files": 153
+  },
+  {
+   "repo": "rebus-org/Rebus.SqlServer",
+   "n_files": 148
+  },
+  {
+   "repo": "datanucleus/datanucleus-api-jdo",
+   "n_files": 146
+  },
+  {
+   "repo": "vlingo/xoom-symbio-jdbc",
+   "n_files": 141
+  },
+  {
+   "repo": "SalivonIvan/distributed-signup",
+   "n_files": 140
+  },
+  {
+   "repo": "dexter-zone/dexter_core",
+   "n_files": 140
+  },
+  {
+   "repo": "Semprini/cbe",
+   "n_files": 139
+  },
+  {
+   "repo": "maximegel/solidstack",
+   "n_files": 139
+  },
+  {
+   "repo": "codeyard/bfh-bookstore",
+   "n_files": 137
+  },
+  {
+   "repo": "gabrieladutra/lp2a4",
+   "n_files": 136
+  },
+  {
+   "repo": "only-cliches/Nano-SQL",
+   "n_files": 135
+  },
+  {
+   "repo": "dpjustdoit/TTT",
+   "n_files": 133
+  },
+  {
+   "repo": "caelcs/cassitory",
+   "n_files": 131
+  },
+  {
+   "repo": "cchantep/acolyte",
+   "n_files": 131
+  },
+  {
+   "repo": "the-Jinxist/Eccentric",
+   "n_files": 128
+  },
+  {
+   "repo": "datanucleus/datanucleus-api-jpa",
+   "n_files": 126
+  },
+  {
+   "repo": "gittiver/litesql",
+   "n_files": 126
+  },
+  {
+   "repo": "smartnsoft/droid4me",
+   "n_files": 122
+  },
+  {
+   "repo": "i-rtfsc/LiteWeather",
+   "n_files": 121
+  },
+  {
+   "repo": "Michsior14/ngrx-addons",
+   "n_files": 120
+  },
+  {
+   "repo": "vlingo-net/xoom-net-symbio",
+   "n_files": 118
+  },
+  {
+   "repo": "morrys/relay-angular",
+   "n_files": 116
+  },
+  {
+   "repo": "neemesis/Handyman",
+   "n_files": 115
+  },
+  {
+   "repo": "jozzdart/prf",
+   "n_files": 114
+  },
+  {
+   "repo": "youagree/skillbox-java",
+   "n_files": 114
+  },
+  {
+   "repo": "Radigeco/webapi-jwt-angular-boilerplate",
+   "n_files": 113
+  },
+  {
+   "repo": "pubkey/client-side-databases",
+   "n_files": 112
+  },
+  {
+   "repo": "vlingo/xoom-symbio",
+   "n_files": 112
+  },
+  {
+   "repo": "MikhailSterkhov/jrest2",
+   "n_files": 111
+  },
+  {
+   "repo": "karambirov/GitHubSearch",
+   "n_files": 111
+  },
+  {
+   "repo": "ampatspell/ember-cli-couch",
+   "n_files": 109
+  },
+  {
+   "repo": "baumgrai/domain",
+   "n_files": 109
+  },
+  {
+   "repo": "ubikgs/AndroidSensorsPersistence",
+   "n_files": 109
+  },
+  {
+   "repo": "flipkart-incubator/batchman",
+   "n_files": 105
+  },
+  {
+   "repo": "j5ik2o/pekko-persistence-effector",
+   "n_files": 105
+  },
+  {
+   "repo": "sigpwned/jdbq",
+   "n_files": 102
+  },
+  {
+   "repo": "raftAtGit/Chainvayler",
+   "n_files": 101
+  },
+  {
+   "repo": "crisnguyengl/miu-cs525-asd-final-project",
+   "n_files": 99
+  },
+  {
+   "repo": "mrmorrandir/EventSourcing",
+   "n_files": 98
+  },
+  {
+   "repo": "steven-varga/h5cpp",
+   "n_files": 97
+  },
+  {
+   "repo": "rohitpotato/spotify-redone-react",
+   "n_files": 96
+  },
+  {
+   "repo": "vaccovecrana/metolithe",
+   "n_files": 94
+  },
+  {
+   "repo": "abhigit-hub/base-mvp",
+   "n_files": 93
+  },
+  {
+   "repo": "robinfriedli/JXP",
+   "n_files": 91
+  },
+  {
+   "repo": "mar10/fancytree",
+   "n_files": 90
+  },
+  {
+   "repo": "otaviofff/raviolini",
+   "n_files": 90
+  },
+  {
+   "repo": "abhigit-hub/base-mvvm",
+   "n_files": 89
+  },
+  {
+   "repo": "javierbrea/cypress-localstorage-commands",
+   "n_files": 88
+  },
+  {
+   "repo": "Data-swift/ManagedModels",
+   "n_files": 87
+  },
+  {
+   "repo": "mergesort/Boutique",
+   "n_files": 87
+  },
+  {
+   "repo": "RoRoche/elegant-android",
+   "n_files": 86
+  },
+  {
+   "repo": "elysiandb/elysiandb",
+   "n_files": 86
+  },
+  {
+   "repo": "ayushmi/agentstate",
+   "n_files": 84
+  },
+  {
+   "repo": "baransonmez/java-persistence-course",
+   "n_files": 84
+  },
+  {
+   "repo": "AlexeyZatsepin/Android-ORM-benchmark",
+   "n_files": 83
+  },
+  {
+   "repo": "StorageKit/StorageKit",
+   "n_files": 83
+  },
+  {
+   "repo": "guillep/steam",
+   "n_files": 83
+  },
+  {
+   "repo": "tbiyiktas/Android-SQLite-ORM",
+   "n_files": 82
+  },
+  {
+   "repo": "gabrielmecruz/locadoraDeVeiculosC",
+   "n_files": 81
+  },
+  {
+   "repo": "null-vector/akka-reactivemongo-plugin",
+   "n_files": 81
+  },
+  {
+   "repo": "IanDarwin/jpademo",
+   "n_files": 80
+  },
+  {
+   "repo": "Romain-P/Webservice-SpringREST-Oauth2",
+   "n_files": 80
+  },
+  {
+   "repo": "Aegrah/PANIX",
+   "n_files": 79
+  },
+  {
+   "repo": "quebrix/quebrix",
+   "n_files": 79
+  },
+  {
+   "repo": "uni-projs/ds-persist-final-work",
+   "n_files": 79
+  },
+  {
+   "repo": "go-po/po",
+   "n_files": 78
+  },
+  {
+   "repo": "proesio/pipe",
+   "n_files": 78
+  },
+  {
+   "repo": "ballerina-platform/module-ballerina-persist",
+   "n_files": 76
+  },
+  {
+   "repo": "Lisomatrix/Channels",
+   "n_files": 75
+  },
+  {
+   "repo": "bitbrain/jpersis",
+   "n_files": 74
+  },
+  {
+   "repo": "querystream/querystream",
+   "n_files": 74
+  },
+  {
+   "repo": "calint/dbo",
+   "n_files": 73
+  },
+  {
+   "repo": "skydoves/PreferenceRoom",
+   "n_files": 73
+  },
+  {
+   "repo": "pointfreeco/swift-sharing",
+   "n_files": 72
+  },
+  {
+   "repo": "poshjosh/bcjpadao",
+   "n_files": 72
+  },
+  {
+   "repo": "renetik/renetik-android-store",
+   "n_files": 72
+  },
+  {
+   "repo": "MichaelBosello/reactive-chat",
+   "n_files": 70
+  },
+  {
+   "repo": "astorDev/persic",
+   "n_files": 70
+  },
+  {
+   "repo": "rebus-org/Rebus.PostgreSql",
+   "n_files": 69
+  },
+  {
+   "repo": "ArjunPatil15/Hibernate-WorkSpace",
+   "n_files": 68
+  },
+  {
+   "repo": "Arkensor/EnfusionPersistenceFramework",
+   "n_files": 68
+  },
+  {
+   "repo": "blugavere/node-repositories",
+   "n_files": 68
+  },
+  {
+   "repo": "josecaballero/clouzy",
+   "n_files": 68
+  },
+  {
+   "repo": "kaloglu/libraries",
+   "n_files": 68
+  },
+  {
+   "repo": "shujutech/StORMi",
+   "n_files": 68
+  },
+  {
+   "repo": "viniciusthiengo/aplicativo-android-para-canais-do-youtube",
+   "n_files": 68
+  },
+  {
+   "repo": "eclipse-datagrid/datagrid",
+   "n_files": 67
+  },
+  {
+   "repo": "suhaotian/use-one",
+   "n_files": 67
+  },
+  {
+   "repo": "ILLGrenoble/preql",
+   "n_files": 66
+  },
+  {
+   "repo": "Laateef/Salsabil",
+   "n_files": 66
+  },
+  {
+   "repo": "wuyichen24/jibernate",
+   "n_files": 66
+  },
+  {
+   "repo": "cyberborean/rdfbeans",
+   "n_files": 65
+  },
+  {
+   "repo": "dkamyshov/hot-persist",
+   "n_files": 65
+  },
+  {
+   "repo": "mikoweb/model-persistence",
+   "n_files": 65
+  },
+  {
+   "repo": "nicatnesibli/pingoo",
+   "n_files": 65
+  },
+  {
+   "repo": "mattmassicotte/Empire",
+   "n_files": 64
+  },
+  {
+   "repo": "ritzvincentvculanag/intelliquest",
+   "n_files": 63
+  },
+  {
+   "repo": "eduardo-rdguez/spring-dev",
+   "n_files": 62
+  },
+  {
+   "repo": "evolution-gaming/safe-akka",
+   "n_files": 61
+  },
+  {
+   "repo": "n1215/lara-todo-persistence",
+   "n_files": 61
+  },
+  {
+   "repo": "payam2104/userStories",
+   "n_files": 61
+  },
+  {
+   "repo": "rom-rb/rom-repository",
+   "n_files": 61
+  },
+  {
+   "repo": "MuriloNogr/ArgosAI-Sprint4",
+   "n_files": 60
+  },
+  {
+   "repo": "alvaroyturburo/ControlDeProyectos",
+   "n_files": 60
+  },
+  {
+   "repo": "davidje13/collection-storage",
+   "n_files": 60
+  },
+  {
+   "repo": "horovodovodo4ka/bones",
+   "n_files": 60
+  },
+  {
+   "repo": "rm3l/datanucleus-gradle-plugin",
+   "n_files": 60
+  },
+  {
+   "repo": "Leksiqq/DtoKit",
+   "n_files": 59
+  },
+  {
+   "repo": "dutroctu/go-webservice",
+   "n_files": 59
+  },
+  {
+   "repo": "renetik/renetik-android-preset",
+   "n_files": 59
+  },
+  {
+   "repo": "mynghn/persistence-aop",
+   "n_files": 58
+  },
+  {
+   "repo": "rebus-org/Rebus.MongoDb",
+   "n_files": 58
+  },
+  {
+   "repo": "rebus-org/Rebus.Oracle",
+   "n_files": 58
+  },
+  {
+   "repo": "3Squared/PeakCoreData",
+   "n_files": 57
+  },
+  {
+   "repo": "bpawluk/MongoDDD",
+   "n_files": 57
+  },
+  {
+   "repo": "goptics/varmq",
+   "n_files": 57
+  },
+  {
+   "repo": "kyuff/es",
+   "n_files": 56
+  },
+  {
+   "repo": "uni-projs/ds-persistence",
+   "n_files": 56
+  },
+  {
+   "repo": "RaheesAhmed/nextjs-state",
+   "n_files": 55
+  },
+  {
+   "repo": "olivergafvert/topcat",
+   "n_files": 55
+  },
+  {
+   "repo": "xpinjection/hibernate-performance",
+   "n_files": 55
+  },
+  {
+   "repo": "ibitcy/react-stores",
+   "n_files": 54
+  },
+  {
+   "repo": "nventive/Nventive.Persistence",
+   "n_files": 54
+  },
+  {
+   "repo": "objectbox/objectbox-c",
+   "n_files": 54
+  },
+  {
+   "repo": "PackRuble/cardoteka",
+   "n_files": 53
+  },
+  {
+   "repo": "anil-gudigar/Twill",
+   "n_files": 53
+  },
+  {
+   "repo": "kruseio/rapiddb",
+   "n_files": 53
+  },
+  {
+   "repo": "LucianoRicardo737/claude-conversation-logger",
+   "n_files": 52
+  },
+  {
+   "repo": "joseantmazonsb/ppl",
+   "n_files": 52
+  },
+  {
+   "repo": "CVDS-TheBoys/historial-de-equipos-labinfo-theboys",
+   "n_files": 51
+  },
+  {
+   "repo": "DaanV2/Config-Handling.Net",
+   "n_files": 51
+  },
+  {
+   "repo": "Morebec/orkestra-normalization",
+   "n_files": 51
+  },
+  {
+   "repo": "jacksonrakena/jacksonbot",
+   "n_files": 51
+  },
+  {
+   "repo": "tobytwigger/laravel-settings",
+   "n_files": 50
+  },
+  {
+   "repo": "lucas34/SwiftQueue",
+   "n_files": 49
+  },
+  {
+   "repo": "cutiips/resto-order",
+   "n_files": 48
+  },
+  {
+   "repo": "michaelcherrera84/ASDVAssignment",
+   "n_files": 48
+  },
+  {
+   "repo": "smartnsoft/droid4me.ws",
+   "n_files": 48
+  },
+  {
+   "repo": "t-neumann/palantir",
+   "n_files": 48
+  },
+  {
+   "repo": "zhouwentong1993/tinycache",
+   "n_files": 48
+  },
+  {
+   "repo": "Bzahov98/PizzaDelivery",
+   "n_files": 47
+  },
+  {
+   "repo": "jaimemartinezcazon/AMR-Persistence-Model",
+   "n_files": 47
+  },
+  {
+   "repo": "CaptainCodeman/rdx",
+   "n_files": 46
+  },
+  {
+   "repo": "Placenote/PlacenoteSDK-Unity",
+   "n_files": 46
+  },
+  {
+   "repo": "VladislavPixel/persi-library",
+   "n_files": 45
+  },
+  {
+   "repo": "hibernate/query-validator",
+   "n_files": 45
+  },
+  {
+   "repo": "spacejam/sled",
+   "n_files": 45
+  },
+  {
+   "repo": "zentala/tmux-persistent-console",
+   "n_files": 45
+  },
+  {
+   "repo": "requests-cache/aiohttp-client-cache",
+   "n_files": 44
+  },
+  {
+   "repo": "BlackBoxVision/react-native-redux-todo",
+   "n_files": 43
+  },
+  {
+   "repo": "turangarusso/MemoTest-ADA",
+   "n_files": 43
+  },
+  {
+   "repo": "jhonnyx2012/Marvel-Comics",
+   "n_files": 42
+  },
+  {
+   "repo": "samedfft2634/Stock_APP",
+   "n_files": 42
+  },
+  {
+   "repo": "y0bu/todo-list-app",
+   "n_files": 42
+  },
+  {
+   "repo": "Bloodiewormer/Proyecto-2-Progra-1",
+   "n_files": 41
+  },
+  {
+   "repo": "R0nald0/Taski",
+   "n_files": 41
+  },
+  {
+   "repo": "simbadltd/simbad.platform",
+   "n_files": 41
+  },
+  {
+   "repo": "vlingo/xoom-symbio-geode",
+   "n_files": 41
+  },
+  {
+   "repo": "Sergiy1987/Selenium_tests_Java",
+   "n_files": 40
+  },
+  {
+   "repo": "WebEngineering-Univaq/Java_Example_Newspaper_DAO",
+   "n_files": 40
+  },
+  {
+   "repo": "albertodebortoli/Skopelos",
+   "n_files": 40
+  },
+  {
+   "repo": "aparnaittekot/AttendanceApp",
+   "n_files": 40
+  },
+  {
+   "repo": "infinispan-demos/infinispan-sqlstore-demo",
+   "n_files": 40
+  },
+  {
+   "repo": "lanej/cistern",
+   "n_files": 40
+  },
+  {
+   "repo": "pinqy520/mobx-persist",
+   "n_files": 40
+  },
+  {
+   "repo": "rob333/flutter_mediator_persistence",
+   "n_files": 40
+  },
+  {
+   "repo": "BoomEnjoyer/MintLoader",
+   "n_files": 39
+  },
+  {
+   "repo": "GoodRequest/GoodPersistence",
+   "n_files": 39
+  },
+  {
+   "repo": "Projetos-Fixacao/logistica-api",
+   "n_files": 39
+  },
+  {
+   "repo": "Soumyo001/HydraRevenant",
+   "n_files": 39
+  },
+  {
+   "repo": "Vedenin/RestAndSpringMVC-CodingChallenge",
+   "n_files": 39
+  },
+  {
+   "repo": "nolia/Noodle",
+   "n_files": 39
+  },
+  {
+   "repo": "sormuras/stash",
+   "n_files": 39
+  },
+  {
+   "repo": "thisisdevelopment/mightymap",
+   "n_files": 39
+  },
+  {
+   "repo": "donatogomez/TheMovieDB-MVMM-Kotlin",
+   "n_files": 38
+  },
+  {
+   "repo": "grantjenks/python-diskcache",
+   "n_files": 38
+  },
+  {
+   "repo": "networkteam/construct",
+   "n_files": 38
+  },
+  {
+   "repo": "Mirobelak/tiktok-clone-fullstack",
+   "n_files": 37
+  },
+  {
+   "repo": "doctrine/persistence",
+   "n_files": 37
+  },
+  {
+   "repo": "heltonricardo/java-jpa",
+   "n_files": 37
+  },
+  {
+   "repo": "sonata-project/EntityAuditBundle",
+   "n_files": 37
+  },
+  {
+   "repo": "baherbebo/FHook",
+   "n_files": 36
+  },
+  {
+   "repo": "ddc-java/codebreaker-solitaire-service",
+   "n_files": 36
+  },
+  {
+   "repo": "dkoster95/PelicanSwift",
+   "n_files": 36
+  },
+  {
+   "repo": "kevinwang5658/backstack",
+   "n_files": 36
+  },
+  {
+   "repo": "ravanscafi/redux-undo-actions",
+   "n_files": 36
+  },
+  {
+   "repo": "AlexDochioiu/JeeFoLogger",
+   "n_files": 35
+  },
+  {
+   "repo": "FancyPixel/rtk-persist",
+   "n_files": 35
+  },
+  {
+   "repo": "VladislavPixel/library-persi",
+   "n_files": 35
+  },
+  {
+   "repo": "backtojuan/JoNaLetterSoup",
+   "n_files": 35
+  },
+  {
+   "repo": "geirolz/fly4s",
+   "n_files": 35
+  },
+  {
+   "repo": "mergesort/Bodega",
+   "n_files": 35
+  },
+  {
+   "repo": "Akshay-Rohatgi/starshower",
+   "n_files": 34
+  },
+  {
+   "repo": "AsrielDreemurrGM/Study_Of_Java_JPA",
+   "n_files": 34
+  },
+  {
+   "repo": "rebus-org/Rebus.AzureStorage",
+   "n_files": 34
+  },
+  {
+   "repo": "zewish/redux-remember",
+   "n_files": 34
+  },
+  {
+   "repo": "LeticiaFarias/Medical-Clinic",
+   "n_files": 33
+  },
+  {
+   "repo": "alvaroyturburo/CarSolutionWebManager",
+   "n_files": 33
+  },
+  {
+   "repo": "austinv11/Persistence",
+   "n_files": 33
+  },
+  {
+   "repo": "boweber/PersistenceMiddleware",
+   "n_files": 33
+  },
+  {
+   "repo": "hakkinenT/flutter_calculadora_imc_sqlite",
+   "n_files": 33
+  },
+  {
+   "repo": "jhwoodward/redis-store",
+   "n_files": 33
+  },
+  {
+   "repo": "tadeuespindolapalermo/EasyJDBC",
+   "n_files": 33
+  },
+  {
+   "repo": "JuliaGraphs/GraphIO.jl",
+   "n_files": 32
+  },
+  {
+   "repo": "MACHINE-IT/Buydot-QbyKart-",
+   "n_files": 32
+  },
+  {
+   "repo": "UCL/covid-api-helidon",
+   "n_files": 32
+  },
+  {
+   "repo": "Yuragy/blackbox-ave",
+   "n_files": 32
+  },
+  {
+   "repo": "brunoccc/redux-manent",
+   "n_files": 32
+  },
+  {
+   "repo": "gabbium/dotnet-persistence",
+   "n_files": 32
+  },
+  {
+   "repo": "georgetdn/SYSCPPCP",
+   "n_files": 32
+  },
+  {
+   "repo": "superswan/kuudereRAT",
+   "n_files": 32
+  },
+  {
+   "repo": "ttpreport/blindage",
+   "n_files": 32
+  },
+  {
+   "repo": "MatheuZSecurity/Rootkit",
+   "n_files": 31
+  },
+  {
+   "repo": "chandrakanthrck/MemPersistCacheSystem",
+   "n_files": 31
+  },
+  {
+   "repo": "cmiles74/EntityFrameworkCore",
+   "n_files": 31
+  },
+  {
+   "repo": "uni-projs/ds-persist-work-1",
+   "n_files": 31
+  },
+  {
+   "repo": "Foacs/pphi",
+   "n_files": 30
+  },
+  {
+   "repo": "desi109/bike-company-app",
+   "n_files": 30
+  },
+  {
+   "repo": "dorukkilitcioglu/persistd",
+   "n_files": 30
+  },
+  {
+   "repo": "formapro/yadm",
+   "n_files": 30
+  },
+  {
+   "repo": "hpoul/simple_json_persistence",
+   "n_files": 30
+  },
+  {
+   "repo": "tyrissoftware/swift-valuestore",
+   "n_files": 30
+  },
+  {
+   "repo": "AsrielDreemurrGM/JPA_Multi_Database_Testing",
+   "n_files": 29
+  },
+  {
+   "repo": "German2943/parking-lot",
+   "n_files": 29
+  },
+  {
+   "repo": "ThisIsNSH/Angular6-LoginApp",
+   "n_files": 29
+  },
+  {
+   "repo": "antoniovl/persistence-tools",
+   "n_files": 29
+  },
+  {
+   "repo": "evanstukalov/redis-alternative",
+   "n_files": 29
+  },
+  {
+   "repo": "toddeTV/SCROLL-persistence",
+   "n_files": 29
+  },
+  {
+   "repo": "VoidbornGames/Ultimate_C_Sharp_Server",
+   "n_files": 28
+  },
+  {
+   "repo": "benja0x40/LittleThumb",
+   "n_files": 28
+  },
+  {
+   "repo": "cbergoon/stitchdb",
+   "n_files": 28
+  },
+  {
+   "repo": "himansaBro/JungleConfig",
+   "n_files": 28
+  },
+  {
+   "repo": "lukasz-szewc/persistence-example",
+   "n_files": 28
+  },
+  {
+   "repo": "reddavis/Papyrus",
+   "n_files": 28
+  },
+  {
+   "repo": "renetik/renetik-android-json",
+   "n_files": 28
+  },
+  {
+   "repo": "Suraj-Tiwari/docker-devs",
+   "n_files": 27
+  },
+  {
+   "repo": "ViraMesha/tweet-card",
+   "n_files": 27
+  },
+  {
+   "repo": "biril/backbone-faux-server",
+   "n_files": 27
+  },
+  {
+   "repo": "cyberfolk/php-todo-list",
+   "n_files": 27
+  },
+  {
+   "repo": "marceloaugusto80/react-ssr-express",
+   "n_files": 27
+  },
+  {
+   "repo": "neallester/danake-sw",
+   "n_files": 27
+  },
+  {
+   "repo": "onePeterCollins/bitcasino",
+   "n_files": 27
+  },
+  {
+   "repo": "rish2408/Hibernate-Practice",
+   "n_files": 27
+  },
+  {
+   "repo": "AndyDentFree/perswifting",
+   "n_files": 26
+  },
+  {
+   "repo": "Ankush-Nmurthy/Car-Rental-Service",
+   "n_files": 26
+  },
+  {
+   "repo": "nccgroup/Winpayloads",
+   "n_files": 26
+  },
+  {
+   "repo": "rahulchauhanraj/EntityManagementSystem",
+   "n_files": 26
+  },
+  {
+   "repo": "tehtea/persisted-requests",
+   "n_files": 26
+  },
+  {
+   "repo": "SwiftKitz/Storez",
+   "n_files": 25
+  },
+  {
+   "repo": "bkuhlmann/lode",
+   "n_files": 25
+  },
+  {
+   "repo": "bobek-balinek/BlueJet",
+   "n_files": 25
+  },
+  {
+   "repo": "geobour98/thesis-c2",
+   "n_files": 25
+  },
+  {
+   "repo": "hxmn/java_school_persistence",
+   "n_files": 25
+  },
+  {
+   "repo": "yusiwen/commons-mapper",
+   "n_files": 25
+  },
+  {
+   "repo": "Manish927/Hibernate-SpringBoot",
+   "n_files": 24
+  },
+  {
+   "repo": "UnlyEd/github-action-store-variable",
+   "n_files": 24
+  },
+  {
+   "repo": "WebEngineering-Univaq/Java_Example_SimpleDataModel",
+   "n_files": 24
+  },
+  {
+   "repo": "aerth/aerthos",
+   "n_files": 24
+  },
+  {
+   "repo": "fthomasvp/fnr-tap-persistence",
+   "n_files": 24
+  },
+  {
+   "repo": "gregorriegler/Bookshelf-Kata",
+   "n_files": 24
+  },
+  {
+   "repo": "hkellaway/Purse",
+   "n_files": 24
+  },
+  {
+   "repo": "hoddmimes/zink",
+   "n_files": 24
+  },
+  {
+   "repo": "mhayes853/swift-uuidv7",
+   "n_files": 24
+  },
+  {
+   "repo": "pyrustic/jinbase",
+   "n_files": 24
+  },
+  {
+   "repo": "sanjay035/Dynamic-Job-Scheduler",
+   "n_files": 24
+  },
+  {
+   "repo": "src-mgra/spfx-webpart",
+   "n_files": 24
+  },
+  {
+   "repo": "wilsongoode/Percy",
+   "n_files": 24
+  },
+  {
+   "repo": "A-Venkat-Giri/AMS_SpringRest",
+   "n_files": 23
+  },
+  {
+   "repo": "MelinaMontes/nestjs-task-management",
+   "n_files": 23
+  },
+  {
+   "repo": "NeoTecDigital/LumberJack",
+   "n_files": 23
+  },
+  {
+   "repo": "Tchoks/hibernate",
+   "n_files": 23
+  },
+  {
+   "repo": "adobe/aio-lib-state",
+   "n_files": 23
+  },
+  {
+   "repo": "baryvn/Orleans.Rqlite",
+   "n_files": 23
+  },
+  {
+   "repo": "lenlag/GarageJPA",
+   "n_files": 23
+  },
+  {
+   "repo": "mixaverros88/convert-Greek-To-Greeklish-java",
+   "n_files": 23
+  },
+  {
+   "repo": "plopezm/goedb",
+   "n_files": 23
+  },
+  {
+   "repo": "thisaislan/persistence-easy-to-delete",
+   "n_files": 23
+  },
+  {
+   "repo": "Jazzuh/AclPersistenceManager",
+   "n_files": 22
+  },
+  {
+   "repo": "MadAppGang/redux_local_state_serializer",
+   "n_files": 22
+  },
+  {
+   "repo": "PauloGarcesCarraco/SistemaIMDB",
+   "n_files": 22
+  },
+  {
+   "repo": "SvenWesterlaken/mongo4j",
+   "n_files": 22
+  },
+  {
+   "repo": "chandrakanthrck/CustomQueueSystem",
+   "n_files": 22
+  },
+  {
+   "repo": "dnunes/autoenvconfig",
+   "n_files": 22
+  },
+  {
+   "repo": "fabio-nettis/tiny-bus",
+   "n_files": 22
+  },
+  {
+   "repo": "georgetdn/SYSCPPCPlinux",
+   "n_files": 22
+  },
+  {
+   "repo": "grandecola/bigqueue",
+   "n_files": 22
+  },
+  {
+   "repo": "jpz4085/BOOTDISK",
+   "n_files": 22
+  },
+  {
+   "repo": "kslong/Persistence",
+   "n_files": 22
+  },
+  {
+   "repo": "sujal12344/todo-app",
+   "n_files": 22
+  },
+  {
+   "repo": "viniciusthiengo/realm-students",
+   "n_files": 22
+  },
+  {
+   "repo": "BranislavOsadkovski/UserManagerAPI-WebApplication",
+   "n_files": 21
+  },
+  {
+   "repo": "Delt06/persistence",
+   "n_files": 21
+  },
+  {
+   "repo": "LoliKingdom/Thaumic-Speedup",
+   "n_files": 21
+  },
+  {
+   "repo": "PepeOjeda/Persyst",
+   "n_files": 21
+  },
+  {
+   "repo": "TJC-Tools/TJC.Persist",
+   "n_files": 21
+  },
+  {
+   "repo": "adamb9/FootballManagementSystem",
+   "n_files": 21
+  },
+  {
+   "repo": "aftermath22/Online_Shopping_Cart",
+   "n_files": 21
+  },
+  {
+   "repo": "alex8088/electron-conf",
+   "n_files": 21
+  },
+  {
+   "repo": "asacxyz/flutter_aplicando_persistencia_de_dados",
+   "n_files": 21
+  },
+  {
+   "repo": "bigjayray/ReviewsApi",
+   "n_files": 21
+  },
+  {
+   "repo": "dcwik96/RESTwsejbdemo",
+   "n_files": 21
+  },
+  {
+   "repo": "lemo-nade-room/event-store-adapter-swift-sqlite",
+   "n_files": 21
+  },
+  {
+   "repo": "maple3142/vuejs-storage",
+   "n_files": 21
+  },
+  {
+   "repo": "maxbogus/VirtualTourist",
+   "n_files": 21
+  },
+  {
+   "repo": "molenzwiebel/Basie",
+   "n_files": 21
+  },
+  {
+   "repo": "mshahzadtariq/persistable",
+   "n_files": 21
+  },
+  {
+   "repo": "sprices-exist/Starship-Invasion",
+   "n_files": 21
+  },
+  {
+   "repo": "ArxOne/Persistence",
+   "n_files": 20
+  },
+  {
+   "repo": "Piyeycorp/Piyeycorp.Rebus.Firestore",
+   "n_files": 20
+  },
+  {
+   "repo": "ben331/instagramX",
+   "n_files": 20
+  },
+  {
+   "repo": "irontec/android-room-example",
+   "n_files": 20
+  },
+  {
+   "repo": "matiasluca72/LibreriaJPA",
+   "n_files": 20
+  },
+  {
+   "repo": "rob333/Flutter-logins-to-a-REST-server-with-i18n-theming-persistence-and-state-management",
+   "n_files": 20
+  },
+  {
+   "repo": "softspiders/clean-architecture-react-counter-db-ts-starter",
+   "n_files": 20
+  },
+  {
+   "repo": "tobytwigger/laravel-settings-vue",
+   "n_files": 20
+  },
+  {
+   "repo": "Hizoul/resub-persist",
+   "n_files": 19
+  },
+  {
+   "repo": "Marcus-Software/ms_persist",
+   "n_files": 19
+  },
+  {
+   "repo": "MattEstHaut/RediSharp",
+   "n_files": 19
+  },
+  {
+   "repo": "coldbox-modules/cbstorages",
+   "n_files": 19
+  },
+  {
+   "repo": "fiorenzino/vertx-jpa",
+   "n_files": 19
+  },
+  {
+   "repo": "imcuttle/vsp",
+   "n_files": 19
+  },
+  {
+   "repo": "juanmbellini/four-layers-webapp-archetype",
+   "n_files": 19
+  },
+  {
+   "repo": "luispedro/diskhash",
+   "n_files": 19
+  },
+  {
+   "repo": "m-lm/taproot",
+   "n_files": 19
+  },
+  {
+   "repo": "sssvip/algorithms4th",
+   "n_files": 19
+  },
+  {
+   "repo": "CayetanoHerreraLuisRicardo/YJSF",
+   "n_files": 18
+  },
+  {
+   "repo": "FurfurV/My_Carbon_Impact_Application_Final",
+   "n_files": 18
+  },
+  {
+   "repo": "MJawad-AbouAleiwi/SLR201",
+   "n_files": 18
+  },
+  {
+   "repo": "NicoVIII/TypedPersistence",
+   "n_files": 18
+  },
+  {
+   "repo": "PHPPlatform/persist",
+   "n_files": 18
+  },
+  {
+   "repo": "WebEngineering-Univaq/Java_Example_BaseApplicationMC",
+   "n_files": 18
+  },
+  {
+   "repo": "brinvex/brinvex-persistence",
+   "n_files": 18
+  },
+  {
+   "repo": "changkun/sched",
+   "n_files": 18
+  },
+  {
+   "repo": "danielepantaleone/PersistedProperty",
+   "n_files": 18
+  },
+  {
+   "repo": "dfleper/ProyectORM",
+   "n_files": 18
+  },
+  {
+   "repo": "jonaszell97/Cryo",
+   "n_files": 18
+  },
+  {
+   "repo": "julianbetov/SpringDataJPA-Course",
+   "n_files": 18
+  },
+  {
+   "repo": "maxbogus/iTunesSearchApp",
+   "n_files": 18
+  },
+  {
+   "repo": "mohammad-safari/Java_HTTP_REST_Client",
+   "n_files": 18
+  },
+  {
+   "repo": "pientaa/hibernate-demo",
+   "n_files": 18
+  },
+  {
+   "repo": "r3dl3g/persistent",
+   "n_files": 18
+  },
+  {
+   "repo": "teragrep/rlo_13",
+   "n_files": 18
+  },
+  {
+   "repo": "ulrikdamm/Sqlable",
+   "n_files": 18
+  },
+  {
+   "repo": "zh-rocco/vue-auto-storage",
+   "n_files": 18
+  },
+  {
+   "repo": "51gordon/squeue",
+   "n_files": 17
+  },
+  {
+   "repo": "AndrePaulino/curso_jdbc",
+   "n_files": 17
+  },
+  {
+   "repo": "KlymentKim/goit-react-hw-07-phonebook",
+   "n_files": 17
+  },
+  {
+   "repo": "Lifestreams-ai/Rust-State-Machine",
+   "n_files": 17
+  },
+  {
+   "repo": "Nikki1930/Todo-List",
+   "n_files": 17
+  },
+  {
+   "repo": "PolukovY/collect-picture-from-nasa",
+   "n_files": 17
+  },
+  {
+   "repo": "SngsProductions/P1_FINAL_PROYECT",
+   "n_files": 17
+  },
+  {
+   "repo": "UnityTech/kafka-archiver",
+   "n_files": 17
+  },
+  {
+   "repo": "Valik3201/goit-react-hw-06-phonebook",
+   "n_files": 17
+  },
+  {
+   "repo": "chronoDave/leaf-db",
+   "n_files": 17
+  },
+  {
+   "repo": "d3adspace/phoenix",
+   "n_files": 17
+  },
+  {
+   "repo": "devrath/literate-datastore-preferences",
+   "n_files": 17
+  },
+  {
+   "repo": "event-engine/php-persistence",
+   "n_files": 17
+  },
+  {
+   "repo": "jcondor98/perseest",
+   "n_files": 17
+  },
+  {
+   "repo": "johanhelsing/bevy_pkv",
+   "n_files": 17
+  },
+  {
+   "repo": "lorenzobilli/Freon",
+   "n_files": 17
+  },
+  {
+   "repo": "sjefvanleeuwen/orleans-morstead-etcd",
+   "n_files": 17
+  },
+  {
+   "repo": "tokahuke/yaque",
+   "n_files": 17
+  },
+  {
+   "repo": "vlingo/xoom-symbio-dynamodb",
+   "n_files": 17
+  },
+  {
+   "repo": "vogonwann/cachey",
+   "n_files": 17
+  },
+  {
+   "repo": "Eduardo-Karpinski/hcf",
+   "n_files": 16
+  },
+  {
+   "repo": "GersonBenito/POO-Peluqueria-JavaFrame",
+   "n_files": 16
+  },
+  {
+   "repo": "HasyimAsya-RI/fintech-lab5-room-database",
+   "n_files": 16
+  },
+  {
+   "repo": "Imanfeng/Telemetry",
+   "n_files": 16
+  },
+  {
+   "repo": "MDecker-MobileComputing/Android_AbkVerzMitRoom",
+   "n_files": 16
+  },
+  {
+   "repo": "Nsikaktopdown/ContactAppExample",
+   "n_files": 16
+  },
+  {
+   "repo": "Pseudomanifold/Skeleton_Persistence",
+   "n_files": 16
+  },
+  {
+   "repo": "R-Rothrock/mantis",
+   "n_files": 16
+  },
+  {
+   "repo": "aCuevasDev/AccessFilesWithGUI",
+   "n_files": 16
+  },
+  {
+   "repo": "ace-teknologi/memzy",
+   "n_files": 16
+  },
+  {
+   "repo": "asperez26/WeatherApp",
+   "n_files": 16
+  },
+  {
+   "repo": "clauf14/Appointment-Aplication-in-Java",
+   "n_files": 16
+  },
+  {
+   "repo": "fatma2705/Brano-Genere-Maven",
+   "n_files": 16
+  },
+  {
+   "repo": "gabrielecorbo/Bayesian-mixture-model-for-environmental-application",
+   "n_files": 16
+  },
+  {
+   "repo": "holinov/zio-event-sourcing",
+   "n_files": 16
+  },
+  {
+   "repo": "lucid-kv/lucid",
+   "n_files": 16
+  },
+  {
+   "repo": "petrknap/zoned-datetime-persistence",
+   "n_files": 16
+  },
+  {
+   "repo": "rumenmitov/snapper",
+   "n_files": 16
+  },
+  {
+   "repo": "skydoves/Only",
+   "n_files": 16
+  },
+  {
+   "repo": "KlymentKim/goit-react-hw-06-phonebook",
+   "n_files": 15
+  },
+  {
+   "repo": "SilensAngelusNex/pgraph",
+   "n_files": 15
+  },
+  {
+   "repo": "asperez26/TravelPlannerApp",
+   "n_files": 15
+  },
+  {
+   "repo": "beatthat/entity-persistence",
+   "n_files": 15
+  },
+  {
+   "repo": "bharatagarwal/sinatra-web-apps",
+   "n_files": 15
+  },
+  {
+   "repo": "cansin-r/sweetWater",
+   "n_files": 15
+  },
+  {
+   "repo": "goptics/redisq",
+   "n_files": 15
+  },
+  {
+   "repo": "husaynhakeem/Android-Room-CRUD-Sample",
+   "n_files": 15
+  },
+  {
+   "repo": "imcuttle/inquirer-store",
+   "n_files": 15
+  },
+  {
+   "repo": "karar-hayder/Simple-MCP",
+   "n_files": 15
+  },
+  {
+   "repo": "noahbclarkson/rustmap-db",
+   "n_files": 15
+  },
+  {
+   "repo": "ryansann/hydro",
+   "n_files": 15
+  },
+  {
+   "repo": "QuitoTactico/Proyecto-FacebookSimulator",
+   "n_files": 14
+  },
+  {
+   "repo": "Rodrigolara05/My-Son-Birthday-SQLite-Flutter",
+   "n_files": 14
+  },
+  {
+   "repo": "ShahOdin/QueryView",
+   "n_files": 14
+  },
+  {
+   "repo": "SonRiab/manifesto-models",
+   "n_files": 14
+  },
+  {
+   "repo": "SyncfusionExamples/EJ2-DataGrid-Core-persistence-clear-persisted-data",
+   "n_files": 14
+  },
+  {
+   "repo": "TallerWebSolutions/apollo-cache-instorage",
+   "n_files": 14
+  },
+  {
+   "repo": "WebEngineering-Univaq/Java_Example_BaseApplicationMVC",
+   "n_files": 14
+  },
+  {
+   "repo": "aholstenson/dwaal",
+   "n_files": 14
+  },
+  {
+   "repo": "avijeetpandey/Agenda",
+   "n_files": 14
+  },
+  {
+   "repo": "bielborgesc/sp-movies-manager",
+   "n_files": 14
+  },
+  {
+   "repo": "dennzimm/redux-persist-expo-file-system-storage",
+   "n_files": 14
+  },
+  {
+   "repo": "douglas-borba/app-Tarefas",
+   "n_files": 14
+  },
+  {
+   "repo": "dsrivan/prj005-2022-b7WebLogin-React-Front",
+   "n_files": 14
+  },
+  {
+   "repo": "hacker1649/local-database",
+   "n_files": 14
+  },
+  {
+   "repo": "ilyasbilgihan/next-firebase-authentication",
+   "n_files": 14
+  },
+  {
+   "repo": "maxwell-wayne-17/CS193p-EmojiArt",
+   "n_files": 14
+  },
+  {
+   "repo": "src-mgra/firebase-TList-Auth",
+   "n_files": 14
+  },
+  {
+   "repo": "sventorben/keycloak-session-model-jpa",
+   "n_files": 14
+  },
+  {
+   "repo": "tgorka/microplum",
+   "n_files": 14
+  },
+  {
+   "repo": "CrisBogucki/Workshop-Jpa-Hibernate-Rest",
+   "n_files": 13
+  },
+  {
+   "repo": "DevExpress-Examples/blazor-multi-tab-ui",
+   "n_files": 13
+  },
+  {
+   "repo": "G9A2HvK9/2Player_Battle_Game",
+   "n_files": 13
+  },
+  {
+   "repo": "Germain712/DFEMyTunes",
+   "n_files": 13
+  },
+  {
+   "repo": "LUI5DA/minimq-broker",
+   "n_files": 13
+  },
+  {
+   "repo": "PedroFidalgo/VideoStore_FenixFramework",
+   "n_files": 13
+  },
+  {
+   "repo": "Q-bio-Belgrade/TA_I_paper",
+   "n_files": 13
+  },
+  {
+   "repo": "Wwarrior1/Scala_Akka_Project",
+   "n_files": 13
+  },
+  {
+   "repo": "abhishekkr/ficklepickle",
+   "n_files": 13
+  },
+  {
+   "repo": "ad4rsh2701/RiRi",
+   "n_files": 13
+  },
+  {
+   "repo": "awncorp/nano",
+   "n_files": 13
+  },
+  {
+   "repo": "dinkar1708-zz/Lifecycle-Aware-Components",
+   "n_files": 13
+  },
+  {
+   "repo": "finedjentleman/routinetracker",
+   "n_files": 13
+  },
+  {
+   "repo": "freniapinto/potential-potato",
+   "n_files": 13
+  },
+  {
+   "repo": "hfiuza/TDA---Topological-Data-Analysis",
+   "n_files": 13
+  },
+  {
+   "repo": "humphriest/iTunes",
+   "n_files": 13
+  },
+  {
+   "repo": "iordanis/moor",
+   "n_files": 13
+  },
+  {
+   "repo": "kondlekar-yash/cook-it",
+   "n_files": 13
+  },
+  {
+   "repo": "martinohmann/endure",
+   "n_files": 13
+  },
+  {
+   "repo": "matiasluca72/TiendaJDBC",
+   "n_files": 13
+  },
+  {
+   "repo": "piellardj/f5-persistence-cookie",
+   "n_files": 13
+  },
+  {
+   "repo": "sebastien-attia/Tools_CSharp",
+   "n_files": 13
+  },
+  {
+   "repo": "sjefvanleeuwen/orleans-morstead-storage",
+   "n_files": 13
+  },
+  {
+   "repo": "2KAbhishek/Kotes",
+   "n_files": 12
+  },
+  {
+   "repo": "ArchitectAK/RoomRxKotlin-Android",
+   "n_files": 12
+  },
+  {
+   "repo": "CayetanoHerreraLuisRicardo/CRUD-JAVA-JSP",
+   "n_files": 12
+  },
+  {
+   "repo": "CayetanoHerreraLuisRicardo/ProductoJSF",
+   "n_files": 12
+  },
+  {
+   "repo": "HectorMRC/gw-pool",
+   "n_files": 12
+  },
+  {
+   "repo": "Huaguang-XinZhe/tauri-mw-store",
+   "n_files": 12
+  },
+  {
+   "repo": "Make-School-Labs/TriviaTime",
+   "n_files": 12
+  },
+  {
+   "repo": "ShaneCotter/BusTimetableSystem",
+   "n_files": 12
+  },
+  {
+   "repo": "ThemeHackers/winsRAT",
+   "n_files": 12
+  },
+  {
+   "repo": "TheresAFewConors/CloudSweep",
+   "n_files": 12
+  },
+  {
+   "repo": "arman-yekkehkhani/simple-redis-server",
+   "n_files": 12
+  },
+  {
+   "repo": "audunegames/object-persistence",
+   "n_files": 12
+  },
+  {
+   "repo": "backtojuan/Airport-Screen",
+   "n_files": 12
+  },
+  {
+   "repo": "blugavere/cassandra-repository",
+   "n_files": 12
+  },
+  {
+   "repo": "bogwi/ugnos",
+   "n_files": 12
+  },
+  {
+   "repo": "caiomello/services",
+   "n_files": 12
+  },
+  {
+   "repo": "cquenum/ask-sdk-dynamodb-persistence-adapter",
+   "n_files": 12
+  },
+  {
+   "repo": "gianpieroc/react-markdown-editor",
+   "n_files": 12
+  },
+  {
+   "repo": "gonzalonm/RoomDemo",
+   "n_files": 12
+  },
+  {
+   "repo": "jor2/CRUD-Java",
+   "n_files": 12
+  },
+  {
+   "repo": "mohitajwani/SnapWork",
+   "n_files": 12
+  },
+  {
+   "repo": "muddassir235/eprefs",
+   "n_files": 12
+  },
+  {
+   "repo": "persistent-dataloader/persistent-dataloader",
+   "n_files": 12
+  },
+  {
+   "repo": "reafreitas1/lotto_backend",
+   "n_files": 12
+  },
+  {
+   "repo": "rtmigo/jaseca_kt",
+   "n_files": 12
+  },
+  {
+   "repo": "xpinjection/hibernate-basics",
+   "n_files": 12
+  },
+  {
+   "repo": "Aleshmandr/Pepersistence",
+   "n_files": 11
+  },
+  {
+   "repo": "Andresariz88/CVDS-LAB07",
+   "n_files": 11
+  },
+  {
+   "repo": "Beherit79/Data-Persistence-Projet",
+   "n_files": 11
+  },
+  {
+   "repo": "DonnieWest/unissist",
+   "n_files": 11
+  },
+  {
+   "repo": "Evernorth/madeleine-rust",
+   "n_files": 11
+  },
+  {
+   "repo": "GemsLab/PENminer",
+   "n_files": 11
+  },
+  {
+   "repo": "IvanovVasil02/JavaLibraryCatalogJPA",
+   "n_files": 11
+  },
+  {
+   "repo": "OGSmurfen/EntityFrameworkCore-p1",
+   "n_files": 11
+  },
+  {
+   "repo": "PushpenderIndia/KratosKnife",
+   "n_files": 11
+  },
+  {
+   "repo": "agilgur5/mst-persist",
+   "n_files": 11
+  },
+  {
+   "repo": "ba-st/Sagan",
+   "n_files": 11
+  },
+  {
+   "repo": "bryanvanhuyneghem/Data-Technology-Project_JPA",
+   "n_files": 11
+  },
+  {
+   "repo": "g3th/State-Persistence-On-Orientation-Change",
+   "n_files": 11
+  },
+  {
+   "repo": "hosford42/vert",
+   "n_files": 11
+  },
+  {
+   "repo": "iNoles/SwiftTasks",
+   "n_files": 11
+  },
+  {
+   "repo": "lavong/RoomPersistenceDemo",
+   "n_files": 11
+  },
+  {
+   "repo": "maxbundscherer/prototype-akka-persistence-rest",
+   "n_files": 11
+  },
+  {
+   "repo": "sjefvanleeuwen/orleans-ravendb",
+   "n_files": 11
+  },
+  {
+   "repo": "taxi-gestion/persistence-infrastructure-legacy",
+   "n_files": 11
+  },
+  {
+   "repo": "viniciusthiengo/to-do-hawk-livro-kotlin-android",
+   "n_files": 11
+  },
+  {
+   "repo": "wilyJ80/todo-express-json",
+   "n_files": 11
+  },
+  {
+   "repo": "AlexandreAkao/Tabela-Copa-do-Mundo-2018",
+   "n_files": 10
+  },
+  {
+   "repo": "AmoloHT/PapersArchives",
+   "n_files": 10
+  },
+  {
+   "repo": "AravindVasudev/clip-sync",
+   "n_files": 10
+  },
+  {
+   "repo": "BobSteagall/CppCon2016",
+   "n_files": 10
+  },
+  {
+   "repo": "CampusIoT/mqtt-logger",
+   "n_files": 10
+  },
+  {
+   "repo": "G-Veigar/vue-vuex-persist",
+   "n_files": 10
+  },
+  {
+   "repo": "MajekDev/Persistence",
+   "n_files": 10
+  },
+  {
+   "repo": "PropicSignifi/MObject.apex",
+   "n_files": 10
+  },
+  {
+   "repo": "PushpenderIndia/Sinister",
+   "n_files": 10
+  },
+  {
+   "repo": "PushpenderIndia/thorse",
+   "n_files": 10
+  },
+  {
+   "repo": "Rizwanishere/AkkaClusterShardingPersistentActorSample",
+   "n_files": 10
+  },
+  {
+   "repo": "SoftwareTree/JDXAndroidRelationshipsExample",
+   "n_files": 10
+  },
+  {
+   "repo": "Terre8055/stashlet",
+   "n_files": 10
+  },
+  {
+   "repo": "alexyer/rumdb",
+   "n_files": 10
+  },
+  {
+   "repo": "aligholipour/StatePattern-EFCore",
+   "n_files": 10
+  },
+  {
+   "repo": "atomic-state/atomic-state.org",
+   "n_files": 10
+  },
+  {
+   "repo": "btr1975/persistentdatatools",
+   "n_files": 10
+  },
+  {
+   "repo": "gagan0894/movieCatalogue",
+   "n_files": 10
+  },
+  {
+   "repo": "giuliocomi/backoori",
+   "n_files": 10
+  },
+  {
+   "repo": "gvespucci/generic-persistence",
+   "n_files": 10
+  },
+  {
+   "repo": "hfreire/perseverance",
+   "n_files": 10
+  },
+  {
+   "repo": "luismiguelro/perro_app",
+   "n_files": 10
+  },
+  {
+   "repo": "marekpiechut/tiny-norm",
+   "n_files": 10
+  },
+  {
+   "repo": "midhetfatema94/OpenWeatherApp",
+   "n_files": 10
+  },
+  {
+   "repo": "purehyperbole/lunar",
+   "n_files": 10
+  },
+  {
+   "repo": "rb3nzr/LnkPersist",
+   "n_files": 10
+  },
+  {
+   "repo": "simp-lee/cache",
+   "n_files": 10
+  },
+  {
+   "repo": "wizardone/forminator",
+   "n_files": 10
+  },
+  {
+   "repo": "IUTInfoAix-M3106/TutoJdbc",
+   "n_files": 9
+  },
+  {
+   "repo": "Jose-Vela/Settings-App",
+   "n_files": 9
+  },
+  {
+   "repo": "Make-School-Courses/ARCHIVE-MOB-3-Persistence-and-Synchronization",
+   "n_files": 9
+  },
+  {
+   "repo": "Shiru99/ARPersistence",
+   "n_files": 9
+  },
+  {
+   "repo": "alansastre/jakartaee-jta",
+   "n_files": 9
+  },
+  {
+   "repo": "anon272/Receipts",
+   "n_files": 9
+  },
+  {
+   "repo": "capJavert/web-storage-object",
+   "n_files": 9
+  },
+  {
+   "repo": "daneseuwu/fullstack-backend-springboot",
+   "n_files": 9
+  },
+  {
+   "repo": "deiberchacon/persistent-context",
+   "n_files": 9
+  },
+  {
+   "repo": "denzil-muchangi/ToDo_List_Flutter",
+   "n_files": 9
+  },
+  {
+   "repo": "donavon/use-persisted-state",
+   "n_files": 9
+  },
+  {
+   "repo": "drawdejohn/ToDoList",
+   "n_files": 9
+  },
+  {
+   "repo": "filinvadim/stubborn",
+   "n_files": 9
+  },
+  {
+   "repo": "guest271314/persistent-serviceworker",
+   "n_files": 9
+  },
+  {
+   "repo": "imyelo/pyro",
+   "n_files": 9
+  },
+  {
+   "repo": "israelias/react-immutability-quiz",
+   "n_files": 9
+  },
+  {
+   "repo": "jamison0902/java-cadastro",
+   "n_files": 9
+  },
+  {
+   "repo": "jdabsofficial/PShellBackdoorBitch",
+   "n_files": 9
+  },
+  {
+   "repo": "juniorsilva42/MercadoSilva",
+   "n_files": 9
+  },
+  {
+   "repo": "leymbda/continuity",
+   "n_files": 9
+  },
+  {
+   "repo": "lomefin/jedis",
+   "n_files": 9
+  },
+  {
+   "repo": "lukadev-0/rbx-persist",
+   "n_files": 9
+  },
+  {
+   "repo": "m-a-huber/automato",
+   "n_files": 9
+  },
+  {
+   "repo": "morrys/cache-persist-example",
+   "n_files": 9
+  },
+  {
+   "repo": "pitzzahh/signaldb-adapter-tauri",
+   "n_files": 9
+  },
+  {
+   "repo": "ramsrib/dropwizard-exception-mapper-example",
+   "n_files": 9
+  },
+  {
+   "repo": "realPy/retry",
+   "n_files": 9
+  },
+  {
+   "repo": "samimaftabahmed/spring-drools-persistence",
+   "n_files": 9
+  },
+  {
+   "repo": "sandra1974/webshop",
+   "n_files": 9
+  },
+  {
+   "repo": "sergioteula/pyrmanent",
+   "n_files": 9
+  },
+  {
+   "repo": "utensils/docker-postgres",
+   "n_files": 9
+  },
+  {
+   "repo": "2100031988/Car-Rental-System",
+   "n_files": 8
+  },
+  {
+   "repo": "CardboardDog/DebianPE",
+   "n_files": 8
+  },
+  {
+   "repo": "ChoppinBlockParty/perq",
+   "n_files": 8
+  },
+  {
+   "repo": "Dobatymo/lmdb-python-dbm",
+   "n_files": 8
+  },
+  {
+   "repo": "ElbowSpaceUK/laravel-settings-vue",
+   "n_files": 8
+  },
+  {
+   "repo": "JGAntunes/pulsarcast",
+   "n_files": 8
+  },
+  {
+   "repo": "LucianoCosta92/LoginJPA",
+   "n_files": 8
+  },
+  {
+   "repo": "dholalchi/spring-thymeleaf-json-persistence",
+   "n_files": 8
+  },
+  {
+   "repo": "fum4/use-persist",
+   "n_files": 8
+  },
+  {
+   "repo": "javanile/symvol",
+   "n_files": 8
+  },
+  {
+   "repo": "jollyblume/MarkingStore",
+   "n_files": 8
+  },
+  {
+   "repo": "joosing/netty-tcp-connection-persistence",
+   "n_files": 8
+  },
+  {
+   "repo": "kislyuk/rehash",
+   "n_files": 8
+  },
+  {
+   "repo": "kostiantyn-matsebora/helm-storage-provisioner",
+   "n_files": 8
+  },
+  {
+   "repo": "lotharschulz/redis_kotlin",
+   "n_files": 8
+  },
+  {
+   "repo": "mahmuuud/Nota",
+   "n_files": 8
+  },
+  {
+   "repo": "markthree/thermal-fn",
+   "n_files": 8
+  },
+  {
+   "repo": "miusarname/Lista-de-Tareas-con-redux-y-react",
+   "n_files": 8
+  },
+  {
+   "repo": "mount-tech/typedb",
+   "n_files": 8
+  },
+  {
+   "repo": "ntd/zettings",
+   "n_files": 8
+  },
+  {
+   "repo": "o-s-expert/polyglot-nosql-lab",
+   "n_files": 8
+  },
+  {
+   "repo": "pyrustic/shared",
+   "n_files": 8
+  },
+  {
+   "repo": "ravitripathi/Beaver",
+   "n_files": 8
+  },
+  {
+   "repo": "tableflip/mem-storage-area",
+   "n_files": 8
+  },
+  {
+   "repo": "temoto/extremofile",
+   "n_files": 8
+  },
+  {
+   "repo": "vimarconi/biotracker",
+   "n_files": 8
+  },
+  {
+   "repo": "voxoco/durable-stream",
+   "n_files": 8
+  },
+  {
+   "repo": "yuval-a/deriveODM",
+   "n_files": 8
+  },
+  {
+   "repo": "3intermute/ramiel",
+   "n_files": 7
+  },
+  {
+   "repo": "CyborgSecurity/PoisonApple",
+   "n_files": 7
+  },
+  {
+   "repo": "DannyBen/pobject",
+   "n_files": 7
+  },
+  {
+   "repo": "HouraiTeahouse/HouraiOptions",
+   "n_files": 7
+  },
+  {
+   "repo": "IUTInfoAix-M3106/TutoJPA",
+   "n_files": 7
+  },
+  {
+   "repo": "Lkikui/ToDoList-Swift",
+   "n_files": 7
+  },
+  {
+   "repo": "LuisHBeck/jpa-persistence",
+   "n_files": 7
+  },
+  {
+   "repo": "Ryuu-64/gdx-mmkv-preferences-android",
+   "n_files": 7
+  },
+  {
+   "repo": "SergeyMakeev/SlotMap",
+   "n_files": 7
+  },
+  {
+   "repo": "arman-yekkehkhani/simple-redis-client",
+   "n_files": 7
+  },
+  {
+   "repo": "bridgefield/PersistentBits",
+   "n_files": 7
+  },
+  {
+   "repo": "carlopedr/pdv2jpa",
+   "n_files": 7
+  },
+  {
+   "repo": "digitalmensch/sqlitent",
+   "n_files": 7
+  },
+  {
+   "repo": "dlozeve/topological-persistence",
+   "n_files": 7
+  },
+  {
+   "repo": "hcf-mc/persistent-service",
+   "n_files": 7
+  },
+  {
+   "repo": "ignatenko-denis/kafka-as-persistent-cache",
+   "n_files": 7
+  },
+  {
+   "repo": "jpzk/bottledynamo",
+   "n_files": 7
+  },
+  {
+   "repo": "kishannareshpal/pairsjs",
+   "n_files": 7
+  },
+  {
+   "repo": "lmangani/gun-elastic",
+   "n_files": 7
+  },
+  {
+   "repo": "m-ahmadian/Weather-App",
+   "n_files": 7
+  },
+  {
+   "repo": "maxkratz/emf-persistence-example",
+   "n_files": 7
+  },
+  {
+   "repo": "mguinea/php-criteria",
+   "n_files": 7
+  },
+  {
+   "repo": "michael-spengler/persistence",
+   "n_files": 7
+  },
+  {
+   "repo": "shevernitskiy/persistent-object",
+   "n_files": 7
+  },
+  {
+   "repo": "voxoco/durable-stream-client",
+   "n_files": 7
+  },
+  {
+   "repo": "4c656f/go-persistent-tree",
+   "n_files": 6
+  },
+  {
+   "repo": "AnghelLeonard/JakartaEE-Persistence",
+   "n_files": 6
+  },
+  {
+   "repo": "DevMountain/BulletinBoard",
+   "n_files": 6
+  },
+  {
+   "repo": "Fittiboy/python-storing-functions",
+   "n_files": 6
+  },
+  {
+   "repo": "JuanPablo70/IETI-H2",
+   "n_files": 6
+  },
+  {
+   "repo": "NTDLS/NTDLS.Persistence",
+   "n_files": 6
+  },
+  {
+   "repo": "PHPPlatform/persist-unit",
+   "n_files": 6
+  },
+  {
+   "repo": "PolyNeural-ai/mcpb",
+   "n_files": 6
+  },
+  {
+   "repo": "SoftwareTree/JDXAndroidSimpleExample",
+   "n_files": 6
+  },
+  {
+   "repo": "TheNewAttacker64/jarbou3",
+   "n_files": 6
+  },
+  {
+   "repo": "WilsonGramer/storage",
+   "n_files": 6
+  },
+  {
+   "repo": "anaskhan96/litfs",
+   "n_files": 6
+  },
+  {
+   "repo": "digitalmensch/sqlfunc",
+   "n_files": 6
+  },
+  {
+   "repo": "fabiocaccamo/FCUUID",
+   "n_files": 6
+  },
+  {
+   "repo": "jacobleygonie/TopologicalBarcode",
+   "n_files": 6
+  },
+  {
+   "repo": "karimboubouh/AGP",
+   "n_files": 6
+  },
+  {
+   "repo": "kunicmarko20/persistent-config-rs",
+   "n_files": 6
+  },
+  {
+   "repo": "martinsing/Image-Save-And-Retrieve-App",
+   "n_files": 6
+  },
+  {
+   "repo": "maxbundscherer/akka-persistence-protobuf-example",
+   "n_files": 6
+  },
+  {
+   "repo": "maxbundscherer/prototype-akka-persistence-serializer",
+   "n_files": 6
+  },
+  {
+   "repo": "minhnt02/PowerRAT",
+   "n_files": 6
+  },
+  {
+   "repo": "psprint/n-commodore",
+   "n_files": 6
+  },
+  {
+   "repo": "r-dent/ObjectStore",
+   "n_files": 6
+  },
+  {
+   "repo": "rmill12/SshService",
+   "n_files": 6
+  },
+  {
+   "repo": "tkoppop/Temos-Bot",
+   "n_files": 6
+  },
+  {
+   "repo": "Auguxto/rdb",
+   "n_files": 5
+  },
+  {
+   "repo": "DavidNoguera1/Ejercicio-PHP1",
+   "n_files": 5
+  },
+  {
+   "repo": "FaisalKhan0777/Student-CRUD-Management-System",
+   "n_files": 5
+  },
+  {
+   "repo": "HydroCarbons/secure-json",
+   "n_files": 5
+  },
+  {
+   "repo": "MB-29/topological_persistence",
+   "n_files": 5
+  },
+  {
+   "repo": "ProDefense/Hawk",
+   "n_files": 5
+  },
+  {
+   "repo": "ServerfulArch/Backlog",
+   "n_files": 5
+  },
+  {
+   "repo": "ThisaruGuruge/movie-database",
+   "n_files": 5
+  },
+  {
+   "repo": "abapPM/abapPM-Persistence",
+   "n_files": 5
+  },
+  {
+   "repo": "adrienjoly/persistent-harmony",
+   "n_files": 5
+  },
+  {
+   "repo": "akarshankapoor7/ChatBot-using-LangGraph",
+   "n_files": 5
+  },
+  {
+   "repo": "andreirusanescu/Redis",
+   "n_files": 5
+  },
+  {
+   "repo": "benedekmeszaros/unity-hextools-userdata",
+   "n_files": 5
+  },
+  {
+   "repo": "cbenaventte/Banco-Solar",
+   "n_files": 5
+  },
+  {
+   "repo": "daskol/url-shortener-go",
+   "n_files": 5
+  },
+  {
+   "repo": "evolution-gaming/stream-journal-to-kafka",
+   "n_files": 5
+  },
+  {
+   "repo": "gonzalorodrigo/globusserver",
+   "n_files": 5
+  },
+  {
+   "repo": "judge2005/ESPConfig",
+   "n_files": 5
+  },
+  {
+   "repo": "m-ahmadian/UserDefaults-Example",
+   "n_files": 5
+  },
+  {
+   "repo": "mih0vil/ParentChildCachingJpa",
+   "n_files": 5
+  },
+  {
+   "repo": "omranjamal/sentient-object",
+   "n_files": 5
+  },
+  {
+   "repo": "realdennis/persist-hook",
+   "n_files": 5
+  },
+  {
+   "repo": "tiaanduplessis/piggy-bank",
+   "n_files": 5
+  },
+  {
+   "repo": "transferwise/terra",
+   "n_files": 5
+  },
+  {
+   "repo": "yanick/redux-persist-pouchdb",
+   "n_files": 5
+  },
+  {
+   "repo": "yaphott/streamlit-persistence",
+   "n_files": 5
+  },
+  {
+   "repo": "1rishu0/News-Research-Tool-Project",
+   "n_files": 4
+  },
+  {
+   "repo": "2KAbhishek/redi-to-rest",
+   "n_files": 4
+  },
+  {
+   "repo": "BonneVoyager/quick-storage",
+   "n_files": 4
+  },
+  {
+   "repo": "EtheaDev/InstantObjects",
+   "n_files": 4
+  },
+  {
+   "repo": "KokorinIlya/persistent-set",
+   "n_files": 4
+  },
+  {
+   "repo": "LucaSforza/MongoPersistence",
+   "n_files": 4
+  },
+  {
+   "repo": "ShindouMihou/go-persist",
+   "n_files": 4
+  },
+  {
+   "repo": "Trevohack/DynastyPersist",
+   "n_files": 4
+  },
+  {
+   "repo": "batuhansk/UserDefault",
+   "n_files": 4
+  },
+  {
+   "repo": "behrad/mqtt-nedb-store",
+   "n_files": 4
+  },
+  {
+   "repo": "bithavoc/CodableLocal",
+   "n_files": 4
+  },
+  {
+   "repo": "cbenaventte/Club-Deportivo",
+   "n_files": 4
+  },
+  {
+   "repo": "deepthipathlawath20/swift-persistence-todo",
+   "n_files": 4
+  },
+  {
+   "repo": "dmccuaig/SaveWindowPos",
+   "n_files": 4
+  },
+  {
+   "repo": "geobe/easyHibernate",
+   "n_files": 4
+  },
+  {
+   "repo": "hanbinglengyue/FridaManager",
+   "n_files": 4
+  },
+  {
+   "repo": "hstrada/java-jpa-many-to-many",
+   "n_files": 4
+  },
+  {
+   "repo": "jayo78/win-backdoor",
+   "n_files": 4
+  },
+  {
+   "repo": "jonstuebe/react-native-storage-item",
+   "n_files": 4
+  },
+  {
+   "repo": "karlmcguire/dump",
+   "n_files": 4
+  },
+  {
+   "repo": "keyvanakbary/mimic",
+   "n_files": 4
+  },
+  {
+   "repo": "lotharschulz/debounce",
+   "n_files": 4
+  },
+  {
+   "repo": "mauricioabcz/Hibernate",
+   "n_files": 4
+  },
+  {
+   "repo": "nfoerster/squeuelite",
+   "n_files": 4
+  },
+  {
+   "repo": "qpwo/dentata",
+   "n_files": 4
+  },
+  {
+   "repo": "rishabhsingh971/persession",
+   "n_files": 4
+  },
+  {
+   "repo": "saenai255/pstore",
+   "n_files": 4
+  },
+  {
+   "repo": "silvodesigns/QuizApp",
+   "n_files": 4
+  },
+  {
+   "repo": "spacejam/acid-state",
+   "n_files": 4
+  },
+  {
+   "repo": "thma/generic-persistence",
+   "n_files": 4
+  },
+  {
+   "repo": "umarSiddique010/use-localstorage-hook",
+   "n_files": 4
+  },
+  {
+   "repo": "D4v0r/CVDS-LAB07",
+   "n_files": 3
+  },
+  {
+   "repo": "Java-Publications/hidden-pearls-for-java-high-peformance-persistence",
+   "n_files": 3
+  },
+  {
+   "repo": "Kawai-Senpai/PotatoDB",
+   "n_files": 3
+  },
+  {
+   "repo": "KeironO/scuffed-kv",
+   "n_files": 3
+  },
+  {
+   "repo": "LexLoki/tableIO",
+   "n_files": 3
+  },
+  {
+   "repo": "MohamedAYassin/GUIShell",
+   "n_files": 3
+  },
+  {
+   "repo": "PyneSys/project-mem-mcp",
+   "n_files": 3
+  },
+  {
+   "repo": "Teahana/Tic-Tac-Toe",
+   "n_files": 3
+  },
+  {
+   "repo": "dianamflorian/TiendaVirtualRopaLogin",
+   "n_files": 3
+  },
+  {
+   "repo": "dmp1ce/DMSS",
+   "n_files": 3
+  },
+  {
+   "repo": "doctrine-dbal-util/connection-pagerfanta",
+   "n_files": 3
+  },
+  {
+   "repo": "douglaspands/cqrs-persistence-js",
+   "n_files": 3
+  },
+  {
+   "repo": "fum4/formik-persist",
+   "n_files": 3
+  },
+  {
+   "repo": "fum4/react-hook-form-persist",
+   "n_files": 3
+  },
+  {
+   "repo": "hagai-helman/jsop",
+   "n_files": 3
+  },
+  {
+   "repo": "isarandi/picklecachefun",
+   "n_files": 3
+  },
+  {
+   "repo": "ivanbg2004/ODH-LocalDB",
+   "n_files": 3
+  },
+  {
+   "repo": "joestanding/pe-hijacker",
+   "n_files": 3
+  },
+  {
+   "repo": "md-py/md.persistence.yaml",
+   "n_files": 3
+  },
+  {
+   "repo": "rusoleal/bundelizer",
+   "n_files": 3
+  },
+  {
+   "repo": "sankyhack/LinuxPersistenceCollector",
+   "n_files": 3
+  },
+  {
+   "repo": "sebastianconcept/Mapless",
+   "n_files": 3
+  },
+  {
+   "repo": "sethgabrielbrady/password-manager",
+   "n_files": 3
+  },
+  {
+   "repo": "shirtd/Hera.jl",
+   "n_files": 3
+  },
+  {
+   "repo": "softspiders/counter-app-api-on-json-server",
+   "n_files": 3
+  },
+  {
+   "repo": "src-mgra/firebase-ToDoList",
+   "n_files": 3
+  },
+  {
+   "repo": "thomasgainant/NodePersistenceLibrary",
+   "n_files": 3
+  },
+  {
+   "repo": "Chainski/PandaCrypter",
+   "n_files": 2
+  },
+  {
+   "repo": "D-Whipp/list-app-jQuery",
+   "n_files": 2
+  },
+  {
+   "repo": "ElbowSpaceUK/laravel-settings",
+   "n_files": 2
+  },
+  {
+   "repo": "Haijie95/Cheat-Sheets",
+   "n_files": 2
+  },
+  {
+   "repo": "HelmutSoellinger/FPROG",
+   "n_files": 2
+  },
+  {
+   "repo": "Icenuke/MoonBoot",
+   "n_files": 2
+  },
+  {
+   "repo": "MadExploits/Gecko",
+   "n_files": 2
+  },
+  {
+   "repo": "NESTLab/mrpcp",
+   "n_files": 2
+  },
+  {
+   "repo": "NIR3X/dbcachinglayer",
+   "n_files": 2
+  },
+  {
+   "repo": "NYAN-x-CAT/Bot-Killer",
+   "n_files": 2
+  },
+  {
+   "repo": "NYAN-x-CAT/Dropless-Malware",
+   "n_files": 2
+  },
+  {
+   "repo": "Offensive-Panda/Persistence_AND_Anti_Sandbox",
+   "n_files": 2
+  },
+  {
+   "repo": "Omikrone/PyBack",
+   "n_files": 2
+  },
+  {
+   "repo": "Sol-AlphaCentauriC/CPPVariablePersistencer",
+   "n_files": 2
+  },
+  {
+   "repo": "Temppus/DiskMemCache",
+   "n_files": 2
+  },
+  {
+   "repo": "Wavalab/corona-cabinet",
+   "n_files": 2
+  },
+  {
+   "repo": "briansunter/haskell-rest-api",
+   "n_files": 2
+  },
+  {
+   "repo": "brosck/Pingoor",
+   "n_files": 2
+  },
+  {
+   "repo": "cwsecur1ty/win-persistence-checker",
+   "n_files": 2
+  },
+  {
+   "repo": "datatrigger/unlimited-translation_docker_swarm",
+   "n_files": 2
+  },
+  {
+   "repo": "ewalk40/NSUbiquitousKeyValueStoreDemo",
+   "n_files": 2
+  },
+  {
+   "repo": "eyedouble/erlstore",
+   "n_files": 2
+  },
+  {
+   "repo": "farooq9/screenlockerV2",
+   "n_files": 2
+  },
+  {
+   "repo": "fish-not-phish/FHook",
+   "n_files": 2
+  },
+  {
+   "repo": "grayshader3020/Multifunctional_Malware",
+   "n_files": 2
+  },
+  {
+   "repo": "hui6075/emq_persist_redis",
+   "n_files": 2
+  },
+  {
+   "repo": "hvsw/HVSQLite",
+   "n_files": 2
+  },
+  {
+   "repo": "joeavanzato/Trawler",
+   "n_files": 2
+  },
+  {
+   "repo": "kowainik/idris-patricia",
+   "n_files": 2
+  },
+  {
+   "repo": "kuvam/isync",
+   "n_files": 2
+  },
+  {
+   "repo": "last-byte/PersistenceSniper",
+   "n_files": 2
+  },
+  {
+   "repo": "melisgl/journal",
+   "n_files": 2
+  },
+  {
+   "repo": "momomo/momomo.com.platform.db.base.jpa.session.with.postgres",
+   "n_files": 2
+  },
+  {
+   "repo": "p-sodmann/splitter",
+   "n_files": 2
+  },
+  {
+   "repo": "philg-dev/tm_settings_template",
+   "n_files": 2
+  },
+  {
+   "repo": "render-examples/redis",
+   "n_files": 2
+  },
+  {
+   "repo": "seandenigris/Simple-Persistence",
+   "n_files": 2
+  },
+  {
+   "repo": "thma/generic-persistence-demo",
+   "n_files": 2
+  },
+  {
+   "repo": "toluna-terraform/terraform-aws-mongodb",
+   "n_files": 2
+  },
+  {
+   "repo": "1captainnemo1/PersistentCReverseShell",
+   "n_files": 1
+  },
+  {
+   "repo": "5iver/PersistenceViewer",
+   "n_files": 1
+  },
+  {
+   "repo": "836541/autostart-detector",
+   "n_files": 1
+  },
+  {
+   "repo": "D-Whipp/knights-radiant-list",
+   "n_files": 1
+  },
+  {
+   "repo": "D00MFist/LaunchAgentPersistence",
+   "n_files": 1
+  },
+  {
+   "repo": "ImpunityJainne/train-schedule",
+   "n_files": 1
+  },
+  {
+   "repo": "JakePeralta7/ScaryMalware",
+   "n_files": 1
+  },
+  {
+   "repo": "Karneades/awesome-malware-persistence",
+   "n_files": 1
+  },
+  {
+   "repo": "MatheuZSecurity/KThreadShell",
+   "n_files": 1
+  },
+  {
+   "repo": "Mustafa-Kum/Regedit-Backdoor-Python",
+   "n_files": 1
+  },
+  {
+   "repo": "NullArray/Shellware",
+   "n_files": 1
+  },
+  {
+   "repo": "RaffaelePiazzolla/terrain-generation",
+   "n_files": 1
+  },
+  {
+   "repo": "ReshiAdavan/ErosDB",
+   "n_files": 1
+  },
+  {
+   "repo": "RohanVDvivedi/Persistence-of-vision-stick",
+   "n_files": 1
+  },
+  {
+   "repo": "T1erno/ALPART",
+   "n_files": 1
+  },
+  {
+   "repo": "ZYSF/KScheme",
+   "n_files": 1
+  },
+  {
+   "repo": "alphaSeclab/persistence",
+   "n_files": 1
+  },
+  {
+   "repo": "behnaz-mirmiran/k8s-mysql-deployment",
+   "n_files": 1
+  },
+  {
+   "repo": "bugra9/persistent",
+   "n_files": 1
+  },
+  {
+   "repo": "d4rpell/DotRat",
+   "n_files": 1
+  },
+  {
+   "repo": "danlucian/vagrant-mongodb-cluster",
+   "n_files": 1
+  },
+  {
+   "repo": "exfil0/WinMal",
+   "n_files": 1
+  },
+  {
+   "repo": "gideonfernandes/expense-tracker-project",
+   "n_files": 1
+  },
+  {
+   "repo": "globalgiving/BetterPersistentManager",
+   "n_files": 1
+  },
+  {
+   "repo": "inaka/sumo_db_mongo",
+   "n_files": 1
+  },
+  {
+   "repo": "injectionmethod/Netcat-Shell-For-Windows",
+   "n_files": 1
+  },
+  {
+   "repo": "malwarekid/VBS-Stager",
+   "n_files": 1
+  },
+  {
+   "repo": "montysecurity/linper",
+   "n_files": 1
+  },
+  {
+   "repo": "narbehaj/system-hash",
+   "n_files": 1
+  },
+  {
+   "repo": "nat-ten/BasicCRAT",
+   "n_files": 1
+  },
+  {
+   "repo": "nmnithinkrishna/UiPath_nmnithinkrishna_PersistenceProcessWithAutoStop_03Mar2022_2122",
+   "n_files": 1
+  },
+  {
+   "repo": "normvcr/BLDEV",
+   "n_files": 1
+  },
+  {
+   "repo": "on-prem/tinycore-symlinktool",
+   "n_files": 1
+  },
+  {
+   "repo": "operatorequals/SMBRat",
+   "n_files": 1
+  },
+  {
+   "repo": "rafaelwdornelas/PersistenceGo",
+   "n_files": 1
+  },
+  {
+   "repo": "sajitha-tj/theOWL",
+   "n_files": 1
+  },
+  {
+   "repo": "usrbinbrain/remotenessh",
+   "n_files": 1
+  },
+  {
+   "repo": "v4resk/PersistHound",
+   "n_files": 1
+  },
+  {
+   "repo": "varppi/DCO-Dynamic-Code-Obfuscator",
+   "n_files": 1
+  },
+  {
+   "repo": "victornpb/formStorage",
+   "n_files": 1
+  },
+  {
+   "repo": "vmware/nsx-alb-datascript-samples-library",
+   "n_files": 1
+  },
+  {
+   "repo": "wackymaker/shadowlnk",
+   "n_files": 1
+  },
+  {
+   "repo": "wearearima/docker-persistency-example",
+   "n_files": 1
+  },
+  {
+   "repo": "whitfin/stash",
+   "n_files": 1
+  },
+  {
+   "repo": "zgmunshi/javascript-cart",
+   "n_files": 1
+  }
+ ],
+ "_meta": {
+  "dataset_sha": "210b9259be248323b0b3bc58252bed3fde53135f",
+  "generated_at": "2026-10-11T18:21:13+0000"
+ }
+}

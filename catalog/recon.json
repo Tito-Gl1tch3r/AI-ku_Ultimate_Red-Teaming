@@ -1,0 +1,2269 @@
+{
+ "topic": "recon",
+ "source": "hf-statistics",
+ "num_examples_hf": 20041,
+ "partial_stats": false,
+ "hf_license_distribution": {
+  "NOASSERTION": 358,
+  "CC-BY-SA-4.0": 6,
+  "MPL-2.0": 10,
+  "GPL-3.0": 1787,
+  "LGPL-3.0": 251,
+  "Unlicense": 11,
+  "BSD-3-Clause": 3706,
+  "Apache-2.0": 675,
+  "BSL-1.0": 2,
+  "ISC": 10,
+  "MIT": 6156,
+  "AGPL-3.0": 682,
+  "GPL-2.0": 1970,
+  "WTFPL": 13
+ },
+ "n_repos": 560,
+ "repos": [
+  {
+   "repo": "GhostTroops/scan4all",
+   "n_files": 3576
+  },
+  {
+   "repo": "andrewrebora/carbontoolkit",
+   "n_files": 2211
+  },
+  {
+   "repo": "urbanadventurer/WhatWeb",
+   "n_files": 1909
+  },
+  {
+   "repo": "solo10010/BugBounty-Hub",
+   "n_files": 1398
+  },
+  {
+   "repo": "smicallef/spiderfoot",
+   "n_files": 743
+  },
+  {
+   "repo": "w4rf0t/AMP-Tools",
+   "n_files": 485
+  },
+  {
+   "repo": "reconurge/flowsint",
+   "n_files": 481
+  },
+  {
+   "repo": "aristosMiliaressis/pwnctl",
+   "n_files": 474
+  },
+  {
+   "repo": "blacklanternsecurity/bbot",
+   "n_files": 459
+  },
+  {
+   "repo": "ice-doom/EyeJo",
+   "n_files": 369
+  },
+  {
+   "repo": "pablosnt/rekono",
+   "n_files": 351
+  },
+  {
+   "repo": "reconness/reconness",
+   "n_files": 321
+  },
+  {
+   "repo": "kennbroorg/iKy",
+   "n_files": 245
+  },
+  {
+   "repo": "OWASP/Nettacker",
+   "n_files": 215
+  },
+  {
+   "repo": "ronin-rb/ronin-db-activerecord",
+   "n_files": 201
+  },
+  {
+   "repo": "owasp-amass/amass",
+   "n_files": 198
+  },
+  {
+   "repo": "RetroPackets/Fugitive",
+   "n_files": 194
+  },
+  {
+   "repo": "MikhailSterkhov/Recon",
+   "n_files": 191
+  },
+  {
+   "repo": "medbsq/scripts",
+   "n_files": 144
+  },
+  {
+   "repo": "ccreater222/slime",
+   "n_files": 131
+  },
+  {
+   "repo": "thesavant42/retrorecon",
+   "n_files": 130
+  },
+  {
+   "repo": "benyG/PentaDrone",
+   "n_files": 126
+  },
+  {
+   "repo": "d3mondev/puredns",
+   "n_files": 120
+  },
+  {
+   "repo": "shmilylty/OneForAll",
+   "n_files": 116
+  },
+  {
+   "repo": "F2u0a0d3/GoRecon",
+   "n_files": 105
+  },
+  {
+   "repo": "3nock/OTE-Templates",
+   "n_files": 98
+  },
+  {
+   "repo": "Zomato/vinifera",
+   "n_files": 94
+  },
+  {
+   "repo": "Ekultek/Zeus-Scanner",
+   "n_files": 93
+  },
+  {
+   "repo": "leveryd-asm/asm",
+   "n_files": 92
+  },
+  {
+   "repo": "D3Ext/go-recon",
+   "n_files": 90
+  },
+  {
+   "repo": "v-byte-cpu/sx",
+   "n_files": 90
+  },
+  {
+   "repo": "Vulnpire/Arsenal",
+   "n_files": 86
+  },
+  {
+   "repo": "tillson/git-hound",
+   "n_files": 79
+  },
+  {
+   "repo": "SecFathy/sectracker",
+   "n_files": 73
+  },
+  {
+   "repo": "mahmoudsalman158/sectracker",
+   "n_files": 73
+  },
+  {
+   "repo": "PhonePe/mantis",
+   "n_files": 72
+  },
+  {
+   "repo": "ronin-rb/ronin-app",
+   "n_files": 69
+  },
+  {
+   "repo": "astroicers/recon-pocket",
+   "n_files": 59
+  },
+  {
+   "repo": "bengabay11/chpass",
+   "n_files": 58
+  },
+  {
+   "repo": "gwen001/pentest-tools",
+   "n_files": 57
+  },
+  {
+   "repo": "Fundacio-i2CAT/InfoHound",
+   "n_files": 54
+  },
+  {
+   "repo": "SimplySecurity/SimplyEmail",
+   "n_files": 51
+  },
+  {
+   "repo": "TonyPhipps/Meerkat",
+   "n_files": 51
+  },
+  {
+   "repo": "Chocapikk/wpprobe",
+   "n_files": 47
+  },
+  {
+   "repo": "Psychevus/pentest-toolkit",
+   "n_files": 47
+  },
+  {
+   "repo": "chainreactors/gogo",
+   "n_files": 47
+  },
+  {
+   "repo": "tarunKoyalwar/talosplus",
+   "n_files": 47
+  },
+  {
+   "repo": "ninoseki/ryo",
+   "n_files": 44
+  },
+  {
+   "repo": "3lLobo/IPFS-Recon",
+   "n_files": 43
+  },
+  {
+   "repo": "Johnermac/noumenon",
+   "n_files": 43
+  },
+  {
+   "repo": "ravro-ir/golang_bug_hunting",
+   "n_files": 43
+  },
+  {
+   "repo": "krishpranav/wpscan",
+   "n_files": 40
+  },
+  {
+   "repo": "TheArqsz/JSRecon-Buddy",
+   "n_files": 39
+  },
+  {
+   "repo": "gokulapap/Reconator",
+   "n_files": 39
+  },
+  {
+   "repo": "Root-Down-Digital/pentesting-resources",
+   "n_files": 38
+  },
+  {
+   "repo": "gl0bal01/discord-osint-assistant",
+   "n_files": 38
+  },
+  {
+   "repo": "reconhub/learn",
+   "n_files": 38
+  },
+  {
+   "repo": "shrkwv/ricco",
+   "n_files": 38
+  },
+  {
+   "repo": "thelikes/wzrd",
+   "n_files": 38
+  },
+  {
+   "repo": "VritraSecz/BloodRecon",
+   "n_files": 37
+  },
+  {
+   "repo": "carlos30112/OneLine",
+   "n_files": 37
+  },
+  {
+   "repo": "nil0x42/dnsanity",
+   "n_files": 36
+  },
+  {
+   "repo": "ExclusiveAccount/IoT-device-Scanner",
+   "n_files": 35
+  },
+  {
+   "repo": "bl4ck0w1/swmap",
+   "n_files": 35
+  },
+  {
+   "repo": "narasimhauppala/automate-pentesting-app",
+   "n_files": 35
+  },
+  {
+   "repo": "ronin-rb/ronin-nmap",
+   "n_files": 34
+  },
+  {
+   "repo": "SonyaCore/ReconDB",
+   "n_files": 33
+  },
+  {
+   "repo": "devxprite/infoooze",
+   "n_files": 33
+  },
+  {
+   "repo": "1342tools/kasm",
+   "n_files": 32
+  },
+  {
+   "repo": "Evil-Twins-X/SubEvil",
+   "n_files": 31
+  },
+  {
+   "repo": "S4TURN0/atomic-python",
+   "n_files": 31
+  },
+  {
+   "repo": "WilardzySenpai/Music-Replit-v13",
+   "n_files": 30
+  },
+  {
+   "repo": "aufzayed/HydraRecon",
+   "n_files": 30
+  },
+  {
+   "repo": "bing0o/bash_scripting",
+   "n_files": 30
+  },
+  {
+   "repo": "malits/bartpy",
+   "n_files": 30
+  },
+  {
+   "repo": "osmedeus/osmedeus-workflow",
+   "n_files": 30
+  },
+  {
+   "repo": "wakeful/spark",
+   "n_files": 29
+  },
+  {
+   "repo": "Ali-hey-0/owasp",
+   "n_files": 28
+  },
+  {
+   "repo": "davemolk/scripts",
+   "n_files": 28
+  },
+  {
+   "repo": "pwnwriter/kanha",
+   "n_files": 28
+  },
+  {
+   "repo": "nestebe/SubdomainScanner",
+   "n_files": 27
+  },
+  {
+   "repo": "x0rr-dan/s1c0n",
+   "n_files": 26
+  },
+  {
+   "repo": "j3ssie/goverview",
+   "n_files": 25
+  },
+  {
+   "repo": "sumododda/Trishul",
+   "n_files": 25
+  },
+  {
+   "repo": "44za12/mailsleuth",
+   "n_files": 24
+  },
+  {
+   "repo": "Cappricio-Securities/ghostrecon",
+   "n_files": 24
+  },
+  {
+   "repo": "atiilla/gitrecon",
+   "n_files": 24
+  },
+  {
+   "repo": "eric-therond/webunpack",
+   "n_files": 24
+  },
+  {
+   "repo": "djnnvx/yellow",
+   "n_files": 23
+  },
+  {
+   "repo": "projectdiscovery/asnmap",
+   "n_files": 23
+  },
+  {
+   "repo": "dewebdes/partizan",
+   "n_files": 22
+  },
+  {
+   "repo": "khast3x/h8mail",
+   "n_files": 22
+  },
+  {
+   "repo": "sham00n/buster",
+   "n_files": 22
+  },
+  {
+   "repo": "Arinerron/pfc",
+   "n_files": 20
+  },
+  {
+   "repo": "MandConsultingGroup/porch-pirate",
+   "n_files": 20
+  },
+  {
+   "repo": "adbar/courlan",
+   "n_files": 20
+  },
+  {
+   "repo": "s0md3v/Arjun",
+   "n_files": 20
+  },
+  {
+   "repo": "0x0d3ad/Kn0ck",
+   "n_files": 19
+  },
+  {
+   "repo": "Sh1Yo/x8",
+   "n_files": 19
+  },
+  {
+   "repo": "dreizehnutters/vide",
+   "n_files": 19
+  },
+  {
+   "repo": "melbadry9/ScanApi",
+   "n_files": 19
+  },
+  {
+   "repo": "mrsi13nt/VulneraX",
+   "n_files": 19
+  },
+  {
+   "repo": "24ping/X37",
+   "n_files": 18
+  },
+  {
+   "repo": "TorhamDev/Death-engine",
+   "n_files": 18
+  },
+  {
+   "repo": "anotherhadi/github-recon",
+   "n_files": 18
+  },
+  {
+   "repo": "leobeosab/sharingan",
+   "n_files": 18
+  },
+  {
+   "repo": "mswell/burnrecon",
+   "n_files": 18
+  },
+  {
+   "repo": "neutrino2211/valradar",
+   "n_files": 18
+  },
+  {
+   "repo": "s0md3v/Striker",
+   "n_files": 18
+  },
+  {
+   "repo": "003random/ICU",
+   "n_files": 17
+  },
+  {
+   "repo": "GoSecure/burp-ntlm-challenge-decoder",
+   "n_files": 17
+  },
+  {
+   "repo": "N0rz3/TraxOsint",
+   "n_files": 17
+  },
+  {
+   "repo": "andreiverse/vaf",
+   "n_files": 17
+  },
+  {
+   "repo": "fasalmbt/reconme",
+   "n_files": 17
+  },
+  {
+   "repo": "jakecreps/poastal",
+   "n_files": 17
+  },
+  {
+   "repo": "lhitori/Squiz",
+   "n_files": 17
+  },
+  {
+   "repo": "moman13/bug_hunter_tools",
+   "n_files": 17
+  },
+  {
+   "repo": "superswan/netrunner.py",
+   "n_files": 17
+  },
+  {
+   "repo": "DHerls/Flashbulb",
+   "n_files": 16
+  },
+  {
+   "repo": "ItsIgnacioPortal/Hacker-Scoper",
+   "n_files": 16
+  },
+  {
+   "repo": "marcolivierbouch/dirbpy",
+   "n_files": 16
+  },
+  {
+   "repo": "mhmdiaa/acumen",
+   "n_files": 16
+  },
+  {
+   "repo": "riza/linx",
+   "n_files": 16
+  },
+  {
+   "repo": "secwatch92/ArgusScope",
+   "n_files": 16
+  },
+  {
+   "repo": "thehackersbrain/webhawk",
+   "n_files": 16
+  },
+  {
+   "repo": "yigitcantunay35/Reconx",
+   "n_files": 16
+  },
+  {
+   "repo": "alpkeskin/SiteGadget",
+   "n_files": 15
+  },
+  {
+   "repo": "m0ni01/ReconSense",
+   "n_files": 15
+  },
+  {
+   "repo": "netrixone/udig",
+   "n_files": 15
+  },
+  {
+   "repo": "ronin-rb/ronin-web-spider",
+   "n_files": 15
+  },
+  {
+   "repo": "the-maux/Recon4Poor",
+   "n_files": 15
+  },
+  {
+   "repo": "wakeful/veil",
+   "n_files": 15
+  },
+  {
+   "repo": "7RU7H/Archive",
+   "n_files": 14
+  },
+  {
+   "repo": "Ademking/FlashFuzz",
+   "n_files": 14
+  },
+  {
+   "repo": "DominicBreuker/iprecon",
+   "n_files": 14
+  },
+  {
+   "repo": "dalryan/ip-enrich",
+   "n_files": 14
+  },
+  {
+   "repo": "n3twork5/xharvester",
+   "n_files": 14
+  },
+  {
+   "repo": "thevillagehacker/Bug-Hunting-Arsenal",
+   "n_files": 14
+  },
+  {
+   "repo": "d2cy/r3c0nX",
+   "n_files": 13
+  },
+  {
+   "repo": "dewebdes/Wide-Bounty",
+   "n_files": 13
+  },
+  {
+   "repo": "lautarovculic/appsRecon",
+   "n_files": 13
+  },
+  {
+   "repo": "s0md3v/ReconDog",
+   "n_files": 13
+  },
+  {
+   "repo": "wavvs/gitosint",
+   "n_files": 13
+  },
+  {
+   "repo": "JulianTerB/wi-enhanced",
+   "n_files": 12
+  },
+  {
+   "repo": "p0dalirius/RDWAtool",
+   "n_files": 12
+  },
+  {
+   "repo": "praetorian-inc/NTLMRecon",
+   "n_files": 12
+  },
+  {
+   "repo": "sttlr/orgia",
+   "n_files": 12
+  },
+  {
+   "repo": "tasooshi/pukpuk",
+   "n_files": 12
+  },
+  {
+   "repo": "yukselberkay/asnap",
+   "n_files": 12
+  },
+  {
+   "repo": "0xdekster/ReconNote",
+   "n_files": 11
+  },
+  {
+   "repo": "MottaSec/Argus-AD",
+   "n_files": 11
+  },
+  {
+   "repo": "dirsoooo/Recon",
+   "n_files": 11
+  },
+  {
+   "repo": "nknaman5121a/GQLMap-",
+   "n_files": 11
+  },
+  {
+   "repo": "nullt3r/jfscan",
+   "n_files": 11
+  },
+  {
+   "repo": "redi-git/SLAP",
+   "n_files": 11
+  },
+  {
+   "repo": "TonyPhipps/SIEM",
+   "n_files": 10
+  },
+  {
+   "repo": "bacon-GIT/Sec_Toolbelt",
+   "n_files": 10
+  },
+  {
+   "repo": "bhaweshchaudhary/Astra",
+   "n_files": 10
+  },
+  {
+   "repo": "chux0r/netbang",
+   "n_files": 10
+  },
+  {
+   "repo": "clarketm/s3recon",
+   "n_files": 10
+  },
+  {
+   "repo": "destan0098/subcheck",
+   "n_files": 10
+  },
+  {
+   "repo": "elfarsaouiomar/monitor-new-subdomain",
+   "n_files": 10
+  },
+  {
+   "repo": "g0ldencybersec/EasyEASM",
+   "n_files": 10
+  },
+  {
+   "repo": "hagiik/subdomain-monitor",
+   "n_files": 10
+  },
+  {
+   "repo": "hessman/rcrt",
+   "n_files": 10
+  },
+  {
+   "repo": "koenrh/s3enum",
+   "n_files": 10
+  },
+  {
+   "repo": "miladhzzzz/har-x",
+   "n_files": 10
+  },
+  {
+   "repo": "oscargilg1/ReconAutomator",
+   "n_files": 10
+  },
+  {
+   "repo": "pikpikcu/XRCross",
+   "n_files": 10
+  },
+  {
+   "repo": "stanmouDev/easyrecon",
+   "n_files": 10
+  },
+  {
+   "repo": "Archive-Puma/LaMaquina",
+   "n_files": 9
+  },
+  {
+   "repo": "ajackal/cherrywasp",
+   "n_files": 9
+  },
+  {
+   "repo": "cyberc00z/trans",
+   "n_files": 9
+  },
+  {
+   "repo": "gigachad80/Aadhar-PAN-Nuclei-Scanner",
+   "n_files": 9
+  },
+  {
+   "repo": "midoxnet/mapperplus",
+   "n_files": 9
+  },
+  {
+   "repo": "putabones/RATT",
+   "n_files": 9
+  },
+  {
+   "repo": "rodnt/quickaz",
+   "n_files": 9
+  },
+  {
+   "repo": "zbo14/jspeye",
+   "n_files": 9
+  },
+  {
+   "repo": "0xPrateek/Stardox",
+   "n_files": 8
+  },
+  {
+   "repo": "Bevigil/BeVigil-OSINT-CLI",
+   "n_files": 8
+  },
+  {
+   "repo": "Gr1mmie/autoenum",
+   "n_files": 8
+  },
+  {
+   "repo": "Mnwa/ReconEngine",
+   "n_files": 8
+  },
+  {
+   "repo": "er4vn/TeleStrike",
+   "n_files": 8
+  },
+  {
+   "repo": "ethiack/ai4eh",
+   "n_files": 8
+  },
+  {
+   "repo": "hoshigakikisame/nwp",
+   "n_files": 8
+  },
+  {
+   "repo": "pentest30/PwndbSharp",
+   "n_files": 8
+  },
+  {
+   "repo": "t0nyc23/lemme-see",
+   "n_files": 8
+  },
+  {
+   "repo": "topscoder/fourohme",
+   "n_files": 8
+  },
+  {
+   "repo": "AlephNullSK/dnsgen",
+   "n_files": 7
+  },
+  {
+   "repo": "JustRandomHacker/SecuriBot",
+   "n_files": 7
+  },
+  {
+   "repo": "altperfect/intrigue",
+   "n_files": 7
+  },
+  {
+   "repo": "ariary/JSextractor",
+   "n_files": 7
+  },
+  {
+   "repo": "davemolk/goGetJS",
+   "n_files": 7
+  },
+  {
+   "repo": "glebarez/cero",
+   "n_files": 7
+  },
+  {
+   "repo": "kaizoku73/Ghostpeek",
+   "n_files": 7
+  },
+  {
+   "repo": "ki9mu/ARL-plus-docker",
+   "n_files": 7
+  },
+  {
+   "repo": "owasp-amass/amass-docker-compose",
+   "n_files": 7
+  },
+  {
+   "repo": "yourpwnguy/crtfinder",
+   "n_files": 7
+  },
+  {
+   "repo": "Bl4ckM1rror/KerberoShutdown",
+   "n_files": 6
+  },
+  {
+   "repo": "J3eyond/Zabbix_pentest",
+   "n_files": 6
+  },
+  {
+   "repo": "Proviesec/Proviesec-Bug-Bounty-Dorking-Site-PBBDS",
+   "n_files": 6
+  },
+  {
+   "repo": "RogueSMG/Scavenger",
+   "n_files": 6
+  },
+  {
+   "repo": "SnailSploit/SnailSploit_Recon_extension",
+   "n_files": 6
+  },
+  {
+   "repo": "blacklanternsecurity/public-dns-servers",
+   "n_files": 6
+  },
+  {
+   "repo": "davemolk/bye403",
+   "n_files": 6
+  },
+  {
+   "repo": "davemolk/searcher",
+   "n_files": 6
+  },
+  {
+   "repo": "destan0098/reconinfo",
+   "n_files": 6
+  },
+  {
+   "repo": "fyxme/genx",
+   "n_files": 6
+  },
+  {
+   "repo": "immunIT/TeamsUserEnum",
+   "n_files": 6
+  },
+  {
+   "repo": "itsyasssin/cdnx",
+   "n_files": 6
+  },
+  {
+   "repo": "jkerai1/HoleHePlayGround",
+   "n_files": 6
+  },
+  {
+   "repo": "melbadry9/WhoEnum",
+   "n_files": 6
+  },
+  {
+   "repo": "mouteee/jsrip",
+   "n_files": 6
+  },
+  {
+   "repo": "oliverdaff/DNScrutiny",
+   "n_files": 6
+  },
+  {
+   "repo": "pietrohoff/DorkDetect",
+   "n_files": 6
+  },
+  {
+   "repo": "reconurge/reconcrawl",
+   "n_files": 6
+  },
+  {
+   "repo": "reconurge/reconspread",
+   "n_files": 6
+  },
+  {
+   "repo": "root4loot/crtsher",
+   "n_files": 6
+  },
+  {
+   "repo": "tarunKoyalwar/nestle",
+   "n_files": 6
+  },
+  {
+   "repo": "thenurhabib/maincoon",
+   "n_files": 6
+  },
+  {
+   "repo": "toluowo/ai-recon",
+   "n_files": 6
+  },
+  {
+   "repo": "x1mdev/ReconPi",
+   "n_files": 6
+  },
+  {
+   "repo": "zer0yu/xrecon",
+   "n_files": 6
+  },
+  {
+   "repo": "0xKoda/huntrs",
+   "n_files": 5
+  },
+  {
+   "repo": "4equest/recon-sploit",
+   "n_files": 5
+  },
+  {
+   "repo": "DavidWittman/slurp-axfr",
+   "n_files": 5
+  },
+  {
+   "repo": "Dking9504/Scoutify",
+   "n_files": 5
+  },
+  {
+   "repo": "SilverPoision/Rock-ON",
+   "n_files": 5
+  },
+  {
+   "repo": "alexmocki/tree-lab",
+   "n_files": 5
+  },
+  {
+   "repo": "daunhijau777/BL4CKOPS-RECON",
+   "n_files": 5
+  },
+  {
+   "repo": "davemolk/dorking",
+   "n_files": 5
+  },
+  {
+   "repo": "enestc0440/kalilitex",
+   "n_files": 5
+  },
+  {
+   "repo": "er4vn/i-Detector",
+   "n_files": 5
+  },
+  {
+   "repo": "f4lc0nd/bug-bounty-arsenal",
+   "n_files": 5
+  },
+  {
+   "repo": "g0ldencybersec/CloudRecon",
+   "n_files": 5
+  },
+  {
+   "repo": "hiddengearz/reconness-universal-wrapper",
+   "n_files": 5
+  },
+  {
+   "repo": "kod34/Mikara",
+   "n_files": 5
+  },
+  {
+   "repo": "laurenelizabethroberts/SMB-Network-Recon",
+   "n_files": 5
+  },
+  {
+   "repo": "pietrohoff/MetaScraper",
+   "n_files": 5
+  },
+  {
+   "repo": "pyneda/paramsmap",
+   "n_files": 5
+  },
+  {
+   "repo": "reconurge/recontrack",
+   "n_files": 5
+  },
+  {
+   "repo": "securi3ytalent/bug-bounty-tips",
+   "n_files": 5
+  },
+  {
+   "repo": "shamo0/endpoint-extractor",
+   "n_files": 5
+  },
+  {
+   "repo": "subfinder/goaltdns",
+   "n_files": 5
+  },
+  {
+   "repo": "theamanrawat/voobar",
+   "n_files": 5
+  },
+  {
+   "repo": "0xdekster/deksterecon",
+   "n_files": 4
+  },
+  {
+   "repo": "Ang31D/recon-tools",
+   "n_files": 4
+  },
+  {
+   "repo": "Anugeeth/reconme.js",
+   "n_files": 4
+  },
+  {
+   "repo": "CYFARE/CYFARE-Reconner",
+   "n_files": 4
+  },
+  {
+   "repo": "ChuckNorr1s/cdn-cracker",
+   "n_files": 4
+  },
+  {
+   "repo": "QTShade/RoboEnum",
+   "n_files": 4
+  },
+  {
+   "repo": "ReverseTEN/CenQuest",
+   "n_files": 4
+  },
+  {
+   "repo": "Roo7K1d/D0x-K1t-v2",
+   "n_files": 4
+  },
+  {
+   "repo": "VAMOS-UNIX/Enum-Orch",
+   "n_files": 4
+  },
+  {
+   "repo": "anotherhadi/gravatar-recon",
+   "n_files": 4
+  },
+  {
+   "repo": "bijan53c/R3c0n",
+   "n_files": 4
+  },
+  {
+   "repo": "blark/aiodnsbrute",
+   "n_files": 4
+  },
+  {
+   "repo": "byt3loss/Nuclei-Blues",
+   "n_files": 4
+  },
+  {
+   "repo": "daudmalik06/WMB-Scrapper",
+   "n_files": 4
+  },
+  {
+   "repo": "devlg2002/massive-finder",
+   "n_files": 4
+  },
+  {
+   "repo": "dreadlocked/DircoverRB",
+   "n_files": 4
+  },
+  {
+   "repo": "gwen001/google-search",
+   "n_files": 4
+  },
+  {
+   "repo": "m0rtem/CloudFail",
+   "n_files": 4
+  },
+  {
+   "repo": "madhanmaaz/recontime",
+   "n_files": 4
+  },
+  {
+   "repo": "mfpantst/anotherreconscript",
+   "n_files": 4
+  },
+  {
+   "repo": "paranoidsec/paranoid-recon",
+   "n_files": 4
+  },
+  {
+   "repo": "pikpikcu/nuubi",
+   "n_files": 4
+  },
+  {
+   "repo": "t3lesph0re/subrecon",
+   "n_files": 4
+  },
+  {
+   "repo": "techspence/observer",
+   "n_files": 4
+  },
+  {
+   "repo": "varppi/DHCPINFO",
+   "n_files": 4
+  },
+  {
+   "repo": "vrn-sh/qs",
+   "n_files": 4
+  },
+  {
+   "repo": "webdragon63/Waybackurl",
+   "n_files": 4
+  },
+  {
+   "repo": "xadhrit/terra",
+   "n_files": 4
+  },
+  {
+   "repo": "0x52sec/recon-automator",
+   "n_files": 3
+  },
+  {
+   "repo": "3nock/SpiderSuite",
+   "n_files": 3
+  },
+  {
+   "repo": "777388/Cerberus",
+   "n_files": 3
+  },
+  {
+   "repo": "777388/RealTime",
+   "n_files": 3
+  },
+  {
+   "repo": "DEMON1A/mapz",
+   "n_files": 3
+  },
+  {
+   "repo": "Den1al/client-reflection",
+   "n_files": 3
+  },
+  {
+   "repo": "Hunt3r0x/zWATCHER",
+   "n_files": 3
+  },
+  {
+   "repo": "MartinPSDev/curl-mcp",
+   "n_files": 3
+  },
+  {
+   "repo": "MayankPandey01/OwnBucket",
+   "n_files": 3
+  },
+  {
+   "repo": "S3cur3Th1sSh1t/WinPwn",
+   "n_files": 3
+  },
+  {
+   "repo": "ShadowVoid-King/ShadowWalker-Recon-Suite",
+   "n_files": 3
+  },
+  {
+   "repo": "americo/webshoter",
+   "n_files": 3
+  },
+  {
+   "repo": "bhitchens/HostReconTool",
+   "n_files": 3
+  },
+  {
+   "repo": "caster0x00/Above",
+   "n_files": 3
+  },
+  {
+   "repo": "christophetd/censys-subdomain-finder",
+   "n_files": 3
+  },
+  {
+   "repo": "cosad3s/hfinder",
+   "n_files": 3
+  },
+  {
+   "repo": "d78ui98/APKaleidoscope",
+   "n_files": 3
+  },
+  {
+   "repo": "davemolk/fuzzyHelpers",
+   "n_files": 3
+  },
+  {
+   "repo": "fyoorer/ShadowClone",
+   "n_files": 3
+  },
+  {
+   "repo": "gsvprharsha/Br0ther_Ey3",
+   "n_files": 3
+  },
+  {
+   "repo": "hkm/whoishere.py",
+   "n_files": 3
+  },
+  {
+   "repo": "indigo-sadland/DNL",
+   "n_files": 3
+  },
+  {
+   "repo": "junzhengca/gitscanner",
+   "n_files": 3
+  },
+  {
+   "repo": "kacakb/jsfinder",
+   "n_files": 3
+  },
+  {
+   "repo": "m8sec/nullinux",
+   "n_files": 3
+  },
+  {
+   "repo": "mbrg/zapcreds",
+   "n_files": 3
+  },
+  {
+   "repo": "michaelknap/favicon-hash-browser-extension",
+   "n_files": 3
+  },
+  {
+   "repo": "milesrichardson/docker-onion-nmap",
+   "n_files": 3
+  },
+  {
+   "repo": "netsecurity-as/recon365",
+   "n_files": 3
+  },
+  {
+   "repo": "noarche/ezOSINT",
+   "n_files": 3
+  },
+  {
+   "repo": "opcod3r/godan",
+   "n_files": 3
+  },
+  {
+   "repo": "pikpikcu/nodecraw",
+   "n_files": 3
+  },
+  {
+   "repo": "rafaelbaldasso/Khitai_Old",
+   "n_files": 3
+  },
+  {
+   "repo": "reconness/reconness-agents",
+   "n_files": 3
+  },
+  {
+   "repo": "ritikx01/myra",
+   "n_files": 3
+  },
+  {
+   "repo": "root4loot/dnsgrab",
+   "n_files": 3
+  },
+  {
+   "repo": "solo10010/HVS-Bitrix",
+   "n_files": 3
+  },
+  {
+   "repo": "swanandx/rustywitness",
+   "n_files": 3
+  },
+  {
+   "repo": "t0nyc23/condi",
+   "n_files": 3
+  },
+  {
+   "repo": "west-wind/LAR",
+   "n_files": 3
+  },
+  {
+   "repo": "zbo14/giturls",
+   "n_files": 3
+  },
+  {
+   "repo": "zbo14/puppetshow",
+   "n_files": 3
+  },
+  {
+   "repo": "777388/Archiveit-extension",
+   "n_files": 2
+  },
+  {
+   "repo": "777388/Backy",
+   "n_files": 2
+  },
+  {
+   "repo": "777388/CloudSearch",
+   "n_files": 2
+  },
+  {
+   "repo": "777388/DomainGlass",
+   "n_files": 2
+  },
+  {
+   "repo": "777388/InstaSearch-Extension",
+   "n_files": 2
+  },
+  {
+   "repo": "777388/ReverseLight-Extension",
+   "n_files": 2
+  },
+  {
+   "repo": "777388/SubdomainsExtension",
+   "n_files": 2
+  },
+  {
+   "repo": "777388/Webcache-Extension",
+   "n_files": 2
+  },
+  {
+   "repo": "Adarsh-S-R/DorkIQ",
+   "n_files": 2
+  },
+  {
+   "repo": "Anas0x1/reconas",
+   "n_files": 2
+  },
+  {
+   "repo": "AntorDOS/Subdub",
+   "n_files": 2
+  },
+  {
+   "repo": "Aquiles369/FLDSMDFR",
+   "n_files": 2
+  },
+  {
+   "repo": "Asjidkalam/SubRecon",
+   "n_files": 2
+  },
+  {
+   "repo": "Bhagavan-Bollina/Recondata",
+   "n_files": 2
+  },
+  {
+   "repo": "CYBER-MRINAL/Mahakal-Framework",
+   "n_files": 2
+  },
+  {
+   "repo": "CYBER-MRINAL/WEB-CRAWLER",
+   "n_files": 2
+  },
+  {
+   "repo": "Clock-Skew/EndPointX",
+   "n_files": 2
+  },
+  {
+   "repo": "ErenIzyat/adbeautifier",
+   "n_files": 2
+  },
+  {
+   "repo": "GabrielCS0/crtsh",
+   "n_files": 2
+  },
+  {
+   "repo": "GabrielCS0/security-trails",
+   "n_files": 2
+  },
+  {
+   "repo": "GhaziRoot/GhaziRecon",
+   "n_files": 2
+  },
+  {
+   "repo": "HydraRecon/hydra-recon-2",
+   "n_files": 2
+  },
+  {
+   "repo": "Impact-I/x8-Burp",
+   "n_files": 2
+  },
+  {
+   "repo": "Johnermac/ecce",
+   "n_files": 2
+  },
+  {
+   "repo": "Khenzl/OPR-Scan",
+   "n_files": 2
+  },
+  {
+   "repo": "Leetcore/recon-deutschland",
+   "n_files": 2
+  },
+  {
+   "repo": "MafiaBV1/SpecterScan",
+   "n_files": 2
+  },
+  {
+   "repo": "Malwarize/optionsprobe",
+   "n_files": 2
+  },
+  {
+   "repo": "N1TSUA-TATHAM-crzywrld/FaultLine",
+   "n_files": 2
+  },
+  {
+   "repo": "Sybil-Scan/TLDbrute",
+   "n_files": 2
+  },
+  {
+   "repo": "The-WebDux/Yakai",
+   "n_files": 2
+  },
+  {
+   "repo": "aashishsec/JS.Scanner",
+   "n_files": 2
+  },
+  {
+   "repo": "aashishsec/portProbe",
+   "n_files": 2
+  },
+  {
+   "repo": "akashoffsec/Favicon_hash_calculator",
+   "n_files": 2
+  },
+  {
+   "repo": "blackhatethicalhacking/AdminPBuster",
+   "n_files": 2
+  },
+  {
+   "repo": "daehee/govcloud",
+   "n_files": 2
+  },
+  {
+   "repo": "darklotuskdb/orgmem",
+   "n_files": 2
+  },
+  {
+   "repo": "dipeshkumarsahani/subdover",
+   "n_files": 2
+  },
+  {
+   "repo": "escf1root/scando",
+   "n_files": 2
+  },
+  {
+   "repo": "foulenzer/paraglider",
+   "n_files": 2
+  },
+  {
+   "repo": "gabamnml/hoper",
+   "n_files": 2
+  },
+  {
+   "repo": "ghostwalkr/SUF",
+   "n_files": 2
+  },
+  {
+   "repo": "h4ckologic/go-SCAN",
+   "n_files": 2
+  },
+  {
+   "repo": "hackribs/Recon-Automation-Toolkit",
+   "n_files": 2
+  },
+  {
+   "repo": "hanhanhanz/apkframe",
+   "n_files": 2
+  },
+  {
+   "repo": "hiitaro/AutoRecon",
+   "n_files": 2
+  },
+  {
+   "repo": "iamunixtz/Rezon",
+   "n_files": 2
+  },
+  {
+   "repo": "ipk1/ASNsearch",
+   "n_files": 2
+  },
+  {
+   "repo": "james-see/enchilada",
+   "n_files": 2
+  },
+  {
+   "repo": "joda32/CertCrunchy",
+   "n_files": 2
+  },
+  {
+   "repo": "jxbt/EyeShot",
+   "n_files": 2
+  },
+  {
+   "repo": "kdandy/WinPwn",
+   "n_files": 2
+  },
+  {
+   "repo": "m8sec/SubWalker",
+   "n_files": 2
+  },
+  {
+   "repo": "mansoorr123/GitRoller",
+   "n_files": 2
+  },
+  {
+   "repo": "mathfaria/Layla",
+   "n_files": 2
+  },
+  {
+   "repo": "matiasmenares/Email-Recon",
+   "n_files": 2
+  },
+  {
+   "repo": "mbeardwell/osint-i3-case-study",
+   "n_files": 2
+  },
+  {
+   "repo": "mhmdiaa/waybackrobots",
+   "n_files": 2
+  },
+  {
+   "repo": "mmpx12/xenv",
+   "n_files": 2
+  },
+  {
+   "repo": "mrnazu/TryHackMe-CTF-s",
+   "n_files": 2
+  },
+  {
+   "repo": "mrprogrammer2938/Black-Recon",
+   "n_files": 2
+  },
+  {
+   "repo": "mxm0z/pasteBino",
+   "n_files": 2
+  },
+  {
+   "repo": "neuralmage/ReconFlare",
+   "n_files": 2
+  },
+  {
+   "repo": "nitefood/asn",
+   "n_files": 2
+  },
+  {
+   "repo": "nixintel/o365chk",
+   "n_files": 2
+  },
+  {
+   "repo": "pardise666/Auto-Reconiz3r",
+   "n_files": 2
+  },
+  {
+   "repo": "pikpikcu/js-finding",
+   "n_files": 2
+  },
+  {
+   "repo": "rainmana/dnxty",
+   "n_files": 2
+  },
+  {
+   "repo": "s0md3v/Zen",
+   "n_files": 2
+  },
+  {
+   "repo": "sec-it/BFAC-Burp-Extension",
+   "n_files": 2
+  },
+  {
+   "repo": "shazsyed/FavHunt",
+   "n_files": 2
+  },
+  {
+   "repo": "shoebpate1/Freak-tools",
+   "n_files": 2
+  },
+  {
+   "repo": "sl4x0/subfree",
+   "n_files": 2
+  },
+  {
+   "repo": "tox7cv3nom/Freak",
+   "n_files": 2
+  },
+  {
+   "repo": "trickest/elasticsearch_index",
+   "n_files": 2
+  },
+  {
+   "repo": "tuxotron/asn-search",
+   "n_files": 2
+  },
+  {
+   "repo": "utkusen/urlhunter",
+   "n_files": 2
+  },
+  {
+   "repo": "webdragon63/codis",
+   "n_files": 2
+  },
+  {
+   "repo": "webemin/nistrich",
+   "n_files": 2
+  },
+  {
+   "repo": "who0xac/SubHunterX",
+   "n_files": 2
+  },
+  {
+   "repo": "wreet/p8",
+   "n_files": 2
+  },
+  {
+   "repo": "yHunterDep/clickjx",
+   "n_files": 2
+  },
+  {
+   "repo": "yHunterDep/listdomains",
+   "n_files": 2
+  },
+  {
+   "repo": "0xRar/Oryx-Auto",
+   "n_files": 1
+  },
+  {
+   "repo": "0xShadow07/ScopeFinder",
+   "n_files": 1
+  },
+  {
+   "repo": "0xShadow07/Subhunter",
+   "n_files": 1
+  },
+  {
+   "repo": "4m3rr0r/SubreconGemini",
+   "n_files": 1
+  },
+  {
+   "repo": "777388/Groolgle",
+   "n_files": 1
+  },
+  {
+   "repo": "777388/ubifuzz",
+   "n_files": 1
+  },
+  {
+   "repo": "A-z-exe/BugBountyToolkit",
+   "n_files": 1
+  },
+  {
+   "repo": "AdrielFreud/Crawler-Tool",
+   "n_files": 1
+  },
+  {
+   "repo": "Ali-hey-0/Bounty-Script",
+   "n_files": 1
+  },
+  {
+   "repo": "Alikhalkhali/active-ip",
+   "n_files": 1
+  },
+  {
+   "repo": "Ap1311/ffuf-GUI",
+   "n_files": 1
+  },
+  {
+   "repo": "Ap6pack/web-cache-deception-testing-tool",
+   "n_files": 1
+  },
+  {
+   "repo": "BL4CK570RM/MHsub",
+   "n_files": 1
+  },
+  {
+   "repo": "Bedrovelsen/SHOstnamesDAN",
+   "n_files": 1
+  },
+  {
+   "repo": "CPScript/netOps",
+   "n_files": 1
+  },
+  {
+   "repo": "DEMON1A/wizsub.sh",
+   "n_files": 1
+  },
+  {
+   "repo": "Dr4ks/IP_Enum",
+   "n_files": 1
+  },
+  {
+   "repo": "Dun4ev/HID-NetAudit",
+   "n_files": 1
+  },
+  {
+   "repo": "FoxSecIntel/GoogleAndShodanDorking",
+   "n_files": 1
+  },
+  {
+   "repo": "G4sp4rCS/imap-recon",
+   "n_files": 1
+  },
+  {
+   "repo": "Habib1211/recon-ghost",
+   "n_files": 1
+  },
+  {
+   "repo": "HanibalAntePortas/get-acq",
+   "n_files": 1
+  },
+  {
+   "repo": "Harsh-Katiyar/ScriptHound",
+   "n_files": 1
+  },
+  {
+   "repo": "INTELEON404/PORT-HUNTER",
+   "n_files": 1
+  },
+  {
+   "repo": "INTELEON404/iptohost",
+   "n_files": 1
+  },
+  {
+   "repo": "InitRoot/fransRecon",
+   "n_files": 1
+  },
+  {
+   "repo": "JavierOlmedo/ipdiscover",
+   "n_files": 1
+  },
+  {
+   "repo": "LeetIDA/IPV4-GEO",
+   "n_files": 1
+  },
+  {
+   "repo": "Lekssays/shellfinder",
+   "n_files": 1
+  },
+  {
+   "repo": "LunarLumos/yametti",
+   "n_files": 1
+  },
+  {
+   "repo": "M3hank/ExplorerPy",
+   "n_files": 1
+  },
+  {
+   "repo": "M3hank/Sub-Scan",
+   "n_files": 1
+  },
+  {
+   "repo": "MalikShoaib678/deep-sea-web-crawler",
+   "n_files": 1
+  },
+  {
+   "repo": "MrBrooks89/BatParamFetcher",
+   "n_files": 1
+  },
+  {
+   "repo": "MrCl0wnLab/SimpleReconSubdomain",
+   "n_files": 1
+  },
+  {
+   "repo": "NakuTenshi/DomainHound",
+   "n_files": 1
+  },
+  {
+   "repo": "NakuTenshi/JSHound",
+   "n_files": 1
+  },
+  {
+   "repo": "NakuTenshi/RoboBack",
+   "n_files": 1
+  },
+  {
+   "repo": "OmarMagedAhmed/DirBrute",
+   "n_files": 1
+  },
+  {
+   "repo": "OxAbdulrahman/whole-pinging",
+   "n_files": 1
+  },
+  {
+   "repo": "Potato-Industries/onlooker",
+   "n_files": 1
+  },
+  {
+   "repo": "Sh7yk/DockerRegistrySpider",
+   "n_files": 1
+  },
+  {
+   "repo": "ShadowDSouL/SmartRecon",
+   "n_files": 1
+  },
+  {
+   "repo": "Somchandra17/TrashRecon",
+   "n_files": 1
+  },
+  {
+   "repo": "Trvefemboy1337/LGBTQ-PwnPC",
+   "n_files": 1
+  },
+  {
+   "repo": "Uayeb5/LAAAZZZY",
+   "n_files": 1
+  },
+  {
+   "repo": "Vulnpire/sXtract",
+   "n_files": 1
+  },
+  {
+   "repo": "ZemlyakovDmitry/cloudfuck",
+   "n_files": 1
+  },
+  {
+   "repo": "aalex954/HTTP-Fingerprinting-Server",
+   "n_files": 1
+  },
+  {
+   "repo": "ahali00/subcrt",
+   "n_files": 1
+  },
+  {
+   "repo": "aizazullahdurrani8/python-network-scanner",
+   "n_files": 1
+  },
+  {
+   "repo": "allannjuguna/WpEnum",
+   "n_files": 1
+  },
+  {
+   "repo": "alppekel/bugbounty-recon-tools",
+   "n_files": 1
+  },
+  {
+   "repo": "anasbousselham/carrotosint",
+   "n_files": 1
+  },
+  {
+   "repo": "anmolksachan/CVESeeker",
+   "n_files": 1
+  },
+  {
+   "repo": "aufzayed/digit",
+   "n_files": 1
+  },
+  {
+   "repo": "axelrdz-4766/certenum",
+   "n_files": 1
+  },
+  {
+   "repo": "b3nj1-1/Beek_OSINT",
+   "n_files": 1
+  },
+  {
+   "repo": "b3rito/yotter",
+   "n_files": 1
+  },
+  {
+   "repo": "bolbolabadi/URLGenerator",
+   "n_files": 1
+  },
+  {
+   "repo": "bruzistico/mortomuitolouco",
+   "n_files": 1
+  },
+  {
+   "repo": "burpgot/Auto-privsec",
+   "n_files": 1
+  },
+  {
+   "repo": "carlospolop/bashReconScan",
+   "n_files": 1
+  },
+  {
+   "repo": "casturity/webspy",
+   "n_files": 1
+  },
+  {
+   "repo": "choirurrizal/paraminer",
+   "n_files": 1
+  },
+  {
+   "repo": "cmhedrick/wposter",
+   "n_files": 1
+  },
+  {
+   "repo": "cosad3s/njsdump",
+   "n_files": 1
+  },
+  {
+   "repo": "daehee/ghdorks-gen",
+   "n_files": 1
+  },
+  {
+   "repo": "dellalibera/titlextractor",
+   "n_files": 1
+  },
+  {
+   "repo": "destan0098/ipdetails",
+   "n_files": 1
+  },
+  {
+   "repo": "devfoundsec/osint",
+   "n_files": 1
+  },
+  {
+   "repo": "devsec23/DevSec-Recon",
+   "n_files": 1
+  },
+  {
+   "repo": "dwisiswant0/awesome-oneliner-bugbounty",
+   "n_files": 1
+  },
+  {
+   "repo": "e-m3din4/netcat-scanner",
+   "n_files": 1
+  },
+  {
+   "repo": "edivangalindo/dwlr",
+   "n_files": 1
+  },
+  {
+   "repo": "ehpavan/SubFury",
+   "n_files": 1
+  },
+  {
+   "repo": "elcaza/do_recon",
+   "n_files": 1
+  },
+  {
+   "repo": "emircanmurat/SubHunter",
+   "n_files": 1
+  },
+  {
+   "repo": "ericwang0533/Edpuzzle-Recon",
+   "n_files": 1
+  },
+  {
+   "repo": "exe249/jsScraper",
+   "n_files": 1
+  },
+  {
+   "repo": "frite/cf-enum",
+   "n_files": 1
+  },
+  {
+   "repo": "g0ttfrid/archiveweb",
+   "n_files": 1
+  },
+  {
+   "repo": "german-namestnikov/unhidens",
+   "n_files": 1
+  },
+  {
+   "repo": "gokulapap/submax",
+   "n_files": 1
+  },
+  {
+   "repo": "h0tak88r/AutoSubRecon",
+   "n_files": 1
+  },
+  {
+   "repo": "hack-with-ethics/dns-recon-dns-redTeaming",
+   "n_files": 1
+  },
+  {
+   "repo": "hakluke/hakip2host",
+   "n_files": 1
+  },
+  {
+   "repo": "haxurn/pentest-toolkit",
+   "n_files": 1
+  },
+  {
+   "repo": "humblelad/Bracket",
+   "n_files": 1
+  },
+  {
+   "repo": "humblelad/favicon-smasher",
+   "n_files": 1
+  },
+  {
+   "repo": "iHassn/chaosdump",
+   "n_files": 1
+  },
+  {
+   "repo": "iamshafayat/JSpider",
+   "n_files": 1
+  },
+  {
+   "repo": "iamunixtz/Lazy-Hunter",
+   "n_files": 1
+  },
+  {
+   "repo": "ikajakam/Js-hunt-Ai-Analysis",
+   "n_files": 1
+  },
+  {
+   "repo": "indiancybertroops/DorKey",
+   "n_files": 1
+  },
+  {
+   "repo": "innkaf/mapper-tool",
+   "n_files": 1
+  },
+  {
+   "repo": "ipk1/Allpdiscover",
+   "n_files": 1
+  },
+  {
+   "repo": "ipk1/BGPsearch",
+   "n_files": 1
+  },
+  {
+   "repo": "ipk1/BugCrowdScope",
+   "n_files": 1
+  },
+  {
+   "repo": "ipk1/BugCrowd_Crowdstream-Recon",
+   "n_files": 1
+  },
+  {
+   "repo": "ipk1/ScanCrawlSecret",
+   "n_files": 1
+  },
+  {
+   "repo": "itsyasssin/crt.sh",
+   "n_files": 1
+  },
+  {
+   "repo": "itsyasssin/lin",
+   "n_files": 1
+  },
+  {
+   "repo": "j3ssie/str-replace",
+   "n_files": 1
+  },
+  {
+   "repo": "jamesarems/ip-straw",
+   "n_files": 1
+  },
+  {
+   "repo": "juanbelin/Hit-The-Dns",
+   "n_files": 1
+  },
+  {
+   "repo": "khadafigans/BugHunter-Recon-Suite",
+   "n_files": 1
+  },
+  {
+   "repo": "lord3ver/gctsubdomains",
+   "n_files": 1
+  },
+  {
+   "repo": "lordsmh/risheyab",
+   "n_files": 1
+  },
+  {
+   "repo": "madhavmehndiratta/shodan-scanner",
+   "n_files": 1
+  },
+  {
+   "repo": "marz-hunter/convert-params",
+   "n_files": 1
+  },
+  {
+   "repo": "mathis2001/Cert4Recon",
+   "n_files": 1
+  },
+  {
+   "repo": "mathis2001/GitDiscloser",
+   "n_files": 1
+  },
+  {
+   "repo": "mathis2001/TwittosINT",
+   "n_files": 1
+  },
+  {
+   "repo": "mathis2001/WebHackUrls",
+   "n_files": 1
+  },
+  {
+   "repo": "matitanium/burpsuite-sitemap",
+   "n_files": 1
+  },
+  {
+   "repo": "matthernet/SubdomainFinder",
+   "n_files": 1
+  },
+  {
+   "repo": "mckipfc/subdomain_scanner",
+   "n_files": 1
+  },
+  {
+   "repo": "mishakorzik/ReconCat",
+   "n_files": 1
+  },
+  {
+   "repo": "mmpx12/xgit",
+   "n_files": 1
+  },
+  {
+   "repo": "mohammed-addar/r3con",
+   "n_files": 1
+  },
+  {
+   "repo": "mortadacherrak/Auto-Map",
+   "n_files": 1
+  },
+  {
+   "repo": "mrco24/OK-VPS",
+   "n_files": 1
+  },
+  {
+   "repo": "mrco24/PH-Recon",
+   "n_files": 1
+  },
+  {
+   "repo": "mubbashirulislam/X3bounty",
+   "n_files": 1
+  },
+  {
+   "repo": "muhammad-abdullah124/Shadow_Recon",
+   "n_files": 1
+  },
+  {
+   "repo": "nezzzumi/userrecon",
+   "n_files": 1
+  },
+  {
+   "repo": "oski02/reconMail",
+   "n_files": 1
+  },
+  {
+   "repo": "p0dalirius/GetFortinetSerialNumber",
+   "n_files": 1
+  },
+  {
+   "repo": "p0dalirius/ListValidGSuiteEmails",
+   "n_files": 1
+  },
+  {
+   "repo": "ph5i/gauhop",
+   "n_files": 1
+  },
+  {
+   "repo": "pietrohoff/GHDB-Wordlist-Collector",
+   "n_files": 1
+  },
+  {
+   "repo": "pikpikcu/hostinject",
+   "n_files": 1
+  },
+  {
+   "repo": "pixelnroot/simple-recon-tool",
+   "n_files": 1
+  },
+  {
+   "repo": "psjs12/TelegramDetective",
+   "n_files": 1
+  },
+  {
+   "repo": "rafaelbaldasso/Khitai",
+   "n_files": 1
+  },
+  {
+   "repo": "rahmansec/CDN-Hunter",
+   "n_files": 1
+  },
+  {
+   "repo": "rehan985/subdomain_recon",
+   "n_files": 1
+  },
+  {
+   "repo": "rotemreiss/robusto",
+   "n_files": 1
+  },
+  {
+   "repo": "scumdestroy/warlusts",
+   "n_files": 1
+  },
+  {
+   "repo": "secnextechnologies/IPWatchtower",
+   "n_files": 1
+  },
+  {
+   "repo": "secnextechnologies/NetInspect",
+   "n_files": 1
+  },
+  {
+   "repo": "sham00n/waybulk",
+   "n_files": 1
+  },
+  {
+   "repo": "shingareom/20d8cb1a7b2cec3df2d5b257f506b6b33d15d621c2dc0a5405f807ed0b49d048",
+   "n_files": 1
+  },
+  {
+   "repo": "six2dez/dorks_hunter",
+   "n_files": 1
+  },
+  {
+   "repo": "solo10010/ASpider",
+   "n_files": 1
+  },
+  {
+   "repo": "some-man1/Banner-hunter",
+   "n_files": 1
+  },
+  {
+   "repo": "superhedgy/sphinx",
+   "n_files": 1
+  },
+  {
+   "repo": "t0nyc23/mr_crawley",
+   "n_files": 1
+  },
+  {
+   "repo": "trmxvibs/scaling-engine",
+   "n_files": 1
+  },
+  {
+   "repo": "tunahorse/gobuster_looper",
+   "n_files": 1
+  },
+  {
+   "repo": "v01dHackTeam/v01dTooL",
+   "n_files": 1
+  },
+  {
+   "repo": "v801/subdomain-recon",
+   "n_files": 1
+  },
+  {
+   "repo": "vmnguyen/findweb",
+   "n_files": 1
+  },
+  {
+   "repo": "xajkep/wordlists",
+   "n_files": 1
+  },
+  {
+   "repo": "xthezealot/saar",
+   "n_files": 1
+  },
+  {
+   "repo": "xvolume/fuzzmap",
+   "n_files": 1
+  },
+  {
+   "repo": "zakaria9448z/PortWarden",
+   "n_files": 1
+  },
+  {
+   "repo": "zbo14/dirscour",
+   "n_files": 1
+  },
+  {
+   "repo": "zbo14/gh0st",
+   "n_files": 1
+  },
+  {
+   "repo": "zbo14/polypath",
+   "n_files": 1
+  },
+  {
+   "repo": "zhongwencool/observer_cli",
+   "n_files": 1
+  }
+ ],
+ "_meta": {
+  "dataset_sha": "210b9259be248323b0b3bc58252bed3fde53135f",
+  "generated_at": "2026-10-11T18:21:14+0000"
+ }
+}

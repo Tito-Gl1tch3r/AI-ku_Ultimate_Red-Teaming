@@ -1,0 +1,1574 @@
+{
+ "topic": "offensive-security",
+ "source": "hf-statistics",
+ "num_examples_hf": 18641,
+ "partial_stats": false,
+ "hf_license_distribution": {
+  "GPL-2.0": 2669,
+  "CC0-1.0": 62,
+  "AGPL-3.0": 472,
+  "MIT": 3372,
+  "BSD-2-Clause": 1308,
+  "BSD-3-Clause": 37,
+  "NOASSERTION": 1850,
+  "Unlicense": 2,
+  "LGPL-2.1": 4,
+  "Apache-2.0": 2284,
+  "GPL-3.0": 1574
+ },
+ "n_repos": 387,
+ "repos": [
+  {
+   "repo": "Syslifters/offsec-tools",
+   "n_files": 2808
+  },
+  {
+   "repo": "byt3n33dl3/Crawler_v2",
+   "n_files": 1911
+  },
+  {
+   "repo": "w4af/w4af",
+   "n_files": 1434
+  },
+  {
+   "repo": "byt3n33dl3/NetExec",
+   "n_files": 1308
+  },
+  {
+   "repo": "krishealty/WhoKnows",
+   "n_files": 1105
+  },
+  {
+   "repo": "ChaitanyaHaritash/IllusiveFog",
+   "n_files": 1097
+  },
+  {
+   "repo": "byt3n33dl3/thc-Nuclei",
+   "n_files": 918
+  },
+  {
+   "repo": "byt3n33dl3/ApolloExec",
+   "n_files": 635
+  },
+  {
+   "repo": "vxcontrol/pentagi",
+   "n_files": 571
+  },
+  {
+   "repo": "pathwar/pathwar",
+   "n_files": 439
+  },
+  {
+   "repo": "xoxruns/deadend-cli",
+   "n_files": 380
+  },
+  {
+   "repo": "C0reL0ader/EaST",
+   "n_files": 317
+  },
+  {
+   "repo": "mendax0110/peTool",
+   "n_files": 211
+  },
+  {
+   "repo": "jivoi/pentest",
+   "n_files": 203
+  },
+  {
+   "repo": "FuzzingLabs/fuzzforge_ai",
+   "n_files": 187
+  },
+  {
+   "repo": "byt3n33dl3/KaylAzureAD",
+   "n_files": 178
+  },
+  {
+   "repo": "MrM8BRH/SuperLibrary",
+   "n_files": 174
+  },
+  {
+   "repo": "analog-substance/carbon",
+   "n_files": 150
+  },
+  {
+   "repo": "roger1337/JDBG",
+   "n_files": 116
+  },
+  {
+   "repo": "CX330Blake/Black-Hat-Zig",
+   "n_files": 99
+  },
+  {
+   "repo": "joseguzman1337/offensive-security",
+   "n_files": 96
+  },
+  {
+   "repo": "ole-knf/GRIDSAFE",
+   "n_files": 85
+  },
+  {
+   "repo": "antifob/pop",
+   "n_files": 81
+  },
+  {
+   "repo": "SanhitaVichare/temp-os",
+   "n_files": 79
+  },
+  {
+   "repo": "darkraver23/OffSec-Utilities",
+   "n_files": 79
+  },
+  {
+   "repo": "byt3n33dl3/httpX",
+   "n_files": 76
+  },
+  {
+   "repo": "offensive-hub/black-widow",
+   "n_files": 73
+  },
+  {
+   "repo": "ivan-sincek/malware-apk",
+   "n_files": 69
+  },
+  {
+   "repo": "BradHacker/titan",
+   "n_files": 68
+  },
+  {
+   "repo": "dustin-ww/ADpwn-core",
+   "n_files": 67
+  },
+  {
+   "repo": "farrosfr/farrosfr-site",
+   "n_files": 66
+  },
+  {
+   "repo": "elbraino/awesome-blackhat-arsenal",
+   "n_files": 61
+  },
+  {
+   "repo": "x42en/sysplant",
+   "n_files": 61
+  },
+  {
+   "repo": "menashe12346/Autonomous-Cyber-Attack-Agent",
+   "n_files": 59
+  },
+  {
+   "repo": "Kracken256/dash-shell-rootkit",
+   "n_files": 58
+  },
+  {
+   "repo": "R3DHULK/fsociety",
+   "n_files": 57
+  },
+  {
+   "repo": "Twilight4/nobility",
+   "n_files": 56
+  },
+  {
+   "repo": "userlandkernel/wksploit-framework",
+   "n_files": 54
+  },
+  {
+   "repo": "faisalmemon/the-road-to-zero",
+   "n_files": 51
+  },
+  {
+   "repo": "SujalMeghwal/ExploitForge",
+   "n_files": 50
+  },
+  {
+   "repo": "JusticeRage/FFM",
+   "n_files": 46
+  },
+  {
+   "repo": "Orange-Cyberdefense/bof",
+   "n_files": 45
+  },
+  {
+   "repo": "abhisharma404/vault",
+   "n_files": 45
+  },
+  {
+   "repo": "MrW0l05zyn/pentesting",
+   "n_files": 43
+  },
+  {
+   "repo": "antifob/linux-prinj",
+   "n_files": 43
+  },
+  {
+   "repo": "syphr0/wifi32",
+   "n_files": 41
+  },
+  {
+   "repo": "byt3n33dl3/.crackedauth",
+   "n_files": 40
+  },
+  {
+   "repo": "byt3n33dl3/PasswordExecution",
+   "n_files": 39
+  },
+  {
+   "repo": "sud0gh0st-pwn/T3mp0ra_C2",
+   "n_files": 39
+  },
+  {
+   "repo": "ciso360ai/ciso360ai",
+   "n_files": 38
+  },
+  {
+   "repo": "YASHASVASISHTA/PHISHINGAPP",
+   "n_files": 37
+  },
+  {
+   "repo": "d01ki/BreachPilot",
+   "n_files": 37
+  },
+  {
+   "repo": "dk0m/NeutralNim",
+   "n_files": 37
+  },
+  {
+   "repo": "ICWR-TEAM/R-AScan",
+   "n_files": 36
+  },
+  {
+   "repo": "MostafaSoliman/ropfilter",
+   "n_files": 36
+  },
+  {
+   "repo": "John0n1/NetDog",
+   "n_files": 34
+  },
+  {
+   "repo": "ivan-sincek/forbidden",
+   "n_files": 34
+  },
+  {
+   "repo": "edoardottt/offensive-onos",
+   "n_files": 33
+  },
+  {
+   "repo": "olivercalazans/offscan",
+   "n_files": 31
+  },
+  {
+   "repo": "gh0x0st/OSEP-Breaking-Chains",
+   "n_files": 30
+  },
+  {
+   "repo": "gh0x0st/pythonizing_nmap",
+   "n_files": 30
+  },
+  {
+   "repo": "Miiraak/Scripts",
+   "n_files": 29
+  },
+  {
+   "repo": "ivan-sincek/chad",
+   "n_files": 29
+  },
+  {
+   "repo": "thesp0nge/nightcrawler-mitm",
+   "n_files": 29
+  },
+  {
+   "repo": "S4CH/s4ch.github.io",
+   "n_files": 28
+  },
+  {
+   "repo": "rphang/evilBPF",
+   "n_files": 28
+  },
+  {
+   "repo": "LuizWT/AutoRecon",
+   "n_files": 27
+  },
+  {
+   "repo": "b1nhack/rust-shellcode",
+   "n_files": 27
+  },
+  {
+   "repo": "juba0x00/Offensive-Python",
+   "n_files": 27
+  },
+  {
+   "repo": "medpaf/hawk",
+   "n_files": 27
+  },
+  {
+   "repo": "0xMarcio/syntax9.ai",
+   "n_files": 26
+  },
+  {
+   "repo": "darshannn10/Penetration-Testing",
+   "n_files": 26
+  },
+  {
+   "repo": "sudosammy/knary",
+   "n_files": 26
+  },
+  {
+   "repo": "anrbn/GATOR",
+   "n_files": 25
+  },
+  {
+   "repo": "p314dO/blog",
+   "n_files": 25
+  },
+  {
+   "repo": "suhailm-in/suhail_m",
+   "n_files": 25
+  },
+  {
+   "repo": "RevEngAI/reai-r2",
+   "n_files": 24
+  },
+  {
+   "repo": "S3lrius/Nimalathatep",
+   "n_files": 24
+  },
+  {
+   "repo": "stavinski/malgo",
+   "n_files": 24
+  },
+  {
+   "repo": "Dr-404/WebHacking",
+   "n_files": 23
+  },
+  {
+   "repo": "Esonhugh/sshd_backdoor",
+   "n_files": 23
+  },
+  {
+   "repo": "BishopFox/rmiscout",
+   "n_files": 22
+  },
+  {
+   "repo": "Cotbert2/JoeCypherEDO",
+   "n_files": 22
+  },
+  {
+   "repo": "aahmadnejad/Fyodost",
+   "n_files": 22
+  },
+  {
+   "repo": "emmaconnor/moria",
+   "n_files": 22
+  },
+  {
+   "repo": "FonderElite/PlagueSecOS",
+   "n_files": 21
+  },
+  {
+   "repo": "georgesotiriadis/Chimera",
+   "n_files": 21
+  },
+  {
+   "repo": "unsecured-company/gitrip",
+   "n_files": 21
+  },
+  {
+   "repo": "blacklanternsecurity/offensive-azure",
+   "n_files": 20
+  },
+  {
+   "repo": "codingo/crithit",
+   "n_files": 20
+  },
+  {
+   "repo": "ricardojoserf/wifi-pentesting-guide",
+   "n_files": 20
+  },
+  {
+   "repo": "DanaEpp/CodeArgos",
+   "n_files": 19
+  },
+  {
+   "repo": "ImVersionizingNotThatAnyoneCares/CloseTheGapCybersecurity",
+   "n_files": 19
+  },
+  {
+   "repo": "Kode-n-Rolla/hacking_time",
+   "n_files": 19
+  },
+  {
+   "repo": "ShivaySabharwal/PenTest1_Tools",
+   "n_files": 19
+  },
+  {
+   "repo": "gh0x0st/pt_phone_home",
+   "n_files": 19
+  },
+  {
+   "repo": "nyancrimew/goop",
+   "n_files": 19
+  },
+  {
+   "repo": "1d8/offsec",
+   "n_files": 18
+  },
+  {
+   "repo": "BlWasp/rs-shell",
+   "n_files": 18
+  },
+  {
+   "repo": "ivan-sincek/file-scraper",
+   "n_files": 18
+  },
+  {
+   "repo": "0xsyr0/OSCP",
+   "n_files": 17
+  },
+  {
+   "repo": "AWSToolbox/find-public-rds-snapshots",
+   "n_files": 17
+  },
+  {
+   "repo": "Ghost53574/havoc_profile_generator",
+   "n_files": 17
+  },
+  {
+   "repo": "cokhikmah/python3-for-security-testing",
+   "n_files": 17
+  },
+  {
+   "repo": "iAleKira/Nmap-Injection-Framework",
+   "n_files": 17
+  },
+  {
+   "repo": "prdngr/red-sky",
+   "n_files": 17
+  },
+  {
+   "repo": "codingo/NoSQLMap",
+   "n_files": 16
+  },
+  {
+   "repo": "codingo/Reconnoitre",
+   "n_files": 16
+  },
+  {
+   "repo": "hanzalaghayasabbasi/offensivesecurity",
+   "n_files": 16
+  },
+  {
+   "repo": "ciso360ai/website",
+   "n_files": 15
+  },
+  {
+   "repo": "codingo/VHostScan",
+   "n_files": 15
+  },
+  {
+   "repo": "joaoviictorti/hypnus",
+   "n_files": 15
+  },
+  {
+   "repo": "tokyoneon/Chimera",
+   "n_files": 15
+  },
+  {
+   "repo": "0x1uke/lurker",
+   "n_files": 14
+  },
+  {
+   "repo": "NullTrace-Security/Exploiting-AI",
+   "n_files": 14
+  },
+  {
+   "repo": "offensive-terraform/offensive-terraform.github.io",
+   "n_files": 14
+  },
+  {
+   "repo": "4xyy/OCT--offensive_security_tool",
+   "n_files": 13
+  },
+  {
+   "repo": "80h3m14n/red-team-tools",
+   "n_files": 13
+  },
+  {
+   "repo": "f0xtek/iam-principal-enumerator",
+   "n_files": 13
+  },
+  {
+   "repo": "f1zm0/hades",
+   "n_files": 13
+  },
+  {
+   "repo": "ivan-sincek/powershell-reverse-tcp",
+   "n_files": 13
+  },
+  {
+   "repo": "ivan-sincek/scrapy-scraper",
+   "n_files": 13
+  },
+  {
+   "repo": "m4riio21/LONS-C2",
+   "n_files": 13
+  },
+  {
+   "repo": "mendax0110/dirtyInject",
+   "n_files": 13
+  },
+  {
+   "repo": "HackToolsLab/GhostScan",
+   "n_files": 12
+  },
+  {
+   "repo": "RevEngAI/reait",
+   "n_files": 12
+  },
+  {
+   "repo": "ivan-sincek/invoker",
+   "n_files": 12
+  },
+  {
+   "repo": "joaoviictorti/runas-rs",
+   "n_files": 12
+  },
+  {
+   "repo": "mendax0110/loggy",
+   "n_files": 12
+  },
+  {
+   "repo": "R3DHULK/golang-for-ethical-hackers",
+   "n_files": 11
+  },
+  {
+   "repo": "byfranke/web-toolkit",
+   "n_files": 11
+  },
+  {
+   "repo": "dhn/OSEE",
+   "n_files": 11
+  },
+  {
+   "repo": "ihebski/DefaultCreds-cheat-sheet",
+   "n_files": 11
+  },
+  {
+   "repo": "ivan-sincek/php-reverse-shell",
+   "n_files": 11
+  },
+  {
+   "repo": "ivan-sincek/property-lister",
+   "n_files": 11
+  },
+  {
+   "repo": "karastift/kitten",
+   "n_files": 11
+  },
+  {
+   "repo": "ricardojoserf/vulnserver-exploits",
+   "n_files": 11
+  },
+  {
+   "repo": "0xflux/rust_shellcode",
+   "n_files": 10
+  },
+  {
+   "repo": "AUX-441/security-tools-hacking",
+   "n_files": 10
+  },
+  {
+   "repo": "MelloSec/BlastBox-II",
+   "n_files": 10
+  },
+  {
+   "repo": "borj404/sc-reentrancy-attack",
+   "n_files": 10
+  },
+  {
+   "repo": "evait-security/wami",
+   "n_files": 10
+  },
+  {
+   "repo": "fdvmoreira/penetration-testing-tools",
+   "n_files": 10
+  },
+  {
+   "repo": "hax3xploit/BufferOverFlow",
+   "n_files": 10
+  },
+  {
+   "repo": "ivan-sincek/java-reverse-tcp",
+   "n_files": 10
+  },
+  {
+   "repo": "nullbr41n/nullbrain",
+   "n_files": 10
+  },
+  {
+   "repo": "so87/OSCP-PwK",
+   "n_files": 10
+  },
+  {
+   "repo": "theahmadov/dash",
+   "n_files": 10
+  },
+  {
+   "repo": "NoahKirchner/speedloader",
+   "n_files": 9
+  },
+  {
+   "repo": "PGAdrian00/UniStudi",
+   "n_files": 9
+  },
+  {
+   "repo": "RED-TEAM-444/STEALTH-SHELL",
+   "n_files": 9
+  },
+  {
+   "repo": "frizb/Vanquish",
+   "n_files": 9
+  },
+  {
+   "repo": "karlvbiron/MATRIX",
+   "n_files": 9
+  },
+  {
+   "repo": "lucasrpatten/ManInTheMirror",
+   "n_files": 9
+  },
+  {
+   "repo": "marzekan/MASAPT",
+   "n_files": 9
+  },
+  {
+   "repo": "pwnish3r/SecuArch",
+   "n_files": 9
+  },
+  {
+   "repo": "sufyandaredevil/OSED",
+   "n_files": 9
+  },
+  {
+   "repo": "thelikes/fuzznav",
+   "n_files": 9
+  },
+  {
+   "repo": "tomekceszke/offensive-security",
+   "n_files": 9
+  },
+  {
+   "repo": "y-mo4n1ngst3r/evillan",
+   "n_files": 9
+  },
+  {
+   "repo": "0xtiago/HackerWhale",
+   "n_files": 8
+  },
+  {
+   "repo": "HikmatAsifli/xssFinder",
+   "n_files": 8
+  },
+  {
+   "repo": "MelloSec/RepeatOffender",
+   "n_files": 8
+  },
+  {
+   "repo": "SUALBA/red-blue-team-attack-defense-conceptos",
+   "n_files": 8
+  },
+  {
+   "repo": "TheBugFather/Pentester-Toolchain",
+   "n_files": 8
+  },
+  {
+   "repo": "Zarcolio/flipperzero",
+   "n_files": 8
+  },
+  {
+   "repo": "ghoat-debug/devkits-redisigned",
+   "n_files": 8
+  },
+  {
+   "repo": "ivan-sincek/amounts",
+   "n_files": 8
+  },
+  {
+   "repo": "ivan-sincek/malware-droppers",
+   "n_files": 8
+  },
+  {
+   "repo": "ky4meru/Kalice",
+   "n_files": 8
+  },
+  {
+   "repo": "rishiraajrs/SQL-injection-Scanner",
+   "n_files": 8
+  },
+  {
+   "repo": "shuciran/shuciran.github.io",
+   "n_files": 8
+  },
+  {
+   "repo": "ELMERIKH/Darkshell",
+   "n_files": 7
+  },
+  {
+   "repo": "Jibbscript/dbminer-multi",
+   "n_files": 7
+  },
+  {
+   "repo": "NONAN23x/SoC-Home-Lab",
+   "n_files": 7
+  },
+  {
+   "repo": "alpernae/AIHTTPAnalyzer",
+   "n_files": 7
+  },
+  {
+   "repo": "byt3n33dl3/R2Nitro",
+   "n_files": 7
+  },
+  {
+   "repo": "gh0x0st/intro-honeypots",
+   "n_files": 7
+  },
+  {
+   "repo": "lm-sec/offensive-awx",
+   "n_files": 7
+  },
+  {
+   "repo": "mthcht/ThreatHunting-Keywords-yara-rules",
+   "n_files": 7
+  },
+  {
+   "repo": "s0ns3/OffSec_Pub",
+   "n_files": 7
+  },
+  {
+   "repo": "urchinsec/param-ninja",
+   "n_files": 7
+  },
+  {
+   "repo": "Add3r/Proxy_Bypass",
+   "n_files": 6
+  },
+  {
+   "repo": "Ethicalrat/Offensive_Tooling",
+   "n_files": 6
+  },
+  {
+   "repo": "Mahmoud-Gamal-Elgendy/GONDOZO-TOOL",
+   "n_files": 6
+  },
+  {
+   "repo": "SecureDoughnut/KeePassXC-Brute",
+   "n_files": 6
+  },
+  {
+   "repo": "alex-obada/nutcracker",
+   "n_files": 6
+  },
+  {
+   "repo": "b1tg/rust-windows-shellcode",
+   "n_files": 6
+  },
+  {
+   "repo": "dessertlab/generative-ai-cybersecurity",
+   "n_files": 6
+  },
+  {
+   "repo": "ivan-sincek/xss-catcher",
+   "n_files": 6
+  },
+  {
+   "repo": "machetevault/machete",
+   "n_files": 6
+  },
+  {
+   "repo": "shehzade/shehzade.github.io",
+   "n_files": 6
+  },
+  {
+   "repo": "zainnadeem786/Z-SHIELD-Advanced-Shell-Based-Cybersecurity-Toolkit",
+   "n_files": 6
+  },
+  {
+   "repo": "HikmatAsifli/ddos_project",
+   "n_files": 5
+  },
+  {
+   "repo": "IamLucif3r/Buffer-Overflow",
+   "n_files": 5
+  },
+  {
+   "repo": "NitinMathew/zero",
+   "n_files": 5
+  },
+  {
+   "repo": "Saiprasad16/MapNoSQL",
+   "n_files": 5
+  },
+  {
+   "repo": "SecureDoughnut/PwdView",
+   "n_files": 5
+  },
+  {
+   "repo": "adhithyashivan/net-armor",
+   "n_files": 5
+  },
+  {
+   "repo": "anxzik/PyNmap",
+   "n_files": 5
+  },
+  {
+   "repo": "aress31/vulcan",
+   "n_files": 5
+  },
+  {
+   "repo": "benbusby/namebuster",
+   "n_files": 5
+  },
+  {
+   "repo": "ggulgun/Offensive-Python-Apps",
+   "n_files": 5
+  },
+  {
+   "repo": "lismore/TargetScanner",
+   "n_files": 5
+  },
+  {
+   "repo": "mendax0110/shellCodeInjector",
+   "n_files": 5
+  },
+  {
+   "repo": "morgenm/dirtypipe",
+   "n_files": 5
+  },
+  {
+   "repo": "noraj/vbsmin",
+   "n_files": 5
+  },
+  {
+   "repo": "redveil-security/ftpspectr",
+   "n_files": 5
+  },
+  {
+   "repo": "Anorak001/KLogger",
+   "n_files": 4
+  },
+  {
+   "repo": "Bigyls/OSCP",
+   "n_files": 4
+  },
+  {
+   "repo": "GhibranAl/SecuToolBox-Integrated-Tools",
+   "n_files": 4
+  },
+  {
+   "repo": "Kode-n-Rolla/evil-kodes",
+   "n_files": 4
+  },
+  {
+   "repo": "Offensive-Panda/DV_NEW",
+   "n_files": 4
+  },
+  {
+   "repo": "austinsonger/OSCP",
+   "n_files": 4
+  },
+  {
+   "repo": "fx2301/reverseshellenum",
+   "n_files": 4
+  },
+  {
+   "repo": "insecurecodes/toolbox",
+   "n_files": 4
+  },
+  {
+   "repo": "ivan-sincek/android-penetration-testing-cheat-sheet",
+   "n_files": 4
+  },
+  {
+   "repo": "ivan-sincek/evil-twin",
+   "n_files": 4
+  },
+  {
+   "repo": "mendax0110/dumper",
+   "n_files": 4
+  },
+  {
+   "repo": "mendax0110/shellDrop",
+   "n_files": 4
+  },
+  {
+   "repo": "natekali/DVI-XSS",
+   "n_files": 4
+  },
+  {
+   "repo": "rtcrowley/Offense-Kit",
+   "n_files": 4
+  },
+  {
+   "repo": "toneillcodes/js-harvester",
+   "n_files": 4
+  },
+  {
+   "repo": "BackdoorAli/user-agent-rce",
+   "n_files": 3
+  },
+  {
+   "repo": "ForbiddenProgrammer/CVE-2021-21315-PoC",
+   "n_files": 3
+  },
+  {
+   "repo": "InfosecHouse/InfosecHouse",
+   "n_files": 3
+  },
+  {
+   "repo": "JustNunuz/PayloadParadise",
+   "n_files": 3
+  },
+  {
+   "repo": "Offensive-Panda/WPM-MAJIC-ENTRY-POINT-INJECTION",
+   "n_files": 3
+  },
+  {
+   "repo": "SrRusian/My_Personal_Guide",
+   "n_files": 3
+  },
+  {
+   "repo": "TahaHatami/svg-xss-exploiter",
+   "n_files": 3
+  },
+  {
+   "repo": "an4kein/crt.go",
+   "n_files": 3
+  },
+  {
+   "repo": "atalayx7/offsec",
+   "n_files": 3
+  },
+  {
+   "repo": "dougives/wisp",
+   "n_files": 3
+  },
+  {
+   "repo": "filipkarc/sqli-postgres-rce-privesc-hacking-playground",
+   "n_files": 3
+  },
+  {
+   "repo": "hackedbyagirl/kali-packer",
+   "n_files": 3
+  },
+  {
+   "repo": "had-nu/C-subdomain-enum",
+   "n_files": 3
+  },
+  {
+   "repo": "ivan-sincek/bot-safe-agents",
+   "n_files": 3
+  },
+  {
+   "repo": "ivan-sincek/ios-penetration-testing-cheat-sheet",
+   "n_files": 3
+  },
+  {
+   "repo": "ivan-sincek/nagooglesearch",
+   "n_files": 3
+  },
+  {
+   "repo": "kraloveckey/venom",
+   "n_files": 3
+  },
+  {
+   "repo": "luijait/PwnKit-Exploit",
+   "n_files": 3
+  },
+  {
+   "repo": "marmuthandsome/SecuToolbox",
+   "n_files": 3
+  },
+  {
+   "repo": "mendax0110/memMan",
+   "n_files": 3
+  },
+  {
+   "repo": "ravi-prakash1907/custom-kali-linux",
+   "n_files": 3
+  },
+  {
+   "repo": "solveditnpc/keylogger",
+   "n_files": 3
+  },
+  {
+   "repo": "tahadraidia/OSQueryED",
+   "n_files": 3
+  },
+  {
+   "repo": "thomfre/OSCP-Exam-Report-Template",
+   "n_files": 3
+  },
+  {
+   "repo": "vatsalgupta67/Shellzor",
+   "n_files": 3
+  },
+  {
+   "repo": "0x4d-sh/offensive-security-exam-report-docker-markdown",
+   "n_files": 2
+  },
+  {
+   "repo": "0xEval/0xeval.github.io",
+   "n_files": 2
+  },
+  {
+   "repo": "0xhuesca/offensive_tools_repository",
+   "n_files": 2
+  },
+  {
+   "repo": "0xsyr0/pytroj",
+   "n_files": 2
+  },
+  {
+   "repo": "0xsyr0/syshell",
+   "n_files": 2
+  },
+  {
+   "repo": "1Xer0/Process-Injector",
+   "n_files": 2
+  },
+  {
+   "repo": "AngixBlack/RedirXploit",
+   "n_files": 2
+  },
+  {
+   "repo": "Chainski/Lifetime-Amsi-EtwPatch",
+   "n_files": 2
+  },
+  {
+   "repo": "D3Ext/DFShell",
+   "n_files": 2
+  },
+  {
+   "repo": "Fincer/penetration-testing",
+   "n_files": 2
+  },
+  {
+   "repo": "Inerska/usb-keylogger",
+   "n_files": 2
+  },
+  {
+   "repo": "MAXIVA11/PingMeMaybe",
+   "n_files": 2
+  },
+  {
+   "repo": "Offensive-Panda/D3MPSEC",
+   "n_files": 2
+  },
+  {
+   "repo": "PeaceKeeper96/simple-rust-executor",
+   "n_files": 2
+  },
+  {
+   "repo": "Pithase/asm-payloads-loaders",
+   "n_files": 2
+  },
+  {
+   "repo": "R3DHULK/sqli-detector-in-python",
+   "n_files": 2
+  },
+  {
+   "repo": "Rafael-Santamaria-Ortega/Digital-Dumpterdiving-malware",
+   "n_files": 2
+  },
+  {
+   "repo": "Rbholika/SilentVector",
+   "n_files": 2
+  },
+  {
+   "repo": "TheBugFather/NetBrute",
+   "n_files": 2
+  },
+  {
+   "repo": "TheBugFather/PyWordlist-Toolset",
+   "n_files": 2
+  },
+  {
+   "repo": "TheBugFather/Shellcode-Generator",
+   "n_files": 2
+  },
+  {
+   "repo": "TheBugFather/Wordlist-Feeder",
+   "n_files": 2
+  },
+  {
+   "repo": "VolkanSah/volkansah.github.io",
+   "n_files": 2
+  },
+  {
+   "repo": "Yashvendra/Ogre",
+   "n_files": 2
+  },
+  {
+   "repo": "aahmadnejad/sherluck",
+   "n_files": 2
+  },
+  {
+   "repo": "aress31/clm-rout",
+   "n_files": 2
+  },
+  {
+   "repo": "aw-junaid/cybersec-projects",
+   "n_files": 2
+  },
+  {
+   "repo": "ayboraa/ayboraa.github.io",
+   "n_files": 2
+  },
+  {
+   "repo": "aydinnyunus/Keylogger",
+   "n_files": 2
+  },
+  {
+   "repo": "c0mm4nd1/qr-g3n",
+   "n_files": 2
+  },
+  {
+   "repo": "demetriusford/mutation-fuzzer",
+   "n_files": 2
+  },
+  {
+   "repo": "fabaff/nix-security-box",
+   "n_files": 2
+  },
+  {
+   "repo": "flashnuke/ssh-door",
+   "n_files": 2
+  },
+  {
+   "repo": "gh0x0st/Buffer_Overflow",
+   "n_files": 2
+  },
+  {
+   "repo": "gh0x0st/RCE_Web_Shell_Python",
+   "n_files": 2
+  },
+  {
+   "repo": "gh0x0st/wanderer",
+   "n_files": 2
+  },
+  {
+   "repo": "heshanthenura/handsome_ransom",
+   "n_files": 2
+  },
+  {
+   "repo": "ivan-sincek/browser-extension-automation",
+   "n_files": 2
+  },
+  {
+   "repo": "mchaffe/ipgen",
+   "n_files": 2
+  },
+  {
+   "repo": "mrlew1s/SubdomainTakeover",
+   "n_files": 2
+  },
+  {
+   "repo": "n0n0peration/AngelHair",
+   "n_files": 2
+  },
+  {
+   "repo": "nocerainfosec/SextouBackdoor",
+   "n_files": 2
+  },
+  {
+   "repo": "offensive-terraform/terraform-aws-ebs-snapshot-publicly-exposed",
+   "n_files": 2
+  },
+  {
+   "repo": "offensive-terraform/terraform-aws-ec2-kali-linux",
+   "n_files": 2
+  },
+  {
+   "repo": "onianis/keymerchant",
+   "n_files": 2
+  },
+  {
+   "repo": "paciente23256/webxploit",
+   "n_files": 2
+  },
+  {
+   "repo": "rbnmaia/netsec-docs",
+   "n_files": 2
+  },
+  {
+   "repo": "riza/indextree",
+   "n_files": 2
+  },
+  {
+   "repo": "snzhny/simpleKeylogger",
+   "n_files": 2
+  },
+  {
+   "repo": "solveditnpc/keylogger-python",
+   "n_files": 2
+  },
+  {
+   "repo": "spamegg1/tryhackme",
+   "n_files": 2
+  },
+  {
+   "repo": "t0thkr1s/offsec-image",
+   "n_files": 2
+  },
+  {
+   "repo": "tokyoneon/CredPhish",
+   "n_files": 2
+  },
+  {
+   "repo": "tomekceszke/upside-down-ternet",
+   "n_files": 2
+  },
+  {
+   "repo": "unk9vvn/unk9vvn.github.io",
+   "n_files": 2
+  },
+  {
+   "repo": "virg736/CyberCrawler-Python",
+   "n_files": 2
+  },
+  {
+   "repo": "0Abanoub/ReconPlus",
+   "n_files": 1
+  },
+  {
+   "repo": "0x0bfixious/TimeTamper",
+   "n_files": 1
+  },
+  {
+   "repo": "0xsyr0/InfoScraper",
+   "n_files": 1
+  },
+  {
+   "repo": "0xvpr/offensive-kernel-mode-c",
+   "n_files": 1
+  },
+  {
+   "repo": "Adkali/PowerJoker",
+   "n_files": 1
+  },
+  {
+   "repo": "Ares-21/CookieMonster",
+   "n_files": 1
+  },
+  {
+   "repo": "BackdoorAli/Backdoor-Stealth-Image-Injection",
+   "n_files": 1
+  },
+  {
+   "repo": "CYB3RMX/WireBirb",
+   "n_files": 1
+  },
+  {
+   "repo": "ChrisInmodis/http-Basic-Bruteforce",
+   "n_files": 1
+  },
+  {
+   "repo": "CloudyKhan/fipp",
+   "n_files": 1
+  },
+  {
+   "repo": "Clutchisback1/h4cklife.org",
+   "n_files": 1
+  },
+  {
+   "repo": "Cr0DiX666/WordPress_AutoExploiter",
+   "n_files": 1
+  },
+  {
+   "repo": "FlyingPhish/BrowserShitter",
+   "n_files": 1
+  },
+  {
+   "repo": "ForbiddenProgrammer/conti-pentester-guide-leak",
+   "n_files": 1
+  },
+  {
+   "repo": "Gurpreet06/AMSI_Patcher",
+   "n_files": 1
+  },
+  {
+   "repo": "HikmatAsifli/Port-Scanner",
+   "n_files": 1
+  },
+  {
+   "repo": "HunxByts/INSTA-OSINT",
+   "n_files": 1
+  },
+  {
+   "repo": "IWC-Development/DoS",
+   "n_files": 1
+  },
+  {
+   "repo": "MTK911/KHATA",
+   "n_files": 1
+  },
+  {
+   "repo": "Mr3lish/CyScore",
+   "n_files": 1
+  },
+  {
+   "repo": "Offensive-Panda/MalwareAnalysis",
+   "n_files": 1
+  },
+  {
+   "repo": "Offensive-Panda/PEB_WALK_AND_API_OBFUSCATION_INJECTION",
+   "n_files": 1
+  },
+  {
+   "repo": "Pranavh-2004/WinSec-DLL-Hijacking",
+   "n_files": 1
+  },
+  {
+   "repo": "PurpleCloud-MT/PurpleCloud_Testphase",
+   "n_files": 1
+  },
+  {
+   "repo": "R3DHULK/gmail-attacker",
+   "n_files": 1
+  },
+  {
+   "repo": "Rival420/ADCS-ESC4-pwn",
+   "n_files": 1
+  },
+  {
+   "repo": "Rival420/Abuse-WriteOwner",
+   "n_files": 1
+  },
+  {
+   "repo": "Shivangx01b/CorsMe",
+   "n_files": 1
+  },
+  {
+   "repo": "ShubhamJagtap2000/TryHackMe-THM",
+   "n_files": 1
+  },
+  {
+   "repo": "SofianeHamlaoui/Pentest-Notes",
+   "n_files": 1
+  },
+  {
+   "repo": "Stuub/GitHush",
+   "n_files": 1
+  },
+  {
+   "repo": "Trapsta1467/sherluck",
+   "n_files": 1
+  },
+  {
+   "repo": "TupleType/awesome-cicd-attacks",
+   "n_files": 1
+  },
+  {
+   "repo": "UFSC-OFFSEC/pwnbase",
+   "n_files": 1
+  },
+  {
+   "repo": "VolkanSah/Ransy-EDU",
+   "n_files": 1
+  },
+  {
+   "repo": "aahmadnejad/Zeus",
+   "n_files": 1
+  },
+  {
+   "repo": "ajansha/GV",
+   "n_files": 1
+  },
+  {
+   "repo": "ajansha/SubSpy",
+   "n_files": 1
+  },
+  {
+   "repo": "alenperic/OSWP-Study-Guide",
+   "n_files": 1
+  },
+  {
+   "repo": "basedBaba/sshBrute",
+   "n_files": 1
+  },
+  {
+   "repo": "byt3exec/WitnessMe",
+   "n_files": 1
+  },
+  {
+   "repo": "crenata/os-pg-funboxeasy",
+   "n_files": 1
+  },
+  {
+   "repo": "d419h/IconJector",
+   "n_files": 1
+  },
+  {
+   "repo": "dabasanta/DNSExplorer",
+   "n_files": 1
+  },
+  {
+   "repo": "davincico/Telegram-C2-bot",
+   "n_files": 1
+  },
+  {
+   "repo": "debugdotdog/hackstack",
+   "n_files": 1
+  },
+  {
+   "repo": "emrekybs/Pip-Intel",
+   "n_files": 1
+  },
+  {
+   "repo": "enriquetomasmb/bruteforce-bypass",
+   "n_files": 1
+  },
+  {
+   "repo": "ericsandanu-crypton/ERIC.S.LIVE_ericsandanu.live.co.uk",
+   "n_files": 1
+  },
+  {
+   "repo": "ericyoc/cyber_ops_analysis_tools_technique_poc",
+   "n_files": 1
+  },
+  {
+   "repo": "f8al/OpenSesame",
+   "n_files": 1
+  },
+  {
+   "repo": "fuzzlove/GopherSSRF",
+   "n_files": 1
+  },
+  {
+   "repo": "gh0x0st/Get-DownloadCradle",
+   "n_files": 1
+  },
+  {
+   "repo": "gh0x0st/Get-GPAutoLogon",
+   "n_files": 1
+  },
+  {
+   "repo": "gh0x0st/Get-ReverseShell",
+   "n_files": 1
+  },
+  {
+   "repo": "gh0x0st/Get-Shellcode",
+   "n_files": 1
+  },
+  {
+   "repo": "gh0x0st/Invoke-PSObfuscation",
+   "n_files": 1
+  },
+  {
+   "repo": "had-nu/PhantomGate",
+   "n_files": 1
+  },
+  {
+   "repo": "j0wittmann/Home-Lab",
+   "n_files": 1
+  },
+  {
+   "repo": "jturini/portfolio",
+   "n_files": 1
+  },
+  {
+   "repo": "limiteci/sql-injection-payloads",
+   "n_files": 1
+  },
+  {
+   "repo": "m4lal0/md2pdf",
+   "n_files": 1
+  },
+  {
+   "repo": "m4ttpizz4/Keylogger-python",
+   "n_files": 1
+  },
+  {
+   "repo": "mikeroyal/Open-Source-Security-Guide",
+   "n_files": 1
+  },
+  {
+   "repo": "milosilo/try-harder",
+   "n_files": 1
+  },
+  {
+   "repo": "natekali/Spyn8",
+   "n_files": 1
+  },
+  {
+   "repo": "natesubra/rdp_alive",
+   "n_files": 1
+  },
+  {
+   "repo": "nopbrick/PyWord",
+   "n_files": 1
+  },
+  {
+   "repo": "noraj/OSCP-Exam-Report-Template-Markdown",
+   "n_files": 1
+  },
+  {
+   "repo": "noraj/flask-session-cookie-manager",
+   "n_files": 1
+  },
+  {
+   "repo": "offensive-terraform/terraform-aws-ec2-instance-credential-exfiltration",
+   "n_files": 1
+  },
+  {
+   "repo": "r3vn/punk.py",
+   "n_files": 1
+  },
+  {
+   "repo": "secwatch92/fortiweb_rce_toolkit",
+   "n_files": 1
+  },
+  {
+   "repo": "six2dez/OSCP-Human-Guide",
+   "n_files": 1
+  },
+  {
+   "repo": "stevcoll/buffmate",
+   "n_files": 1
+  },
+  {
+   "repo": "tokyoneon/Arcane",
+   "n_files": 1
+  },
+  {
+   "repo": "toneillcodes/cas-fuzzer",
+   "n_files": 1
+  },
+  {
+   "repo": "toneillcodes/id-me",
+   "n_files": 1
+  },
+  {
+   "repo": "toneillcodes/pb-scanner",
+   "n_files": 1
+  },
+  {
+   "repo": "trojand/cheatsheet",
+   "n_files": 1
+  },
+  {
+   "repo": "victorazzam/aml",
+   "n_files": 1
+  },
+  {
+   "repo": "xen0vas/Ascii-And-Sub-Encoder",
+   "n_files": 1
+  },
+  {
+   "repo": "yukixyz/simple-keylogger",
+   "n_files": 1
+  }
+ ],
+ "_meta": {
+  "dataset_sha": "210b9259be248323b0b3bc58252bed3fde53135f",
+  "generated_at": "2026-10-11T18:19:41+0000"
+ }
+}

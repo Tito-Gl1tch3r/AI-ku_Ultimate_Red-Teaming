@@ -1,0 +1,120 @@
+{
+ "topic": "lateral-movement",
+ "source": "hf-statistics",
+ "num_examples_hf": 357,
+ "partial_stats": false,
+ "hf_license_distribution": {
+  "GPL-3.0": 62,
+  "BSD-2-Clause": 1,
+  "AGPL-3.0": 21,
+  "MIT": 115,
+  "NOASSERTION": 40
+ },
+ "n_repos": 25,
+ "repos": [
+  {
+   "repo": "bazilinskyy/videos-animations-crowdsourced",
+   "n_files": 95
+  },
+  {
+   "repo": "FalconOpsLLC/goexec",
+   "n_files": 57
+  },
+  {
+   "repo": "klezVirus/CheeseTools",
+   "n_files": 42
+  },
+  {
+   "repo": "databricks-industry-solutions/context-graph-analytics",
+   "n_files": 40
+  },
+  {
+   "repo": "blackarrowsec/pivotnacci",
+   "n_files": 21
+  },
+  {
+   "repo": "Richl-lab/recognize-unusual-logins",
+   "n_files": 17
+  },
+  {
+   "repo": "biringaChi/SEAL",
+   "n_files": 10
+  },
+  {
+   "repo": "jupyterj0nes/masstin",
+   "n_files": 10
+  },
+  {
+   "repo": "jenomgimba/azure-microsegmentation-research",
+   "n_files": 9
+  },
+  {
+   "repo": "mez-0/MoveScheduler",
+   "n_files": 9
+  },
+  {
+   "repo": "mez-0/winrmdll",
+   "n_files": 9
+  },
+  {
+   "repo": "resiliencetheatre/nk-macsec",
+   "n_files": 7
+  },
+  {
+   "repo": "Viralmaniar/HiveJack",
+   "n_files": 6
+  },
+  {
+   "repo": "Kaufrau/lmd-optc-benchmark",
+   "n_files": 5
+  },
+  {
+   "repo": "mez-0/CSharpWinRM",
+   "n_files": 4
+  },
+  {
+   "repo": "raf41/Multi-View-Temporal-Graph-Fusion-for-Lateral-Movement-Anomaly-Detection",
+   "n_files": 3
+  },
+  {
+   "repo": "violentqm/Blind-Ghost",
+   "n_files": 3
+  },
+  {
+   "repo": "Gill-Singh-A/SSH-Credential-Logger",
+   "n_files": 2
+  },
+  {
+   "repo": "Leo4j/Invoke-SMBRemoting",
+   "n_files": 2
+  },
+  {
+   "repo": "Compcode1/splunk-insider-threat-simulation1",
+   "n_files": 1
+  },
+  {
+   "repo": "Hagrid29/ReadWrite-DCOM",
+   "n_files": 1
+  },
+  {
+   "repo": "The-Viper-One/Invoke-FindEventCreds",
+   "n_files": 1
+  },
+  {
+   "repo": "The-Viper-One/Invoke-RDPThief",
+   "n_files": 1
+  },
+  {
+   "repo": "The-Viper-One/PsMapExec",
+   "n_files": 1
+  },
+  {
+   "repo": "pyrrh1c/Start-RdpSessionTakeover",
+   "n_files": 1
+  }
+ ],
+ "_meta": {
+  "dataset_sha": "210b9259be248323b0b3bc58252bed3fde53135f",
+  "generated_at": "2026-10-11T18:19:10+0000"
+ }
+}

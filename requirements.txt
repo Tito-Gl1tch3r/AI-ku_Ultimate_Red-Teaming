@@ -1,0 +1,8 @@
+# AI-ku clean-room pipeline — sin dependencias externas.
+# Requisitos reales:
+#   - Python >= 3.9 (solo stdlib: json, urllib, hashlib, re, fnmatch, argparse)
+#   - git >= 2.25 (clonado shallow en la fase de minería)
+#
+# Variables de entorno (NO se versionan):
+#   HF_TOKEN      — token de lectura de Hugging Face (dataset con gate manual)
+#   GITHUB_TOKEN  — token con permisos de lectura (repos + search)
