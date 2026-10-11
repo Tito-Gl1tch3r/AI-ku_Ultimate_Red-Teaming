@@ -224,12 +224,17 @@ def main():
 
         repo_dir = os.path.join(corpus, safe_name(repo))
         os.makedirs(repo_dir, exist_ok=True)
-        # atribución: copiar LICENSE upstream junto al código extraído
-        for lic in ("LICENSE", "LICENSE.txt", "LICENSE.md", "COPYING", "COPYING.txt"):
-            src = os.path.join(dest, lic)
-            if os.path.exists(src):
-                shutil.copy2(src, os.path.join(repo_dir, "_UPSTREAM_LICENSE"))
-                break
+        # atribución: copiar LICENSE (y NOTICE si existe) upstream junto al código
+        ATTRIBUTION = {
+            "_UPSTREAM_LICENSE": ("LICENSE", "LICENSE.txt", "LICENSE.md", "COPYING", "COPYING.txt"),
+            "_UPSTREAM_NOTICE": ("NOTICE", "NOTICE.txt", "NOTICE.md"),
+        }
+        for dst_name, candidates in ATTRIBUTION.items():
+            for lic in candidates:
+                src = os.path.join(dest, lic)
+                if os.path.exists(src):
+                    shutil.copy2(src, os.path.join(repo_dir, dst_name))
+                    break
 
         r_accepted = r_rejected = 0
         for dirpath, dirnames, filenames in os.walk(dest):

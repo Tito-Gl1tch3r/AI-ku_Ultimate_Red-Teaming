@@ -54,12 +54,15 @@ La propia documentación de TanDev reconoce: *"Rights in the original repositori
 ├── src/
 │   ├── 01_hf_catalog.py        Fase 1 — catálogo híbrido (hf-statistics | github-topics)
 │   ├── 02_github_verify.py     Fase 2a — puerta dura de licencias upstream
-│   └── 03_mine_github.py       Fase 2b — clonado + minería + manifiesto de procedencia
+│   ├── 03_mine_github.py       Fase 2b — clonado + minería + manifiesto de procedencia
+│   └── 04_verify.py            Fase 2c — verificación de integridad (sha256, firmas, NOTICE)
 ├── audit/topics_audit.json     auditoría de estructura del dataset (shards/filas/fuente por tópico)
+├── audit/hf_vs_cleanroom.json  comparativa de calidad HF vs corpus limpio (contaminación de licencias)
 ├── catalog/{topic}.json        catálogo por tópico (9.576 repos únicos en la unión)
 ├── catalog/github/             verificación de licencias (verified.jsonl, resumen, checkpoint)
 ├── results/demo/               tanda de demostración: manifiesto + estadísticas + dedup
-└── corpus/                     (gitignored) código extraído — regenerable con 03
+├── results/verification/       informes de integridad por tanda
+└── corpus/                     código extraído, versionado con atribución (_UPSTREAM_LICENSE/NOTICE por repo)
 ```
 
 ## 4. Uso
@@ -85,6 +88,9 @@ python3 src/02_github_verify.py
 
 # Fase 2b — minería con la rúbrica
 python3 src/03_mine_github.py --topics ctf,pwn,osint --repos-per-topic 5 --label tanda1
+
+# Fase 2c — verificación de integridad (sha256, firmas de licencia, NOTICE, huérfanos)
+python3 src/04_verify.py --label tanda1
 ```
 
 ## 5. La rúbrica (resumen)
@@ -104,6 +110,21 @@ python3 src/03_mine_github.py --topics ctf,pwn,osint --repos-per-topic 5 --label
 - **Fase 2a** (top-30/tópico, 759 repos): **301 aceptados** · 436 licencia no permisiva · 21 repos desaparecidos · 1 DMCA bloqueado (`BloodHound`, HTTP 451 — excluido correctamente por el pipeline).
 - **Fase 2b** (3 repos: `CobaltStrike_OpenBeacon` MIT, `ysoserial` MIT, `SteppingStones` Apache-2.0): **144 archivos aceptados / 382 rechazados** — razones principales: AUTOGEN 126, EXT_NOT_ALLOWED 117, LOW_SCORE 76, TOO_SMALL 49. 0 duplicados (sha256).
 - Cada archivo aceptado queda en `results/demo/manifest.jsonl` con repo, commit, sha256, score, SPDX y fecha: **trazabilidad total del linaje**.
+- **Verificación de integridad (04): 5/5 OK** — 144/144 sha256 válidos, LICENSE firmado según SPDX en los 3 repos, cumplimiento NOTICE (Apache-2.0), 0 huérfanos, 0 rechazados presentes. Informe: `results/verification/demo.json`.
+
+### 6.1 ¿Es la misma calidad que el dataset de Hugging Face?
+
+**No es el mismo corpus: es el subconjunto legal y técnicamente limpio del mismo upstream.** Comparativa medida (metadatos server-side, método en `audit/hf_vs_cleanroom.json`):
+
+| | filas HF | % con licencia permisiva | tras rúbrica (est.) |
+|---|---:|---:|---:|
+| TOTAL (30 configs) | 3.813.682 | **22,5%** | **~235.080 (6,2%)** |
+
+- **Calidad legal:** el 77,5% de las filas de HF son de repos con licencia no permisiva (GPL, CC, sin licencia…) o sin etiqueta — jamás entrarían en AI-ku. Casos extremos: `exploit` 1,9% permisivo, `osint` 7,3%, `pwn` 4,7%; frente a `exploitation` 68,3% o `persistence` 65,4%.
+- **Calidad técnica:** de lo que sí pasa la puerta de licencia, la rúbrica elimina otro 72,6% de basura (minificados, autogenerados, triviales) — medido en la tanda demo.
+- **Trazabilidad:** HF no da commit ni hash; nuestro manifiesto da commit + sha256 + SPDX por archivo, y las licencias se verifican contra GitHub **hoy** (las etiquetas de HF pueden estar caducadas: los repos cambian de licencia).
+- **Cobertura:** para 17/30 tópicos el catálogo reproduce exactamente los repos de HF (derivado de sus metadatos); para 13/30 (cardinalidad alta) usamos descubrimiento independiente en GitHub top-500 por estrellas — difiere por diseño.
+- Conclusión: **menos volumen (~6% de las filas), mucha más señal**: lo que HF habría publicado si filtrara por licencia y calidad.
 
 ## 7. Escalado
 

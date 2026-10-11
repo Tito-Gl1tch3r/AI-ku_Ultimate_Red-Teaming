@@ -1,7 +1,5 @@
-# Artefactos locales generados por el pipeline (NO se versionan)
-corpus/
+# Artefactos transitorios (NO se versionan)
 .workspace/
-catalog/github/_checkpoint.json
 results/**/manifest.jsonl.tmp
 
 # Python

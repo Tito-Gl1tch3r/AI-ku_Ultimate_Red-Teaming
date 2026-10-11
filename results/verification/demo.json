@@ -1,0 +1,36 @@
+{
+ "label": "demo",
+ "entries": 526,
+ "accepted": 144,
+ "rejected": 382,
+ "duplicates": 0,
+ "repos_mined": 3,
+ "checks": [
+  {
+   "check": "manifest→corpus sha256",
+   "ok": true,
+   "detail": "aceptados verificados: 144 · sha256 inválido: 0 · ausentes: 0"
+  },
+  {
+   "check": "rechazados ausentes de corpus",
+   "ok": true,
+   "detail": "rechazados/duplicados encontrados en corpus: 0"
+  },
+  {
+   "check": "LICENSE firmado según SPDX",
+   "ok": true,
+   "detail": "firmas correctas: 3 · fallos: []"
+  },
+  {
+   "check": "cumplimiento NOTICE (Apache-2.0)",
+   "ok": true,
+   "detail": "NOTICE traídos de upstream: 0 · fallos: []"
+  },
+  {
+   "check": "sin huérfanos en corpus",
+   "ok": true,
+   "detail": "huérfanos: []"
+  }
+ ],
+ "all_ok": true
+}
