@@ -54,6 +54,8 @@ def main():
                     help="verificar solo el top-N por tópico (0 = todos)")
     ap.add_argument("--delay", type=float, default=0.22, help="segundos entre llamadas API")
     ap.add_argument("--limit", type=int, default=0, help="tope global de repos (0 = sin tope)")
+    ap.add_argument("--max-runtime", type=float, default=0,
+                    help="salir limpiamente tras N segundos (0 = sin límite); checkpoint reanudable")
     args = ap.parse_args()
 
     token = os.environ.get("GITHUB_TOKEN", "")
@@ -100,20 +102,37 @@ def main():
           f"(per-topic={'todos' if args.per_topic == 0 else args.per_topic})")
 
     rate_floor = 100
+    t0 = time.time()
     for i, (topic, repo) in enumerate(plan, 1):
         if repo in done:
             continue
         data, hdrs, code = http_json(f"{GH}/repos/{repo}", token)
 
         remaining = hdrs.get("X-RateLimit-Remaining")
+        reset = hdrs.get("X-RateLimit-Reset")
         try:
             remaining = int(remaining) if remaining is not None else 9999
         except ValueError:
             remaining = 9999
         if remaining < rate_floor:
-            wait = 60
-            print(f"  [rate-limit] remaining={remaining}; pausa {wait}s")
-            time.sleep(wait)
+            now = time.time()
+            try:
+                target = int(reset) + 3 if reset else 0
+            except (TypeError, ValueError):
+                target = 0
+            wait = (target - now) if target > now else 60
+            wait = max(30.0, min(wait, 3700.0))
+            print(f"  [rate-limit] remaining={remaining}; espera {int(wait)}s hasta reset", flush=True)
+            left = wait
+            while left > 0:  # porciones; NUNCA exceder el presupuesto de runtime del chunk
+                elapsed = time.time() - t0
+                if args.max_runtime and elapsed > args.max_runtime:
+                    break
+                budget = (args.max_runtime - elapsed) if args.max_runtime else left
+                time.sleep(max(1.0, min(480.0, left, budget)))
+                left -= 480.0
+            if args.max_runtime and (time.time() - t0) > args.max_runtime:
+                break
 
         if code == 404 or (isinstance(data, dict) and data.get("_http_error") == 404):
             rec = {"repo": repo, "topics": [topic], "verdict": "rejected",
@@ -144,8 +163,16 @@ def main():
         if i % 50 == 0 or i == len(plan):
             with open(ck_path, "w", encoding="utf-8") as f:
                 json.dump(done, f, ensure_ascii=False)
-            print(f"  {i}/{len(plan)} verificados ({sum(1 for r in done.values() if r['verdict']=='accepted')} aceptados)")
+            print(f"  {i}/{len(plan)} verificados ({sum(1 for r in done.values() if r['verdict']=='accepted')} aceptados)", flush=True)
+        if args.max_runtime and (time.time() - t0) > args.max_runtime:
+            with open(ck_path, "w", encoding="utf-8") as f:
+                json.dump(done, f, ensure_ascii=False)
+            print(f"  --max-runtime alcanzado ({int(time.time()-t0)}s): {len(done)}/{len(plan)} verificados. Reanudable.", flush=True)
+            break
         time.sleep(args.delay)
+
+    with open(ck_path, "w", encoding="utf-8") as f:
+        json.dump(done, f, ensure_ascii=False)
 
     # consolidar tópicos (un repo verificado una vez, tópicos agregados)
     topic_map = {}

@@ -121,8 +121,19 @@ def safe_name(repo):
     return repo.replace("/", "__")
 
 
+def gh_url(repo):
+    """URL de clonado; autenticada si GITHUB_TOKEN está presente (evita límites secundarios)."""
+    t = os.environ.get("GITHUB_TOKEN", "")
+    return f"https://x-access-token:{t}@github.com/{repo}.git" if t else f"{GH_URL}/{repo}.git"
+
+
+def sanitize(text):
+    t = os.environ.get("GITHUB_TOKEN", "")
+    return text.replace(t, "***") if t else text
+
+
 def git_clone(repo, dest, max_mb):
-    url = f"{GH_URL}/{repo}.git"
+    url = gh_url(repo)
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
     try:
         out = subprocess.run(
@@ -134,7 +145,7 @@ def git_clone(repo, dest, max_mb):
     except subprocess.TimeoutExpired:
         return None, "CLONE_TIMEOUT"
     except subprocess.CalledProcessError as e:
-        msg = (e.stderr or "").strip().splitlines()
+        msg = [sanitize(x) for x in (e.stderr or "").strip().splitlines()]
         return None, "CLONE_ERROR: " + (msg[-1] if msg else str(e.returncode))
 
 
@@ -158,6 +169,8 @@ def main():
     ap.add_argument("--window", default="100,3000", help="rango KB preferente para elegir repo demo")
     ap.add_argument("--label", default="demo")
     ap.add_argument("--purge-duplicates", action="store_true")
+    ap.add_argument("--max-runtime", type=float, default=0,
+                    help="salir limpiamente tras N segundos (0 = sin límite); checkpoint reanudable")
     args = ap.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -187,12 +200,13 @@ def main():
                     by_topic.setdefault(t, []).append(rec)
 
     window = tuple(int(x) for x in args.window.split(","))
-    plan = []
+    plan, plan_repos = [], set()
     for t in sorted(by_topic):
         for _ in range(min(args.repos_per_topic, len(by_topic[t]))):
             c = pick_repo(by_topic[t], window)
-            if c and c["repo"] not in {p[0] for p in plan}:
+            if c and c["repo"] not in plan_repos:
                 plan.append((t, c))
+                plan_repos.add(c["repo"])
                 by_topic[t].remove(c)
     if not plan:
         sys.exit("ERROR: ningún repo aceptado cumple los criterios de selección.")
@@ -204,37 +218,63 @@ def main():
         os.makedirs(d, exist_ok=True)
 
     manifest_path = os.path.join(res, "manifest.jsonl")
-    manifest = open(manifest_path, "w", encoding="utf-8")
-    stats = {"repos": {}, "by_reason": {}, "accepted": 0, "rejected": 0, "dir_skips": {}}
+    ck_path = os.path.join(res, "_mined.json")
+    ck = {}
+    if os.path.exists(ck_path) and os.path.exists(manifest_path):
+        with open(ck_path, encoding="utf-8") as f:
+            ck = json.load(f)
+        manifest = open(manifest_path, "a", encoding="utf-8")
+        print(f"reanudando tanda: {len(ck)} repos ya minados")
+    else:
+        manifest = open(manifest_path, "w", encoding="utf-8")
+    stats = {"repos": dict(ck), "by_reason": {}, "accepted": 0, "rejected": 0, "dir_skips": {}}
 
     print(f"plan de minería: {len(plan)} repos → {[p[1]['repo'] for p in plan]}")
+    t0 = time.time()
     for topic, rec in plan:
         repo = rec["repo"]
+        if repo in ck:
+            continue  # ya minado en una ejecución anterior de esta tanda (checkpoint)
         dest = os.path.join(ws, safe_name(repo))
         if os.path.exists(dest):
             shutil.rmtree(dest)
         print(f"\n[{repo}] clonando… ", end="", flush=True)
         sha, err = git_clone(repo, dest, args.max_repo_mb)
         if err:
-            print(err)
-            stats["repos"][repo] = {"verdict": "REPO_FAIL", "reason": err, "topic": topic}
+            print(sanitize(err))
+            stats["repos"][repo] = {"verdict": "REPO_FAIL", "reason": sanitize(err), "topic": topic}
+            ck[repo] = stats["repos"][repo]
             stats["by_reason"][err.split(":")[0]] = stats["by_reason"].get(err.split(":")[0], 0) + 1
             continue
         print(f"commit {sha[:8]}")
 
         repo_dir = os.path.join(corpus, safe_name(repo))
         os.makedirs(repo_dir, exist_ok=True)
-        # atribución: copiar LICENSE (y NOTICE si existe) upstream junto al código
-        ATTRIBUTION = {
-            "_UPSTREAM_LICENSE": ("LICENSE", "LICENSE.txt", "LICENSE.md", "COPYING", "COPYING.txt"),
-            "_UPSTREAM_NOTICE": ("NOTICE", "NOTICE.txt", "NOTICE.md"),
-        }
-        for dst_name, candidates in ATTRIBUTION.items():
-            for lic in candidates:
-                src = os.path.join(dest, lic)
-                if os.path.exists(src):
-                    shutil.copy2(src, os.path.join(repo_dir, dst_name))
-                    break
+        # atribución: copiar LICENSE/NOTICE del upstream (raíz), incluidas variantes
+        # no estándar: LICENCE, LICENSE-MIT, LICENSE.APACHE, COPYING, etc.
+        _lic_re = re.compile(r"^(licen[cs]e|copying)([._-].*)?$", re.I)
+        _notice_re = re.compile(r"^notice([._-].*)?$", re.I)
+
+        def _attr_prio(name):
+            n = name.lower()
+            if n in ("license", "licence", "copying", "notice"):
+                return 0
+            if "mit" in n:
+                return 1
+            return 2
+
+        try:
+            _root_files = [f for f in os.listdir(dest) if os.path.isfile(os.path.join(dest, f))]
+        except OSError:
+            _root_files = []
+        _lics = sorted([f for f in _root_files if _lic_re.match(f)], key=lambda f: (_attr_prio(f), f))
+        _nots = sorted([f for f in _root_files if _notice_re.match(f)], key=lambda f: (_attr_prio(f), f))
+        for _i, _f in enumerate(_lics):
+            _dst = "_UPSTREAM_LICENSE" if _i == 0 else "_UPSTREAM_LICENSE__" + re.sub(r"[^A-Za-z0-9]", "_", _f)
+            shutil.copy2(os.path.join(dest, _f), os.path.join(repo_dir, _dst))
+        for _i, _f in enumerate(_nots):
+            _dst = "_UPSTREAM_NOTICE" if _i == 0 else "_UPSTREAM_NOTICE__" + re.sub(r"[^A-Za-z0-9]", "_", _f)
+            shutil.copy2(os.path.join(dest, _f), os.path.join(repo_dir, _dst))
 
         r_accepted = r_rejected = 0
         for dirpath, dirnames, filenames in os.walk(dest):
@@ -274,12 +314,24 @@ def main():
             "verdict": "MINED", "topic": topic, "spdx": rec.get("spdx"),
             "commit": sha, "accepted": r_accepted, "rejected": r_rejected,
         }
+        ck[repo] = stats["repos"][repo]
         stats["accepted"] += r_accepted
         stats["rejected"] += r_rejected
         print(f"    aceptados: {r_accepted}  ·  rechazados: {r_rejected}")
         shutil.rmtree(dest, ignore_errors=True)
+        if len(ck) % 10 == 0:
+            with open(ck_path, "w", encoding="utf-8") as f:
+                json.dump(ck, f, ensure_ascii=False)
+        if args.max_runtime and (time.time() - t0) > args.max_runtime:
+            with open(ck_path, "w", encoding="utf-8") as f:
+                json.dump(ck, f, ensure_ascii=False)
+            print(f"\n--max-runtime alcanzado ({int(time.time()-t0)}s): {len(ck)} repos procesados. Reanudable.", flush=True)
+            manifest.close()
+            return
 
     manifest.close()
+    with open(ck_path, "w", encoding="utf-8") as f:
+        json.dump(ck, f, ensure_ascii=False)
 
     # dedup exacto por sha256 (mantener primera aparición)
     seen_hash, dups = {}, {}
@@ -305,34 +357,52 @@ def main():
     with open(os.path.join(res, "dedup.json"), "w", encoding="utf-8") as f:
         json.dump({"duplicates": len(dups), "detail": dups}, f, ensure_ascii=False, indent=1)
 
+    # agregados definitivos desde el manifiesto completo (todas las ejecuciones del label)
+    acc_total = rej_total = dup_total = 0
+    by_reason = {}
+    with open(manifest_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            e = json.loads(line)
+            v = e["verdict"]
+            if v == "accepted":
+                acc_total += 1
+            elif v == "duplicate":
+                dup_total += 1
+            elif v == "rejected":
+                by_reason[e["reason"]] = by_reason.get(e["reason"], 0) + 1
+                rej_total += 1
+
     # stats.md
     md = [
         f"# Resultados de minería — tanda `{args.label}`",
-        f"\n- Fecha: {time.strftime('%Y-%m-%d %H:%M %z')}",
-        f"- Repos minados: {len([r for r in stats['repos'].values() if r['verdict']=='MINED'])}",
-        f"- Archivos aceptados: {stats['accepted']}  ·  rechazados: {stats['rejected']}",
-        f"- Duplicados exactos eliminados/marcados: {len(dups)}",
+        f"\n- Actualizado: {time.strftime('%Y-%m-%d %H:%M %z')} (incremental; reanudable)",
+        f"- Repos procesados: {len(ck)} ({sum(1 for r in ck.values() if r['verdict']=='MINED')} minados OK)",
+        f"- Archivos aceptados: {acc_total}  ·  rechazados: {rej_total}",
+        f"- Duplicados exactos marcados: {dup_total}",
         "\n## Por repositorio\n",
         "| repo | tópico | SPDX | commit | aceptados | rechazados |",
         "|---|---|---|---|---:|---:|",
     ]
-    for repo, r in stats["repos"].items():
-        if r["verdict"] == "MINED":
-            md.append(f"| {repo} | {r['topic']} | {r['spdx']} | {r['commit'][:8]} | {r['accepted']} | {r['rejected']} |")
+    for repo, r in sorted(ck.items()):
+        if r.get("verdict") == "MINED":
+            md.append(f"| {repo} | {r['topic']} | {r.get('spdx')} | {r['commit'][:8]} | {r['accepted']} | {r['rejected']} |")
         else:
-            md.append(f"| {repo} | {r['topic']} | — | — | 0 | 0 (**{r['reason']}**) |")
+            md.append(f"| {repo} | {r['topic']} | — | — | 0 | 0 (**{r.get('reason')}**) |")
     md.append("\n## Razones de rechazo\n")
     md.append("| razón | nº |")
     md.append("|---|---:|")
-    for k, v in sorted(stats["by_reason"].items(), key=lambda kv: -kv[1]):
+    for k, v in sorted(by_reason.items(), key=lambda kv: -kv[1]):
         md.append(f"| {k} | {v} |")
-    md.append("\n## Directorios podados en el walk\n")
+    md.append("\n## Directorios podados en el walk (esta ejecución)\n")
     md.append(", ".join(f"{k}×{v}" for k, v in sorted(stats["dir_skips"].items())) or "—")
     with open(os.path.join(res, "stats.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(md) + "\n")
 
-    print(f"\n== FASE 2b COMPLETA ({args.label}) ==")
-    print(f"   aceptados: {stats['accepted']} · rechazados: {stats['rejected']} · duplicados: {len(dups)}")
+    print(f"\n== FASE 2b ({args.label}) — acumulado de la tanda ==")
+    print(f"   repos: {len(ck)} · aceptados: {acc_total} · rechazados: {rej_total} · duplicados: {dup_total}")
     print(f"   corpus: {corpus}/ · resultados: {res}/")
 
 

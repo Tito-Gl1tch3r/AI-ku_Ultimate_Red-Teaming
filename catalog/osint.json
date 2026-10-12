@@ -1,10 +1,10 @@
 {
  "topic": "osint",
- "source": "github-topics",
+ "source": "github-topics+expansion(stars>=25,keyword,curated-orgs)",
  "num_examples_hf": 382956,
  "partial_stats": false,
  "note": "cardinalidad alta: /statistics omite frecuencias de repo_name; catálogo por descubrimiento independiente en GitHub",
- "n_repos": 500,
+ "n_repos": 1579,
  "repos": [
   {
    "repo": "sherlock-project/sherlock",
@@ -3005,10 +3005,8660 @@
    "stars": 197,
    "spdx_hint": "MIT",
    "size_kb": 200
+  },
+  {
+   "repo": "sharsil/favicorn",
+   "stars": 196,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 434,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "OSINT-mindset/vk-osint-ru",
+   "stars": 195,
+   "spdx_hint": "MIT",
+   "size_kb": 10,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "humandecoded/twayback",
+   "stars": 195,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 196,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "hahwul/urx",
+   "stars": 194,
+   "spdx_hint": "MIT",
+   "size_kb": 13700,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "iamnihal/warf",
+   "stars": 194,
+   "spdx_hint": "MIT",
+   "size_kb": 2113,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "tlgrcli/tlgr",
+   "stars": 193,
+   "spdx_hint": "MIT",
+   "size_kb": 23501,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "neonpangolin/geospatial-intelligence-library",
+   "stars": 193,
+   "spdx_hint": null,
+   "size_kb": 352,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "HASH1da1/Gotanda",
+   "stars": 193,
+   "spdx_hint": "MIT",
+   "size_kb": 209,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Hamed233/Digital-Footprint-OSINT-Tool",
+   "stars": 193,
+   "spdx_hint": "MIT",
+   "size_kb": 16,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Ginsberg5150/Discord-and-Telegram-OSINT-references",
+   "stars": 192,
+   "spdx_hint": null,
+   "size_kb": 17634,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "harleo/knockknock",
+   "stars": 192,
+   "spdx_hint": "MIT",
+   "size_kb": 40,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "uosint-project/uosint",
+   "stars": 192,
+   "spdx_hint": "MIT",
+   "size_kb": 2972,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "josh0xA/Pantheon",
+   "stars": 189,
+   "spdx_hint": null,
+   "size_kb": 767,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "C3n7ral051nt4g3ncy/Prot1ntelligence",
+   "stars": 188,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 132,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "bb1nfosec/Information-Security-Tasks",
+   "stars": 188,
+   "spdx_hint": null,
+   "size_kb": 90321,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "ffffffff0x/ones",
+   "stars": 186,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 446,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "ecstatic-nobel/pOSINT",
+   "stars": 186,
+   "spdx_hint": "MIT",
+   "size_kb": 8608,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "HaxL0p4/L0p4-Toolkit",
+   "stars": 186,
+   "spdx_hint": "MIT",
+   "size_kb": 47123,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "kulkansecurity/gitxray",
+   "stars": 184,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 3841,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "jois-code/tweeds",
+   "stars": 184,
+   "spdx_hint": "MIT",
+   "size_kb": 280,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "devploit/CTF_OnlineTools",
+   "stars": 184,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 37,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "OSINTI4L/cupidcr4wl",
+   "stars": 184,
+   "spdx_hint": null,
+   "size_kb": 149,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "caio-ishikawa/netscout",
+   "stars": 183,
+   "spdx_hint": "MIT",
+   "size_kb": 871,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Juliusolsson05/pharos-ai",
+   "stars": 183,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 4531,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "elbraino/awesome-blackhat-arsenal",
+   "stars": 182,
+   "spdx_hint": "CC0-1.0",
+   "size_kb": 19386,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "theahmadov/vector",
+   "stars": 181,
+   "spdx_hint": "MIT",
+   "size_kb": 491,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "saeeddhqan/evine",
+   "stars": 181,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 673,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "osintbuddy/osintbuddy",
+   "stars": 180,
+   "spdx_hint": null,
+   "size_kb": 7302,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "megadose/facebook_totem",
+   "stars": 180,
+   "spdx_hint": null,
+   "size_kb": 31188,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "SofianeHamlaoui/Pentest-Bookmarkz",
+   "stars": 180,
+   "spdx_hint": null,
+   "size_kb": 25,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "HOPain/OSINT-Search-Tools",
+   "stars": 180,
+   "spdx_hint": null,
+   "size_kb": 409,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "soxoj/username-generation-guide",
+   "stars": 180,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 297,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "rix4uni/medium-writeups",
+   "stars": 180,
+   "spdx_hint": null,
+   "size_kb": 207949,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "kinshukdua/LiveActionMap",
+   "stars": 179,
+   "spdx_hint": "MIT",
+   "size_kb": 7391,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "dhn/udon",
+   "stars": 179,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 45,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "rly0nheart/osinteye",
+   "stars": 178,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 61,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "fknMega/Aether",
+   "stars": 177,
+   "spdx_hint": "MIT",
+   "size_kb": 28674,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Cl4r4-5/OriON",
+   "stars": 176,
+   "spdx_hint": null,
+   "size_kb": 355,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "j3ssie/IPOsint",
+   "stars": 176,
+   "spdx_hint": null,
+   "size_kb": 13611,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "pazo01/awesome-cyber-ai-arsenal",
+   "stars": 176,
+   "spdx_hint": "MIT",
+   "size_kb": 1551,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "falkensmz/tw1tter0s1nt",
+   "stars": 174,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 88,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "DedSecInside/gotor",
+   "stars": 174,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 11220,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "ruyynn/GhostIntel",
+   "stars": 174,
+   "spdx_hint": "MIT",
+   "size_kb": 3822,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "w0h1v/mcp-shodan",
+   "stars": 174,
+   "spdx_hint": "MIT",
+   "size_kb": 155,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "buddhsen-tripathi/OSINT-Kit",
+   "stars": 173,
+   "spdx_hint": "MIT",
+   "size_kb": 184,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "tg12/PoC_CVEs",
+   "stars": 171,
+   "spdx_hint": null,
+   "size_kb": 28476,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "The-Osint-Toolbox/People-Search-OSINT",
+   "stars": 171,
+   "spdx_hint": null,
+   "size_kb": 38,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "typedb-osi/typedb-cti",
+   "stars": 171,
+   "spdx_hint": null,
+   "size_kb": 7880,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "OldBonhart/Osint-Resources",
+   "stars": 171,
+   "spdx_hint": null,
+   "size_kb": 269,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "PeterDaveHello/url-shorteners",
+   "stars": 171,
+   "spdx_hint": "CC-BY-SA-4.0",
+   "size_kb": 265,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "SOsintOps/Argos",
+   "stars": 171,
+   "spdx_hint": "MIT",
+   "size_kb": 124059,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Merklemap/merklemap-cli",
+   "stars": 168,
+   "spdx_hint": "MIT",
+   "size_kb": 63,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "fulluhq/BlueMagic-Multitool",
+   "stars": 168,
+   "spdx_hint": null,
+   "size_kb": 9785,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "OSINT-TECHNOLOGIES/dpulse",
+   "stars": 168,
+   "spdx_hint": "MIT",
+   "size_kb": 2529,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "boringthegod/postmaniac",
+   "stars": 168,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 230,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "rishitsaiya/CTFlearn-Writeups",
+   "stars": 167,
+   "spdx_hint": "MIT",
+   "size_kb": 50206,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "7WaySecurity/ai_osint",
+   "stars": 167,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 3975,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "ax-i-om/bitcrook",
+   "stars": 165,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 93833,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "davidonzo/Threat-Intel",
+   "stars": 165,
+   "spdx_hint": "MIT",
+   "size_kb": 7383594,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "BushidoUK/OSINT-SearchOperators",
+   "stars": 165,
+   "spdx_hint": null,
+   "size_kb": 94,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "K2SOsint/Legendary_Crypto",
+   "stars": 165,
+   "spdx_hint": "CC0-1.0",
+   "size_kb": 175,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "paulpogoda/OSINT-for-countries-V2.0",
+   "stars": 165,
+   "spdx_hint": null,
+   "size_kb": 142,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Ringmast4r/crystal-vault",
+   "stars": 164,
+   "spdx_hint": null,
+   "size_kb": 3321323,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "devanshbatham/ArchiveFuzz",
+   "stars": 164,
+   "spdx_hint": null,
+   "size_kb": 114,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "scalytics/kafSIEM",
+   "stars": 164,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 46911,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "breach-tw/breach.tw",
+   "stars": 163,
+   "spdx_hint": "MIT",
+   "size_kb": 2025,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "soxoj/maigret-tg-bot",
+   "stars": 163,
+   "spdx_hint": "MIT",
+   "size_kb": 15,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "socai-io/jev-social",
+   "stars": 163,
+   "spdx_hint": "MIT",
+   "size_kb": 7915,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "mxrch/revealin",
+   "stars": 162,
+   "spdx_hint": null,
+   "size_kb": 10,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "M0m0SMS-OSINT/Maltego",
+   "stars": 162,
+   "spdx_hint": null,
+   "size_kb": 22,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Fundacio-i2CAT/InfoHound",
+   "stars": 162,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 1970,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "paulpogoda/OSINT-CSE",
+   "stars": 161,
+   "spdx_hint": null,
+   "size_kb": 98,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "WhiteHatInspector/emailGuesser",
+   "stars": 160,
+   "spdx_hint": "MIT",
+   "size_kb": 19850,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Ringmast4r/FLOCK",
+   "stars": 159,
+   "spdx_hint": null,
+   "size_kb": 24971,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "mattwright324/youtube-geofind",
+   "stars": 159,
+   "spdx_hint": "MIT",
+   "size_kb": 2262,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "novitae/Tenai",
+   "stars": 159,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 404,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "shredzwho/IG-Detective",
+   "stars": 158,
+   "spdx_hint": "MIT",
+   "size_kb": 215,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "lucasgelfond/exiftool-web",
+   "stars": 158,
+   "spdx_hint": null,
+   "size_kb": 10233,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Pa55w0rd/google-hacking-assistant",
+   "stars": 156,
+   "spdx_hint": null,
+   "size_kb": 2785,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "appsecco/spaces-finder",
+   "stars": 156,
+   "spdx_hint": "MIT",
+   "size_kb": 19,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "ksharinarayanan/SourceWolf",
+   "stars": 156,
+   "spdx_hint": "MIT",
+   "size_kb": 360,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "retr0-g04t/EagleOsint",
+   "stars": 155,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1259,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "NexvisionLab/Darkweb-search-engine",
+   "stars": 154,
+   "spdx_hint": "MIT",
+   "size_kb": 4973,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "rix4uni/WordList",
+   "stars": 154,
+   "spdx_hint": null,
+   "size_kb": 808147,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "HACKE-RC/webdork",
+   "stars": 154,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 70,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "trickest/insiders",
+   "stars": 154,
+   "spdx_hint": "MIT",
+   "size_kb": 397215,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "evildevill/Hackerwasi",
+   "stars": 152,
+   "spdx_hint": "MIT",
+   "size_kb": 384,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "bhattsameer/numspy",
+   "stars": 151,
+   "spdx_hint": "MIT",
+   "size_kb": 292,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "GONZOsint/deepfaceui",
+   "stars": 151,
+   "spdx_hint": null,
+   "size_kb": 17,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Viralmaniar/XposedOrNot",
+   "stars": 150,
+   "spdx_hint": null,
+   "size_kb": 25,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "visualbasic6/chatter",
+   "stars": 150,
+   "spdx_hint": null,
+   "size_kb": 40185,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Just-Roma/DorkingDB",
+   "stars": 149,
+   "spdx_hint": "MIT",
+   "size_kb": 1868,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "xPloits3c/DorkEye",
+   "stars": 149,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 10076,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "umitkaanusta/TIA",
+   "stars": 149,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 26736,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "cloudtracer/paskto",
+   "stars": 148,
+   "spdx_hint": "MIT",
+   "size_kb": 55735,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Bevigil/BeVigil-OSINT-CLI",
+   "stars": 148,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 5572,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "banaxou/hostagram",
+   "stars": 147,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 455,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Cyber-Courses/Cyber-Library",
+   "stars": 147,
+   "spdx_hint": null,
+   "size_kb": 17311,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "C3n7ral051nt4g3ncy/HandleHawk",
+   "stars": 146,
+   "spdx_hint": "MIT",
+   "size_kb": 6389,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "i64/pervertgram",
+   "stars": 146,
+   "spdx_hint": "MIT",
+   "size_kb": 8639,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "C3n7ral051nt4g3ncy/WhatsMyName-Python",
+   "stars": 145,
+   "spdx_hint": "MIT",
+   "size_kb": 246,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "thedmdim/switchsearch",
+   "stars": 144,
+   "spdx_hint": null,
+   "size_kb": 67,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "CaviraOSS/Akashic",
+   "stars": 144,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 96357,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "efekrbas/guns.lol-username-checker",
+   "stars": 144,
+   "spdx_hint": "MIT",
+   "size_kb": 918,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "MrM8BRH/CRLJ",
+   "stars": 144,
+   "spdx_hint": "MPL-2.0",
+   "size_kb": 796,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "7WaySecurity/cloud_osint",
+   "stars": 142,
+   "spdx_hint": "MIT",
+   "size_kb": 149,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "smixs/osint-skill",
+   "stars": 142,
+   "spdx_hint": "MIT",
+   "size_kb": 57,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "lucianosrp/open-source-aviation",
+   "stars": 142,
+   "spdx_hint": "CC0-1.0",
+   "size_kb": 297,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "selmux/Alhasawi-ICS-OT-Security-projetcs",
+   "stars": 141,
+   "spdx_hint": null,
+   "size_kb": 433,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "z0m31en7/WhatMail",
+   "stars": 141,
+   "spdx_hint": "MIT",
+   "size_kb": 311,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "NotLoBi/NotLoBi",
+   "stars": 141,
+   "spdx_hint": null,
+   "size_kb": 746,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "thumpersecure/Telespot",
+   "stars": 141,
+   "spdx_hint": "MIT",
+   "size_kb": 757,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "teal33t/poopak",
+   "stars": 141,
+   "spdx_hint": null,
+   "size_kb": 18083,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "tigthor/NSA-CIA-Blocklist",
+   "stars": 140,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 425,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "rix4uni/cvemapping",
+   "stars": 140,
+   "spdx_hint": null,
+   "size_kb": 783887,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "urbanadventurer/bing-ip2hosts",
+   "stars": 140,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 138,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "joshiayush/inb",
+   "stars": 140,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 33371,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "CScorza/GEOINTInvestigation",
+   "stars": 139,
+   "spdx_hint": null,
+   "size_kb": 179,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "qbitseclabs/osint",
+   "stars": 139,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 4918,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "K2SOsint/Bookmarklets",
+   "stars": 139,
+   "spdx_hint": null,
+   "size_kb": 91,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "tg12/rapid7_OSINT",
+   "stars": 139,
+   "spdx_hint": null,
+   "size_kb": 3501,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "xanwz/leaks",
+   "stars": 139,
+   "spdx_hint": null,
+   "size_kb": 50062,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "JambaAcademy/OSINT",
+   "stars": 139,
+   "spdx_hint": "MIT",
+   "size_kb": 2153,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "sshell/reddit-analyzer",
+   "stars": 137,
+   "spdx_hint": null,
+   "size_kb": 35,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "osintshifu/osint-tradecraft",
+   "stars": 137,
+   "spdx_hint": null,
+   "size_kb": 760,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "shelld3v/aquatone",
+   "stars": 137,
+   "spdx_hint": "MIT",
+   "size_kb": 42097,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "tegridydev/python-OSINT-notebook",
+   "stars": 136,
+   "spdx_hint": "MIT",
+   "size_kb": 170,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "devanshbatham/CertEagle",
+   "stars": 135,
+   "spdx_hint": null,
+   "size_kb": 328,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "megadose/phoneinfoga-maltego",
+   "stars": 135,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 16267,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "KanekiWeb/Email-Osint",
+   "stars": 134,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2720,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "akrambak/TikTok-OSINT",
+   "stars": 134,
+   "spdx_hint": "MIT",
+   "size_kb": 1932,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "audibleblink/passdb-frontend",
+   "stars": 134,
+   "spdx_hint": null,
+   "size_kb": 6333,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Nix4444/Pimeyes-scraper",
+   "stars": 134,
+   "spdx_hint": null,
+   "size_kb": 5,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "HackUnderway/whatslookup",
+   "stars": 133,
+   "spdx_hint": "MIT",
+   "size_kb": 410,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "damionrashford/RivalSearchMCP",
+   "stars": 132,
+   "spdx_hint": "MIT",
+   "size_kb": 10916,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "SocialLinks-IO/sociallinks-api",
+   "stars": 132,
+   "spdx_hint": null,
+   "size_kb": 437,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "meedan/check",
+   "stars": 131,
+   "spdx_hint": "MIT",
+   "size_kb": 5783,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "yogsec/Digital-Forensics-Tools",
+   "stars": 131,
+   "spdx_hint": "MIT",
+   "size_kb": 124,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "0xZDH/BridgeKeeper",
+   "stars": 131,
+   "spdx_hint": "MIT",
+   "size_kb": 50,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "d-Rickyy-b/pastepwn",
+   "stars": 130,
+   "spdx_hint": "MIT",
+   "size_kb": 1077,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "phishdestroy/shortdot-evidence",
+   "stars": 130,
+   "spdx_hint": "MIT",
+   "size_kb": 559752,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "osint-and-search/boti_dlya_poiska",
+   "stars": 130,
+   "spdx_hint": null,
+   "size_kb": 199,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "j3ssie/sdlookup",
+   "stars": 130,
+   "spdx_hint": "MIT",
+   "size_kb": 11,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "LeakIX/l9explore",
+   "stars": 129,
+   "spdx_hint": "MIT",
+   "size_kb": 64,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "rootdr-backup/Reconner",
+   "stars": 129,
+   "spdx_hint": "MIT",
+   "size_kb": 8822,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "pielco11/DOT",
+   "stars": 127,
+   "spdx_hint": "MIT",
+   "size_kb": 942,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "B0sintBlanc/Osint-Bookmarklets",
+   "stars": 127,
+   "spdx_hint": null,
+   "size_kb": 32,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "ecstatic-nobel/Analyst-Arsenal",
+   "stars": 127,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 6140,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "HackUnderway/OsintNum",
+   "stars": 126,
+   "spdx_hint": "MIT",
+   "size_kb": 718,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "pielco11/DOGE",
+   "stars": 126,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 3291,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "tg12/phantomtide",
+   "stars": 126,
+   "spdx_hint": null,
+   "size_kb": 44323,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "vincenzocaputo/FoxyRecon",
+   "stars": 126,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 25853,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "needmorecowbell/giggity",
+   "stars": 125,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 151,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "nccgroup/cloud_ip_ranges",
+   "stars": 125,
+   "spdx_hint": "MIT",
+   "size_kb": 20,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "subzeroid/insto",
+   "stars": 124,
+   "spdx_hint": "MIT",
+   "size_kb": 3432,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "dheerajydv19/Social-Media-Osint",
+   "stars": 124,
+   "spdx_hint": null,
+   "size_kb": 60,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "shadowscatcher/shodan",
+   "stars": 123,
+   "spdx_hint": "MIT",
+   "size_kb": 77,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "PeterDaveHello/threat-hostlist",
+   "stars": 123,
+   "spdx_hint": null,
+   "size_kb": 25,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "yasserjanah/FacebookChecker",
+   "stars": 123,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 12335,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "cisagov/findcdn",
+   "stars": 123,
+   "spdx_hint": "CC0-1.0",
+   "size_kb": 8236,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Dimaslg/osintBOX",
+   "stars": 122,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 4493,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "ResearchandDestroy/DorXNG",
+   "stars": 122,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 21228,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Tzohar/PassLLM",
+   "stars": 122,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 8303,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "cipher387/grep_for_osint",
+   "stars": 121,
+   "spdx_hint": null,
+   "size_kb": 125,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "tomsec8/IntelHub",
+   "stars": 121,
+   "spdx_hint": "MIT",
+   "size_kb": 11410,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "chriswmorris/Metaforge",
+   "stars": 121,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2931,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "baywolf88/seeallthethings",
+   "stars": 120,
+   "spdx_hint": null,
+   "size_kb": 82,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "snooppr/shotstars",
+   "stars": 120,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 27208,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "chr3st5an/tracer",
+   "stars": 120,
+   "spdx_hint": "MIT",
+   "size_kb": 261,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "CScorza/OSINTInvestigation",
+   "stars": 120,
+   "spdx_hint": null,
+   "size_kb": 136,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "IccTeam/Owl-sint",
+   "stars": 119,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 60,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "hueristiq/xsubfind3r",
+   "stars": 119,
+   "spdx_hint": "MIT",
+   "size_kb": 584,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "commit-issues/google-dorking",
+   "stars": 119,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 121,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "osintshifu/Cyber-Intelligence-GPT",
+   "stars": 119,
+   "spdx_hint": null,
+   "size_kb": 305,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "r1cksec/corptrace",
+   "stars": 119,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 877,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "HackUnderway/TokIntel",
+   "stars": 118,
+   "spdx_hint": "MIT",
+   "size_kb": 3528,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "r3mlab/datajournalism-resources",
+   "stars": 118,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 105,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Fergs32/DevilsEye",
+   "stars": 118,
+   "spdx_hint": null,
+   "size_kb": 4830,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "NullArray/Mimir",
+   "stars": 118,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 35,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "rhematt/Snap-Scraper",
+   "stars": 117,
+   "spdx_hint": "MIT",
+   "size_kb": 1257,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "CScorza/SOCMIntelligence",
+   "stars": 117,
+   "spdx_hint": null,
+   "size_kb": 111,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "machine1337/userfinder",
+   "stars": 116,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 14,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "king-millez/snapmap-archiver",
+   "stars": 116,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 160,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "asharbinkhalil/intellitoolz",
+   "stars": 115,
+   "spdx_hint": null,
+   "size_kb": 1969,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "bot-probiv-tg/.github",
+   "stars": 115,
+   "spdx_hint": null,
+   "size_kb": 99,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "conflict-investigations/media-search-engine",
+   "stars": 115,
+   "spdx_hint": null,
+   "size_kb": 1327,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Whomrx666/osint-X",
+   "stars": 114,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 375,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "ropcat/reversing-unofficial-APIs",
+   "stars": 114,
+   "spdx_hint": null,
+   "size_kb": 220,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "qeeqbox/osint",
+   "stars": 114,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 3501,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "joeavanzato/LogBoost",
+   "stars": 113,
+   "spdx_hint": "MIT",
+   "size_kb": 4229,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "CScorza/OSINTSurveillance",
+   "stars": 113,
+   "spdx_hint": null,
+   "size_kb": 40,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "junnlikestea/vita",
+   "stars": 113,
+   "spdx_hint": "Unlicense",
+   "size_kb": 241,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "stlewandowski/GitMAD",
+   "stars": 112,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 5529,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Kcisti/bat-security-toolkit",
+   "stars": 112,
+   "spdx_hint": null,
+   "size_kb": 36469,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Evil-Twins-X/SubEvil",
+   "stars": 111,
+   "spdx_hint": null,
+   "size_kb": 2289,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "amanverasia/Unseen",
+   "stars": 111,
+   "spdx_hint": null,
+   "size_kb": 129,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Gheris-579/gHoStGD",
+   "stars": 111,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 9124,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "landoncrabtree/awesome-cyber",
+   "stars": 111,
+   "spdx_hint": null,
+   "size_kb": 288,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "MilkMp/CIA-World-Factbooks-Archive-1990-2025",
+   "stars": 111,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 168609,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "ebrasha/cidr-ip-ranges-by-country",
+   "stars": 110,
+   "spdx_hint": null,
+   "size_kb": 3715,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "dalunacrobate/DaProfiler",
+   "stars": 110,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2494,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "airborne-commando/OPSEC-OSINT-Tools",
+   "stars": 110,
+   "spdx_hint": "Unlicense",
+   "size_kb": 9992,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "misiektoja/spotify_monitor",
+   "stars": 109,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 7724,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "purrsec/Turbolehe",
+   "stars": 109,
+   "spdx_hint": null,
+   "size_kb": 16,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "ipverse/as-metadata",
+   "stars": 108,
+   "spdx_hint": "CC0-1.0",
+   "size_kb": 354478,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "glaz-boga-bot-tg/.github",
+   "stars": 108,
+   "spdx_hint": null,
+   "size_kb": 6,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "MazenElzanaty/TwLocation",
+   "stars": 108,
+   "spdx_hint": null,
+   "size_kb": 17,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "samogod/bugradar",
+   "stars": 108,
+   "spdx_hint": null,
+   "size_kb": 75,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "birbwatcher/wayback-machine-downloader",
+   "stars": 106,
+   "spdx_hint": null,
+   "size_kb": 62,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "1N3/AttackSurfaceManagement",
+   "stars": 106,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 34955,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "ibnaleem/instatracker",
+   "stars": 106,
+   "spdx_hint": "MIT",
+   "size_kb": 219,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "The-Osint-Toolbox/OSINT-Communities-Practitioners",
+   "stars": 105,
+   "spdx_hint": null,
+   "size_kb": 94,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "The-Osint-Toolbox/YouTube-Video-OSINT",
+   "stars": 105,
+   "spdx_hint": null,
+   "size_kb": 76,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "bm-github/owasp-social-osint-agent",
+   "stars": 104,
+   "spdx_hint": "MIT",
+   "size_kb": 450,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "C3n7ral051nt4g3ncy/GitOSINT_Bot",
+   "stars": 103,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 27125,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Coordinate-Cat/osint-tools-cli",
+   "stars": 102,
+   "spdx_hint": null,
+   "size_kb": 77137,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "matiash26/steam-osint",
+   "stars": 102,
+   "spdx_hint": null,
+   "size_kb": 1035,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Miiden/EyeSpy",
+   "stars": 102,
+   "spdx_hint": "MIT",
+   "size_kb": 4506,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "arn-c0de/Crawllama",
+   "stars": 102,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 4222,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "CScorza/OSINT-IA",
+   "stars": 101,
+   "spdx_hint": null,
+   "size_kb": 26,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "umair9747/vichiti",
+   "stars": 101,
+   "spdx_hint": "MIT",
+   "size_kb": 42734,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "CScorza/Tool-VATINT",
+   "stars": 101,
+   "spdx_hint": null,
+   "size_kb": 174,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "rix4uni/scope",
+   "stars": 101,
+   "spdx_hint": null,
+   "size_kb": 26769,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "estebanpdl/tik-spyder",
+   "stars": 101,
+   "spdx_hint": null,
+   "size_kb": 201,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "phor3nsic/favicon_hash_shodan",
+   "stars": 101,
+   "spdx_hint": "MIT",
+   "size_kb": 6,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "soxoj/gitcolombo",
+   "stars": 100,
+   "spdx_hint": "MIT",
+   "size_kb": 800,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "probit-vk/probiv-vk",
+   "stars": 100,
+   "spdx_hint": null,
+   "size_kb": 29,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "TheSecuredAnalyst/security-suite",
+   "stars": 100,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 473,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "t4d/StalkPhish-OSS",
+   "stars": 100,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 148,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "krishpranav/socialosint",
+   "stars": 100,
+   "spdx_hint": null,
+   "size_kb": 120,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "chopicalqui/KaliIntelligenceSuite",
+   "stars": 99,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2796,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "zhiyuzi/Signex",
+   "stars": 98,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 290,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "SirCryptic/phisherprice",
+   "stars": 98,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 325,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "XposedOrNot/XposedOrNot-API",
+   "stars": 98,
+   "spdx_hint": "MIT",
+   "size_kb": 4329,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "emrekybs/DraculaOS",
+   "stars": 98,
+   "spdx_hint": null,
+   "size_kb": 9237,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "scottalt/senior-securityengineer-cybersecuritybookmarks",
+   "stars": 98,
+   "spdx_hint": "MIT",
+   "size_kb": 78,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "TahaGorme/InstaMassUnliker",
+   "stars": 98,
+   "spdx_hint": "MIT",
+   "size_kb": 62,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "atlosdotorg/atlos",
+   "stars": 97,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 161837,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "The-Osint-Toolbox/Internet-OSINT",
+   "stars": 97,
+   "spdx_hint": null,
+   "size_kb": 70,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "daehee/mildew",
+   "stars": 97,
+   "spdx_hint": "MIT",
+   "size_kb": 26,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Fricciolosa-Red-Team/evildork",
+   "stars": 96,
+   "spdx_hint": "MIT",
+   "size_kb": 91,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "bellingcat/adsb-history",
+   "stars": 96,
+   "spdx_hint": "MIT",
+   "size_kb": 13483,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "The-Osint-Toolbox/Search-Engines",
+   "stars": 96,
+   "spdx_hint": null,
+   "size_kb": 55,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "notdodo/pastego",
+   "stars": 96,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 90,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "AndrewCTF/velocity",
+   "stars": 96,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 312238,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Siv-nick/WhoCord",
+   "stars": 95,
+   "spdx_hint": null,
+   "size_kb": 3920,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "soxoj/maigret-maltego",
+   "stars": 95,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 13,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "PicartaAI/Picarta-API",
+   "stars": 95,
+   "spdx_hint": "MIT",
+   "size_kb": 142,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Hue-Jhan/OSINT-War-Room",
+   "stars": 95,
+   "spdx_hint": "MIT",
+   "size_kb": 22062,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "osint-and-search/analogi_Glaza_Boga",
+   "stars": 95,
+   "spdx_hint": null,
+   "size_kb": 1354,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "savannah-i-g/TSUKUYOMI",
+   "stars": 95,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 278,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "SherlockLinux/SherlockLinux",
+   "stars": 94,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 129535,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "trickest/cloud",
+   "stars": 94,
+   "spdx_hint": "MIT",
+   "size_kb": 40665306,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "lucideus-repo/cybergym",
+   "stars": 94,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 17524,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "bitsofinfo/comms-analyzer-toolbox",
+   "stars": 93,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 811,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "AnonCatalyst/Odinova",
+   "stars": 93,
+   "spdx_hint": "MIT",
+   "size_kb": 29066,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "blacklanternsecurity/cloudcheck",
+   "stars": 93,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 8055,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "malwaredojo/loki",
+   "stars": 93,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 93189,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "TrixSec/DorkHub",
+   "stars": 92,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 22684,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "011-sam-110/Provenance",
+   "stars": 92,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 210954,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "M4elstr0m/gophoner",
+   "stars": 92,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 8097,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "d3mocide/Sovereign_Watch",
+   "stars": 92,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 39125,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "AXRoux/OSINT-Assistant",
+   "stars": 92,
+   "spdx_hint": "MIT",
+   "size_kb": 213,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "atlas-bear/osint-ai-guide",
+   "stars": 92,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 315,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "VrushankPatel/godseye",
+   "stars": 92,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 17936,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "jeet-ganguly/birdy-edwards",
+   "stars": 91,
+   "spdx_hint": "MIT",
+   "size_kb": 11863,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "priyankvadaliya/AwsomeOSINT",
+   "stars": 90,
+   "spdx_hint": null,
+   "size_kb": 25,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "boringthegod/doxcord",
+   "stars": 90,
+   "spdx_hint": null,
+   "size_kb": 2895,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "dave-137/project",
+   "stars": 90,
+   "spdx_hint": "MIT",
+   "size_kb": 20,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Faizan-Khanx/TelegramOSINT",
+   "stars": 90,
+   "spdx_hint": "MIT",
+   "size_kb": 3506,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "paulpogoda/OSINT-Tools-Russia",
+   "stars": 90,
+   "spdx_hint": null,
+   "size_kb": 75,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "0xRamInf0sec/SocialRecon",
+   "stars": 90,
+   "spdx_hint": null,
+   "size_kb": 61,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Reflets-info/maltego-tools",
+   "stars": 89,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 686,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "sexettin78/sexettintool",
+   "stars": 89,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 667,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "netsecurity-as/recon365",
+   "stars": 89,
+   "spdx_hint": null,
+   "size_kb": 120,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Stuub/SquatSquasher",
+   "stars": 88,
+   "spdx_hint": null,
+   "size_kb": 19,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Keyj33k/htkit",
+   "stars": 88,
+   "spdx_hint": "MIT",
+   "size_kb": 76983,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "michenriksen/bucketlist",
+   "stars": 87,
+   "spdx_hint": "MIT",
+   "size_kb": 17,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "ninoseki/shimon",
+   "stars": 87,
+   "spdx_hint": "MIT",
+   "size_kb": 11820,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "blacknon/pydork",
+   "stars": 87,
+   "spdx_hint": "MIT",
+   "size_kb": 147,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "osintbrazuca/osint-brazuca-nuclei-templates",
+   "stars": 87,
+   "spdx_hint": null,
+   "size_kb": 1114,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "pikpikcu/nuubi",
+   "stars": 86,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 182,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "BuddyOsint/Probiv_telegram",
+   "stars": 86,
+   "spdx_hint": null,
+   "size_kb": 215,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "s0cm0nkey/Security-Reference-Guide",
+   "stars": 86,
+   "spdx_hint": null,
+   "size_kb": 38308,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "famasoon/crtsh",
+   "stars": 86,
+   "spdx_hint": null,
+   "size_kb": 31,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "ajuelosemmanuel/duolingOSINT",
+   "stars": 86,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 27,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "intelowlproject/IntelOwl-ng",
+   "stars": 86,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 2743,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "OSINT-mindset/lingolens",
+   "stars": 86,
+   "spdx_hint": "MIT",
+   "size_kb": 4985,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "carnal0wnage/pentesty_scripts",
+   "stars": 86,
+   "spdx_hint": null,
+   "size_kb": 221,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "JoogsWasTaken/tg-nearby",
+   "stars": 86,
+   "spdx_hint": "MIT",
+   "size_kb": 12,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "FauvidoTechnologies/open-atlas",
+   "stars": 85,
+   "spdx_hint": "MIT",
+   "size_kb": 119656,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "mouna23/OSINT-with-LLM",
+   "stars": 85,
+   "spdx_hint": null,
+   "size_kb": 312,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "dhn/spk",
+   "stars": 85,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 80,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "The-Osint-Toolbox/Custom-Search-Engines",
+   "stars": 84,
+   "spdx_hint": null,
+   "size_kb": 48,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "soxoj/osint-cli-tool-skeleton",
+   "stars": 84,
+   "spdx_hint": "MIT",
+   "size_kb": 233,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "UCYBERS/Bug-Bounty-Beginner-Roadmap",
+   "stars": 84,
+   "spdx_hint": "CC0-1.0",
+   "size_kb": 288,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "Sekhan/NightPi",
+   "stars": 84,
+   "spdx_hint": null,
+   "size_kb": 10909,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "PeterDaveHello/chkdomain",
+   "stars": 84,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 231,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "N4rr34n6/TgUserDetails",
+   "stars": 83,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 22,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "balestek/hashtray",
+   "stars": 83,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1053,
+   "fork": false,
+   "discovery": "topic-stars:topic:osint stars:>=25"
+  },
+  {
+   "repo": "xillwillx/skiptracer",
+   "stars": 1149,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 434,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "tnt-wolve/ch3r0",
+   "stars": 328,
+   "spdx_hint": "MIT",
+   "size_kb": 34,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "mhmdiaa/chronos",
+   "stars": 235,
+   "spdx_hint": "MIT",
+   "size_kb": 203,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "fr4nc1stein/osint-framework",
+   "stars": 207,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 2743,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "micro-joan/D4TA-HUNTER",
+   "stars": 178,
+   "spdx_hint": null,
+   "size_kb": 4011,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "trmxvibs/Tool-X",
+   "stars": 137,
+   "spdx_hint": "MIT",
+   "size_kb": 414,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "syamsv/Pyosint",
+   "stars": 118,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 6431,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "digitalshadows/orca",
+   "stars": 87,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 74,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "yogsec/OSINT-Tools",
+   "stars": 82,
+   "spdx_hint": null,
+   "size_kb": 48,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "VECERTUSA/DarkForumCTI",
+   "stars": 79,
+   "spdx_hint": null,
+   "size_kb": 573,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "bret99/telegram_scan",
+   "stars": 75,
+   "spdx_hint": "MIT",
+   "size_kb": 87,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "P3run/otwartezrodla",
+   "stars": 74,
+   "spdx_hint": "MIT",
+   "size_kb": 471,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "skyvanguard/awesome-ai-pentesting",
+   "stars": 73,
+   "spdx_hint": "MIT",
+   "size_kb": 242,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "h9zdev/SocioSential",
+   "stars": 73,
+   "spdx_hint": null,
+   "size_kb": 149,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "SpookySec/OSINTed",
+   "stars": 69,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 137,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "karim852/KUMO-Domain-Recon-Tool",
+   "stars": 69,
+   "spdx_hint": "MIT",
+   "size_kb": 10353,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "thenurhabib/tenssens",
+   "stars": 68,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 178,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "VECERTUSA/LeakBaseCTI",
+   "stars": 67,
+   "spdx_hint": null,
+   "size_kb": 2699,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "VainlyStrain/Vaile",
+   "stars": 64,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 20156,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "Cyb3rtch/Cyb3rtech-Tool",
+   "stars": 62,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 156,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "elfalehed/hack4squad",
+   "stars": 60,
+   "spdx_hint": "MIT",
+   "size_kb": 404,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "gs-ai/SYNINT",
+   "stars": 58,
+   "spdx_hint": null,
+   "size_kb": 4141,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "tracelabs/gumshoe",
+   "stars": 56,
+   "spdx_hint": "MPL-2.0",
+   "size_kb": 252,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "osint-dev-team/osint-framework",
+   "stars": 46,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 20051,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "Or1un/MOSAIC",
+   "stars": 44,
+   "spdx_hint": "MIT",
+   "size_kb": 2761,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "Expert21/hermes-osint",
+   "stars": 43,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 996,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "Escape-Technologies/awesome-attack-surface-management",
+   "stars": 43,
+   "spdx_hint": "CC0-1.0",
+   "size_kb": 21,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "ExploitCraft/ReconNinja",
+   "stars": 43,
+   "spdx_hint": "MIT",
+   "size_kb": 1332,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "Purpl3-Dev/OSINTLAB",
+   "stars": 42,
+   "spdx_hint": "MIT",
+   "size_kb": 9,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "drneox/nutcracker",
+   "stars": 42,
+   "spdx_hint": "MIT",
+   "size_kb": 13810,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "VECERTUSA/XSS.isCTI",
+   "stars": 41,
+   "spdx_hint": null,
+   "size_kb": 9455,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "paulveillard/cybersecurity-osint",
+   "stars": 40,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 950,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "sec0ps/va-pt",
+   "stars": 40,
+   "spdx_hint": null,
+   "size_kb": 5106,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "Bafomet666/OSINT-SAN-PRO",
+   "stars": 38,
+   "spdx_hint": null,
+   "size_kb": 23712,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "tedmdelacruz/recon-scripts",
+   "stars": 38,
+   "spdx_hint": null,
+   "size_kb": 105,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "V1n1v131r4/OSINT-Agentic-Framework",
+   "stars": 34,
+   "spdx_hint": null,
+   "size_kb": 215,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "txuswashere/pentesting",
+   "stars": 33,
+   "spdx_hint": null,
+   "size_kb": 38216,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "mohamedxk9tb/BladeRecon",
+   "stars": 32,
+   "spdx_hint": "MIT",
+   "size_kb": 18981,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "Archive-Puma/Elliot",
+   "stars": 31,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 2779,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "itszeeshan/subdomainx",
+   "stars": 28,
+   "spdx_hint": "MIT",
+   "size_kb": 35091,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "paulpogoda/OSINT-Tools_USA",
+   "stars": 27,
+   "spdx_hint": null,
+   "size_kb": 9,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "gowthamaraj/OSINT-Explorer",
+   "stars": 25,
+   "spdx_hint": "MIT",
+   "size_kb": 377,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "lhitori/Smog",
+   "stars": 25,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 17607,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "appsecco/docker-datasploit",
+   "stars": 25,
+   "spdx_hint": null,
+   "size_kb": 11,
+   "fork": false,
+   "discovery": "keyword:osint framework stars:>=25"
+  },
+  {
+   "repo": "sinwindie/OSINT",
+   "stars": 3782,
+   "spdx_hint": null,
+   "size_kb": 12227,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "v0id4real/Void-Tools",
+   "stars": 3075,
+   "spdx_hint": null,
+   "size_kb": 709,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "apurvsinghgautam/dark-web-osint-tools",
+   "stars": 2624,
+   "spdx_hint": null,
+   "size_kb": 8419,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "h9zdev/WireTapper",
+   "stars": 2498,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 11871,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "ilektrojohn/creepy",
+   "stars": 1490,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 4398,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "mishakorzik/UserFinder",
+   "stars": 1370,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1307,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "kinghacker0/WhatsApp-OSINT",
+   "stars": 1191,
+   "spdx_hint": null,
+   "size_kb": 1459,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "AKCodez/hackingtool-plugin",
+   "stars": 1099,
+   "spdx_hint": null,
+   "size_kb": 1041,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "TheBurnsy/Vehicle-OSINT-Collection",
+   "stars": 1089,
+   "spdx_hint": null,
+   "size_kb": 191,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "XD-MHLOO/Osintgraph",
+   "stars": 961,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 150,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "dev-lu/osint_toolkit",
+   "stars": 949,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 4466,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "wddadk/OSINT-for-countries",
+   "stars": 904,
+   "spdx_hint": null,
+   "size_kb": 120,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "spider863644/PhoneNumber-OSINT",
+   "stars": 898,
+   "spdx_hint": "MIT",
+   "size_kb": 313,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "n0mi1k/apk2url",
+   "stars": 880,
+   "spdx_hint": "MIT",
+   "size_kb": 19,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "drego85/tosint",
+   "stars": 874,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 121,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Greyjedix/Profil3r",
+   "stars": 669,
+   "spdx_hint": "MIT",
+   "size_kb": 22,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "mishakorzik/MailFinder",
+   "stars": 598,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 640,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Viralmaniar/SMWYG-Show-Me-What-You-Got",
+   "stars": 578,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 22,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "hippiiee/osgint",
+   "stars": 575,
+   "spdx_hint": "MIT",
+   "size_kb": 22,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "The-Osint-Toolbox/Image-Research-OSINT",
+   "stars": 554,
+   "spdx_hint": null,
+   "size_kb": 201,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "chris408/ct-exposer",
+   "stars": 488,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 63,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "chm0dx/creepyCrawler",
+   "stars": 464,
+   "spdx_hint": null,
+   "size_kb": 4152,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "techenthusiast167/Master-OSINT-Toolkit-",
+   "stars": 425,
+   "spdx_hint": null,
+   "size_kb": 61,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "tracelabs/awesome-osint",
+   "stars": 422,
+   "spdx_hint": "MPL-2.0",
+   "size_kb": 27,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "techenthusiast167/D4rk_Intel-OSINT-Investigative-Toolkit",
+   "stars": 419,
+   "spdx_hint": null,
+   "size_kb": 375,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "tjnull/TJ-OSINT-Notebook",
+   "stars": 372,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 121,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "MrHacker-X/DevilX",
+   "stars": 351,
+   "spdx_hint": "BSL-1.0",
+   "size_kb": 5312,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Kr0wZ/SnapIntel",
+   "stars": 346,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 976,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "silverxcyber/SilverInstaEye",
+   "stars": 316,
+   "spdx_hint": null,
+   "size_kb": 107,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "dvopsway/datasploit",
+   "stars": 311,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 11162,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "mwakidenis/WebCheck-OSINT",
+   "stars": 304,
+   "spdx_hint": "MIT",
+   "size_kb": 26999,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "techenthusiast167/WebRecon",
+   "stars": 304,
+   "spdx_hint": null,
+   "size_kb": 214,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "danieldurnea/Dark-Web-Osint-Tools-",
+   "stars": 268,
+   "spdx_hint": null,
+   "size_kb": 49,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "techenthusiast167/EMAIL-CRAWL",
+   "stars": 260,
+   "spdx_hint": null,
+   "size_kb": 66,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "codingo/dorky",
+   "stars": 250,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 61,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Y0oshi/Project-Eyes-On",
+   "stars": 245,
+   "spdx_hint": "MIT",
+   "size_kb": 962,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "abdulgaphy/r3con1z3r",
+   "stars": 227,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 4192,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Cillian-Collins/dirscraper",
+   "stars": 225,
+   "spdx_hint": null,
+   "size_kb": 19,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "AbirHasan2005/LittleBrother",
+   "stars": 216,
+   "spdx_hint": null,
+   "size_kb": 37,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "passthesh3ll/The-Pika-s-OSINT-ToolBox",
+   "stars": 211,
+   "spdx_hint": null,
+   "size_kb": 180,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "s3cm44s/osintt001",
+   "stars": 208,
+   "spdx_hint": null,
+   "size_kb": 0,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "cyberpunkOS/CyberPunkOS",
+   "stars": 202,
+   "spdx_hint": null,
+   "size_kb": 13401,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "dsonbaker/email2whatsapp",
+   "stars": 201,
+   "spdx_hint": "MIT",
+   "size_kb": 19716,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "DouglasFreshHabian/OsintDroid",
+   "stars": 199,
+   "spdx_hint": "MIT",
+   "size_kb": 16,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "aryanguenthner/darkfox",
+   "stars": 190,
+   "spdx_hint": null,
+   "size_kb": 221,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "The-Osint-Toolbox/AI-Resources",
+   "stars": 171,
+   "spdx_hint": null,
+   "size_kb": 90,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Quantika14/osint-suite-tools",
+   "stars": 168,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 36132,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "m00s3c/awesome-breach-intelligence",
+   "stars": 158,
+   "spdx_hint": null,
+   "size_kb": 9,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "jmortega/osint_tools_security_auditing",
+   "stars": 157,
+   "spdx_hint": null,
+   "size_kb": 51244,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "bormaxi8080/osint-timeline",
+   "stars": 157,
+   "spdx_hint": null,
+   "size_kb": 120480,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "LeeBrotherston/badflare",
+   "stars": 156,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 13,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "T43cr0wl3r/OSINT-RECON",
+   "stars": 154,
+   "spdx_hint": null,
+   "size_kb": 237,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "tomoneill19/FacebookOSINT",
+   "stars": 148,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 32,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "cipher387/OSINT-and-Cybersecurity-accounts-in-Mastodon",
+   "stars": 145,
+   "spdx_hint": "MIT",
+   "size_kb": 68,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "bitPanG98/GeoSpy",
+   "stars": 145,
+   "spdx_hint": null,
+   "size_kb": 1098,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "rashidwassan/My-Ultimate-OSINT-Arsenal",
+   "stars": 144,
+   "spdx_hint": "MIT",
+   "size_kb": 15,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "sandialabs/dr_robot",
+   "stars": 143,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 6671,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "whoamitang/numint",
+   "stars": 140,
+   "spdx_hint": "MIT",
+   "size_kb": 105,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "The-Osint-Toolbox/The-OSINT-Toolbox",
+   "stars": 134,
+   "spdx_hint": null,
+   "size_kb": 134,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "amitrajputfff/Profil3r",
+   "stars": 133,
+   "spdx_hint": "MIT",
+   "size_kb": 170,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "lorien/awesome-osint",
+   "stars": 132,
+   "spdx_hint": null,
+   "size_kb": 73,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "thomasjjj/Obsidian-OSINT-Entity-Extractor",
+   "stars": 132,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 13998,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "SK-CERT/Taranis-NG",
+   "stars": 130,
+   "spdx_hint": "EUPL-1.2",
+   "size_kb": 23545,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Lazza/Carbon14",
+   "stars": 128,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 98,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "CYB3R-G0D/SPY",
+   "stars": 126,
+   "spdx_hint": "MIT",
+   "size_kb": 14,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Aidennnn33/cloudgazer",
+   "stars": 125,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 22,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "elliott-diy/Weather2Geo",
+   "stars": 124,
+   "spdx_hint": "MIT",
+   "size_kb": 2878,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "The-OSINT-Newsletter/OSINT-Tools-Library",
+   "stars": 118,
+   "spdx_hint": null,
+   "size_kb": 218464,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "cipher387/OSINT-Github-profiles",
+   "stars": 117,
+   "spdx_hint": null,
+   "size_kb": 19,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Gowtham-Darkseid/IntelTrace",
+   "stars": 111,
+   "spdx_hint": null,
+   "size_kb": 177,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "kienmarkdo/Telegram-OSINT-for-Cyber-Threat-Intelligence-Analysis",
+   "stars": 108,
+   "spdx_hint": null,
+   "size_kb": 1250,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "secgron/osint.sh",
+   "stars": 106,
+   "spdx_hint": "MIT",
+   "size_kb": 4,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "0xSojalSec/read-dark-web",
+   "stars": 102,
+   "spdx_hint": null,
+   "size_kb": 89,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "thumpersecure/Spin",
+   "stars": 97,
+   "spdx_hint": "Unlicense",
+   "size_kb": 951,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Cignoraptor-ita/cignotrack",
+   "stars": 94,
+   "spdx_hint": null,
+   "size_kb": 267,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "codeluu/blockchain-osint",
+   "stars": 93,
+   "spdx_hint": null,
+   "size_kb": 26,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "RocketGod-git/shodanbot",
+   "stars": 92,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 86,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "ranlo/OSINT-Tools-Israel",
+   "stars": 88,
+   "spdx_hint": null,
+   "size_kb": 25,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "GIANTcybernoob/infosec-cheat-sheets",
+   "stars": 88,
+   "spdx_hint": null,
+   "size_kb": 17959,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "t0mxplo1t/Mokuton",
+   "stars": 86,
+   "spdx_hint": null,
+   "size_kb": 16,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "TheCyberViking/Facebook_OSINT_Dump",
+   "stars": 82,
+   "spdx_hint": "MIT",
+   "size_kb": 16,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "cipher387/regex-for-OSINT",
+   "stars": 82,
+   "spdx_hint": "MIT",
+   "size_kb": 1699,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Th3Tr1ckst3r/GReverse",
+   "stars": 81,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 57,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "De-Technocrats/findigo",
+   "stars": 80,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 29,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "thumpersecure/Telespotter",
+   "stars": 80,
+   "spdx_hint": "MIT",
+   "size_kb": 704,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "OmphalosOSINT/OSINT-Playbook",
+   "stars": 79,
+   "spdx_hint": null,
+   "size_kb": 334,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "tzkuat/Ressources",
+   "stars": 79,
+   "spdx_hint": null,
+   "size_kb": 59,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "malek10xdev/igsearch-osint",
+   "stars": 78,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 161,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "stegman-ux/Butcher-Tools",
+   "stars": 78,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 454,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "teal33t/osint-notes",
+   "stars": 77,
+   "spdx_hint": null,
+   "size_kb": 334,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "N0rz3/SpyScraper",
+   "stars": 77,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 540,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "LinaYorda/OSINTtools",
+   "stars": 77,
+   "spdx_hint": null,
+   "size_kb": 10,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "PaulSec/skype-osint",
+   "stars": 76,
+   "spdx_hint": null,
+   "size_kb": 85,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "user421921/OSINTX",
+   "stars": 76,
+   "spdx_hint": null,
+   "size_kb": 2,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "WildSiphon/Mailfoguess",
+   "stars": 76,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 9564,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Whomrx666/osintgram",
+   "stars": 75,
+   "spdx_hint": null,
+   "size_kb": 278,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "techenthusiast167/OSINTMAILER-",
+   "stars": 75,
+   "spdx_hint": null,
+   "size_kb": 18,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "amberzovitis/GraphKer",
+   "stars": 75,
+   "spdx_hint": null,
+   "size_kb": 84,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "vixkram/OSINTBox-data",
+   "stars": 74,
+   "spdx_hint": "MIT",
+   "size_kb": 205,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "loseys/Goblyn",
+   "stars": 74,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 95,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "webdragon63/Mr.Holmes",
+   "stars": 73,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 3044,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "AnkhCorp/Snoop",
+   "stars": 73,
+   "spdx_hint": null,
+   "size_kb": 28,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "qurbat/upi-recon",
+   "stars": 73,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 72,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Prestonflatfooted659/Void-Tools-v2.0",
+   "stars": 73,
+   "spdx_hint": null,
+   "size_kb": 1355,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "techenthusiast167/INFOFINDER_PRO",
+   "stars": 73,
+   "spdx_hint": null,
+   "size_kb": 21,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "mgp25/OSINT-Tools",
+   "stars": 72,
+   "spdx_hint": "MIT",
+   "size_kb": 11,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "t0mxplo1t/IG-OSINT",
+   "stars": 72,
+   "spdx_hint": null,
+   "size_kb": 14,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "0xSojalSec/Telegram-OSINT",
+   "stars": 72,
+   "spdx_hint": null,
+   "size_kb": 3,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "assafkip/kipi",
+   "stars": 72,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 19793,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "SamueleAmato/OsintTube",
+   "stars": 71,
+   "spdx_hint": null,
+   "size_kb": 52,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "0x6rss/keklick",
+   "stars": 71,
+   "spdx_hint": "MIT",
+   "size_kb": 2700,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "SamueleAmato/Lawliet",
+   "stars": 71,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2017,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "dwisiswant0/stargather",
+   "stars": 71,
+   "spdx_hint": "MIT",
+   "size_kb": 9,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Whomrx666/Xtrack",
+   "stars": 70,
+   "spdx_hint": null,
+   "size_kb": 426,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "rix4uni/subdog",
+   "stars": 70,
+   "spdx_hint": "MIT",
+   "size_kb": 168,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "castlelemongrab/parlance",
+   "stars": 70,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 229,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "osintshifu/awesome-osint-repos",
+   "stars": 69,
+   "spdx_hint": "MIT",
+   "size_kb": 2602,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "26zl/cybersec-toolkit",
+   "stars": 69,
+   "spdx_hint": "MIT",
+   "size_kb": 12976,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "waffl3ss/NameSpi",
+   "stars": 68,
+   "spdx_hint": null,
+   "size_kb": 100,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "megadose/keskivonfer",
+   "stars": 68,
+   "spdx_hint": null,
+   "size_kb": 5614,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "victorpreston/bruteX",
+   "stars": 68,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 675,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "s-r-e-e-r-a-j/IPAnalyzer",
+   "stars": 67,
+   "spdx_hint": "MIT",
+   "size_kb": 24,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "mportatoes/venemy",
+   "stars": 66,
+   "spdx_hint": null,
+   "size_kb": 9453,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "GainSec/LeakScope",
+   "stars": 66,
+   "spdx_hint": "MIT",
+   "size_kb": 2318,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Niko13teen/SearchMyName",
+   "stars": 65,
+   "spdx_hint": "MIT",
+   "size_kb": 86,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "ndr-repo/DocuFinderJS",
+   "stars": 65,
+   "spdx_hint": "MIT",
+   "size_kb": 70,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "andersonsevla/OsintIA_Tools",
+   "stars": 64,
+   "spdx_hint": "MIT",
+   "size_kb": 108,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "silverxcyber/silvertgosint",
+   "stars": 64,
+   "spdx_hint": null,
+   "size_kb": 58,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "JLospinoso/unfurl",
+   "stars": 63,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 94,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "root7am/ReconXplorer",
+   "stars": 63,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 256,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "WhitePrime/OSINT-tool",
+   "stars": 62,
+   "spdx_hint": null,
+   "size_kb": 120,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Whomrx666/Osint-fb",
+   "stars": 61,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 193,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "RPxGoon/3TH1C4L-MultiTool",
+   "stars": 61,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 267,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "WildSiphon/Mailfogle",
+   "stars": 61,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 149707,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "rix4uni/xssrecon",
+   "stars": 61,
+   "spdx_hint": "MIT",
+   "size_kb": 219,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "0x90/osint-arsenal",
+   "stars": 60,
+   "spdx_hint": null,
+   "size_kb": 31,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "paulpogoda/OSINT-Tools-India",
+   "stars": 60,
+   "spdx_hint": null,
+   "size_kb": 5,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "badchars/osint-mcp-server",
+   "stars": 60,
+   "spdx_hint": "MIT",
+   "size_kb": 987,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Haax9/WaybackPDF",
+   "stars": 60,
+   "spdx_hint": null,
+   "size_kb": 4,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "aelew/lookup.tools",
+   "stars": 60,
+   "spdx_hint": "MIT",
+   "size_kb": 2419,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "CyberRoute/bruter",
+   "stars": 59,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 8939,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "The-Osint-Toolbox/OSINT-Toolbox-Peripherals",
+   "stars": 58,
+   "spdx_hint": null,
+   "size_kb": 121,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "sgxgsx/ViberOSINT",
+   "stars": 58,
+   "spdx_hint": null,
+   "size_kb": 49,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "yousseflahouifi/dorkish",
+   "stars": 58,
+   "spdx_hint": null,
+   "size_kb": 86,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "UnkL4b/GitMiner3",
+   "stars": 58,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 70,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "intelseclab/osintelligence",
+   "stars": 57,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 360,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "sc1341/Venmo-OSINT",
+   "stars": 57,
+   "spdx_hint": "MIT",
+   "size_kb": 9,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Gobutsu/MineSight",
+   "stars": 57,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 19,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "MythicStack/Python-Security-Tool-Database",
+   "stars": 57,
+   "spdx_hint": "MIT",
+   "size_kb": 49,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "rix4uni/uforall",
+   "stars": 57,
+   "spdx_hint": "MIT",
+   "size_kb": 54,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "atiilla/gitrecon",
+   "stars": 56,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 1219,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "sp34rh34d/GReal",
+   "stars": 56,
+   "spdx_hint": null,
+   "size_kb": 57,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "champmq/GoogleFU",
+   "stars": 56,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 24,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Cybersight-Security/OSINT-Toolkit",
+   "stars": 55,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1389,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "yogsec/Hardware-Hacking-Tools",
+   "stars": 55,
+   "spdx_hint": "MIT",
+   "size_kb": 105,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "internet-relay-chat/IRCP",
+   "stars": 55,
+   "spdx_hint": "ISC",
+   "size_kb": 1125,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "argcyberskillhub/OSINT-X",
+   "stars": 54,
+   "spdx_hint": null,
+   "size_kb": 106,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "andrew-vii/Entro.py",
+   "stars": 54,
+   "spdx_hint": null,
+   "size_kb": 27,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "kaan-44/DeadTrap",
+   "stars": 54,
+   "spdx_hint": "MIT",
+   "size_kb": 46,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "chm0dx/gitSome",
+   "stars": 54,
+   "spdx_hint": null,
+   "size_kb": 948,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "karndeepbaror/traceintel",
+   "stars": 54,
+   "spdx_hint": "MIT",
+   "size_kb": 77,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "voelspriet/aiwhisperer",
+   "stars": 54,
+   "spdx_hint": "CC0-1.0",
+   "size_kb": 327,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "theabhishekchandra/ZeroDroid",
+   "stars": 54,
+   "spdx_hint": "MIT",
+   "size_kb": 7866,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "jollncoelho/Zhetikal_OSINT_tracker",
+   "stars": 53,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 11487,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "culturally/Insta-OSINT",
+   "stars": 53,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 21,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "n0mi1k/certina",
+   "stars": 53,
+   "spdx_hint": "MIT",
+   "size_kb": 22,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "GONZOsint/trufflehog-explorer",
+   "stars": 53,
+   "spdx_hint": null,
+   "size_kb": 388,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "AjayAntoIsDev/WaSonar",
+   "stars": 53,
+   "spdx_hint": null,
+   "size_kb": 406,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Ringmast4r/Epstein",
+   "stars": 53,
+   "spdx_hint": null,
+   "size_kb": 4537125,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "akashblackhat/no-infoga.py",
+   "stars": 53,
+   "spdx_hint": "MIT",
+   "size_kb": 54,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "michaelelizarov/linkedin-osint-toolkit",
+   "stars": 52,
+   "spdx_hint": "MIT",
+   "size_kb": 7702,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "hiiruki/CheckRek",
+   "stars": 52,
+   "spdx_hint": "MIT",
+   "size_kb": 6,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "AnuragRoy485/Telegram-OSINT-Toolkit",
+   "stars": 52,
+   "spdx_hint": null,
+   "size_kb": 42,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "HackUnderway/meta_scan",
+   "stars": 52,
+   "spdx_hint": "MIT",
+   "size_kb": 3027,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "DAWA0/Dawa-Multitools",
+   "stars": 52,
+   "spdx_hint": null,
+   "size_kb": 7,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "nixintel/o365chk",
+   "stars": 51,
+   "spdx_hint": "MIT",
+   "size_kb": 20,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "v4resk/BreachCheck",
+   "stars": 51,
+   "spdx_hint": null,
+   "size_kb": 92,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Cyreslab-AI/shodan-mcp-server",
+   "stars": 51,
+   "spdx_hint": "MIT",
+   "size_kb": 175,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "rix4uni/originiphunter",
+   "stars": 51,
+   "spdx_hint": null,
+   "size_kb": 61,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "shogunlab/Gitformant",
+   "stars": 50,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 35,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "its0x08/IPTV-tool",
+   "stars": 50,
+   "spdx_hint": null,
+   "size_kb": 235,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "jipegit/Twintelligence",
+   "stars": 50,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 35,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "thepinguin073/osint-hub",
+   "stars": 50,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 9799,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "3xp0rt/Naminter",
+   "stars": 50,
+   "spdx_hint": "MIT",
+   "size_kb": 1655,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "MattMoony/d4v1d",
+   "stars": 50,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 3804,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "pakistanihackergroup/TERMUX-HACKING-",
+   "stars": 50,
+   "spdx_hint": null,
+   "size_kb": 16,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "HunxByts/SubDump",
+   "stars": 50,
+   "spdx_hint": "MIT",
+   "size_kb": 127,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "gokhancode/OSINT-Tools",
+   "stars": 49,
+   "spdx_hint": null,
+   "size_kb": 444,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "indiancyberops/Drishti",
+   "stars": 49,
+   "spdx_hint": "MIT",
+   "size_kb": 3869,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "rahulrajpl/netizenship",
+   "stars": 49,
+   "spdx_hint": "MIT",
+   "size_kb": 7462,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "megadose/cqfd",
+   "stars": 49,
+   "spdx_hint": null,
+   "size_kb": 2436,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "CyberNDR/PhoNumSpy",
+   "stars": 49,
+   "spdx_hint": "MIT",
+   "size_kb": 18,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "thecnical/cybermind",
+   "stars": 49,
+   "spdx_hint": "MIT",
+   "size_kb": 915369,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "mathis2001/WebHackUrls",
+   "stars": 48,
+   "spdx_hint": null,
+   "size_kb": 46,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "asharbinkhalil/khoji",
+   "stars": 48,
+   "spdx_hint": null,
+   "size_kb": 1032,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "777genius/social-monitor",
+   "stars": 48,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 96540,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "citcheese/ODBParser",
+   "stars": 47,
+   "spdx_hint": "MIT",
+   "size_kb": 1027,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "feedphantom/InfoHunter",
+   "stars": 47,
+   "spdx_hint": "MIT",
+   "size_kb": 2564,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "blacklanternsecurity/webcap",
+   "stars": 47,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 698,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "0xNayel/MonMon",
+   "stars": 47,
+   "spdx_hint": "MIT",
+   "size_kb": 1872,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Muhib-Mehdi/OSINT-NEXUS",
+   "stars": 46,
+   "spdx_hint": null,
+   "size_kb": 1192,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "fabacab/fetlife-maltego",
+   "stars": 46,
+   "spdx_hint": null,
+   "size_kb": 43,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "brandonhimpfen/awesome-osint",
+   "stars": 45,
+   "spdx_hint": null,
+   "size_kb": 49,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "phishontop/bloxsint",
+   "stars": 45,
+   "spdx_hint": null,
+   "size_kb": 33,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "culturally/yin-Omega",
+   "stars": 45,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 51180,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "mitocondria40/OSINT-dork-tool",
+   "stars": 44,
+   "spdx_hint": null,
+   "size_kb": 158389,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "The-Osint-Toolbox/Company-Business-OSINT",
+   "stars": 44,
+   "spdx_hint": null,
+   "size_kb": 44,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Kirozaku/Wiwok",
+   "stars": 44,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 100,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "A3-N/xpfarm",
+   "stars": 44,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 2684,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "rly0nheart/thorndyke",
+   "stars": 44,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 103,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "ubikron/Awesome-OSINT-Lists",
+   "stars": 43,
+   "spdx_hint": null,
+   "size_kb": 21,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "coldvisionz/osint-investigation",
+   "stars": 43,
+   "spdx_hint": null,
+   "size_kb": 54,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "aenoshrajora/OSINTel-Dashboard",
+   "stars": 43,
+   "spdx_hint": "MIT",
+   "size_kb": 122,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "ericalexanderorg/should-i-trust",
+   "stars": 43,
+   "spdx_hint": null,
+   "size_kb": 410,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "pollonegro/eyeOnTheSky",
+   "stars": 43,
+   "spdx_hint": null,
+   "size_kb": 8079,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Coordinate-Cat/OSINT-JAPAN",
+   "stars": 43,
+   "spdx_hint": null,
+   "size_kb": 1790,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "AnonKryptiQuz/TimeVault",
+   "stars": 43,
+   "spdx_hint": null,
+   "size_kb": 4,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "SirCryptic/autoexif",
+   "stars": 43,
+   "spdx_hint": "MIT",
+   "size_kb": 10531,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "azurejoga/osint-explorer",
+   "stars": 42,
+   "spdx_hint": "MIT",
+   "size_kb": 410,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "RojanSapkota/osint-terminal",
+   "stars": 42,
+   "spdx_hint": "MIT",
+   "size_kb": 2485,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Hackerd-825/RedTiger-Tools",
+   "stars": 42,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 6445,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "zidansec/subscan",
+   "stars": 42,
+   "spdx_hint": "MIT",
+   "size_kb": 16,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "soxoj/CommiPiste",
+   "stars": 42,
+   "spdx_hint": "MIT",
+   "size_kb": 168,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "HackingLZ/saas_enum",
+   "stars": 42,
+   "spdx_hint": "MIT",
+   "size_kb": 22,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "HackUnderway/UsernameSearchOSINT",
+   "stars": 41,
+   "spdx_hint": "MIT",
+   "size_kb": 998,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "hitesh22rana/ghoulbond",
+   "stars": 41,
+   "spdx_hint": null,
+   "size_kb": 110,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "david3107/squatm3",
+   "stars": 41,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 60,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "umair9747/headmail",
+   "stars": 41,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1188,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "evildevill/instainfo",
+   "stars": 41,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 104,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Hyldem0er/Skirnir",
+   "stars": 41,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 8191,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "xaynov-osint/txfetch",
+   "stars": 41,
+   "spdx_hint": "MIT",
+   "size_kb": 708,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "afolivieri/streaming_overseer",
+   "stars": 40,
+   "spdx_hint": null,
+   "size_kb": 23,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "MrCl0wnLab/SimpleReconSubdomain",
+   "stars": 40,
+   "spdx_hint": null,
+   "size_kb": 5388,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "stellaryx-labs/awesome-space-osint",
+   "stars": 40,
+   "spdx_hint": "CC0-1.0",
+   "size_kb": 1058,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "drooling/phosint",
+   "stars": 40,
+   "spdx_hint": null,
+   "size_kb": 14,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "paulpogoda/OSINT-Tools-Kazakhstan",
+   "stars": 40,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 194,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Faizan-Khanx/TracingDarkWebAndBlockChain",
+   "stars": 40,
+   "spdx_hint": "MIT",
+   "size_kb": 15,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "joe444-pnj/saintgram",
+   "stars": 40,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 60,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Ashmmmm/crockTail",
+   "stars": 40,
+   "spdx_hint": null,
+   "size_kb": 83,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "BrsDincer/Dark_OSINT_AI",
+   "stars": 39,
+   "spdx_hint": null,
+   "size_kb": 23,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "paulpogoda/OSINT-Tools-China",
+   "stars": 39,
+   "spdx_hint": null,
+   "size_kb": 57,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "n0skill/AVOSINT",
+   "stars": 39,
+   "spdx_hint": null,
+   "size_kb": 293,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "4m3rr0r/BreachHunter",
+   "stars": 39,
+   "spdx_hint": "MIT",
+   "size_kb": 657,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Tech-Sec/InfoG",
+   "stars": 39,
+   "spdx_hint": null,
+   "size_kb": 512,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Krypteria/Seekolver",
+   "stars": 39,
+   "spdx_hint": null,
+   "size_kb": 52,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "e-m3din4/wigle-bt",
+   "stars": 39,
+   "spdx_hint": "MIT",
+   "size_kb": 10,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "TheCyberpunker/OSINT",
+   "stars": 38,
+   "spdx_hint": null,
+   "size_kb": 24,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "paulpogoda/OSINT-Tools-Australia",
+   "stars": 38,
+   "spdx_hint": null,
+   "size_kb": 35,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "thd3r/fakjs",
+   "stars": 38,
+   "spdx_hint": "MIT",
+   "size_kb": 131,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "SOsintOps/Exploratores",
+   "stars": 38,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 100286,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "sametsazak/linkedinscraper",
+   "stars": 38,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 653,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "restanse/NicknameFinder",
+   "stars": 37,
+   "spdx_hint": "MIT",
+   "size_kb": 21,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "danieldurnea/OSINT-Resources",
+   "stars": 37,
+   "spdx_hint": null,
+   "size_kb": 2352,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "PaulSec/API-InstagramLocation",
+   "stars": 37,
+   "spdx_hint": null,
+   "size_kb": 152,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "BC100Dev/osintgram4j",
+   "stars": 37,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 3219,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "CScorza/CStools",
+   "stars": 37,
+   "spdx_hint": null,
+   "size_kb": 65,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "RetroPackets/Fugitive",
+   "stars": 37,
+   "spdx_hint": null,
+   "size_kb": 2221,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "e-m3din4/wigle-wifi",
+   "stars": 37,
+   "spdx_hint": "MIT",
+   "size_kb": 15,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "ruarxive/metawarc",
+   "stars": 37,
+   "spdx_hint": "MIT",
+   "size_kb": 2059,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "paulpogoda/OSINT-Tools-North-Korea",
+   "stars": 36,
+   "spdx_hint": null,
+   "size_kb": 36,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "charliebrassington/one",
+   "stars": 36,
+   "spdx_hint": null,
+   "size_kb": 73,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Dutchosintguy/OSINT-timeline",
+   "stars": 35,
+   "spdx_hint": null,
+   "size_kb": 41,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "MrHacker-X/OsintifyX",
+   "stars": 35,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 4015,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "asharbinkhalil/gumshoe",
+   "stars": 35,
+   "spdx_hint": null,
+   "size_kb": 241,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "pasknel/beholder",
+   "stars": 35,
+   "spdx_hint": null,
+   "size_kb": 4209,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "nyxgeek/cloudkicker",
+   "stars": 35,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 4623,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "rly0nheart/occli",
+   "stars": 35,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 116,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "MischaU8/spevktator",
+   "stars": 35,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 260,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "spider863644/Forensight",
+   "stars": 35,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 292,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "jagdishtripathy/ctf-helper",
+   "stars": 35,
+   "spdx_hint": "MIT",
+   "size_kb": 450,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "scarlmao/peepler",
+   "stars": 35,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 500,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "NickQuelloVero/ARGUS",
+   "stars": 35,
+   "spdx_hint": null,
+   "size_kb": 1541,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "NextKool/Osintgram",
+   "stars": 34,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 852,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "powerexploit/MailBomber",
+   "stars": 34,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 20,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Frontline-Femmes/Steam-OSINT",
+   "stars": 34,
+   "spdx_hint": "MIT",
+   "size_kb": 58,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "l0n3m4n/SearchToolkit",
+   "stars": 34,
+   "spdx_hint": "MIT",
+   "size_kb": 4857,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Flintgliboom/OSINT-Tool-For-TG",
+   "stars": 34,
+   "spdx_hint": "MIT",
+   "size_kb": 328,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "ravenastar-js/social-id",
+   "stars": 34,
+   "spdx_hint": "MIT",
+   "size_kb": 2311,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "cipher387/awesome-overpass-turbo",
+   "stars": 34,
+   "spdx_hint": "MIT",
+   "size_kb": 41,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "sobri3195/pegasus-lacak-ultimate",
+   "stars": 34,
+   "spdx_hint": null,
+   "size_kb": 37,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "vulnbe/github-osint",
+   "stars": 33,
+   "spdx_hint": "MIT",
+   "size_kb": 9,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "sh1katagana1/osint",
+   "stars": 33,
+   "spdx_hint": null,
+   "size_kb": 2532,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "SagarBiswas-MultiHAT/Phoneint-OSINT-Toolkit",
+   "stars": 33,
+   "spdx_hint": "MIT",
+   "size_kb": 143,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "soxoj/maigret-adapter",
+   "stars": 33,
+   "spdx_hint": "MIT",
+   "size_kb": 303,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "turbo-hackers/Insta-Recon",
+   "stars": 33,
+   "spdx_hint": null,
+   "size_kb": 179,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Achik-Ahmed/IG-OSINT-V2",
+   "stars": 33,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 26,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "HPx12/Doxx",
+   "stars": 33,
+   "spdx_hint": null,
+   "size_kb": 465,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "ninoseki/iocingestor",
+   "stars": 33,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 322,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Myskiv-Ivan/SecTools",
+   "stars": 33,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 115,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "r3mlab/tweetsmapper",
+   "stars": 33,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1125,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "chiasmod0n/chiasmodon-mobile",
+   "stars": 33,
+   "spdx_hint": null,
+   "size_kb": 593,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "mrofcodyx/gxsuid",
+   "stars": 33,
+   "spdx_hint": "MIT",
+   "size_kb": 6846,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "UPinar/contrastapi",
+   "stars": 33,
+   "spdx_hint": "MIT",
+   "size_kb": 3102,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "SagarBiswas-MultiHAT/SagarBiswas-MultiHAT",
+   "stars": 33,
+   "spdx_hint": "MIT",
+   "size_kb": 3903,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "FadeHack/strypt",
+   "stars": 33,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 2441,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "vehbiu/go-osint",
+   "stars": 32,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 38,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "campwill/osint-dashboard",
+   "stars": 32,
+   "spdx_hint": null,
+   "size_kb": 5502,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "CodingRanjith/cybersec",
+   "stars": 32,
+   "spdx_hint": "MIT",
+   "size_kb": 2470,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Sachaaaaaa/Grhoth",
+   "stars": 32,
+   "spdx_hint": null,
+   "size_kb": 32,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "HJ23/Raptor",
+   "stars": 32,
+   "spdx_hint": "MIT",
+   "size_kb": 123,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "0xbharath/datasploit",
+   "stars": 32,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 4049,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "atlas-bear/osint-tools",
+   "stars": 31,
+   "spdx_hint": "MIT",
+   "size_kb": 124,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "rmdir-rp/OSINT-twitter-tools",
+   "stars": 31,
+   "spdx_hint": null,
+   "size_kb": 5,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "paulpogoda/OSINT-Tools-Emirates",
+   "stars": 31,
+   "spdx_hint": null,
+   "size_kb": 36,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Frikallo/footprint",
+   "stars": 31,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1460,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "44za12/mailsleuth",
+   "stars": 31,
+   "spdx_hint": null,
+   "size_kb": 45,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "paulpogoda/OSINT-Tools-UK",
+   "stars": 30,
+   "spdx_hint": null,
+   "size_kb": 31,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "yusiqo/telegram-osint",
+   "stars": 30,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 73,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Damian89/commonCrawlParser",
+   "stars": 30,
+   "spdx_hint": "MIT",
+   "size_kb": 14,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "laitoxx/Laitoxx-Multi-Tool",
+   "stars": 30,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 37729,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "rangertaha/urlinsane",
+   "stars": 30,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 404556,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "kawaiipantsu/redjoust",
+   "stars": 30,
+   "spdx_hint": "MIT",
+   "size_kb": 4087,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "fchr80/deepkrak3n",
+   "stars": 29,
+   "spdx_hint": "MIT",
+   "size_kb": 138409,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "EchterAlsFake/Osintgram2",
+   "stars": 29,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 181,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "humandecoded/FBI_Watchdog",
+   "stars": 29,
+   "spdx_hint": "MIT",
+   "size_kb": 3333,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "0xrajneesh/OSINT-Projects-for-Beginners",
+   "stars": 29,
+   "spdx_hint": null,
+   "size_kb": 15,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "meico-wq/fufufafa",
+   "stars": 29,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 230,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "SirYadav1/AdwanceSNI-2.0",
+   "stars": 29,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 172,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "data-hunters/metadata-digger",
+   "stars": 29,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 6680,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "NERVsystems/osmmcp",
+   "stars": 29,
+   "spdx_hint": "MIT",
+   "size_kb": 34403,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "theahmadov/DISCOS",
+   "stars": 29,
+   "spdx_hint": null,
+   "size_kb": 11853,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "UjsGit/Notes-on-OSINT",
+   "stars": 28,
+   "spdx_hint": null,
+   "size_kb": 86,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "redsecurityfr/WPint",
+   "stars": 28,
+   "spdx_hint": null,
+   "size_kb": 58,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "SagarBiswas-MultiHAT/osint-exposure-toolkit",
+   "stars": 28,
+   "spdx_hint": null,
+   "size_kb": 1661,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "reconurge/reconcrawl",
+   "stars": 28,
+   "spdx_hint": "MIT",
+   "size_kb": 25,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "DavidJKTofan/CyberSec-resources",
+   "stars": 28,
+   "spdx_hint": null,
+   "size_kb": 182900,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "SirCryptic/cwv-scanner",
+   "stars": 28,
+   "spdx_hint": "MIT",
+   "size_kb": 115,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "SagarBiswas-MultiHAT/attack-surface-toolkit",
+   "stars": 28,
+   "spdx_hint": null,
+   "size_kb": 1646,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "ajuelosemmanuel/philINT",
+   "stars": 28,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 63,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "cybersecify/OpenEASD",
+   "stars": 28,
+   "spdx_hint": "MIT",
+   "size_kb": 17293,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "mouteee/jsrip",
+   "stars": 28,
+   "spdx_hint": "CC-BY-SA-4.0",
+   "size_kb": 399,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "SagarBiswas-MultiHAT/The-BlackHAT-roadmap",
+   "stars": 28,
+   "spdx_hint": "MIT",
+   "size_kb": 152885,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "pentestfunctions/OSINT-MasterTool",
+   "stars": 27,
+   "spdx_hint": null,
+   "size_kb": 6724,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "rxerium/bug-bounty-tools",
+   "stars": 27,
+   "spdx_hint": null,
+   "size_kb": 12,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Orange-OpenSource/floss-toolbox",
+   "stars": 27,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 902,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "therealaleph/OSINT",
+   "stars": 27,
+   "spdx_hint": null,
+   "size_kb": 34,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "vaginessa/essential-osint",
+   "stars": 27,
+   "spdx_hint": null,
+   "size_kb": 249,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Mr-Pstar7/Preview-DarkStar",
+   "stars": 27,
+   "spdx_hint": null,
+   "size_kb": 43,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "armourinfosec/Python-for-Security-Professionals",
+   "stars": 27,
+   "spdx_hint": "CC-BY-4.0",
+   "size_kb": 883,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "OsintMeThat/azimut",
+   "stars": 27,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 37219,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "xtrafr/webdna",
+   "stars": 27,
+   "spdx_hint": "MIT",
+   "size_kb": 3937,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "SagarBiswas-MultiHAT/awesome-cybersecurity-paths",
+   "stars": 27,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 462,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "TheCyberIndia/OSINT-TOOLs",
+   "stars": 26,
+   "spdx_hint": null,
+   "size_kb": 11,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "neox41/os4tw",
+   "stars": 26,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 622,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "techenthusiast167/NAIJA-OSINT-SOCIAL-SEARCH",
+   "stars": 26,
+   "spdx_hint": null,
+   "size_kb": 10,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "techenthusiast167/MASTER-OSINTv4-",
+   "stars": 26,
+   "spdx_hint": null,
+   "size_kb": 60,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Med0-n/Midins_Titan-Osint_Tool",
+   "stars": 26,
+   "spdx_hint": null,
+   "size_kb": 111,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "R3DRUN3/nostro",
+   "stars": 26,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 395,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Blackleets/aegis",
+   "stars": 26,
+   "spdx_hint": "MIT",
+   "size_kb": 7920,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "JavideSs/insta-extract",
+   "stars": 26,
+   "spdx_hint": "Unlicense",
+   "size_kb": 119,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "beshketnyksirka/DiscordOSINT",
+   "stars": 26,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 222,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Aravindha1234u/Probe_spider",
+   "stars": 26,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 228,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "krishpranav/emailosint",
+   "stars": 26,
+   "spdx_hint": null,
+   "size_kb": 27,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "n0kovo/DomainDouche",
+   "stars": 26,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 42,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "odaysec/Cybersec",
+   "stars": 26,
+   "spdx_hint": "MIT",
+   "size_kb": 385,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "caetano-dev/Gopher-Find",
+   "stars": 26,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 13377,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "yogsec/DorkTerm",
+   "stars": 26,
+   "spdx_hint": "MIT",
+   "size_kb": 169,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "rhinonix/equasis-cli",
+   "stars": 26,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 777,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "WHOISshuvam/gotld",
+   "stars": 26,
+   "spdx_hint": null,
+   "size_kb": 151,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "elementalsouls/SubdomainX",
+   "stars": 25,
+   "spdx_hint": null,
+   "size_kb": 513,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Faizee-Asad/InstaRecon",
+   "stars": 25,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 81,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Whomrx666/Whatsapp-Osint",
+   "stars": 25,
+   "spdx_hint": "MIT",
+   "size_kb": 1929,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "mathis2001/Cert4Recon",
+   "stars": 25,
+   "spdx_hint": null,
+   "size_kb": 42,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "thalha-a9/helix",
+   "stars": 25,
+   "spdx_hint": "MIT",
+   "size_kb": 577,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "Mohamad-Mortada/Osintgram",
+   "stars": 25,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 3603,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "ctkqiang/MalaysianOSINT",
+   "stars": 25,
+   "spdx_hint": "MIT",
+   "size_kb": 51794,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "iamankeshsharma/LittleBrother-GUI-",
+   "stars": 25,
+   "spdx_hint": "MIT",
+   "size_kb": 14325,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "AbdaullahAG/ThreatLens",
+   "stars": 25,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 702,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "AnonCatalyst/DepthSearch",
+   "stars": 25,
+   "spdx_hint": "MIT",
+   "size_kb": 33,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "N0tA1dan/Crab",
+   "stars": 25,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 82,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "jomoza/Offensive_Callback",
+   "stars": 25,
+   "spdx_hint": null,
+   "size_kb": 19641,
+   "fork": false,
+   "discovery": "keyword:osint tool stars:>=25"
+  },
+  {
+   "repo": "pwn-college/.github",
+   "stars": 0,
+   "spdx_hint": null,
+   "size_kb": 1,
+   "fork": false,
+   "discovery": "curated-org:pwn-college"
+  },
+  {
+   "repo": "Gallopsled/pwntools",
+   "stars": 13754,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 29024,
+   "fork": false,
+   "discovery": "curated-org:Gallopsled"
+  },
+  {
+   "repo": "Gallopsled/pwncrypto",
+   "stars": 22,
+   "spdx_hint": null,
+   "size_kb": 160,
+   "fork": false,
+   "discovery": "curated-org:Gallopsled"
+  },
+  {
+   "repo": "Gallopsled/pwntools-write-ups",
+   "stars": 529,
+   "spdx_hint": "MIT",
+   "size_kb": 7830,
+   "fork": false,
+   "discovery": "curated-org:Gallopsled"
+  },
+  {
+   "repo": "Gallopsled/pwntools-regression",
+   "stars": 9,
+   "spdx_hint": "MIT",
+   "size_kb": 224,
+   "fork": false,
+   "discovery": "curated-org:Gallopsled"
+  },
+  {
+   "repo": "Gallopsled/Stregsystem-Server",
+   "stars": 2,
+   "spdx_hint": null,
+   "size_kb": 120,
+   "fork": false,
+   "discovery": "curated-org:Gallopsled"
+  },
+  {
+   "repo": "Gallopsled/pwntools-binutils",
+   "stars": 84,
+   "spdx_hint": "MIT",
+   "size_kb": 31,
+   "fork": false,
+   "discovery": "curated-org:Gallopsled"
+  },
+  {
+   "repo": "Gallopsled/pwntools-tutorial",
+   "stars": 1590,
+   "spdx_hint": "MIT",
+   "size_kb": 87,
+   "fork": false,
+   "discovery": "curated-org:Gallopsled"
+  },
+  {
+   "repo": "Gallopsled/pwntools-gdb-travis-ci",
+   "stars": 1,
+   "spdx_hint": null,
+   "size_kb": 74993,
+   "fork": false,
+   "discovery": "curated-org:Gallopsled"
+  },
+  {
+   "repo": "Gallopsled/gallopsled.github.io",
+   "stars": 3,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 4960,
+   "fork": false,
+   "discovery": "curated-org:Gallopsled"
+  },
+  {
+   "repo": "SpecterOps/BloodHound-Legacy",
+   "stars": 10610,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 190012,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/chronology",
+   "stars": 16,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 60,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/at-ps",
+   "stars": 1611,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 90288,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/abstractionmaps",
+   "stars": 0,
+   "spdx_hint": null,
+   "size_kb": 0,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/ipc-research",
+   "stars": 28,
+   "spdx_hint": null,
+   "size_kb": 16181,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/presentations",
+   "stars": 232,
+   "spdx_hint": null,
+   "size_kb": 634760,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/SharpHoundCommon",
+   "stars": 105,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 32508,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/SharpHound",
+   "stars": 1363,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 464,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/AzureHound",
+   "stars": 968,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1317,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/CLA",
+   "stars": 2,
+   "spdx_hint": null,
+   "size_kb": 202,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/specterops",
+   "stars": 9,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 1616,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/.github",
+   "stars": 0,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 5254,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/Nemesis",
+   "stars": 1007,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 64216,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/BloodHound",
+   "stars": 3482,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 2689855,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/TierZeroTable",
+   "stars": 280,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 406,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/bhe-code-exercise",
+   "stars": 0,
+   "spdx_hint": null,
+   "size_kb": 424,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/ghostwriter-oplog-populate",
+   "stars": 1,
+   "spdx_hint": null,
+   "size_kb": 319,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/bloodhound-go-sdk",
+   "stars": 2,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 560,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/bloodhound-python-sdk",
+   "stars": 0,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 294,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/cred1py",
+   "stars": 173,
+   "spdx_hint": null,
+   "size_kb": 267,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/bloodhound-cli",
+   "stars": 125,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 334,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/specterops.github.io",
+   "stars": 1,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 4000,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/CredentialShuffle",
+   "stars": 9,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 20705,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/BloodHoundQueryLibrary",
+   "stars": 208,
+   "spdx_hint": "MIT",
+   "size_kb": 921,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/ghost_scout",
+   "stars": 14,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1071,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/bloodhound-docs",
+   "stars": 31,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 117055,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/DAWGS",
+   "stars": 21,
+   "spdx_hint": "MIT",
+   "size_kb": 14845,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/GitHound",
+   "stars": 148,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 8758,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/SnowHound",
+   "stars": 23,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1552,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/1PassHound",
+   "stars": 19,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1987,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/MSSQLHound",
+   "stars": 347,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 11365,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/JamfHound",
+   "stars": 138,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 619,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/ConfigManBearPig",
+   "stars": 153,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 4731,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/EntraSSSOHound",
+   "stars": 15,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 143,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/DeepPass2",
+   "stars": 48,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 60,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/SpecterOpsDocs",
+   "stars": 2,
+   "spdx_hint": null,
+   "size_kb": 59772,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/SCOMHound",
+   "stars": 45,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 50,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/pass-the-passkey",
+   "stars": 232,
+   "spdx_hint": "MIT",
+   "size_kb": 2921,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/chow",
+   "stars": 8,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 92,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/openhound-jamf",
+   "stars": 3,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 4011,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/bloodhound-scim-extension",
+   "stars": 3,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 605,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/skills",
+   "stars": 706,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 77968,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/OktaHound",
+   "stars": 17,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 3081,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/WSFCHound",
+   "stars": 5,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 75,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/OpenHound-template",
+   "stars": 2,
+   "spdx_hint": "MIT",
+   "size_kb": 3246,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/og-docs-automation",
+   "stars": 5,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 391,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/kraken",
+   "stars": 23,
+   "spdx_hint": null,
+   "size_kb": 10252,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/Oracle",
+   "stars": 3,
+   "spdx_hint": null,
+   "size_kb": 1241,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/Janus",
+   "stars": 59,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 26329,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/OpenHound",
+   "stars": 31,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 3934,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/openhound-github",
+   "stars": 3,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 4492,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/openhound-okta",
+   "stars": 1,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 4421,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/go-repl",
+   "stars": 0,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 31,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/offensive-reasoning-index",
+   "stars": 0,
+   "spdx_hint": null,
+   "size_kb": 4105,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/Jailbreaker-CE",
+   "stars": 111,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 1901,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/so-aws-lab",
+   "stars": 2,
+   "spdx_hint": "MIT",
+   "size_kb": 202,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/homebrew-labs",
+   "stars": 0,
+   "spdx_hint": null,
+   "size_kb": 0,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/test-pub-repo",
+   "stars": 0,
+   "spdx_hint": null,
+   "size_kb": 0,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/Blacklight",
+   "stars": 86,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 3298,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "SpecterOps/pr-size-check",
+   "stars": 0,
+   "spdx_hint": null,
+   "size_kb": 6,
+   "fork": false,
+   "discovery": "curated-org:specterops"
+  },
+  {
+   "repo": "nccgroup/keimpx",
+   "stars": 268,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 3444,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/tcpprox",
+   "stars": 155,
+   "spdx_hint": null,
+   "size_kb": 29,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/grepify",
+   "stars": 23,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 7620,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/pip3line",
+   "stars": 43,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 1820,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/hostresolver",
+   "stars": 13,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 304,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ncccodenavi",
+   "stars": 54,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 8759,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/IP-reputation-snort-rule-generator",
+   "stars": 57,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 145,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/metasploitavevasion",
+   "stars": 256,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 51,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/vlan-hopping---frogger",
+   "stars": 391,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 35,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/cisco-SNMP-enumeration",
+   "stars": 226,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 151,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/port-scan-automation",
+   "stars": 139,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 152,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/whitebox",
+   "stars": 7,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 36576,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/lapith",
+   "stars": 50,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 154,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/easyda",
+   "stars": 52,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 161,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/firstexecution",
+   "stars": 16,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 9364,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/dotnetpefuzzing",
+   "stars": 12,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 128,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/liblapith",
+   "stars": 5,
+   "spdx_hint": "LGPL-3.0",
+   "size_kb": 112,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ssh_user_enum",
+   "stars": 95,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 17,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/dotnetpaddingoracle",
+   "stars": 31,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 26,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/winauthlib",
+   "stars": 9,
+   "spdx_hint": "LGPL-3.0",
+   "size_kb": 74,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/fat-finger",
+   "stars": 16,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 64,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/lendal",
+   "stars": 8,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 148,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/scenester",
+   "stars": 31,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 37810,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/44Con2013Game",
+   "stars": 8,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 2056,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/creep-web-app-scanner",
+   "stars": 24,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 560,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/umap",
+   "stars": 294,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 1342,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/WindowsDACLEnumProject",
+   "stars": 111,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 399,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/memgrep",
+   "stars": 44,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 340,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/xcavator",
+   "stars": 33,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 132,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/tybocer",
+   "stars": 19,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 548,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/EDIDFuzzer",
+   "stars": 19,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 884,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/FrisbeeLite",
+   "stars": 65,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 1932,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/CECster",
+   "stars": 31,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 1184,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/WindowsJobLock",
+   "stars": 70,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 160,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Scout2",
+   "stars": 1718,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 3191,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/typofinder",
+   "stars": 166,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 31916,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/vbrute",
+   "stars": 22,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 132,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/memaddressanalysis",
+   "stars": 14,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 400,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Zulu",
+   "stars": 125,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 2504,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/DIBF",
+   "stars": 127,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 13862,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ncloader",
+   "stars": 76,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 420,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/WinShareEnum",
+   "stars": 128,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 535,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/LoggerPlusPlus",
+   "stars": 711,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 2206,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/burp-reflux",
+   "stars": 12,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 156,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/matt.net",
+   "stars": 8,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 870,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/WhoWasI",
+   "stars": 35,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 294,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/UPnP-Pentest-Toolkit",
+   "stars": 262,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 2819,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/WebFEET",
+   "stars": 78,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 813,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/GrepifyProfiles",
+   "stars": 14,
+   "spdx_hint": null,
+   "size_kb": 109,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Watson",
+   "stars": 12,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 102,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Baskerville",
+   "stars": 5,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 510,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Mortimer",
+   "stars": 12,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 111,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/nccgroup.github.io",
+   "stars": 5,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 0,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/shocker",
+   "stars": 327,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 100,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Cisco-SNMP-Slap",
+   "stars": 59,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 136,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/IODIDE",
+   "stars": 79,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 3324,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/diskwalker",
+   "stars": 19,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 115,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/WindowsFirewallHookDriverEnumeration",
+   "stars": 21,
+   "spdx_hint": null,
+   "size_kb": 178,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/VCG",
+   "stars": 552,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 9405,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/WindowClicker",
+   "stars": 16,
+   "spdx_hint": null,
+   "size_kb": 17068,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/CrossSiteContentHijacking",
+   "stars": 385,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 219,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/SetCookieAnalysisInBrowsers",
+   "stars": 10,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 328,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/WindowsPatchDetector",
+   "stars": 23,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 144,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/AWS-recipes",
+   "stars": 192,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 210,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/loki",
+   "stars": 63,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 60,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Sleipnir",
+   "stars": 27,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 173,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Fenrir",
+   "stars": 67,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 202,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/opinel",
+   "stars": 24,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 428,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/autopwn",
+   "stars": 387,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 633,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/pcap-burp",
+   "stars": 114,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 4709,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/RFTM",
+   "stars": 90,
+   "spdx_hint": null,
+   "size_kb": 8763,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Untrue",
+   "stars": 42,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 579,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/NCCOpenSourcePolicy",
+   "stars": 5,
+   "spdx_hint": "CC-BY-SA-4.0",
+   "size_kb": 116,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/AMFDSer-ngng",
+   "stars": 27,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 2313,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/JDSer-ngng",
+   "stars": 26,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 651,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/WCFDSer-ngng",
+   "stars": 30,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 234,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/autoserve",
+   "stars": 9,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 7149,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/memscan",
+   "stars": 128,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 178,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/libtalloc",
+   "stars": 17,
+   "spdx_hint": null,
+   "size_kb": 132,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Winpayloads",
+   "stars": 1623,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 23947,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/chuckle",
+   "stars": 151,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 13,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Cyber-Defence",
+   "stars": 475,
+   "spdx_hint": null,
+   "size_kb": 120162,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/holepuncher",
+   "stars": 33,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 4,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/featherduster",
+   "stars": 1140,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 786,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Hodor",
+   "stars": 129,
+   "spdx_hint": null,
+   "size_kb": 30,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/umap2",
+   "stars": 287,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 663,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/TriforceAFL",
+   "stars": 644,
+   "spdx_hint": null,
+   "size_kb": 34848,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/TriforceLinuxSyscallFuzzer",
+   "stars": 179,
+   "spdx_hint": null,
+   "size_kb": 2390,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ransomware-simulator",
+   "stars": 70,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 310,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/The_Automotive_Threat_Modeling_Template",
+   "stars": 49,
+   "spdx_hint": null,
+   "size_kb": 2289,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/BLESuite",
+   "stars": 192,
+   "spdx_hint": "MIT",
+   "size_kb": 7058,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/BLESuite-CLI",
+   "stars": 34,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 14,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/BLE-Replay",
+   "stars": 152,
+   "spdx_hint": null,
+   "size_kb": 24,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ABPTTS",
+   "stars": 742,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 6556,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/BinProxy",
+   "stars": 176,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 125,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/TriforceOpenBSDFuzzer",
+   "stars": 47,
+   "spdx_hint": null,
+   "size_kb": 44,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/nOBEX",
+   "stars": 99,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 275,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/DriverBuddy",
+   "stars": 383,
+   "spdx_hint": "MIT",
+   "size_kb": 15,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/redsnarf",
+   "stars": 1221,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 14251,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Berserko",
+   "stars": 106,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 696,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/jmxbf",
+   "stars": 35,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 72,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/SCOMDecrypt",
+   "stars": 131,
+   "spdx_hint": null,
+   "size_kb": 27,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/autochrome",
+   "stars": 482,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 541,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/call_map",
+   "stars": 29,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 385,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/assethook",
+   "stars": 83,
+   "spdx_hint": "BSD-2-Clause",
+   "size_kb": 6251,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/mnemosyne",
+   "stars": 69,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 66,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/wssip",
+   "stars": 451,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 2238,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/kube-auto-analyzer",
+   "stars": 191,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 348,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/sobelow",
+   "stars": 1795,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1395,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/WMIcmd",
+   "stars": 332,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 133,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/LazyDroid",
+   "stars": 160,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 14188,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Decoder-Improved",
+   "stars": 138,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 22275,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/thingernet-graph",
+   "stars": 7,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 15,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/G-Scout",
+   "stars": 236,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 179,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/libdlmalloc",
+   "stars": 32,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 26,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/libptmalloc",
+   "stars": 46,
+   "spdx_hint": "MIT",
+   "size_kb": 936,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/libmempool",
+   "stars": 13,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 32,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/gitpwnd",
+   "stars": 147,
+   "spdx_hint": null,
+   "size_kb": 123,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/demiguise",
+   "stars": 1428,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 141,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/binja_arch_ref",
+   "stars": 7,
+   "spdx_hint": "MIT",
+   "size_kb": 8,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/binja_sensei",
+   "stars": 26,
+   "spdx_hint": "MIT",
+   "size_kb": 23607,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/binja_dynamics",
+   "stars": 25,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 672,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/binja_explain_instruction",
+   "stars": 52,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 309,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/CVE-2017-8759",
+   "stars": 94,
+   "spdx_hint": null,
+   "size_kb": 2316,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/asafw",
+   "stars": 108,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 183,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/asadbg",
+   "stars": 81,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 1507,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/idahunt",
+   "stars": 394,
+   "spdx_hint": null,
+   "size_kb": 448,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/asatools",
+   "stars": 239,
+   "spdx_hint": null,
+   "size_kb": 63,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/gists",
+   "stars": 5,
+   "spdx_hint": null,
+   "size_kb": 1,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/SusanRTTI",
+   "stars": 312,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 16,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/formal_np1sec",
+   "stars": 1,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 30,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/psr",
+   "stars": 76,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 2070,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/AutoRepeater",
+   "stars": 893,
+   "spdx_hint": "MIT",
+   "size_kb": 6322,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/cachegrab",
+   "stars": 87,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 2518,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/yaml2yara",
+   "stars": 22,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 39,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/TPMGenie",
+   "stars": 230,
+   "spdx_hint": null,
+   "size_kb": 9628,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/BLEBoy",
+   "stars": 49,
+   "spdx_hint": "MIT",
+   "size_kb": 1119,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Royal_APT",
+   "stars": 52,
+   "spdx_hint": null,
+   "size_kb": 223,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/readable-thrift",
+   "stars": 25,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 69,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/GOATCasino",
+   "stars": 121,
+   "spdx_hint": "MIT",
+   "size_kb": 25,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/OutlookLeakTest",
+   "stars": 129,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 2907,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/azucar",
+   "stars": 586,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 1386,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/proxmark3-amiimicyou",
+   "stars": 60,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 14041,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/tracy",
+   "stars": 558,
+   "spdx_hint": "MIT",
+   "size_kb": 20421,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ICPin",
+   "stars": 60,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 33,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/cmakerer",
+   "stars": 25,
+   "spdx_hint": "BSD-2-Clause",
+   "size_kb": 11,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/freddy",
+   "stars": 580,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 790,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/blackboxprotobuf",
+   "stars": 742,
+   "spdx_hint": "MIT",
+   "size_kb": 563,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Extractor",
+   "stars": 41,
+   "spdx_hint": "MIT",
+   "size_kb": 122,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/aws-inventory",
+   "stars": 738,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 3642,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/PMapper",
+   "stars": 1584,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 1096,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/house",
+   "stars": 1469,
+   "spdx_hint": "MIT",
+   "size_kb": 14339,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/singularity",
+   "stars": 1321,
+   "spdx_hint": "MIT",
+   "size_kb": 3319,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/zipdefrag",
+   "stars": 7,
+   "spdx_hint": null,
+   "size_kb": 679,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/BurpSuiteHTTPSmuggler",
+   "stars": 743,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 2731,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/hashcrack",
+   "stars": 101,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 37670,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/yocto-whitepaper-examples",
+   "stars": 17,
+   "spdx_hint": "MIT",
+   "size_kb": 6,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/xendbg",
+   "stars": 75,
+   "spdx_hint": "MIT",
+   "size_kb": 17168,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/pythia",
+   "stars": 25,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 131,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Splunking-Crime",
+   "stars": 11,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 76319,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ConMachi",
+   "stars": 106,
+   "spdx_hint": "MIT",
+   "size_kb": 26,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ScoutSuite",
+   "stars": 7841,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 20501,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/glasgo",
+   "stars": 29,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 3119,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ebpf",
+   "stars": 135,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 2079,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/DNSHighJackMonitoring",
+   "stars": 8,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 18,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/uninstallable",
+   "stars": 3,
+   "spdx_hint": "BSD-2-Clause",
+   "size_kb": 4,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/dapr",
+   "stars": 19,
+   "spdx_hint": null,
+   "size_kb": 1540,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/VulnerableDotNetHTTPRemoting",
+   "stars": 87,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 5230,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/argumentinjectionhammer",
+   "stars": 125,
+   "spdx_hint": null,
+   "size_kb": 196,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ImpossibleTravelLogAnalysis",
+   "stars": 20,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 22,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/BKScan",
+   "stars": 168,
+   "spdx_hint": null,
+   "size_kb": 16,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/phantap",
+   "stars": 625,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 103,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/fuzzowski",
+   "stars": 794,
+   "spdx_hint": "GPL-2.0",
+   "size_kb": 351,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Change-Lockscreen",
+   "stars": 145,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 1846,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/DatajackProxy",
+   "stars": 104,
+   "spdx_hint": "MIT",
+   "size_kb": 35,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Sniffle",
+   "stars": 1189,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 711,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/requests-racer",
+   "stars": 161,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 47,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Winstrument",
+   "stars": 68,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 87,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/encoderama",
+   "stars": 19,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 16,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/acCOMplice",
+   "stars": 339,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 38807,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/thetick",
+   "stars": 198,
+   "spdx_hint": "LGPL-3.0",
+   "size_kb": 919,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/GTFOBLookup",
+   "stars": 292,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 96,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/hwsecuritybingo",
+   "stars": 11,
+   "spdx_hint": null,
+   "size_kb": 141,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/lightweight_static_analysis",
+   "stars": 13,
+   "spdx_hint": null,
+   "size_kb": 13,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/sadcloud",
+   "stars": 793,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 97,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/clickjacking-poc",
+   "stars": 36,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 13,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/OneLogicalMyth_Shell",
+   "stars": 110,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 86,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/SSHession",
+   "stars": 65,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 14,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/wstalker",
+   "stars": 25,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 48,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/CollaboratorPlusPlus",
+   "stars": 148,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 6554,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/go-pillage-registries",
+   "stars": 113,
+   "spdx_hint": "MIT",
+   "size_kb": 741,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/draft-irtf-cfrg-vrf-06",
+   "stars": 8,
+   "spdx_hint": "MIT",
+   "size_kb": 58,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/SocksOverRDP",
+   "stars": 1317,
+   "spdx_hint": "MIT",
+   "size_kb": 202,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/BurpImportSitemap",
+   "stars": 6,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 771,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/scrying",
+   "stars": 475,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 5377,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/pairing-bls12381",
+   "stars": 14,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 39,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/listips",
+   "stars": 9,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 21,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/nccfsas",
+   "stars": 608,
+   "spdx_hint": null,
+   "size_kb": 2461,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/depthcharge",
+   "stars": 285,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 9631,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/reactor",
+   "stars": 3,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 427,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/whalescan",
+   "stars": 155,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 558,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/s3_objects_check",
+   "stars": 77,
+   "spdx_hint": "MIT",
+   "size_kb": 13,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/SFPolDevChk",
+   "stars": 30,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 74,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/WindowsMemPageDelta",
+   "stars": 33,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 278,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/HTTPSignatures",
+   "stars": 43,
+   "spdx_hint": "MIT",
+   "size_kb": 120,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Carnivore",
+   "stars": 150,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 14214,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/abstractshimmer",
+   "stars": 18,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 11,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Solitude",
+   "stars": 375,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 256,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/pybeacon",
+   "stars": 168,
+   "spdx_hint": null,
+   "size_kb": 12,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/nlahoney",
+   "stars": 10,
+   "spdx_hint": null,
+   "size_kb": 12501,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/RFC-Security-Research",
+   "stars": 21,
+   "spdx_hint": null,
+   "size_kb": 402,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/KilledProcessCanary",
+   "stars": 101,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 524,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Wubes",
+   "stars": 128,
+   "spdx_hint": null,
+   "size_kb": 338,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/UninstalledAppCanary",
+   "stars": 34,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 23,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/nlist",
+   "stars": 35,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 28,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/nsdp-discover",
+   "stars": 6,
+   "spdx_hint": null,
+   "size_kb": 1,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/nmap-nse-vulnerability-scripts",
+   "stars": 620,
+   "spdx_hint": null,
+   "size_kb": 16,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/pairing",
+   "stars": 17,
+   "spdx_hint": "BSD-3-Clause",
+   "size_kb": 63,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/JA3_outlier",
+   "stars": 17,
+   "spdx_hint": null,
+   "size_kb": 4,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/raccoon",
+   "stars": 116,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 30,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/drb-rb",
+   "stars": 0,
+   "spdx_hint": null,
+   "size_kb": 8382,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/exploit_mitigations",
+   "stars": 929,
+   "spdx_hint": "MIT",
+   "size_kb": 97,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ruby-trace",
+   "stars": 1,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 209,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/obfuscation-snippets",
+   "stars": 24,
+   "spdx_hint": null,
+   "size_kb": 6,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ML-for-RNGs",
+   "stars": 45,
+   "spdx_hint": null,
+   "size_kb": 2880,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Threat-Intelligence-Alerts",
+   "stars": 25,
+   "spdx_hint": null,
+   "size_kb": 145,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/cryptopals-py",
+   "stars": 8,
+   "spdx_hint": null,
+   "size_kb": 70,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/log4j-jndi-be-gone",
+   "stars": 72,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 82,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/DetectWindowsCopyOnWriteForAPI",
+   "stars": 197,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 239,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/shouganaiyo-loader",
+   "stars": 39,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 78,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/insject",
+   "stars": 50,
+   "spdx_hint": "BSD-2-Clause",
+   "size_kb": 25,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ghostrings",
+   "stars": 141,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 1181,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/pasta-curves",
+   "stars": 3,
+   "spdx_hint": "MIT",
+   "size_kb": 65,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/remarkjs-ncc",
+   "stars": 0,
+   "spdx_hint": null,
+   "size_kb": 17385,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/jwt-reauth",
+   "stars": 106,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 726,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/freebsd-kernel-module-rust",
+   "stars": 60,
+   "spdx_hint": "BSD-2-Clause",
+   "size_kb": 28,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/DroppedConnection",
+   "stars": 129,
+   "spdx_hint": null,
+   "size_kb": 9,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/mimikatz-detector-busylight",
+   "stars": 21,
+   "spdx_hint": null,
+   "size_kb": 27,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/mimikatz-detector-condrv",
+   "stars": 42,
+   "spdx_hint": null,
+   "size_kb": 17,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/web3-decoder",
+   "stars": 117,
+   "spdx_hint": "MIT",
+   "size_kb": 52958,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ataraxy",
+   "stars": 3,
+   "spdx_hint": "MIT",
+   "size_kb": 2116,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/rustproofing-linux",
+   "stars": 22,
+   "spdx_hint": null,
+   "size_kb": 85,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/manim-cranim",
+   "stars": 35,
+   "spdx_hint": "MIT",
+   "size_kb": 10124,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/PS2",
+   "stars": 82,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 105,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/cq",
+   "stars": 114,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 25,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ccs",
+   "stars": 114,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 23,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/SecretScrub",
+   "stars": 5,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 50,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/libslub",
+   "stars": 189,
+   "spdx_hint": "MIT",
+   "size_kb": 127,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Custom-ROP-Chain",
+   "stars": 1,
+   "spdx_hint": null,
+   "size_kb": 2,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/cowcloud",
+   "stars": 60,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 743,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/FastBTCParser",
+   "stars": 5,
+   "spdx_hint": "MIT",
+   "size_kb": 27,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/android_demystification_toolbox",
+   "stars": 8,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 58,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/Cartographer",
+   "stars": 384,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 18233,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/MetadataPlus",
+   "stars": 64,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 18,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/detaped",
+   "stars": 3,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 566,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/kubetcd",
+   "stars": 93,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 11989,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ConscryptTrustUserCerts",
+   "stars": 164,
+   "spdx_hint": "AGPL-3.0",
+   "size_kb": 21,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/SteppingStones",
+   "stars": 243,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1235,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/mtk_bp",
+   "stars": 81,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 42,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ghidra-nanomips",
+   "stars": 56,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 514,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/fips203",
+   "stars": 19,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 386,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/test_avb_key",
+   "stars": 8,
+   "spdx_hint": null,
+   "size_kb": 48,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/kramdown-ts",
+   "stars": 0,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 366,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/http-mcp-bridge",
+   "stars": 18,
+   "spdx_hint": "MIT",
+   "size_kb": 28,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/powerg-tools",
+   "stars": 5,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 130,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/ghidra-mtk-loader",
+   "stars": 8,
+   "spdx_hint": "GPL-3.0",
+   "size_kb": 431,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "nccgroup/async-pico-hub",
+   "stars": 26,
+   "spdx_hint": "MIT",
+   "size_kb": 113,
+   "fork": false,
+   "discovery": "curated-org:nccgroup"
+  },
+  {
+   "repo": "googleprojectzero/bochspwn",
+   "stars": 345,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 729,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/symboliclink-testing-tools",
+   "stars": 858,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 53,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/sandbox-attacksurface-analysis-tools",
+   "stars": 2339,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 13242,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/winafl",
+   "stars": 2608,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 5484,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/functionsimsearch",
+   "stars": 560,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 174392,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/domato",
+   "stars": 1785,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 480,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/p0tools",
+   "stars": 853,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 4526,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/reil",
+   "stars": 61,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 296,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/BrokenType",
+   "stars": 435,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 510,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/bochspwn-reloaded",
+   "stars": 311,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 80,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/halfempty",
+   "stars": 976,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 1145,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/Street-Party",
+   "stars": 244,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 29,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/CompareCoverage",
+   "stars": 207,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 26,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/fuzzilli",
+   "stars": 2350,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 10969,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/iOS-messaging-tools",
+   "stars": 386,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 19,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/DrSancov",
+   "stars": 214,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 15,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/ktrw",
+   "stars": 700,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 276,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/SkCodecFuzzer",
+   "stars": 356,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 59,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/TinyInst",
+   "stars": 1359,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 505,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/Jackalope",
+   "stars": 1384,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 170,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/0days-in-the-wild",
+   "stars": 1043,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 17621,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/SockFuzzer",
+   "stars": 453,
+   "spdx_hint": "NOASSERTION",
+   "size_kb": 25109,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/Hyntrospect",
+   "stars": 186,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 211,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/.allstar",
+   "stars": 1,
+   "spdx_hint": null,
+   "size_kb": 0,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/.github",
+   "stars": 1,
+   "spdx_hint": null,
+   "size_kb": 0,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/sandbox-attacksurface-analysis-tools.v1",
+   "stars": 19,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 11444,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
+  },
+  {
+   "repo": "googleprojectzero/MAccConc",
+   "stars": 51,
+   "spdx_hint": "Apache-2.0",
+   "size_kb": 129,
+   "fork": false,
+   "discovery": "curated-org:googleprojectzero"
   }
  ],
  "_meta": {
   "dataset_sha": "210b9259be248323b0b3bc58252bed3fde53135f",
-  "generated_at": "2026-10-11T18:20:11+0000"
+  "generated_at": "2026-10-11T18:20:11+0000",
+  "expansion": {
+   "run": "2026-10-11T19:37:19+0000",
+   "stars_cutoff": 25,
+   "added": 1079,
+   "queries": [
+    "topic:osint stars:>=25",
+    "osint framework stars:>=25",
+    "osint tool stars:>=25",
+    "osint tooling stars:>=25"
+   ],
+   "curated_orgs": [
+    "pwn-college",
+    "Gallopsled",
+    "specterops",
+    "nccgroup",
+    "googleprojectzero"
+   ]
+  }
  }
 }

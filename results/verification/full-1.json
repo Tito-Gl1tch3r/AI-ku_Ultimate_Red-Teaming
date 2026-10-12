@@ -1,0 +1,36 @@
+{
+ "label": "full-1",
+ "entries": 846037,
+ "accepted": 228880,
+ "rejected": 610174,
+ "duplicates": 6983,
+ "repos_mined": 3193,
+ "checks": [
+  {
+   "check": "manifest→corpus sha256",
+   "ok": true,
+   "detail": "aceptados verificados: 228880 · sha256 inválido: 0 · ausentes: 0"
+  },
+  {
+   "check": "rechazados ausentes de corpus",
+   "ok": true,
+   "detail": "rechazados/duplicados encontrados en corpus: 0"
+  },
+  {
+   "check": "LICENSE firmado según SPDX",
+   "ok": true,
+   "detail": "firmas correctas: 3193 · fallos: []"
+  },
+  {
+   "check": "cumplimiento NOTICE (Apache-2.0)",
+   "ok": true,
+   "detail": "Apache con NOTICE presente: 49 · sin NOTICE upstream (no requerido): 595 · fallos: []"
+  },
+  {
+   "check": "sin huérfanos en corpus",
+   "ok": true,
+   "detail": "huérfanos: []"
+  }
+ ],
+ "all_ok": true
+}

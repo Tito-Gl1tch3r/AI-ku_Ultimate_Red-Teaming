@@ -53,16 +53,21 @@ La propia documentación de TanDev reconoce: *"Rights in the original repositori
 ├── rubric.json                 rúbrica formal de aceptación/rechazo (determinista, sin LLM)
 ├── src/
 │   ├── 01_hf_catalog.py        Fase 1 — catálogo híbrido (hf-statistics | github-topics)
-│   ├── 02_github_verify.py     Fase 2a — puerta dura de licencias upstream
-│   ├── 03_mine_github.py       Fase 2b — clonado + minería + manifiesto de procedencia
-│   └── 04_verify.py            Fase 2c — verificación de integridad (sha256, firmas, NOTICE)
+│   ├── 02_github_verify.py     Fase 2a — puerta dura de licencias upstream (reanudable por chunks)
+│   ├── 03_mine_github.py       Fase 2b — clonado + minería + manifiesto de procedencia (incremental)
+│   ├── 04_verify.py            Fase 2c — verificación de integridad (sha256, firmas, NOTICE, huérfanos)
+│   ├── 05_expand_github.py     Fase 2e — expansión dirigida (stars≥25, keywords, orgs curadas)
+│   ├── 06_hf_dataset_search.py Fase 2d — datasets públicos en HF con regla de licencia estricta
+│   └── 07_repair_attribution.py Fase 2f — mantenimiento: purga de duplicados + reparación de atribución
 ├── audit/topics_audit.json     auditoría de estructura del dataset (shards/filas/fuente por tópico)
 ├── audit/hf_vs_cleanroom.json  comparativa de calidad HF vs corpus limpio (contaminación de licencias)
+├── audit/hf_datasets_candidates.json  datasets HF evaluados por licencia declarada (ACEPTADO/REVISAR/RECHAZADO)
 ├── catalog/{topic}.json        catálogo por tópico (9.576 repos únicos en la unión)
 ├── catalog/github/             verificación de licencias (verified.jsonl, resumen, checkpoint)
 ├── results/demo/               tanda de demostración: manifiesto + estadísticas + dedup
-├── results/verification/       informes de integridad por tanda
-└── corpus/                     código extraído, versionado con atribución (_UPSTREAM_LICENSE/NOTICE por repo)
+├── results/full-1/             tanda completa: 3.553 repos · 228.880 archivos · dedup + reparaciones
+├── results/verification/       informes de integridad por tanda (5/5 OK en full-1)
+└── corpus/                     código extraído, versionado con atribución (_UPSTREAM_LICENSE/NOTICE por repo; variantes dual-licencia preservadas)
 ```
 
 ## 4. Uso
@@ -91,7 +96,18 @@ python3 src/03_mine_github.py --topics ctf,pwn,osint --repos-per-topic 5 --label
 
 # Fase 2c — verificación de integridad (sha256, firmas de licencia, NOTICE, huérfanos)
 python3 src/04_verify.py --label tanda1
+
+# Fase 2e — expansión dirigida (tópicos deficitarios: pwn/exploit/osint)
+python3 src/05_expand_github.py --stars 25
+
+# Fase 2d — exploración de datasets públicos en HF (solo licencia declarada; sin contenido)
+python3 src/06_hf_dataset_search.py
+
+# Fase 2f — mantenimiento del corpus (purga duplicados + reparación de atribución)
+python3 src/07_repair_attribution.py --label full-1 --purge-duplicates --fix-attribution
 ```
+
+> **Nota de ejecución (entornos con límite de tiempo por llamada):** 02, 03 y 07 aceptan `--max-runtime N` para salir limpiamente tras N segundos; todos son reanudables vía checkpoint (`_checkpoint.json`, `_mined.json`, `_attribution.json`). Patrón recomendado para tandas grandes: bucles de chunks de ~500 s.
 
 ## 5. La rúbrica (resumen)
 
@@ -104,13 +120,20 @@ python3 src/04_verify.py --label tanda1
 | 3 · Contenido | tamaño; binario (byte nulo); minificado; autogenerado; trivial | 80 B–256 KiB · ≥30 chars útiles · avg línea <180 |
 | 4 · Calidad | puntuación 0–100 (estructura, volumen, comentarios, profundidad técnica, modularidad) | aceptación ≥ 40 |
 
-## 6. Resultados de la tanda de demostración
+## 6. Resultados
 
-- **Fase 1:** 9.576 repos únicos (17 configs vía `/statistics`, 13 vía GitHub topics — los de cardinalidad alta).
-- **Fase 2a** (top-30/tópico, 759 repos): **301 aceptados** · 436 licencia no permisiva · 21 repos desaparecidos · 1 DMCA bloqueado (`BloodHound`, HTTP 451 — excluido correctamente por el pipeline).
-- **Fase 2b** (3 repos: `CobaltStrike_OpenBeacon` MIT, `ysoserial` MIT, `SteppingStones` Apache-2.0): **144 archivos aceptados / 382 rechazados** — razones principales: AUTOGEN 126, EXT_NOT_ALLOWED 117, LOW_SCORE 76, TOO_SMALL 49. 0 duplicados (sha256).
-- Cada archivo aceptado queda en `results/demo/manifest.jsonl` con repo, commit, sha256, score, SPDX y fecha: **trazabilidad total del linaje**.
-- **Verificación de integridad (04): 5/5 OK** — 144/144 sha256 válidos, LICENSE firmado según SPDX en los 3 repos, cumplimiento NOTICE (Apache-2.0), 0 huérfanos, 0 rechazados presentes. Informe: `results/verification/demo.json`.
+### 6.0 Tanda completa `full-1` (base consolidada)
+
+| fase | resultado |
+|---|---|
+| Catálogo (01) | 30 configs auditados; unión de 9.576 repos; expansión dirigida (05): +2.625 → plan final 11.090 únicos |
+| Verificación (02) | **11.090/11.090 verificados** · 4.215 aceptados · 6.623 licencia no permisiva · 251 desaparecidos · 1 DMCA |
+| Minería (03) | plan 4.563 → 3.553 repos minados · 0 fallos de clonado · 609.619 rechazos (razones deterministas) |
+| Dedup exacto | 6.989 duplicados marcados y purgados del corpus (sha256) |
+| Integridad (04) | **5/5 OK**: 228.880 archivos sha256-verificados · 0 huérfanos · 0 rechazados presentes |
+| Exclusiones post | 6 repos sin LICENSE en raíz (spdx de la API caducado) → eliminados por directiva estricta |
+| Atribución (07) | 679 reparaciones; variantes cubiertas: LICENCE, MIT-LICENSE, LICENSE-MIT/APACHE, dual-licencia (ambos textos preservados) |
+| Corpus final | **228.880 archivos · ~232.000 con atribución · 2,7 GB** |
 
 ### 6.1 ¿Es la misma calidad que el dataset de Hugging Face?
 
@@ -126,18 +149,34 @@ python3 src/04_verify.py --label tanda1
 - **Cobertura:** para 17/30 tópicos el catálogo reproduce exactamente los repos de HF (derivado de sus metadatos); para 13/30 (cardinalidad alta) usamos descubrimiento independiente en GitHub top-500 por estrellas — difiere por diseño.
 - Conclusión: **menos volumen (~6% de las filas), mucha más señal**: lo que HF habría publicado si filtrara por licencia y calidad.
 
-## 7. Escalado
+### 6.2 Datasets públicos en Hugging Face (exploración con regla de licencia estricta)
 
-- Verificación completa: 9.576 repos ≈ 40 min (delay 0.22 s; límite API 5.000/h con token clásico; el checkpoint reanuda donde lo dejaste).
-- Minería completa: proporcional al nº de repos; el walk poda directorios excluidos sin leerlos.
-- Recomendado para el entrenamiento: dedup exacto (ya incluido) + dedup aproximado (MinHash) en una fase posterior.
+Exploración de datasets HF orientados a `pwn`, `binary-exploitation`, `ctf`, `reverse-engineering`, `exploit-code` y `osint` — **sin descargar jamás su contenido**; solo metadata/tarjeta (`audit/hf_datasets_candidates.json`, 214 datasets evaluados):
+
+- **23 ACEPTADO (STRONG)** — licencia declarada permisiva + foco real. Ejemplos: `ethz-spylab/ctf-satml24` (MIT, retos CTF reales), `jason-oneal/mitre-stix-cve-exploitdb-*` (Apache-2.0, señales CVE/exploit), `exploitintel/cve-cwe-consensus` (CC-BY-4.0), `qizwiz/pact-ctf-corpus` (MIT), `invariantlabs/agent-ctf24-public` (MIT), familia `Yemen-JPT/OSINT-*` (CC-BY-4.0).
+- **13 MARGINAL** — `jordan-taylor-aisi/*` (Apache-2.0): trazas de evaluación de agentes CTF, no código.
+- **7 FALSO POSITIVO** — descartados por curación (minería en francés `site d'exploitation`, usernames con 'pwn', etc.).
+- **17 REVISAR** — permisiva declarada pero parecen compilaciones (casi todos espejos de ExploitDB): exigen licencias por registro o síntesis propia; upstream no las provee → no usar sin verificación registro a registro.
+- **154 RECHAZADO** — CC-BY-NC, GPL/AGPL, `other`/privativa o sin licencia explícita.
+
+> Regla aplicada (decisión del usuario): MIT · Apache-2.0 · BSD-2/3 · **CC-BY-4.0** (solo para datasets HF; el gate de código GitHub sigue siendo MIT/Apache/BSD). NC y sin licencia explícita → fuera.
+
+## 7. Escalado y costes reales (medidos)
+
+- Verificación completa (11.090 repos): el cuello de botella es el límite REST de GitHub (5.000/h con token clásico) → ~2 h con chunks de 500 s reanudables. No depende de nosotros: planificar en consecuencia.
+- Minería completa (3.553 clones): ~1,4 s/repo medio con `--depth 1` → ~1,5 h total; reanudable por `_mined.json`.
+- Reproducibilidad exacta: hoy el manifiesto registra el commit minado, pero 03 clona HEAD; para reprodución bit a bit usar clones pineados al commit del manifiesto (ver hoja de ruta).
+- Recomendado para el entrenamiento: dedup exacto (incluido) + dedup aproximado (MinHash) en fase posterior.
 
 ## 8. Hoja de ruta
 
-- [ ] Fase 3: empaquetado del corpus a formato de entrenamiento (JSONL con `content` + metadatos)
+- [ ] Fase 3: empaquetado del corpus a formato de entrenamiento (JSONL `content` + metadatos) — en pausa hasta integrar HF (06) + expansión (05), según plan del usuario
+- [x] Exploración HF (06) y expansión dirigida (05) — completadas en esta revisión
+- [ ] Clones pineados al commit del manifiesto (reproducibilidad bit a bit del corpus)
 - [ ] Dedup aproximado (MinHash/LSH) sobre el corpus completo
-- [ ] Verificación periódica de licencias upstream (los repos pueden cambiar de licencia; re-verificar antes de cada tanda)
-- [ ] Panel de estadísticas del corpus (lenguajes, tópicos, distribución de tamaños)
+- [ ] Re-verificación periódica de licencias upstream antes de cada tanda
+- [ ] Panel de estadísticas del corpus (lenguajes, tópicos, tamaños)
+- [ ] Distribución del corpus >2 GB: valorar GitHub Release assets en lugar de historial git
 
 ## 9. Aviso
 

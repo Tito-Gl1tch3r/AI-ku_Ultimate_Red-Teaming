@@ -1,0 +1,33 @@
+{
+ "note": "manifiesto dividido: GitHub limita 100MB/archivo",
+ "source": "manifest.jsonl",
+ "total_lines": 846037,
+ "total_parts": 4,
+ "reassemble": "cat manifest.part-*.jsonl > manifest.jsonl",
+ "parts": [
+  {
+   "part": "manifest.part-000.jsonl",
+   "bytes": 90000173,
+   "lines": 226798,
+   "sha256": "08361fab9debb1659b6a9b9aade76b49f6f2da8a5837a32b292050109b324cf4"
+  },
+  {
+   "part": "manifest.part-001.jsonl",
+   "bytes": 90000202,
+   "lines": 221951,
+   "sha256": "e76411131a80bc06fd4f7a7ab4f66e44cd72cb13a0073253f841a09676407a50"
+  },
+  {
+   "part": "manifest.part-002.jsonl",
+   "bytes": 90000145,
+   "lines": 221925,
+   "sha256": "345c20e429d1618c13c8ff35ea5a007761ba7022ac011065f05b6e1102f7b71b"
+  },
+  {
+   "part": "manifest.part-003.jsonl",
+   "bytes": 70447073,
+   "lines": 175363,
+   "sha256": "19fc706535667e200952e3f8e6d650afdaa0fa99c334baf212185d21cc146a34"
+  }
+ ]
+}
