@@ -1,0 +1,78 @@
+use ratatui::layout::Constraint;
+use ratatui::prelude::Stylize;
+use ratatui::widgets::{Cell, Table, TableState};
+use ratatui::{Frame, layout::Rect, style::Style, widgets::Row};
+
+use super::{GREEN, PURPLE, effective_mode, pane_block};
+
+use crate::{Mode, State};
+
+pub fn draw_asm(state: &mut State, f: &mut Frame, asm: Rect) {
+    // Asm
+    // TODO: cache the pc_index if this doesn't change
+    let mut rows = vec![];
+    let mut pc_index = None;
+    let mut function_name = None;
+    let mut tallest_function_len = 0;
+
+    // Display asm, this will already be in a sorted order
+    for (index, a) in state.asm.iter().enumerate() {
+        if a.address == state.current_pc {
+            pc_index = Some(index);
+            if let Some(func_name) = &a.func_name {
+                function_name = Some(func_name.clone());
+                if func_name.len() > tallest_function_len {
+                    tallest_function_len = func_name.len();
+                }
+            }
+        }
+        let addr_cell =
+            Cell::from(format!("0x{:02x}", a.address)).style(Style::default().fg(PURPLE));
+        let mut row = vec![addr_cell];
+
+        if let Some(function_name) = &a.func_name {
+            let function_cell = Cell::from(format!("{function_name}+{:02x}", a.offset))
+                .style(Style::default().fg(PURPLE));
+            row.push(function_cell);
+        } else {
+            row.push(Cell::from(""));
+        }
+
+        // Replace \t (needed for a riscv32 gdb)
+        let inst = if a.inst.contains("\\t") {
+            let parts: Vec<&str> = a.inst.splitn(2, "\\t").collect();
+            format!("{:<8}{}", parts[0], parts[1])
+        } else {
+            a.inst.clone()
+        };
+
+        let inst_cell = if let Some(pc_index) = pc_index {
+            if pc_index == index { Cell::from(inst).fg(GREEN) } else { Cell::from(inst).white() }
+        } else {
+            Cell::from(inst).dark_gray()
+        };
+        row.push(inst_cell);
+
+        rows.push(Row::new(row));
+    }
+
+    let active = matches!(effective_mode(state), Mode::OnlyInstructions);
+    let block = pane_block("Instructions", function_name, "", active);
+    if let Some(pc_index) = pc_index {
+        let widths = [
+            Constraint::Length(16),
+            Constraint::Length(tallest_function_len as u16 + 5),
+            Constraint::Fill(1),
+        ];
+        let table = Table::new(rows, widths)
+            .block(block)
+            .row_highlight_style(Style::new().fg(GREEN))
+            .highlight_symbol(">>");
+        let start_offset = pc_index.saturating_sub(5);
+        let mut table_state =
+            TableState::default().with_offset(start_offset).with_selected(pc_index);
+        f.render_stateful_widget(table, asm, &mut table_state);
+    } else {
+        f.render_widget(block, asm);
+    }
+}

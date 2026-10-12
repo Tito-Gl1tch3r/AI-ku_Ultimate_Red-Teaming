@@ -1,0 +1,910 @@
+"""Volatility3 wrapper and integration."""
+
+import json
+import os
+import re
+import shlex
+import subprocess
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+import time
+
+from loguru import logger
+
+
+class VolatilityError(Exception):
+    """Exception raised for Volatility-related errors."""
+
+    def __init__(
+        self,
+        message: str,
+        plugin: Optional[str] = None,
+        returncode: Optional[int] = None,
+        stdout: str = "",
+        stderr: str = "",
+    ):
+        super().__init__(message)
+        self.plugin = plugin
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+@dataclass
+class VolatilityConfig:
+    """Configuration for Volatility execution."""
+    timeout: int = 300  # 5 minutes default
+    yara_timeout: int = 900  # 15 minutes default for windows.vadyarascan
+    retry_count: int = 1
+    retry_delay: float = 1.0
+    cache_results: bool = True
+    # optional directories where symbol tables are stored; will be passed to
+    # Volatility via ``--symbol-dirs`` joined using os.pathsep
+    symbol_dirs: List[Path] = None
+
+
+class VolatilityWrapper:
+    """Wrapper around Volatility3 CLI for memory analysis.
+    
+    This class provides a high-level interface to Volatility3 for memory dump analysis.
+    Current implementation uses the CLI; future versions may use direct API integration.
+    
+    Features:
+    - Automatic volatility binary detection
+    - Command execution with timeout and retry logic
+    - Output parsing and caching
+    - Comprehensive error handling and logging
+    """
+    
+    def __init__(self, dump_path: Path, config: Optional[VolatilityConfig] = None):
+        """Initialize Volatility wrapper.
+        
+        Args:
+            dump_path: Path to the memory dump file
+            config: Optional VolatilityConfig for customization
+            
+        Raises:
+            VolatilityError: If dump file doesn't exist or Volatility is not installed
+        """
+        self.dump_path = Path(dump_path)
+        if not self.dump_path.exists():
+            raise VolatilityError(f"Memory dump not found: {dump_path}")
+        
+        self.config = config or VolatilityConfig()
+        self._volatility_bin = self._find_volatility()
+        if not self._volatility_bin:
+            raise VolatilityError("Volatility3 not found in PATH")
+        
+        self._cache: Dict[str, str] = {}
+        
+        logger.debug(f"Using Volatility3 binary: {self._volatility_bin}")
+        logger.debug(f"Memory dump: {self.dump_path.name} ({self.dump_path.stat().st_size / (1024**3):.1f} GB)")
+        logger.debug(f"Config: timeout={self.config.timeout}s, retry={self.config.retry_count}x")
+        if self.config.symbol_dirs:
+            logger.debug(f"Symbol dirs: {[str(p) for p in self.config.symbol_dirs]}")
+    
+    @staticmethod
+    def _find_volatility() -> Optional[Path]:
+        """Find Volatility3 executable in PATH.
+        
+        Tries multiple common names:
+        - vol (most common)
+        - volatility3
+        - vol.py
+        
+        Returns:
+            Path to volatility binary, or None if not found
+        """
+        candidates = ["vol", "volatility3", "vol.py"]
+        
+        for cmd in candidates:
+            try:
+                result = subprocess.run(
+                    ["which", cmd],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    binary = Path(result.stdout.strip())
+                    logger.debug(f"Found volatility binary: {binary} ({cmd})")
+                    return binary
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                continue
+        
+        return None
+    
+    def _run_command(
+        self,
+        *args: str,
+        use_cache: bool = True,
+        output_dir: Optional[Path] = None,
+        timeout: Optional[int] = None,
+    ) -> Tuple[str, str]:
+        """Run a volatility command with retry and caching.
+        
+        Args:
+            *args: Arguments to pass to volatility
+            use_cache: Whether to use cached results if available
+            
+        Returns:
+            Tuple of (stdout, stderr)
+            
+        Raises:
+            VolatilityError: If command fails after retries
+        """
+        output_dir_token = str(output_dir) if output_dir else ""
+        cache_key = " ".join(args) + f"|out={output_dir_token}"
+        
+        # Check cache
+        if use_cache and cache_key in self._cache:
+            logger.debug(f"Cache hit for: {cache_key}")
+            return self._cache[cache_key], ""
+        
+        cmd = [str(self._volatility_bin), "-f", str(self.dump_path)]
+        if output_dir:
+            cmd += ["-o", str(output_dir)]
+        # include symbol directories if configured
+        if self.config.symbol_dirs:
+            dirs = os.pathsep.join(str(p) for p in self.config.symbol_dirs)
+            cmd.append(f"--symbol-dirs={dirs}")
+        cmd += list(args)
+        command_timeout = timeout if timeout is not None else self.config.timeout
+        
+        last_error = None
+        
+        for attempt in range(self.config.retry_count):
+            try:
+                logger.debug(
+                    f"Attempt {attempt + 1}/{self.config.retry_count}: {shlex.join(cmd)}"
+                )
+                
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=command_timeout
+                )
+                
+                if result.returncode != 0:
+                    plugin_name = args[0] if args else "<unknown-plugin>"
+                    stdout_excerpt = (result.stdout or "")[:4000]
+                    stderr_excerpt = (result.stderr or "")[:4000]
+                    logger.warning(
+                        f"Volatility returned code {result.returncode} for: {plugin_name}"
+                    )
+                    if stdout_excerpt:
+                        logger.debug(f"stdout: {stdout_excerpt}")
+                    if stderr_excerpt:
+                        logger.debug(f"stderr: {stderr_excerpt}")
+
+                    last_error = VolatilityError(
+                        f"Volatility command failed ({result.returncode}) for {plugin_name}",
+                        plugin=plugin_name,
+                        returncode=result.returncode,
+                        stdout=result.stdout or "",
+                        stderr=result.stderr or "",
+                    )
+                    if attempt < self.config.retry_count - 1:
+                        logger.debug(f"Retrying after {self.config.retry_delay}s...")
+                        time.sleep(self.config.retry_delay)
+                        continue
+                    raise last_error
+
+                # Cache successful result
+                if self.config.cache_results:
+                    self._cache[cache_key] = result.stdout
+
+                return result.stdout, result.stderr
+            
+            except subprocess.TimeoutExpired as e:
+                last_error = VolatilityError(
+                    f"Volatility command timed out after {command_timeout}s: {args[0]}"
+                )
+                logger.warning(f"Timeout on attempt {attempt + 1}")
+                
+                if attempt < self.config.retry_count - 1:
+                    logger.debug(f"Retrying after {self.config.retry_delay}s...")
+                    time.sleep(self.config.retry_delay)
+            
+            except VolatilityError:
+                raise
+
+            except Exception as e:
+                last_error = VolatilityError(f"Failed to run volatility: {e}")
+                logger.error(f"Error on attempt {attempt + 1}: {e}")
+                
+                if attempt < self.config.retry_count - 1:
+                    time.sleep(self.config.retry_delay)
+        
+        if last_error:
+            raise last_error
+        
+        raise VolatilityError(f"Volatility command failed: {' '.join(args)}")
+
+    @staticmethod
+    def is_symbol_requirement_error(error: Exception) -> bool:
+        """Return True if error indicates missing/unsatisfied Volatility symbols."""
+        if not isinstance(error, VolatilityError):
+            return False
+        combined = "\n".join([str(error), error.stdout or "", error.stderr or ""]).lower()
+        return (
+            "symbol table requirement" in combined
+            or "unsatisfied requirement" in combined
+            or "symbol_table_name" in combined
+        )
+
+    @staticmethod
+    def is_yara_dependency_error(error: Exception) -> bool:
+        """Return True if error indicates missing YARA backend for Volatility."""
+        if not isinstance(error, VolatilityError):
+            return False
+        combined = "\n".join([str(error), error.stdout or "", error.stderr or ""]).lower()
+        return (
+            "neither yara-x nor yara-python" in combined
+            or "yara-python (>3.8.0) module was found" in combined
+            or "plugin (and dependent plugins) not available" in combined
+        )
+
+    @staticmethod
+    def _extract_symbol_download_urls(text: str) -> List[str]:
+        """Extract symbol-server download URLs from Volatility output text."""
+        pattern = re.compile(r"https?://[^\s]+/download/symbols/[^\s]+", re.IGNORECASE)
+        urls = pattern.findall(text or "")
+        seen = []
+        for url in urls:
+            cleaned = url.strip().rstrip(")]")
+            if cleaned not in seen:
+                seen.append(cleaned)
+        return seen
+
+    @staticmethod
+    def _alternate_symbol_url(url: str) -> Optional[str]:
+        """Build alternate symbol URL variant (.pdb <-> .pd_) if possible."""
+        if url.endswith(".pd_"):
+            return url[:-1] + "b"
+        if url.endswith(".pdb"):
+            return url[:-1] + "_"
+        return None
+
+    @staticmethod
+    def _scheme_variants(url: str) -> List[str]:
+        variants = [url]
+        if url.startswith("http://"):
+            variants.append("https://" + url[len("http://"):])
+        elif url.startswith("https://"):
+            variants.append("http://" + url[len("https://"):])
+        seen = []
+        for item in variants:
+            if item not in seen:
+                seen.append(item)
+        return seen
+
+    @staticmethod
+    def _get_windows_symbol_root(symbol_dirs: Optional[List[Path]]) -> Path:
+        for directory in symbol_dirs or []:
+            directory = Path(directory)
+            if directory.name == "windows":
+                return directory
+        return Path.home() / ".malhunt" / "symbols" / "windows"
+
+    def _build_symbol_download_candidates(self, url: str) -> List[str]:
+        candidates = []
+        for scheme_url in self._scheme_variants(url):
+            candidates.append(scheme_url)
+            alt = self._alternate_symbol_url(scheme_url)
+            if alt:
+                candidates.append(alt)
+
+        seen = []
+        for candidate in candidates:
+            if candidate not in seen:
+                seen.append(candidate)
+        return seen
+
+    @staticmethod
+    def _extract_symbol_parts(url: str) -> Optional[Dict[str, str]]:
+        parts = [p for p in url.split("/") if p]
+        if len(parts) < 3:
+            return None
+        return {
+            "pdb_name": parts[-3],
+            "guidage": parts[-2],
+            "filename": parts[-1],
+        }
+
+    def auto_recover_windows_symbols(self, error: VolatilityError) -> bool:
+        """Best-effort recovery of missing Windows symbol files.
+
+        Attempts to download referenced symbol files from URLs present in
+        Volatility output and place them under the local symbol directory tree.
+
+        Returns:
+            True if at least one symbol file was downloaded, False otherwise.
+        """
+        payload = "\n".join([str(error), error.stdout or "", error.stderr or ""])
+        urls = self._extract_symbol_download_urls(payload)
+        if not urls:
+            logger.warning("No downloadable symbol URLs found in Volatility output")
+            return False
+
+        symbol_root = self._get_windows_symbol_root(self.config.symbol_dirs)
+        symbol_root.mkdir(parents=True, exist_ok=True)
+
+        downloaded_any = False
+
+        for url in urls:
+            candidates = self._build_symbol_download_candidates(url)
+
+            # Expected layout: .../download/symbols/<pdb_name>/<GUIDAGE>/<filename>
+            symbol_parts = self._extract_symbol_parts(url)
+            if not symbol_parts:
+                continue
+            pdb_name = symbol_parts["pdb_name"]
+            guidage = symbol_parts["guidage"]
+            target_dir = symbol_root / pdb_name / guidage
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            for candidate_url in candidates:
+                filename = candidate_url.rsplit("/", 1)[-1]
+                target_file = target_dir / filename
+                if target_file.exists() and target_file.stat().st_size > 0:
+                    logger.debug(f"Symbol file already present: {target_file}")
+                    downloaded_any = True
+                    continue
+
+                try:
+                    logger.info(f"Attempting symbol download: {candidate_url}")
+                    request = urllib.request.Request(
+                        candidate_url,
+                        headers={"User-Agent": "malhunt/0.4 (+volatility-symbol-helper)"},
+                    )
+                    with urllib.request.urlopen(request, timeout=60) as response:
+                        data = response.read()
+                    if not data:
+                        logger.debug(f"No data returned for {candidate_url}")
+                        continue
+                    target_file.write_bytes(data)
+                    logger.success(f"Downloaded symbol candidate: {target_file}")
+                    downloaded_any = True
+                except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
+                    logger.debug(f"Symbol download failed for {candidate_url}: {exc}")
+
+        if not downloaded_any:
+            logger.warning("Automatic symbol recovery did not download any files")
+        return downloaded_any
+
+    def enrich_symbol_diagnostics(self, diagnostics: Dict[str, Any]) -> Dict[str, Any]:
+        """Enrich diagnostics with local availability and recovery helper path."""
+        missing = diagnostics.get("missing_symbols", [])
+        symbol_root = self._get_windows_symbol_root(self.config.symbol_dirs)
+        symbol_root.mkdir(parents=True, exist_ok=True)
+
+        enriched_missing = []
+        for item in missing:
+            pdb_name = item.get("pdb_name")
+            guidage = item.get("guidage")
+            if not pdb_name or not guidage:
+                enriched_missing.append(item)
+                continue
+
+            local_dir = symbol_root / pdb_name / guidage
+            local_files = []
+            if local_dir.exists():
+                local_files = [str(path) for path in local_dir.iterdir() if path.is_file()]
+
+            item_copy = dict(item)
+            item_copy["local_dir"] = str(local_dir)
+            item_copy["local_files"] = local_files
+            item_copy["is_locally_available"] = bool(local_files)
+            item_copy["candidate_urls"] = self._build_symbol_download_candidates(item.get("url", ""))
+            enriched_missing.append(item_copy)
+
+        diagnostics = dict(diagnostics)
+        diagnostics["missing_symbols"] = enriched_missing
+        diagnostics["symbol_root"] = str(symbol_root)
+
+        helper_path = self.write_symbol_recovery_helper(diagnostics)
+        diagnostics["helper_script"] = str(helper_path)
+        return diagnostics
+
+    def write_symbol_recovery_helper(self, diagnostics: Dict[str, Any]) -> Path:
+        """Write a shell helper script to attempt manual symbol recovery."""
+        symbol_root = Path(diagnostics.get("symbol_root") or self._get_windows_symbol_root(self.config.symbol_dirs))
+        helper_path = symbol_root / "recover_missing_symbols.sh"
+        symbol_root.mkdir(parents=True, exist_ok=True)
+
+        lines = [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            f'SYMBOL_ROOT="{symbol_root}"',
+            "echo \"Using symbol root: $SYMBOL_ROOT\"",
+            "",
+        ]
+
+        missing = diagnostics.get("missing_symbols", [])
+        if not missing:
+            lines.append("echo \"No missing symbols reported.\"")
+        else:
+            for item in missing:
+                pdb_name = item.get("pdb_name", "unknown.pdb")
+                guidage = item.get("guidage", "unknown")
+                lines.append(f'echo "=== {pdb_name} / {guidage} ==="')
+                lines.append(f'mkdir -p "$SYMBOL_ROOT/{pdb_name}/{guidage}"')
+                for candidate in item.get("candidate_urls", [])[:6]:
+                    filename = candidate.rsplit("/", 1)[-1]
+                    lines.append(
+                        f'curl -fL --retry 2 --connect-timeout 15 "{candidate}" '
+                        f'-o "$SYMBOL_ROOT/{pdb_name}/{guidage}/{filename}" || true'
+                    )
+                lines.append(
+                    f'ls -lah "$SYMBOL_ROOT/{pdb_name}/{guidage}" || true'
+                )
+                lines.append("")
+
+        lines.append('echo "Done. Re-run malhunt after verifying symbol files."')
+        helper_path.write_text("\n".join(lines) + "\n")
+        helper_path.chmod(0o755)
+        return helper_path
+
+    def get_symbol_diagnostics(self, error: VolatilityError) -> Dict[str, Any]:
+        """Build a human-friendly diagnostics report for symbol failures.
+
+        Args:
+            error: VolatilityError raised by a plugin invocation
+
+        Returns:
+            Dictionary with plugin name, missing requirements and PDB hints.
+        """
+        payload = "\n".join([str(error), error.stdout or "", error.stderr or ""])
+        urls = self._extract_symbol_download_urls(payload)
+
+        # collect unsatisfied requirement names when present
+        requirement_matches = re.findall(
+            r"Unsatisfied requirement\s+([^:]+):",
+            payload,
+            flags=re.IGNORECASE,
+        )
+        requirements = []
+        for req in requirement_matches:
+            req = req.strip()
+            if req and req not in requirements:
+                requirements.append(req)
+
+        missing_symbols = []
+        for url in urls:
+            parts = [p for p in url.split("/") if p]
+            if len(parts) < 3:
+                continue
+            pdb_name = parts[-3]
+            guidage = parts[-2]
+            filename = parts[-1]
+            missing_symbols.append(
+                {
+                    "pdb_name": pdb_name,
+                    "guidage": guidage,
+                    "filename": filename,
+                    "url": url,
+                }
+            )
+
+        return {
+            "plugin": error.plugin or "unknown",
+            "returncode": error.returncode,
+            "requirements": requirements,
+            "missing_symbols": missing_symbols,
+            "auto_symbols_enabled": True,
+        }
+    
+    def imageinfo(self) -> Dict[str, Any]:
+        """Get image identification information using windows.info plugin.
+        
+        Returns:
+            Dictionary with OS information and detected properties
+        """
+        logger.info("Analyzing memory dump profile...")
+        
+        try:
+            # Use windows.info plugin (Volatility3)
+            stdout, stderr = self._run_command("windows.info")
+            
+            # Parse key-value pairs from output
+            # Format: "Variable        Value" (older versions also printed
+            # "Suggested : <profile>,…")
+            info: dict[str, str] = {}
+            suggested: list[str] = []
+            for line in stdout.split('\n'):
+                # Skip headers and empty lines
+                if not line.strip() or line.startswith('Variable') or line.startswith('---'):
+                    continue
+
+                # detect any suggested profile line (case‑insensitive)
+                if line.lower().startswith('suggested'):
+                    parts = line.split(':', 1)
+                    if len(parts) > 1:
+                        suggested = [p.strip() for p in parts[1].split(',') if p.strip()]
+                    continue
+
+                # Split on whitespace - key is first word(s), value is last word
+                parts = line.split()
+                if len(parts) >= 2:
+                    # For multi-word keys like "Major/Minor", "PE MajorOperatingSystemVersion"
+                    # Value is the last part, rest is the key
+                    value = parts[-1]
+                    key = ' '.join(parts[:-1])
+
+                    # Store in lowercase for easier access
+                    info[key.lower()] = value
+
+            # Deduce OS information
+            is_64bit = info.get('is64bit', 'False').lower() == 'true'
+            nt_major = info.get('ntmajorversion', '')
+            nt_minor = info.get('ntminorversion', '')
+            build_lab = info.get('ntbuildlab', '')
+            nt_product = info.get('ntproducttype', '')
+            
+            logger.debug(f"Windows version: {nt_major}.{nt_minor}, 64bit={is_64bit}, build={build_lab}")
+            
+            # Build OS description
+            os_name = "Unknown"
+            if nt_major and nt_minor:
+                # Map Windows versions to common names
+                version_key = f"{nt_major}.{nt_minor}"
+                arch = "x64" if is_64bit else "x86"
+                
+                version_map = {
+                    "5.1": "Windows XP",      # Windows XP
+                    "5.2": "Windows 2003",    # Windows 2003
+                    "6.0": "Windows Vista",   # Vista
+                    "6.1": "Windows 7",       # Windows 7
+                    "6.2": "Windows 8",       # Windows 8
+                    "6.3": "Windows 8.1",     # Windows 8.1
+                    "10.0": "Windows 10",     # Windows 10
+                }
+                
+                base_name = version_map.get(version_key, f"Windows {version_key}")
+                os_name = f"{base_name} ({arch})"
+                logger.info(f"Detected OS: {os_name}")
+            
+            return {
+                "raw": stdout,
+                "os_name": os_name,
+                "is_64bit": is_64bit,
+                "is_windows": bool(nt_major),
+                "is_linux": False,
+                "version": f"{nt_major}.{nt_minor}" if nt_major else "",
+                "build": build_lab,
+                "info": info,
+                "suggested_profiles": suggested
+            }
+        
+        except VolatilityError as e:
+            logger.warning(f"Profile identification failed: {e}")
+            return {
+                "raw": "", 
+                "os_name": "Unknown",
+                "error": str(e)
+            }
+    
+    def pslist(self) -> str:
+        """List processes in memory dump.
+        
+        Returns:
+            Process list output
+        """
+        logger.debug("Fetching process list...")
+        stdout, _ = self._run_command("windows.pslist")
+        return stdout
+    
+    def yarascan(self, rule_file: Path) -> str:
+        """Run YARA scan on memory dump.
+        
+        Args:
+            rule_file: Path to YARA rule file
+            
+        Returns:
+            Scan output
+            
+        Raises:
+            VolatilityError: If rule file doesn't exist
+        """
+        if not rule_file.exists():
+            raise VolatilityError(f"YARA rule file not found: {rule_file}")
+        
+        logger.info(f"Running YARA scan with {rule_file.name}")
+
+        attempt_file = rule_file
+        max_syntax_retries = 50
+        yara_timeout = max(self.config.timeout, self.config.yara_timeout)
+        for attempt in range(max_syntax_retries):
+            try:
+                stdout, _ = self._run_command(
+                    "windows.vadyarascan",
+                    f"--yara-file={attempt_file}",
+                    use_cache=False,
+                    timeout=yara_timeout,
+                )
+                match_count = stdout.count("Rule:")
+                logger.debug(f"YARA scan found {match_count} rule matches")
+                return stdout
+            except VolatilityError as error:
+                if self.is_yara_dependency_error(error):
+                    raise VolatilityError(
+                        "YARA backend not available for Volatility. Install yara-python in the same Python environment used by 'vol' (or use yara-x), then retry.",
+                        plugin=error.plugin,
+                        returncode=error.returncode,
+                        stdout=error.stdout,
+                        stderr=error.stderr,
+                    )
+
+                if "timed out" in str(error).lower() and yara_timeout < 3600:
+                    previous_timeout = yara_timeout
+                    yara_timeout = min(yara_timeout * 2, 3600)
+                    logger.warning(
+                        f"YARA scan timed out after {previous_timeout}s; retrying with {yara_timeout}s timeout"
+                    )
+                    continue
+
+                line_number = self._extract_yara_syntax_error_line(error)
+                if line_number is None:
+                    raise
+
+                sanitized_candidate = attempt_file.with_suffix(f".retry{attempt + 1}.yar")
+                removed = self._drop_rule_block_at_line(attempt_file, sanitized_candidate, line_number)
+                if not removed:
+                    raise
+
+                logger.warning(
+                    f"Retrying YARA scan after removing incompatible rule around line {line_number}"
+                )
+                attempt_file = sanitized_candidate
+
+        raise VolatilityError("YARA scan failed after repeated syntax-error recovery attempts")
+
+    @staticmethod
+    def _extract_yara_syntax_error_line(error: VolatilityError) -> Optional[int]:
+        payload = "\n".join([error.stdout or "", error.stderr or "", str(error)])
+        match = re.search(r"yara\.SyntaxError:\s*line\s*(\d+)\s*:", payload)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _drop_rule_block_at_line(source: Path, destination: Path, line_number: int) -> bool:
+        """Drop the YARA rule block around a 1-based line number.
+
+        Returns True if a block (or at least a line) was removed.
+        """
+        lines = source.read_text(errors="ignore").splitlines(keepends=True)
+        if not lines:
+            return False
+
+        index = max(0, min(len(lines) - 1, line_number - 1))
+        bounds = VolatilityWrapper._find_yara_block_bounds(lines, index)
+        if bounds is None:
+            # last-resort fallback: drop only the offending line
+            trimmed = lines[:index] + lines[index + 1 :]
+            destination.write_text("".join(trimmed))
+            return True
+
+        start, end = bounds
+        trimmed = lines[:start] + lines[end + 1 :]
+        destination.write_text("".join(trimmed))
+        return True
+
+    @staticmethod
+    def _find_yara_block_bounds(lines: List[str], index: int) -> Optional[Tuple[int, int]]:
+        """Find the most likely malformed block around an error line.
+
+        First tries to remove a full `rule ... { ... }` block.
+        If no rule header is found, falls back to removing an orphan block
+        bounded by surrounding closing braces.
+        """
+        rule_start = re.compile(r"^\s*(?:(?:private|global)\s+)*rule\b")
+
+        start: Optional[int] = None
+        for i in range(index, -1, -1):
+            if not rule_start.match(lines[i]):
+                continue
+
+            candidate_start = i
+            depth = 0
+            seen_open = False
+            candidate_end = candidate_start
+            for j in range(candidate_start, len(lines)):
+                depth += lines[j].count("{") - lines[j].count("}")
+                if "{" in lines[j]:
+                    seen_open = True
+                candidate_end = j
+                if seen_open and depth <= 0:
+                    break
+
+            # Only treat as the target rule if error line is within candidate block
+            if candidate_start <= index <= candidate_end:
+                start = candidate_start
+                end = candidate_end
+                return (start, end)
+
+            # If candidate already closed before index, the error is outside that rule.
+            if seen_open and depth <= 0 and candidate_end < index:
+                break
+
+            # Rule appears malformed and may never close: if it starts before index,
+            # remove it to recover parsing.
+            if candidate_start <= index and (not seen_open or depth > 0):
+                for j in range(candidate_start + 1, len(lines)):
+                    if rule_start.match(lines[j]):
+                        return (candidate_start, j - 1)
+                return (candidate_start, len(lines) - 1)
+
+        # Orphan fallback: remove the nearest standalone block between `}` delimiters
+        orphan_start = index
+        while orphan_start > 0 and lines[orphan_start - 1].strip() != "}":
+            orphan_start -= 1
+
+        orphan_end = index
+        while orphan_end < len(lines) and lines[orphan_end].strip() != "}":
+            orphan_end += 1
+        if orphan_end >= len(lines):
+            orphan_end = len(lines) - 1
+
+        chunk = "".join(lines[orphan_start : orphan_end + 1]).lower()
+        if not any(token in chunk for token in ("rule ", "meta:", "strings:", "condition:", "$")):
+            return None
+
+        return (orphan_start, orphan_end)
+    
+    def malfind(self) -> str:
+        """Scan for suspicious injected code.
+        
+        Returns:
+            Malfind output
+        """
+        logger.info("Running Malfind scan...")
+        stdout, _ = self._run_command("windows.malfind")
+        
+        process_count = stdout.count("Process:")
+        logger.debug(f"Malfind found {process_count} suspicious processes")
+        
+        return stdout
+    
+    def netscan(self) -> str:
+        """Scan network connections.
+        
+        Returns:
+            Network scan output
+        """
+        logger.info("Running network scan (netscan)...")
+        try:
+            stdout, _ = self._run_command("windows.netscan")
+        except VolatilityError as error:
+            details = "\n".join([str(error), error.stdout or "", error.stderr or ""]).lower()
+            if "notimplementederror" in details or "not supported" in details:
+                logger.warning("windows.netscan unsupported for this image - falling back to windows.netstat")
+                try:
+                    stdout, _ = self._run_command("windows.netstat")
+                except VolatilityError as netstat_error:
+                    netstat_details = "\n".join(
+                        [str(netstat_error), netstat_error.stdout or "", netstat_error.stderr or ""]
+                    ).lower()
+                    if "notimplementederror" in netstat_details or "not supported" in netstat_details:
+                        logger.warning("windows.netstat is also unsupported for this image")
+                        return ""
+                    raise
+            else:
+                raise
+        
+        connection_count = len([l for l in stdout.split('\n') if l.strip()])
+        logger.debug(f"Found {connection_count} network connections")
+        
+        return stdout
+    
+    def connscan(self) -> str:
+        """Scan for connection objects (legacy, older Windows versions).
+        
+        Returns:
+            Connection scan output
+        """
+        logger.info("Running legacy connection scan (connscan)...")
+        stdout, _ = self._run_command("windows.connscan")
+        return stdout
+    
+    def procdump(self, pid: str, output_dir: Path) -> Optional[Path]:
+        """Dump process memory.
+        
+        Args:
+            pid: Process ID to dump
+            output_dir: Directory to save dump
+            
+        Returns:
+            Path to dumped file, or None if failed
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"Dumping process {pid}...")
+        before_files = {p.resolve() for p in output_dir.glob("*") if p.is_file()}
+
+        try:
+            stdout, _ = self._run_command(
+                "windows.dumpfiles",
+                f"--pid={pid}",
+                use_cache=False,
+                output_dir=output_dir,
+            )
+        except VolatilityError as error:
+            details = "\n".join([str(error), error.stdout or "", error.stderr or ""]).lower()
+            if "invalid choice windows.dumpfiles" not in details:
+                raise
+
+            logger.warning("windows.dumpfiles unavailable, falling back to windows.procdump")
+            stdout, _ = self._run_command(
+                "windows.procdump",
+                f"--pid={pid}",
+                f"--dump-dir={output_dir}",
+                use_cache=False,
+            )
+        
+        # Parse output to find the dumped file
+        # Vol3 output typically contains the saved filename
+        for line in stdout.split('\n'):
+            if 'Dumped' in line or 'Saved' in line or pid in line:
+                logger.debug(f"Procdump output: {line}")
+                
+                # Try to extract file path
+                if output_dir.name in line:
+                    parts = line.split()
+                    for part in parts:
+                        if part.endswith('.dmp') or part.endswith('.bin'):
+                            dump_file = output_dir / part
+                            if dump_file.exists():
+                                logger.success(f"Dumped to {dump_file}")
+                                return dump_file
+
+        after_files = [p for p in output_dir.glob("*") if p.is_file() and p.resolve() not in before_files]
+        if after_files:
+            newest = max(after_files, key=lambda p: p.stat().st_mtime)
+            logger.success(f"Dumped to {newest}")
+            return newest
+        
+        logger.warning(f"Could not locate dumped file for PID {pid}")
+        return None
+    
+    def handles(self, pid: str) -> str:
+        """Get process handles.
+        
+        Args:
+            pid: Process ID
+            
+        Returns:
+            Handles output
+        """
+        logger.debug(f"Collecting handles for PID {pid}...")
+        stdout, _ = self._run_command("windows.handles", f"--pid={pid}")
+        
+        handle_count = stdout.count('0x')  # Rough count of handles
+        logger.debug(f"Found ~{handle_count} handles for PID {pid}")
+        
+        return stdout
+    
+    def clear_cache(self) -> None:
+        """Clear the result cache."""
+        self._cache.clear()
+        logger.debug("Cache cleared")
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics.
+        
+        Returns:
+            Dictionary with cache info
+        """
+        return {
+            "size": len(self._cache),
+            "entries": list(self._cache.keys()),
+            "memory_bytes": sum(len(v) for v in self._cache.values())
+        }

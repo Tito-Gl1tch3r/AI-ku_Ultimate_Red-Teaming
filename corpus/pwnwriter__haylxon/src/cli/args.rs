@@ -1,0 +1,174 @@
+use super::ascii;
+use clap::{Args, Parser, ValueEnum};
+
+#[derive(Debug, Args)]
+#[group(required = false, multiple = false, conflicts_with = "stdin")]
+pub struct Input {
+    /// Website URL
+    #[arg(short, long)]
+    pub url: Option<String>,
+
+    /// Path of the file containing URLs
+    #[arg(short, long)]
+    pub file_path: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    author,
+    version,
+    about = ascii::splash(),
+    propagate_version = true,
+    arg_required_else_help = true
+)]
+pub struct Cli {
+    #[command(flatten)]
+    pub input: Input,
+
+    /// Browser binary path (local mode)
+    #[arg(short, long, default_value = "/usr/bin/chrome", conflicts_with_all = ["remote_url", "remote_host"])]
+    pub binary_path: String,
+
+    /// Connect to a remote browser via WebSocket URL
+    /// e.g. ws://10.0.0.5:9222/devtools/browser/<uuid>
+    #[arg(long, conflicts_with_all = ["binary_path", "remote_host"])]
+    pub remote_url: Option<String>,
+
+    /// Connect to a remote browser via host:port (auto-discovers WebSocket URL)
+    /// e.g. 10.0.0.5:9222
+    #[arg(long, conflicts_with_all = ["binary_path", "remote_url"])]
+    pub remote_host: Option<String>,
+
+    /// Output directory to save screenshots
+    #[arg(short, long, default_value = "hxnshots")]
+    pub outdir: String,
+
+    /// Maximum number of parallel tabs
+    #[arg(short, long, default_value = "4")]
+    pub tabs: usize,
+
+    /// Width of the website; URL
+    #[arg(short = 'x', long, default_value = "1440")]
+    pub width: u32,
+
+    /// Height of the website; URL
+    #[arg(short = 'y', long, default_value = "900")]
+    pub height: u32,
+
+    /// Define timeout for urls
+    #[arg(long, default_value = "100")]
+    pub timeout: u64,
+
+    /// Define delay for client side loading
+    #[arg(long, default_value = "0")]
+    pub delay: u64,
+
+    /// Provide ports as a range (x..y) or absolute values (x,y,z).
+    #[arg(long, num_args(0..=1000), required=false)]
+    pub ports: Option<String>,
+
+    /// Read urls from the standard input
+    #[arg(long)]
+    pub stdin: bool,
+
+    /// Silent mode, suppress extra output (useful for automation)
+    #[arg(short, long)]
+    pub silent: bool,
+
+    /// Take fullpage screenshot
+    #[arg(long, default_value = "false")]
+    pub fullpage: bool,
+
+    /// Define your image type
+    #[arg(long, default_value = "png")]
+    pub screenshot_type: ScreenshotType,
+
+    /// Accept invalid certs, trust dns
+    #[arg(long)]
+    pub accept_invalid_certs: bool,
+
+    /// Run arbiraty javascript
+    #[arg(long)]
+    pub javascript: Option<String>,
+
+    /// User-agent: "random", "random-per-url", path to a UA file, or a custom string
+    #[arg(long)]
+    pub user_agent: Option<String>,
+
+    /// Proxy URL (e.g., http://127.0.0.1:8080, socks5://127.0.0.1:9050)
+    #[arg(long)]
+    pub proxy: Option<String>,
+
+    /// Output results as NDJSON (one JSON object per line)
+    #[arg(long)]
+    pub json: bool,
+
+    /// Generate an HTML gallery report as index.html in the output directory
+    #[arg(long)]
+    pub html_report: bool,
+
+    /// Reuse browser tabs instead of creating a new one per URL
+    #[arg(long, default_value = "true")]
+    pub reuse_tabs: bool,
+
+    /// Maximum number of warm pages kept in the tab pool
+    #[arg(long, default_value = "8")]
+    pub pool_size: usize,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+#[allow(non_camel_case_types)]
+pub enum ScreenshotType {
+    /// format png
+    Png,
+    /// format Jpeg
+    Jpeg,
+    /// format Webg
+    Webg,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::error::ErrorKind;
+
+    use super::*;
+
+    #[test]
+    fn test_no_input_urls() {
+        let result = Cli::try_parse_from(["hxn"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stdin_source_mutual_exclusion() {
+        let args = Cli::try_parse_from([
+            "-b my_browser",
+            "--stdin",
+            "-u https://example.com",
+            "-f /my/file",
+        ]);
+        assert!(args.is_err());
+        assert_eq!(args.unwrap_err().kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn test_url_mutual_exclusion_with_file_path() {
+        let args = Cli::try_parse_from(["-b my_browser", "-u https://example.com", "-f /my/file"]);
+        assert!(args.is_err());
+        assert_eq!(args.unwrap_err().kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn test_file_path_as_source() {
+        let args = Cli::try_parse_from(["-b my_browser", "-f /my/file"]);
+        assert!(args.is_ok());
+    }
+
+    #[test]
+    fn test_html_report_flag() {
+        let args =
+            Cli::try_parse_from(["-b my_browser", "-u https://example.com", "--html-report"])
+                .unwrap();
+        assert!(args.html_report);
+    }
+}

@@ -1,0 +1,1098 @@
+use chrono::Utc;
+use clap::{Parser, ValueEnum};
+use colored::*;
+use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::time::Duration;
+use tokio::time::sleep;
+
+mod phone;
+mod search;
+mod google;
+mod bing;
+mod duckduckgo;
+mod dehashed;
+mod parser;
+mod analysis;
+
+// People search site modules
+mod whitepages;
+mod truepeoplesearch;
+mod fastpeoplesearch;
+mod thatsthem;
+mod usphonebook;
+
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+
+/// Maximum number of simultaneous in-flight HTTP requests in concurrent mode.
+const MAX_CONCURRENT_REQUESTS: usize = 4;
+
+use crate::phone::PhoneFormatter;
+use crate::search::{SearchResult, SearchConfig};
+use crate::analysis::PatternAnalyzer;
+
+const ASCII_LOGO: &str = r#"
+████████╗███████╗██╗     ███████╗███████╗██████╗  ██████╗ ████████╗████████╗███████╗██████╗ 
+╚══██╔══╝██╔════╝██║     ██╔════╝██╔════╝██╔══██╗██╔═══██╗╚══██╔══╝╚══██╔══╝██╔════╝██╔══██╗
+   ██║   █████╗  ██║     █████╗  ███████╗██████╔╝██║   ██║   ██║      ██║   █████╗  ██████╔╝
+   ██║   ██╔══╝  ██║     ██╔══╝  ╚════██║██╔═══╝ ██║   ██║   ██║      ██║   ██╔══╝  ██╔══██╗
+   ██║   ███████╗███████╗███████╗███████║██║     ╚██████╔╝   ██║      ██║   ███████╗██║  ██║
+   ╚═╝   ╚══════╝╚══════╝╚══════╝╚══════╝╚═╝      ╚═════╝    ╚═╝      ╚═╝   ╚══════╝╚═╝  ╚═╝
+                                                                              version 2.1
+"#;
+
+/// Output format options
+#[derive(Debug, Clone, ValueEnum, Default)]
+pub enum OutputFormat {
+    #[default]
+    Json,
+    Csv,
+    Txt,
+}
+
+/// Search engine options
+#[derive(Debug, Clone, ValueEnum, PartialEq)]
+pub enum Engine {
+    Google,
+    Bing,
+    Duckduckgo,
+    Dehashed,
+    All,
+}
+
+#[derive(Parser, Debug)]
+#[command(author, version, about = "Phone Number OSINT Search Tool", long_about = None)]
+struct Args {
+    /// Phone number to search
+    #[arg(help = "Phone number (digits only or formatted)")]
+    phone_number: Option<String>,
+
+    /// Enable debug mode (shows errors and sample results)
+    #[arg(short, long)]
+    debug: bool,
+
+    /// Number of results per search engine
+    #[arg(short = 'n', long, default_value = "5")]
+    num_results: usize,
+
+    /// Save results to file automatically
+    #[arg(short = 's', long)]
+    save: bool,
+
+    /// HTTP request timeout in seconds
+    #[arg(short = 't', long, default_value = "10")]
+    timeout: u64,
+
+    /// Delay between requests in seconds (rate limiting)
+    #[arg(long, default_value = "1")]
+    delay: u64,
+
+    /// Custom output file path (default: telespotter_results_<phone>.json)
+    #[arg(short = 'o', long)]
+    output: Option<String>,
+
+    /// Output format: json, csv, or txt
+    #[arg(short = 'f', long, value_enum, default_value = "json")]
+    format: OutputFormat,
+
+    /// Search engines to use (can specify multiple: -e google -e bing)
+    #[arg(short = 'e', long, value_enum, default_value = "all")]
+    engines: Vec<Engine>,
+
+    /// Quiet mode - minimal output
+    #[arg(short = 'q', long)]
+    quiet: bool,
+
+    /// Disable colored output
+    #[arg(long)]
+    no_color: bool,
+
+    /// Maximum number of names to display in results
+    #[arg(long, default_value = "10")]
+    max_names: usize,
+
+    /// Maximum number of locations to display in results
+    #[arg(long, default_value = "10")]
+    max_locations: usize,
+
+    /// Maximum number of emails to display in results
+    #[arg(long, default_value = "10")]
+    max_emails: usize,
+
+    /// Maximum number of usernames to display in results
+    #[arg(long, default_value = "10")]
+    max_usernames: usize,
+
+    /// Enable concurrent searches across engines (faster but may trigger rate limits)
+    #[arg(short = 'c', long)]
+    concurrent: bool,
+
+    /// Number of retry attempts for failed requests
+    #[arg(long, default_value = "2")]
+    retries: usize,
+
+    /// Auto-run Sherlock on found usernames (skips prompt)
+    #[arg(long)]
+    sherlock: bool,
+
+    /// Auto-run Blackbird on found emails (skips prompt)
+    #[arg(long)]
+    blackbird: bool,
+
+    /// Run email2phonenumber reverse lookup
+    #[arg(long)]
+    email2phone: bool,
+
+    /// Skip OSINT tool prompts (don't ask to run Sherlock/Blackbird)
+    #[arg(long)]
+    no_osint_prompts: bool,
+
+    /// Use random user agent for each request (helps avoid detection)
+    #[arg(long)]
+    random_ua: bool,
+
+    /// Search people lookup sites (Whitepages, TruePeopleSearch, etc.)
+    #[arg(short = 'p', long)]
+    people_search: bool,
+
+    /// Enable only Whitepages search (use with --people-search)
+    #[arg(long)]
+    whitepages: bool,
+
+    /// Enable only TruePeopleSearch (use with --people-search)
+    #[arg(long)]
+    truepeoplesearch: bool,
+
+    /// Enable only FastPeopleSearch (use with --people-search)
+    #[arg(long)]
+    fastpeoplesearch: bool,
+
+    /// Enable only ThatsThem search (use with --people-search)
+    #[arg(long)]
+    thatsthem: bool,
+
+    /// Enable only USPhoneBook search (use with --people-search)
+    #[arg(long)]
+    usphonebook: bool,
+}
+
+/// Helper to determine if an engine should be used
+fn should_use_engine(engines: &[Engine], target: Engine) -> bool {
+    engines.is_empty() || engines.contains(&Engine::All) || engines.contains(&target)
+}
+
+/// Search Google with retries
+async fn search_google_with_retry(
+    query: &str,
+    num_results: usize,
+    client: &reqwest::Client,
+    retries: usize,
+) -> anyhow::Result<Vec<SearchResult>> {
+    let mut last_error = None;
+    for attempt in 0..=retries {
+        match google::search_with_config(query, num_results, client).await {
+            Ok(results) => return Ok(results),
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < retries {
+                    sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap())
+}
+
+/// Search Bing with retries
+async fn search_bing_with_retry(
+    query: &str,
+    num_results: usize,
+    client: &reqwest::Client,
+    retries: usize,
+) -> anyhow::Result<Vec<SearchResult>> {
+    let mut last_error = None;
+    for attempt in 0..=retries {
+        match bing::search_with_config(query, num_results, client).await {
+            Ok(results) => return Ok(results),
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < retries {
+                    sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap())
+}
+
+/// Search DuckDuckGo with retries
+async fn search_duckduckgo_with_retry(
+    query: &str,
+    num_results: usize,
+    client: &reqwest::Client,
+    retries: usize,
+) -> anyhow::Result<Vec<SearchResult>> {
+    let mut last_error = None;
+    for attempt in 0..=retries {
+        match duckduckgo::search_with_config(query, num_results, client).await {
+            Ok(results) => return Ok(results),
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < retries {
+                    sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap())
+}
+
+/// Search Dehashed with retries
+async fn search_dehashed_with_retry(
+    query: &str,
+    client: &reqwest::Client,
+    retries: usize,
+) -> anyhow::Result<Vec<SearchResult>> {
+    let mut last_error = None;
+    for attempt in 0..=retries {
+        match dehashed::search_with_config(query, client).await {
+            Ok(results) => return Ok(results),
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < retries {
+                    sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap())
+}
+
+/// Search a single engine
+async fn search_engine(
+    engine: &str,
+    query: &str,
+    num_results: usize,
+    client: &reqwest::Client,
+    retries: usize,
+) -> anyhow::Result<Vec<SearchResult>> {
+    match engine {
+        "google" => search_google_with_retry(query, num_results, client, retries).await,
+        "bing" => search_bing_with_retry(query, num_results, client, retries).await,
+        "duckduckgo" => search_duckduckgo_with_retry(query, num_results, client, retries).await,
+        "dehashed" => search_dehashed_with_retry(query, client, retries).await,
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Search all enabled engines concurrently.
+/// A shared semaphore caps the number of simultaneous in-flight requests so we
+/// don't fire every engine (and now every format) at once.
+async fn search_concurrent(
+    query: &str,
+    num_results: usize,
+    client: &Arc<reqwest::Client>,
+    engines: &[Engine],
+    retries: usize,
+    semaphore: &Arc<Semaphore>,
+) -> Vec<(String, anyhow::Result<Vec<SearchResult>>)> {
+    let mut handles: Vec<(String, tokio::task::JoinHandle<anyhow::Result<Vec<SearchResult>>>)> =
+        Vec::new();
+
+    let spawn_engine = |name: &str, key: &'static str| {
+        let q = query.to_string();
+        let cl = Arc::clone(client);
+        let sem = Arc::clone(semaphore);
+        (name.to_string(), tokio::spawn(async move {
+            // Hold a permit for the duration of this engine's request(s).
+            let _permit = sem.acquire().await.expect("semaphore closed");
+            search_engine(key, &q, num_results, &cl, retries).await
+        }))
+    };
+
+    if should_use_engine(engines, Engine::Google) {
+        handles.push(spawn_engine("Google", "google"));
+    }
+    if should_use_engine(engines, Engine::Bing) {
+        handles.push(spawn_engine("Bing", "bing"));
+    }
+    if should_use_engine(engines, Engine::Duckduckgo) {
+        handles.push(spawn_engine("DuckDuckGo", "duckduckgo"));
+    }
+    // Dehashed only runs when explicitly requested (needs an API key); it is not
+    // part of the "all" default so a missing key doesn't add noise.
+    if engines.contains(&Engine::Dehashed) {
+        handles.push(spawn_engine("Dehashed", "dehashed"));
+    }
+
+    let mut results = Vec::new();
+    for (name, handle) in handles {
+        let result = handle.await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task failed: {}", e)));
+        results.push((name, result));
+    }
+    results
+}
+
+/// Print helper that respects quiet and no-color modes
+macro_rules! qprint {
+    ($quiet:expr, $no_color:expr, $colored:expr, $plain:expr) => {
+        if !$quiet {
+            if $no_color {
+                println!("{}", $plain);
+            } else {
+                println!("{}", $colored);
+            }
+        }
+    };
+}
+
+macro_rules! qprint_inline {
+    ($quiet:expr, $no_color:expr, $colored:expr, $plain:expr) => {
+        if !$quiet {
+            if $no_color {
+                print!("{}", $plain);
+            } else {
+                print!("{}", $colored);
+            }
+            let _ = std::io::stdout().flush();
+        }
+    };
+}
+
+/// Run Sherlock tool on usernames
+fn run_sherlock(usernames: &[String], no_color: bool) -> std::io::Result<()> {
+    use std::process::Command;
+
+    println!();
+    if no_color {
+        println!("Running Sherlock on {} username(s)...", usernames.len());
+    } else {
+        println!("{}", format!("🔎 Running Sherlock on {} username(s)...", usernames.len()).cyan().bold());
+    }
+
+    for username in usernames {
+        if no_color {
+            println!("\n  Searching for: @{}", username);
+        } else {
+            println!("\n  {} @{}", "Searching for:".yellow(), username.green());
+        }
+
+        let output = Command::new("sherlock")
+            .arg(username)
+            .arg("--print-found")
+            .output();
+
+        match output {
+            Ok(result) => {
+                if result.status.success() {
+                    let stdout = String::from_utf8_lossy(&result.stdout);
+                    for line in stdout.lines().take(20) {
+                        println!("    {}", line);
+                    }
+                    if stdout.lines().count() > 20 {
+                        println!("    ... (truncated, see full output)");
+                    }
+                } else {
+                    let stderr = String::from_utf8_lossy(&result.stderr);
+                    eprintln!("    Sherlock error: {}", stderr.trim());
+                }
+            }
+            Err(e) => {
+                eprintln!("    Failed to run Sherlock: {}", e);
+                eprintln!("    Make sure Sherlock is installed: pip install sherlock-project");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run Blackbird tool on emails
+fn run_blackbird(emails: &[String], no_color: bool) -> std::io::Result<()> {
+    use std::process::Command;
+
+    println!();
+    if no_color {
+        println!("Running Blackbird on {} email(s)...", emails.len());
+    } else {
+        println!("{}", format!("🐦 Running Blackbird on {} email(s)...", emails.len()).cyan().bold());
+    }
+
+    for email in emails {
+        if no_color {
+            println!("\n  Searching for: {}", email);
+        } else {
+            println!("\n  {} {}", "Searching for:".yellow(), email.green());
+        }
+
+        let output = Command::new("blackbird")
+            .arg("-e")
+            .arg(email)
+            .output();
+
+        match output {
+            Ok(result) => {
+                if result.status.success() {
+                    let stdout = String::from_utf8_lossy(&result.stdout);
+                    for line in stdout.lines().take(20) {
+                        println!("    {}", line);
+                    }
+                } else {
+                    let stderr = String::from_utf8_lossy(&result.stderr);
+                    eprintln!("    Blackbird error: {}", stderr.trim());
+                }
+            }
+            Err(e) => {
+                eprintln!("    Failed to run Blackbird: {}", e);
+                eprintln!("    Make sure Blackbird is installed: pip install blackbird");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run email2phonenumber tool
+fn run_email2phone(emails: &[String], no_color: bool) -> std::io::Result<()> {
+    use std::process::Command;
+
+    println!();
+    if no_color {
+        println!("Running email2phonenumber on {} email(s)...", emails.len());
+    } else {
+        println!("{}", format!("📱 Running email2phonenumber on {} email(s)...", emails.len()).cyan().bold());
+    }
+
+    for email in emails {
+        if no_color {
+            println!("\n  Looking up: {}", email);
+        } else {
+            println!("\n  {} {}", "Looking up:".yellow(), email.green());
+        }
+
+        let output = Command::new("email2phonenumber")
+            .arg("scrape")
+            .arg("-e")
+            .arg(email)
+            .output();
+
+        match output {
+            Ok(result) => {
+                let stdout = String::from_utf8_lossy(&result.stdout);
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                if !stdout.is_empty() {
+                    for line in stdout.lines() {
+                        println!("    {}", line);
+                    }
+                }
+                if !stderr.is_empty() && !result.status.success() {
+                    eprintln!("    {}", stderr.trim());
+                }
+            }
+            Err(e) => {
+                eprintln!("    Failed to run email2phonenumber: {}", e);
+                eprintln!("    Make sure it's installed: pip install email2phonenumber");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Prompt user for yes/no
+fn prompt_yes_no(prompt: &str, no_color: bool) -> bool {
+    if no_color {
+        print!("{} (y/n): ", prompt);
+    } else {
+        print!("{} (y/n): ", prompt.cyan());
+    }
+    let _ = std::io::stdout().flush();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_ok() {
+        input.trim().to_lowercase() == "y"
+    } else {
+        false
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
+    // Handle no-color flag
+    if args.no_color {
+        colored::control::set_override(false);
+    }
+
+    // Print logo (unless quiet mode)
+    if !args.quiet {
+        if args.no_color {
+            println!("{}", ASCII_LOGO);
+        } else {
+            println!("{}", ASCII_LOGO.cyan().bold());
+        }
+    }
+
+    if args.debug && !args.quiet {
+        qprint!(args.quiet, args.no_color, "🐛 Debug mode enabled\n".yellow(), "Debug mode enabled\n");
+    }
+
+    // Get phone number
+    let phone_number = match args.phone_number {
+        Some(num) => num,
+        None => {
+            qprint_inline!(false, args.no_color,
+                "Enter phone number (digits only or formatted): ".cyan(),
+                "Enter phone number (digits only or formatted): ");
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            input.trim().to_string()
+        }
+    };
+
+    // Generate phone formats
+    qprint!(args.quiet, args.no_color,
+        "\nGenerating search formats...".yellow(),
+        "\nGenerating search formats...");
+    let formatter = PhoneFormatter::new(&phone_number)?;
+    let formats = formatter.generate_formats();
+
+    qprint!(args.quiet, args.no_color,
+        format!("Generated {} search format variations\n", formats.len()).green(),
+        format!("Generated {} search format variations\n", formats.len()));
+
+    // Create search config and build ONE shared HTTP client (built once, passed
+    // by reference/Arc to every search function instead of rebuilt per request).
+    let config = SearchConfig {
+        timeout_secs: args.timeout,
+        random_user_agent: args.random_ua,
+    };
+    let client = Arc::new(search::create_client_from_config(&config)?);
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
+
+    if args.random_ua && !args.quiet {
+        qprint!(args.quiet, args.no_color,
+            "Random user agent rotation enabled".green(),
+            "Random user agent rotation enabled");
+    }
+
+    // Store all results
+    let mut all_results: HashMap<String, Vec<SearchResult>> = HashMap::new();
+
+    // Search each format
+    for (i, format) in formats.iter().enumerate() {
+        qprint!(args.quiet, args.no_color,
+            format!("[{}/{}] Searching: {}", i + 1, formats.len(), format).blue(),
+            format!("[{}/{}] Searching: {}", i + 1, formats.len(), format));
+
+        let mut format_results = Vec::new();
+
+        if args.concurrent {
+            // Concurrent search mode
+            let results = search_concurrent(format, args.num_results, &client, &args.engines, args.retries, &semaphore).await;
+
+            for (engine_name, result) in results {
+                match result {
+                    Ok(res) => {
+                        let count = res.len();
+                        format_results.extend(res);
+                        qprint!(args.quiet, args.no_color,
+                            format!("  → {}: {} results", engine_name, count).green(),
+                            format!("  → {}: {} results", engine_name, count));
+                    }
+                    Err(e) if args.debug => {
+                        qprint!(args.quiet, args.no_color,
+                            format!("  → {}: Error: {}", engine_name, e).yellow(),
+                            format!("  → {}: Error: {}", engine_name, e));
+                    }
+                    Err(_) => {
+                        qprint!(args.quiet, args.no_color,
+                            format!("  → {}: 0 results", engine_name).yellow(),
+                            format!("  → {}: 0 results", engine_name));
+                    }
+                }
+            }
+        } else {
+            // Sequential search mode
+            if should_use_engine(&args.engines, Engine::Google) {
+                qprint_inline!(args.quiet, args.no_color,
+                    "  → Searching Google... ".cyan(),
+                    "  → Searching Google... ");
+                match search_engine("google", format, args.num_results, &client, args.retries).await {
+                    Ok(results) => {
+                        let count = results.len();
+                        format_results.extend(results);
+                        qprint!(args.quiet, args.no_color,
+                            format!("({} results)", count).green(),
+                            format!("({} results)", count));
+                    }
+                    Err(e) if args.debug => {
+                        qprint!(args.quiet, args.no_color,
+                            format!("Error: {}", e).yellow(),
+                            format!("Error: {}", e));
+                    }
+                    Err(_) => {
+                        qprint!(args.quiet, args.no_color,
+                            "(0 results)".yellow(),
+                            "(0 results)");
+                    }
+                }
+                sleep(Duration::from_secs(args.delay)).await;
+            }
+
+            if should_use_engine(&args.engines, Engine::Bing) {
+                qprint_inline!(args.quiet, args.no_color,
+                    "  → Searching Bing... ".cyan(),
+                    "  → Searching Bing... ");
+                match search_engine("bing", format, args.num_results, &client, args.retries).await {
+                    Ok(results) => {
+                        let count = results.len();
+                        format_results.extend(results);
+                        qprint!(args.quiet, args.no_color,
+                            format!("({} results)", count).green(),
+                            format!("({} results)", count));
+                    }
+                    Err(e) if args.debug => {
+                        qprint!(args.quiet, args.no_color,
+                            format!("Error: {}", e).yellow(),
+                            format!("Error: {}", e));
+                    }
+                    Err(_) => {
+                        qprint!(args.quiet, args.no_color,
+                            "(0 results)".yellow(),
+                            "(0 results)");
+                    }
+                }
+                sleep(Duration::from_secs(args.delay)).await;
+            }
+
+            if should_use_engine(&args.engines, Engine::Duckduckgo) {
+                qprint_inline!(args.quiet, args.no_color,
+                    "  → Searching DuckDuckGo... ".cyan(),
+                    "  → Searching DuckDuckGo... ");
+                match search_engine("duckduckgo", format, args.num_results, &client, args.retries).await {
+                    Ok(results) => {
+                        let count = results.len();
+                        format_results.extend(results);
+                        qprint!(args.quiet, args.no_color,
+                            format!("({} results)", count).green(),
+                            format!("({} results)", count));
+                    }
+                    Err(e) if args.debug => {
+                        qprint!(args.quiet, args.no_color,
+                            format!("Error: {}", e).yellow(),
+                            format!("Error: {}", e));
+                    }
+                    Err(_) => {
+                        qprint!(args.quiet, args.no_color,
+                            "(0 results)".yellow(),
+                            "(0 results)");
+                    }
+                }
+                sleep(Duration::from_secs(args.delay)).await;
+            }
+
+            // Dehashed only runs when explicitly requested (needs DEHASHED_API_KEY);
+            // not part of the "all" default so a missing key doesn't add noise.
+            if args.engines.contains(&Engine::Dehashed) {
+                qprint_inline!(args.quiet, args.no_color,
+                    "  → Searching Dehashed... ".cyan(),
+                    "  → Searching Dehashed... ");
+                match search_engine("dehashed", format, args.num_results, &client, args.retries).await {
+                    Ok(results) => {
+                        let count = results.len();
+                        format_results.extend(results);
+                        qprint!(args.quiet, args.no_color,
+                            format!("({} results)", count).green(),
+                            format!("({} results)", count));
+                    }
+                    Err(e) if args.debug => {
+                        qprint!(args.quiet, args.no_color,
+                            format!("Error: {}", e).yellow(),
+                            format!("Error: {}", e));
+                    }
+                    Err(_) => {
+                        qprint!(args.quiet, args.no_color,
+                            "(0 results)".yellow(),
+                            "(0 results)");
+                    }
+                }
+            }
+        }
+
+        qprint!(args.quiet, args.no_color,
+            format!("  ✓ Total: {} results for this format", format_results.len()).green(),
+            format!("  Total: {} results for this format", format_results.len()));
+
+        if args.debug && !format_results.is_empty() && !args.quiet {
+            let sample = &format_results[0].title;
+            let truncated = if sample.chars().count() > 60 {
+                let end_idx = sample.char_indices().nth(60).map(|(i, _)| i).unwrap_or(sample.len());
+                format!("{}...", &sample[..end_idx])
+            } else {
+                sample.clone()
+            };
+            qprint!(args.quiet, args.no_color,
+                format!("  Debug: Sample - {}", truncated).yellow(),
+                format!("  Debug: Sample - {}", truncated));
+        }
+
+        all_results.insert(format.clone(), format_results);
+
+        // Rate limiting between formats
+        if i < formats.len() - 1 {
+            let wait_time = args.delay * 3;
+            qprint!(args.quiet, args.no_color,
+                format!("  ⏳ Waiting {} seconds...\n", wait_time).yellow(),
+                format!("  Waiting {} seconds...\n", wait_time));
+            sleep(Duration::from_secs(wait_time)).await;
+        } else if !args.quiet {
+            println!();
+        }
+    }
+
+    // People search sites (if enabled)
+    if args.people_search {
+        qprint!(args.quiet, args.no_color,
+            "\nSearching people lookup sites...".magenta().bold(),
+            "\nSearching people lookup sites...");
+
+        let phone_digits: String = phone_number.chars().filter(|c| c.is_numeric()).collect();
+        let mut people_results: Vec<SearchResult> = Vec::new();
+
+        // Determine which sites to search (if none specified, search all)
+        let search_all = !args.whitepages && !args.truepeoplesearch &&
+                        !args.fastpeoplesearch && !args.thatsthem && !args.usphonebook;
+
+        // Whitepages
+        if search_all || args.whitepages {
+            qprint_inline!(args.quiet, args.no_color,
+                "  → Searching Whitepages... ".cyan(),
+                "  → Searching Whitepages... ");
+            match whitepages::search_with_config(&phone_digits, &client).await {
+                Ok(results) => {
+                    let count = results.len();
+                    people_results.extend(results);
+                    qprint!(args.quiet, args.no_color,
+                        format!("({} results)", count).green(),
+                        format!("({} results)", count));
+                }
+                Err(e) if args.debug => {
+                    qprint!(args.quiet, args.no_color,
+                        format!("Error: {}", e).yellow(),
+                        format!("Error: {}", e));
+                }
+                Err(_) => {
+                    qprint!(args.quiet, args.no_color,
+                        "(0 results)".yellow(),
+                        "(0 results)");
+                }
+            }
+            sleep(Duration::from_secs(args.delay)).await;
+        }
+
+        // TruePeopleSearch
+        if search_all || args.truepeoplesearch {
+            qprint_inline!(args.quiet, args.no_color,
+                "  → Searching TruePeopleSearch... ".cyan(),
+                "  → Searching TruePeopleSearch... ");
+            match truepeoplesearch::search_with_config(&phone_digits, &client).await {
+                Ok(results) => {
+                    let count = results.len();
+                    people_results.extend(results);
+                    qprint!(args.quiet, args.no_color,
+                        format!("({} results)", count).green(),
+                        format!("({} results)", count));
+                }
+                Err(e) if args.debug => {
+                    qprint!(args.quiet, args.no_color,
+                        format!("Error: {}", e).yellow(),
+                        format!("Error: {}", e));
+                }
+                Err(_) => {
+                    qprint!(args.quiet, args.no_color,
+                        "(0 results)".yellow(),
+                        "(0 results)");
+                }
+            }
+            sleep(Duration::from_secs(args.delay)).await;
+        }
+
+        // FastPeopleSearch
+        if search_all || args.fastpeoplesearch {
+            qprint_inline!(args.quiet, args.no_color,
+                "  → Searching FastPeopleSearch... ".cyan(),
+                "  → Searching FastPeopleSearch... ");
+            match fastpeoplesearch::search_with_config(&phone_digits, &client).await {
+                Ok(results) => {
+                    let count = results.len();
+                    people_results.extend(results);
+                    qprint!(args.quiet, args.no_color,
+                        format!("({} results)", count).green(),
+                        format!("({} results)", count));
+                }
+                Err(e) if args.debug => {
+                    qprint!(args.quiet, args.no_color,
+                        format!("Error: {}", e).yellow(),
+                        format!("Error: {}", e));
+                }
+                Err(_) => {
+                    qprint!(args.quiet, args.no_color,
+                        "(0 results)".yellow(),
+                        "(0 results)");
+                }
+            }
+            sleep(Duration::from_secs(args.delay)).await;
+        }
+
+        // ThatsThem
+        if search_all || args.thatsthem {
+            qprint_inline!(args.quiet, args.no_color,
+                "  → Searching ThatsThem... ".cyan(),
+                "  → Searching ThatsThem... ");
+            match thatsthem::search_with_config(&phone_digits, &client).await {
+                Ok(results) => {
+                    let count = results.len();
+                    people_results.extend(results);
+                    qprint!(args.quiet, args.no_color,
+                        format!("({} results)", count).green(),
+                        format!("({} results)", count));
+                }
+                Err(e) if args.debug => {
+                    qprint!(args.quiet, args.no_color,
+                        format!("Error: {}", e).yellow(),
+                        format!("Error: {}", e));
+                }
+                Err(_) => {
+                    qprint!(args.quiet, args.no_color,
+                        "(0 results)".yellow(),
+                        "(0 results)");
+                }
+            }
+            sleep(Duration::from_secs(args.delay)).await;
+        }
+
+        // USPhoneBook
+        if search_all || args.usphonebook {
+            qprint_inline!(args.quiet, args.no_color,
+                "  → Searching USPhoneBook... ".cyan(),
+                "  → Searching USPhoneBook... ");
+            match usphonebook::search_with_config(&phone_digits, &client).await {
+                Ok(results) => {
+                    let count = results.len();
+                    people_results.extend(results);
+                    qprint!(args.quiet, args.no_color,
+                        format!("({} results)", count).green(),
+                        format!("({} results)", count));
+                }
+                Err(e) if args.debug => {
+                    qprint!(args.quiet, args.no_color,
+                        format!("Error: {}", e).yellow(),
+                        format!("Error: {}", e));
+                }
+                Err(_) => {
+                    qprint!(args.quiet, args.no_color,
+                        "(0 results)".yellow(),
+                        "(0 results)");
+                }
+            }
+        }
+
+        // Add people search results to all_results
+        if !people_results.is_empty() {
+            qprint!(args.quiet, args.no_color,
+                format!("  ✓ Total from people search sites: {} results\n", people_results.len()).green(),
+                format!("  Total from people search sites: {} results\n", people_results.len()));
+            all_results.insert("People Search Sites".to_string(), people_results);
+        } else {
+            qprint!(args.quiet, args.no_color,
+                "  No results from people search sites\n".yellow(),
+                "  No results from people search sites\n");
+        }
+    }
+
+    // Analyze patterns
+    qprint!(args.quiet, args.no_color,
+        "Analyzing patterns across all results...".yellow(),
+        "Analyzing patterns across all results...");
+    let analyzer = PatternAnalyzer::new();
+    let patterns = analyzer.analyze(&all_results, args.max_names, args.max_locations, args.max_emails, args.max_usernames);
+
+    // Print summary (unless quiet mode)
+    if !args.quiet {
+        patterns.print_summary(args.no_color);
+    }
+
+    // Save results if requested or prompted
+    let should_save = if args.save {
+        true
+    } else if args.quiet {
+        false
+    } else {
+        qprint_inline!(false, args.no_color,
+            "Save detailed results to file? (y/n): ".cyan(),
+            "Save detailed results to file? (y/n): ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        input.trim().to_lowercase() == "y"
+    };
+
+    if should_save {
+        let digits: String = phone_number.chars().filter(|c| c.is_numeric()).collect();
+
+        // Determine filename
+        let filename = match &args.output {
+            Some(path) => path.clone(),
+            None => {
+                let ext = match args.format {
+                    OutputFormat::Json => "json",
+                    OutputFormat::Csv => "csv",
+                    OutputFormat::Txt => "txt",
+                };
+                format!("telespotter_results_{}.{}", digits, ext)
+            }
+        };
+
+        // Format and save based on output format
+        match args.format {
+            OutputFormat::Json => {
+                let output = serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "timestamp": Utc::now().to_rfc3339(),
+                    "phone_number": phone_number,
+                    "search_formats": formats,
+                    "results": all_results,
+                    "pattern_analysis": patterns.to_json()
+                });
+                fs::write(&filename, serde_json::to_string_pretty(&output)?)?;
+            }
+            OutputFormat::Csv => {
+                let mut csv_content = String::from("Source,Title,Snippet\n");
+                for results in all_results.values() {
+                    for result in results {
+                        // Escape quotes by doubling them and escape newlines
+                        let title = result.title.replace('"', "\"\"").replace('\n', " ").replace('\r', "");
+                        let snippet = result.snippet.replace('"', "\"\"").replace('\n', " ").replace('\r', "");
+                        let source = result.source.replace('"', "\"\"");
+                        csv_content.push_str(&format!("\"{}\",\"{}\",\"{}\"\n",
+                            source, title, snippet));
+                    }
+                }
+                fs::write(&filename, csv_content)?;
+            }
+            OutputFormat::Txt => {
+                let mut txt_content = format!("Telespotter Results for: {}\n", phone_number);
+                txt_content.push_str(&"=".repeat(60));
+                txt_content.push('\n');
+
+                txt_content.push_str(&format!("\nTotal Results: {}\n", patterns.total_results));
+
+                if !patterns.common_names.is_empty() {
+                    txt_content.push_str("\nNames Found:\n");
+                    for (name, count) in &patterns.common_names {
+                        txt_content.push_str(&format!("  - {}: {} time(s)\n", name, count));
+                    }
+                }
+
+                if !patterns.common_locations.is_empty() {
+                    txt_content.push_str("\nLocations Found:\n");
+                    for (loc, count) in &patterns.common_locations {
+                        txt_content.push_str(&format!("  - {}: {} occurrence(s)\n", loc, count));
+                    }
+                }
+
+                if !patterns.emails.is_empty() {
+                    txt_content.push_str("\nEmails Found:\n");
+                    for (email, count) in &patterns.emails {
+                        txt_content.push_str(&format!("  - {}: {} occurrence(s)\n", email, count));
+                    }
+                }
+
+                if !patterns.usernames.is_empty() {
+                    txt_content.push_str("\nUsernames/Social Media Found:\n");
+                    for (username, count) in &patterns.usernames {
+                        txt_content.push_str(&format!("  - @{}: {} occurrence(s)\n", username, count));
+                    }
+                }
+
+                txt_content.push_str(&format!("\n{}\n", "=".repeat(60)));
+                txt_content.push_str("\nDetailed Results:\n\n");
+
+                for (format, results) in &all_results {
+                    txt_content.push_str(&format!("Format: {}\n", format));
+                    for result in results {
+                        txt_content.push_str(&format!("  [{}] {}\n", result.source, result.title));
+                        if !result.snippet.is_empty() {
+                            txt_content.push_str(&format!("       {}\n", result.snippet));
+                        }
+                    }
+                    txt_content.push('\n');
+                }
+
+                fs::write(&filename, txt_content)?;
+            }
+        }
+
+        qprint!(args.quiet, args.no_color,
+            format!("Results saved to: {}\n", filename).green(),
+            format!("Results saved to: {}\n", filename));
+    }
+
+    // OSINT Tool Integration
+    if !args.quiet {
+        let usernames = patterns.get_usernames();
+        let emails = patterns.get_emails();
+
+        // Sherlock integration for usernames
+        if patterns.has_usernames() {
+            let run_sherlock_tool = if args.sherlock {
+                true
+            } else if args.no_osint_prompts {
+                false
+            } else {
+                let prompt = format!(
+                    "Found {} username(s). Run Sherlock to find social media profiles?",
+                    usernames.len()
+                );
+                prompt_yes_no(&prompt, args.no_color)
+            };
+
+            if run_sherlock_tool {
+                let _ = run_sherlock(&usernames, args.no_color);
+            }
+        }
+
+        // Blackbird integration for emails
+        if patterns.has_emails() {
+            let run_blackbird_tool = if args.blackbird {
+                true
+            } else if args.no_osint_prompts {
+                false
+            } else {
+                let prompt = format!(
+                    "Found {} email(s). Run Blackbird to search for accounts?",
+                    emails.len()
+                );
+                prompt_yes_no(&prompt, args.no_color)
+            };
+
+            if run_blackbird_tool {
+                let _ = run_blackbird(&emails, args.no_color);
+            }
+
+            // email2phonenumber integration
+            let run_e2p = if args.email2phone {
+                true
+            } else if args.no_osint_prompts {
+                false
+            } else {
+                prompt_yes_no("Run email2phonenumber reverse lookup?", args.no_color)
+            };
+
+            if run_e2p {
+                let _ = run_email2phone(&emails, args.no_color);
+            }
+        }
+    }
+
+    Ok(())
+}

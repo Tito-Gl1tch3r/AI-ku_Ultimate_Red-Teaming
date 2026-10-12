@@ -1,0 +1,952 @@
+//! Index / match / query, built on the loader + emulator + fingerprint + db.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use anyhow::Result;
+use fnprint_db::{Corpus, Db};
+use fnprint_emu::{Config, MicroExec};
+use fnprint_loader::{Func, FuncSource};
+use fnprint_sig::Fingerprint;
+use rayon::prelude::*;
+
+pub mod align;
+pub use align::{Opts as AlignOpts, Pair, GRAPH_WEIGHT};
+
+/// below this we don't trust a match, thunks and tiny leaves all look alike
+pub const MIN_COMPLEXITY: u32 = 4;
+/// two prints this close are "the same function"
+pub const SAME_THRESH: f64 = 0.88;
+/// advisory only: a coverage at or below this is worth an analyst's second look
+/// (the print was built from a small slice of the body). it does NOT gate a
+/// verdict. low coverage cannot gate, because the functions that matter most for
+/// n-day work (large input-driven state machines like zlib inflate/deflate)
+/// legitimately execute almost none of their body on microexecution's junk
+/// input, so a hard gate would refuse verdicts on exactly the crown-jewel CVE
+/// functions. coverage is surfaced next to results so a human can discount a
+/// suspicious low-coverage match; it is not a forgery gate. see SECURITY.md.
+pub const LOW_COVERAGE_ADVISORY: f32 = 0.15;
+/// fixed seeds used per function. deterministic, so prints are reproducible.
+const SEEDS: [u64; 4] = [0, 0x9e3779b9, 0x1234_5678, 0xdead_beef];
+
+// unicorn/qemu keep process-global TCG (translation) state, so two engines
+// running at once in different rayon threads corrupt each other's translation
+// and the same binary fingerprints differently run to run. serialize the actual
+// emulation behind this lock: the loop still parallelizes, but only one
+// run_explore executes at a time, which restores byte-identical prints. the
+// non-emulation work (loading, fingerprint hashing) still overlaps. a future
+// fix can shard functions across worker processes to get parallelism back
+// without the shared globals; for now correctness wins over the extra cores.
+static EMU_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct IndexedFunc {
+    pub name: Option<String>,
+    pub entry: u64,
+    pub source: FuncSource,
+    pub fp: Fingerprint,
+    /// best coverage across this function's seed runs, in [0,1]. advisory signal
+    /// of how much of the body microexecution actually observed; surfaced next to
+    /// results so a low-coverage match can be discounted by a human. not a gate.
+    #[serde(default = "default_coverage")]
+    pub coverage: f32,
+    /// direct in-image callees (entries), union over the seed runs. call-graph
+    /// edges for match-time propagation; empty for an old corpus row.
+    #[serde(default)]
+    pub callees: Vec<u64>,
+}
+
+// default for a missing coverage field. the worker reply is postcard (positional,
+// not self-describing), and the worker is always a self re-exec of the same
+// binary, so a version-skewed reply can't actually occur over that pipe; this
+// default only matters if IndexedFunc is ever read from a self-describing format.
+fn default_coverage() -> f32 {
+    1.0
+}
+
+// re-exported so the cli's privsep worker can render dump output without
+// depending on the trace crate directly.
+pub use fnprint_trace::EffectTrace;
+// re-exported so the cli can validate a worker's fingerprint replies (sig length)
+// without a direct dep on the sig crate.
+pub use fnprint_sig::SIG_LEN;
+
+/// Force the rayon global pool to spawn its worker threads now. The sandboxed
+/// worker calls this before it jails itself, so the jail can forbid clone/clone3
+/// (no thread creation after lockdown) without starving the parallel index.
+pub fn warm_pool() {
+    let _: u64 = (0..256u64).into_par_iter().sum();
+}
+
+pub fn source_str(s: FuncSource) -> &'static str {
+    match s {
+        FuncSource::Symtab => "symtab",
+        FuncSource::DynSym => "dynsym",
+        FuncSource::EhFrame => "eh_frame",
+    }
+}
+
+/// micro-execute + fingerprint every discovered function in an ELF blob.
+pub fn index_bytes(bytes: &[u8], cfg: Config) -> Result<Vec<IndexedFunc>> {
+    index_bytes_shard(bytes, cfg, 0, 1)
+}
+
+/// index only the functions assigned to shard `shard_idx` of `shard_count`. the
+/// loader's function list is deterministically sorted+deduped, so assigning the
+/// function at sorted position `i` to shard `i % shard_count` partitions the work
+/// identically in every process with no coordination. run one shard per jailed
+/// worker process to get real parallelism back (the emu lock only serializes
+/// within a process, and separate processes share no qemu TCG state). `(0, 1)`
+/// is the whole binary, i.e. the old single-process behavior. the caller merges
+/// the shards and sorts by entry to reconstruct the single-process order, so the
+/// resulting corpus is byte-identical regardless of shard_count.
+pub fn index_bytes_shard(
+    bytes: &[u8],
+    cfg: Config,
+    shard_idx: usize,
+    shard_count: usize,
+) -> Result<Vec<IndexedFunc>> {
+    let shard_count = shard_count.max(1);
+    let shard_idx = shard_idx.min(shard_count - 1);
+    let loaded = fnprint_loader::load(bytes)?;
+    let image = &loaded.image;
+
+    // stubbed calls are named from the IMPORT map only (plt stubs, got slots).
+    // internal symbol names are gone on a stripped target, so naming them in the
+    // corpus would make the two sides token the same call differently. imports
+    // survive strip, so they are the stable part. internal direct calls are kept
+    // as callee edges instead and used by the call-graph pass at match time.
+    let symbols = Arc::new(loaded.imports.clone());
+    // a PIC .so calls its own exported functions through the plt, so those show
+    // up as Call(Sym(name)) with no direct target. if that name is defined in
+    // this image, it is a call-graph edge too (dynsym keeps the name on a
+    // stripped .so, so the edge is there on both sides).
+    let local_by_name: HashMap<&str, u64> = loaded
+        .funcs
+        .iter()
+        .filter_map(|f| f.name.as_deref().map(|n| (n, f.entry)))
+        .collect();
+
+    let out: Vec<IndexedFunc> = loaded
+        .funcs
+        .par_iter()
+        .enumerate()
+        // shard assignment is by position in the deterministic sorted list, so it
+        // is identical in every worker. the size/code filter is applied after, so
+        // a function's shard never depends on which others have code.
+        .filter(|(i, _)| i % shard_count == shard_idx)
+        .map(|(_, f)| f)
+        .filter(|f| f.size > 0 && image.code_at(f.entry, 1).is_some())
+        .map(|f: &Func| {
+            // hold the emu lock across engine build + run: engine creation also
+            // touches the shared TCG globals, so both must be serialized. recover
+            // a poisoned lock instead of panicking (a panic here would abort the
+            // whole index under panic=abort).
+            let traces = {
+                let _g = EMU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                let ex = MicroExec::new(cfg.clone());
+                // a few deterministic seeds vary the input buffers so behavior
+                // that only shows up on some inputs still makes it into the print.
+                ex.run_explore(image, f, &symbols, &SEEDS)
+            };
+            // best coverage any seed reached: the fairest read of how much of the
+            // body is actually observable, since input-dependent branches differ
+            // by seed. from_traces already unions the effects.
+            let coverage = traces.iter().map(|t| t.coverage).fold(0.0f32, f32::max);
+            // call-graph edges: the static sweep (every call in the body) plus
+            // whatever the runs actually executed, which the sweep can miss on
+            // an indirect target. import names that are local functions (a PIC
+            // .so calling its own exports through the plt) become edges too.
+            let (mut callees, import_names) = fnprint_emu::static_calls(image, f, &loaded.imports);
+            callees.extend(traces.iter().flat_map(|t| t.callees.iter().copied()));
+            let dyn_names = traces.iter().flat_map(|t| {
+                t.effects.iter().filter_map(|e| match e {
+                    fnprint_trace::Effect::Call(fnprint_trace::CallTarget::Sym(n)) => Some(n),
+                    _ => None,
+                })
+            });
+            for n in import_names.iter().chain(dyn_names) {
+                if let Some(&entry) = local_by_name.get(n.as_str()) {
+                    callees.push(entry);
+                }
+            }
+            callees.retain(|&e| e != f.entry);
+            callees.sort_unstable();
+            callees.dedup();
+            IndexedFunc {
+                name: f.name.clone(),
+                entry: f.entry,
+                source: f.source,
+                fp: Fingerprint::from_traces(&traces),
+                coverage,
+                callees,
+            }
+        })
+        .collect();
+
+    Ok(out)
+}
+
+pub fn index_to_db(bytes: &[u8], binary: &str, db: &Db, cfg: Config) -> Result<usize> {
+    let funcs = index_bytes(bytes, cfg)?;
+    let prints: Vec<fnprint_db::FuncPrint> = funcs
+        .iter()
+        .map(|f| fnprint_db::FuncPrint {
+            name: f.name.as_deref(),
+            entry: f.entry,
+            source: source_str(f.source),
+            fp: &f.fp,
+            callees: &f.callees,
+        })
+        .collect();
+    // one transaction instead of a commit per print, see Db::insert_all
+    db.insert_all(binary, &prints)
+}
+
+// -------- match (n-day / cross-version diff) --------
+
+pub struct Changed {
+    pub name: String,
+    pub similarity: f64,
+    /// set on an aligned (name-free) match: where the pair sits in each build
+    pub entry_a: Option<u64>,
+    pub entry_b: Option<u64>,
+}
+
+#[derive(Default)]
+pub struct MatchReport {
+    pub same: usize,
+    pub changed: Vec<Changed>,
+    pub only_a: Vec<String>,
+    pub only_b: Vec<String>,
+    pub compared: usize,
+    /// present in both but too little signal to judge (tiny/scalar helpers)
+    pub low_signal: usize,
+}
+
+/// align two indexes by symbol name and report which shared functions actually
+/// changed behavior. this is the "what did the vendor quietly patch" view.
+pub fn match_by_name(a: &[IndexedFunc], b: &[IndexedFunc]) -> MatchReport {
+    let mut bmap: HashMap<&str, &IndexedFunc> = HashMap::new();
+    for f in b {
+        if let Some(n) = &f.name {
+            bmap.insert(n.as_str(), f);
+        }
+    }
+    let mut amap: HashMap<&str, &IndexedFunc> = HashMap::new();
+    for f in a {
+        if let Some(n) = &f.name {
+            amap.insert(n.as_str(), f);
+        }
+    }
+
+    let mut rep = MatchReport::default();
+    for (name, fa) in &amap {
+        match bmap.get(name) {
+            Some(fb) => {
+                rep.compared += 1;
+                // don't cry wolf on thunks/scalar helpers: not enough behavior
+                // to tell "changed" from "recompiled the same".
+                if fa.fp.complexity < MIN_COMPLEXITY || fb.fp.complexity < MIN_COMPLEXITY {
+                    rep.low_signal += 1;
+                    continue;
+                }
+                let sim = fa.fp.similarity(&fb.fp);
+                if sim >= SAME_THRESH {
+                    rep.same += 1;
+                } else {
+                    rep.changed.push(Changed {
+                        name: name.to_string(),
+                        similarity: sim,
+                        entry_a: Some(fa.entry),
+                        entry_b: Some(fb.entry),
+                    });
+                }
+            }
+            None => rep.only_a.push(name.to_string()),
+        }
+    }
+    for name in bmap.keys() {
+        if !amap.contains_key(name) {
+            rep.only_b.push(name.to_string());
+        }
+    }
+    // name tiebreak so equal-similarity ties are stable: changed is built from
+    // HashMap iteration (nondeterministic), and similarity-only sort would leave
+    // ties in that random order. query/eval already tiebreak on name; match didn't.
+    rep.changed.sort_by(|x, y| {
+        x.similarity
+            .total_cmp(&y.similarity)
+            .then_with(|| x.name.cmp(&y.name))
+    });
+    rep.only_a.sort();
+    rep.only_b.sort();
+    rep
+}
+
+/// true when both sides carry enough symbol names to align by name. a stripped
+/// build has none (eh_frame discovery), so match falls back to `match_aligned`.
+pub fn both_named(a: &[IndexedFunc], b: &[IndexedFunc]) -> bool {
+    let named = |v: &[IndexedFunc]| v.iter().filter(|f| f.name.is_some()).count();
+    named(a) > 0 && named(b) > 0
+}
+
+/// diff two builds with no symbol names: align a to b 1:1 on behavior plus the
+/// call graph, then read the pairs. an accepted pair at or above SAME_THRESH is
+/// unchanged, below it is changed, and whatever found no partner is only_a /
+/// only_b. this is the stripped-firmware view BinDiff gives you that the
+/// by-name path can't.
+pub fn match_aligned(a: &[IndexedFunc], b: &[IndexedFunc], graph_weight: f64) -> MatchReport {
+    let an: Vec<align::Node> = a.iter().map(align::Node::from_indexed).collect();
+    let bn: Vec<align::Node> = b.iter().map(align::Node::from_indexed).collect();
+    // accept anything with a plausible partner (a changed function is still
+    // the same function), and let SAME_THRESH split changed from unchanged.
+    let pairs = align::align(
+        &an,
+        &bn,
+        align::Opts {
+            threshold: 0.45,
+            graph_weight,
+            rounds: 2,
+        },
+    );
+    let mut rep = MatchReport::default();
+    let mut a_paired = vec![false; a.len()];
+    let mut b_paired = vec![false; b.len()];
+    for p in &pairs {
+        a_paired[p.a] = true;
+        b_paired[p.b] = true;
+        rep.compared += 1;
+        if p.sim >= SAME_THRESH {
+            rep.same += 1;
+        } else {
+            let label = match (&a[p.a].name, &b[p.b].name) {
+                (Some(x), Some(y)) if x == y => x.clone(),
+                (Some(x), Some(y)) => format!("{x} -> {y}"),
+                (Some(x), None) | (None, Some(x)) => x.clone(),
+                (None, None) => format!("{:#x} -> {:#x}", a[p.a].entry, b[p.b].entry),
+            };
+            rep.changed.push(Changed {
+                name: label,
+                similarity: p.sim,
+                entry_a: Some(a[p.a].entry),
+                entry_b: Some(b[p.b].entry),
+            });
+        }
+    }
+    let label = |f: &IndexedFunc| f.name.clone().unwrap_or_else(|| format!("{:#x}", f.entry));
+    for (i, f) in a.iter().enumerate() {
+        if !a_paired[i] && f.fp.complexity >= MIN_COMPLEXITY && f.fp.shingles > 0 {
+            rep.only_a.push(label(f));
+        }
+    }
+    for (j, f) in b.iter().enumerate() {
+        if !b_paired[j] && f.fp.complexity >= MIN_COMPLEXITY && f.fp.shingles > 0 {
+            rep.only_b.push(label(f));
+        }
+    }
+    rep.low_signal = a
+        .iter()
+        .filter(|f| f.fp.complexity < MIN_COMPLEXITY || f.fp.shingles == 0)
+        .count();
+    rep.changed.sort_by(|x, y| {
+        x.similarity
+            .total_cmp(&y.similarity)
+            .then_with(|| x.name.cmp(&y.name))
+    });
+    rep.only_a.sort();
+    rep.only_b.sort();
+    rep
+}
+
+// -------- query (auto-name against a corpus) --------
+
+pub struct Named {
+    pub entry: u64,
+    pub guess: String,
+    pub from_binary: String,
+    pub similarity: f64,
+    /// call-graph consistency of the pair, 0 when there were no edges to check
+    pub graph: f64,
+    /// what the assignment ranked on: similarity lifted by the graph, <= 1
+    pub score: f64,
+}
+
+/// best-scoring named function in a corpus for one print. narrows with the LSH
+/// bands first and falls back to the full set if no band hit. returns
+/// (similarity, name, binary). the preloaded `all` is the fallback pool.
+fn best_in_corpus<C: Corpus>(
+    fp: &Fingerprint,
+    db: &C,
+    all: &[fnprint_db::FuncRec],
+) -> Result<Option<(f64, String, String)>> {
+    let cands = db.candidates(fp)?;
+    let pool: &[fnprint_db::FuncRec] = if cands.is_empty() { all } else { &cands };
+    let mut best: Option<(f64, String, String)> = None;
+    for c in pool {
+        if c.fp.complexity < MIN_COMPLEXITY {
+            continue;
+        }
+        let cname = match &c.name {
+            Some(n) => n,
+            None => continue,
+        };
+        let sim = fp.similarity(&c.fp);
+        // total tie-break: on equal similarity prefer the lexicographically
+        // smaller (name, binary). without this the winner depended on pool
+        // order, which the candidate set does not guarantee, so the same query
+        // could name a different twin run to run.
+        let better = match best.as_ref() {
+            None => true,
+            Some((s, bn, bb)) => {
+                sim > *s
+                    || (sim == *s
+                        && (cname.as_str(), c.binary.as_str()) < (bn.as_str(), bb.as_str()))
+            }
+        };
+        if better {
+            best = Some((sim, cname.clone(), c.binary.clone()));
+        }
+    }
+    Ok(best)
+}
+
+/// name the target's functions from a corpus: a global 1:1 alignment (a corpus
+/// function is claimed once) with call-graph propagation, then keep the pairs
+/// whose score clears `threshold`. withholds tiny/low-signal functions and
+/// unnamed corpus rows.
+pub fn query_corpus<C: Corpus>(
+    target: &[IndexedFunc],
+    corpus: &C,
+    threshold: f64,
+    graph_weight: f64,
+) -> Result<Vec<Named>> {
+    let recs: Vec<fnprint_db::FuncRec> = corpus
+        .all()? // small corpora, fine to hold in memory
+        .into_iter()
+        .filter(|r| r.name.is_some())
+        .collect();
+    let tn: Vec<align::Node> = target.iter().map(align::Node::from_indexed).collect();
+    let cn: Vec<align::Node> = recs.iter().map(align::Node::from_rec).collect();
+    let pairs = align::align(
+        &tn,
+        &cn,
+        align::Opts {
+            threshold,
+            graph_weight,
+            rounds: 2,
+        },
+    );
+    let mut out: Vec<Named> = pairs
+        .iter()
+        .map(|p| Named {
+            entry: target[p.a].entry,
+            guess: recs[p.b].name.clone().unwrap_or_default(),
+            from_binary: recs[p.b].binary.clone(),
+            similarity: p.sim,
+            graph: p.graph,
+            score: p.score,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(b.similarity.total_cmp(&a.similarity))
+            .then(a.entry.cmp(&b.entry))
+    });
+    Ok(out)
+}
+
+// -------- triage (n-day: vulnerable vs patched, the actionable view) --------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Verdict {
+    /// leans toward the known-vulnerable version, clear of the patched one
+    Vulnerable,
+    /// leans toward the patched version
+    Patched,
+    /// neither side is close enough, or the two are too close to separate
+    Inconclusive,
+}
+
+pub struct TriageHit {
+    pub entry: u64,
+    pub verdict: Verdict,
+    pub vuln_sim: f64,
+    pub vuln_name: String,
+    pub patched_sim: f64,
+    pub patched_name: String,
+    /// fraction of the target function body executed, in [0,1]. advisory: a low
+    /// value means the print was built from a small slice of the function, so the
+    /// verdict rests on little observed behavior. shown to the analyst, does not
+    /// change the verdict (see LOW_COVERAGE_ADVISORY).
+    pub coverage: f32,
+}
+
+impl TriageHit {
+    /// how far the vulnerable side leads the patched side. negative means it
+    /// looks patched. this is the separation the reviewer actually cares about.
+    pub fn margin(&self) -> f64 {
+        self.vuln_sim - self.patched_sim
+    }
+}
+
+fn verdict_order(v: Verdict) -> u8 {
+    // vulnerable-leaning to the top of the review queue, patched to the bottom
+    match v {
+        Verdict::Vulnerable => 0,
+        Verdict::Inconclusive => 1,
+        Verdict::Patched => 2,
+    }
+}
+
+/// rank each target function against a known-vulnerable corpus and a known-patched
+/// corpus and call which side it leans to. a function close to the vulnerable
+/// version and clearly separated from the patched one is a candidate worth a
+/// human's time, which is more useful for n-day work than a single match score.
+///
+/// `min_sim`: a side has to be at least this similar to count as a real lead.
+/// `margin`: how far the two sides must separate before we commit to a verdict.
+/// the result is sorted as a review queue, strongest vulnerable lead first.
+pub fn triage<C: Corpus>(
+    target: &[IndexedFunc],
+    vuln: &C,
+    patched: &C,
+    min_sim: f64,
+    margin: f64,
+) -> Result<Vec<TriageHit>> {
+    // deliberately NOT a 1:1 alignment. triage asks "how close is this function
+    // to anything on each side", and two behavioral twins in the target must both
+    // be allowed to sit at 100% on both sides so they come back inconclusive. a
+    // 1:1 pass hands the twin to one of them and leaves the other with a 0% side
+    // and a bogus +100 margin (seen on crc32_little in the case study).
+    let side = |db: &C| -> Result<Vec<Option<(f64, String)>>> {
+        let recs: Vec<fnprint_db::FuncRec> =
+            db.all()?.into_iter().filter(|r| r.name.is_some()).collect();
+        let mut best: Vec<Option<(f64, String)>> = vec![None; target.len()];
+        for (i, f) in target.iter().enumerate() {
+            if f.fp.complexity < MIN_COMPLEXITY || f.fp.shingles == 0 {
+                continue;
+            }
+            best[i] = best_in_corpus(&f.fp, db, &recs)?.map(|(s, n, _)| (s, n));
+        }
+        Ok(best)
+    };
+    let v = side(vuln)?;
+    let pt = side(patched)?;
+    let mut out = Vec::new();
+    for (i, f) in target.iter().enumerate() {
+        if f.fp.complexity < MIN_COMPLEXITY || f.fp.shingles == 0 {
+            continue;
+        }
+        let (vuln_sim, vuln_name) = v[i].clone().unwrap_or((0.0, String::new()));
+        let (patched_sim, patched_name) = pt[i].clone().unwrap_or((0.0, String::new()));
+
+        let top = vuln_sim.max(patched_sim);
+        let verdict = if top < min_sim {
+            Verdict::Inconclusive
+        } else if vuln_sim - patched_sim >= margin {
+            Verdict::Vulnerable
+        } else if patched_sim - vuln_sim >= margin {
+            Verdict::Patched
+        } else {
+            Verdict::Inconclusive
+        };
+        out.push(TriageHit {
+            entry: f.entry,
+            verdict,
+            vuln_sim,
+            vuln_name,
+            patched_sim,
+            patched_name,
+            coverage: f.coverage,
+        });
+    }
+    out.sort_by(|a, b| {
+        verdict_order(a.verdict)
+            .cmp(&verdict_order(b.verdict))
+            .then(b.vuln_sim.total_cmp(&a.vuln_sim))
+            .then(a.entry.cmp(&b.entry))
+    });
+    Ok(out)
+}
+
+pub struct EvalResult {
+    /// functions in A that we scored (had signal and a same-named twin in B)
+    pub scored: usize,
+    /// top-1 ranked match in B is the same-named function
+    pub rank1: usize,
+    /// sum of 1/rank of the correct match, for mean reciprocal rank
+    pub rr_sum: f64,
+    /// at SAME_THRESH: predicted-same that are actually same-named
+    pub tp: usize,
+    pub fp: usize,
+    /// same-named pairs we failed to call same
+    pub fn_: usize,
+    /// 1-based rank of the correct match for each scored function. lets us ask
+    /// "does reviewing the top k candidates find it", not just the top-1 number.
+    pub ranks: Vec<usize>,
+    /// scored functions where the top-1 similarity was below SAME_THRESH, i.e.
+    /// the tool would decline to make a confident call rather than guess.
+    pub abstained: usize,
+    /// aligned (1:1 + call graph) view, what query actually does: of the scored
+    /// functions, how many got the right partner; and of the pairs accepted at
+    /// SAME_THRESH, how many were right.
+    pub align_correct: usize,
+    pub align_paired: usize,
+    pub align_tp: usize,
+    pub align_fp: usize,
+}
+
+impl EvalResult {
+    pub fn rank1_acc(&self) -> f64 {
+        if self.scored == 0 {
+            0.0
+        } else {
+            self.rank1 as f64 / self.scored as f64
+        }
+    }
+    pub fn mrr(&self) -> f64 {
+        if self.scored == 0 {
+            0.0
+        } else {
+            self.rr_sum / self.scored as f64
+        }
+    }
+    pub fn precision(&self) -> f64 {
+        let d = self.tp + self.fp;
+        if d == 0 {
+            0.0
+        } else {
+            self.tp as f64 / d as f64
+        }
+    }
+    pub fn recall(&self) -> f64 {
+        let d = self.tp + self.fn_;
+        if d == 0 {
+            0.0
+        } else {
+            self.tp as f64 / d as f64
+        }
+    }
+    /// fraction of scored functions whose correct match lands in the top k.
+    /// recall@5 answers "if an analyst looks at 5 candidates, do they find it".
+    pub fn recall_at(&self, k: usize) -> f64 {
+        if self.scored == 0 {
+            return 0.0;
+        }
+        let hits = self.ranks.iter().filter(|&&r| r <= k).count();
+        hits as f64 / self.scored as f64
+    }
+    /// how often the tool declined a confident top-1 call. high abstention with
+    /// high precision is the honest tradeoff: quiet when it isn't sure.
+    pub fn abstain_rate(&self) -> f64 {
+        if self.scored == 0 {
+            0.0
+        } else {
+            self.abstained as f64 / self.scored as f64
+        }
+    }
+    /// fraction of scored functions whose aligned partner is the right one
+    pub fn align_acc(&self) -> f64 {
+        if self.scored == 0 {
+            0.0
+        } else {
+            self.align_correct as f64 / self.scored as f64
+        }
+    }
+    /// of the aligned pairs accepted at SAME_THRESH, how many were right
+    pub fn align_precision(&self) -> f64 {
+        let d = self.align_tp + self.align_fp;
+        if d == 0 {
+            0.0
+        } else {
+            self.align_tp as f64 / d as f64
+        }
+    }
+    pub fn align_recall(&self) -> f64 {
+        if self.scored == 0 {
+            0.0
+        } else {
+            self.align_tp as f64 / self.scored as f64
+        }
+    }
+}
+
+/// rank every signal-bearing function in A against all of B, using symbol names
+/// as ground truth. this is the headline accuracy measurement.
+pub fn eval(a: &[IndexedFunc], b: &[IndexedFunc], graph_weight: f64) -> EvalResult {
+    let bsig: Vec<&IndexedFunc> = b
+        .iter()
+        .filter(|f| f.fp.complexity >= MIN_COMPLEXITY && f.fp.shingles > 0 && f.name.is_some())
+        .collect();
+
+    let mut res = EvalResult {
+        scored: 0,
+        rank1: 0,
+        rr_sum: 0.0,
+        tp: 0,
+        fp: 0,
+        fn_: 0,
+        ranks: Vec::new(),
+        abstained: 0,
+        align_correct: 0,
+        align_paired: 0,
+        align_tp: 0,
+        align_fp: 0,
+    };
+
+    // the aligned view: accept every plausible pair (low threshold), then score
+    // it against the names. accepted-at-SAME_THRESH gives the precision row.
+    let an: Vec<align::Node> = a.iter().map(align::Node::from_indexed).collect();
+    let bn: Vec<align::Node> = b.iter().map(align::Node::from_indexed).collect();
+    let pairs = align::align(
+        &an,
+        &bn,
+        align::Opts {
+            threshold: 0.2,
+            graph_weight,
+            rounds: 2,
+        },
+    );
+    let mut partner: HashMap<usize, &align::Pair> = HashMap::new();
+    for p in &pairs {
+        partner.insert(p.a, p);
+    }
+
+    for (ia, fa) in a.iter().enumerate() {
+        if fa.fp.complexity < MIN_COMPLEXITY || fa.fp.shingles == 0 {
+            continue;
+        }
+        let aname = match &fa.name {
+            Some(n) => n.as_str(),
+            None => continue,
+        };
+        // only score functions that actually exist in B (a fair denominator)
+        if !bsig.iter().any(|f| f.name.as_deref() == Some(aname)) {
+            continue;
+        }
+        // rank B by similarity. bsig is prefiltered to named funcs, but use
+        // filter_map + first() so a later filter change can't unwrap or panic.
+        let mut scored: Vec<(f64, &str)> = bsig
+            .iter()
+            .filter_map(|f| f.name.as_deref().map(|n| (fa.fp.similarity(&f.fp), n)))
+            .collect();
+        scored.sort_by(|x, y| y.0.total_cmp(&x.0));
+        let Some(&(top_sim, top_name)) = scored.first() else {
+            continue; // unreachable: the twin check above guarantees a named hit
+        };
+        res.scored += 1;
+
+        if top_name == aname {
+            res.rank1 += 1;
+        }
+        if let Some(pos) = scored.iter().position(|(_, n)| *n == aname) {
+            res.rr_sum += 1.0 / (pos as f64 + 1.0);
+            res.ranks.push(pos + 1); // 1-based rank for recall@k
+        }
+
+        // threshold-based precision/recall on the top-1 call
+        let predicted_same = top_sim >= SAME_THRESH;
+        if !predicted_same {
+            res.abstained += 1; // below threshold, we'd decline to call it
+        }
+        let correct = top_name == aname;
+        match (predicted_same, correct) {
+            (true, true) => res.tp += 1,
+            (true, false) => res.fp += 1,
+            (false, true) => res.fn_ += 1,
+            (false, false) => {}
+        }
+
+        if let Some(p) = partner.get(&ia) {
+            res.align_paired += 1;
+            let right = b[p.b].name.as_deref() == Some(aname);
+            if right {
+                res.align_correct += 1;
+            }
+            if p.score >= SAME_THRESH {
+                if right {
+                    res.align_tp += 1;
+                } else {
+                    res.align_fp += 1;
+                }
+            }
+        }
+    }
+    res
+}
+
+/// debug helper: micro-execute one named function and return its effect traces
+/// (one per seed/path). used by `fnprint dump` to see what the engine records.
+pub fn dump_traces(
+    bytes: &[u8],
+    name: &str,
+    cfg: Config,
+) -> Result<Vec<fnprint_trace::EffectTrace>> {
+    let loaded = fnprint_loader::load(bytes)?;
+    let image = &loaded.image;
+    let symbols = Arc::new(loaded.imports.clone());
+    let f = loaded
+        .funcs
+        .iter()
+        .find(|f| f.name.as_deref() == Some(name))
+        .ok_or_else(|| anyhow::anyhow!("no function named {name}"))?;
+    let ex = MicroExec::new(cfg);
+    Ok(ex.run_explore(image, f, &symbols, &SEEDS))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // a tiny position-independent ELF-less path isn't easy here, so we test the
+    // matcher/eval logic on hand-built indexes instead. loader+emu are covered
+    // in their own crates and end-to-end by the bench harness.
+    fn ifunc(name: &str, sig_seed: u64, complexity: u32) -> IndexedFunc {
+        IndexedFunc {
+            name: Some(name.to_string()),
+            entry: 0,
+            source: FuncSource::Symtab,
+            fp: fnprint_sig::Fingerprint {
+                sig: (0..fnprint_sig::SIG_LEN as u64)
+                    .map(|i| i.wrapping_mul(sig_seed))
+                    .collect(),
+                shingles: 20,
+                complexity,
+                capped: false,
+            },
+            coverage: 1.0,
+            callees: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn identical_indexes_report_no_changes() {
+        let a = vec![ifunc("foo", 3, 10), ifunc("bar", 7, 10)];
+        let b = vec![ifunc("foo", 3, 10), ifunc("bar", 7, 10)];
+        let rep = match_by_name(&a, &b);
+        assert_eq!(rep.changed.len(), 0);
+        assert_eq!(rep.same, 2);
+    }
+
+    #[test]
+    fn changed_behavior_is_flagged() {
+        let a = vec![ifunc("foo", 3, 10)];
+        let b = vec![ifunc("foo", 999, 10)]; // very different sig
+        let rep = match_by_name(&a, &b);
+        assert_eq!(rep.changed.len(), 1);
+    }
+
+    #[test]
+    fn low_signal_not_called_changed() {
+        // same name, low complexity on one side -> low_signal, never "changed"
+        let a = vec![ifunc("foo", 3, 2)];
+        let b = vec![ifunc("foo", 999, 2)];
+        let rep = match_by_name(&a, &b);
+        assert_eq!(rep.changed.len(), 0);
+        assert_eq!(rep.low_signal, 1);
+    }
+
+    #[test]
+    fn triage_leans_to_matching_side() {
+        // vuln corpus holds the function at seed 3, patched holds it at seed 999.
+        // a target that behaves like seed 3 must come back Vulnerable, and one
+        // like seed 999 must come back Patched.
+        let vuln = Db::open_memory().unwrap();
+        vuln.insert(
+            "v1",
+            Some("f"),
+            0x1000,
+            "symtab",
+            &ifunc("f", 3, 10).fp,
+            &[],
+        )
+        .unwrap();
+        let patched = Db::open_memory().unwrap();
+        patched
+            .insert(
+                "v2",
+                Some("f"),
+                0x1000,
+                "symtab",
+                &ifunc("f", 999, 10).fp,
+                &[],
+            )
+            .unwrap();
+
+        let looks_vuln = triage(&[ifunc("x", 3, 10)], &vuln, &patched, 0.5, 0.1).unwrap();
+        assert_eq!(looks_vuln[0].verdict, Verdict::Vulnerable);
+        assert!(looks_vuln[0].margin() > 0.0);
+
+        let looks_patched = triage(&[ifunc("x", 999, 10)], &vuln, &patched, 0.5, 0.1).unwrap();
+        assert_eq!(looks_patched[0].verdict, Verdict::Patched);
+    }
+
+    #[test]
+    fn low_coverage_is_advisory_not_a_gate() {
+        // a target that clearly matches the vuln side but has 0 coverage must
+        // still come back Vulnerable: coverage is surfaced, never gates a verdict
+        // (else the crown-jewel functions, which run almost none of their body,
+        // would never get a call).
+        let vuln = Db::open_memory().unwrap();
+        vuln.insert(
+            "v1",
+            Some("f"),
+            0x1000,
+            "symtab",
+            &ifunc("f", 3, 10).fp,
+            &[],
+        )
+        .unwrap();
+        let patched = Db::open_memory().unwrap();
+        patched
+            .insert(
+                "v2",
+                Some("f"),
+                0x1000,
+                "symtab",
+                &ifunc("f", 999, 10).fp,
+                &[],
+            )
+            .unwrap();
+
+        let mut t = ifunc("x", 3, 10);
+        t.coverage = 0.0;
+        let hits = triage(&[t], &vuln, &patched, 0.5, 0.1).unwrap();
+        assert_eq!(hits[0].verdict, Verdict::Vulnerable);
+        assert_eq!(
+            hits[0].coverage, 0.0,
+            "coverage carried through for display"
+        );
+    }
+
+    #[test]
+    fn triage_abstains_when_nothing_close() {
+        // target matches neither side -> below min_sim -> Inconclusive
+        let vuln = Db::open_memory().unwrap();
+        vuln.insert(
+            "v1",
+            Some("f"),
+            0x1000,
+            "symtab",
+            &ifunc("f", 3, 10).fp,
+            &[],
+        )
+        .unwrap();
+        let patched = Db::open_memory().unwrap();
+        patched
+            .insert(
+                "v2",
+                Some("f"),
+                0x1000,
+                "symtab",
+                &ifunc("f", 999, 10).fp,
+                &[],
+            )
+            .unwrap();
+
+        let hits = triage(&[ifunc("x", 55555, 10)], &vuln, &patched, 0.9, 0.1).unwrap();
+        assert_eq!(hits[0].verdict, Verdict::Inconclusive);
+    }
+}

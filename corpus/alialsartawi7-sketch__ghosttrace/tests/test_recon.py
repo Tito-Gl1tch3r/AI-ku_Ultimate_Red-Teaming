@@ -1,0 +1,239 @@
+"""Tests for recon modules (DNS resolver, data quality)"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+import pytest
+import socket
+from unittest.mock import patch, MagicMock
+from recon import (DNSResolver, DataQuality, AttackSurfaceDetector,
+                   HTTPProber, PortScanner, _is_internal_host,
+                   _safe_pinned_ip, _PinnedHTTPConnection, _PinnedHTTPSConnection)
+from recon.risk_engine import RiskScorer, RiskLevel
+
+
+# ═══════════ DataQuality ═══════════
+
+class TestDataQuality:
+    @pytest.mark.parametrize("ip,expected", [
+        ("10.0.0.1", True),
+        ("192.168.1.1", True),
+        ("172.16.5.10", True),
+        ("172.20.1.1", True),
+        ("127.0.0.1", True),
+        ("0.0.0.0", True),
+        ("169.254.1.1", True),
+        ("8.8.8.8", False),
+        ("1.1.1.1", False),
+        ("193.227.29.12", False),
+    ])
+    def test_is_private_ip(self, ip, expected):
+        assert DataQuality.is_private_ip(ip) == expected
+
+    def test_filter_removes_private_ips(self):
+        results = [
+            {"value": "admin.test.com (1.2.3.4)", "type": "subdomain", "confidence": 0.8},
+            {"value": "internal.test.com (10.0.0.5)", "type": "subdomain", "confidence": 0.8},
+            {"value": "test@test.com", "type": "email", "confidence": 0.9},
+        ]
+        filtered = DataQuality.filter_results(results, domain=None)
+        # Private IP entry filtered out
+        assert len(filtered) == 2
+        assert all("10.0.0.5" not in r["value"] for r in filtered)
+
+    def test_filter_dedups(self):
+        results = [
+            {"value": "test@test.com", "type": "email", "confidence": 0.9},
+            {"value": "test@test.com", "type": "email", "confidence": 0.7},  # duplicate
+            {"value": "other@test.com", "type": "email", "confidence": 0.8},
+        ]
+        filtered = DataQuality.filter_results(results, domain=None)
+        assert len(filtered) == 2
+
+
+# ═══════════ DNSResolver ═══════════
+
+class TestDNSResolver:
+    def test_resolve_invalid_hostname(self):
+        result = DNSResolver.resolve("invalid.nonexistent.domain.local.fake", timeout=2)
+        assert result is not None
+        assert result["alive"] is False
+
+    def test_resolve_empty_hostname(self):
+        result = DNSResolver.resolve("", timeout=2)
+        assert result is None
+
+    def test_resolve_cleans_parenthesis_format(self):
+        """Should handle 'host (ip)' format by taking only host"""
+        result = DNSResolver.resolve("example.com (192.0.2.1)", timeout=2)
+        # Should strip the "(ip)" part
+        assert result is None or result["hostname"] in ("example.com", "")
+
+    def test_bulk_resolve_empty(self):
+        results = DNSResolver.bulk_resolve([], max_workers=1)
+        assert results == {}
+
+
+# ═══════════ AttackSurfaceDetector ═══════════
+
+class TestAttackSurfaceDetector:
+    def test_admin_paths_defined(self):
+        assert len(AttackSurfaceDetector.ADMIN_PATHS) > 0
+        assert "/admin" in AttackSurfaceDetector.ADMIN_PATHS
+
+    def test_login_paths_defined(self):
+        assert len(AttackSurfaceDetector.LOGIN_PATHS) > 0
+        assert "/login" in AttackSurfaceDetector.LOGIN_PATHS
+
+    def test_api_paths_defined(self):
+        assert len(AttackSurfaceDetector.API_PATHS) > 0
+        assert "/api" in AttackSurfaceDetector.API_PATHS
+
+    def test_detect_structure(self):
+        """Mock _check_path to avoid network calls"""
+        with patch.object(AttackSurfaceDetector, "_check_path", return_value=None):
+            result = AttackSurfaceDetector.detect("example.com", timeout=1)
+            assert "admin_panels" in result
+            assert "login_pages" in result
+            assert "api_endpoints" in result
+            assert result["hostname"] == "example.com"
+
+
+# ═══════════ Risk Level ═══════════
+
+class TestRiskLevelBoundaries:
+    """Test exact boundaries"""
+    @pytest.mark.parametrize("score,expected", [
+        (100, "critical"), (85, "critical"),
+        (84, "high"), (65, "high"),
+        (64, "medium"), (40, "medium"),
+        (39, "low"), (20, "low"),
+        (19, "info"), (0, "info"),
+    ])
+    def test_boundaries(self, score, expected):
+        assert RiskLevel.from_score(score) == expected
+
+    def test_color_returns_hex(self):
+        for level in ["critical", "high", "medium", "low", "info"]:
+            c = RiskLevel.color(level)
+            assert c.startswith("#")
+            assert len(c) == 7
+
+
+# ═══════════ SSRF GUARD ═══════════
+
+def _private_addrinfo(ip):
+    """Shape a socket.getaddrinfo() return value pointing at one address."""
+    return [(2, 1, 6, "", (ip, 0))]
+
+
+class TestSSRFGuard:
+    """The active-recon probes must refuse internal targets. Covers the three
+    network surfaces — HTTP prober, attack-surface detector, and (regression)
+    the port scanner, which previously bypassed the guard entirely."""
+
+    # ── _is_internal_host: IP literals need no DNS ──
+    @pytest.mark.parametrize("ip", ["127.0.0.1", "10.0.0.5", "192.168.1.1",
+                                    "172.16.0.1", "169.254.169.254", "0.0.0.0"])
+    def test_internal_ip_literals(self, ip):
+        assert _is_internal_host(ip) is True
+
+    @pytest.mark.parametrize("ip", ["8.8.8.8", "1.1.1.1", "93.184.216.34"])
+    def test_public_ip_literals(self, ip):
+        assert _is_internal_host(ip) is False
+
+    def test_hostname_resolving_to_private_is_internal(self):
+        with patch("recon.socket.getaddrinfo", return_value=_private_addrinfo("10.0.0.5")):
+            assert _is_internal_host("anything.example") is True
+
+    def test_hostname_resolving_to_public_is_external(self):
+        with patch("recon.socket.getaddrinfo", return_value=_private_addrinfo("93.184.216.34")):
+            assert _is_internal_host("anything.example") is False
+
+    # ── The probes block internal hosts (no network is reached) ──
+    def test_http_prober_blocks_internal(self):
+        with patch("recon.socket.getaddrinfo", return_value=_private_addrinfo("127.0.0.1")):
+            r = HTTPProber.probe("internal.example", timeout=1)
+        assert r.get("blocked") == "internal address"
+        assert r["alive"] is False
+
+    def test_attack_surface_blocks_internal(self):
+        with patch("recon.socket.getaddrinfo", return_value=_private_addrinfo("10.0.0.5")):
+            r = AttackSurfaceDetector.detect("internal.example", timeout=1)
+        assert r["admin_panels"] == []
+        assert r["login_pages"] == []
+        assert r["api_endpoints"] == []
+
+    def test_port_scanner_blocks_internal(self):
+        # Regression: PortScanner.scan used to skip _is_internal_host, so a
+        # hostname resolving to a private/loopback IP got port-scanned.
+        with patch("recon.socket.getaddrinfo", return_value=_private_addrinfo("10.0.0.5")):
+            r = PortScanner.scan("internal.example", timeout=1)
+        assert r["ports"] == []
+        assert r.get("blocked") == "internal address"
+
+
+# ═══════════ DNS PINNING (anti-rebinding) ═══════════
+
+def _addrinfo(*pairs):
+    """Shape getaddrinfo() output from (family, ip) pairs."""
+    return [(fam, 1, 6, "", (ip, 0)) for fam, ip in pairs]
+
+
+class TestDNSPinning:
+    """One resolution decides the verdict AND supplies the IP we connect to, so a
+    DNS rebind between validation and connect can't redirect a probe to an
+    internal address."""
+
+    # ── _safe_pinned_ip verdicts ──
+    def test_public_ip_literal_ok(self):
+        assert _safe_pinned_ip("8.8.8.8") == ("ok", "8.8.8.8")
+
+    @pytest.mark.parametrize("ip", ["127.0.0.1", "10.0.0.5", "169.254.169.254"])
+    def test_internal_ip_literal_refused(self, ip):
+        assert _safe_pinned_ip(ip) == ("internal", None)
+
+    def test_hostname_public_pins_resolved_ip(self):
+        with patch("recon.socket.getaddrinfo",
+                   return_value=_addrinfo((socket.AF_INET, "93.184.216.34"))):
+            assert _safe_pinned_ip("x.example") == ("ok", "93.184.216.34")
+
+    def test_hostname_private_refused(self):
+        with patch("recon.socket.getaddrinfo",
+                   return_value=_addrinfo((socket.AF_INET, "10.1.2.3"))):
+            assert _safe_pinned_ip("x.example") == ("internal", None)
+
+    def test_any_internal_address_refuses_whole_host(self):
+        # public + private in the same answer => refuse (rebinding defence)
+        mixed = _addrinfo((socket.AF_INET, "93.184.216.34"),
+                          (socket.AF_INET, "10.1.2.3"))
+        with patch("recon.socket.getaddrinfo", return_value=mixed):
+            assert _safe_pinned_ip("x.example") == ("internal", None)
+
+    def test_unresolvable_is_dead(self):
+        with patch("recon.socket.getaddrinfo", side_effect=OSError("nxdomain")):
+            assert _safe_pinned_ip("x.example") == ("dead", None)
+
+    def test_family_filter_v6_only_wanting_v4_is_dead(self):
+        # public IPv6 only; the port scanner asks for AF_INET => nothing to scan
+        with patch("recon.socket.getaddrinfo",
+                   return_value=_addrinfo((socket.AF_INET6, "2606:2800:220:1::1"))):
+            assert _safe_pinned_ip("x.example", family=socket.AF_INET) == ("dead", None)
+
+    # ── the connection dials the pinned IP, never a re-resolved one ──
+    def test_http_connection_dials_pinned_ip(self):
+        fake = MagicMock()
+        with patch("recon.socket.create_connection", return_value=fake) as cc:
+            conn = _PinnedHTTPConnection("victim.example.com", "93.184.216.34")
+            conn.connect()
+        assert cc.call_args.args[0] == ("93.184.216.34", 80)   # dialed the vetted IP
+        assert conn.host == "victim.example.com"               # Host header unchanged
+
+    def test_https_connection_pins_ip_and_keeps_sni(self):
+        fake = MagicMock()
+        ctx = MagicMock(); ctx.wrap_socket.return_value = fake
+        with patch("recon.socket.create_connection", return_value=fake) as cc:
+            conn = _PinnedHTTPSConnection("victim.example.com", "93.184.216.34")
+            conn._context = ctx
+            conn.connect()
+        assert cc.call_args.args[0] == ("93.184.216.34", 443)
+        assert ctx.wrap_socket.call_args.kwargs["server_hostname"] == "victim.example.com"

@@ -1,0 +1,26 @@
+# Third-party data notice
+
+The files under `data/samples/` are trimmed extracts from
+[Splunk's `attack_data`](https://github.com/splunk/attack_data) corpus,
+licensed under the Apache License, Version 2.0 (see `LICENSE`). All of it is
+lab-generated/simulated attack-range traffic (RFC1918 addresses, lab
+domains such as `attackrange.local`) - no production systems, real victims,
+or real PII are represented.
+
+| Sample file | Source path(s) under `attack_data/datasets/` | Records |
+|---|---|---|
+| `zeek_conn_cobalt_strike.jsonl` | `attack_techniques/T1572/cobalt_strike/stream_events_zeek.log` (conn records; 343 external + a capped sample of the top-3 internal pairs) | 1,243 |
+| `zeek_dns_cobalt_strike.jsonl` | same file, dns records | 126 |
+| `zeek_conn_outbound_smb_beacon.jsonl` | `attack_techniques/T1071.002/outbound_smb_traffic/zeek_conn.log` (verbatim) | 19 |
+| `sysmon_dns_tunneling.csv` | Sysmon EventID 22 records parsed from `attack_techniques/{T1071.004/long_dns_query,T1071.004/upload_files_dns,T1071.004/vbc_dnsquery,T1071.004/kerberos_coercion,T1071.004/snapattack,T1590.002/enum_dns_record,T1105/tinyurl_dns_query,T1102.002/telegram_api_dns,T1059.005/discord_dnsquery}` | 52 |
+| `cisco_dns_anonymizer.csv` | `cisco_secure_access/dns/anonymizer_dns.log` | 3 |
+| `suricata_http_useragents.jsonl` | `attack_techniques/T1071.001/http_user_agents/{suricata_c2,suricata_malware,suricata_pua,suricata_rmm}.log`, `http` events with a user-agent, labeled by source file | 53 |
+| `sysmon_process_hashes.txt` | Sysmon EventID 1 `Hashes` fields, capped at 40/source, from `attack_techniques/{T1071.004/long_dns_query,T1546.008,T1547.010,T1018,T1059.005/discord_dnsquery}/.../*.log` | 112 |
+| `powershell_commandlines.csv` | Sysmon EventID 1 `CommandLine` fields, capped at 35/source, from `attack_techniques/{T1546.008,T1547.010,T1546.011,T1018,T1070}/atomic_red_team/*.log` and `T1059.005/discord_dnsquery/sysmon.log`; `-EncodedCommand` payloads are base64/UTF-16LE decoded into `decoded_command` | 189 |
+| `sysmon_process_lineage.csv` | Sysmon EventID 1 `Image`/`ParentImage`/`CommandLine` pairs, capped at 40/source, from `attack_techniques/{T1218.011,T1218.005,T1127.001,T1036.003}/.../*.log` (LOLBAS abuse, masquerading) and `T1055/cobalt_strike/{windows-sysmon.log,Cobalt_spawnto.log}` (process injection) | 175 |
+| `tls_certificates.jsonl` | `attack_techniques/T1572/cobalt_strike/stream_dns.log`, SSL certificate summary records — all 4 real self-signed/blank-subject certs plus a capped sample of 150 legitimately CA-issued ones | 154 |
+| `ioc_watchlist.csv` | Hand-built for this project, not sourced from `attack_data` — six IOCs (IPs/domains/hashes) chosen because they already appear in the other sample files above, so `hunt-ioc` demonstrates real cross-file matches | 6 |
+
+None of this data is redistributed in bulk - each file above is a small,
+capped subset extracted for this project's own worked examples. If you use
+`attack_data` yourself, see its `README.md`/`LICENSE` for the full terms.

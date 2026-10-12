@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# build zlib + lua variants and report accuracy numbers. run from repo root:
+#   cargo build --release && bench/run.sh
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+root="$(cd "$here/.." && pwd)"
+fp="${CARGO_TARGET_DIR:-$root/target}/release/fnprint"
+work="${1:-$here/work}"
+[ -x "$fp" ] || { echo "build first: cargo build --release"; exit 1; }
+bash "$here/build_zlib.sh" "$work"
+bash "$here/build_lua.sh" "$work"
+B="$work/builds"
+
+# two views per pair. raw: each function ranked alone (rank-1, MRR), the print
+# quality on its own. aligned: the 1:1 + call-graph assignment query/match
+# actually use (acc = right partner, prec/recall at the same-threshold).
+row() { # a b label
+  printf "%-22s " "$3"
+  "$fp" eval "$B/$1" "$B/$2" | awk '
+    /rank-1/{r=$3} /MRR/{m=$2} /aligned-acc/{a=$2} /aligned-prec/{p=$2} /aligned-recall/{rc=$2}
+    END{printf "rank1 %-6s MRR %-6s | aligned acc %-6s prec %-7s recall %s\n", r, m, a, p, rc}'
+}
+echo "== same compiler, across optimization =="
+row libz_gcc_O0.so libz_gcc_O1.so "gcc O0 -> O1"
+row libz_gcc_O1.so libz_gcc_O2.so "gcc O1 -> O2"
+row libz_gcc_O2.so libz_gcc_O3.so "gcc O2 -> O3"
+row libz_gcc_O0.so libz_gcc_O2.so "gcc O0 -> O2"
+row libz_gcc_O0.so libz_gcc_O3.so "gcc O0 -> O3"
+echo "== cross compiler, same optimization =="
+row libz_gcc_O0.so libz_clang_O0.so "gcc/clang O0"
+row libz_gcc_O2.so libz_clang_O2.so "gcc/clang O2"
+row libz_gcc_O3.so libz_clang_O3.so "gcc/clang O3"
+echo "== lua (bigger pool, the frontier) =="
+row liblua_gcc_O0.so liblua_gcc_O2.so "lua gcc O0 -> O2"
+row liblua_gcc_O2.so liblua_gcc_O3.so "lua gcc O2 -> O3"
+
+# cross-arch: the same source built for aarch64. bench/build_arm64.sh makes
+# these (needs aarch64-linux-gnu-gcc, or run it in a container, see the script).
+if [ -f "$B/libz_arm64_O0.so" ]; then
+  echo "== cross arch, x86-64 -> aarch64 =="
+  row libz_gcc_O0.so libz_arm64_O0.so "zlib x86 O0 -> arm O0"
+  row libz_gcc_O2.so libz_arm64_O2.so "zlib x86 O2 -> arm O2"
+  row libz_gcc_O0.so libz_arm64_O2.so "zlib x86 O0 -> arm O2"
+  row liblua_gcc_O0.so liblua_arm64_O0.so "lua x86 O0 -> arm O0"
+  row liblua_gcc_O2.so liblua_arm64_O2.so "lua x86 O2 -> arm O2"
+  echo "== aarch64 only, across optimization =="
+  row libz_arm64_O0.so libz_arm64_O2.so "zlib arm O0 -> O2"
+  row liblua_arm64_O0.so liblua_arm64_O2.so "lua arm O0 -> O2"
+else
+  echo "(no arm64 builds, skipping cross-arch rows: bench/build_arm64.sh)"
+fi
+
+# determinism gate: the same binary indexed twice must produce a byte-identical
+# corpus, and (once sharding lands) the shard count must not change the output.
+# fingerprints are per-function independent and the func list is sorted by entry,
+# so both are guaranteed by construction; this proves it, and fails loud if a
+# change ever breaks it.
+echo "== determinism gate =="
+det_bin="$B/libz_gcc_O2.so"
+# index -o appends to an existing corpus (that is how a multi-binary corpus is
+# built), so start from fresh files or the gate compares stale stacks.
+rm -f "$work"/det_a.db "$work"/det_b.db "$work"/det_s1.db "$work"/det_s8.db
+"$fp" index "$det_bin" -o "$work/det_a.db"
+"$fp" index "$det_bin" -o "$work/det_b.db"
+if cmp -s "$work/det_a.db" "$work/det_b.db"; then
+  echo "two indexes byte-identical: OK"
+else
+  echo "DETERMINISM FAIL: two indexes of the same binary differ" >&2
+  exit 1
+fi
+# shard-count invariance (Phase 3+: FNPRINT_SHARDS honored). N=1 vs N=8 must match.
+if "$fp" index --help 2>&1 | grep -q FNPRINT_SHARDS || true; then
+  FNPRINT_SHARDS=1 "$fp" index "$det_bin" -o "$work/det_s1.db"
+  FNPRINT_SHARDS=8 "$fp" index "$det_bin" -o "$work/det_s8.db"
+  if cmp -s "$work/det_s1.db" "$work/det_s8.db"; then
+    echo "shard count 1 vs 8 byte-identical: OK"
+  else
+    echo "DETERMINISM FAIL: shard count changes the corpus" >&2
+    exit 1
+  fi
+fi

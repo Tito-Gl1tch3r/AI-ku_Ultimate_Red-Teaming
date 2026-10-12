@@ -1,0 +1,602 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync, existsSync } from 'node:fs';
+
+// 审查记录的回归断言：把「已修的事实性缺陷」变成永久检查。
+// 价值有两层——① 复核（确认修正确实落地）② 防回归（日后有人重写技能时，不会把错的说法写回去）。
+// 每条对应 docs/audit/2026-09-13-factual-audit.md 的一个编号。
+const S = '.claude/skills/';
+const read = (p) => readFileSync(S + p, 'utf8');
+
+// 「提到错误写法」与「把错误写法当对的用」是两回事——技能里的迁移说明会刻意写出旧写法
+// （如"旧写法 Module.findExportByName(null, n) 已移除"）。因此断言只认**非否定语境**下的出现。
+const NEGATION = /已移除|已废弃|弃用|无此|没有|不再|不是|勿用|不应|错误|旧写法|过时|不携带|不具备|不支持|不存在/;
+
+/** 断言：这些串不该再以"正确写法"的身份出现 */
+function absent(t, file, needles, note) {
+  const lines = read(file).split('\n');
+  const hit = [];
+  for (const n of needles) {
+    const offenders = lines.filter((l) => l.includes(n) && !NEGATION.test(l));
+    if (offenders.length) hit.push(`${n}（${offenders.length} 处，如：${offenders[0].trim().slice(0, 70)}）`);
+  }
+  assert.deepEqual(hit, [], `${file} 仍把已修正的错误表述当作正确写法（${note}）`);
+}
+/** 断言：文件里应出现这些串（修正后的表述） */
+function present(t, file, needles, note) {
+  const text = read(file);
+  const miss = needles.filter((n) => !text.includes(n));
+  assert.deepEqual(miss, [], `${file} 缺少修正后的表述（${note}）：${miss.join(' / ')}`);
+}
+
+test('#1/#2 re-android-crypto：KeyInfo 的 API 用对', () => {
+  const f = 're-android-crypto/SKILL.md';
+  absent(null, f, ['getKeyAlias'], 'KeyStore 无此方法');
+  present(null, f, ['getSecurityLevel'], 'API 31+ 判安全等级');
+});
+
+test('#3 re-macos：Secure Enclave 密钥不能用导入 API', () => {
+  const f = 're-macos/SKILL.md';
+  present(null, f, ['SecKeyCreateRandomKey'], 'SE 密钥只能设备内生成');
+});
+
+test('#4 re-ai-model：Safetensors 头长度是小端', () => {
+  const f = 're-ai-model/SKILL.md';
+  absent(null, f, ['大端 u64 头长度'], '字节序反了');
+  present(null, f, ['<Q'], '小端解析');
+});
+
+test('#5/#6/#7 re-mobile-forensics：备份索引是 Manifest.db、fileID 由路径派生、IsEncrypted 判加密', () => {
+  const f = 're-mobile-forensics/SKILL.md';
+  present(null, f, ['Manifest.db'], '文件索引在 SQLite');
+  present(null, f, ['IsEncrypted'], '加密判定读 Manifest.plist 的该键');
+});
+
+test('#8 re-riscv：QEMU virt 的 reset 向量在 MROM 0x1000', () => {
+  const f = 're-riscv/SKILL.md';
+  present(null, f, ['0x1000'], 'MROM 地址');
+  present(null, f, ['0x80000000'], 'DRAM 基址（stub 跳转目标）');
+});
+
+test('#9 re-dotnet：EntryPoint 是 union，不总是 RVA', () => {
+  const f = 're-dotnet/SKILL.md';
+  present(null, f, ['EntryPointToken'], 'union 写法');
+  present(null, f, ['COMIMAGE_FLAGS_NATIVE_ENTRYPOINT'], '按标志位决定解释');
+});
+
+test('#10 re-automotive：candump 的过滤语法与写文件是两件事', () => {
+  const f = 're-automotive/SKILL.md';
+  present(null, f, ['candump can0,7E0:7FF'], '过滤在接口名后的逗号位');
+  absent(null, f, ['candump can0 -f 0x7E0'], '-f 是写文件，不是过滤');
+});
+
+test('#11 re-forensics：gcore 产物走进程级复盘，不走 Volatility 整机路径', () => {
+  const f = 're-forensics/SKILL.md';
+  present(null, f, ['gcore'], '分流说明应保留');
+});
+
+test('#12 re-ai-model：ONNX 起始字节不是固定 signature', () => {
+  const f = 're-ai-model/SKILL.md';
+  present(null, f, ['ir_version'], '首字段是 ir_version，随版本递增');
+});
+
+test('#13 re-dotnet：版本串是典型默认值，不是不变量', () => {
+  const f = 're-dotnet/SKILL.md';
+  absent(null, f, ['产物恒定'], '不应作恒定断言');
+});
+
+test('#14 re-macos：可访问性与访问控制是两个属性', () => {
+  const f = 're-macos/SKILL.md';
+  present(null, f, ['kSecAttrAccessControl'], '访问控制是它，不是 kSecAttrAccessible');
+});
+
+test('#15 re-mem-forensics：volatility3 只要求 Python 3.8+，无 3.11 上限', () => {
+  const f = 're-mem-forensics/SKILL.md';
+  absent(null, f, ['Python 3.8-3.11'], '官方无该上限');
+});
+
+test('#16 高熵不等于加密（ransomware 与 proto-rev 两处）', () => {
+  const r = read('re-ransomware/SKILL.md');
+  assert.ok(!/>7\.0 已加密/.test(r), 're-ransomware 不应把高熵当加密判定');
+  const p = read('re-proto-rev/SKILL.md');
+  assert.ok(!/几乎肯定加密/.test(p), 're-proto-rev 不应出现"几乎肯定加密"');
+});
+
+test('#17 Frida 17：静态查找/枚举 API 已移除，须用模块实例方法', () => {
+  const files = [
+    're-frida/SKILL.md', 're-frida/references/frida-scripts.md',
+    're-android-native/SKILL.md', 're-android-native/references/probes.md',
+    're-crypto-id/SKILL.md', 're-ios-jb/SKILL.md', 're-flutter/SKILL.md',
+    're-address-space/SKILL.md',
+  ];
+  const offenders = [];
+  for (const f of files) {
+    if (!existsSync(S + f)) continue;
+    const lines = read(f).split('\n');
+    for (const bad of ['Module.findExportByName(', 'Module.getExportByName(', 'Module.findBaseAddress(']) {
+      const badLines = lines.filter((l) => l.includes(bad) && !NEGATION.test(l));
+      if (badLines.length) offenders.push(`${f}: ${bad}（${badLines[0].trim().slice(0, 70)}）`);
+    }
+  }
+  assert.deepEqual(offenders, [], `仍在使用 Frida 17 已移除的静态 API：\n${offenders.join('\n')}`);
+});
+
+test('#18 re-frida-script-author：改返回值必须用 onLeave 的 retval.replace', () => {
+  const f = 're-frida-script-author/SKILL.md';
+  present(null, f, ['retval.replace'], 'onLeave 的 retval 才是改返回值的入口');
+  absent(null, f, ['this.returnValue'], '`this` 上没有 returnValue');
+});
+
+test('#19 re-ics：scapy Modbus 字段名是 camelCase startAddr', () => {
+  const f = 're-ics/SKILL.md';
+  present(null, f, ['startAddr'], 'scapy 定义的字段名');
+  absent(null, f, ['start_addr='], '下划线写法在 scapy 上不成立');
+});
+
+test('#20 re-angr：9.2.x 不是固定 Python 区间', () => {
+  const f = 're-angr/SKILL.md';
+  absent(null, f, ['支持 Python 3.8–3.11', '支持 Python 3.8-3.11'], '下限随补丁版本抬高');
+  present(null, f, ['requires-python'], '以目标版本元数据为准');
+});
+
+test('#21 re-ios-jb：读 C 字符串是 NativePointer 实例方法', () => {
+  const f = 're-ios-jb/SKILL.md';
+  absent(null, f, ['Memory.readCString'], 'Memory 下无此方法');
+});
+
+test('补充 22：analysis-contract 的 ELF 魔数表述与字节序正确', () => {
+  const f = 're-analyze/references/analysis-contract.md';
+  const text = read(f);
+  assert.ok(text.includes('7f 45 4c 46'), '应给出字节序列');
+  assert.ok(text.includes('0x464c457f'), '小端 u32 读法');
+  assert.ok(!/小端读作 0x7f454c46/.test(text), '旧表述把大端读法写成了小端');
+  assert.ok(!text.includes('0x202'), '最初的错误值不应复现');
+});
+
+test('补充 22：system-fingerprints 的 FreeBSD 标识是 .note.tag', () => {
+  const f = 're-analyze/references/system-fingerprints.md';
+  const text = read(f);
+  assert.ok(text.includes('.note.tag'), '现代 FreeBSD 由 crtbrand.S 生成 .note.tag');
+  assert.ok(!text.includes('`.note.ABI-tag`(FreeBSD)'), '不应把 note type 与 section name 混写');
+});
+
+test('补充 22：ET_REL 不单独断定 Linux 内核模块', () => {
+  const f = 're-analyze/references/system-fingerprints.md';
+  const text = read(f);
+  assert.ok(!/ET_REL\s*\*\*\s*→.*Linux 内核模块/s.test(text) || !/\[强\]\s*Linux 内核模块/.test(text),
+    'ET_REL 只说明"可重定位 ELF"，需组合判据才升 Linux kmod');
+});
+
+test('补充 28：Mach-O 基础常量表与 Apple 头文件一致', () => {
+  const f = 're-format-macho/references/layout.md';
+  const text = read(f);
+  // 旧的错误表述不得复现
+  assert.ok(!text.includes('0x0100000B=arm64e'), 'arm64e 的 cputype 不是 0x0100000B');
+  assert.ok(!text.includes('0x80000003=x86_64h'), '0x80000003 是 ALL+LIB64 位，不是 x86_64h');
+  assert.ok(!/4=TWOLEVEL/.test(text), 'TWOLEVEL 是 0x80 不是 4');
+  assert.ok(!/0x800000=LAZY_INIT/.test(text), '0x800000 是 HAS_TLV_DESCRIPTORS');
+  assert.ok(!/0x0F=N_UNDF/.test(text), '0x0f = N_SECT|N_EXT');
+  assert.ok(!/LE 文件字节 be ba fe ca/.test(text), 'fat 恒为大端，文件开头是 CA FE BA BE');
+  assert.ok(!/offset 为 4 字节对齐的绝对文件偏移/.test(text), 'align 是 2 的幂，不是固定 4 字节对齐');
+  // 修正后的取值应在文中
+  for (const s of ['0x0100000C', 'ARM64E', '0x40', 'TWOLEVEL', '0x800000', 'N_SECT', 'CA FE BA BE', '2 的幂']) {
+    assert.ok(text.includes(s), `缺少修正后的表述：${s}`);
+  }
+});
+
+test('补充 28：udsoncan 示例带 config 的 data_identifiers', () => {
+  const f = 're-automotive/SKILL.md';
+  const text = read(f);
+  assert.ok(text.includes('data_identifiers'), 'DID 解码依赖配置里的 codec 映射');
+  assert.ok(text.includes('config=config'), '示例必须把 config 传给 Client');
+  assert.ok(!/with Client\(conn, request_timeout=2\) as client/.test(text), '不带 config 的旧示例会解码失败');
+});
+
+test('补充 27：re-flutter 的 Dart 格式 magic 是数值不是 ASCII 串', () => {
+  const f = 're-flutter/SKILL.md';
+  absent(null, f, ['"KERNEL" magic'], 'KERNEL 不是 magic（正确写法是数值 0x90abcdef）');
+  present(null, f, ['0x90abcdef'], 'kernel magic 实为该数值');
+  present(null, f, ['0xdcdcf5f5'], 'snapshot magic 实为该数值');
+  absent(null, f, ["b'SNAPSHOT'"], '快照头里没有 ASCII SNAPSHOT');
+  absent(null, f, ['版本串 12B'], '不存在固定 12 字节版本串');
+});
+
+test('补充 27：re-flutter 的 Profile 属 AOT 一侧', () => {
+  const f = 're-flutter/SKILL.md';
+  absent(null, f, ['kernel_blob 只在 debug/Profile 构建存在'], 'Profile 用的是 AOT');
+  present(null, f, ['Profile 与 Release 都是 AOT'], '执行模型划分');
+});
+
+test('补充 27：不写死 IDA Free 的版本代际', () => {
+  const f = 're-analyze/references/preferences.md';
+  absent(null, f, ['当前 8.x'], '版本代际会漂移');
+});
+
+test('补充 27：mitmproxy 的 Python 下限为 3.12', () => {
+  const f = 're-netcap/SKILL.md';
+  present(null, f, ['Python >=3.12'], '当前 12.x 的要求');
+  absent(null, f, ['（Python 3.10+）'], '旧的 Python 下限');
+});
+
+test('补充 27：angr 的 Python 版本矩阵只维护一处（re-angr）', () => {
+  const f = 're-exploit/SKILL.md';
+  absent(null, f, ['9.x 支持 Python 3.9–3.11'], '与 re-angr 冲突的旧矩阵');
+  present(null, f, ['[[re-angr]]'], '指向唯一事实源');
+});
+
+test('补充 32：Python 版本下限与无 pin 安装一致（torch/protobuf/web3）', () => {
+  absent(null, 're-ai-model/SKILL.md', ['Python 3.9+'], 'torch 当前要求 >=3.10');
+  present(null, 're-ai-model/SKILL.md', ['>=3.10'], 'torch 下限');
+  absent(null, 're-ai-model/SKILL.md', ['（Python 3.8+，onnx'], 'protobuf 当前要求 >=3.10');
+  absent(null, 're-blockchain/SKILL.md', ['Python 3.8+'], 'web3 8.x 要求 >=3.10');
+  present(null, 're-blockchain/SKILL.md', ['7.x'], '3.8/3.9 需 pin 的出路');
+});
+
+test('补充 32：angr 的 Python 矩阵只在 re-angr 维护一处', () => {
+  const f = 're-crypto-decrypt/SKILL.md';
+  absent(null, f, ['（Python 3.8+，依赖多'], '与 re-angr 冲突的旧副本');
+  present(null, f, ['[[re-angr]]'], '指向唯一事实源');
+});
+
+test('补充 32：attach 失败不得直接判成 PPL，内核调试不是唯一手段', () => {
+  const f = 're-anti-cheat/SKILL.md';
+  absent(null, f, ['内核调试是分析反作弊驱动的唯一动态手段', '唯一可用的动态手段',
+    '反作弊驱动用 PPL（Protected Process Light）保护游戏与自身进程'], 'PPL 是 Windows 的机制，不由反作弊驱动"设定"');
+  present(null, f, ['ProcessProtectionLevelInfo', 'PROTECTION_LEVEL_NONE'], '先查真实 protection level');
+  present(null, f, ['ObRegisterCallbacks'], '普通进程 attach 失败的替代解释');
+});
+
+test('补充 32：Zig 普通函数不是默认 C ABI', () => {
+  const files = ['re-zig/SKILL.md', 're-zig/references/layout.md'];
+  const bad = [];
+  for (const f of files) {
+    const lines = read(f).split('\n');
+    for (const l of lines) {
+      if (/默认调用约定即 C ABI|为默认.*x86-64 SysV|调用约定：默认 C ABI/.test(l) && !/只在|不是|仅/.test(l)) {
+        bad.push(`${f}: ${l.trim().slice(0, 80)}`);
+      }
+    }
+  }
+  assert.deepEqual(bad, [], '普通 Zig fn 用 Zig 默认约定，只有 extern/export/callconv(.c) 才是 C ABI');
+  present(null, files[0], ['extern'], 'C ABI 边界的来源');
+  present(null, files[1], ['callconv(.c)'], '显式要求 C 约定');
+});
+
+test('补充 32：DNP3 组 3 是静态双位输入，不是事件', () => {
+  const f = 're-ics/SKILL.md';
+  absent(null, f, ['组 3 事件'], '组 3 = Double-bit Binary Input（静态）；其事件对象是组 4');
+  present(null, f, ['Double-bit Binary Input'], '正确的对象名');
+  present(null, f, ['组 4'], '配对的静态/事件关系');
+});
+
+test('补充 32：AArch32 的 8 项向量表不得泛化到整个 Cortex-A', () => {
+  const f = 're-arm/SKILL.md';
+  const lines = read(f).split('\n');
+  const bad = lines.filter((l) => l.includes('异常向量表 8 项') && !/AArch32|Armv7/.test(l));
+  assert.deepEqual(bad, [], 'AArch64 用 VBAR_ELx + 16×0x80，不存在固定 8 项表');
+  present(null, f, ['AArch32', 'AArch64'], '两套异常模型必须分开写（缺一侧则等于把结论删掉而非改正）');
+  present(null, f, ['VBAR_EL', '0x80'], 'AArch64 向量表的基址寄存器与槽位步长');
+  present(null, f, ['vbar_el1'], '定位异常表的线索（MSR VBAR_ELx 序列）');
+});
+
+test('补充 31：RISC-V Float ABI 以 e_flags 判定，不用浮点指令反推', () => {
+  const f = 're-riscv/SKILL.md';
+  absent(null, f, ['混编软/硬浮点编译单元时按单元确认'], 'linker 会直接拒绝不同 Float ABI 的输入');
+  present(null, f, ['EF_RISCV_FLOAT_ABI'], '以 e_flags 掩码判定');
+  present(null, f, ['cannot link object files with different floating-point ABI'], '链接期实际行为');
+  present(null, f, ['mabi=lp64'], 'ISA 扩展与调用约定是两件事的反例');
+});
+
+test('补充 31：re-arm 不得用浮点指令频率佐证 float ABI（同型缺陷）', () => {
+  const f = 're-arm/SKILL.md';
+  absent(null, f, ['vcmp/vcvt 等浮点指令出现频率佐证'], 'softfp 即反例：有 VFP 指令但参数仍走 r0-r3');
+  present(null, f, ['softfp'], 'softfp 的定位必须写明');
+  present(null, f, ['浮点指令出现频率不能佐证'], '修正后的表述');
+});
+
+test('补充 31：pwntools 的 Python 兼容矩阵只维护一处', () => {
+  const e = 're-exploit/SKILL.md';
+  absent(null, e, ['Python 3.8+'], '与 re-pwn 冲突的旧表述');
+  present(null, e, ['[[re-pwn]]'], '指向唯一事实源');
+  const p = 're-pwn/SKILL.md';
+  present(null, p, ['pwntools==4.15.0'], '旧环境需 pin');
+  present(null, p, ['最后一个支持'], '迁移窗口说明');
+});
+
+test('补充 30：PT_LOAD 不得表述成"唯一被映射的段类型"', () => {
+  const f = 're-format-elf/references/layout.md';
+  const lines = read(f).split('\n');
+  const offenders = lines.filter((l) => l.includes('唯一被映射') && !/不要|不是|不能|而非/.test(l));
+  assert.deepEqual(offenders, [], 'ELF gABI 只规定 PT_LOAD 是 loadable segment；PT_PHDR 同样描述内存映像中的位置');
+  present(null, f, ['loadable segment'], '应保留 loadable segment 的定位');
+  present(null, f, ['PT_PHDR'], '反证应写明');
+});
+
+test('补充 30：PT_GNU_STACK 缺失不得一律判定为可执行栈', () => {
+  const f = 're-format-elf/references/layout.md';
+  const lines = read(f).split('\n');
+  const offenders = lines.filter(
+    (l) => /缺失.*假定可执行|缺失\s*=\s*可执行栈|缺失.*= *可执行/.test(l) && !/不能|依目标|而异|不可/.test(l)
+  );
+  assert.deepEqual(offenders, [], '缺失 PT_GNU_STACK 的默认策略依目标 ABI/内核而异，不存在统一规则');
+  present(null, f, ['存在时'], '存在与缺失两种情形必须分开写');
+  present(null, f, ['READ_IMPLIES_EXEC', 'x86-64', 'ia32'], '跨架构差异（ia32 缺失才走 RIE）');
+});
+
+test('补充 30：udsoncan 示例保留"部分配置可用"这一已实测事实', () => {
+  const f = 're-automotive/SKILL.md';
+  // 这条对应一次**被驳回的报告**：报称示例里 ClientConfig() 会让 import/实例化失败，实测均不成立
+  //（client.py 运行时 import 了 ClientConfig；TypedDict 实例化得空 dict；refresh_config 会补齐缺键）。
+  // 断言的作用是把这个已核事实钉住，防止日后被"修"成别的说法。
+  present(null, f, ['default_client_config'], 'Client 会用默认配置补齐缺键（实测 1.26.1）');
+  present(null, f, ['ConfigError'], '未配该 DID 的失败签名（发送前抛出）');
+  present(null, f, ['DidCodec'], 'codec 必须是 DidCodec 实例');
+});
+
+test('补充 29：re-apk 的 apktool 版本模型是 3.x 主线 / 2.x 维护线', () => {
+  const g = 're-apk/references/gotchas.md';
+  present(null, g, ['3.x 为当前主线', '2.x 为维护线'], '版本模型');
+  present(null, g, ['--all-src'], '取代 --only-main-classes 的选项');
+  present(null, g, ['--aapt'], '3.x 的 aapt2 二进制入口');
+  present(null, g, ['Unrecognized option'], '旧短参在 3.x 的失败表现');
+  present(null, 're-apk/SKILL.md', ['3.x 为当前主线'], '工具准备段须先定 major version');
+});
+
+test('补充 29：apktool 调用行里不得残留 2.x 专有选项', () => {
+  // 迁移说明会**刻意引用**旧写法（"--use-aapt2 已移除"），因此只查"像命令一样写出来"的行；
+  // 判据是行内出现 apktool d/b 调用，且整行不在迁移语境里。
+  const MIGR = /移除|消失|取代|不再|没有|无此|旧写法|过时|改用|2\.x|须写/;
+  const BANNED = ['--use-aapt2', '--use-aapt1', '--api-level', '--only-main-classes'];
+  const files = ['re-apk/SKILL.md', 're-apk/references/gotchas.md', 're-apk/references/commands.md'];
+  const bad = [];
+  for (const f of files) {
+    for (const l of read(f).split('\n')) {
+      if (!/\bapktool\s+[bd]\b/.test(l) || MIGR.test(l)) continue;
+      for (const opt of BANNED) if (l.includes(opt)) bad.push(`${f}: ${l.trim().slice(0, 90)}`);
+    }
+  }
+  assert.deepEqual(bad, [], `apktool 调用行里仍有 2.x 专有选项：\n${bad.join('\n')}`);
+});
+
+test('补充 29：apktool 的 --api-level 不得写成可用选项', () => {
+  const files = ['re-apk/SKILL.md', 're-apk/references/gotchas.md', 're-apk/references/commands.md'];
+  const offenders = [];
+  for (const f of files) {
+    for (const l of read(f).split('\n')) {
+      if (l.includes('--api-level') && !/移除|不再|消失|没有|无此|旧写法|过时/.test(l)) {
+        offenders.push(`${f}: ${l.trim().slice(0, 90)}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, [], '--api-level 在 apktool 3.x 已移除（API 等级不再由命令行指定）');
+});
+
+test('补充 29：不再支持 32 位的表述与 2.x 的 _64 后缀命名一致', () => {
+  const g = 're-apk/references/gotchas.md';
+  present(null, g, ['32 位'], '3.x 无 32 位产物');
+  assert.ok(!/老环境用 `aapt`（34 前默认）.*apktool/.test(read(g)), 'aapt 与 apktool 的版本线不得混写');
+});
+
+test('补充 23：re-angr 的 recv hook 返回值是长度不是指针', () => {
+  const f = 're-angr/SKILL.md';
+  present(null, f, ['ssize_t'], '返回值语义');
+  absent(null, f, ['hook 返回符号指针'], '旧写法会把控制流建歪');
+});
+
+// ===== 补充 34：监控报告对账波落地（2026-10-05）=====
+// 对 95 条外部报告逐条判定后采纳 70 条。下列断言锁住修正后的表述，防止日后重写时把错的说法写回；
+// 文件末尾另有「驳回项守护」——那 11 条经实测判定为报告有误，仓库原表述是对的，不得被"修"错。
+
+test('补充 34：Ghidra 版本不再钉死 patch 号', () => {
+  const f = 're-ghidra/SKILL.md';
+  absent(null, f, ['2026-08 最新 12.1.3'], '易腐化的版本写法');
+  present(null, f, ['12.x 为当前主线'], '改为以官方 Releases 为准');
+});
+
+test('补充 34：angr 主线已到 10.x（不再是 9.3.x）', () => {
+  const f = 're-angr/SKILL.md';
+  absent(null, f, ['最新 9.3.x 线'], '9.3.x 已不是主线');
+  present(null, f, ['10.x'], '当前主线');
+});
+
+test('补充 34：binwalk 的 pip 渠道标为 legacy v2，v3 走官方安装方式', () => {
+  const f = 're-fw-extract/SKILL.md';
+  absent(null, f, ['版本新、签名库全'], '把 2015 年的 pip 包说成"版本新"');
+  present(null, f, ['legacy', 'v3'], 'v2 遗留 / v3 主线要分清');
+});
+
+test('补充 34：rizin 的 apt 安装不得再作为可用安装方式（副本技能）', () => {
+  const files = [
+    're-variant/SKILL.md', 're-patching/SKILL.md', 're-license/SKILL.md',
+    're-imports/SKILL.md', 're-deobfuscate/SKILL.md', 're-unpack-advanced/SKILL.md',
+  ];
+  // 提醒「apt 装不上」是允许的写法，只禁把 apt 当作可用安装方式
+  const offenders = [];
+  for (const f of files) {
+    for (const l of read(f).split('\n')) {
+      if (l.includes('apt install rizin') && !/会失败|无 rizin|无包|不再|不是|旧写法|勿用/.test(l)) {
+        offenders.push(`${f}: ${l.trim().slice(0, 90)}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, [], 'Debian/Ubuntu 仓库无 rizin 包，apt 装不上');
+  present(null, files[0], ['re-radare2'], '安装矩阵应指向单一事实源');
+});
+
+test('补充 34：QEMU 默认网络是 user 后端不是断网（安全基线）', () => {
+  const files = ['re-fw-emulate/SKILL.md', 're-fw-emulate/references/commands.md', 're-fw-emulate/references/gotchas.md'];
+  for (const f of files) absent(null, f, ['默认 `-net none`', '默认无网络'], 'QEMU 不加参数会自建 NIC + user 后端');
+  present(null, files[1], ['-nic none'], '不可信固件必须显式断网');
+});
+
+test('补充 34：IDA 9.x 无 64 后缀（无头统一 idat）', () => {
+  const f = 're-ida/SKILL.md';
+  absent(null, f, ['idat64（64 位无头）'], '9.x 已取消 64 后缀二进制');
+  present(null, f, ['idat'], '以 idat 为基线');
+});
+
+test('补充 34：JNIEnv 槽位是固定 ABI（RegisterNatives = 215）', () => {
+  const f = 're-android-native/SKILL.md';
+  absent(null, f, ['槽号是易变参数'], '槽位是 JNI ABI 固定布局');
+  present(null, f, ['215'], 'RegisterNatives 的规范 index');
+  present(null, 're-android-native/references/probes.md', ['215'], '探测层也不得再写"槽号随头文件漂移"');
+});
+
+test('补充 34：eBPF helper 号是 UAPI 稳定编号，不"漂移"', () => {
+  const f = 're-ebpf/SKILL.md';
+  absent(null, f, ['随内核版本增删漂移'], '已有 ID 不随内核重编号');
+  present(null, f, ['稳定'], '编号稳定性');
+});
+
+test('补充 34：Delphi 经典 VMT 负偏移（vmt-0x20 一类写法已纠正）', () => {
+  const f = 're-format-pe/SKILL.md';
+  absent(null, f, ['vmt-0x20'], '原值落进了 TObject 虚方法槽区');
+  present(null, f, ['-0x3C'], '经典 Win32 的 TypeInfo 偏移');
+});
+
+test('补充 34：Itanium typeinfo 布局按指针宽度，不写死 64 位', () => {
+  const f = 're-cpp-abi/SKILL.md';
+  absent(null, f, ['首 8 字节 vptr'], '32 位下为 +0/+4');
+  present(null, f, ['pointer-sized'], 'vptr 后接一个指针宽度的槽');
+});
+
+test('补充 34：lambda closure type 不是"无 RTTI"', () => {
+  const f = 're-cpp-abi/SKILL.md';
+  absent(null, f, ['lambda 无 RTTI'], '缺 _ZTI 既不能排除也不能反推');
+  present(null, f, ['_ZTI'], '按 mangling/捕获布局识别');
+});
+
+test('补充 34：DT_SYMENT 不硬编码 24（ELF32 为 16）', () => {
+  const f = 're-format-elf/SKILL.md';
+  absent(null, f, ['DT_SYMENT`(24 字节/条)'], '只对 ELF64 成立');
+  present(null, f, ['ELF32'], '按目标 class 取步长');
+});
+
+test('补充 34：.fini_array 在退出阶段执行，不与 .init_array 同时机', () => {
+  const f = 're-format-elf/SKILL.md';
+  absent(null, f, ['main 之前执行）'], 'fini_array 在 main 之后');
+  present(null, f, ['退出'], '退出清理阶段');
+});
+
+test('补充 34：缺 PT_GNU_STACK 的 workaround 是 execstack=2', () => {
+  const f = 're-format-elf/SKILL.md';
+  absent(null, f, ['rtld.execstack=1'], '=1 实测无效');
+  present(null, f, ['execstack=2'], '实测有效的取值');
+});
+
+test('补充 34：Mach-O 的 LC 最小长度是 8 字节不是 16', () => {
+  const f = 're-format-macho/SKILL.md';
+  absent(null, f, ['64 位下 LC 最小 16 字节'], 'load_command 头本身即 8 字节');
+  present(null, f, ['至少 8 字节'], '以结构体最小尺寸为准');
+});
+
+test('补充 34：LC_DYLD_INFO 是五组信息流（含 weak_bind）', () => {
+  const f = 're-format-macho/SKILL.md';
+  absent(null, f, ['四张表'], '漏了 weak_bind');
+  present(null, f, ['weak_bind'], '弱符号合并有独立语义');
+});
+
+test('补充 34：PIE 判定要看 DF_1_PIE，不能由 ET_DYN 直接推', () => {
+  const f = 're-triage/SKILL.md';
+  absent(null, f, ['ET_DYN=PIE'], '共享库同样是 ET_DYN');
+  present(null, f, ['DF_1_PIE'], 'readelf -d 的 FLAGS_1: PIE');
+});
+
+test('补充 34：TLS 1.3 的 ALPN 结果在 EncryptedExtensions', () => {
+  const f = 're-tls/SKILL.md';
+  present(null, f, ['EncryptedExtensions'], 'TLS 1.3 的落点');
+});
+
+test('补充 34：私有协议恢复必须先做 TCP 流重组', () => {
+  const f = 're-proto-rev/SKILL.md';
+  present(null, f, ['流重建'], 'segment payload ≠ 应用层 message');
+});
+
+test('补充 34：密文长度不能区分分组/流密码', () => {
+  const f = 're-crypto-id/SKILL.md';
+  absent(null, f, ['密文长度是块大小整数倍'], 'CTR/OFB 可产出与明文等长密文');
+  present(null, f, ['等长'], '长度只辅助判断 mode');
+});
+
+test('补充 34：zipalign 与签名方案的顺序关系', () => {
+  const f = 're-apk/references/gotchas.md';
+  absent(null, f, ['v1 签名需要 zipalign'], '用 apksigner 时必须先对齐后签名');
+  present(null, f, ['zipalign'], '把顺序要求写清');
+});
+
+test('补充 34：Armv6-M 有合法的 32 位编码（BL 不是幻觉）', () => {
+  const f = 're-arm/SKILL.md';
+  absent(null, f, ['只有 16 位 Thumb'], 'Armv6-M 含 32 位 BL/DMB/DSB/ISB/MRS/MSR');
+  present(null, f, ['Armv6-M'], '按具体 opcode 判定变体是否选错');
+});
+
+test('补充 34：MIPS 延迟槽要区分 Branch Likely 的 annul', () => {
+  const f = 're-mips/SKILL.md';
+  absent(null, f, ['无条件执行'], 'likely 分支 not-taken 时延迟槽被取消');
+  present(null, f, ['Branch Likely'], 'annul 语义');
+});
+
+test('补充 34：Game Boy 用 SM83，不是 Z80 变体', () => {
+  const f = 're-console/SKILL.md';
+  absent(null, f, ['Z80 变体'], 'SM83 与 Z80 不兼容');
+  present(null, f, ['SM83'], '专用 processor definition');
+});
+
+test('补充 34：unc0ver 的 iOS 版本范围', () => {
+  const f = 're-ios/references/gotchas.md';
+  absent(null, f, ['unc0ver（iOS 14-15 系）'], 'unc0ver 不支持 iOS 15');
+  present(null, f, ['11.0-14.8'], '实际支持范围');
+});
+
+test('补充 34：Frida host 与 frida-server 只需 major 一致', () => {
+  const f = 're-frida/SKILL.md';
+  absent(null, f, ['版本必须与主机 frida 完全一致'], '官方判据是 major 匹配 + 功能存在');
+  present(null, f, ['major'], '兼容判据');
+});
+
+test('补充 34：运行时基线不再是 EOL 的 Node 18', () => {
+  const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+  assert.ok(pkg.engines.node !== '>=18', 'engines.node 不得停留在已 EOL 的 18');
+  present(null, 're-crash-triage/SKILL.md', ['coredumpctl'], 'core 取回补全');
+});
+
+// ===== 驳回项守护（2026-10-05）=====
+// 这 6 组经实测判定为「报告有误」，仓库原表述正确。照报告去"修"会把正确内容改错，
+// 因此反向锁住：正确表述必须在位。（依据见 docs/audit/2026-09-30-adjudication.md 第四节）
+
+test('驳回守护：ET_DYN 的 e_entry 措辞不得被改成"文件偏移"', () => {
+  const f = 're-format-elf/references/layout.md';
+  present(null, f, ['相对基址'], 'gABI ch5 的 base address 定义 + 内核 +load_bias 支持此措辞');
+  absent(null, f, ['e_entry 是文件偏移'], 'e_entry 从来不是文件偏移');
+});
+
+test('驳回守护：LC_MAIN 入口公式不得被改', () => {
+  const f = 're-format-macho/SKILL.md';
+  present(null, f, ['vmaddr'], 'Apple loader.h 与 dyld 源码均按 vmaddr + entryoff 计算');
+});
+
+test('驳回守护：x86-64 SysV 栈对齐表述不得被改', () => {
+  const f = 're-exploit/SKILL.md';
+  present(null, f, ['% 16 == 0'], 'psABI 原文即"call 指令执行前 16 字节对齐"');
+});
+
+test('驳回守护：pwntools 4.15.0 仍是当前正式版', () => {
+  present(null, 're-pwn/SKILL.md', ['4.15.0'], 'PyPI 至今无 5.x 发行版');
+});
+
+test('驳回守护：capstone 5.x 仍是稳定版', () => {
+  present(null, 're-emulation/references/gotchas.md', ['5.0'], '6.0.0 仅有预发行');
+});
+
+test('驳回守护：udsoncan 的 ClientConfig() 示例可运行，不得照报告改', () => {
+  present(null, 're-automotive/SKILL.md', ['ClientConfig'], 'TypedDict 实例化返回空 dict，refresh_config 补齐缺键');
+});
+
+test('补充 34：AI 模型格式信号以字节为准（实测 file(1) 输出）', () => {
+  const f = 're-ai-triage/SKILL.md';
+  // 实测：onnx/safetensors/tflite 三种样本 file(1) 都报 `data`；老式 pickle 被误报为 XENIX
+  absent(null, f, ['`08 08`'], 'onnx 第二字节随 ir_version 递增，不是常量');
+  present(null, f, ['TFL3'], 'tflite 的文件标识符在字节 4–7');
+  present(null, f, ['小端头长度'], 'safetensors 先 8 字节长度再 JSON');
+  present(null, f, ['XENIX'], '老式 pickle 的 file(1) 误报可作为识别线索');
+});

@@ -1,0 +1,672 @@
+/*
+ * Copyright (C) 2019 skydoves
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+@file:Suppress("unused")
+
+package com.skydoves.only
+
+import android.content.Context
+import android.content.SharedPreferences
+import android.content.pm.ApplicationInfo
+import androidx.annotation.RestrictTo
+import androidx.annotation.VisibleForTesting
+
+@DslMarker
+internal annotation class OnlyDsl
+
+/** Run [Only] by [Only.Builder] using kotlin dsl. */
+@OnlyDsl
+@JvmSynthetic
+inline fun only(name: String, times: Int, block: Only.Builder.() -> Unit): Unit =
+  Only.Builder(name, times).apply(block).run()
+
+/** Run only once [Only] by [Only.Builder] using kotlin dsl. */
+@OnlyDsl
+@JvmSynthetic
+inline fun onlyOnce(name: String, times: Int = 1, block: Only.Builder.() -> Unit): Unit =
+  Only.Builder(name, times).apply(block).run()
+
+/** Run only twice [Only] by [Only.Builder] using kotlin dsl. */
+@OnlyDsl
+@JvmSynthetic
+inline fun onlyTwice(name: String, times: Int = 2, block: Only.Builder.() -> Unit): Unit =
+  Only.Builder(name, times).apply(block).run()
+
+/** Run only thrice [Only] by [Only.Builder] using kotlin dsl. */
+@OnlyDsl
+@JvmSynthetic
+inline fun onlyThrice(name: String, times: Int = 3, block: Only.Builder.() -> Unit): Unit =
+  Only.Builder(name, times).apply(block).run()
+
+/** Easy way to run block codes only as many times as necessary. */
+object Only {
+
+  @Volatile
+  private lateinit var preference: SharedPreferences
+  private lateinit var buildVersion: String
+  private var isDebuggable = 0
+  private var doOnDebugMode = false
+
+  /** initialize the Only default properties. */
+  @JvmStatic
+  fun init(context: Context): Only {
+    val info = context.packageManager.getPackageInfo(context.packageName, 0)
+    init(context, info.versionName)
+    return this@Only
+  }
+
+  /** initialize the Only default properties. */
+  @JvmStatic
+  @VisibleForTesting
+  internal fun init(context: Context, buildVersion: String): Only {
+    if (!::preference.isInitialized) {
+      this.preference = context.applicationContext.getSharedPreferences("Only", Context.MODE_PRIVATE)
+      this.isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE
+      this.buildVersion = buildVersion
+    }
+    return this@Only
+  }
+
+  /** run onDo using [Only.Builder]. */
+  private fun runByBuilder(builder: Builder) {
+    if (getOnlyTimes(builder.name) == 0) {
+      mark(builder.name, builder.marking)
+    }
+    onDo(builder.name, builder.times, builder.onDo, builder.onDone, builder.onLastDo, builder.onBeforeDone, builder.version)
+  }
+
+  /** check debugging mode. */
+  @JvmStatic
+  fun onlyOnDoDebugMode(ignore: Boolean): Only {
+    this.doOnDebugMode = ignore
+    return this@Only
+  }
+
+  /** check debug mode. */
+  @JvmStatic
+  fun isDebugMode(): Boolean {
+    return doOnDebugMode && isDebuggable != 0
+  }
+
+  /** execute the onDo block only as many times as necessary. */
+  @JvmStatic
+  fun onDo(
+    name: String,
+    times: Int,
+    onDO: Runnable
+  ): Only {
+
+    onDo(name, times) { onDO.run() }
+    return this@Only
+  }
+
+  /** execute the onDo block only as many times as necessary. */
+  @JvmSynthetic
+  inline fun onDo(
+    name: String,
+    times: Int,
+    crossinline onDo: (Int) -> Unit
+  ): Only {
+
+    onDo(name, times, onDo, { })
+    return this@Only
+  }
+
+  /**
+   * execute the onDo block only as many times as necessary.
+   * if unnecessary, unCatch block will be executed.
+   */
+  @JvmStatic
+  fun onDo(
+    name: String,
+    times: Int,
+    onDo: Runnable,
+    onDone: Runnable
+  ): Only {
+
+    onDo(name, times, { onDo.run() }, { onDone.run() })
+    return this@Only
+  }
+
+  /**
+   * execute the onDo block only as many times as necessary.
+   * if unnecessary, unCatch block will be executed.
+   */
+  @JvmSynthetic
+  inline fun onDo(
+    name: String,
+    times: Int,
+    crossinline onDo: (Int) -> Unit,
+    crossinline onDone: () -> Unit
+  ): Only {
+
+    onDo(name, times, onDo, onDone, { }, { })
+    return this@Only
+  }
+
+  /**
+   * execute the onDo block only as many times as necessary.
+   * if the version is different from the old version, Only times will be initialized 0.
+   */
+  @JvmStatic
+  fun onDo(
+    name: String,
+    times: Int,
+    onDo: Runnable,
+    version: String = ""
+  ): Only {
+
+    onDo(name, times, { onDo.run() }, version)
+    return this@Only
+  }
+
+  /**
+   * execute the onDo block only as many times as necessary.
+   * if the version is different from the old version, Only times will be initialized 0.
+   */
+  @JvmSynthetic
+  inline fun onDo(
+    name: String,
+    times: Int,
+    crossinline onDo: (Int) -> Unit,
+    version: String = ""
+  ): Only {
+
+    affectVersion(name, version)
+    onDo(name, times, onDo, { }, { }, { })
+
+    return this@Only
+  }
+
+  /**
+   * execute the onDo block only as many times as necessary.
+   * if unnecessary, unCatch block will be executed.
+   * if the version is different from the old version, Only times will be initialized 0.
+   */
+  @JvmStatic
+  fun onDo(
+    name: String,
+    times: Int,
+    onDo: Runnable,
+    onDone: Runnable,
+    version: String = ""
+  ): Only {
+
+    onDo(name, times, { onDo.run() }, { onDone.run() }, version)
+    return this@Only
+  }
+
+  /**
+   * execute the onDo block only as many times as necessary.
+   * if unnecessary, unCatch block will be executed.
+   * if the version is different from the old version, Only times will be initialized 0.
+   */
+  @JvmSynthetic
+  inline fun onDo(
+    name: String,
+    times: Int,
+    crossinline onDo: (Int) -> Unit,
+    crossinline onDone: () -> Unit,
+    version: String = ""
+  ): Only {
+
+    affectVersion(name, version)
+    onDo(name, times, onDo, onDone, { }, { })
+    return this@Only
+  }
+
+  /**
+   * execute the onDo block only as many times as necessary.
+   * if unnecessary, unCatch block will be executed.
+   * if the version is different from the old version, Only times will be initialized 0.
+   * onLastDo block will be run only once after the last run time of the onDo.
+   * onBeforeDone block will be run only once before the onDone block will be run.
+   */
+  @JvmStatic
+  fun onDo(
+    name: String,
+    times: Int,
+    onDo: Runnable,
+    onDone: Runnable,
+    onLastDo: Runnable,
+    onBeforeDone: Runnable
+  ): Only {
+
+    onDo(name, times, { onDo.run() }, { onDone.run() }, { onLastDo.run() }, { onBeforeDone.run() })
+    return this@Only
+  }
+
+  /**
+   * execute the onDo block only as many times as necessary.
+   * if unnecessary, unCatch block will be executed.
+   * if the version is different from the old version, Only times will be initialized 0.
+   * onLastDo block will be run only once after the last run time of the onDo.
+   * onBeforeDone block will be run only once before the onDone block will be run.
+   */
+  @JvmSynthetic
+  inline fun onDo(
+    name: String,
+    times: Int,
+    crossinline onDo: (Int) -> Unit,
+    crossinline onDone: () -> Unit,
+    crossinline onLastDo: () -> Unit = {},
+    crossinline onBeforeDone: () -> Unit = {}
+  ): Only {
+    val persistedOnlyTimes = getOnlyTimes(name)
+
+    // run only onDo block when debug mode.
+    if (isDebugMode()) {
+      onDo(persistedOnlyTimes)
+      return this@Only
+    }
+
+    if (persistedOnlyTimes < times) {
+      setOnlyTimes(name, persistedOnlyTimes + 1)
+      onDo(persistedOnlyTimes)
+
+      if (persistedOnlyTimes == times - 1) {
+        onLastDo()
+      }
+    } else if (persistedOnlyTimes >= times) {
+      if (!getOnBeforeDoneExecuted(name)) {
+        setOnBeforeDoneExecuted(name)
+        onBeforeDone()
+      }
+      onDone()
+    }
+    return this@Only
+  }
+
+  /**
+   * execute the onDo block only as many times as necessary with onLastDo and onBeforeDone.
+   * if unnecessary, unCatch block will be executed.
+   * if the version is different from the old version, Only times will be initialized 0.
+   */
+  @JvmStatic
+  fun onDo(
+    name: String,
+    times: Int,
+    onDo: Runnable,
+    onDone: Runnable,
+    onLastDo: Runnable,
+    onBeforeDone: Runnable,
+    version: String = ""
+  ): Only {
+
+    onDo(name, times, { onDo.run() }, { onDone.run() }, { onLastDo.run() }, { onBeforeDone.run() }, version)
+    return this@Only
+  }
+
+  /**
+   * execute the onDo block only as many times as necessary with onLastDo and onBeforeDone.
+   * if unnecessary, unCatch block will be executed.
+   * if the version is different from the old version, Only times will be initialized 0.
+   */
+  @JvmSynthetic
+  inline fun onDo(
+    name: String,
+    times: Int,
+    crossinline onDo: (Int) -> Unit,
+    crossinline onDone: () -> Unit,
+    crossinline onLastDo: () -> Unit = {},
+    crossinline onBeforeDone: () -> Unit = {},
+    version: String = ""
+  ): Only {
+
+    affectVersion(name, version)
+    onDo(name, times, onDo, onDone, onLastDo, onBeforeDone)
+    return this@Only
+  }
+
+  /** execute the onDo block only once. */
+  @JvmStatic
+  fun onDoOnce(
+    name: String,
+    onDo: Runnable,
+    onDone: Runnable,
+    version: String = ""
+  ): Only {
+
+    onDoOnce(name, { onDo.run() }, { onDone.run() }, version)
+    return this@Only
+  }
+
+  /** execute the onDo block only once. */
+  @JvmSynthetic
+  inline fun onDoOnce(
+    name: String,
+    crossinline onDo: (Int) -> Unit,
+    crossinline onDone: () -> Unit = {},
+    version: String = ""
+  ): Only {
+
+    onDo(name, 1, onDo, onDone, version)
+    return this@Only
+  }
+
+  /** execute the onDo block only once with onLastDo and onBeforeDone. */
+  @JvmStatic
+  fun onDoOnce(
+    name: String,
+    onDo: Runnable,
+    onDone: Runnable,
+    onLastDo: Runnable,
+    onBeforeDone: Runnable,
+    version: String = ""
+  ): Only {
+
+    onDoOnce(name, { onDo.run() }, { onDone.run() }, { onLastDo.run() }, { onBeforeDone.run() }, version)
+    return this@Only
+  }
+
+  /** execute the onDo block only once with onLastDo and onBeforeDone. */
+  @JvmSynthetic
+  inline fun onDoOnce(
+    name: String,
+    crossinline onDo: (Int) -> Unit,
+    crossinline onDone: () -> Unit = {},
+    crossinline onLastDo: () -> Unit = {},
+    crossinline onBeforeDone: () -> Unit = {},
+    version: String = ""
+  ): Only {
+
+    onDo(name, 1, onDo, onDone, onLastDo, onBeforeDone, version)
+    return this@Only
+  }
+
+  /** execute the onDo block only twice. */
+  @JvmStatic
+  fun onDoTwice(
+    name: String,
+    onDo: Runnable,
+    onDone: Runnable,
+    version: String = ""
+  ): Only {
+
+    onDoTwice(name, { onDo.run() }, { onDone.run() }, version)
+    return this@Only
+  }
+
+  /** execute the onDo block only twice. */
+  @JvmSynthetic
+  inline fun onDoTwice(
+    name: String,
+    crossinline onDo: (Int) -> Unit,
+    crossinline onDone: () -> Unit = {},
+    version: String = ""
+  ): Only {
+
+    onDo(name, 2, onDo, onDone, version)
+    return this@Only
+  }
+
+  /** execute the onDo block only twice with onLastDo and onBeforeDone. */
+  @JvmStatic
+  fun onDoTwice(
+    name: String,
+    onDo: Runnable,
+    onDone: Runnable,
+    onLastDo: Runnable,
+    onBeforeDone: Runnable,
+    version: String = ""
+  ): Only {
+
+    onDoTwice(name, { onDo.run() }, { onDone.run() }, { onLastDo.run() }, { onBeforeDone.run() }, version)
+    return this@Only
+  }
+
+  /** execute the onDo block only twice with onLastDo and onBeforeDone. */
+  @JvmSynthetic
+  inline fun onDoTwice(
+    name: String,
+    crossinline onDo: (Int) -> Unit,
+    crossinline onDone: () -> Unit = {},
+    crossinline onLastDo: () -> Unit = {},
+    crossinline onBeforeDone: () -> Unit = {},
+    version: String = ""
+  ): Only {
+
+    onDo(name, 2, onDo, onDone, onLastDo, onBeforeDone, version)
+    return this@Only
+  }
+
+  /** execute the onDo block only thrice. */
+  @JvmStatic
+  fun onDoThrice(
+    name: String,
+    onDo: Runnable,
+    onDone: Runnable,
+    version: String = ""
+  ): Only {
+
+    onDoThrice(name, { onDo.run() }, { onDone.run() }, version)
+    return this@Only
+  }
+
+  /** execute the onDo block only thrice. */
+  @JvmSynthetic
+  inline fun onDoThrice(
+    name: String,
+    crossinline onDo: (Int) -> Unit,
+    crossinline onDone: () -> Unit = {},
+    version: String = ""
+  ): Only {
+
+    onDo(name, 3, onDo, onDone, version)
+    return this@Only
+  }
+
+  /** execute the onDo block only thrice with onLastDo and onBeforeDone. */
+  @JvmStatic
+  fun onDoThrice(
+    name: String,
+    onDo: Runnable,
+    onDone: Runnable,
+    onLastDo: Runnable,
+    onBeforeDone: Runnable,
+    version: String = ""
+  ): Only {
+
+    onDoThrice(name, { onDo.run() }, { onDone.run() }, { onLastDo.run() }, { onBeforeDone.run() }, version)
+    return this@Only
+  }
+
+  /** execute the onDo block only thrice with onLastDo and onBeforeDone. */
+  @JvmSynthetic
+  inline fun onDoThrice(
+    name: String,
+    crossinline onDo: (Int) -> Unit,
+    crossinline onDone: () -> Unit = {},
+    crossinline onLastDo: () -> Unit = {},
+    crossinline onBeforeDone: () -> Unit = {},
+    version: String = ""
+  ): Only {
+
+    onDo(name, 3, onDo, onDone, onLastDo, onBeforeDone, version)
+    return this@Only
+  }
+
+  /** get Only time from the preference. */
+  @JvmStatic
+  fun getOnlyTimes(name: String): Int {
+    return this.preference.getInt(name, 0)
+  }
+
+  /** set Only time from the preference. */
+  @JvmStatic
+  fun setOnlyTimes(name: String, time: Int) {
+    this.preference.edit { putInt(name, time) }
+  }
+
+  /** get version data from the preference. */
+  @JvmStatic
+  @PublishedApi
+  @RestrictTo(RestrictTo.Scope.LIBRARY_GROUP)
+  internal fun affectVersion(name: String, version: String): Boolean {
+    return if (version.isEmpty() || getOnlyVersion(name).equals(version)) {
+      false
+    } else {
+      setOnlyVersion(name, version)
+      setOnlyTimes(name, 0)
+      true
+    }
+  }
+
+  /** get the Only version from the preference. */
+  private fun getOnlyVersion(name: String): String? {
+    return preference.getString(getOnlyVersionName(name), buildVersion)
+      ?: return buildVersion
+  }
+
+  /** set the Only version from the preference. */
+  private fun setOnlyVersion(name: String, version: String) {
+    this.preference.edit { putString(getOnlyVersionName(name), version) }
+  }
+
+  /** get Only version preference naming convention. */
+  private fun getOnlyVersionName(name: String): String {
+    return name + "_version"
+  }
+
+  /** get Only executed or not about onBeforeDone. */
+  @JvmStatic
+  fun getOnBeforeDoneExecuted(name: String): Boolean {
+    return this.preference.getBoolean(getOnBeforeDoneName(name), false)
+  }
+
+  /** set Only executed or not about onBeforeDone. */
+  @JvmStatic
+  @PublishedApi
+  @RestrictTo(RestrictTo.Scope.LIBRARY_GROUP)
+  internal fun setOnBeforeDoneExecuted(name: String) {
+    this.preference.edit { putBoolean(getOnBeforeDoneName(name), true) }
+  }
+
+  /** get Only version preference naming convention. */
+  private fun getOnBeforeDoneName(name: String): String {
+    return name + "_onBeforeDone"
+  }
+
+  /** marks Only tag data. */
+  @JvmStatic
+  fun mark(name: String, marking: Any?) {
+    marking?.let { this.preference.edit { putString(getMarkingName(name), it.toString()) } }
+  }
+
+  /** gets Only marking data. */
+  @JvmStatic
+  fun getMarking(name: String): String? {
+    return this.preference.getString(getMarkingName(name), null)
+  }
+
+  /** get Only marking preference naming convention. */
+  private fun getMarkingName(name: String): String {
+    return name + "_marking"
+  }
+
+  /** remove a Only data from the preference. */
+  @JvmStatic
+  fun clearOnly(name: String) {
+    this.preference.edit {
+      remove(name).apply()
+      remove(getOnlyVersion(name))
+      remove(getOnBeforeDoneName(name))
+      remove(getMarkingName(name))
+    }
+  }
+
+  /** clear all Only data from the preference. */
+  @JvmStatic
+  fun clearAllOnly() {
+    this.preference.edit { clear() }
+  }
+
+  private inline fun SharedPreferences.edit(
+    action: SharedPreferences.Editor.() -> Unit
+  ) {
+    val editor = edit()
+    action(editor)
+    editor.apply()
+  }
+
+  /** Builder class for creating [Only]. */
+  @OnlyDsl
+  class Builder(
+    val name: String,
+    val times: Int = 1
+  ) {
+
+    @JvmField
+    @set:JvmSynthetic
+    var onDo: (Int) -> Unit = { }
+
+    @JvmField
+    @set:JvmSynthetic
+    var onDone: () -> Unit = { }
+
+    @JvmField
+    @set:JvmSynthetic
+    var onLastDo: () -> Unit = { }
+
+    @JvmField
+    @set:JvmSynthetic
+    var onBeforeDone: () -> Unit = { }
+
+    @JvmField
+    @set:JvmSynthetic
+    var version: String = ""
+
+    @JvmField
+    @set:JvmSynthetic
+    var marking: Any? = null
+
+    /** executes the [onDo] block only as many times as necessary. */
+    @JvmSynthetic
+    fun onDo(onDo: (Int) -> Unit): Builder = apply { this.onDo = onDo }
+
+    /** executes the [onDo] block only as many times as necessary. */
+    fun onDo(runnable: Runnable): Builder = apply { this.onDo = { runnable.run() } }
+
+    /** executes the [onDone] block after executing x+1 times [onDo] block. */
+    @JvmSynthetic
+    fun onDone(onDone: () -> Unit): Builder = apply { this.onDone = onDone }
+
+    /** executes the [onDone] block after executing x+1 times [onDo] block. */
+    fun onDone(runnable: Runnable): Builder = apply { this.onDone = { runnable.run() } }
+
+    /** executes only once the [onLastDo] block after finishing x times [onDo] block. */
+    @JvmSynthetic
+    fun onLastDo(onLastDo: () -> Unit): Builder = apply { this.onLastDo = onLastDo }
+
+    /** executes only once the [onLastDo] block after finishing x times [onDo] block. */
+    fun onLastDo(runnable: Runnable): Builder = apply { this.onLastDo = { runnable.run() } }
+
+    /** executes only once the [onBeforeDone] block after before executing [onDone] block. */
+    @JvmSynthetic
+    fun onBeforeDone(onBeforeDone: () -> Unit): Builder = apply { this.onBeforeDone = onBeforeDone }
+
+    /** executes only once the [onBeforeDone] block after before executing [onDone] block. */
+    fun onBeforeDone(runnable: Runnable): Builder = apply { this.onBeforeDone = { runnable.run() } }
+
+    /** changes version and clear the executed time history. */
+    fun version(version: String): Builder = apply { this.version = version }
+
+    /** marks to the [Only] data. */
+    fun mark(marking: Any?): Builder = apply { this.marking = marking }
+
+    fun run() = runByBuilder(this@Builder)
+  }
+}

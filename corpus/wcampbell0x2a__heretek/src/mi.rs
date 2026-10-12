@@ -1,0 +1,951 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+use regex::{CaptureMatches, Regex};
+
+/// Amount of bytes requested during deref to get symbol/asm
+pub const INSTRUCTION_LEN: usize = 8;
+
+pub fn match_inner_items(haystack: &str) -> CaptureMatches<'_, '_> {
+    // compile once and re-use
+    // NOTE: this only parses nested 3 {} deep, more and this will fail!
+    static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"\{(?:[^}{]|\{(?:[^}{]|\{(?:[^}{]|\{[^}{]*\})*\})*\})*\}").unwrap()
+    });
+    RE.captures_iter(haystack)
+}
+
+/// Seen on gdb 15.1
+pub const MEMORY_MAP_START_STR_NEW: [&str; 8] =
+    ["Start", "Addr", "End", "Addr", "Size", "Offset", "Perms", "objfile"];
+
+/// Seen on gdb 16.2
+pub const MEMORY_MAP_START_STR_NEW_2: [&str; 8] =
+    ["Start", "Addr", "End", "Addr", "Size", "Offset", "Perms", "File"];
+
+/// Seen on gdb 7.12
+pub const MEMORY_MAP_START_STR_OLD: [&str; 7] =
+    ["Start", "Addr", "End", "Addr", "Size", "Offset", "objfile"];
+
+/// Common gdb memory map, to try and detect new additions to this return
+pub const MEMORY_MAP_BEGIN: [&str; 6] = ["Start", "Addr", "End", "Addr", "Size", "Offset"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mapping {
+    New,
+    Old,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryMapping {
+    pub start_address: u64,
+    pub end_address: u64,
+    pub size: u64,
+    pub offset: u64,
+    pub permissions: Option<String>,
+    pub path: Option<String>,
+}
+
+impl MemoryMapping {
+    /// Mapping is the stack
+    pub fn is_stack(&self) -> bool {
+        self.path == Some("[stack]".to_owned())
+    }
+
+    /// Mapping is the heap
+    pub fn is_heap(&self) -> bool {
+        self.path == Some("[heap]".to_owned())
+    }
+
+    /// Mapping filepath matches `filepath`
+    ///
+    /// This could be set from something like "file test-assets/test_render_app/a.out"
+    /// so we make sure to match with a mapping such as:
+    /// "/home/wcampbell/projects/wcampbell/heretek/test-assets/test_render_app/a.out"
+    pub fn is_path(&self, filepath: &str) -> bool {
+        if let Some(path) = &self.path { path.ends_with(&filepath.to_owned()) } else { false }
+    }
+
+    pub fn is_exec(&self) -> bool {
+        if let Some(permissions) = &self.permissions { permissions.contains('x') } else { false }
+    }
+
+    /// Mapping contains the `addr`
+    pub fn contains(&self, addr: u64) -> bool {
+        (addr > self.start_address) && (addr < self.end_address)
+    }
+}
+
+impl MemoryMapping {
+    /// Parse from `MEMORY_MAP_START_STR_NEW`
+    fn from_str_new(line: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() == 5 {
+            Ok(MemoryMapping {
+                start_address: u64::from_str_radix(&parts[0][2..], 16)
+                    .map_err(|_| "Invalid start address")?,
+                end_address: u64::from_str_radix(&parts[1][2..], 16)
+                    .map_err(|_| "Invalid end address")?,
+                size: u64::from_str_radix(&parts[2][2..], 16).map_err(|_| "Invalid size")?,
+                offset: u64::from_str_radix(&parts[3][2..], 16).map_err(|_| "Invalid offset")?,
+                permissions: Some(parts[4..].join(" ")), // Combine the rest as the path
+                path: None,
+            })
+        } else if parts.len() == 6 {
+            Ok(MemoryMapping {
+                start_address: u64::from_str_radix(&parts[0][2..], 16)
+                    .map_err(|_| "Invalid start address")?,
+                end_address: u64::from_str_radix(&parts[1][2..], 16)
+                    .map_err(|_| "Invalid end address")?,
+                size: u64::from_str_radix(&parts[2][2..], 16).map_err(|_| "Invalid size")?,
+                offset: u64::from_str_radix(&parts[3][2..], 16).map_err(|_| "Invalid offset")?,
+                permissions: Some(parts[4].to_string()),
+                path: Some(parts[5..].join(" ")), // Combine the rest as the path
+            })
+        } else {
+            Err(format!("Invalid line format: {line}"))
+        }
+    }
+
+    /// Parse from `MEMORY_MAP_START_STR_OLD`
+    fn from_str_old(line: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() == 5 {
+            Ok(MemoryMapping {
+                start_address: u64::from_str_radix(&parts[0][2..], 16)
+                    .map_err(|_| "Invalid start address")?,
+                end_address: u64::from_str_radix(&parts[1][2..], 16)
+                    .map_err(|_| "Invalid end address")?,
+                size: u64::from_str_radix(&parts[2][2..], 16).map_err(|_| "Invalid size")?,
+                offset: u64::from_str_radix(&parts[3][2..], 16).map_err(|_| "Invalid offset")?,
+                permissions: None,
+                path: Some(parts[4..].join(" ")), // Combine the rest as the path
+            })
+        } else {
+            Err(format!("Invalid line format: {line}"))
+        }
+    }
+}
+
+/// Parse from `MEMORY_MAP_START_STR_NEW`
+pub fn parse_memory_mappings_new(input: &str) -> Vec<MemoryMapping> {
+    input.lines().skip(1).filter_map(|line| MemoryMapping::from_str_new(line).ok()).collect()
+}
+
+/// Parse from `MEMORY_MAP_START_STR_OLD`
+pub fn parse_memory_mappings_old(input: &str) -> Vec<MemoryMapping> {
+    input.lines().skip(1).filter_map(|line| MemoryMapping::from_str_old(line).ok()).collect()
+}
+
+// Define Register struct to hold register data
+#[derive(Debug, Clone)]
+pub struct Register {
+    pub number: String,
+    pub value: Option<String>,
+    pub v2_int128: Option<String>,
+    pub v8_int32: Option<String>,
+    pub v4_int64: Option<String>,
+    pub v8_float: Option<String>,
+    pub v16_int8: Option<String>,
+    pub v4_int32: Option<String>,
+    pub error: Option<String>,
+}
+
+impl Register {
+    /// Value is not set to anything readable
+    pub fn is_set(&self) -> bool {
+        self.error.is_none() && self.value != Some("<unavailable>".to_string())
+    }
+}
+
+/// Info from Exec Result "`asm_insns`"
+#[derive(Debug, Clone)]
+pub struct Asm {
+    pub address: u64,
+    pub inst: String,
+    pub offset: u64,
+    pub func_name: Option<String>,
+}
+
+/// Normalizes a value: trims quotes around strings like "\"0\"" -> "0"
+pub fn normalize_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') {
+        trimmed[1..trimmed.len() - 1].to_string() // Remove surrounding quotes
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn parse_key_value_pairs(input: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let mut current_key = String::new();
+    let mut current_value = String::new();
+    let mut inside_quotes = false;
+    let mut bracket_count = 0;
+
+    let mut is_parsing_value = false;
+
+    for c in input.chars() {
+        match c {
+            '=' if !inside_quotes && bracket_count == 0 => {
+                // Start parsing the value
+                is_parsing_value = true;
+            }
+            ',' if !inside_quotes && bracket_count == 0 => {
+                // End of a key-value pair
+                if !current_key.is_empty() {
+                    map.insert(current_key.trim().to_string(), normalize_value(&current_value));
+                }
+                current_key.clear();
+                current_value.clear();
+                is_parsing_value = false;
+            }
+            '[' if !inside_quotes => {
+                // Start of a bracketed value
+                bracket_count += 1;
+                current_value.push(c);
+            }
+            ']' if !inside_quotes => {
+                // End of a bracketed value
+                bracket_count -= 1;
+                current_value.push(c);
+            }
+            '"' => {
+                // Toggle inside_quotes flag
+                inside_quotes = !inside_quotes;
+                if is_parsing_value {
+                    current_value.push(c);
+                } else {
+                    current_key.push(c);
+                }
+            }
+            _ => {
+                // Add character to the current key or value
+                if is_parsing_value {
+                    current_value.push(c);
+                } else {
+                    current_key.push(c);
+                }
+            }
+        }
+    }
+
+    // Add the last key-value pair
+    if !current_key.is_empty() {
+        map.insert(current_key.trim().to_string(), normalize_value(&current_value));
+    }
+
+    map
+}
+
+pub fn join_registers(
+    register_names: &Vec<String>,
+    registers: &[Option<Register>],
+) -> Vec<(String, Option<Register>)> {
+    let mut registers_arch = vec![];
+    for (register, name) in registers.iter().zip(register_names.iter()) {
+        if let Some(register) = register
+            && !register.number.is_empty()
+        {
+            registers_arch.push((name.clone(), Some(register.clone())));
+        }
+    }
+    registers_arch
+}
+
+// Function to parse register-values as an array of Registers
+pub fn parse_register_values(input: &str) -> Vec<Option<Register>> {
+    let mut registers = Vec::new();
+
+    // Capture each register block and parse it
+    for capture in match_inner_items(input) {
+        let cap_str = &capture[0];
+        let cap_str = &cap_str[1..cap_str.len() - 1].to_string();
+        let mut register = Register {
+            number: String::new(),
+            value: None,
+            v2_int128: None,
+            v8_int32: None,
+            v4_int64: None,
+            v8_float: None,
+            v16_int8: None,
+            v4_int32: None,
+            error: None,
+        };
+
+        let key_values = parse_key_value_pairs(cap_str);
+        let mut fail = false;
+        for (key, val) in key_values {
+            if val.starts_with("\"{") {
+                // skipping, for now
+                fail = true;
+                break;
+            }
+            match key.as_str() {
+                "number" => register.number = val,
+                "value" => register.value = Some(val),
+                "v2_int128" => register.v2_int128 = Some(val),
+                "v8_int32" => register.v8_int32 = Some(val),
+                "v4_int64" => register.v4_int64 = Some(val),
+                "v8_float" => register.v8_float = Some(val),
+                "v16_int8" => register.v16_int8 = Some(val),
+                "v4_int32" => register.v4_int32 = Some(val),
+                "error" => register.error = Some(val),
+                _ => {}
+            }
+        }
+        if fail {
+            registers.push(None);
+        } else {
+            registers.push(Some(register));
+        }
+    }
+
+    registers
+}
+
+// Function to parse register-values as an array of Registers
+pub fn parse_register_names_values(input: &str) -> Vec<String> {
+    let registers: Vec<String> = input
+        .trim_matches(|c| c == '[' || c == ']')
+        .split(',')
+        .map(|s| s.trim_matches('"').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    registers
+}
+
+// Function to parse register-values as an array of Registers
+pub fn parse_asm_insns_values(input: &str) -> Vec<Asm> {
+    let mut asms = Vec::new();
+
+    // Capture each register block and parse it
+    for capture in match_inner_items(input) {
+        let cap_str = &capture[0];
+        let cap_str = &cap_str[1..cap_str.len() - 1].to_string();
+        let mut asm = Asm { address: 0, inst: String::new(), offset: 0, func_name: None };
+
+        let key_values = parse_key_value_pairs(cap_str);
+        for (key, val) in key_values {
+            match key.as_str() {
+                "address" => {
+                    asm.address = {
+                        let val = val.strip_prefix("0x").unwrap();
+                        u64::from_str_radix(val, 16).unwrap()
+                    }
+                }
+                // Some targets (e.g. esp32-c3/RISC-V) emit a literal `\t` between the
+                // mnemonic and its operands. Replace it with a space so the instruction
+                // renders like the space-separated x86 output. See issue #150.
+                "inst" => asm.inst = val.replace("\\t", " "),
+                "offset" => asm.offset = val.parse::<u64>().unwrap(),
+                "func-name" => asm.func_name = Some(val),
+                _ => {}
+            }
+        }
+        asms.push(asm);
+    }
+
+    asms
+}
+
+// MIResponse enum to represent different types of GDB responses
+#[derive(Debug)]
+pub enum MIResponse {
+    ExecResult(String, HashMap<String, String>),
+    AsyncRecord(String, HashMap<String, String>),
+    #[allow(dead_code)]
+    Notify(String, HashMap<String, String>),
+    StreamOutput(String, String),
+    Unknown(String),
+}
+
+pub fn parse_mi_response(line: &str) -> MIResponse {
+    // debug!("line: {}", line);
+    if line.starts_with('^') {
+        parse_exec_result(&line[1..])
+    } else if line.starts_with('*') {
+        parse_async_record(&line[1..])
+    } else if line.starts_with('=') {
+        parse_notify(&line[1..])
+    } else if line.starts_with('~') || line.starts_with('@') || line.starts_with('&') {
+        parse_stream_output(line)
+    } else {
+        MIResponse::Unknown(line.to_string())
+    }
+}
+
+fn parse_exec_result(input: &str) -> MIResponse {
+    if let Some((prefix, rest)) = input.split_once(',') {
+        let data = parse_key_value_pairs(rest);
+        MIResponse::ExecResult(prefix.to_string(), data)
+    } else {
+        MIResponse::ExecResult(input.to_string(), HashMap::new())
+    }
+}
+
+fn parse_async_record(input: &str) -> MIResponse {
+    if let Some((prefix, rest)) = input.split_once(',') {
+        let data = parse_key_value_pairs(rest);
+        MIResponse::AsyncRecord(prefix.to_string(), data)
+    } else {
+        MIResponse::AsyncRecord(input.to_string(), HashMap::new())
+    }
+}
+
+fn parse_notify(input: &str) -> MIResponse {
+    if let Some((event, rest)) = input.split_once(',') {
+        MIResponse::Notify(event.to_string(), parse_key_value_pairs(rest))
+    } else {
+        MIResponse::Notify(input.to_string(), HashMap::new())
+    }
+}
+
+fn parse_stream_output(input: &str) -> MIResponse {
+    let (kind, content) = input.split_at(1);
+    let unescaped_content = unescape_gdb_output(content.trim_matches('"'));
+    MIResponse::StreamOutput(kind.to_string(), unescaped_content.to_string())
+}
+
+fn unescape_gdb_output(input: &str) -> Cow<'_, str> {
+    if !input.contains('\\') {
+        return Cow::Borrowed(input);
+    }
+
+    let mut bytes: Vec<u8> = Vec::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            let mut buf = [0u8; 4];
+            bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some('n') => {
+                chars.next();
+                bytes.push(b'\n');
+            }
+            Some('t') => {
+                chars.next();
+                bytes.push(b'\t');
+            }
+            Some('r') => {
+                chars.next();
+                bytes.push(b'\r');
+            }
+            Some('"') => {
+                chars.next();
+                bytes.push(b'"');
+            }
+            Some('\\') => {
+                chars.next();
+                bytes.push(b'\\');
+            }
+            Some('0'..='7') => {
+                // Octal escape: collect up to 3 octal digits
+                let mut octal = String::with_capacity(3);
+                for _ in 0..3 {
+                    match chars.peek().copied() {
+                        Some(d) if matches!(d, '0'..='7') => {
+                            octal.push(d);
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                // Safe: octal digits always parse
+                bytes.push(u8::from_str_radix(&octal, 8).unwrap());
+            }
+            _ => {
+                bytes.push(b'\\');
+            }
+        }
+    }
+
+    Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+pub fn read_pc_value() -> String {
+    "-data-evaluate-expression $pc".to_string()
+}
+
+pub fn data_read_sp_bytes(hex_offset: u64, len: u64) -> String {
+    format!("-data-read-memory-bytes $sp+0x{hex_offset:02x} {len}")
+}
+
+pub fn data_read_memory_bytes(addr: u64, hex_offset: u64, len: u64) -> String {
+    format!("-data-read-memory-bytes 0x{addr:02x}+0x{hex_offset:02x} {len}")
+}
+
+pub fn data_disassemble_pc(before: usize, amt: usize) -> String {
+    format!("-data-disassemble -s $pc-{before} -e $pc+{amt} -- 0")
+}
+
+pub fn data_disassemble(start: usize, amt: usize) -> String {
+    format!("-data-disassemble -s {start} -e {start}+{amt} -- 0")
+}
+
+#[allow(dead_code)]
+pub fn data_disassemble_function(name: &str) -> String {
+    // -data-disassemble with -n (function name) option
+    // Using mode 0 for disassembly only (no opcodes)
+    format!(r#"-data-disassemble -n "{name}" -- 0"#)
+}
+
+pub fn info_functions() -> String {
+    r#"-interpreter-exec console "info functions""#.to_string()
+}
+
+pub fn info_address(symbol: &str) -> String {
+    format!(r#"-interpreter-exec console "info address {symbol}""#)
+}
+
+#[allow(dead_code)]
+pub fn disassemble_function(name: &str) -> String {
+    format!(r#"-interpreter-exec console "disassemble /r {name}""#)
+}
+
+/// Parse output from "info functions" command
+/// Returns a list of symbols sorted alphabetically by name
+pub fn parse_symbol_list(input: &str) -> Vec<crate::Symbol> {
+    let mut symbols = Vec::new();
+
+    for line in input.lines() {
+        let trimmed = line.trim();
+
+        // Skip empty lines, headers, and file declarations
+        if trimmed.is_empty()
+            || trimmed.starts_with("All defined functions:")
+            || trimmed.starts_with("File ")
+            || trimmed.starts_with("Non-debugging symbols:")
+        {
+            continue;
+        }
+
+        // Parse lines like "0x0000000000001234  function_name" or "0x1234  function_name"
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() >= 2
+            && parts[0].starts_with("0x")
+            && let Ok(address) = u64::from_str_radix(&parts[0][2..], 16)
+        {
+            let name = parts[1..].join(" ");
+            symbols.push(crate::Symbol { address, name, needs_address_resolution: false });
+        } else if let Some(colon_pos) = trimmed.find(':')
+            && trimmed[..colon_pos].chars().all(|c| c.is_ascii_digit())
+        {
+            let after_colon = trimmed[colon_pos + 1..].trim();
+            let name = if let Some(name) =
+                after_colon.strip_prefix("static fn ").or_else(|| after_colon.strip_prefix("fn "))
+            {
+                // Rust: "static fn name::path(args);" or "fn name(args);"
+                Some(name.trim_end_matches(';').trim().to_string())
+            } else if let Some(paren_pos) = after_colon.find('(') {
+                // C: "return_type name(args);" - extract the identifier before '('
+                let before_paren = after_colon[..paren_pos].trim();
+                // Function name is the last whitespace-delimited token (after return type)
+                // e.g. "void helper" -> "helper", "int main" -> "main"
+                before_paren.rsplit_once(' ').or(Some(("", before_paren))).map(|(_, n)| {
+                    // Strip leading pointer markers like '*'
+                    n.trim_start_matches('*').to_string()
+                })
+            } else {
+                None
+            };
+            if let Some(name) = name
+                && !name.is_empty()
+            {
+                // These symbols from "All defined functions:" don't have real addresses yet
+                // Store line number as placeholder, will be resolved via info address
+                let line_num = trimmed[..colon_pos].parse::<u64>().unwrap_or(0);
+                symbols.push(crate::Symbol {
+                    address: line_num,
+                    name,
+                    needs_address_resolution: true,
+                });
+            }
+        }
+    }
+
+    // Sort alphabetically by name
+    symbols.sort_by(|a, b| a.name.cmp(&b.name));
+
+    symbols
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_exec_result_register_values() {
+        let input = r#"^done,register-values=[{number="0",value="0x0"},{number="1",value="0x1"}]"#;
+        if let MIResponse::ExecResult(_status, key_values) = parse_mi_response(input) {
+            let register_values = &key_values["register-values"];
+            let registers = parse_register_values(register_values);
+            assert_eq!(registers.len(), 2);
+
+            assert_eq!(registers[0].as_ref().unwrap().number, "0");
+            assert_eq!(registers[0].as_ref().unwrap().value.as_deref(), Some("0x0"));
+            assert_eq!(registers[1].as_ref().unwrap().number, "1");
+            assert_eq!(registers[1].as_ref().unwrap().value.as_deref(), Some("0x1"));
+        } else {
+            panic!("Expected ExecResult response");
+        }
+    }
+
+    #[test]
+    fn test_async_record() {
+        let input = r#"*stopped,reason="breakpoint-hit",disp="keep",bkptno="1""#;
+        if let MIResponse::AsyncRecord(reason, key_values) = parse_mi_response(input) {
+            assert_eq!(reason, "stopped");
+            assert_eq!(
+                key_values.get("reason").map(std::string::String::as_str),
+                Some("breakpoint-hit")
+            );
+            assert_eq!(key_values.get("disp").map(std::string::String::as_str), Some("keep"));
+            assert_eq!(key_values.get("bkptno").map(std::string::String::as_str), Some("1"));
+        } else {
+            panic!("Expected AsyncRecord response");
+        }
+    }
+
+    #[test]
+    fn test_notify() {
+        let input = r#"=thread-group-added,id="i1""#;
+        if let MIResponse::Notify(event, key_values) = parse_mi_response(input) {
+            assert_eq!(event, "thread-group-added");
+            assert_eq!(key_values.get("id").map(std::string::String::as_str), Some("i1"));
+        } else {
+            panic!("Expected Notify response");
+        }
+    }
+
+    #[test]
+    fn test_stream_output() {
+        let input = r#"~"GNU gdb (GDB) 12.1\n""#;
+        if let MIResponse::StreamOutput(kind, content) = parse_mi_response(input) {
+            assert_eq!(kind, "~");
+            assert_eq!(content, "GNU gdb (GDB) 12.1\n");
+        } else {
+            panic!("Expected StreamOutput response");
+        }
+    }
+
+    #[test]
+    fn test_stream_output_octal_utf8() {
+        // GDB encodes the racing car emoji 🏎 as octal bytes in MI output
+        // \360\237\217\216 = U+1F3CE (🏎), \357\270\217 = U+FE0F (variation selector)
+        let input = r#"~"\360\237\217\216 Undefined command\n""#;
+        if let MIResponse::StreamOutput(kind, content) = parse_mi_response(input) {
+            assert_eq!(kind, "~");
+            assert!(content.contains("🏎"), "expected emoji, got: {content:?}");
+            assert!(content.contains("Undefined command"));
+        } else {
+            panic!("Expected StreamOutput response");
+        }
+    }
+
+    #[test]
+    fn test_unknown_response() {
+        let input = r"unsupported-command-output";
+        if let MIResponse::Unknown(response) = parse_mi_response(input) {
+            assert_eq!(response, "unsupported-command-output");
+        } else {
+            panic!("Expected Unknown response");
+        }
+    }
+
+    #[test]
+    fn test_info_functions() {
+        let cmd = info_functions();
+        assert_eq!(cmd, r#"-interpreter-exec console "info functions""#);
+    }
+
+    #[test]
+    fn test_disassemble_function() {
+        let cmd = disassemble_function("main");
+        assert_eq!(cmd, r#"-interpreter-exec console "disassemble /r main""#);
+
+        let cmd = disassemble_function("foo_bar_123");
+        assert_eq!(cmd, r#"-interpreter-exec console "disassemble /r foo_bar_123""#);
+    }
+
+    #[test]
+    fn test_recursive_parsing() {
+        let input = "*stopped,reason=\"breakpoint-hit\",disp=\"keep\",bkptno=\"1\",frame={addr=\"0x00007ffff7e04c48\",func=\"printf\",args=[],from=\"/usr/lib/libc.so.6\",arch=\"i386:x86-64\"},thread-id=\"1\",stopped-threads=\"all\",core=\"1\"";
+        let response = parse_mi_response(input);
+
+        if let MIResponse::AsyncRecord(reason, data) = response {
+            assert_eq!(reason, "stopped");
+            assert_eq!(data.get("reason"), Some(&"breakpoint-hit".to_string()));
+            assert_eq!(data.get("disp"), Some(&"keep".to_string()));
+            assert_eq!(data.get("bkptno"), Some(&"1".to_string()));
+            // TODO: fix frame
+        } else {
+            panic!("Unexpected MIResponse type");
+        }
+    }
+
+    #[test]
+    fn test_parse_stopped_message() {
+        let input = r#"
+        *stopped,reason="breakpoint-hit",disp="keep",bkptno="1",frame={addr="0x00007ffff7e04c48",func="printf",args=[],from="/usr/lib/libc.so.6",arch="i386:x86-64"},thread-id="1",stopped-threads="all",core="2"
+    "#;
+
+        let parsed = parse_mi_response(input.trim());
+
+        match parsed {
+            MIResponse::AsyncRecord(record_type, data) => {
+                // Verify the AsyncRecord type
+                assert_eq!(record_type, "stopped");
+
+                // Verify fields
+                assert_eq!(data.get("reason"), Some(&"breakpoint-hit".to_string()));
+                assert_eq!(data.get("disp"), Some(&"keep".to_string()));
+                assert_eq!(data.get("bkptno"), Some(&"1".to_string()));
+                assert_eq!(data.get("thread-id"), Some(&"1".to_string()));
+                assert_eq!(data.get("stopped-threads"), Some(&"all".to_string()));
+                assert_eq!(data.get("core"), Some(&"2".to_string()));
+                // TODO: fix frame
+            }
+            _ => panic!("Failed to parse AsyncRecord"),
+        }
+    }
+
+    #[test]
+    fn test_parse_symbol_list() {
+        let input = r"All defined functions:
+
+File test.c:
+0x0000000000001234  main
+0x0000000000005678  foo
+0x00000000000090ab  bar
+
+Non-debugging symbols:
+0x0000000000001000  _start
+0x0000000000001020  _init";
+
+        let symbols = parse_symbol_list(input);
+
+        assert_eq!(symbols.len(), 5);
+        assert_eq!(symbols[0].name, "_init");
+        assert_eq!(symbols[0].address, 0x1020);
+        assert_eq!(symbols[1].name, "_start");
+        assert_eq!(symbols[1].address, 0x1000);
+        assert_eq!(symbols[2].name, "bar");
+        assert_eq!(symbols[2].address, 0x90ab);
+        assert_eq!(symbols[3].name, "foo");
+        assert_eq!(symbols[3].address, 0x5678);
+        assert_eq!(symbols[4].name, "main");
+        assert_eq!(symbols[4].address, 0x1234);
+    }
+
+    #[test]
+    fn test_parse_symbol_list_rust_debug_format() {
+        let input = r"All defined functions:
+
+File /home/user/.rustup/toolchains/nightly/lib/rustlib/src/rust/library/core/src/fmt/mod.rs:
+815:    static fn core::fmt::Arguments::from_str(&str) -> core::fmt::Arguments;
+
+File /home/user/.rustup/toolchains/nightly/lib/rustlib/src/rust/library/core/src/ops/function.rs:
+250:    static fn core::ops::function::FnOnce::call_once<fn(), ()>(*mut fn (), ());
+250:    static fn core::ops::function::FnOnce::call_once<std::rt::lang_start::{closure_env#0}<()>, ()>(*mut std::rt::lang_start::{closure_env#0}<()>, ()) -> i32;
+
+File /home/user/.rustup/toolchains/nightly/lib/rustlib/src/rust/library/std/src/rt.rs:
+206:    static fn std::rt::lang_start::{closure#0}<()>() -> i32;
+199:    static fn std::rt::lang_start<()>(*mut fn (), isize, *mut *mut u8, u8) -> isize;
+
+Non-debugging symbols:
+0x0000000000001000  _start
+0x0000000000001020  _init";
+
+        let symbols = parse_symbol_list(input);
+
+        assert_eq!(symbols.len(), 7);
+
+        assert_eq!(symbols[0].name, "_init");
+        assert_eq!(symbols[0].address, 0x1020);
+        assert_eq!(symbols[1].name, "_start");
+        assert_eq!(symbols[1].address, 0x1000);
+
+        let rust_symbols: Vec<_> = symbols.iter().filter(|s| s.name.contains("::")).collect();
+        assert_eq!(rust_symbols.len(), 5);
+
+        assert!(symbols.iter().any(|s| s.name.starts_with("core::fmt::Arguments::from_str")));
+        assert!(
+            symbols.iter().any(|s| s.name.starts_with("core::ops::function::FnOnce::call_once"))
+        );
+        assert!(symbols.iter().any(|s| s.name.starts_with("std::rt::lang_start")));
+    }
+
+    #[test]
+    fn test_parse_symbol_list_c_debug_format() {
+        let input = r"All defined functions:
+
+File /home/user/demo.c:
+5:	void helper(int);
+10:	int main(int, char **);
+
+Non-debugging symbols:
+0x0000000000001000  _start
+0x0000000000001020  _init";
+
+        let symbols = parse_symbol_list(input);
+
+        assert_eq!(symbols.len(), 4);
+        assert!(symbols.iter().any(|s| s.name == "helper"));
+        assert!(symbols.iter().any(|s| s.name == "main"));
+        assert!(symbols.iter().any(|s| s.name == "_start"));
+        assert!(symbols.iter().any(|s| s.name == "_init"));
+
+        // Verify the debug symbols have needs_address_resolution set
+        let helper = symbols.iter().find(|s| s.name == "helper").unwrap();
+        assert!(helper.needs_address_resolution);
+        let main = symbols.iter().find(|s| s.name == "main").unwrap();
+        assert!(main.needs_address_resolution);
+    }
+
+    #[test]
+    fn test_parse_asm_insns() {
+        // Real captured asm_insns response
+        let input = r#"^done,asm_insns=[{address="0x0000000000404888",func-name="printf",offset="8",inst="sub    rsp,0xd0"},{address="0x000000000040488f",func-name="printf",offset="15",inst="mov    QWORD PTR [rbp-0xa8],rsi"}]"#;
+
+        if let MIResponse::ExecResult(_status, kv) = parse_mi_response(input) {
+            let asm_insns = kv.get("asm_insns").unwrap();
+            let parsed = parse_asm_insns_values(asm_insns);
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0].address, 0x0000000000404888);
+            assert_eq!(parsed[0].inst, "sub    rsp,0xd0");
+            assert_eq!(parsed[0].func_name, Some("printf".to_string()));
+            assert_eq!(parsed[0].offset, 8);
+
+            assert_eq!(parsed[1].address, 0x000000000040488f);
+            assert_eq!(parsed[1].inst, "mov    QWORD PTR [rbp-0xa8],rsi");
+        } else {
+            panic!("Expected ExecResult");
+        }
+    }
+
+    #[test]
+    fn test_parse_asm_insns_no_func() {
+        // asm_insns without func-name
+        let input = r#"^done,asm_insns=[{address="0x0000000000479010",inst="rex.B"},{address="0x0000000000479011",inst="fs fs jb 0x47907a"}]"#;
+
+        if let MIResponse::ExecResult(_status, kv) = parse_mi_response(input) {
+            let asm_insns = kv.get("asm_insns").unwrap();
+            let parsed = parse_asm_insns_values(asm_insns);
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0].func_name, None);
+            assert_eq!(parsed[1].func_name, None);
+        } else {
+            panic!("Expected ExecResult");
+        }
+    }
+
+    #[test]
+    fn test_parse_asm_insns_tab_separated() {
+        // Some targets (e.g. esp32-c3/RISC-V) separate the mnemonic and operands with a
+        // literal `\t` rather than spaces. See issue #150.
+        let input = r#"^done,asm_insns=[{address="0x42030194",inst="auipc\tra,0xffffd"},{address="0x42030198",inst="jalr\t792(ra)"}]"#;
+
+        if let MIResponse::ExecResult(_status, kv) = parse_mi_response(input) {
+            let asm_insns = kv.get("asm_insns").unwrap();
+            let parsed = parse_asm_insns_values(asm_insns);
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0].inst, "auipc ra,0xffffd");
+            assert_eq!(parsed[1].inst, "jalr 792(ra)");
+        } else {
+            panic!("Expected ExecResult");
+        }
+    }
+
+    #[test]
+    fn test_parse_register_values_complex() {
+        // Real captured register with complex value (XMM register)
+        let input = r#"[{number="40",value="{v8_bfloat16 = {0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}, v4_float = {0x0, 0x0, 0x0, 0x0}, v2_double = {0x0, 0x0}}"}]"#;
+        let parsed = parse_register_values(input);
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].as_ref().unwrap().number, "40");
+        assert!(parsed[0].as_ref().unwrap().value.is_some());
+    }
+
+    #[test]
+    fn test_parse_memory_mappings_new_format() {
+        let input = r"Start Addr         End Addr           Size               Offset             Perms File
+0x0000000000400000 0x0000000000401000 0x1000             0x0                r--p  /home/test/a.out
+0x0000000000401000 0x0000000000479000 0x78000            0x1000             r-xp  /home/test/a.out ";
+
+        let mappings = parse_memory_mappings_new(input);
+        assert_eq!(mappings.len(), 2);
+
+        assert_eq!(mappings[0].start_address, 0x0000000000400000);
+        assert_eq!(mappings[0].end_address, 0x0000000000401000);
+        assert_eq!(mappings[0].size, 0x1000);
+        assert_eq!(mappings[0].offset, 0x0);
+        assert_eq!(mappings[0].permissions, Some("r--p".to_string()));
+        assert_eq!(mappings[0].path, Some("/home/test/a.out".to_string()));
+
+        assert_eq!(mappings[1].start_address, 0x0000000000401000);
+        assert_eq!(mappings[1].permissions, Some("r-xp".to_string()));
+    }
+
+    #[test]
+    fn test_data_disassemble_commands() {
+        let cmd = data_disassemble(0x401000, 10);
+        assert!(cmd.contains("4198400")); // 0x401000 in decimal
+        assert!(cmd.contains("10"));
+
+        let cmd = data_disassemble_pc(5, 10);
+        assert!(cmd.contains("$pc"));
+        assert!(cmd.contains('5'));
+        assert!(cmd.contains("10"));
+    }
+
+    #[test]
+    fn test_data_read_memory_bytes() {
+        let cmd = data_read_memory_bytes(0x7fffffffa000, 0, 16);
+        assert!(cmd.contains("0x7fffffffa000"));
+        assert!(cmd.contains("16"));
+    }
+
+    #[test]
+    fn test_data_read_sp_bytes() {
+        let cmd = data_read_sp_bytes(0x100, 8);
+        assert!(cmd.contains("$sp"));
+        assert!(cmd.contains("0x100"));
+        assert!(cmd.contains('8'));
+    }
+
+    #[test]
+    fn test_parse_key_value_pairs() {
+        let input = r#"reason="breakpoint-hit",disp="keep",bkptno="1""#;
+        let pairs = parse_key_value_pairs(input);
+
+        assert_eq!(pairs.get("reason"), Some(&"breakpoint-hit".to_string()));
+        assert_eq!(pairs.get("disp"), Some(&"keep".to_string()));
+        assert_eq!(pairs.get("bkptno"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn test_match_inner_items() {
+        let input = r#"[{address="0x1234",inst="mov"},{address="0x5678",inst="add"}]"#;
+        let matches: Vec<_> = match_inner_items(input).map(|m| m[0].to_string()).collect();
+
+        assert_eq!(matches.len(), 2);
+        assert!(matches[0].contains("0x1234"));
+        assert!(matches[1].contains("0x5678"));
+    }
+
+    #[test]
+    fn test_normalize_value() {
+        assert_eq!(normalize_value("\"0x123\""), "0x123");
+        assert_eq!(normalize_value("0x123"), "0x123");
+        assert_eq!(normalize_value("  \"test\"  "), "test");
+        assert_eq!(normalize_value("plain"), "plain");
+    }
+}

@@ -1,0 +1,228 @@
+<#
+.SYNOPSIS
+    Converts a BloodHound extension file into markdown (*.md) or MDX.
+#>
+
+#Requires -Version 5.1
+
+[CmdletBinding()]
+param (
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string] $ExtensionSchemaPath,
+
+    [Parameter(Mandatory = $false)]
+    [string] $ExtensionShortName = '',
+
+    [Parameter(Mandatory = $false)]
+    [ValidateNotNullOrEmpty()]
+    [string] $OutputPath = (Join-Path -Path $PSScriptRoot -ChildPath '../../schema.md'),
+
+    [Parameter(Mandatory = $false)]
+    [AllowNull()]
+    [string] $NodeLinkBasePath = 'nodes',
+
+    [Parameter(Mandatory = $false)]
+    [AllowNull()]
+    [string] $EdgeLinkBasePath = 'edges',
+
+    [Parameter(Mandatory = $false)]
+    [ValidateNotNullOrEmpty()]
+    [string] $IconBasePath = 'icons',
+
+    [Parameter(Mandatory = $false)]
+    [string] $GitHubBaseUrl = '',
+
+    [Parameter(Mandatory = $false)]
+    [switch] $OfficialDocs
+)
+
+Set-StrictMode -Version Latest
+
+function Get-KindMarkdownLink {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string] $KindName,
+
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [string] $LinkBasePath,
+
+        [Parameter(Mandatory = $false)]
+        [string] $Extension = '',
+
+        [Parameter(Mandatory = $false)]
+        [switch] $LowercasePath
+    )
+
+    [string] $pathName = if ($LowercasePath) { $KindName.ToLower() } else { $KindName }
+
+    if ($null -eq $LinkBasePath) {
+        return $KindName
+    } elseif ([string]::Empty -eq $LinkBasePath) {
+        return '[{0}]({1}{2})' -f $KindName, $pathName, $Extension
+    } else {
+        return '[{0}]({1}/{2}{3})' -f $KindName, $LinkBasePath, $pathName, $Extension
+    }
+}
+
+# Parse the JSON file
+[psobject] $json = $null
+try {
+    $json = Get-Content -Path $ExtensionSchemaPath | ConvertFrom-Json
+}
+catch {
+    Write-Error "Failed to parse extension file '$ExtensionSchemaPath': $($_.Exception.Message)"
+    throw
+}
+
+if ([string]::IsNullOrWhiteSpace($json.schema.name)) {
+    throw "schema.name is missing in extension file: $ExtensionSchemaPath"
+}
+
+[psobject[]] $nodeKinds = @($json.node_kinds | Sort-Object -Property name)
+[psobject[]] $relationshipKinds = @($json.relationship_kinds | Sort-Object -Property name)
+[string] $extensionName = $json.schema.name
+[string] $effectiveExtensionShortName = if (-not [string]::IsNullOrWhiteSpace($ExtensionShortName)) {
+    $ExtensionShortName
+} else {
+    $extensionName
+}
+[string] $extensionDisplayName = if (-not [string]::IsNullOrWhiteSpace($json.schema.display_name)) {
+    $json.schema.display_name
+} else {
+    $extensionName
+}
+if ($OfficialDocs) {
+    [string] $linkExtension = ''
+    [string] $effectiveGitHubBaseUrl = if ([string]::IsNullOrEmpty($GitHubBaseUrl)) {
+        'https://github.com/SpecterOps/{0}' -f $extensionName
+    } else {
+        $GitHubBaseUrl.TrimEnd('/')
+    }
+    # Compute repo-relative path for the GitHub link
+    [string] $gitRoot = (& git -C (Split-Path -Parent $ExtensionSchemaPath) rev-parse --show-toplevel) -replace '\\', '/'
+    [string] $extensionAbsolute = (Get-Item -Path $ExtensionSchemaPath).FullName -replace '\\', '/'
+    [string] $extensionRepoRelPath = $extensionAbsolute.Substring($gitRoot.Length + 1)
+    [string] $extensionFilePath = '{0}/blob/main/{1}' -f $effectiveGitHubBaseUrl, $extensionRepoRelPath
+    [bool] $useMintlifyCallouts = $true
+} else {
+    [string] $linkExtension = '.md'
+    # Compute relative path from the output directory to the extension file
+    [string] $outputDir = (Get-Item -Path (Split-Path -Parent $OutputPath)).FullName
+    [string] $resolvedExtensionPath = (Get-Item -Path $ExtensionSchemaPath).FullName
+    Push-Location -Path $outputDir
+    try {
+        [string] $extensionFilePath = (Resolve-Path -Relative -Path $resolvedExtensionPath) -replace '\\', '/'
+    } finally {
+        Pop-Location
+    }
+    [bool] $useMintlifyCallouts = $false
+}
+
+# Generate the header and metadata section
+[string] $markdown = ''
+if ($OfficialDocs) {
+    $markdown += @'
+---
+title: Schema
+description: {0} extension schema definition
+icon: circle-nodes
+---
+
+<img noZoom src="/assets/enterprise-AND-community-edition-pill-tag.svg" alt="Applies to BloodHound Enterprise and CE"/>
+
+'@ -f $effectiveExtensionShortName
+}
+
+if (-not $OfficialDocs) {
+    $markdown += @'
+# Schema
+
+'@
+}
+
+$markdown += @'
+## Metadata
+
+**Name:** {0}<br />
+**Display Name:** {1}<br />
+**Version:** {2}<br />
+**Namespace:** {3}<br />
+**Environment Kind:** {4}<br />
+**Source Kind:** {5}
+
+'@ -f $extensionName, $extensionDisplayName, $json.schema.version, $json.schema.namespace, $json.environments[0].environment_kind, $json.environments[0].source_kind
+
+$markdown += "`n"
+
+if ($useMintlifyCallouts) {
+    $markdown += @'
+<Info>
+This file is automatically generated from the [extension schema definition file]({0}).
+</Info>
+'@ -f $extensionFilePath
+} else {
+    $markdown += @'
+> [!NOTE]
+> This file is automatically generated from the [extension schema definition file]({0}).
+'@ -f $extensionFilePath
+}
+
+$markdown += "`n"
+$markdown += @'
+
+## Nodes
+
+| Icon | Node Kind | Display Name |
+|------|-----------|--------------|
+'@
+
+# Add a table row for each node kind
+foreach ($nodeKind in $nodeKinds) {
+    try {
+        # Append node-specific markdown
+        # Sample: | ![Okta_Organization](icons/Okta_Organization.png) | Okta_Organization | Okta Organization |
+        $markdown += "`n"
+        [string] $nodeKindDisplay = Get-KindMarkdownLink -KindName $nodeKind.name -LinkBasePath $NodeLinkBasePath -Extension $linkExtension -LowercasePath:$OfficialDocs
+        $markdown += '| ![{0}]({1}/{2}.png) | {3} | {4} |' -f $nodeKind.name, $IconBasePath, $nodeKind.name.ToLower(), $nodeKindDisplay, $nodeKind.display_name
+    }
+    catch {
+        Write-Error "Error rendering schema row for node kind '$($nodeKind.name)': $($_.Exception.Message)`nScriptStackTrace: $($_.ScriptStackTrace)"
+        throw
+    }
+}
+
+$markdown += "`n`n"
+$markdown += @'
+## Edges
+
+| Relationship Kind | Traversable | Description |
+|-------------------|:-----------:|-------------|
+'@
+
+# Add a table row for each relationship kind
+foreach ($relationshipKind in $relationshipKinds) {
+    try {
+        # Append relationship-specific markdown
+        # Sample: | OktaUserHasRole | ✅ | Indicates that a user is assigned a role in Okta. |
+        $markdown += "`n"
+        [string] $traversableIcon = if ($relationshipKind.is_traversable) { '✅' } else { '❌' }
+        [string] $relationshipKindDisplay = Get-KindMarkdownLink -KindName $relationshipKind.name -LinkBasePath $EdgeLinkBasePath -Extension $linkExtension -LowercasePath:$OfficialDocs
+        $markdown += '| {0} | {1} | {2} |' -f $relationshipKindDisplay, $traversableIcon, $relationshipKind.description
+    }
+    catch {
+        Write-Error "Error rendering schema row for relationship kind '$($relationshipKind.name)': $($_.Exception.Message)`nScriptStackTrace: $($_.ScriptStackTrace)"
+        throw
+    }
+}
+
+# Normalize line endings to CRLF for Git working tree
+$markdown = $markdown -replace "`r?`n", "`r`n"
+
+# Create the Nodes.md file
+Set-Content -Path $OutputPath -Value $markdown -Encoding UTF8
+Write-Host "Wrote $OutputPath" -ForegroundColor DarkGray

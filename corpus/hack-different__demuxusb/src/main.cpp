@@ -1,0 +1,47 @@
+#include <iostream>
+#include <boost/filesystem.hpp>
+#include <memory>
+#include "file/InputFile.h"
+#include "file/PcapNGInputFile.h"
+
+
+using namespace demuxusb;
+
+int main(int argc, const char *argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <capture_file.pcapng|pcap>" << std::endl;
+        return 1;
+    }
+
+    fs::path input_path(argv[1]);
+
+    std::unique_ptr<InputFile> input;
+
+    if (input_path.extension() == ".pcapng" || input_path.extension() == ".pcap") {
+        input = std::make_unique<PcapNGInputFile>(input_path);
+    } else {
+        std::cerr << "Input file type is not supported." << std::endl;
+        exit(-1);
+    }
+
+    input->parse();
+
+    for (const auto &device: input->getDevices()) {
+        std::wcout << L"\n\nDevice ID: " << std::hex << device->getIdentifier() << std::endl;
+        std::wcout << L"  Manufacturer: " << device->getManufacturer() << std::endl;
+        std::wcout << L"  Product: " << device->getProduct() << std::endl;
+        std::wcout << L"  Statistics: " << std::dec << device->getPacketCount() << L" packets and " <<
+                   device->getByteCount() << L" bytes. (control " << device->getControlPacketCount() << L" packets, " <<
+                   device->getControlByteCount() << L" bytes)." << std::endl;
+
+
+        std::wcout << L"  Interface Experts:\n";
+        for (const auto &expert: device->getExperts()) {
+            if (!expert->isEmpty()) {
+                std::cout << "    " << expert->toString() << std::endl;
+            }
+        }
+    }
+
+    return 0;
+}

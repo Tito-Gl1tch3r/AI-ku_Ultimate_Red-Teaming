@@ -1,0 +1,230 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Doctrine\Tests\Persistence\Mapping;
+
+use Doctrine\Persistence\Mapping\ClassMetadata;
+use Doctrine\Persistence\Mapping\Driver\FileDriver;
+use Doctrine\Persistence\Mapping\Driver\FileLocator;
+use Doctrine\Tests\Persistence\Mapping\Fixtures\AnotherGlobalClass;
+use Doctrine\Tests\Persistence\Mapping\Fixtures\GlobalClass;
+use Doctrine\Tests\Persistence\Mapping\Fixtures\NotLoadedClass;
+use Doctrine\Tests\Persistence\Mapping\Fixtures\TestClassMetadata;
+use PHPUnit\Framework\MockObject\MockObject;
+use PHPUnit\Framework\MockObject\Stub;
+use PHPUnit\Framework\TestCase;
+use stdClass;
+
+use function str_contains;
+
+class FileDriverTest extends TestCase
+{
+    public function testGlobalBasename(): void
+    {
+        $driver = $this->createTestFileDriver([]);
+
+        self::assertSame('', $driver->getGlobalBasename());
+
+        $driver->setGlobalBasename('global');
+
+        self::assertSame('global', $driver->getGlobalBasename());
+    }
+
+    public function testGetElementFromGlobalFile(): void
+    {
+        $driver = $this->createTestFileDriver($this->newLocator());
+
+        $driver->setGlobalBasename('global');
+
+        $element = $driver->getElement(GlobalClass::class);
+
+        self::assertSame(GlobalClass::class, $element->getName());
+    }
+
+    public function testGetElementFromFile(): void
+    {
+        $locator = $this->newLocator(true);
+        $locator->expects(self::once())
+                ->method('findMappingFile')
+                ->with(self::equalTo(stdClass::class))
+                ->willReturn(__DIR__ . '/_files/stdClass.yml');
+
+        $driver = $this->createTestFileDriver($locator);
+
+        self::assertSame(stdClass::class, $driver->getElement(stdClass::class)->getName());
+    }
+
+    public function testGetElementUpdatesClassCache(): void
+    {
+        $locator = $this->newLocator(true);
+
+        // findMappingFile should only be called once
+        $locator->expects(self::once())
+            ->method('findMappingFile')
+                ->with(self::equalTo(stdClass::class))
+                ->willReturn(__DIR__ . '/_files/stdClass.yml');
+
+        $driver = $this->createTestFileDriver($locator);
+
+        // not cached
+        self::assertSame(stdClass::class, $driver->getElement(stdClass::class)->getName());
+
+        // cached call
+        self::assertSame(stdClass::class, $driver->getElement(stdClass::class)->getName());
+    }
+
+    public function testGetAllClassNamesGlobalBasename(): void
+    {
+        $locator = $this->newLocator();
+        $locator->method('getAllClassNames')->with('global')->willReturn([
+            GlobalClass::class,
+            AnotherGlobalClass::class,
+        ]);
+
+        $driver = $this->createTestFileDriver($locator);
+        $driver->setGlobalBasename('global');
+
+        $classNames = $driver->getAllClassNames();
+
+        self::assertSame([GlobalClass::class, AnotherGlobalClass::class], $classNames);
+    }
+
+    public function testGetAllClassNamesFromMappingFile(): void
+    {
+        $locator = $this->newLocator();
+        $locator->method('getAllClassNames')
+                ->with(self::equalTo(null))
+                ->willReturn([stdClass::class]);
+        $driver = new TestFileDriver($locator);
+
+        $classNames = $driver->getAllClassNames();
+
+        self::assertSame([stdClass::class], $classNames);
+    }
+
+    public function testGetAllClassNamesBothSources(): void
+    {
+        $locator = $this->newLocator();
+        $locator->method('getAllClassNames')
+                ->with(self::equalTo('global'))
+                ->willReturn([stdClass::class]);
+        $driver = new TestFileDriver($locator);
+        $driver->setGlobalBasename('global');
+
+        $classNames = $driver->getAllClassNames();
+
+        self::assertSame([GlobalClass::class, AnotherGlobalClass::class, stdClass::class], $classNames);
+    }
+
+    public function testGetAllClassNamesBothSourcesNoDupes(): void
+    {
+        $locator = $this->newLocator(true);
+        $locator->expects(self::once())
+                ->method('getAllClassNames')
+                ->with(self::equalTo('global'))
+                ->willReturn([stdClass::class]);
+        $locator->expects(self::once())
+                ->method('findMappingFile')
+                ->with(self::equalTo(stdClass::class))
+                ->willReturn(__DIR__ . '/_files/stdClass.yml');
+        $driver = new TestFileDriver($locator);
+        $driver->setGlobalBasename('global');
+
+        $driver->getElement(stdClass::class);
+        $classNames = $driver->getAllClassNames();
+
+        self::assertSame([GlobalClass::class, AnotherGlobalClass::class, stdClass::class], $classNames);
+    }
+
+    public function testIsNotTransient(): void
+    {
+        $locator = $this->newLocator(true);
+        $locator->expects(self::once())
+                ->method('fileExists')
+                ->with(self::equalTo(stdClass::class))
+                ->willReturn(true);
+
+        $driver = $this->createTestFileDriver($locator);
+        $driver->setGlobalBasename('global');
+
+        self::assertFalse($driver->isTransient(stdClass::class));
+        self::assertFalse($driver->isTransient(GlobalClass::class));
+        self::assertFalse($driver->isTransient(AnotherGlobalClass::class));
+    }
+
+    public function testIsTransient(): void
+    {
+        $locator = $this->newLocator(true);
+        $locator->expects(self::once())
+                ->method('fileExists')
+                ->with(self::equalTo(NotLoadedClass::class))
+                ->willReturn(false);
+
+        $driver = $this->createTestFileDriver($locator);
+
+        self::assertTrue($driver->isTransient(NotLoadedClass::class));
+    }
+
+    public function testNonLocatorFallback(): void
+    {
+        $driver = new TestFileDriver(__DIR__ . '/_files', '.yml');
+        self::assertTrue($driver->isTransient(NotLoadedClass::class));
+        self::assertFalse($driver->isTransient(stdClass::class));
+    }
+
+    /** @return ($mock is true ? (FileLocator&MockObject) : (FileLocator&Stub)) */
+    private function newLocator(bool $mock = false): FileLocator
+    {
+        $locator = $mock ? $this->createMock(FileLocator::class) : self::createStub(FileLocator::class);
+        $locator->method('getFileExtension')->willReturn('.yml');
+        $locator->method('getPaths')->willReturn([__DIR__ . '/_files']);
+
+        return $locator;
+    }
+
+    /** @param string|array<int, string>|FileLocator $locator */
+    private function createTestFileDriver(string|array|FileLocator $locator, string|null $fileExtension = null): TestFileDriver
+    {
+        $driver = new TestFileDriver($locator, $fileExtension);
+
+        $driver->stdClass   = self::createStub(ClassMetadata::class);
+        $driver->stdGlobal  = self::createStub(ClassMetadata::class);
+        $driver->stdGlobal2 = self::createStub(ClassMetadata::class);
+
+        return $driver;
+    }
+}
+
+/** @template-extends FileDriver<TestClassMetadata<object>> */
+class TestFileDriver extends FileDriver
+{
+    /** @var ClassMetadata<object> */
+    public ClassMetadata $stdGlobal;
+
+    /** @var ClassMetadata<object> */
+    public ClassMetadata $stdGlobal2;
+
+    /** @var ClassMetadata<object> */
+    public ClassMetadata $stdClass;
+
+    /**
+     * {@inheritDoc}
+     */
+    protected function loadMappingFile(string $file): array
+    {
+        if (str_contains($file, 'global.yml')) {
+            return [
+                GlobalClass::class => new TestClassMetadata(GlobalClass::class),
+                AnotherGlobalClass::class => new TestClassMetadata(AnotherGlobalClass::class),
+            ];
+        }
+
+        return [stdClass::class => new TestClassMetadata(stdClass::class)];
+    }
+
+    /** @param ClassMetadata<object> $metadata */
+    public function loadMetadataForClass(string $className, ClassMetadata $metadata): void
+    {
+    }
+}

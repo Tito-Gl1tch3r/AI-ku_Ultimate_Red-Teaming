@@ -1,0 +1,380 @@
+import { useQueries } from '@tanstack/react-query';
+import {
+  createFileRoute,
+  Link,
+  notFound,
+  Outlet,
+  useLocation,
+  useNavigate
+} from '@tanstack/react-router';
+import {
+  CircleAlertIcon,
+  CircleCheckIcon,
+  CornerDownLeftIcon,
+  EthernetPortIcon,
+  MailIcon,
+  MapPinIcon
+} from 'lucide-react';
+import { useEffect, useState, type FormEvent } from 'react';
+import { match } from 'ts-pattern';
+import z from 'zod';
+
+import { Button, buttonVariants } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
+import {
+  Field,
+  FieldError,
+  FieldGroup,
+  FieldLabel
+} from '@/components/ui/field';
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupButton,
+  InputGroupInput
+} from '@/components/ui/input-group';
+import { Spinner } from '@/components/ui/spinner';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import useMediaQuery from '@/hooks/use-media-query';
+import { useVisitorIPQuery } from '@/hooks/use-visitor-ip-query';
+import {
+  TOOL_METADATA,
+  type ToolKey,
+  type ToolMetadataEntries
+} from '@/lib/meta';
+import { getToolQueryOptions } from '@/lib/query';
+import { QUERY_SCHEMAS, type QueryType } from '@/lib/schema';
+import { cn } from 'cn';
+
+export const Route = createFileRoute('/_tool')({
+  component: ToolLayoutRouteComponent,
+  validateSearch: z
+    .object({ q: z.union(Object.values(QUERY_SCHEMAS)) })
+    .partial()
+});
+
+function ToolLayoutRouteComponent() {
+  const { pathname } = useLocation();
+
+  const tkey = pathname.split('/').pop() as ToolKey;
+  const tool = TOOL_METADATA[tkey];
+
+  if (!tool) {
+    throw notFound();
+  }
+
+  const search = Route.useSearch();
+
+  const toolsOfQueryType = Object.entries(TOOL_METADATA).filter(
+    ([_, t]) =>
+      t.queryType === tool.queryType && //
+      !t.disableUniversalLookup
+  ) as ToolMetadataEntries;
+
+  const queries = useQueries({
+    queries: toolsOfQueryType.map(([k]) => getToolQueryOptions(k, search.q))
+  });
+
+  if (search.q) {
+    return (
+      <article className="grid gap-2 sm:gap-0">
+        <header className="grid gap-2 pt-3">
+          <div className="flex flex-col items-center justify-between gap-2.5 sm:flex-row">
+            <div className="flex flex-col items-center text-center leading-tight sm:flex-row sm:items-baseline sm:gap-2 sm:text-left">
+              <Link
+                className="transition-opacity hover:opacity-75 dark:hover:opacity-90"
+                to={`/${tkey}`}
+              >
+                <h1 className="text-lg/tight font-semibold tracking-tight whitespace-nowrap">
+                  {tool.name}
+                </h1>
+              </Link>
+              <p className="text-muted-foreground max-w-[50dvw] truncate">
+                {search.q}
+              </p>
+            </div>
+
+            <div className="w-full max-w-64">
+              <ToolForm variant="compact" queryType={tool.queryType} />
+            </div>
+          </div>
+        </header>
+
+        <Tabs value={tkey} className="overflow-x-auto">
+          {toolsOfQueryType.length > 1 && (
+            <div className="overflow-x-auto py-2">
+              <TabsList>
+                {toolsOfQueryType.map(([key, t], i) => {
+                  const query = queries[i];
+
+                  let icon;
+                  let statusLabel;
+                  switch (query.status) {
+                    case 'error':
+                      icon = (
+                        <CircleAlertIcon
+                          aria-hidden="true"
+                          className="text-destructive"
+                        />
+                      );
+                      statusLabel = 'Failed';
+                      break;
+                    case 'success':
+                      icon = (
+                        <CircleCheckIcon
+                          aria-hidden="true"
+                          className="text-green-500"
+                        />
+                      );
+                      statusLabel = 'Ready';
+                      break;
+                    default:
+                      icon = (
+                        <Spinner aria-hidden="true" className="opacity-50" />
+                      );
+                      statusLabel = 'Loading';
+                      break;
+                  }
+
+                  return (
+                    <TabsTrigger
+                      key={key}
+                      value={key}
+                      nativeButton={false}
+                      render={
+                        <Link
+                          aria-label={`${t.name}, ${statusLabel}`}
+                          to={`/${key}`}
+                          search={{ q: search.q }}
+                        >
+                          {icon} {t.name}
+                        </Link>
+                      }
+                    />
+                  );
+                })}
+              </TabsList>
+            </div>
+          )}
+
+          <TabsContent
+            value={tkey}
+            className={cn(
+              'm-px grid gap-4 pb-4',
+              toolsOfQueryType.length <= 1 && 'mt-3'
+            )}
+          >
+            <Outlet />
+          </TabsContent>
+        </Tabs>
+      </article>
+    );
+  }
+
+  return (
+    <section className="grid gap-6 py-24 sm:py-48">
+      <hgroup className="grid gap-4 text-center">
+        <h1 className="text-5xl font-semibold tracking-tighter md:text-6xl">
+          {tool.name}
+        </h1>
+        <p className="text-muted-foreground mx-auto max-w-md text-base">
+          {tool.description}
+        </p>
+      </hgroup>
+
+      <Card className="mx-auto w-full max-w-sm">
+        <CardContent>
+          <ToolForm queryType={tool.queryType} />
+        </CardContent>
+      </Card>
+
+      {tool.queryType === 'ip' && <UseMyIPAddressButton />}
+    </section>
+  );
+}
+
+interface ToolFormProps {
+  queryType: QueryType;
+  variant?: 'default' | 'compact';
+}
+
+function ToolForm({ queryType, variant = 'default' }: ToolFormProps) {
+  const navigate = useNavigate();
+  const { pathname } = useLocation();
+  const { isDesktop } = useMediaQuery();
+  const [error, setError] = useState<string>();
+
+  function handleSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+
+    const formData = new FormData(e.currentTarget);
+
+    const parseResult = z
+      .object({ q: QUERY_SCHEMAS[queryType] })
+      .safeParse({ q: formData.get('q') });
+
+    if (!parseResult.success) {
+      setError(parseResult.error.issues[0].message);
+      return;
+    }
+
+    setError(undefined);
+
+    navigate({
+      to: pathname,
+      search: parseResult.data
+    });
+  }
+
+  useEffect(() => {
+    if (variant === 'default' && isDesktop) {
+      document.querySelector<HTMLInputElement>('input[name="q"]')?.focus();
+    }
+  }, [variant, isDesktop]);
+
+  return (
+    <form onSubmit={handleSubmit}>
+      {match(queryType)
+        .with('domain', () => (
+          <FieldGroup>
+            <Field data-invalid={!!error}>
+              <FieldLabel
+                className={cn(variant === 'compact' && 'sr-only')}
+                htmlFor="domain"
+              >
+                Domain
+              </FieldLabel>
+
+              <InputGroup className="shadow-lg/5">
+                <InputGroupAddon>
+                  <EthernetPortIcon className="mr-0.5" />
+                </InputGroupAddon>
+
+                <InputGroupInput
+                  aria-describedby={error ? 'domain-error' : undefined}
+                  aria-invalid={!!error}
+                  placeholder="example.com"
+                  type="text"
+                  id="domain"
+                  name="q"
+                  onChange={() => setError(undefined)}
+                />
+
+                <InputGroupButton
+                  aria-label="Look up domain"
+                  size="icon-sm"
+                  type="submit"
+                >
+                  <CornerDownLeftIcon />
+                </InputGroupButton>
+              </InputGroup>
+              <FieldError id="domain-error">{error}</FieldError>
+            </Field>
+          </FieldGroup>
+        ))
+        .with('ip', () => (
+          <FieldGroup>
+            <Field data-invalid={!!error}>
+              <FieldLabel
+                className={cn(variant === 'compact' && 'sr-only')}
+                htmlFor="ip"
+              >
+                IP Address
+              </FieldLabel>
+
+              <InputGroup className="shadow-lg/5">
+                <InputGroupAddon>
+                  <MapPinIcon className="mr-0.5" />
+                </InputGroupAddon>
+
+                <InputGroupInput
+                  aria-describedby={error ? 'ip-error' : undefined}
+                  aria-invalid={!!error}
+                  placeholder="1.1.1.1"
+                  type="text"
+                  id="ip"
+                  name="q"
+                  onChange={() => setError(undefined)}
+                />
+
+                <InputGroupButton
+                  aria-label="Look up IP address"
+                  size="icon-sm"
+                  type="submit"
+                >
+                  <CornerDownLeftIcon />
+                </InputGroupButton>
+              </InputGroup>
+              <FieldError id="ip-error">{error}</FieldError>
+            </Field>
+          </FieldGroup>
+        ))
+        .with('email', () => (
+          <FieldGroup>
+            <Field data-invalid={!!error}>
+              <FieldLabel
+                className={cn(variant === 'compact' && 'sr-only')}
+                htmlFor="email"
+              >
+                Email Address
+              </FieldLabel>
+
+              <InputGroup className="shadow-lg/5">
+                <InputGroupAddon>
+                  <MailIcon className="mr-0.5" />
+                </InputGroupAddon>
+
+                <InputGroupInput
+                  aria-describedby={error ? 'email-error' : undefined}
+                  aria-invalid={!!error}
+                  placeholder="me@example.com"
+                  data-form-type="other"
+                  data-1p-ignore="true"
+                  data-bwignore="true"
+                  data-lpignore="true"
+                  autoComplete="off"
+                  type="email"
+                  id="email"
+                  name="q"
+                  onChange={() => setError(undefined)}
+                />
+
+                <InputGroupButton
+                  aria-label="Look up email address"
+                  size="icon-sm"
+                  type="submit"
+                >
+                  <CornerDownLeftIcon />
+                </InputGroupButton>
+              </InputGroup>
+              <FieldError id="email-error">{error}</FieldError>
+            </Field>
+          </FieldGroup>
+        ))
+        .exhaustive()}
+    </form>
+  );
+}
+
+function UseMyIPAddressButton() {
+  const { data } = useVisitorIPQuery();
+  const ip = data?.ip;
+
+  if (!ip) {
+    return (
+      <Button className="mx-auto w-fit" disabled>
+        Use my IP address
+      </Button>
+    );
+  }
+
+  return (
+    <Link
+      className={cn(buttonVariants(), 'mx-auto w-fit')}
+      search={{ q: ip }}
+      to="/ip"
+    >
+      Use my IP address
+    </Link>
+  );
+}

@@ -1,0 +1,304 @@
+"""
+GhostTrace Configuration
+Centralized config with environment support
+"""
+import os, json, secrets
+
+class Config:
+    VERSION = "6.3"
+    BASE_DIR = os.path.expanduser("~/ghosttrace_data")
+    DB_PATH = os.path.join(BASE_DIR, "ghosttrace.db")
+    EXPORT_DIR = os.path.expanduser("~/ghosttrace_exports")
+    CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+    LOG_DIR = os.path.join(BASE_DIR, "logs")
+    KEYFILE = os.path.join(BASE_DIR, ".keyfile")   # per-install key for at-rest encryption
+    _ENC_PREFIX = "enc:v1:"                          # marks an encrypted value in config.json
+    KEY_MASK = "********"                            # sent to the UI in place of a stored key;
+    #                                                  echoed back unchanged => keep stored value
+
+    TOR_PROXY = os.environ.get("GT_TOR_PROXY", "socks5://127.0.0.1:9050")
+    # SECRET_KEY is resolved via get_secret_key() so sessions survive restarts:
+    # env override > value stored in config.json > generated-and-persisted once.
+
+    # Execution limits
+    TOOL_TIMEOUT = 240         # Max seconds per tool
+    TOOL_MAX_OUTPUT_LINES = 5000
+    MAX_CONCURRENT_SCANS = 3
+    SSE_KEEPALIVE_SEC = 15
+
+    # Security
+    ALLOWED_TOOLS = {"theharvester", "sherlock", "exiftool", "maigret", "phoneinfoga", "whois", "dig", "openssl"}
+    FORBIDDEN_PATHS = ["/etc/shadow", "/etc/passwd", ".ssh", "id_rsa", "/root", "/proc", "/sys"]
+    MAX_INPUT_LENGTH = 256
+
+    # theHarvester free sources (v4.10.1)
+    FREE_SOURCES = [
+        "certspotter", "crtsh", "dnsdumpster", "duckduckgo", "hackertarget",
+        "otx", "rapiddns", "robtex", "subdomaincenter", "threatcrowd",
+        "urlscan", "waybackarchive", "yahoo"
+    ]
+    IGNORE_EMAILS = {"cmartorella@edge-security.com", "cmartorella@gmail.com"}
+
+    # theHarvester sources that REQUIRE an API key. Maps the config-key saved by
+    # the settings UI -> (theHarvester "-b" source name, api-keys.yaml section).
+    # theHarvester reads keys from ~/.theHarvester/api-keys.yaml, NOT env vars,
+    # so keys saved in the UI are synced into that file (see sync_harvester_keys).
+    HARVESTER_KEYED_SOURCES = {
+        "shodan":         ("shodan",         "shodan"),
+        "hunter":         ("hunter",         "hunter"),
+        "securitytrails": ("securityTrails", "securityTrails"),
+        "virustotal":     ("virustotal",     "virustotal"),
+        "censys":         ("censys",         "censys"),  # value entered as "id:secret"
+    }
+    THEHARVESTER_KEYS_PATH = os.path.expanduser("~/.theHarvester/api-keys.yaml")
+
+    # Intelligence
+    SOURCE_WEIGHTS = {
+        "crtsh": 0.9, "certspotter": 0.9, "dnsdumpster": 0.8,
+        "hackertarget": 0.7, "rapiddns": 0.7, "duckduckgo": 0.5,
+        "yahoo": 0.5, "otx": 0.8, "robtex": 0.7, "urlscan": 0.8,
+        "waybackarchive": 0.6, "subdomaincenter": 0.6, "threatcrowd": 0.5,
+        "theHarvester": 0.7, "Sherlock": 0.8, "ExifTool": 0.95
+    }
+
+    @classmethod
+    def init(cls):
+        for d in [cls.BASE_DIR, cls.EXPORT_DIR, cls.LOG_DIR]:
+            os.makedirs(d, exist_ok=True)
+        cls.augment_tool_path()
+
+    @classmethod
+    def augment_tool_path(cls):
+        """Make tool binaries discoverable no matter how the app was launched.
+        Adds common install locations (pipx shims + isolated venvs, ~/.local/bin,
+        standard system dirs) to PATH so `which`/subprocess can find tools like
+        maigret, sherlock and phoneinfoga even when started from a minimal
+        environment (desktop launcher, systemd, fresh shell without pipx PATH)."""
+        import glob
+        home = os.path.expanduser("~")
+        extra = [
+            os.path.join(home, ".local", "bin"),
+            "/usr/local/bin", "/usr/local/sbin",
+            "/usr/bin", "/usr/sbin", "/bin", "/sbin",
+            "/snap/bin",
+        ]
+        # pipx installs each tool in its own venv: ~/.local/share/pipx/venvs/<tool>/bin
+        extra += glob.glob(os.path.join(home, ".local", "share", "pipx", "venvs", "*", "bin"))
+        parts = os.environ.get("PATH", "").split(os.pathsep)
+        parts = [p for p in parts if p]
+        for d in extra:
+            if os.path.isdir(d) and d not in parts:
+                parts.append(d)
+        os.environ["PATH"] = os.pathsep.join(parts)
+
+    @classmethod
+    def _get_cipher(cls):
+        """Fernet cipher backed by a per-install key at KEYFILE (0600), created on
+        first use. Returns None if `cryptography` is unavailable so callers can
+        degrade gracefully (store/return plaintext) rather than crash."""
+        try:
+            from cryptography.fernet import Fernet
+        except ImportError:
+            return None
+        try:
+            if os.path.exists(cls.KEYFILE):
+                with open(cls.KEYFILE, "rb") as f:
+                    key = f.read().strip()
+            else:
+                key = Fernet.generate_key()
+                os.makedirs(os.path.dirname(cls.KEYFILE), exist_ok=True)
+                with open(cls.KEYFILE, "wb") as f:
+                    f.write(key)
+                try:
+                    os.chmod(cls.KEYFILE, 0o600)
+                except OSError:
+                    pass
+            return Fernet(key)
+        except Exception:
+            return None
+
+    @classmethod
+    def _encrypt_value(cls, val):
+        """Encrypt a single key value for at-rest storage. No-op on empty values
+        or when crypto is unavailable."""
+        val = str(val or "")
+        if not val:
+            return val
+        c = cls._get_cipher()
+        if not c:
+            return val
+        try:
+            return cls._ENC_PREFIX + c.encrypt(val.encode()).decode()
+        except Exception:
+            return val
+
+    @classmethod
+    def _decrypt_value(cls, val):
+        """Decrypt a stored value. Legacy plaintext (no prefix) is returned as-is
+        so existing configs keep working; a value we can't decrypt returns ''."""
+        if not isinstance(val, str) or not val.startswith(cls._ENC_PREFIX):
+            return val  # legacy plaintext / empty
+        c = cls._get_cipher()
+        if not c:
+            return ""
+        try:
+            return c.decrypt(val[len(cls._ENC_PREFIX):].encode()).decode()
+        except Exception:
+            return ""
+
+    @classmethod
+    def load_api_keys(cls):
+        if os.path.exists(cls.CONFIG_FILE):
+            with open(cls.CONFIG_FILE) as f:
+                raw = json.load(f).get("api_keys", {})
+            # transparently decrypt — callers always see plaintext
+            return {k: cls._decrypt_value(v) for k, v in raw.items()}
+        return {}
+
+    @classmethod
+    def load_api_keys_masked(cls):
+        """Never returns secrets — a set key becomes KEY_MASK, an unset key ''.
+        The settings UI shows the mask and echoes it back unchanged for fields the
+        user didn't touch; save_api_keys then keeps the stored value. Stops the
+        settings GET from leaking plaintext API keys to the browser."""
+        return {k: (cls.KEY_MASK if str(v or "").strip() else "")
+                for k, v in cls.load_api_keys().items()}
+
+    @classmethod
+    def save_api_keys(cls, keys):
+        cfg = {}
+        if os.path.exists(cls.CONFIG_FILE):
+            with open(cls.CONFIG_FILE) as f: cfg = json.load(f)
+        existing = cfg.get("api_keys", {})   # already-encrypted at rest
+        merged = {}
+        for k, v in (keys or {}).items():
+            # The UI echoes KEY_MASK for a field the user left untouched — keep the
+            # stored secret instead of overwriting it with the mask.
+            if v == cls.KEY_MASK:
+                if existing.get(k):
+                    merged[k] = existing[k]
+                continue                          # unset + mask => nothing to store
+            merged[k] = cls._encrypt_value(v)     # new value ('' clears the key)
+        cfg["api_keys"] = merged
+        with open(cls.CONFIG_FILE, "w") as f: json.dump(cfg, f, indent=2)
+        try:
+            os.chmod(cls.CONFIG_FILE, 0o600)
+        except OSError:
+            pass
+        # theHarvester reads plaintext from its own yaml — derive it from what we
+        # just stored so kept (masked) keys are synced too, never the mask itself.
+        try:
+            cls.sync_harvester_keys({k: cls._decrypt_value(v) for k, v in merged.items()})
+        except Exception:
+            pass
+
+    @classmethod
+    def configured_key_sources(cls, keys=None):
+        """theHarvester '-b' source names whose API key is set (non-empty)."""
+        keys = cls.load_api_keys() if keys is None else keys
+        out = []
+        for cfg_name, (src, _section) in cls.HARVESTER_KEYED_SOURCES.items():
+            if str(keys.get(cfg_name, "") or "").strip():
+                out.append(src)
+        return out
+
+    @classmethod
+    def sync_harvester_keys(cls, keys=None):
+        """Write configured API keys into theHarvester's api-keys.yaml so the tool
+        actually consumes them. Merges into the existing structure and never
+        clobbers sections GhostTrace doesn't manage. Returns synced section names."""
+        keys = cls.load_api_keys() if keys is None else keys
+        try:
+            import yaml
+        except ImportError:
+            return []
+        path = cls.THEHARVESTER_KEYS_PATH
+        data = {}
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    data = yaml.safe_load(f) or {}
+            except Exception:
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
+        api = data.get("apikeys")
+        if not isinstance(api, dict):
+            api = {}
+        synced = []
+        for cfg_name, (_src, section) in cls.HARVESTER_KEYED_SOURCES.items():
+            val = str(keys.get(cfg_name, "") or "").strip()
+            if not val:
+                continue
+            if section == "censys":
+                # Censys needs id + secret, entered in the UI as "id:secret"
+                if ":" in val:
+                    cid, _, csecret = val.partition(":")
+                    api["censys"] = {"id": cid.strip(), "secret": csecret.strip()}
+                    synced.append("censys")
+                continue
+            api[section] = {"key": val}
+            synced.append(section)
+        if not synced:
+            return []
+        data["apikeys"] = api
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        except Exception:
+            return []
+        return synced
+
+    @classmethod
+    def load_auth_hash(cls):
+        if os.path.exists(cls.CONFIG_FILE):
+            with open(cls.CONFIG_FILE) as f:
+                return json.load(f).get("auth_hash")
+        return None
+
+    @classmethod
+    def get_secret_key(cls):
+        """Resolve the Flask session secret so it is STABLE across restarts.
+
+        Priority: GT_SECRET_KEY env var > value stored in config.json >
+        a freshly generated key that we then persist. Generating a new key
+        on every boot (the old behaviour) silently logged every user out.
+        Call after init() so BASE_DIR exists.
+        """
+        env_key = os.environ.get("GT_SECRET_KEY")
+        if env_key:
+            return env_key
+        cfg = {}
+        if os.path.exists(cls.CONFIG_FILE):
+            with open(cls.CONFIG_FILE) as f:
+                cfg = json.load(f)
+        key = cfg.get("secret_key")
+        if not key:
+            key = secrets.token_hex(32)
+            cfg["secret_key"] = key
+            with open(cls.CONFIG_FILE, "w") as f:
+                json.dump(cfg, f, indent=2)
+            try:
+                os.chmod(cls.CONFIG_FILE, 0o600)  # secrets live here — lock it down
+            except OSError:
+                pass
+        return key
+
+    @classmethod
+    def save_auth_hash(cls, hashed: str):
+        cfg = {}
+        if os.path.exists(cls.CONFIG_FILE):
+            with open(cls.CONFIG_FILE) as f:
+                cfg = json.load(f)
+        cfg["auth_hash"] = hashed
+        with open(cls.CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+        try:
+            os.chmod(cls.CONFIG_FILE, 0o600)
+        except OSError:
+            pass

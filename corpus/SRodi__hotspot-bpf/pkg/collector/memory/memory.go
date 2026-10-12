@@ -1,0 +1,105 @@
+// Package memory provides helpers for reading process memory metrics from /proc.
+//
+// These functions serve as a FALLBACK for processes that have no BPF-sourced RSS
+// (e.g., PIDs that appear only in CPU stats without page faults). The primary RSS
+// source is the BPF fault handler which reads mm->rss_stat directly in the kernel.
+package memory
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// rssBytes returns the resident set size for a single PID.
+func rssBytes(pid int) (uint64, error) {
+	if pid <= 0 {
+		return 0, fmt.Errorf("invalid pid %d", pid)
+	}
+	statmPath := filepath.Join("/proc", strconv.Itoa(pid), "statm")
+	data, err := os.ReadFile(statmPath)
+	if err != nil {
+		return 0, err
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 2 {
+		return 0, fmt.Errorf("unexpected statm format for pid %d", pid)
+	}
+	rssPages, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return rssPages * uint64(os.Getpagesize()), nil
+}
+
+// RSSBytesForPIDs returns a PID->RSS map for the provided set.
+// It retries once on transient /proc read failures to handle race conditions
+// where a process is briefly unavailable between BPF data collection and /proc reads.
+func RSSBytesForPIDs(pids []int) map[int]uint64 {
+	result := make(map[int]uint64, len(pids))
+	seen := make(map[int]struct{}, len(pids))
+	var retryPIDs []int
+	for _, pid := range pids {
+		if pid <= 0 {
+			continue
+		}
+		if _, ok := seen[pid]; ok {
+			continue
+		}
+		seen[pid] = struct{}{}
+		rss, err := rssBytes(pid)
+		if err == nil {
+			result[pid] = rss
+		} else if !errors.Is(err, os.ErrNotExist) {
+			retryPIDs = append(retryPIDs, pid)
+		}
+	}
+	if len(retryPIDs) > 0 {
+		time.Sleep(5 * time.Millisecond)
+		for _, pid := range retryPIDs {
+			rss, err := rssBytes(pid)
+			if err == nil {
+				result[pid] = rss
+			} else {
+				log.Printf("rss read failed for pid %d after retry: %v", pid, err)
+			}
+		}
+	}
+	return result
+}
+
+// TotalMemoryBytes returns the total system memory in bytes.
+// TODO: future scenario, consider container memory limits
+func TotalMemoryBytes() (uint64, error) {
+	f, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "MemTotal:") {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				return 0, fmt.Errorf("unexpected format for MemTotal")
+			}
+			kb, err := strconv.ParseUint(fields[1], 10, 64)
+			if err != nil {
+				return 0, err
+			}
+			return kb * 1024, nil // bytes
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	return 0, fmt.Errorf("MemTotal not found in /proc/meminfo")
+}

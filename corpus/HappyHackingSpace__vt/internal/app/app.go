@@ -1,0 +1,60 @@
+// Package app provides the application dependency container and configuration.
+package app
+
+import (
+	"os"
+	"path/filepath"
+
+	"github.com/happyhackingspace/vt/pkg/provider"
+	"github.com/happyhackingspace/vt/pkg/template"
+)
+
+// Config holds application configuration.
+type Config struct {
+	TemplatesPath string
+	StoragePath   string
+	LogLevel      string
+}
+
+// App is the dependency container for the application.
+type App struct {
+	Templates map[string]template.Template
+	Playbooks map[string]template.Playbook
+	Providers map[string]provider.Provider
+	Config    *Config
+}
+
+// DefaultConfig returns the default application configuration.
+func DefaultConfig() *Config {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		homeDir = "."
+	}
+
+	return &Config{
+		TemplatesPath: filepath.Join(homeDir, "vt-templates"),
+		StoragePath:   filepath.Join(homeDir, ".vt-cli"),
+		LogLevel:      "info",
+	}
+}
+
+// NewApp creates a new App instance with the given dependencies.
+func NewApp(
+	templates map[string]template.Template,
+	playbooks map[string]template.Playbook,
+	providers map[string]provider.Provider,
+	config *Config,
+) *App {
+	return &App{
+		Templates: templates,
+		Playbooks: playbooks,
+		Providers: providers,
+		Config:    config,
+	}
+}
+
+// GetProvider retrieves a provider by name from the app's provider map.
+func (a *App) GetProvider(name string) (provider.Provider, bool) {
+	p, ok := a.Providers[name]
+	return p, ok
+}

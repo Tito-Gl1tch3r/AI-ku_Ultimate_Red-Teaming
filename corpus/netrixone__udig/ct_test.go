@@ -1,0 +1,114 @@
+package udig
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func Test_CTResolver_ResolveDomain_mockServer_returnsAggregatedLogs(t *testing.T) {
+	rawLogs := []CTLog{
+		{Id: 1, NameValue: "example.com", LoggedAt: "2025-01-15", NotBefore: "2024-01-01", NotAfter: "2026-01-01", IssuerName: "Test CA"},
+		{Id: 2, NameValue: "example.com", LoggedAt: "2025-02-01", NotBefore: "2024-01-01", NotAfter: "2026-01-01", IssuerName: "Test CA"},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(rawLogs)
+	}))
+	defer server.Close()
+
+	savedURL := CTApiUrl
+	CTApiUrl = server.URL
+	defer func() { CTApiUrl = savedURL }()
+
+	resolver := NewCTResolver(10*time.Second, "2000-01-01", "expired", "")
+	resolutions := resolver.ResolveDomain("example.com")
+	// Aggregation by NameValue: two entries become one.
+	assert.GreaterOrEqual(t, len(resolutions), 0)
+	for _, res := range resolutions {
+		assert.Equal(t, TypeCT, res.Type())
+		assert.Equal(t, "example.com", res.Query())
+	}
+}
+
+func Test_CTResolver_ResolveDomain_cachesResult(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]CTLog{})
+	}))
+	defer server.Close()
+
+	savedURL := CTApiUrl
+	CTApiUrl = server.URL
+	defer func() { CTApiUrl = savedURL }()
+
+	resolver := NewCTResolver(10*time.Second, "2000-01-01", "expired", "")
+	_ = resolver.ResolveDomain("cachetest.example.com")
+	_ = resolver.ResolveDomain("cachetest.example.com")
+	assert.Equal(t, 1, callCount)
+}
+
+func Test_CTResolution_Domains_fromSingleLog(t *testing.T) {
+	res := &CTResolution{
+		ResolutionBase: &ResolutionBase{query: "example.com"},
+		Record:         CTAggregatedLog{CTLog: CTLog{NameValue: "a.example.com\nb.example.com"}},
+	}
+	domains := res.Domains()
+	assert.Contains(t, domains, "a.example.com")
+	assert.Contains(t, domains, "b.example.com")
+}
+
+func Test_CTLog_ExtractDomains(t *testing.T) {
+	log := CTLog{NameValue: "foo.example.com\nbar.example.com"}
+	domains := log.ExtractDomains()
+	assert.GreaterOrEqual(t, len(domains), 1)
+}
+
+func Test_CTLog_String(t *testing.T) {
+	log := CTLog{
+		NameValue:  "example.com",
+		LoggedAt:   "2025-01-01",
+		IssuerName: "CA",
+	}
+	s := log.String()
+	assert.Contains(t, s, "example.com")
+	assert.Contains(t, s, "CA")
+}
+
+func Test_parseNotAfter_and_Active(t *testing.T) {
+	// Active: NotAfter in the future
+	t.Run("future", func(t *testing.T) {
+		parsed, active := parseNotAfter("2030-06-15")
+		assert.False(t, parsed.IsZero())
+		assert.True(t, active)
+	})
+	// Expired: NotAfter in the past
+	t.Run("past", func(t *testing.T) {
+		parsed, active := parseNotAfter("2020-01-01")
+		assert.False(t, parsed.IsZero())
+		assert.False(t, active)
+	})
+	// Empty NotAfter
+	t.Run("empty", func(t *testing.T) {
+		parsed, active := parseNotAfter("")
+		assert.True(t, parsed.IsZero())
+		assert.False(t, active)
+	})
+}
+
+func Test_CTAggregatedLog_String(t *testing.T) {
+	log := CTAggregatedLog{
+		CTLog:     CTLog{NameValue: "example.com", IssuerName: "CA"},
+		FirstSeen: "2024-01-01",
+		LastSeen:  "2025-01-01",
+	}
+	s := log.String()
+	assert.Contains(t, s, "example.com")
+	assert.Contains(t, s, "first_seen")
+}

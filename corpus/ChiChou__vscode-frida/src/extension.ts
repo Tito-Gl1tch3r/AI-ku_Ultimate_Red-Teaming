@@ -1,0 +1,138 @@
+// The module 'vscode' contains the VS Code extensibility API
+// Import the module and reference it with the alias vscode in your code below
+import * as vscode from 'vscode';
+
+import { DevicesProvider } from './providers/devices';
+import { ProviderType } from './types';
+
+import * as android from './commands/android';
+import * as boilerplate from './commands/boilerplate';
+import * as clipboard from './commands/clipboard';
+import dump from './commands/dump';
+import * as objection from './commands/objection';
+import * as repl from './commands/repl';
+import * as ssh from './commands/ssh';
+import * as syslog from './commands/syslog';
+import * as typing from './commands/typing';
+import * as views from './commands/views';
+
+import { FridaCompletionProvider } from './providers/completion';
+import * as target from './commands/target';
+import { logger } from './logger';
+
+function errorMessage(error: unknown): string {
+	if (error instanceof Error && error.message) {
+		return error.message;
+	}
+	return String(error);
+}
+
+export function activate(context: vscode.ExtensionContext) {
+	logger.appendLine('Frida extension activated');
+	const register = (cmd: string, cb: (...args: any[]) => any) => vscode.commands.registerCommand(cmd, async (...args: any[]) => {
+		try {
+			return await cb(...args);
+		} catch (error) {
+			const message = errorMessage(error);
+			logger.appendLine(`Error: command ${cmd} failed - ${message}`);
+			if (error instanceof Error && error.stack) {
+				logger.appendLine(error.stack);
+			}
+			vscode.window.showErrorMessage(vscode.l10n.t('Frida command failed: {0}', message));
+		}
+	});
+	const push = (item: vscode.Disposable) => context.subscriptions.push(item);
+
+	const appsProvider = new DevicesProvider(ProviderType.Apps);
+	vscode.window.registerTreeDataProvider('fridaApps', appsProvider);
+
+	push(register('frida.apps.refresh', () => appsProvider.refresh()));
+
+	const psProvider = new DevicesProvider(ProviderType.Processes);
+	vscode.window.registerTreeDataProvider('fridaPs', psProvider);
+
+	push(register('frida.ps.refresh', () => {
+		psProvider.refresh();
+	}));
+	push(register('frida.spawn', repl.spawn));
+	push(register('frida.spawn.suspended', repl.spawnSuspended));
+	push(register('frida.attach', repl.attach));
+	push(register('frida.attach.elevated', repl.attachElevated));
+	push(register('frida.kill', repl.kill));
+	push(register('frida.remote.add', repl.addRemote));
+	push(register('frida.remote.remove', repl.delRemote));
+
+	push(register('frida.syslog', syslog.show));
+	push(register('frida.syslog.vacuum', syslog.vacuum));
+
+	push(register('frida.bundle.copy', clipboard.copy));
+	push(register('frida.name.copy', clipboard.copy));
+	push(register('frida.pid.copy', clipboard.copyPid));
+	push(register('frida.path.copy', clipboard.copyPath));
+	push(register('frida.device.copy', clipboard.copy));
+	
+	push(register('frida.device.androidserver', android.startServer));
+	push(register('frida.external.objection', objection.explore));
+
+	push(register('frida.external.apk', dump));
+
+	push(register('frida.external.shell', ssh.shell));
+
+	push(register('frida.boilerplate.agent', boilerplate.agent));
+	push(register('frida.boilerplate.module', boilerplate.module));
+	push(register('frida.debug.setup', boilerplate.debug));
+
+	push(register('frida.typing.init', typing.init));
+
+	views.init(context);
+	push(register('frida.view.classes', views.classes));
+	push(register('frida.view.protocols', views.protocols));
+	push(register('frida.view.modules', views.modules));
+	push(register('frida.view.detail', views.detail));
+	push(register('frida.view.memory', views.memory));
+	push(register('frida.view.scanner', views.scanner));
+	push(register('frida.view.manifest', views.manifest));
+	push(register('frida.view.infoPlist', views.infoPlist));
+	push(register('frida.view.entitlements', views.entitlements));
+
+	// auto-refresh timer
+	//
+	// Use a self-rescheduling setTimeout rather than setInterval: when the
+	// machine hibernates the timer cannot fire, and on wake setInterval fires
+	// repeatedly to "catch up" on every missed tick, which would reload the
+	// lists endlessly. A setTimeout that only schedules the next tick after the
+	// current one runs has no backlog to catch up on, so it fires at most once.
+	let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+	function startAutoRefresh() {
+		if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = undefined; }
+		const interval = vscode.workspace.getConfiguration('frida').get<number>('refreshInterval', 0);
+		if (interval > 0) {
+			const tick = () => {
+				appsProvider.refresh();
+				psProvider.refresh();
+				refreshTimer = setTimeout(tick, interval);
+			};
+			refreshTimer = setTimeout(tick, interval);
+		}
+	}
+	startAutoRefresh();
+	push(vscode.workspace.onDidChangeConfiguration(e => {
+		if (e.affectsConfiguration('frida.refreshInterval')) { startAutoRefresh(); }
+	}));
+	push({ dispose() { if (refreshTimer) { clearTimeout(refreshTimer); } } });
+
+	const completionProvider = new FridaCompletionProvider();
+	push(vscode.languages.registerCompletionItemProvider(
+		[{ language: 'javascript', scheme: '*' }, { language: 'typescript', scheme: '*' }],
+		completionProvider,
+		'.', "'", '"', '`', '['
+	));
+	push(completionProvider);
+
+	push(register('frida.lsp.target', target.setTarget));
+}
+
+// this method is called when your extension is deactivated
+export function deactivate() {
+
+}

@@ -1,0 +1,218 @@
+package command
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/spf13/cobra"
+	"github.com/v-byte-cpu/sx/command/log"
+	"github.com/v-byte-cpu/sx/pkg/packet"
+	"github.com/v-byte-cpu/sx/pkg/packet/afpacket"
+	"github.com/v-byte-cpu/sx/pkg/scan"
+	"go.uber.org/ratelimit"
+)
+
+func Main(version string) {
+	if err := newRootCmd(version).Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func newRootCmd(version string) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "sx",
+		Short:   "Fast, modern, easy-to-use network scanner",
+		Version: version,
+	}
+
+	tcpCmd := newTCPFlagsCmd().cmd
+	tcpCmd.AddCommand(
+		newTCPSYNCmd().cmd,
+		newTCPFINCmd().cmd,
+		newTCPNULLCmd().cmd,
+		newTCPXmasCmd().cmd,
+	)
+	icmpCmd := newICMPCmd().cmd
+	icmpCmd.AddCommand(newICMPDiscoverCmd().cmd)
+
+	cmd.AddCommand(
+		newARPCmd().cmd,
+		newNDPCmd().cmd,
+		icmpCmd,
+		newUDPCmd().cmd,
+		tcpCmd,
+		newSocksCmd().cmd,
+	)
+
+	return cmd
+}
+
+type bpfFilterFunc func(r *scan.Range) (filter string, maxPacketLength int)
+
+type engineConfig struct {
+	logger    log.Logger
+	scanRange scan.Range
+	exitDelay time.Duration
+}
+
+type engineConfigOption func(c *engineConfig)
+
+func withLogger(logger log.Logger) engineConfigOption {
+	return func(c *engineConfig) {
+		c.logger = logger
+	}
+}
+
+func withScanRange(r *scan.Range) engineConfigOption {
+	return func(c *engineConfig) {
+		c.scanRange = *r
+	}
+}
+
+func withExitDelay(exitDelay time.Duration) engineConfigOption {
+	return func(c *engineConfig) {
+		c.exitDelay = exitDelay
+	}
+}
+
+func newEngineConfig(opts ...engineConfigOption) *engineConfig {
+	c := &engineConfig{
+		exitDelay: defaultExitDelay,
+	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
+}
+
+type packetScanConfig struct {
+	engineConfig
+	scanMethod scan.PacketMethod
+	bpfFilter  bpfFilterFunc
+	rateCount  int
+	rateWindow time.Duration
+	vpnMode    bool
+}
+
+type packetScanConfigOption func(c *packetScanConfig)
+
+func withPacketEngineConfig(conf *engineConfig) packetScanConfigOption {
+	return func(c *packetScanConfig) {
+		c.engineConfig = *conf
+	}
+}
+
+func withPacketScanMethod(sm scan.PacketMethod) packetScanConfigOption {
+	return func(c *packetScanConfig) {
+		c.scanMethod = sm
+	}
+}
+
+func withPacketBPFFilter(bpfFilter bpfFilterFunc) packetScanConfigOption {
+	return func(c *packetScanConfig) {
+		c.bpfFilter = bpfFilter
+	}
+}
+
+func withRateCount(rateCount int) packetScanConfigOption {
+	return func(c *packetScanConfig) {
+		c.rateCount = rateCount
+	}
+}
+
+func withRateWindow(rateWindow time.Duration) packetScanConfigOption {
+	return func(c *packetScanConfig) {
+		c.rateWindow = rateWindow
+	}
+}
+
+func withPacketVPNmode(vpnMode bool) packetScanConfigOption {
+	return func(c *packetScanConfig) {
+		c.vpnMode = vpnMode
+	}
+}
+
+func newPacketScanConfig(opts ...packetScanConfigOption) *packetScanConfig {
+	c := &packetScanConfig{}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
+}
+
+func startPortScanEngine(ctx context.Context, conf *packetScanConfig) error {
+	// BPF filter doesn't accept large list of port ranges
+	chunkSize := 200
+	for i := 0; i < len(conf.scanRange.Ports); i += chunkSize {
+		end := i + chunkSize
+		if end > len(conf.scanRange.Ports) {
+			end = len(conf.scanRange.Ports)
+		}
+		newConf := *conf
+		newConf.scanRange.Ports = conf.scanRange.Ports[i:end]
+		if err := startPacketScanEngine(ctx, &newConf); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func startPacketScanEngine(ctx context.Context, conf *packetScanConfig) error {
+	r := &conf.scanRange
+
+	// setup network interface to read/write packets
+	ps, err := afpacket.NewPacketSource(r.Interface.Name, conf.vpnMode, r.SrcIP.Is6())
+	if err != nil {
+		return err
+	}
+	defer ps.Close()
+	err = ps.SetBPFFilter(conf.bpfFilter(r))
+	if err != nil {
+		return fmt.Errorf("BPFFilter: %w", err)
+	}
+	var rw packet.ReadWriter = ps
+	// setup rate limit for sending packets
+	if conf.rateCount > 0 {
+		rw = packet.NewRateLimitReadWriter(ps,
+			ratelimit.New(conf.rateCount, ratelimit.Per(conf.rateWindow)))
+	}
+	engine := scan.SetupPacketEngine(rw, conf.scanMethod)
+	return startScanEngine(ctx, engine, &conf.engineConfig)
+}
+
+func startScanEngine(ctx context.Context, engine scan.EngineResulter, conf *engineConfig) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	logger := conf.logger
+
+	// setup result logging
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		logger.LogResults(ctx, engine.Results())
+	}()
+
+	// start scan
+	done, errc := engine.Start(ctx, &conf.scanRange)
+	go func() {
+		defer cancel()
+		<-done
+		<-time.After(conf.exitDelay)
+	}()
+
+	// error logging
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for err := range errc {
+			logger.Error(err)
+		}
+	}()
+	wg.Wait()
+	return nil
+}

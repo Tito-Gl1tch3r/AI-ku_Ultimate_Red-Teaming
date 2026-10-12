@@ -1,0 +1,416 @@
+"""Console output formatting and display utilities for Naminter CLI."""
+
+from dataclasses import dataclass
+from datetime import timedelta
+import difflib
+from pathlib import Path
+from typing import Any
+
+from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.style import Style
+from rich.table import Table
+from rich.text import Text
+from rich.tree import Tree
+
+from naminter import (
+    __author__,
+    __description__,
+    __email__,
+    __license__,
+    __url__,
+    __version__,
+)
+from naminter.cli.constants import (
+    STATUS_STYLES,
+    STATUS_SYMBOLS,
+    VERBOSE_LEVEL_DETAILS,
+    VERBOSE_LEVEL_HEADERS,
+)
+from naminter.core.models import WMNResult, WMNStatus, WMNTestResult
+
+console: Console = Console()
+
+
+@dataclass(frozen=True)
+class Theme:
+    """Application color theme configuration.
+
+    Attributes:
+        primary: Primary accent color.
+        success: Color for success messages.
+        error: Color for error messages.
+        warning: Color for warning messages.
+        info: Color for informational messages.
+        muted: Color for de-emphasized text.
+    """
+
+    primary: str = "bright_blue"
+    success: str = "bright_green"
+    error: str = "bright_red"
+    warning: str = "bright_yellow"
+    info: str = "bright_cyan"
+    muted: str = "bright_black"
+
+
+THEME = Theme()
+
+
+def _get_status_symbol(status: WMNStatus) -> str:
+    """Get display symbol for a status using constants.
+
+    Args:
+        status: The WMNStatus to get symbol for.
+
+    Returns:
+        str: Symbol character for the status.
+    """
+    return STATUS_SYMBOLS.get(status, "?")
+
+
+def _get_status_style(status: WMNStatus) -> Style:
+    """Get Rich Style for a status using constants.
+
+    Args:
+        status: The WMNStatus to get styling for.
+
+    Returns:
+        Style: Rich Style object with appropriate color and formatting.
+    """
+    style_str = STATUS_STYLES.get(status, "white")
+    return Style.parse(style_str)
+
+
+class ResultFormatter:
+    """Formats enumeration and validation results for console output."""
+
+    def __init__(self, *, verbose: int = 0) -> None:
+        """Initialize the result formatter.
+
+        Args:
+            verbose: Verbosity level (0=off, 1=errors, 2=+details, 3=+headers).
+        """
+        self.verbose = verbose
+
+    def format_result(
+        self,
+        site_result: WMNResult,
+        response_file_path: Path | None = None,
+    ) -> Tree:
+        """Format a single result as a tree-style output.
+
+        Args:
+            site_result: The result to format.
+            response_file_path: Optional path to the response file for debugging.
+
+        Returns:
+            Tree: Rich Tree containing the formatted result.
+        """
+        root_label = Text()
+        status_symbol = _get_status_symbol(site_result.status)
+        status_style = _get_status_style(site_result.status)
+
+        root_label.append(status_symbol, style=status_style)
+        root_label.append(" [", style=THEME.muted)
+        root_label.append(site_result.name or "Unknown", style=THEME.info)
+        root_label.append("] ", style=THEME.muted)
+        root_label.append(
+            site_result.uri_pretty or "",
+            style=THEME.primary,
+        )
+
+        tree = Tree(root_label, guide_style=THEME.muted)
+
+        if self.verbose > 0:
+            self._add_verbose(
+                tree,
+                self.verbose,
+                status_code=site_result.status_code,
+                headers=site_result.headers,
+                elapsed=site_result.elapsed,
+                error=site_result.error,
+                response_file=response_file_path,
+            )
+
+        return tree
+
+    def format_test_result(
+        self,
+        test_result: WMNTestResult,
+        response_files: list[Path | None] | None = None,
+    ) -> Tree:
+        """Format a site test result as a tree-style output.
+
+        Args:
+            test_result: The site test result to format.
+            response_files: Optional list of response file paths for debugging.
+
+        Returns:
+            Tree: Rich Tree containing the formatted test result.
+        """
+        root_label = Text()
+        root_label.append(
+            _get_status_symbol(test_result.status),
+            style=_get_status_style(test_result.status),
+        )
+        root_label.append(" [", style=THEME.muted)
+        root_label.append(test_result.name, style=THEME.info)
+        root_label.append("]", style=THEME.muted)
+
+        tree = Tree(root_label, guide_style=THEME.muted, expanded=True)
+
+        if test_result.results:
+            for i, result in enumerate(test_result.results):
+                url_text = Text()
+                url_text.append(
+                    _get_status_symbol(result.status),
+                    style=_get_status_style(result.status),
+                )
+                url_text.append(" ", style=THEME.muted)
+                url_text.append(f"{result.username}: ", style=THEME.info)
+                url_text.append(
+                    result.uri_pretty or "",
+                    style=THEME.primary,
+                )
+
+                result_node = tree.add(url_text)
+
+                if self.verbose > 0:
+                    response_file = (
+                        response_files[i]
+                        if response_files and i < len(response_files)
+                        else None
+                    )
+                    self._add_verbose(
+                        result_node,
+                        self.verbose,
+                        status_code=result.status_code,
+                        headers=result.headers,
+                        elapsed=result.elapsed,
+                        error=result.error,
+                        response_file=response_file,
+                    )
+
+        return tree
+
+    @staticmethod
+    def _add_verbose(
+        node: Tree,
+        level: int,
+        *,
+        status_code: int | None = None,
+        headers: dict[str, str] | None = None,
+        elapsed: timedelta | None = None,
+        error: str | None = None,
+        response_file: Path | None = None,
+    ) -> None:
+        """Add debug information to a tree node based on verbosity level.
+
+        Verbosity levels: 1 (-v) shows error details, 2 (-vv) adds status
+        code, elapsed time, and response file path, 3 (-vvv) adds headers.
+
+        Args:
+            node: The tree node to add information to.
+            level: Verbosity level (1-3).
+            status_code: Optional HTTP status code.
+            headers: Optional HTTP response headers.
+            elapsed: Optional elapsed time.
+            error: Optional error message.
+            response_file: Optional path to response file.
+        """
+        if error is not None:
+            node.add(Text(f"Error: {error}", style=THEME.error))
+
+        if level >= VERBOSE_LEVEL_DETAILS:
+            if status_code is not None:
+                node.add(Text(f"Status Code: {status_code}", style=THEME.info))
+            if elapsed is not None:
+                elapsed_seconds = elapsed.total_seconds()
+                node.add(Text(f"Elapsed: {elapsed_seconds:.2f}s", style=THEME.info))
+            if response_file is not None:
+                node.add(Text(f"Response File: {response_file}", style=THEME.info))
+
+        if level >= VERBOSE_LEVEL_HEADERS and headers:
+            headers_node = node.add(Text("Headers:", style=THEME.info))
+            for key, value in headers.items():
+                headers_node.add(Text(f"{key}: {value}", style=THEME.muted))
+
+
+def _display_message(
+    message: str,
+    style: str,
+    symbol: str,
+    label: str,
+    end: str = "\n",
+) -> None:
+    """Display a styled message with symbol and label.
+
+    Args:
+        message: The message text to display.
+        style: Rich style string for the symbol and label.
+        symbol: Symbol character to prefix the message.
+        label: Label text shown between brackets after the symbol.
+        end: String to append after the message (default: newline).
+    """
+
+    formatted_message = Text()
+    formatted_message.append(symbol, style=style)
+    formatted_message.append(f" [{label}] ", style=style)
+    formatted_message.append(message)
+
+    console.print(formatted_message, end=end)
+    console.file.flush()
+
+
+def display_error(
+    message: str,
+    *,
+    end: str = "\n",
+) -> None:
+    """Display an error message.
+
+    Args:
+        message: The error message to display.
+        end: String to append after the message (default: newline).
+    """
+    _display_message(message, THEME.error, "!", "ERROR", end=end)
+
+
+def display_warning(message: str) -> None:
+    """Display a warning message.
+
+    Args:
+        message: The warning message to display.
+    """
+
+    _display_message(message, THEME.warning, "?", "WARNING")
+
+
+def _add_error_nodes(parent: Tree, errors: list[Any]) -> None:
+    """Add validation error entries as children of a tree node."""
+    for error in errors:
+        path = str(getattr(error, "path", "N/A") or "N/A")
+        message = str(getattr(error, "message", "Unknown error"))
+        data = getattr(error, "data", None)
+
+        error_text = Text()
+        error_text.append("• ", style=THEME.error)
+        error_text.append(f"{path}: ", style=THEME.info)
+        error_text.append(message, style=THEME.warning)
+
+        error_node = parent.add(error_text)
+
+        if data is not None:
+            error_node.add(Text(f"Data: {data}", style=THEME.muted))
+
+
+def display_validation_errors(
+    message: str,
+    *,
+    schema_errors: list[Any] | None = None,
+    data_errors: list[Any] | None = None,
+) -> None:
+    """Display WMN validation failures as one tree rooted at the error message.
+
+    Args:
+        message: Top-level error message.
+        schema_errors: Optional JSON schema validation errors.
+        data_errors: Optional custom data validation errors.
+    """
+    schema_errors = schema_errors or []
+    data_errors = data_errors or []
+
+    if not schema_errors and not data_errors:
+        display_error(message)
+        return
+
+    root_label = Text()
+    root_label.append("!", style=THEME.error)
+    root_label.append(" [ERROR] ", style=THEME.error)
+    root_label.append(message)
+
+    tree = Tree(root_label, guide_style=THEME.muted, expanded=True)
+
+    if schema_errors:
+        schema_label = Text()
+        schema_label.append("Schema Errors ", style=THEME.error)
+        schema_label.append(f"({len(schema_errors)})", style=THEME.muted)
+        schema_node = tree.add(schema_label)
+        _add_error_nodes(schema_node, schema_errors)
+
+    if data_errors:
+        data_label = Text()
+        data_label.append("Data Errors ", style=THEME.error)
+        data_label.append(f"({len(data_errors)})", style=THEME.muted)
+        data_node = tree.add(data_label)
+        _add_error_nodes(data_node, data_errors)
+
+    console.print(tree)
+    console.file.flush()
+
+
+def display_version() -> None:
+    """Display version and metadata of the application."""
+
+    version_table = Table.grid(padding=(0, 2))
+    version_table.add_column(style=THEME.info)
+    version_table.add_column(style="bold")
+
+    version_table.add_row("Version:", __version__)
+    version_table.add_row("Author:", __author__)
+    version_table.add_row("Description:", __description__)
+    version_table.add_row("License:", __license__)
+    version_table.add_row("Email:", __email__)
+    version_table.add_row("GitHub:", __url__)
+
+    panel = Panel(
+        version_table,
+        title="[bold]:mag: Naminter[/]",
+        border_style=THEME.muted,
+        box=box.ROUNDED,
+    )
+
+    console.print(panel)
+
+
+def display_diff(original: str, formatted: str, file_path: Path) -> None:
+    """Display a git-style diff showing changes between original and formatted content.
+
+    Args:
+        original: The original file content.
+        formatted: The formatted file content.
+        file_path: Path to the file being formatted.
+    """
+    original_lines = original.splitlines(keepends=False)
+    formatted_lines = formatted.splitlines(keepends=False)
+
+    diff = difflib.unified_diff(
+        original_lines,
+        formatted_lines,
+        fromfile=str(file_path),
+        tofile=str(file_path),
+        lineterm="",
+    )
+
+    diff_lines = list(diff)
+    if not diff_lines:
+        return
+
+    diff_text = Text()
+    for line in diff_lines:
+        if line.startswith(("---", "+++")):
+            diff_text.append(line, style=THEME.muted)
+        elif line.startswith("@@"):
+            diff_text.append(line, style=THEME.info)
+        elif line.startswith("-"):
+            diff_text.append(line, style=THEME.error)
+        elif line.startswith("+"):
+            diff_text.append(line, style=THEME.success)
+        else:
+            diff_text.append(line)
+
+        diff_text.append("\n")
+
+    console.print(diff_text)
+    console.file.flush()

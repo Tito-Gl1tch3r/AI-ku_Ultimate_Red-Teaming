@@ -1,0 +1,52 @@
+//! Command-line entry point for `haruspex`.
+
+use std::env;
+use std::ffi::OsStr;
+use std::path::Path;
+use std::process::ExitCode;
+
+/// Binary name.
+const PROGRAM: &str = env!("CARGO_BIN_NAME");
+/// Package version.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Package authors.
+const AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
+
+fn main() -> ExitCode {
+    eprintln!("{PROGRAM} {VERSION} - Tool to extract IDA decompiler's pseudocode");
+    eprintln!("Copyright (c) 2024-2026 {AUTHORS}");
+    eprintln!();
+
+    // Force IDA to stay quiet.
+    idalib::force_batch_mode();
+
+    let mut args = env::args_os();
+    let argv0 = args.next().unwrap_or_else(|| PROGRAM.into());
+    let is_help = |arg: &OsStr| matches!(arg.to_str(), Some("-h" | "--help"));
+
+    let prog = Path::new(&argv0)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or(PROGRAM);
+
+    let filename = match (args.next(), args.next()) {
+        (Some(arg), None) if !is_help(&arg) => arg,
+        _ => return usage(prog),
+    };
+
+    match haruspex::run(&filename) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("[!] Error: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Prints usage information and returns a failure exit code.
+fn usage(prog: &str) -> ExitCode {
+    eprintln!("Usage:");
+    eprintln!("{prog} <binary_file>");
+
+    ExitCode::FAILURE
+}

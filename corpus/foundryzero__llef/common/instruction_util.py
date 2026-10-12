@@ -1,0 +1,140 @@
+import re
+from re import Match
+
+from lldb import SBAddress, SBInstruction, SBTarget
+
+from arch import I386, X86_64, BaseArch
+from common.color_settings import LLEFColorSettings
+from common.golang.analysis import go_annotate_jumps
+from common.golang.util import go_context_analysis
+from common.output_util import color_string, output_line
+from common.settings import LLEFSettings
+
+
+def extract_instructions(
+    target: SBTarget, arch: BaseArch, start_address: int, end_address: int, disassembly_flavour: str
+) -> list[SBInstruction]:
+    """
+    Returns a list of instructions between a range of memory address defined by @start_address and @end_address.
+
+    :param target: The target context.
+    :param start_address: The address to start reading instructions from memory.
+    :param end_address: The address to stop reading instruction from memory.
+    :return: A list of instructions.
+    """
+    instructions = []
+    current = start_address
+    while current <= end_address:
+        address = SBAddress(current, target)
+        if arch is I386 or arch is X86_64:
+            instruction = target.ReadInstructions(address, 1, disassembly_flavour).GetInstructionAtIndex(0)
+        else:
+            instruction = target.ReadInstructions(address, 1).GetInstructionAtIndex(0)
+        instructions.append(instruction)
+        instruction_size = instruction.GetByteSize()
+        if instruction_size > 0:
+            current += instruction_size
+        else:
+            break
+
+    return instructions
+
+
+def color_operands(
+    operands: str,
+    color_settings: LLEFColorSettings,
+) -> str:
+    """
+    Colors the registers and addresses in the instruction's operands.
+
+    :param operands: A string of the instruction's operands returned from instruction.GetOperands().
+    :param color_settings: Contains the color settings to color the instruction.
+    """
+
+    # Addresses can start with either '$0x', '#0x' or just '0x', followed by atleast one hex value.
+    address_pattern = r"(\$?|#?)-?0x[0-9a-fA-F]+"
+
+    # Registers MAY start with '%'.
+    # Then there MUST be a sequence of letters, which CAN be followed by a number.
+    # A register can NEVER start with numbers or any other special character other than '%'.
+    register_pattern = r"(?<![\w])%?[a-zA-Z]+[0-9]*"
+
+    def color_register(match: Match[str]) -> str:
+        return color_string(match.group(0), color_settings.register_color)
+
+    def color_address(match: Match[str]) -> str:
+        return color_string(match.group(0), color_settings.address_operand_color)
+
+    operands = re.sub(register_pattern, color_register, operands)
+    operands = re.sub(address_pattern, color_address, operands)
+
+    return operands
+
+
+def print_instruction(
+    target: SBTarget,
+    instruction: SBInstruction,
+    lldb_frame_start: int,
+    function_start: int,
+    settings: LLEFSettings,
+    color_settings: LLEFColorSettings,
+    highlight: bool = False,
+) -> None:
+    """
+    Print formatted @instruction extracted from SBInstruction object.
+
+    :param target: The target executable.
+    :param instruction: The instruction object.
+    :param base: The address base to calculate offsets from.
+    :param color_settings: Contains the color settings to color the instruction.
+    :param highlight: If true, highlight the whole instruction with the highlight color.
+    """
+
+    address = instruction.GetAddress().GetLoadAddress(target)
+    offset = address - function_start
+
+    line = hex(address)
+    if offset >= 0:
+        line += f" <+{offset:02}>: "
+    else:
+        line += f" <-{abs(offset):02}>: "
+
+    mnemonic = instruction.GetMnemonic(target) or ""
+    operands = instruction.GetOperands(target) or ""
+    comment = instruction.GetComment(target) or ""
+
+    ops_width = len(operands)  # visible length, for spacing (before colouring)
+    if go_context_analysis(settings):
+        comment = go_annotate_jumps(target, instruction, lldb_frame_start, comment)
+
+    if not highlight:
+        operands = color_operands(operands, color_settings)
+
+    if comment != "":
+        comment = f"; {comment}"
+    line += f"{mnemonic:<10}{operands.ljust(35 + len(operands) - ops_width)}{comment}"
+
+    if highlight:
+        line = color_string(line, color_settings.highlighted_instruction_color)
+
+    output_line(line)
+
+
+def print_instructions(
+    target: SBTarget,
+    instructions: list[SBInstruction],
+    lldb_frame_start: int,
+    function_start: int,
+    settings: LLEFSettings,
+    color_settings: LLEFColorSettings,
+) -> None:
+    """
+    Print formatted @instructions extracting information from the SBInstruction objects.
+
+    :param target: The target executable.
+    :param instructions: A list of instruction objects.
+    :param base: The address base to calculate offsets from.
+    :param color_settings: Contains the color settings to color the instruction.
+    """
+    for instruction in instructions:
+        print_instruction(target, instruction, lldb_frame_start, function_start, settings, color_settings)

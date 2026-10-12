@@ -1,0 +1,132 @@
+import sys
+import sqlite3
+from codeargos.scrapedpage import ScrapedPage
+from codeargos.diff import Diff
+import threading
+from os.path import isfile, getsize
+import logging
+import json
+
+class DataStore:
+    def __init__(self, db_file_name):
+        # To handle the fact python doesn't like recursive cursors
+        # for sqlite, we have to use thread locking to prevent mangling
+        self.lock = threading.Lock()
+
+        # sqlite3 does not like multithreading in python. 
+        # We have to remove the thread id check.
+        self.conn = sqlite3.connect( db_file_name, check_same_thread=False )
+        self.conn.row_factory = sqlite3.Row
+
+        self.db = self.conn.cursor()
+        self.create_datastore()
+
+    def close(self):
+        self.db.close()
+        self.conn.close()
+    
+    def create_datastore(self):
+        try:
+            self.lock.acquire(True)
+            self.db.execute( 
+                """CREATE TABLE IF NOT EXISTS 
+                    pages (
+                        url TEXT NOT NULL PRIMARY KEY, 
+                        sig TEXT NOT NULL, 
+                        content TEXT,
+                        last_update DATETIME DEFAULT CURRENT_TIMESTAMP)
+                """ )
+            self.conn.commit()
+
+            self.db.execute( 
+                """CREATE TABLE IF NOT EXISTS 
+                    diffs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        url TEXT, 
+                        content TEXT,
+                        last_update DATETIME DEFAULT CURRENT_TIMESTAMP)
+                """ )
+            self.conn.commit()
+        finally:
+            self.lock.release()                
+
+    def add_page(self, page):
+        # As sqlite doesn't have UPSERT, this will do the trick
+        try:
+            self.lock.acquire(True)
+            self.db.execute(
+                """INSERT INTO pages VALUES( :url, :sig, :content, CURRENT_TIMESTAMP )
+                    ON CONFLICT(url) 
+                        DO UPDATE SET sig=:sig, content=:content, last_update=CURRENT_TIMESTAMP
+                """, 
+                { 
+                    'url': page.url, 
+                    'sig': page.signature, 
+                    'content': page.content
+                })
+            self.conn.commit()
+        finally:
+            self.lock.release()
+
+    def add_diff(self, url, diff_content):
+        last_id = -1
+        try:
+            self.lock.acquire(True)
+            # We store the history of all code changes.            
+            self.db.execute(
+                """INSERT INTO diffs VALUES( :id, :url, :content, CURRENT_TIMESTAMP )""", 
+                { 
+                    'id': None,
+                    'url': url, 
+                    'content': diff_content
+                })
+            self.conn.commit()
+
+            last_id = self.db.lastrowid
+        finally:
+            self.lock.release()
+
+        return last_id
+            
+    def get_page(self, url):
+        page = None
+        try:
+            self.lock.acquire(True)
+            self.db.execute("SELECT * FROM pages WHERE url=:u", {'u': url})
+            data = self.db.fetchone()
+            if data:
+                page = ScrapedPage( 
+                    data['url'], 
+                    data['sig'], 
+                    data['content'])
+        finally:
+            self.lock.release()
+        return page
+
+    def get_diff(self, diff_id):
+        diff = None
+        try:
+            self.lock.acquire(True)
+            self.db.execute("SELECT * FROM diffs WHERE id=:id", {'id': diff_id})
+            data = self.db.fetchone()
+            if data:
+                diff = Diff(
+                    diff_id, 
+                    data['url'], 
+                    data['content'],
+                    data['last_update']
+                    )
+        finally:
+            self.lock.release()
+        return diff
+
+    def dump_pages(self):
+        try:
+            self.lock.acquire(True)
+            self.db.execute( "SELECT * FROM pages")
+            pages = self.db.fetchall()
+        finally:
+            self.lock.release()
+
+        for page in pages:
+            print(page)

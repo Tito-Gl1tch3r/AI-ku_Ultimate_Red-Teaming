@@ -1,0 +1,220 @@
+package dockercompose
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"github.com/compose-spec/compose-go/v2/loader"
+	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/docker/cli/cli/command"
+	"github.com/docker/cli/cli/flags"
+	"github.com/docker/compose/v2/pkg/api"
+	"github.com/docker/compose/v2/pkg/compose"
+	"github.com/happyhackingspace/vt/internal/app"
+	tmpl "github.com/happyhackingspace/vt/pkg/template"
+)
+
+func createDockerCLI() (command.Cli, error) {
+	dockerCli, err := command.NewDockerCli()
+	if err != nil {
+		return nil, err
+	}
+
+	opts := flags.NewClientOptions()
+	err = dockerCli.Initialize(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return dockerCli, nil
+}
+
+func loadComposeProject(template tmpl.Template) (*types.Project, error) {
+	cfg := app.DefaultConfig()
+	composePath, workingDir, err := tmpl.GetDockerComposePath(template.ID, cfg.TemplatesPath)
+	if err != nil {
+		return nil, err
+	}
+
+	projectName := toProjectName(template.ID)
+
+	configDetails := types.ConfigDetails{
+		WorkingDir: workingDir,
+		ConfigFiles: []types.ConfigFile{
+			{
+				Filename: composePath,
+			},
+		},
+		Environment: map[string]string{
+			"COMPOSE_PROJECT_NAME": projectName,
+		},
+	}
+
+	project, err := loader.LoadWithContext(
+		context.Background(),
+		configDetails,
+		func(options *loader.Options) {
+			options.SkipValidation = false
+			options.SkipInterpolation = false
+			options.SetProjectName(projectName, true)
+			options.ResolvePaths = true
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	updatedServices := make(types.Services, len(project.Services))
+	for name, service := range project.Services {
+		serviceCopy := service
+		if serviceCopy.Labels == nil {
+			serviceCopy.Labels = make(map[string]string)
+		}
+		serviceCopy.Labels["com.docker.compose.project"] = projectName
+		serviceCopy.Labels["com.docker.compose.service"] = name
+		serviceCopy.Labels["com.docker.compose.project.working_dir"] = workingDir
+		serviceCopy.Labels["com.docker.compose.project.config_files"] = composePath
+		serviceCopy.Labels["com.docker.compose.config-hash"] = name
+		serviceCopy.Labels["com.docker.compose.oneoff"] = "False"
+		serviceCopy.Labels["vt.template-id"] = template.ID
+		updatedServices[name] = serviceCopy
+	}
+	project.Services = updatedServices
+
+	return project, nil
+}
+
+func runComposeUp(dockerCli command.Cli, project *types.Project) error {
+	composeService := compose.NewComposeService(dockerCli)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	servicesToBuild := []string{}
+	for name, service := range project.Services {
+		if service.Build != nil {
+			servicesToBuild = append(servicesToBuild, name)
+		}
+	}
+
+	if len(servicesToBuild) > 0 {
+		err := composeService.Build(ctx, project, api.BuildOptions{
+			Services: servicesToBuild,
+		})
+		if err != nil {
+			return err
+		}
+	}
+
+	err := composeService.Pull(ctx, project, api.PullOptions{})
+	if err != nil {
+		return err
+	}
+
+	err = composeService.Create(ctx, project, api.CreateOptions{
+		Services:      project.ServiceNames(),
+		RemoveOrphans: true,
+		Recreate:      api.RecreateForce,
+		Inherit:       true,
+		QuietPull:     false,
+	})
+	if err != nil {
+		return err
+	}
+
+	err = composeService.Start(ctx, project.Name, api.StartOptions{
+		Project:  project,
+		Attach:   nil,
+		Services: project.ServiceNames(),
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func runComposeDown(dockerCli command.Cli, project *types.Project) error {
+	composeService := compose.NewComposeService(dockerCli)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	err := composeService.Down(ctx, project.Name, api.DownOptions{
+		Project:       project,
+		RemoveOrphans: true,
+		Volumes:       true,
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func runComposeStats(dockerCli command.Cli, project *types.Project) (bool, error) {
+	composeService := compose.NewComposeService(dockerCli)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	summary, err := composeService.Ps(ctx, project.Name, api.PsOptions{
+		Project: project,
+		All:     true,
+	})
+
+	if err != nil {
+		return false, err
+	}
+
+	for i := 0; i < len(summary); i++ {
+		if summary[i].State != "running" {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+const vtProjectPrefix = "vt-"
+
+// toProjectName converts a template ID to a Docker Compose project name.
+// Strips "vt-" prefix if present, then prepends "vt-":
+//   - "vt-xbow-034" → "vt-xbow-034"
+//   - "mytemplate"   → "vt-mytemplate"
+func toProjectName(templateID string) string {
+	return vtProjectPrefix + strings.TrimPrefix(templateID, vtProjectPrefix)
+}
+
+// toTemplateID extracts the template ID from a Docker Compose project name.
+func toTemplateID(projectName string) string {
+	return projectName
+}
+
+// listVTProjects lists all running vt projects via Docker API.
+func listVTProjects(dockerCli command.Cli) ([]api.Stack, error) {
+	composeService := compose.NewComposeService(dockerCli)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	stacks, err := composeService.List(ctx, api.ListOptions{All: true})
+	if err != nil {
+		return nil, err
+	}
+
+	var vtStacks []api.Stack
+	for _, stack := range stacks {
+		if strings.HasPrefix(stack.Name, vtProjectPrefix) {
+			vtStacks = append(vtStacks, stack)
+		}
+	}
+
+	return vtStacks, nil
+}
+
+// getProjectContainers returns container details for a given project name.
+func getProjectContainers(dockerCli command.Cli, projectName string) ([]api.ContainerSummary, error) {
+	composeService := compose.NewComposeService(dockerCli)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	return composeService.Ps(ctx, projectName, api.PsOptions{All: true})
+}

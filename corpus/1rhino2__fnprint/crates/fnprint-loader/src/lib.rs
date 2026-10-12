@@ -1,0 +1,771 @@
+//! Load an ELF, hand back the loadable segments and a best-effort list of
+//! functions. x86-64 and aarch64. We try symbols first, fall back to .eh_frame
+//! FDE ranges when the thing is stripped, which covers most release binaries
+//! since they keep unwind info even without a symtab.
+
+use std::collections::HashMap;
+
+use anyhow::{bail, Context, Result};
+use goblin::elf::Elf;
+
+#[derive(Clone)]
+pub struct Segment {
+    pub vaddr: u64,
+    pub bytes: Vec<u8>,
+    pub exec: bool,
+    pub write: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct Func {
+    pub name: Option<String>,
+    pub entry: u64,
+    pub size: u64,
+    /// how we found it, handy for debugging discovery
+    pub source: FuncSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FuncSource {
+    Symtab,
+    DynSym,
+    EhFrame,
+}
+
+/// the instruction set the image is for. everything downstream of the loader
+/// that touches machine code (the emulator, the static call sweep) keys on it;
+/// the effect model and the matcher never see it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Arch {
+    X86_64,
+    Aarch64,
+}
+
+impl Arch {
+    pub fn name(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "x86-64",
+            Arch::Aarch64 => "aarch64",
+        }
+    }
+}
+
+pub struct Image {
+    pub segments: Vec<Segment>,
+    pub entry: u64,
+    pub is_pie: bool,
+    pub arch: Arch,
+}
+
+impl Image {
+    /// grab the code bytes for a function out of the mapped segments.
+    /// vaddr/len come from attacker-controlled headers, so every bound is
+    /// checked without ever doing arithmetic that can wrap.
+    pub fn code_at(&self, vaddr: u64, len: usize) -> Option<&[u8]> {
+        let len = len as u64;
+        for s in &self.segments {
+            if vaddr < s.vaddr {
+                continue;
+            }
+            let off = vaddr - s.vaddr; // safe: vaddr >= s.vaddr
+            let seg_len = s.bytes.len() as u64;
+            // off + len must fit inside the segment, no overflow
+            if off.checked_add(len).is_none_or(|end| end > seg_len) {
+                continue;
+            }
+            let off = off as usize;
+            return Some(&s.bytes[off..off + len as usize]);
+        }
+        None
+    }
+}
+
+pub struct Loaded {
+    pub image: Image,
+    pub funcs: Vec<Func>,
+    /// plt stub address (and got slot address, for `call [rip+x]` -fno-plt style
+    /// calls) -> the imported symbol it resolves to. this is what survives
+    /// `strip --strip-all`: the dynamic linker still needs it. the emulator names
+    /// stubbed calls from this map only, never from internal symbols, so a
+    /// symboled corpus and a stripped target token their calls the same way.
+    pub imports: HashMap<u64, String>,
+}
+
+/// a single PT_LOAD bigger than this is refused rather than allocated. real RE
+/// targets, firmware included, sit well under it (real binaries run single-digit
+/// to low-hundreds of MB); anything past it is a crafted header (tiny p_filesz,
+/// huge p_memsz) trying to amplify a few bytes of file into a big zero-fill and
+/// allocate our way into an OOM. kept at 1 GiB: still orders of magnitude over
+/// any real input, but it halves the worst-case single-shot allocation a crafted
+/// bss claim can force.
+const MAX_SEG_MEM: u64 = 1 << 30; // 1 GiB
+/// total mapped memory across all segments, same idea, bounds a fan-out of many
+/// medium segments that each pass the per-segment check.
+const MAX_TOTAL_MEM: u64 = 1 << 31; // 2 GiB
+/// cap on the number of PT_LOAD segments. total-memory is not enough on its own:
+/// thousands of tiny segments stay under MAX_TOTAL_MEM but each becomes a qemu
+/// memory region at emulate time, and softmmu cost is super-linear in region
+/// count, so a few-hundred-KB crafted ELF can drive minutes of CPU. a real
+/// binary has a handful of PT_LOADs; 256 is far above anything legit.
+const MAX_LOAD_SEGS: usize = 256;
+
+pub fn load(bytes: &[u8]) -> Result<Loaded> {
+    let elf = Elf::parse(bytes).context("not a valid elf")?;
+    let arch = match elf.header.e_machine {
+        goblin::elf::header::EM_X86_64 => Arch::X86_64,
+        goblin::elf::header::EM_AARCH64 => Arch::Aarch64,
+        m => bail!("only x86-64 and aarch64 are supported (got e_machine {m})"),
+    };
+
+    // first pass: validate every PT_LOAD and sum what it WILL allocate, WITHOUT
+    // allocating anything yet. the total-memory guard has to count the actual
+    // bytes each segment holds, which is the file-window copy (end-start) grown to
+    // the bss tail (memsz), not p_memsz alone. a header with p_memsz=0 but a huge
+    // p_filesz still copies a whole file window, so many overlapping ones would
+    // amplify past the cap if we only counted memsz. computing the sum before any
+    // copy means such a bomb is rejected outright instead of ballooning up to the
+    // cap and only then bailing.
+    let mut plans: Vec<(usize, usize, usize, u64, bool, bool)> = Vec::new();
+    let mut total_mem: u64 = 0;
+    for ph in &elf.program_headers {
+        if ph.p_type != goblin::elf::program_header::PT_LOAD {
+            continue;
+        }
+        // refuse a bss claim we won't allocate for (loader bomb)
+        if ph.p_memsz > MAX_SEG_MEM {
+            bail!(
+                "PT_LOAD p_memsz {} over {}-byte limit, refusing",
+                ph.p_memsz,
+                MAX_SEG_MEM
+            );
+        }
+        // a vaddr+memsz that wraps u64 is nonsense and would overflow the
+        // page math downstream, reject it here at the boundary.
+        if ph.p_vaddr.checked_add(ph.p_memsz).is_none() {
+            bail!("PT_LOAD vaddr {:#x} + memsz overflows", ph.p_vaddr);
+        }
+
+        // clamp the file window: p_offset past EOF must not slice-panic. try_from
+        // so a value too big for usize (32-bit target) clamps to EOF instead of
+        // truncating past the .min() guard.
+        let start = usize::try_from(ph.p_offset)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        let fsz = usize::try_from(ph.p_filesz).unwrap_or(usize::MAX);
+        let end = start.saturating_add(fsz).min(bytes.len());
+        // p_memsz is already capped under MAX_SEG_MEM above, so it fits usize.
+        let memsz = usize::try_from(ph.p_memsz).unwrap_or(usize::MAX);
+
+        let alloc_len = (end - start).max(memsz); // end >= start, no wrap
+        total_mem = total_mem.saturating_add(alloc_len as u64);
+        if total_mem > MAX_TOTAL_MEM {
+            bail!("total PT_LOAD memory over {}-byte limit", MAX_TOTAL_MEM);
+        }
+        plans.push((
+            start,
+            end,
+            memsz,
+            ph.p_vaddr,
+            ph.is_executable(),
+            ph.is_write(),
+        ));
+        if plans.len() > MAX_LOAD_SEGS {
+            bail!("over {} PT_LOAD segments, refusing", MAX_LOAD_SEGS);
+        }
+    }
+    if plans.is_empty() {
+        bail!("no PT_LOAD segments");
+    }
+
+    // second pass: now that the total is known-bounded, actually copy.
+    let mut segments = Vec::with_capacity(plans.len());
+    for (start, end, memsz, vaddr, exec, write) in plans {
+        let mut data = Vec::with_capacity((end - start).max(memsz));
+        data.extend_from_slice(&bytes[start..end]);
+        // bss: memsz > filesz, pad with zeros so reads there are defined.
+        if memsz > data.len() {
+            data.resize(memsz, 0);
+        }
+        segments.push(Segment {
+            vaddr,
+            bytes: data,
+            exec,
+            write,
+        });
+    }
+
+    // PT_LOAD segments must occupy disjoint address ranges: the ELF loading model
+    // gives every byte of the address space to at most one PT_LOAD. a crafted file
+    // with truly overlapping ranges is malformed and, downstream, drives the
+    // emulator's per-page remap fallback, which a hostile layout could fragment
+    // into a flood of qemu memory regions. sort by vaddr (also makes segment order
+    // deterministic) and reject any real byte-level overlap. segments that only
+    // share a rounded page boundary have disjoint bytes and are left alone; the
+    // emulator coalesces those.
+    segments.sort_by_key(|s| s.vaddr);
+    for w in segments.windows(2) {
+        let a_end = w[0].vaddr.saturating_add(w[0].bytes.len() as u64);
+        if w[1].vaddr < a_end {
+            bail!(
+                "overlapping PT_LOAD segments at {:#x} and {:#x}, refusing",
+                w[0].vaddr,
+                w[1].vaddr
+            );
+        }
+    }
+
+    let is_pie = elf.header.e_type == goblin::elf::header::ET_DYN;
+
+    let mut funcs = discover(&elf, bytes)?;
+    let imports = plt_imports(&elf, bytes, arch);
+    // sort + dedup by entry, prefer named entries
+    funcs.sort_by(|a, b| {
+        a.entry
+            .cmp(&b.entry)
+            .then(b.name.is_some().cmp(&a.name.is_some()))
+    });
+    funcs.dedup_by_key(|f| f.entry);
+
+    Ok(Loaded {
+        image: Image {
+            segments,
+            entry: elf.header.e_entry,
+            is_pie,
+            arch,
+        },
+        funcs,
+        imports,
+    })
+}
+
+// a crafted ELF can point thousands of symbols at one long strtab run, so cloning
+// each name would be (symbol count * name length) bytes: a small file forcing a
+// huge allocation. cap both. real binaries are far under these (libcrypto ~6k
+// functions, symbol names tens of bytes); a name past the cap is truncated, and we
+// stop after MAX_FUNCS symbols. the segment loader's own MAX_TOTAL_MEM does not
+// cover the symbol table, so this is where that amplification is bounded.
+const MAX_NAME: usize = 4096;
+const MAX_FUNCS: usize = 1_000_000;
+
+fn clamp_name(s: &str) -> String {
+    if s.len() <= MAX_NAME {
+        return s.to_string();
+    }
+    let mut end = MAX_NAME;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+fn discover(elf: &Elf, raw: &[u8]) -> Result<Vec<Func>> {
+    let mut out = Vec::new();
+
+    for (sym, src) in elf
+        .syms
+        .iter()
+        .map(|s| (s, FuncSource::Symtab))
+        .chain(elf.dynsyms.iter().map(|s| (s, FuncSource::DynSym)))
+    {
+        if out.len() >= MAX_FUNCS {
+            break; // pathological symbol count; stop rather than amplify
+        }
+        if sym.st_type() != goblin::elf::sym::STT_FUNC {
+            continue;
+        }
+        if sym.st_value == 0 || sym.st_size == 0 {
+            continue; // imports / plt stubs with no body
+        }
+        let name = match src {
+            FuncSource::Symtab => elf.strtab.get_at(sym.st_name),
+            _ => elf.dynstrtab.get_at(sym.st_name),
+        }
+        .map(clamp_name)
+        .filter(|s| !s.is_empty());
+        out.push(Func {
+            name,
+            entry: sym.st_value,
+            size: sym.st_size,
+            source: src,
+        });
+    }
+
+    // unwind info covers what the symbols did not. a `strip --strip-all` .so
+    // keeps its dynsym (the exports) but loses every static function, and those
+    // are most of the interesting ones (inflate_fast, deflate_stored...). so
+    // always merge the FDEs, not just when there are no symbols at all. the
+    // plt has an FDE too; skip that range, its stubs are not functions.
+    if let Some(fdes) = eh_frame_funcs(elf, raw) {
+        let known: std::collections::HashSet<u64> = out.iter().map(|f| f.entry).collect();
+        let plt: Vec<(u64, u64)> = elf
+            .section_headers
+            .iter()
+            .filter(|sh| {
+                matches!(
+                    elf.shdr_strtab.get_at(sh.sh_name),
+                    Some(".plt") | Some(".plt.sec") | Some(".plt.got")
+                )
+            })
+            .map(|sh| (sh.sh_addr, sh.sh_addr.saturating_add(sh.sh_size)))
+            .collect();
+        for f in fdes {
+            if out.len() >= MAX_FUNCS {
+                break;
+            }
+            if known.contains(&f.entry) || plt.iter().any(|&(a, b)| f.entry >= a && f.entry < b) {
+                continue;
+            }
+            out.push(f);
+        }
+    }
+
+    Ok(out)
+}
+
+// got slot -> import name, from the jump-slot (and glob_dat, for -z now / -fno-plt)
+// relocs, then every 16-byte stub in .plt / .plt.sec is scanned for the
+// `jmp [rip+disp32]` that goes through a known slot. keyed by stub address AND
+// slot address, the two never collide (different sections). plt0 (the lazy
+// resolver) jumps through GOT[2] which has no reloc, so it drops out on its own.
+fn plt_imports(elf: &Elf, raw: &[u8], arch: Arch) -> HashMap<u64, String> {
+    let mut out: HashMap<u64, String> = HashMap::new();
+    for r in elf
+        .pltrelocs
+        .iter()
+        .chain(elf.dynrelas.iter())
+        .chain(elf.dynrels.iter())
+    {
+        if out.len() >= MAX_FUNCS {
+            break;
+        }
+        let Some(sym) = elf.dynsyms.get(r.r_sym) else {
+            continue;
+        };
+        let Some(name) = elf.dynstrtab.get_at(sym.st_name) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        out.insert(r.r_offset, clamp_name(name));
+    }
+    if out.is_empty() {
+        return out;
+    }
+    let mut stubs: Vec<(u64, String)> = Vec::new();
+    for sh in &elf.section_headers {
+        let sname = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
+        if sname != ".plt" && sname != ".plt.sec" {
+            continue;
+        }
+        let Ok(start) = usize::try_from(sh.sh_offset) else {
+            continue;
+        };
+        let Ok(size) = usize::try_from(sh.sh_size) else {
+            continue;
+        };
+        let Some(end) = start.checked_add(size) else {
+            continue;
+        };
+        let Some(data) = raw.get(start..end) else {
+            continue;
+        };
+        let mut off = 0usize;
+        while off + 16 <= data.len() && stubs.len() < MAX_FUNCS {
+            let stub = &data[off..off + 16];
+            let stub_addr = sh.sh_addr.wrapping_add(off as u64);
+            let slot = match arch {
+                Arch::X86_64 => find_jmp_rip(stub).map(|at| {
+                    let disp = i32::from_le_bytes([
+                        stub[at + 2],
+                        stub[at + 3],
+                        stub[at + 4],
+                        stub[at + 5],
+                    ]) as i64;
+                    let next = stub_addr.wrapping_add(at as u64 + 6);
+                    next.wrapping_add(disp as u64)
+                }),
+                Arch::Aarch64 => aarch64_plt_slot(stub, stub_addr),
+            };
+            if let Some(n) = slot.and_then(|s| out.get(&s)) {
+                stubs.push((stub_addr, n.clone()));
+            }
+            off += 16;
+        }
+    }
+    out.extend(stubs);
+    out
+}
+
+// offset of `ff 25` (jmp qword [rip+disp32]) inside a plt stub, allowing the
+// endbr64 (f3 0f 1e fa) and bnd (f2) prefixes gcc/clang put in front of it.
+fn find_jmp_rip(stub: &[u8]) -> Option<usize> {
+    let mut i = 0usize;
+    if stub.len() >= 4 && stub[..4] == [0xf3, 0x0f, 0x1e, 0xfa] {
+        i = 4;
+    }
+    if stub.get(i) == Some(&0xf2) {
+        i += 1;
+    }
+    if stub.len() >= i + 6 && stub[i] == 0xff && stub[i + 1] == 0x25 {
+        Some(i)
+    } else {
+        None
+    }
+}
+
+// the got slot an aarch64 plt stub loads through. a stub is
+//   adrp x16, page ; ldr x17, [x16, #lo12] ; add x16, x16, #lo12 ; br x17
+// so the slot is the adrp page plus the ldr's scaled imm12. plt0 (32 bytes,
+// the lazy resolver) never decodes as adrp+ldr in its first 8 bytes, and the
+// 16-byte stride puts the real stubs on the right boundary after it.
+fn aarch64_plt_slot(stub: &[u8], stub_addr: u64) -> Option<u64> {
+    let w0 = u32::from_le_bytes([stub[0], stub[1], stub[2], stub[3]]);
+    let w1 = u32::from_le_bytes([stub[4], stub[5], stub[6], stub[7]]);
+    // adrp: 1 immlo(2) 10000 immhi(19) rd(5)
+    if w0 & 0x9f00_0000 != 0x9000_0000 {
+        return None;
+    }
+    let immlo = ((w0 >> 29) & 0x3) as u64;
+    let immhi = ((w0 >> 5) & 0x7_ffff) as u64;
+    let imm = (immhi << 2) | immlo; // 21 bits, signed
+    let imm = ((imm << 43) as i64 >> 43) as u64; // sign extend
+    let page = (stub_addr & !0xfff).wrapping_add(imm << 12);
+    // ldr xt, [xn, #imm12*8]: 11 111 0 01 01 imm12 rn rt
+    if w1 & 0xffc0_0000 != 0xf940_0000 {
+        return None;
+    }
+    let imm12 = ((w1 >> 10) & 0xfff) as u64;
+    Some(page.wrapping_add(imm12 * 8))
+}
+
+// pull function start+length out of every FDE in .eh_frame.
+fn eh_frame_funcs(elf: &Elf, raw: &[u8]) -> Option<Vec<Func>> {
+    use gimli::{BaseAddresses, CieOrFde, EhFrame, LittleEndian, UnwindSection};
+
+    let sh = elf
+        .section_headers
+        .iter()
+        .find(|s| elf.shdr_strtab.get_at(s.sh_name) == Some(".eh_frame"))?;
+    // sh_offset/sh_size are attacker-controlled. try_from (None if too big for
+    // usize) + checked_add so a crafted size can't overflow the range and
+    // panic; get() handles past-EOF as None.
+    let start = usize::try_from(sh.sh_offset).ok()?;
+    let size = usize::try_from(sh.sh_size).ok()?;
+    let end = start.checked_add(size)?;
+    let data = raw.get(start..end)?;
+
+    let eh = EhFrame::new(data, LittleEndian);
+    let bases = BaseAddresses::default().set_eh_frame(sh.sh_addr);
+
+    let mut entries = eh.entries(&bases);
+    let mut out = Vec::new();
+    loop {
+        match entries.next() {
+            Ok(Some(CieOrFde::Fde(partial))) => {
+                if let Ok(fde) = partial.parse(EhFrame::cie_from_offset) {
+                    let entry = fde.initial_address();
+                    let size = fde.len();
+                    if size > 0 {
+                        out.push(Func {
+                            name: None,
+                            entry,
+                            size,
+                            source: FuncSource::EhFrame,
+                        });
+                    }
+                }
+            }
+            Ok(Some(CieOrFde::Cie(_))) => {}
+            Ok(None) => break,
+            Err(_) => break,
+        }
+        // same cap discover() applies: a crafted .eh_frame full of tiny FDEs
+        // must not force an unbounded func list here where symtab's cap misses.
+        if out.len() >= MAX_FUNCS {
+            break;
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aarch64_plt_stub_resolves_its_got_slot() {
+        // a real-shaped stub at 0x10640:
+        //   adrp x16, 0x20000        (page +0x10000 from 0x10000)
+        //   ldr  x17, [x16, #0x18]
+        //   add  x16, x16, #0x18
+        //   br   x17
+        let stub_addr = 0x10640u64;
+        // adrp: immhi:immlo = 0x10 pages -> immlo = 0, immhi = 4
+        let adrp: u32 = 0x9000_0000 | (4 << 5) | 16;
+        let ldr: u32 = 0xf940_0000 | (3 << 10) | (16 << 5) | 17; // imm12 = 3 -> +0x18
+        let mut stub = Vec::new();
+        stub.extend_from_slice(&adrp.to_le_bytes());
+        stub.extend_from_slice(&ldr.to_le_bytes());
+        stub.extend_from_slice(&0x9100_6210u32.to_le_bytes());
+        stub.extend_from_slice(&0xd61f_0220u32.to_le_bytes());
+        assert_eq!(aarch64_plt_slot(&stub, stub_addr), Some(0x20018));
+        // negative page offset
+        let adrp_neg: u32 = 0x9000_0000 | (0x7_ffff << 5) | 16; // immhi all ones, immlo 0 -> -4 pages
+        stub[..4].copy_from_slice(&adrp_neg.to_le_bytes());
+        assert_eq!(
+            aarch64_plt_slot(&stub, stub_addr),
+            Some(0x10000 - 0x4000 + 0x18)
+        );
+        // plt0 shape (stp first) is not a stub
+        assert_eq!(
+            aarch64_plt_slot(
+                &[0xf0, 0x7b, 0xbf, 0xa9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                0
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn garbage_input_errors_not_panics() {
+        assert!(load(b"").is_err());
+        assert!(load(b"not an elf at all, just text here").is_err());
+        // elf magic then garbage bytes
+        let mut junk = vec![0x7f, b'E', b'L', b'F'];
+        junk.extend(std::iter::repeat_n(0x41u8, 400));
+        let _ = load(&junk); // must return Err/Ok, never panic
+    }
+
+    #[test]
+    fn truncated_header_does_not_panic() {
+        let mut hdr = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
+        hdr.extend(std::iter::repeat_n(0u8, 48));
+        let _ = load(&hdr);
+    }
+
+    // minimal ELF64 x86-64 with exactly one PT_LOAD, so we can craft hostile
+    // program-header fields and prove the loader refuses them instead of
+    // panicking or allocating its way into an OOM.
+    fn craft_elf(p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz: u64) -> Vec<u8> {
+        let mut e = vec![0u8; 64 + 56];
+        e[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        e[4] = 2; // ELFCLASS64
+        e[5] = 1; // ELFDATA2LSB
+        e[6] = 1; // EV_CURRENT
+        let put16 =
+            |e: &mut [u8], off: usize, v: u16| e[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 =
+            |e: &mut [u8], off: usize, v: u32| e[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 =
+            |e: &mut [u8], off: usize, v: u64| e[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        put16(&mut e, 16, 2); // e_type ET_EXEC
+        put16(&mut e, 18, 62); // e_machine EM_X86_64
+        put32(&mut e, 20, 1); // e_version
+        put64(&mut e, 32, 64); // e_phoff, header is 64 bytes
+        put16(&mut e, 52, 64); // e_ehsize
+        put16(&mut e, 54, 56); // e_phentsize
+        put16(&mut e, 56, 1); // e_phnum
+                              // program header at offset 64
+        let ph = 64;
+        put32(&mut e, ph, 1); // p_type PT_LOAD
+        put32(&mut e, ph + 4, 5); // p_flags R+X
+        put64(&mut e, ph + 8, p_offset);
+        put64(&mut e, ph + 16, p_vaddr);
+        put64(&mut e, ph + 32, p_filesz);
+        put64(&mut e, ph + 40, p_memsz);
+        put64(&mut e, ph + 48, 0x1000); // p_align
+        e
+    }
+
+    #[test]
+    fn huge_memsz_is_refused_not_allocated() {
+        // p_memsz near u64::MAX must error, never try to allocate ~16 EiB
+        let elf = craft_elf(0, 0x1000, 0, u64::MAX);
+        assert!(load(&elf).is_err());
+        // just over the cap is refused too
+        let elf = craft_elf(0, 0x1000, 0, MAX_SEG_MEM + 1);
+        assert!(load(&elf).is_err());
+    }
+
+    #[test]
+    fn vaddr_plus_memsz_overflow_is_refused() {
+        let elf = craft_elf(0, u64::MAX - 16, 0, 4096);
+        assert!(load(&elf).is_err());
+    }
+
+    // many overlapping file-backed PT_LOAD headers (p_memsz=0, huge p_filesz).
+    // each copies a full file window; the old cap only summed p_memsz so it never
+    // tripped and the loader would allocate n*filesize (hundreds of GB). the fix
+    // sums the real copy length and refuses before allocating anything.
+    fn craft_elf_many_load(n: u16) -> Vec<u8> {
+        let phoff = 64usize;
+        let file_len = phoff + (n as usize) * 56;
+        let mut e = vec![0u8; file_len];
+        e[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        e[4] = 2; // ELFCLASS64
+        e[5] = 1; // ELFDATA2LSB
+        e[6] = 1; // EV_CURRENT
+        let put16 =
+            |e: &mut [u8], off: usize, v: u16| e[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 =
+            |e: &mut [u8], off: usize, v: u32| e[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 =
+            |e: &mut [u8], off: usize, v: u64| e[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        put16(&mut e, 16, 2); // e_type ET_EXEC
+        put16(&mut e, 18, 62); // e_machine EM_X86_64
+        put32(&mut e, 20, 1);
+        put64(&mut e, 32, phoff as u64);
+        put16(&mut e, 52, 64);
+        put16(&mut e, 54, 56);
+        put16(&mut e, 56, n);
+        for i in 0..n as usize {
+            let ph = phoff + i * 56;
+            put32(&mut e, ph, 1); // PT_LOAD
+            put32(&mut e, ph + 4, 4); // R
+            put64(&mut e, ph + 8, 0); // p_offset = 0
+            put64(&mut e, ph + 16, 0x1000 + i as u64 * 0x1000); // distinct vaddr
+            put64(&mut e, ph + 32, file_len as u64); // p_filesz = whole file
+            put64(&mut e, ph + 40, 0); // p_memsz = 0, evades the old sum
+            put64(&mut e, ph + 48, 0x1000);
+        }
+        e
+    }
+
+    // n PT_LOADs each tiny (filesz 16, memsz 0x1000) so total memory stays far
+    // under MAX_TOTAL_MEM. isolates the per-count cap from the byte cap.
+    fn craft_elf_nsegs_small(n: u16) -> Vec<u8> {
+        let phoff = 64usize;
+        let file_len = phoff + (n as usize) * 56;
+        let mut e = vec![0u8; file_len];
+        e[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        e[4] = 2;
+        e[5] = 1;
+        e[6] = 1;
+        let put16 =
+            |e: &mut [u8], off: usize, v: u16| e[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 =
+            |e: &mut [u8], off: usize, v: u32| e[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 =
+            |e: &mut [u8], off: usize, v: u64| e[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        put16(&mut e, 16, 2);
+        put16(&mut e, 18, 62);
+        put32(&mut e, 20, 1);
+        put64(&mut e, 32, phoff as u64);
+        put16(&mut e, 52, 64);
+        put16(&mut e, 54, 56);
+        put16(&mut e, 56, n);
+        for i in 0..n as usize {
+            let ph = phoff + i * 56;
+            put32(&mut e, ph, 1); // PT_LOAD
+            put32(&mut e, ph + 4, 4); // R
+            put64(&mut e, ph + 8, 0); // p_offset
+            put64(&mut e, ph + 16, 0x1000 + i as u64 * 0x1000); // distinct vaddr
+            put64(&mut e, ph + 32, 16); // small p_filesz
+            put64(&mut e, ph + 40, 0x1000); // p_memsz
+            put64(&mut e, ph + 48, 0x1000);
+        }
+        e
+    }
+
+    #[test]
+    fn too_many_small_segments_refused_by_count() {
+        // ~300 tiny segments: total memory is ~1.2 MB (well under MAX_TOTAL_MEM),
+        // so only the per-count cap can catch this region-flood. must be refused
+        // rather than turned into hundreds of qemu memory regions at emulate time.
+        let elf = craft_elf_nsegs_small(300);
+        assert!(
+            load(&elf).is_err(),
+            "expected the segment-count cap to refuse the region flood"
+        );
+    }
+
+    #[test]
+    fn overlapping_file_backed_segments_are_refused_not_allocated() {
+        // n * file_len copies far exceed MAX_TOTAL_MEM. must Err on accounting,
+        // never allocate its way there. (if this OOMs the test, the fix regressed.)
+        let elf = craft_elf_many_load(20000);
+        let r = load(&elf);
+        assert!(
+            r.is_err(),
+            "expected the alloc-amplification bomb to be refused"
+        );
+    }
+
+    // two PT_LOADs whose vaddr ranges truly overlap: seg1 starts inside seg0.
+    // [0x1000,0x3000) and [0x2000,0x3000). a well-formed ELF never does this.
+    fn craft_elf_overlap() -> Vec<u8> {
+        let phoff = 64usize;
+        let n = 2usize;
+        let mut e = vec![0u8; phoff + n * 56];
+        e[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        e[4] = 2;
+        e[5] = 1;
+        e[6] = 1;
+        let put16 =
+            |e: &mut [u8], off: usize, v: u16| e[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 =
+            |e: &mut [u8], off: usize, v: u32| e[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 =
+            |e: &mut [u8], off: usize, v: u64| e[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        put16(&mut e, 16, 2);
+        put16(&mut e, 18, 62);
+        put32(&mut e, 20, 1);
+        put64(&mut e, 32, phoff as u64);
+        put16(&mut e, 52, 64);
+        put16(&mut e, 54, 56);
+        put16(&mut e, 56, n as u16);
+        let vaddrs = [0x1000u64, 0x2000u64];
+        let memszs = [0x2000u64, 0x1000u64];
+        for i in 0..n {
+            let ph = phoff + i * 56;
+            put32(&mut e, ph, 1); // PT_LOAD
+            put32(&mut e, ph + 4, 4); // R
+            put64(&mut e, ph + 8, 0); // p_offset
+            put64(&mut e, ph + 16, vaddrs[i]);
+            put64(&mut e, ph + 32, 16); // small p_filesz
+            put64(&mut e, ph + 40, memszs[i]);
+            put64(&mut e, ph + 48, 0x1000); // p_align
+        }
+        e
+    }
+
+    #[test]
+    fn overlapping_vaddr_segments_refused() {
+        // truly overlapping PT_LOAD ranges are malformed and drive the emulator's
+        // per-page remap fallback; the loader must reject them up front.
+        let elf = craft_elf_overlap();
+        let e = load(&elf).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.contains("overlapping PT_LOAD"), "got: {e}");
+    }
+
+    #[test]
+    fn offset_past_eof_does_not_panic() {
+        // p_offset way past the file end must clamp, not slice-panic
+        let elf = craft_elf(0xffff_0000, 0x1000, 32, 32);
+        let _ = load(&elf); // Err or Ok, never a panic
+    }
+
+    #[test]
+    fn code_at_high_vaddr_no_overflow() {
+        // a segment near the top of the address space, then a read whose
+        // vaddr+len would wrap: must return None, not panic
+        let img = Image {
+            segments: vec![Segment {
+                vaddr: u64::MAX - 8,
+                bytes: vec![0u8; 8],
+                exec: true,
+                write: false,
+            }],
+            entry: 0,
+            is_pie: false,
+            arch: Arch::X86_64,
+        };
+        assert!(img.code_at(u64::MAX - 4, 64).is_none());
+        assert!(img.code_at(u64::MAX, 16).is_none());
+    }
+}

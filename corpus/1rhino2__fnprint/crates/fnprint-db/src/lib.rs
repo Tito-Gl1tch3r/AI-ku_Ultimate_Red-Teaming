@@ -1,0 +1,1036 @@
+//! sqlite store for fingerprints, with a tiny LSH band index so queries don't
+//! have to compare against every row.
+
+use std::collections::{HashMap, HashSet};
+use std::ptr::{self, NonNull};
+
+use anyhow::{anyhow, Result};
+use fnprint_sig::{Fingerprint, SIG_LEN};
+use rusqlite::serialize::OwnedData;
+use rusqlite::{ffi, params, Connection, OptionalExtension, MAIN_DB};
+use serde::{Deserialize, Serialize};
+
+// b bands of r rows. b*r must equal SIG_LEN.
+pub const BAND_ROWS: usize = 4;
+pub const BANDS: usize = SIG_LEN / BAND_ROWS;
+// every legit signature is exactly SIG_LEN u64s. a stored blob of any other
+// size is corrupt or crafted, so we never select or decode it. this also caps
+// how big a blob a malicious corpus db can make us allocate.
+const SIG_BYTES: i64 = (SIG_LEN * 8) as i64;
+// generous upper bound on a text column (binary path, symbol name, source tag).
+// real values are tens of bytes; anything past 1 MiB is a crafted corpus trying
+// to make the reader allocate, and we skip the row instead of materializing it.
+// this is a BYTE cap: the WHERE guards use octet_length (byte count) not length
+// (character count), so a multibyte string can't slip 4x its bytes past it.
+const MAX_TEXT: i64 = 1 << 20;
+// aggregate corpus backstops for the untrusted-image read (all()). a crafted db
+// can hold millions of individually-valid small rows; these bound the total work
+// before we build a Vec the reply cap would reject anyway. a real corpus is far
+// smaller (the 128 MiB postcard reply cap binds effective corpus size well below
+// these), so they only ever trip a bomb. exceeding them fails closed (bail), not
+// truncates, because a silently short corpus would corrupt match results.
+const MAX_ROWS: usize = 2_000_000;
+const MAX_TOTAL_BYTES: u64 = 256 << 20; // 256 MiB of decoded text + sig
+
+// the exact physical shape open_image requires of `funcs` before it reads a row.
+// DEFENSIVE + ENABLE_VIEW=false + TRUSTED_SCHEMA=false already block views and
+// schema-defined SQL surface, but a crafted image can still declare funcs as a
+// virtual/shadow table, or an ordinary table carrying generated/hidden columns
+// whose expressions drag in extra sqlite surface, or columns whose declared type
+// shifts affinity under our WHERE guards. so we assert funcs is an ordinary rowid
+// table with exactly these columns, in this order, with these declared types and
+// no hidden/generated columns. anything else is rejected, never read.
+const EXPECTED_FUNCS_COLS: &[(&str, &str)] = &[
+    ("id", "INTEGER"),
+    ("binary", "TEXT"),
+    ("name", "TEXT"),
+    ("entry", "INTEGER"),
+    ("source", "TEXT"),
+    ("complexity", "INTEGER"),
+    ("shingles", "INTEGER"),
+    ("capped", "INTEGER"),
+    ("sig", "BLOB"),
+    ("callees", "BLOB"),
+];
+// a corpus written before 0.6 has no callees column. it is still a valid corpus
+// (the fingerprints are unchanged), the call-graph pass just has no edges for it.
+const LEGACY_FUNCS_COLS: usize = EXPECTED_FUNCS_COLS.len() - 1;
+// most callee edges one row may carry (8 bytes each). a real function calls a
+// few dozen distinct things; this bounds a crafted row's blob to 32 KiB.
+const MAX_CALLEES: usize = 4096;
+
+pub struct Db {
+    pub conn: Connection,
+    // false for a legacy (pre-0.6) image with no callees column
+    has_callees: bool,
+}
+
+// Serialize/Deserialize so a jailed db-reader worker can hand a decoded corpus
+// back to the trusted parent over the postcard pipe (see cli dbload op). The
+// parent treats every field as untrusted, same as it does the index reply.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct FuncRec {
+    pub id: i64,
+    pub binary: String,
+    pub name: Option<String>,
+    pub entry: u64,
+    pub source: String,
+    pub fp: Fingerprint,
+    /// direct in-image callee entries, empty for a legacy row
+    #[serde(default)]
+    pub callees: Vec<u64>,
+}
+
+/// One print to write, borrowed. The bulk-insert shape for `insert_all`: it holds
+/// references so a caller with a `Vec` of already-indexed functions can hand them
+/// over without cloning the strings or the signature.
+pub struct FuncPrint<'a> {
+    pub name: Option<&'a str>,
+    pub entry: u64,
+    pub source: &'a str,
+    pub fp: &'a Fingerprint,
+    pub callees: &'a [u64],
+}
+
+impl Db {
+    pub fn open(path: &str) -> Result<Db> {
+        let conn = Connection::open(path)?;
+        Self::init(&conn)?;
+        Ok(Db {
+            conn,
+            has_callees: true,
+        })
+    }
+
+    pub fn open_memory() -> Result<Db> {
+        let conn = Connection::open_in_memory()?;
+        Self::init(&conn)?;
+        Ok(Db {
+            conn,
+            has_callees: true,
+        })
+    }
+
+    /// Parse a corpus .db image entirely in memory, read-only. No file is ever
+    /// opened: the bytes are handed straight to sqlite3_deserialize, so the whole
+    /// sqlite parse surface (b-tree pages, cell/record decoding, overflow pages)
+    /// only ever touches this buffer. That is what lets the corpus read run inside
+    /// the seccomp jail, where open/openat are denied. `bytes` is the raw file the
+    /// parent read off disk; it is untrusted.
+    ///
+    /// We deliberately do NOT run `init()` here: it issues CREATE TABLE, a write,
+    /// which a read-only deserialized db rejects, and we do not want to mutate an
+    /// image we are only reading. A db missing the `funcs` table just makes the
+    /// later SELECT in `all()` return a clean error.
+    pub fn open_image(bytes: &[u8]) -> Result<Db> {
+        let mut conn = Connection::open_in_memory()?;
+        // keep any query spill in memory. the jail has no temp-file access anyway,
+        // so this turns a would-be EPERM into a normal in-memory sort.
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        // harden against a hostile image before we parse its schema. a crafted
+        // .db can name `funcs` a VIEW (or trigger) whose body reaches vtab
+        // modules (fts/rtree) and SQL functions, turning our plain SELECT into
+        // arbitrary sqlite surface. DEFENSIVE blocks writes to shadow/schema via
+        // the parsed schema; TRUSTED_SCHEMA=false makes schema-defined SQL run as
+        // untrusted (no vtab/loadable funcs from the schema); ENABLE_VIEW=false
+        // rejects views outright, so `funcs` must be a real table.
+        conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA,
+            false,
+        )?;
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_VIEW,
+            false,
+        )?;
+        let data = owned_from_bytes(bytes)?;
+        // read_only = true -> SQLITE_DESERIALIZE_READONLY: sqlite refuses writes
+        // and never grows/journals the image.
+        conn.deserialize(MAIN_DB, data, true)?;
+        // parse-and-check the physical schema before any row read. this also
+        // forces sqlite to materialize the (lazily-parsed) schema now, so a
+        // malformed schema surfaces here as a clean error, not mid-query.
+        let has_callees = Self::verify_funcs_schema(&conn)?;
+        Ok(Db { conn, has_callees })
+    }
+
+    // assert `funcs` is an ordinary table with exactly the expected columns and
+    // no hidden/generated columns. runs against the untrusted deserialized image,
+    // inside the jail, before all() reads anything. returns whether the image
+    // carries the callees column (false = legacy corpus, still accepted).
+    fn verify_funcs_schema(conn: &Connection) -> Result<bool> {
+        // funcs must be an ordinary table (not a view/virtual/shadow table).
+        // pragma_table_list.type is 'table' | 'view' | 'virtual' | 'shadow'.
+        let kind: Option<String> = conn
+            .query_row(
+                "SELECT type FROM pragma_table_list WHERE schema='main' AND name='funcs'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match kind.as_deref() {
+            Some("table") => {}
+            Some(other) => {
+                anyhow::bail!("corpus funcs is a '{other}', expected an ordinary table")
+            }
+            None => anyhow::bail!("corpus has no funcs table"),
+        }
+        // exact columns, declared types, and no hidden/generated columns.
+        // pragma_table_xinfo.hidden: 0 normal, 1 hidden (vtab), 2 generated-
+        // virtual, 3 generated-stored. anything != 0 is rejected.
+        let mut st = conn.prepare(
+            "SELECT name, upper(type), hidden FROM pragma_table_xinfo('funcs') ORDER BY cid",
+        )?;
+        let cols: Vec<(String, String, i64)> = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        if cols.len() != EXPECTED_FUNCS_COLS.len() && cols.len() != LEGACY_FUNCS_COLS {
+            anyhow::bail!(
+                "corpus funcs has {} columns, expected {} (or {} for a pre-0.6 corpus)",
+                cols.len(),
+                EXPECTED_FUNCS_COLS.len(),
+                LEGACY_FUNCS_COLS
+            );
+        }
+        for ((name, ty, hidden), (exp_name, exp_ty)) in cols.iter().zip(EXPECTED_FUNCS_COLS) {
+            if *hidden != 0 {
+                anyhow::bail!("corpus funcs column '{name}' is hidden/generated (hidden={hidden})");
+            }
+            if name != exp_name || ty != *exp_ty {
+                anyhow::bail!(
+                    "corpus funcs column mismatch: got '{name}' {ty}, expected '{exp_name}' {exp_ty}"
+                );
+            }
+        }
+        Ok(cols.len() == EXPECTED_FUNCS_COLS.len())
+    }
+
+    fn init(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS funcs(
+                id INTEGER PRIMARY KEY,
+                binary TEXT NOT NULL,
+                name TEXT,
+                entry INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                complexity INTEGER NOT NULL,
+                shingles INTEGER NOT NULL,
+                capped INTEGER NOT NULL,
+                sig BLOB NOT NULL,
+                callees BLOB
+            );
+            CREATE TABLE IF NOT EXISTS bands(
+                band INTEGER NOT NULL,
+                key INTEGER NOT NULL,
+                func_id INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS bands_lookup ON bands(band, key);",
+        )?;
+        // a pre-0.6 file opened for writing: grow it in place so new rows can
+        // carry edges. old rows read back with no callees, which is fine.
+        let ncols: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_xinfo('funcs')",
+            [],
+            |r| r.get(0),
+        )?;
+        if ncols == LEGACY_FUNCS_COLS as i64 {
+            conn.execute_batch("ALTER TABLE funcs ADD COLUMN callees BLOB")?;
+        }
+        Ok(())
+    }
+
+    // the select list for a row, with callees read as an empty blob on a
+    // legacy image so row_to_rec sees one shape.
+    fn row_select(&self) -> &'static str {
+        if self.has_callees {
+            "id,binary,name,entry,source,complexity,shingles,capped,sig,callees"
+        } else {
+            "id,binary,name,entry,source,complexity,shingles,capped,sig,x''"
+        }
+    }
+
+    pub fn insert(
+        &self,
+        binary: &str,
+        name: Option<&str>,
+        entry: u64,
+        source: &str,
+        fp: &Fingerprint,
+        callees: &[u64],
+    ) -> Result<i64> {
+        let callees = &callees[..callees.len().min(MAX_CALLEES)];
+        self.conn.execute(
+            "INSERT INTO funcs(binary,name,entry,source,complexity,shingles,capped,sig,callees)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                binary,
+                name,
+                entry as i64,
+                source,
+                fp.complexity as i64,
+                fp.shingles as i64,
+                fp.capped as i64,
+                encode_sig(&fp.sig),
+                encode_sig(callees)
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        for (band, key) in fp.band_keys(BAND_ROWS).into_iter().enumerate() {
+            self.conn.execute(
+                "INSERT INTO bands(band,key,func_id) VALUES(?1,?2,?3)",
+                params![band as i64, key as i64, id],
+            )?;
+        }
+        Ok(id)
+    }
+
+    /// insert every print in `prints` under one transaction. functionally
+    /// identical to calling `insert()` once per print (same rows in funcs +
+    /// bands), but `index -o` on a big binary was paying a commit + fsync per
+    /// statement, so a few hundred functions each meant thousands of tiny
+    /// commits. one BEGIN/COMMIT around the batch turns that into a single
+    /// flush. returns the number of prints written. fail-closed: any error rolls
+    /// the whole batch back when the tx drops without commit, so a half-written
+    /// corpus can't be left behind. must not be called with another transaction
+    /// already open on this connection: it issues its own BEGIN, so a nested call
+    /// errors and writes nothing. the only callers are single-shot parent paths.
+    pub fn insert_all(&self, binary: &str, prints: &[FuncPrint]) -> Result<usize> {
+        // unchecked_transaction borrows &self.conn immutably, same as insert's
+        // execute, so the two shared borrows coexist. it issues BEGIN now and
+        // COMMIT on commit(); a drop without commit rolls back.
+        let tx = self.conn.unchecked_transaction()?;
+        for p in prints {
+            self.insert(binary, p.name, p.entry, p.source, p.fp, p.callees)?;
+        }
+        tx.commit()?;
+        Ok(prints.len())
+    }
+
+    pub fn all(&self) -> Result<Vec<FuncRec>> {
+        // filter absurd text fields in sqlite so a crafted corpus can't make us
+        // materialize a giant String per row. 1 MiB is far above any real binary
+        // path or symbol name, so this only ever drops crafted rows, never legit
+        // ones. defense in depth: all() runs in the jailed worker, already backed
+        // by RLIMIT_AS and the reply cap, this just skips the alloc earlier.
+        let sql = format!(
+            "SELECT {} FROM funcs
+             WHERE octet_length(sig)=?1
+               AND octet_length(binary)<=?2
+               AND (name IS NULL OR octet_length(name)<=?2)
+               AND octet_length(source)<=?2",
+            self.row_select()
+        );
+        let mut st = self.conn.prepare(&sql)?;
+        let rows = st.query_map(params![SIG_BYTES, MAX_TEXT], |r| Ok(row_to_rec(r)))?;
+        let mut out = Vec::new();
+        let mut total_bytes: u64 = 0;
+        for r in rows {
+            let rec = r??;
+            // byte recheck in Rust: the octet_length WHERE already dropped over-
+            // long text, this catches a build whose sqlite octet_length behaves
+            // unexpectedly. skip the crafted row, same as a corrupt-sig row.
+            if over_text_cap(&rec) {
+                continue;
+            }
+            // aggregate bomb backstops: fail closed rather than build a Vec a
+            // billion-row image would blow memory (and the reply cap) on.
+            if out.len() >= MAX_ROWS {
+                anyhow::bail!("corpus exceeds {MAX_ROWS}-row budget");
+            }
+            total_bytes = total_bytes.saturating_add(rec_bytes(&rec));
+            if total_bytes > MAX_TOTAL_BYTES {
+                anyhow::bail!("corpus exceeds {MAX_TOTAL_BYTES}-byte budget");
+            }
+            out.push(rec);
+        }
+        Ok(out)
+    }
+
+    /// candidate rows that share at least one LSH band with `fp`.
+    pub fn candidates(&self, fp: &Fingerprint) -> Result<Vec<FuncRec>> {
+        // hoist both prepares out of their loops. re-preparing the same statement
+        // once per band and once per candidate id turned a large corpus into a lot
+        // of wasted sqlite recompile work; prepare once, reuse. (the hostile-corpus
+        // query path runs through MemCorpus, not this, but index --out and the
+        // tests still use it, so keep it cheap.)
+        let mut ids = std::collections::HashSet::new();
+        {
+            let mut band_st = self
+                .conn
+                .prepare("SELECT func_id FROM bands WHERE band=?1 AND key=?2")?;
+            for (band, key) in fp.band_keys(BAND_ROWS).into_iter().enumerate() {
+                let it =
+                    band_st.query_map(params![band as i64, key as i64], |r| r.get::<_, i64>(0))?;
+                for id in it {
+                    ids.insert(id?);
+                }
+            }
+        }
+        // same absurd-text guard as all(): a crafted corpus row with a huge
+        // binary/name/source string is skipped in sqlite before we materialize
+        // it, not just dropped after the alloc. keeps this path (index --out +
+        // tests) consistent with all()'s defense in depth.
+        let sql = format!(
+            "SELECT {} FROM funcs
+             WHERE id=?1 AND octet_length(sig)=?2
+               AND octet_length(binary)<=?3
+               AND (name IS NULL OR octet_length(name)<=?3)
+               AND octet_length(source)<=?3",
+            self.row_select()
+        );
+        let mut row_st = self.conn.prepare(&sql)?;
+        let mut out = Vec::new();
+        for id in ids {
+            // a band pointing at a missing or wrong-sized row (corrupt/crafted
+            // db) is skipped, not a hard error that kills the whole query.
+            match row_st
+                .query_row(params![id, SIG_BYTES, MAX_TEXT], |r| Ok(row_to_rec(r)))
+                .optional()?
+            {
+                Some(rec) => out.push(rec?),
+                None => continue,
+            }
+        }
+        Ok(out)
+    }
+}
+
+// The one unsafe point in the whole workspace. `deserialize` takes ownership of
+// a buffer that sqlite will later free with sqlite3_free, so the buffer must come
+// from sqlite's own allocator; there is no safe constructor for OwnedData from a
+// &[u8]. We allocate with sqlite3_malloc64, copy the (untrusted) image in, and
+// hand ownership to sqlite. Nothing here dereferences attacker data: it is a
+// length-checked copy into a freshly allocated block. If the alloc fails we error
+// instead of proceeding.
+#[allow(unsafe_code)]
+fn owned_from_bytes(bytes: &[u8]) -> Result<OwnedData> {
+    let len = bytes.len();
+    // SAFETY: sqlite3_malloc64 returns a block sqlite3_free can release (the
+    // contract OwnedData::Drop relies on). We copy exactly `len` bytes into it,
+    // both pointers valid and non-overlapping (src is our slice, dst is fresh).
+    // NonNull rejects a null (OOM) return before we build the OwnedData.
+    unsafe {
+        let p = ffi::sqlite3_malloc64(len as u64) as *mut u8;
+        let nn =
+            NonNull::new(p).ok_or_else(|| anyhow!("sqlite3_malloc64 failed for {len} bytes"))?;
+        ptr::copy_nonoverlapping(bytes.as_ptr(), p, len);
+        Ok(OwnedData::from_raw_nonnull(nn, len))
+    }
+}
+
+/// The read side of a corpus, as consumed by query/triage/match. Both the
+/// sqlite-backed `Db` and the in-memory `MemCorpus` implement it, so the compare
+/// pipelines in fnprint-core don't care which one they got. The cli feeds them a
+/// `MemCorpus` built from a jailed worker's decoded records; the tests feed a
+/// `Db`.
+pub trait Corpus {
+    fn all(&self) -> Result<Vec<FuncRec>>;
+    fn candidates(&self, fp: &Fingerprint) -> Result<Vec<FuncRec>>;
+}
+
+impl Corpus for Db {
+    fn all(&self) -> Result<Vec<FuncRec>> {
+        Db::all(self)
+    }
+    fn candidates(&self, fp: &Fingerprint) -> Result<Vec<FuncRec>> {
+        Db::candidates(self, fp)
+    }
+}
+
+/// A corpus already decoded into memory, with the LSH band index rebuilt from the
+/// records themselves (no sqlite). This is what the trusted parent uses after a
+/// jailed worker has parsed the .db, so the parent never runs sqlite on the
+/// untrusted image.
+pub struct MemCorpus {
+    recs: Vec<FuncRec>,
+    // (band, key) -> indices into `recs`, the same mapping the `bands` table held.
+    bands: HashMap<(usize, u64), Vec<usize>>,
+}
+
+impl MemCorpus {
+    pub fn from_records(recs: Vec<FuncRec>) -> MemCorpus {
+        let mut bands: HashMap<(usize, u64), Vec<usize>> = HashMap::new();
+        for (i, r) in recs.iter().enumerate() {
+            for (band, key) in r.fp.band_keys(BAND_ROWS).into_iter().enumerate() {
+                bands.entry((band, key)).or_default().push(i);
+            }
+        }
+        MemCorpus { recs, bands }
+    }
+
+    pub fn len(&self) -> usize {
+        self.recs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.recs.is_empty()
+    }
+}
+
+impl Corpus for MemCorpus {
+    fn all(&self) -> Result<Vec<FuncRec>> {
+        Ok(self.recs.clone())
+    }
+    fn candidates(&self, fp: &Fingerprint) -> Result<Vec<FuncRec>> {
+        let mut idxs = HashSet::new();
+        for (band, key) in fp.band_keys(BAND_ROWS).into_iter().enumerate() {
+            if let Some(v) = self.bands.get(&(band, key)) {
+                for &i in v {
+                    idxs.insert(i);
+                }
+            }
+        }
+        // sort so the candidate pool has a stable order: HashSet iteration is
+        // nondeterministic and downstream scoring breaks ties by pool position.
+        let mut idxs: Vec<usize> = idxs.into_iter().collect();
+        idxs.sort_unstable();
+        Ok(idxs.into_iter().map(|i| self.recs[i].clone()).collect())
+    }
+}
+
+// byte length of the text a row will materialize past its fixed sig blob. used
+// for the aggregate byte budget in all().
+fn rec_bytes(rec: &FuncRec) -> u64 {
+    let name = rec.name.as_deref().map(str::len).unwrap_or(0);
+    (SIG_BYTES as u64)
+        .saturating_add(rec.binary.len() as u64)
+        .saturating_add(name as u64)
+        .saturating_add(rec.source.len() as u64)
+        .saturating_add((rec.callees.len() * 8) as u64)
+}
+
+// true if any single text field exceeds the byte cap. the SQL octet_length guard
+// already drops these; this is the Rust-side backstop against a divergent sqlite.
+fn over_text_cap(rec: &FuncRec) -> bool {
+    let cap = MAX_TEXT as usize;
+    rec.binary.len() > cap
+        || rec.source.len() > cap
+        || rec.name.as_deref().map(str::len).unwrap_or(0) > cap
+}
+
+fn row_to_rec(r: &rusqlite::Row) -> Result<FuncRec> {
+    let sig: Vec<u8> = r.get(8)?;
+    // a crafted corpus can store negative/huge shingles/complexity; clamp with
+    // try_from so a bogus row degrades to a low-signal 0 instead of wrapping to
+    // u32::MAX (which would sail past the complexity signal gate). these only feed
+    // scoring gates, never an index/alloc, so this is tidiness, not a safety fix.
+    let fp = Fingerprint {
+        sig: decode_sig(&sig),
+        shingles: u32::try_from(r.get::<_, i64>(6)?).unwrap_or(0),
+        complexity: u32::try_from(r.get::<_, i64>(5)?).unwrap_or(0),
+        capped: r.get::<_, i64>(7)? != 0,
+    };
+    // NULL (a row written by an older fnprint into an upgraded file) reads as
+    // no edges. cap the blob before decoding so a crafted row can't grow the Vec.
+    let cb: Option<Vec<u8>> = r.get(9)?;
+    let cb = cb.unwrap_or_default();
+    let cb = &cb[..cb.len().min(MAX_CALLEES * 8)];
+    Ok(FuncRec {
+        id: r.get(0)?,
+        binary: r.get(1)?,
+        name: r.get(2)?,
+        entry: r.get::<_, i64>(3)? as u64,
+        source: r.get(4)?,
+        fp,
+        callees: decode_sig(cb),
+    })
+}
+
+fn encode_sig(sig: &[u64]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(sig.len() * 8);
+    for x in sig {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    v
+}
+
+fn decode_sig(bytes: &[u8]) -> Vec<u64> {
+    // manual 8-byte stride instead of chunks_exact: copy_from_slice can't panic
+    // here (the window is provably 8 bytes) and there is no unwrap on db-loaded
+    // bytes. written this way on purpose so no clippy version rewrites it into
+    // as_chunks (newer than our MSRV) and no lint fires across toolchains.
+    let mut out = Vec::with_capacity(bytes.len() / 8);
+    let mut i = 0;
+    while i + 8 <= bytes.len() {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&bytes[i..i + 8]);
+        out.push(u64::from_le_bytes(w));
+        i += 8;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fnprint_sig::Fingerprint;
+
+    fn fp(seed: u64) -> Fingerprint {
+        Fingerprint {
+            sig: (0..SIG_LEN as u64).map(|i| i ^ seed).collect(),
+            shingles: 10,
+            complexity: 5,
+            capped: false,
+        }
+    }
+
+    #[test]
+    fn bundled_sqlite_is_past_cve_2025_3277() {
+        // CVE-2025-3277 (integer overflow in concat_ws) is fixed in SQLite 3.49.1.
+        // we parse untrusted corpus images with sqlite, so a dep downgrade that
+        // dropped the bundle below that must fail the build, not ship silently.
+        // version_number is MAJOR*1_000_000 + MINOR*1_000 + PATCH.
+        let v = rusqlite::version_number();
+        assert!(
+            v >= 3_049_001,
+            "bundled sqlite {v} is below 3.49.1; CVE-2025-3277 unpatched"
+        );
+    }
+
+    #[test]
+    fn roundtrip_and_candidates() {
+        let db = Db::open_memory().unwrap();
+        db.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0), &[])
+            .unwrap();
+        db.insert("a.bin", Some("bar"), 0x2000, "symtab", &fp(999), &[])
+            .unwrap();
+        assert_eq!(db.all().unwrap().len(), 2);
+        // querying with foo's own print must surface foo as a candidate
+        let cands = db.candidates(&fp(0)).unwrap();
+        assert!(cands.iter().any(|c| c.name.as_deref() == Some("foo")));
+    }
+
+    // project a corpus to comparable rows: full content (Fingerprint has no
+    // PartialEq, so compare its fields), sorted by entry for a stable order.
+    type Projected = (
+        String,
+        Option<String>,
+        u64,
+        String,
+        Vec<u64>,
+        u32,
+        u32,
+        bool,
+    );
+    fn project(db: &Db) -> Vec<Projected> {
+        let mut v: Vec<Projected> = db
+            .all()
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                (
+                    r.binary,
+                    r.name,
+                    r.entry,
+                    r.source,
+                    r.fp.sig,
+                    r.fp.shingles,
+                    r.fp.complexity,
+                    r.fp.capped,
+                )
+            })
+            .collect();
+        v.sort_by_key(|t| t.2);
+        v
+    }
+    fn band_count(db: &Db) -> i64 {
+        db.conn
+            .query_row("SELECT count(*) FROM bands", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn insert_all_matches_per_row_insert() {
+        // a batch insert must land exactly the rows (funcs + bands) that the same
+        // prints inserted one at a time would, just under one commit.
+        let one = Db::open_memory().unwrap();
+        one.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0), &[])
+            .unwrap();
+        one.insert("a.bin", None, 0x2000, "eh_frame", &fp(7), &[])
+            .unwrap();
+
+        let batch = Db::open_memory().unwrap();
+        let f0 = fp(0);
+        let f7 = fp(7);
+        let n = batch
+            .insert_all(
+                "a.bin",
+                &[
+                    FuncPrint {
+                        name: Some("foo"),
+                        entry: 0x1000,
+                        source: "symtab",
+                        fp: &f0,
+                        callees: &[],
+                    },
+                    FuncPrint {
+                        name: None,
+                        entry: 0x2000,
+                        source: "eh_frame",
+                        fp: &f7,
+                        callees: &[],
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+        // full row content matches, not just the count
+        assert_eq!(project(&batch), project(&one));
+        // and the LSH band rows match too (candidate lookup depends on them)
+        assert_eq!(band_count(&batch), band_count(&one));
+        let cands = batch.candidates(&fp(0)).unwrap();
+        assert!(cands.iter().any(|c| c.name.as_deref() == Some("foo")));
+    }
+
+    #[test]
+    fn insert_all_empty_is_a_noop() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(db.insert_all("a.bin", &[]).unwrap(), 0);
+        assert!(db.all().unwrap().is_empty());
+        assert_eq!(band_count(&db), 0);
+    }
+
+    #[test]
+    fn insert_all_rolls_back_on_error() {
+        // the whole point of the transaction: a mid-batch failure must leave the
+        // corpus empty, not half-written. a unique index on entry makes the second
+        // row (same entry) violate a constraint, so the first row + its bands must
+        // roll back with it.
+        let db = Db::open_memory().unwrap();
+        db.conn
+            .execute_batch("CREATE UNIQUE INDEX ux_entry ON funcs(entry)")
+            .unwrap();
+        let f0 = fp(0);
+        let f1 = fp(1);
+        let res = db.insert_all(
+            "a.bin",
+            &[
+                FuncPrint {
+                    name: Some("first"),
+                    entry: 0x1000,
+                    source: "symtab",
+                    fp: &f0,
+                    callees: &[],
+                },
+                FuncPrint {
+                    name: Some("dup"),
+                    entry: 0x1000, // same entry -> UNIQUE violation on row 2
+                    source: "symtab",
+                    fp: &f1,
+                    callees: &[],
+                },
+            ],
+        );
+        assert!(res.is_err(), "duplicate entry must fail the batch");
+        assert!(
+            db.all().unwrap().is_empty(),
+            "a failed batch must roll back the rows already inserted"
+        );
+        assert_eq!(band_count(&db), 0, "band rows must roll back too");
+    }
+
+    #[test]
+    fn corrupt_sig_row_is_skipped_not_fatal() {
+        let db = Db::open_memory().unwrap();
+        db.insert("a.bin", Some("good"), 0x1000, "symtab", &fp(0), &[])
+            .unwrap();
+        // craft a row with a wrong-sized sig blob, like a corrupt or malicious
+        // corpus would have. it must be skipped, and it must not make us try to
+        // decode a giant blob or blow up the query.
+        db.conn
+            .execute(
+                "INSERT INTO funcs(binary,name,entry,source,complexity,shingles,capped,sig)
+                 VALUES('evil.bin','bad',0x2000,'symtab',5,10,0,?1)",
+                params![vec![0u8; 7]], // not a multiple of 8, and not SIG_BYTES
+            )
+            .unwrap();
+        // also a plausible-but-oversized blob
+        db.conn
+            .execute(
+                "INSERT INTO funcs(binary,name,entry,source,complexity,shingles,capped,sig)
+                 VALUES('evil.bin','huge',0x3000,'symtab',5,10,0,?1)",
+                params![vec![0u8; SIG_BYTES as usize * 4]],
+            )
+            .unwrap();
+
+        let all = db.all().unwrap();
+        assert_eq!(all.len(), 1, "only the well-formed row should load");
+        assert_eq!(all[0].name.as_deref(), Some("good"));
+        // candidate lookup must not error out on the corrupt rows either
+        let _ = db.candidates(&fp(0)).unwrap();
+    }
+
+    #[test]
+    fn oversized_text_row_is_skipped() {
+        let db = Db::open_memory().unwrap();
+        db.insert("a.bin", Some("good"), 0x1000, "symtab", &fp(0), &[])
+            .unwrap();
+        // a crafted corpus with a huge binary-name string. all() must skip it
+        // rather than materialize a multi-MB String per row.
+        let huge = "x".repeat((MAX_TEXT as usize) + 1);
+        db.insert(&huge, Some("bad"), 0x2000, "symtab", &fp(1), &[])
+            .unwrap();
+        let all = db.all().unwrap();
+        assert_eq!(all.len(), 1, "only the sane-sized row should load");
+        assert_eq!(all[0].name.as_deref(), Some("good"));
+    }
+
+    // serialize an in-memory db to a raw image the way the parent reads one off
+    // disk, so open_image can be tested without a file.
+    fn image_of(db: &Db) -> Vec<u8> {
+        db.conn.serialize(MAIN_DB).unwrap().to_vec()
+    }
+
+    #[test]
+    fn open_image_reads_a_corpus_in_memory() {
+        let src = Db::open_memory().unwrap();
+        src.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0), &[])
+            .unwrap();
+        src.insert("a.bin", Some("bar"), 0x2000, "symtab", &fp(999), &[])
+            .unwrap();
+        let image = image_of(&src);
+
+        // this is what the jailed worker does: parse the bytes with no file open
+        let db = Db::open_image(&image).unwrap();
+        let all = db.all().unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|r| r.name.as_deref() == Some("foo")));
+    }
+
+    #[test]
+    fn open_image_is_read_only() {
+        let src = Db::open_memory().unwrap();
+        src.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0), &[])
+            .unwrap();
+        let db = Db::open_image(&image_of(&src)).unwrap();
+        // a deserialized image is read-only: any write must be refused, not
+        // silently mutate the corpus.
+        let wr = db
+            .conn
+            .execute("DELETE FROM funcs", [])
+            .err()
+            .map(|e| e.to_string());
+        assert!(wr.is_some(), "write to a read-only image should fail");
+    }
+
+    #[test]
+    fn open_image_rejects_garbage() {
+        // sqlite validates the image lazily, so a non-sqlite blob surfaces as a
+        // clean error on the first read, exactly the open_image().and_then(all)
+        // the worker runs. never a panic or a crash.
+        let bad = Db::open_image(&[0xde, 0xad, 0xbe, 0xef, 0, 1, 2, 3]).and_then(|db| db.all());
+        assert!(bad.is_err());
+        // empty image too
+        let empty = Db::open_image(&[]).and_then(|db| db.all());
+        assert!(empty.is_err());
+    }
+
+    // serialize a raw connection (bypassing init()) so a test can craft any
+    // physical schema the way a hostile corpus author would.
+    fn crafted_image(setup_sql: &str) -> Vec<u8> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(setup_sql).unwrap();
+        conn.serialize(MAIN_DB).unwrap().to_vec()
+    }
+
+    #[test]
+    fn rejects_funcs_as_view() {
+        // funcs declared as a VIEW over a base table must be rejected outright:
+        // a view body is arbitrary SQL surface we refuse to run.
+        let img = crafted_image(
+            "CREATE TABLE base(id INTEGER, binary TEXT, name TEXT, entry INTEGER,
+                 source TEXT, complexity INTEGER, shingles INTEGER, capped INTEGER, sig BLOB);
+             CREATE VIEW funcs AS SELECT * FROM base;",
+        );
+        let e = Db::open_image(&img)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            e.contains("view") || e.to_lowercase().contains("funcs"),
+            "got: {e}"
+        );
+    }
+
+    #[test]
+    fn rejects_generated_column() {
+        // exactly the 9 expected column names/types, but `capped` is a generated
+        // column (hidden != 0). must be rejected, not read.
+        let img = crafted_image(
+            "CREATE TABLE funcs(
+                 id INTEGER PRIMARY KEY, binary TEXT NOT NULL, name TEXT, entry INTEGER NOT NULL,
+                 source TEXT NOT NULL, complexity INTEGER NOT NULL, shingles INTEGER NOT NULL,
+                 capped INTEGER GENERATED ALWAYS AS (0) VIRTUAL, sig BLOB NOT NULL);",
+        );
+        let e = Db::open_image(&img)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("hidden/generated"), "got: {e}");
+    }
+
+    #[test]
+    fn rejects_extra_column() {
+        // a 10th column that is not `callees BLOB` is a different physical shape; reject.
+        let img = crafted_image(
+            "CREATE TABLE funcs(
+                 id INTEGER PRIMARY KEY, binary TEXT NOT NULL, name TEXT, entry INTEGER NOT NULL,
+                 source TEXT NOT NULL, complexity INTEGER NOT NULL, shingles INTEGER NOT NULL,
+                 capped INTEGER NOT NULL, sig BLOB NOT NULL, extra INTEGER);",
+        );
+        let e = Db::open_image(&img)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("mismatch"), "got: {e}");
+        // and one past the full 10 is rejected on count.
+        let img = crafted_image(
+            "CREATE TABLE funcs(
+                 id INTEGER PRIMARY KEY, binary TEXT NOT NULL, name TEXT, entry INTEGER NOT NULL,
+                 source TEXT NOT NULL, complexity INTEGER NOT NULL, shingles INTEGER NOT NULL,
+                 capped INTEGER NOT NULL, sig BLOB NOT NULL, callees BLOB, extra INTEGER);",
+        );
+        let e = Db::open_image(&img)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("columns"), "got: {e}");
+    }
+
+    #[test]
+    fn legacy_nine_column_corpus_reads_with_no_edges() {
+        // a pre-0.6 corpus has no callees column. it must still open and read,
+        // rows come back with empty callees, and the fingerprint is intact.
+        let src = Connection::open_in_memory().unwrap();
+        src.execute_batch(
+            "CREATE TABLE funcs(
+                 id INTEGER PRIMARY KEY, binary TEXT NOT NULL, name TEXT, entry INTEGER NOT NULL,
+                 source TEXT NOT NULL, complexity INTEGER NOT NULL, shingles INTEGER NOT NULL,
+                 capped INTEGER NOT NULL, sig BLOB NOT NULL);
+             CREATE TABLE bands(band INTEGER NOT NULL, key INTEGER NOT NULL, func_id INTEGER NOT NULL);",
+        )
+        .unwrap();
+        let f = fp(3);
+        src.execute(
+            "INSERT INTO funcs(binary,name,entry,source,complexity,shingles,capped,sig)
+             VALUES('a.bin','foo',4096,'symtab',9,20,0,?1)",
+            params![encode_sig(&f.sig)],
+        )
+        .unwrap();
+        let img = src.serialize(MAIN_DB).unwrap().to_vec();
+        let db = Db::open_image(&img).unwrap();
+        let recs = db.all().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert!(recs[0].callees.is_empty());
+        assert_eq!(recs[0].fp.sig, f.sig);
+        assert_eq!(recs[0].name.as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn callees_round_trip_and_cap() {
+        let db = Db::open_memory().unwrap();
+        db.insert(
+            "a.bin",
+            Some("foo"),
+            0x1000,
+            "symtab",
+            &fp(0),
+            &[0x2000, 0x3000],
+        )
+        .unwrap();
+        // a row with more edges than the cap is truncated at insert
+        let big: Vec<u64> = (0..(MAX_CALLEES as u64 + 10)).collect();
+        db.insert("a.bin", Some("bar"), 0x2000, "symtab", &fp(1), &big)
+            .unwrap();
+        let mut recs = db.all().unwrap();
+        recs.sort_by_key(|r| r.entry);
+        assert_eq!(recs[0].callees, vec![0x2000, 0x3000]);
+        assert_eq!(recs[1].callees.len(), MAX_CALLEES);
+    }
+
+    #[test]
+    fn rejects_wrong_column_type() {
+        // sig declared TEXT instead of BLOB shifts affinity under our guards; reject.
+        let img = crafted_image(
+            "CREATE TABLE funcs(
+                 id INTEGER PRIMARY KEY, binary TEXT NOT NULL, name TEXT, entry INTEGER NOT NULL,
+                 source TEXT NOT NULL, complexity INTEGER NOT NULL, shingles INTEGER NOT NULL,
+                 capped INTEGER NOT NULL, sig TEXT NOT NULL);",
+        );
+        let e = Db::open_image(&img)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("column mismatch"), "got: {e}");
+    }
+
+    #[test]
+    fn multibyte_text_over_byte_cap_is_skipped() {
+        // a name whose CHARACTER count is under the cap but whose BYTE count is
+        // over it must be dropped: the guard is octet_length (bytes), not length
+        // (chars). 400k 3-byte chars = 1.2 MiB > MAX_TEXT but only 400k chars.
+        let src = Db::open_memory().unwrap();
+        src.insert("a.bin", Some("good"), 0x1000, "symtab", &fp(0), &[])
+            .unwrap();
+        let wide = "\u{3042}".repeat(400_000); // 'HIRAGANA A', 3 bytes each
+        assert!(
+            (wide.chars().count() as i64) < MAX_TEXT,
+            "char count must be under cap"
+        );
+        assert!(
+            (wide.len() as i64) > MAX_TEXT,
+            "byte count must be over cap"
+        );
+        src.insert("b.bin", Some(&wide), 0x2000, "symtab", &fp(1), &[])
+            .unwrap();
+        let db = Db::open_image(&image_of(&src)).unwrap();
+        let all = db.all().unwrap();
+        assert_eq!(all.len(), 1, "only the byte-sane row should load");
+        assert_eq!(all[0].name.as_deref(), Some("good"));
+    }
+
+    #[test]
+    fn wellformed_image_still_passes_schema_check() {
+        // the schema verifier must accept a corpus our own init() produced.
+        let src = Db::open_memory().unwrap();
+        src.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0), &[])
+            .unwrap();
+        let db = Db::open_image(&image_of(&src)).unwrap();
+        assert_eq!(db.all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn memcorpus_matches_db_semantics() {
+        let db = Db::open_memory().unwrap();
+        db.insert("a.bin", Some("foo"), 0x1000, "symtab", &fp(0), &[])
+            .unwrap();
+        db.insert("a.bin", Some("bar"), 0x2000, "symtab", &fp(999), &[])
+            .unwrap();
+
+        // MemCorpus built from the same rows must answer all()/candidates() the
+        // same way the sqlite-backed Db does, since the parent swaps one for the
+        // other.
+        let mem = MemCorpus::from_records(db.all().unwrap());
+        assert_eq!(mem.len(), db.all().unwrap().len());
+
+        let db_c: HashSet<i64> = db
+            .candidates(&fp(0))
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        let mem_c: HashSet<i64> = Corpus::candidates(&mem, &fp(0))
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(db_c, mem_c);
+        assert!(mem_c.contains(&db.all().unwrap()[0].id));
+    }
+}

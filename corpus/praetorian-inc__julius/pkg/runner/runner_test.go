@@ -1,0 +1,239 @@
+package runner
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/praetorian-inc/julius/pkg/rules"
+	"github.com/praetorian-inc/julius/pkg/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// An empty request path is valid: the request targets the supplied URL as-is, so a probe
+// can classify the exact URL it is handed (e.g. MCP, whose endpoint path is not fixed and
+// is discovered upstream) rather than a fixed sub-path of it.
+func TestValidateProbe_EmptyPathIsValid(t *testing.T) {
+	p := &types.Probe{
+		Name: "match-target-as-is",
+		Requests: []types.Request{{
+			Path:     "",
+			Method:   "POST",
+			RawMatch: []rules.RawRule{{Type: "body.contains", Value: "x"}},
+		}},
+	}
+	assert.Empty(t, validateProbe(p), "empty path should be allowed")
+}
+
+func TestValidateProbe_RequiresMatchRule(t *testing.T) {
+	p := &types.Probe{
+		Name:     "no-rules",
+		Requests: []types.Request{{Path: "", Method: "GET"}},
+	}
+	assert.NotEmpty(t, validateProbe(p), "a request with no match rules should be invalid")
+}
+
+func TestBuildTLSConfig_NilWhenNoFlagsSet(t *testing.T) {
+	// Save original values
+	origInsecure := insecureSkipVerify
+	origCACert := caCertFile
+	defer func() {
+		insecureSkipVerify = origInsecure
+		caCertFile = origCACert
+	}()
+
+	// Test: no flags set
+	insecureSkipVerify = false
+	caCertFile = ""
+
+	tlsConfig, err := buildTLSConfig()
+	require.NoError(t, err)
+	assert.Nil(t, tlsConfig, "buildTLSConfig should return nil when no flags are set")
+}
+
+func TestBuildTLSConfig_WithInsecureFlag(t *testing.T) {
+	// Save original values
+	origInsecure := insecureSkipVerify
+	origCACert := caCertFile
+	defer func() {
+		insecureSkipVerify = origInsecure
+		caCertFile = origCACert
+	}()
+
+	insecureSkipVerify = true
+	caCertFile = ""
+
+	tlsConfig, err := buildTLSConfig()
+	require.NoError(t, err)
+	require.NotNil(t, tlsConfig, "buildTLSConfig should return config when insecure flag set")
+	assert.True(t, tlsConfig.InsecureSkipVerify, "InsecureSkipVerify should be true")
+}
+
+func TestBuildTLSConfig_InvalidCACertFile(t *testing.T) {
+	// Save original values
+	origInsecure := insecureSkipVerify
+	origCACert := caCertFile
+	defer func() {
+		insecureSkipVerify = origInsecure
+		caCertFile = origCACert
+	}()
+
+	insecureSkipVerify = false
+	caCertFile = "/nonexistent/path/to/cert.pem"
+
+	_, err := buildTLSConfig()
+	assert.Error(t, err, "buildTLSConfig should return error for invalid CA cert file")
+}
+
+func TestBuildTLSConfig_ValidCACertFile(t *testing.T) {
+	// Save original values
+	origInsecure := insecureSkipVerify
+	origCACert := caCertFile
+	defer func() {
+		insecureSkipVerify = origInsecure
+		caCertFile = origCACert
+	}()
+
+	// Create a temporary CA cert file with a valid self-signed cert
+	tempDir := t.TempDir()
+	certFile := filepath.Join(tempDir, "ca.pem")
+	// Valid self-signed certificate (generated with: openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=test")
+	certPEM := []byte(`-----BEGIN CERTIFICATE-----
+MIIC/zCCAeegAwIBAgIUXpSGR6tdBCoct0eghI4fF7gvVCIwDQYJKoZIhvcNAQEL
+BQAwDzENMAsGA1UEAwwEdGVzdDAeFw0yNjAyMTQxNTQ0NTZaFw0yNzAyMTQxNTQ0
+NTZaMA8xDTALBgNVBAMMBHRlc3QwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK
+AoIBAQC6QsGr39yxVTsMxFZvuL4jWUkopPDVjXQkNIHnayJgNS85f9eBJ6yFX16q
+bS4bMh6Tgy8Wdl74LHbGQ4qhGfoJbu37GCI8gqbc0ne/6qJJWLrfh9N98gM6907L
+HxF5KdDQVJLMF8SvPzR5A8QztmfxOa+Ds1fEzWPQ0vkHRzPPp2gWmtY6m9aPDlnV
+976t/Nya9UWTIDu/Tjn8e5MkUkm3uvQjTastW94owlJxqtL631i8dxAoXPiMxmx0
+jRfiA27xwbXOXG2/wdnPlDECPHDkcetov1HP+3Kc1UOvyWGccN11Gr/siy5sQPjJ
+zXr5Iwdk1fAWDcoKcnC1GSRZBKl/AgMBAAGjUzBRMB0GA1UdDgQWBBQ0VAGxojF9
+bn9ZoQwcXkuwuUJ6wzAfBgNVHSMEGDAWgBQ0VAGxojF9bn9ZoQwcXkuwuUJ6wzAP
+BgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQBngJFsDr121fIls/DB
+sXT9XTRnC9sBKPwq+vBp+AR+KOh1EZJ9Hoyn0l4noA99L498Xo/lkr+8tEq/8e5+
+KEAh91IhOFv+HVkjby2b3DTCiXi0LckCn9TO1M03091TmrKvQJDqm4QBE/JoUXKJ
+n7GuU94IcgjxunD9Aoo9oaGfq3tvb/MLdPvHyyBaTKwshBhHI+vENBnvY0jw1RNV
+O9qmUCC+jbnfDuXv9eEDeUCTa0mt3UsigJZjsm43EASpsp7DnPerhDiVo7q/LBZU
+W+qmbNe6MWuCmsF6q6mqA/hjSzdjrK5Q5STYdK49may9W3sFvgvLhnRtYczuq7Hh
+o96z
+-----END CERTIFICATE-----`)
+	err := os.WriteFile(certFile, certPEM, 0600)
+	require.NoError(t, err)
+
+	insecureSkipVerify = false
+	caCertFile = certFile
+
+	tlsConfig, err := buildTLSConfig()
+	require.NoError(t, err)
+	require.NotNil(t, tlsConfig, "buildTLSConfig should return config when CA cert provided")
+	assert.NotNil(t, tlsConfig.RootCAs, "RootCAs should be set")
+}
+
+func TestParseHeaders_ValidHeaders(t *testing.T) {
+	headers, err := parseHeaders([]string{
+		"Authorization: Bearer token123",
+		"X-Api-Key: abc123",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer token123", headers["Authorization"])
+	assert.Equal(t, "abc123", headers["X-Api-Key"])
+}
+
+func TestParseHeaders_TrimSpaces(t *testing.T) {
+	headers, err := parseHeaders([]string{"  X-Key  :  some-value  "})
+	require.NoError(t, err)
+	assert.Equal(t, "some-value", headers["X-Key"])
+}
+
+func TestParseHeaders_InvalidFormat(t *testing.T) {
+	_, err := parseHeaders([]string{"no-colon-here"})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid header format")
+}
+
+func TestParseHeaders_EmptySlice(t *testing.T) {
+	headers, err := parseHeaders(nil)
+	require.NoError(t, err)
+	assert.Nil(t, headers)
+}
+
+func TestParseHeaders_ColonInValue(t *testing.T) {
+	headers, err := parseHeaders([]string{"Authorization: Bearer eyJ0eXAiOiJKV1Q:payload:sig"})
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer eyJ0eXAiOiJKV1Q:payload:sig", headers["Authorization"])
+}
+
+func TestParseHeaders_EmptyKeyOrValue(t *testing.T) {
+	t.Run("empty value", func(t *testing.T) {
+		headers, err := parseHeaders([]string{"X-Key:"})
+		require.NoError(t, err)
+		assert.Equal(t, "", headers["X-Key"])
+	})
+
+	t.Run("value with spaces only", func(t *testing.T) {
+		headers, err := parseHeaders([]string{"X-Key:   "})
+		require.NoError(t, err)
+		assert.Equal(t, "", headers["X-Key"])
+	})
+
+	t.Run("empty key rejected", func(t *testing.T) {
+		_, err := parseHeaders([]string{": some-value"})
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "empty header name")
+	})
+}
+
+func TestParseHeaders_DuplicateKeys(t *testing.T) {
+	headers, err := parseHeaders([]string{
+		"Authorization: Bearer first",
+		"Authorization: Bearer second",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer second", headers["Authorization"], "duplicate keys should use last-writer-wins")
+}
+
+func TestLoadProbes_ReturnsEmbeddedWhenNoDirSet(t *testing.T) {
+	// Save original value
+	origProbesDir := probesDir
+	defer func() {
+		probesDir = origProbesDir
+	}()
+
+	probesDir = ""
+
+	probes, err := loadProbes()
+	require.NoError(t, err, "loadProbes should not error when probesDir is empty")
+	assert.NotEmpty(t, probes, "loadProbes should return embedded probes")
+}
+
+func TestLoadProbes_LoadsFromDirWhenSet(t *testing.T) {
+	// Save original value
+	origProbesDir := probesDir
+	defer func() {
+		probesDir = origProbesDir
+	}()
+
+	// Create temp directory with a probe
+	tempDir := t.TempDir()
+	probeFile := filepath.Join(tempDir, "test.yaml")
+	probeYAML := []byte(`name: test-probe
+category: test
+type: http
+requests:
+  - path: /test
+    method: GET
+    match:
+      - type: status
+        value: 200
+`)
+	err := os.WriteFile(probeFile, probeYAML, 0600)
+	require.NoError(t, err)
+
+	probesDir = tempDir
+
+	probes, err := loadProbes()
+	require.NoError(t, err, "loadProbes should not error when loading from directory")
+	require.NotEmpty(t, probes, "loadProbes should return probes from directory")
+	assert.Equal(t, "test-probe", probes[0].Name)
+}

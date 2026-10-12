@@ -1,0 +1,65 @@
+from django.contrib import admin
+from django import forms
+from django.db import models
+from django.contrib.contenttypes.admin import GenericTabularInline
+
+from cbe.party.models import Organisation, Individual, PhysicalContact, EmailContact, TelephoneNumber, GenericPartyRole, Owner, PartyRoleAssociation
+
+
+class GenericPartyRoleAdminForm(forms.ModelForm):
+    party = forms.ChoiceField()
+
+    class Meta:
+        exclude = ['contact_mediums',]
+        model = GenericPartyRole
+
+    def __init__(self, *args, **kwargs):
+        choices = (('', ''),)
+        for individual in Individual.objects.all():
+            choices += (("%d::%s::%s" % (individual.id,
+                                         individual.__class__.__name__, individual), "%s" % individual),)
+
+        for organisation in Organisation.objects.all():
+            choices += (("%d::%s::%s" % (organisation.id,
+                                         organisation.__class__.__name__, organisation), "%s" % organisation),)
+
+        self.base_fields['party'].choices = choices
+
+        forms.ModelForm.__init__(self, *args, **kwargs)
+
+        instance = kwargs.get('instance')
+        if instance:
+            if instance.party:
+                self.initial['party'] = "%d::%s::%s" % (
+                    instance.party.id, instance.party.__class__.__name__, instance.party)
+
+
+# TODO: Validate the role name vs other roles (E.g. Customer) and force
+# users to admin the correct role.
+class GenericPartyRoleAdmin(admin.ModelAdmin):
+    list_display = ('code', 'valid_from', 'valid_to', 'party', 'name')
+    form = GenericPartyRoleAdminForm
+    fields = ('code', 'valid_from', 'valid_to', 'name', 'party', )
+
+    def save_model(self, request, obj, form, change):
+        splitparty = form.cleaned_data['party'].split('::')
+        if splitparty[1] == "Individual":
+            obj.party = Individual.objects.get(id=splitparty[0])
+        if splitparty[1] == "Organisation":
+            obj.party = Organisation.objects.get(id=splitparty[0])
+        obj.save()
+
+
+class TelephoneNumberAdmin(admin.ModelAdmin):
+    list_display = ('number',)
+
+
+admin.site.register(Organisation)
+admin.site.register(Individual)
+admin.site.register(PhysicalContact)
+admin.site.register(EmailContact)
+admin.site.register(TelephoneNumber, TelephoneNumberAdmin)
+admin.site.register(GenericPartyRole, GenericPartyRoleAdmin)
+admin.site.register(Owner, GenericPartyRoleAdmin)
+admin.site.register(PartyRoleAssociation)
+

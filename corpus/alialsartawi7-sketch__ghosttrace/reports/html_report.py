@@ -1,0 +1,917 @@
+"""HTML/PDF Report Generator — Professional OSINT Intelligence Reports"""
+import os, subprocess
+from datetime import datetime
+from html import escape
+from urllib.parse import urlparse
+from config import Config
+from utils.logger import log
+
+
+def _pdf_url_fetcher(url):
+    """url_fetcher for weasyprint that refuses non-network resources. Only remote
+    http(s) URLs (e.g. the report's web font) may be fetched — a file:// (or any
+    other local-scheme) reference is blocked, so a value that ever slipped past
+    HTML escaping can't pull a local file into the rendered PDF."""
+    scheme = (urlparse(url).scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise ValueError("blocked non-network resource in report: %s" % (scheme or "local"))
+    import weasyprint
+    return weasyprint.default_url_fetcher(url)
+
+
+# ═══════════════ All supported result types ═══════════════
+RESULT_TYPES = {
+    "email":     {"label": "Emails",          "icon": "📧", "color": "#3ecf8e", "tag": "te"},
+    "username":  {"label": "Profiles",        "icon": "👤", "color": "#3ecf8e", "tag": "tu"},
+    "subdomain": {"label": "Subdomains",      "icon": "🌐", "color": "#38bdf8", "tag": "ts"},
+    "ip":        {"label": "IP Addresses",    "icon": "🖥️", "color": "#38bdf8", "tag": "ts"},
+    "metadata":  {"label": "Metadata",        "icon": "📎", "color": "#b79af7", "tag": "tm"},
+    "dns":       {"label": "DNS Records",     "icon": "📡", "color": "#4f8ef7", "tag": "td"},
+    "ssl":       {"label": "SSL Certificate", "icon": "🔒", "color": "#e8a838", "tag": "tl"},
+    "whois":     {"label": "WHOIS",           "icon": "📋", "color": "#e8a838", "tag": "tw"},
+    "phone":     {"label": "Phone Intel",     "icon": "📱", "color": "#b79af7", "tag": "tp"},
+    "dork":      {"label": "Google Dorks",    "icon": "🔍", "color": "#f16060", "tag": "tg"},
+}
+
+
+# Subdomain-name sensitivity keywords — shared by the OSINT analysis and the
+# executive-summary recommendations so the two can never drift apart.
+#   STRONG  : distinctive infra / admin / remote-access terms, matched as a
+#             SUBSTRING (e.g. "webadmin", "vpngw" should flag).
+#   NOISY   : short / common terms, matched only as an EXACT DNS label to avoid
+#             false positives (e.g. "...studreg"->dr, "database"->db).
+# Generic security patterns — not target-specific.
+_SENSITIVE_STRONG = {"admin", "vpn", "internal", "jenkins", "gitlab", "gitea",
+                     "grafana", "kibana", "vault", "backup", "phpmyadmin",
+                     "webmail", "citrix", "sonarqube"}
+_SENSITIVE_NOISY = {"dev", "staging", "test", "uat", "qa", "git", "db", "sql",
+                    "old", "beta", "dr", "jira", "remote", "portal", "sso",
+                    "owa", "rdp", "gateway", "vnc"}
+
+
+class ReportGenerator:
+    @staticmethod
+    def _group_subdomains(items):
+        """Collapse subdomain results that share a hostname into a single row.
+
+        Handles both formats:
+          * new (v6.2+): value is a clean hostname, IPs live in `extra`
+          * legacy: value is "host (ip)" with one row per IP
+        One row per hostname, all IPs aggregated, highest confidence kept."""
+        import re as _re
+        ip_re = _re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+        groups, order = {}, []
+        for r in items:
+            val = (r.get("value", "") or "").strip()
+            host, found_ips = val, []
+            # Legacy inline "host (ip)"
+            if " (" in val and val.endswith(")"):
+                host = val.split(" (")[0].strip()
+                found_ips.append(val[val.index(" (") + 2:-1].strip().rstrip("."))
+            # New format: IPs (possibly comma-separated) in extra
+            extra = (r.get("extra", "") or "").strip()
+            if extra:
+                for piece in extra.split(","):
+                    piece = piece.strip().rstrip(".")
+                    if piece:
+                        found_ips.append(piece)
+            key = host
+            if key not in groups:
+                groups[key] = {"ips": [], "rep": r, "conf": r.get("confidence", 0)}
+                order.append(key)
+            for ip in found_ips:
+                if ip and ip != key and ip not in groups[key]["ips"]:
+                    groups[key]["ips"].append(ip)
+            if r.get("confidence", 0) > groups[key]["conf"]:
+                groups[key]["conf"] = r.get("confidence", 0)
+                groups[key]["rep"] = r
+        out = []
+        for key in order:
+            g = groups[key]
+            rep = dict(g["rep"])
+            if g["ips"] and not ip_re.match(key):
+                shown = ", ".join(g["ips"][:6]) + ("  …" if len(g["ips"]) > 6 else "")
+                rep["value"] = f"{key}  →  {shown}"
+            else:
+                rep["value"] = key
+            rep["confidence"] = g["conf"]
+            rep["extra"] = ""  # consumed into value; avoid double-display
+            out.append(rep)
+        return out
+
+    @staticmethod
+    def _base_domain(value):
+        """Best-effort host from a target/URL string, for scope checks.
+        Not a public-suffix parser — strips scheme/path/port/www/trailing dot
+        and lowercases. Enough to tell one registrable domain apart from another."""
+        import re as _re
+        s = str(value or "").strip().lower()
+        s = _re.sub(r'^[a-z]+://', '', s)   # scheme
+        s = s.split('/')[0].split('?')[0]    # path / query
+        s = s.split('@')[-1]                 # strip any creds / email local part
+        s = s.split(':')[0]                  # port
+        s = s.strip().strip('.')
+        if s.startswith('www.'):
+            s = s[4:]
+        return s
+
+    @staticmethod
+    def _host_in_scope(hostname, base):
+        """True if hostname is the target or shares its domain (sub/parent)."""
+        h = ReportGenerator._base_domain(hostname)
+        if not h or not base:
+            return False
+        return h == base or h.endswith('.' + base) or base.endswith('.' + h)
+
+    @staticmethod
+    def _analyze_osint(cats):
+        """Cross-correlate passive findings into honest signals — no network
+        calls, no invented severity. Reads only what was already collected
+        (emails, subdomains, DNS records, IPs)."""
+        import re as _re
+        out = {"email_posture": None, "private_ips": [], "sensitive_subs": [],
+               "admin_emails": [], "mx": 0, "ns": 0}
+
+        # ── DNS-derived email security posture (SPF / DMARC) + infra counts ──
+        spf = None
+        dmarc = None
+        for r in cats.get("dns", []):
+            v = (r.get("value", "") or "")
+            low = v.lower()
+            if "v=spf1" in low:
+                if "+all" in low:
+                    spf = "permissive (+all)"
+                elif "-all" in low:
+                    spf = "enforced (-all)"
+                elif "~all" in low:
+                    spf = "soft-fail (~all)"
+                else:
+                    spf = "present"
+            if "v=dmarc1" in low:
+                m = _re.search(r"p\s*=\s*(none|quarantine|reject)", low)
+                dmarc = m.group(1) if m else "present"
+            vs = v.strip()
+            if vs.startswith("[MX]"):
+                out["mx"] += 1
+            elif vs.startswith("[NS]"):
+                out["ns"] += 1
+        if cats.get("dns"):
+            out["email_posture"] = {"spf": spf, "dmarc": dmarc}
+
+        # ── Private / non-routable IPs disclosed in public records ──
+        def _priv(ip):
+            return bool(_re.match(
+                r"^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.|0\.0\.0\.0$)", ip))
+        seen = set()
+        for r in cats.get("ip", []):
+            ip = (r.get("value", "") or "").strip()
+            if _re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip) and _priv(ip) and ip not in seen:
+                seen.add(ip)
+                out["private_ips"].append(ip)
+        # IPs embedded inside SPF includes (ip4:...)
+        for r in cats.get("dns", []):
+            for ip in _re.findall(r"ip4:(\d{1,3}(?:\.\d{1,3}){3})", r.get("value", "")):
+                if _priv(ip) and ip not in seen:
+                    seen.add(ip)
+                    out["private_ips"].append(ip)
+
+        # ── Subdomains whose NAME flags non-prod / sensitive / access infra.
+        #    Two tiers:
+        #    STRONG keywords (admin, vpn, citrix…) match as a SUBSTRING — they're
+        #    distinctive enough that appearing anywhere in a name (e.g.
+        #    "webadmin", "admin-portal", "vpngw") is almost always intentional,
+        #    and missing a real admin/remote-access panel is worse than one extra
+        #    line. NOISY/short/common keywords (test, dev, remote, portal…) match
+        #    only as an EXACT DNS label, to avoid false positives like
+        #    "...studreg"→dr, "latest"→test, "database"→db, "remotelearning"→remote.
+        #    Generic security patterns — not target-specific examples. ──
+        STRONG = _SENSITIVE_STRONG
+        NOISY = _SENSITIVE_NOISY
+        sub_seen = set()
+        for r in cats.get("subdomain", []):
+            host = (r.get("value", "") or "").split("→")[0].split(" ")[0].strip().lower()
+            if not host or host in sub_seen:
+                continue
+            labels = set(_re.split(r"[.\-_]", host))
+            hits = {k for k in STRONG if k in host} | (labels & NOISY)
+            if hits:
+                sub_seen.add(host)
+                out["sensitive_subs"].append((host, sorted(hits)[0]))
+
+        # ── Emails hosted on a sensitive subdomain (e.g. isa@admin.example.com)
+        #    — the address itself points at admin/internal infra. ──
+        email_seen = set()
+        for r in cats.get("email", []):
+            val = (r.get("value", "") or "").strip().lower()
+            if "@" not in val or val in email_seen:
+                continue
+            domain = val.split("@")[-1]
+            if any(k in domain for k in ("admin", "internal", "vpn")):
+                email_seen.add(val)
+                out["admin_emails"].append(val)
+        return out
+
+    @staticmethod
+    def _exec_recommendations(an):
+        """Turn the honest signals from _analyze_osint into prioritised,
+        standard remediation / verification actions. No invented severity —
+        these are the conventional next steps for each observed signal, ordered
+        by how directly each one expands attack surface. Returns [] when
+        nothing applies (clean degradation)."""
+        recs = []
+        subs = [h for h, _ in an["sensitive_subs"]]
+        strong = [h for h in subs if any(k in h for k in _SENSITIVE_STRONG)]
+        noisy = [h for h in subs if h not in strong]
+
+        # 1) Internet-facing admin / remote-access / internal infra — top priority
+        if strong:
+            recs.append(
+                "Confirm the admin / remote-access / internal-named hosts above are "
+                "meant to be internet-facing; if so, enforce MFA and restrict them to "
+                "known source IPs (VPN or allow-list).")
+
+        # 2) Email anti-spoofing — only when the posture is actually weak
+        ep = an["email_posture"]
+        if ep:
+            spf, dmarc = ep["spf"], ep["dmarc"]
+            fixes = []
+            if spf is None:
+                fixes.append("publish an SPF record ending in -all")
+            elif spf.startswith("permissive"):
+                fixes.append("tighten SPF from +all to -all (hard-fail)")
+            if dmarc is None:
+                fixes.append("publish a DMARC record (start at p=none, then move to quarantine/reject)")
+            elif dmarc == "none":
+                fixes.append("raise DMARC from p=none to quarantine, then reject")
+            if fixes:
+                recs.append("Harden email anti-spoofing: " + "; ".join(fixes) + ".")
+
+        # 3) Internal topology leaked through public records
+        if an["private_ips"]:
+            recs.append(
+                "Remove the internal / non-routable IP addresses from public DNS and "
+                "SPF includes — they leak internal network topology to attackers.")
+
+        # 4) Non-production hosts (dev / staging / test ...) with no strong-infra flag
+        if noisy:
+            recs.append(
+                "Review the non-production hosts (dev / staging / test) for public "
+                "exposure — these commonly run outdated software or weaker auth.")
+
+        # 5) Admin addresses on sensitive infra — phishing / credential-reuse targets
+        if an["admin_emails"]:
+            recs.append(
+                "Treat the admin addresses on sensitive subdomains as high-value "
+                "phishing targets and verify their credentials aren't reused across "
+                "the exposed panels.")
+        return recs
+
+    @staticmethod
+    def _exec_bottom_line(an):
+        """One-sentence posture conclusion naming the single most significant
+        passive exposure, so the reader knows what to address first. Mirrors the
+        recommendation priority order. Returns None when nothing notable."""
+        subs = [h for h, _ in an["sensitive_subs"]]
+        strong = [h for h in subs if any(k in h for k in _SENSITIVE_STRONG)]
+        ep = an["email_posture"]
+        spf = ep["spf"] if ep else None
+        dmarc = ep["dmarc"] if ep else None
+        email_weak = ep and (spf is None or (spf or "").startswith("permissive")
+                             or dmarc is None or dmarc == "none")
+        if strong:
+            return ("the internet-facing admin / remote-access subdomains — these are "
+                    "direct attack surface and should be reviewed first")
+        if an["private_ips"]:
+            return ("internal network addresses disclosed in public records, which "
+                    "reveal internal topology")
+        if email_weak:
+            return ("a weak email anti-spoofing posture (SPF / DMARC), which leaves "
+                    "the domain open to spoofing")
+        if subs:
+            return "the set of non-production hosts exposed publicly"
+        if an["admin_emails"]:
+            return "admin email addresses exposed on sensitive infrastructure"
+        return None
+
+    @staticmethod
+    def _build_exec_summary(cats, target_e, module_e, total, n_cats,
+                            summary_text, high_conf, conf_high_pct):
+        """Build the executive-summary HTML body: scope + cross-correlated,
+        honest observations. target_e/module_e are already HTML-escaped."""
+        an = ReportGenerator._analyze_osint(cats)
+        parts = [
+            f'<p>Passive reconnaissance of <span class="highlight">{target_e}</span> via the '
+            f'<b>{module_e}</b> module surfaced <span class="highlight">{total} findings</span> '
+            f'across {n_cats} categories: {summary_text}. '
+            f'<span class="highlight">{high_conf} ({conf_high_pct}%)</span> are corroborated '
+            f'by reliable sources.</p>'
+        ]
+
+        # ── Email security posture (only when DNS records were collected) ──
+        ep = an["email_posture"]
+        if ep:
+            bits = []
+            spf = ep["spf"]
+            if spf is None:
+                bits.append('<span class="risk">no SPF record</span>')
+            elif spf.startswith("permissive"):
+                bits.append('SPF <span class="risk">permissive (+all)</span>')
+            elif spf.startswith("soft"):
+                bits.append('SPF present (soft-fail, ~all)')
+            elif spf.startswith("enforced"):
+                bits.append('SPF <span class="highlight">enforced (-all)</span>')
+            else:
+                bits.append('SPF present')
+            dm = ep["dmarc"]
+            if dm is None:
+                bits.append('<span class="risk">no DMARC record</span>')
+            elif dm == "none":
+                bits.append('DMARC <span style="color:#e8a838">p=none (monitoring only)</span>')
+            elif dm == "quarantine":
+                bits.append('DMARC <span style="color:#e8a838">p=quarantine</span>')
+            elif dm == "reject":
+                bits.append('DMARC <span class="highlight">enforced (p=reject)</span>')
+            else:
+                bits.append('DMARC present')
+            infra = []
+            if an["mx"]:
+                infra.append(f'{an["mx"]} mail server' + ("s" if an["mx"] != 1 else ""))
+            if an["ns"]:
+                infra.append(f'{an["ns"]} nameserver' + ("s" if an["ns"] != 1 else ""))
+            infra_txt = f' {", ".join(infra)} identified.' if infra else ''
+            parts.append(f'<p><b>Email security:</b> {"; ".join(bits)}.{infra_txt}</p>')
+
+        # ── Signals worth reviewing (private IPs, sensitive subdomain names) ──
+        signals = []
+        if an["private_ips"]:
+            shown = ", ".join(escape(ip) for ip in an["private_ips"][:5])
+            more = " …" if len(an["private_ips"]) > 5 else ""
+            signals.append(
+                f'<span class="risk">Private/internal IP addresses disclosed</span> in public '
+                f'records ({shown}{more}) — exposes internal network ranges.')
+        if an["sensitive_subs"]:
+            hosts = [h for h, _ in an["sensitive_subs"]]
+            shown = ", ".join(escape(h) for h in hosts[:4])
+            more = f' (+{len(hosts) - 4} more)' if len(hosts) > 4 else ''
+            signals.append(
+                f'{len(hosts)} subdomain' + ("s" if len(hosts) != 1 else "") +
+                f' use sensitive/non-production naming ({shown}{more}) — review on '
+                f'authorized targets.')
+        if an["admin_emails"]:
+            ae = an["admin_emails"]
+            shown = ", ".join(escape(e) for e in ae[:3])
+            more = f' (+{len(ae) - 3} more)' if len(ae) > 3 else ''
+            signals.append(
+                f'{len(ae)} email address' + ("es" if len(ae) != 1 else "") +
+                f' hosted on a sensitive subdomain ({shown}{more}).')
+        if signals:
+            lis = "".join(f'<li>{s}</li>' for s in signals)
+            parts.append(
+                '<p style="margin-top:8px"><b>Worth reviewing:</b></p>'
+                '<ul style="margin:4px 0 0 18px;color:var(--text2);font-size:13px;line-height:1.7">'
+                f'{lis}</ul>')
+        elif not ep:
+            parts.append('<p>No notable cross-source signals surfaced from passive data alone.</p>')
+        else:
+            parts.append('<p><span class="highlight">No high-risk indicators</span> surfaced '
+                         'from passive data alone.</p>')
+
+        # ── Prioritised, actionable next steps (parity with the recon summary) ──
+        recs = ReportGenerator._exec_recommendations(an)
+        if recs:
+            lis = "".join(f'<li>{escape(r)}</li>' for r in recs)
+            parts.append(
+                '<p style="margin-top:8px"><b>Recommended next steps</b> '
+                '<span style="color:var(--text2);font-weight:400">(in priority order)</span>:</p>'
+                '<ol style="margin:4px 0 0 18px;color:var(--text2);font-size:13px;line-height:1.7">'
+                f'{lis}</ol>')
+
+        # ── One-line posture conclusion: what to address first ──
+        bl = ReportGenerator._exec_bottom_line(an)
+        if bl:
+            parts.append(f'<p style="margin-top:8px"><b>Bottom line:</b> the most '
+                         f'significant passive exposure is {bl}.</p>')
+
+        return "\n".join(parts)
+
+    @staticmethod
+    def generate_html(results, target, module, recon_data=None):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        target_e = escape(str(target))
+        module_e = escape(str(module))
+
+        # Categorize ALL results
+        cats = {t: [] for t in RESULT_TYPES}
+        for r in results:
+            t = r.get("type", "")
+            if t in cats:
+                cats[t].append(r)
+
+        # Collapse multi-IP subdomain duplicates into one row per hostname
+        if cats.get("subdomain"):
+            cats["subdomain"] = ReportGenerator._group_subdomains(cats["subdomain"])
+
+        # Recompute counts from the (grouped) categories so cards/summary are accurate
+        all_items = [r for items in cats.values() for r in items]
+        high_conf = sum(1 for r in all_items if r.get("confidence", 0) >= 0.8)
+        med_conf = sum(1 for r in all_items if 0.5 <= r.get("confidence", 0) < 0.8)
+
+        # Find which categories have results
+        active_cats = {k: v for k, v in cats.items() if v}
+        total = len(all_items)
+
+        # Build stat cards (top 6 with results + total)
+        def stat_card(value, label, color):
+            return f'<div class="card"><div class="card-v" style="color:{color}">{value}</div><div class="card-l">{label}</div></div>'
+
+        cards_html = stat_card(total, "Total Results", "#4f8ef7")
+        for t, items in active_cats.items():
+            info = RESULT_TYPES[t]
+            cards_html += stat_card(len(items), info["label"], info["color"])
+        cards_html += stat_card(high_conf, "High Confidence", "#3ecf8e")
+
+        # Build executive summary
+        summary_parts = []
+        for t, items in active_cats.items():
+            info = RESULT_TYPES[t]
+            summary_parts.append(f'{info["icon"]} <span class="highlight">{len(items)} {info["label"].lower()}</span>')
+        summary_text = ", ".join(summary_parts) if summary_parts else "No results"
+
+        # Build confidence bar
+        conf_high_pct = round(high_conf / max(total, 1) * 100)
+        conf_med_pct = round(med_conf / max(total, 1) * 100)
+        conf_low_pct = 100 - conf_high_pct - conf_med_pct
+
+        # Cross-correlated, honest executive-summary body (built outside the
+        # big f-string to keep complex logic out of brace-escaping).
+        exec_body_html = ReportGenerator._build_exec_summary(
+            cats, target_e, module_e, total, len(active_cats),
+            summary_text, high_conf, conf_high_pct)
+
+        # Table builder
+        def tbl(items, tag_cls):
+            h = '<table><thead><tr><th class="th-n">#</th><th class="th-v">Value</th><th class="th-s">Source</th><th class="th-c">Confidence</th></tr></thead><tbody>'
+            for i, r in enumerate(items, 1):
+                conf = r.get('confidence', 0)
+                conf_cls = 'conf-high' if conf >= 0.8 else 'conf-med' if conf >= 0.5 else 'conf-low'
+                bar_w = max(2, int(conf * 100))
+                val = escape(r.get('value', ''))
+                src = escape(r.get('source', ''))
+                h += f'<tr><td class="td-n">{i}</td><td class="td-v">{val}</td>'
+                h += f'<td><span class="tag {tag_cls}">{src}</span></td>'
+                h += f'<td class="td-c"><div class="conf-bar"><div class="conf-fill {conf_cls}" style="width:{bar_w}%"></div></div><span class="{conf_cls}">{conf:.0%}</span></td></tr>'
+            return h + '</tbody></table>'
+
+        # ═══════════════ HTML ═══════════════
+        html = f'''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GhostTrace Report — {target_e}</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+:root{{--bg:#0a0e14;--surface:#111820;--raised:#182030;--border:#1e2a3a;--accent:#4f8ef7;--green:#3ecf8e;--red:#f16060;--orange:#e8a838;--cyan:#38bdf8;--purple:#b79af7;--text1:#e8edf5;--text2:#8a96aa;--text3:#4a5568;--mono:'JetBrains Mono',monospace;--sans:'Inter',sans-serif}}
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:var(--sans);background:var(--bg);color:var(--text1);line-height:1.6}}
+.rpt{{max-width:960px;margin:0 auto;padding:40px 32px}}
+
+/* Header */
+.hdr{{text-align:center;padding:48px 0 40px;border-bottom:2px solid var(--border);margin-bottom:36px;position:relative}}
+.hdr::before{{content:'';position:absolute;bottom:-2px;left:50%;transform:translateX(-50%);width:120px;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent)}}
+.hdr .logo{{font-size:11px;font-family:var(--mono);color:var(--accent);letter-spacing:4px;text-transform:uppercase;margin-bottom:8px}}
+.hdr h1{{font-size:28px;font-weight:800;letter-spacing:-0.5px;margin-bottom:8px}}
+.hdr .sub{{color:var(--text2);font-size:13px}}.hdr .sub b{{color:var(--text1)}}
+.hdr .meta{{font-size:11px;color:var(--text3);font-family:var(--mono);margin-top:6px}}
+
+/* Stat Grid */
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin-bottom:32px}}
+.card{{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:20px 16px;text-align:center;transition:border-color .2s}}
+.card:hover{{border-color:var(--accent)}}
+.card-v{{font-size:28px;font-weight:800;font-family:var(--mono)}}
+.card-l{{font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:1.5px;margin-top:6px;font-weight:500}}
+
+/* Executive Summary */
+.exec{{background:linear-gradient(135deg,var(--surface),var(--raised));border:1px solid var(--border);border-radius:12px;padding:28px;margin-bottom:32px}}
+.exec h3{{font-size:15px;font-weight:700;color:var(--accent);margin-bottom:14px;display:flex;align-items:center;gap:8px}}
+.exec h3::before{{content:'📊'}}
+.exec p{{font-size:13px;color:var(--text2);line-height:1.8}}
+.highlight{{color:var(--green);font-weight:600}}.risk{{color:var(--red);font-weight:600}}
+
+/* Confidence Overview */
+.conf-overview{{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:20px;margin-bottom:32px}}
+.conf-overview h4{{font-size:12px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px}}
+.conf-bar-big{{height:10px;background:var(--raised);border-radius:5px;overflow:hidden;display:flex}}
+.conf-seg{{height:100%;transition:width .3s}}
+.conf-legend{{display:flex;gap:20px;margin-top:10px;font-size:11px;font-family:var(--mono)}}
+.conf-legend span{{display:flex;align-items:center;gap:6px}}
+.conf-dot{{width:8px;height:8px;border-radius:50%;display:inline-block}}
+
+/* Sections */
+.sec{{margin-bottom:32px;page-break-inside:avoid}}
+.sec-h{{display:flex;align-items:center;gap:10px;padding-bottom:10px;border-bottom:1px solid var(--border);margin-bottom:16px}}
+.sec-icon{{font-size:18px}}.sec-title{{font-size:14px;font-weight:700;color:var(--text1);text-transform:uppercase;letter-spacing:1px}}
+.sec-count{{font-size:11px;font-family:var(--mono);color:var(--text3);margin-left:auto;background:var(--raised);padding:2px 10px;border-radius:12px}}
+
+/* Tables */
+table{{width:100%;border-collapse:collapse;font-size:12px}}
+thead th{{text-align:left;font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;padding:10px 14px;border-bottom:2px solid var(--border);font-weight:600}}
+tbody td{{padding:10px 14px;border-bottom:1px solid var(--border)}}
+tbody tr:hover td{{background:rgba(79,142,247,0.03)}}
+.th-n,.td-n{{width:36px;color:var(--text3);font-family:var(--mono)}}
+.td-v{{font-family:var(--mono);font-size:11px;word-break:break-all;max-width:420px}}
+.th-s{{width:120px}}.th-c{{width:140px}}
+.td-c{{display:flex;align-items:center;gap:8px}}
+.conf-bar{{width:60px;height:4px;background:var(--raised);border-radius:2px;overflow:hidden;flex-shrink:0}}
+.conf-fill{{height:100%;border-radius:2px}}
+.conf-high,.conf-fill.conf-high{{color:var(--green);background:var(--green)}}
+.conf-med,.conf-fill.conf-med{{color:var(--orange);background:var(--orange)}}
+.conf-low,.conf-fill.conf-low{{color:var(--red);background:var(--red)}}
+.tag{{padding:3px 8px;border-radius:4px;font-size:9px;font-family:var(--mono);font-weight:500}}
+.te{{background:#3ecf8e12;color:#3ecf8e}}.tu{{background:#3ecf8e12;color:#3ecf8e}}
+.ts{{background:#38bdf812;color:#38bdf8}}.tm{{background:#b79af712;color:#b79af7}}
+.td{{background:#4f8ef712;color:#4f8ef7}}.tl{{background:#e8a83812;color:#e8a838}}
+.tw{{background:#e8a83812;color:#e8a838}}.tp{{background:#b79af712;color:#b79af7}}
+.tg{{background:#f1606012;color:#f16060}}
+
+/* Technical Details */
+.details{{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:20px;margin-bottom:32px}}
+.details h4{{font-size:12px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:14px}}
+.detail-grid{{display:grid;grid-template-columns:1fr 1fr;gap:8px}}
+.detail-row{{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border)}}
+.detail-key{{font-size:11px;color:var(--text3)}}.detail-val{{font-size:11px;font-family:var(--mono);color:var(--text1)}}
+
+/* Footer */
+.ftr{{text-align:center;padding:32px 0;border-top:2px solid var(--border);margin-top:40px;position:relative}}
+.ftr::before{{content:'';position:absolute;top:-2px;left:50%;transform:translateX(-50%);width:80px;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent)}}
+.ftr .brand{{font-family:var(--mono);font-size:11px;color:var(--accent);letter-spacing:2px;margin-bottom:4px}}
+.ftr .copy{{font-size:10px;color:var(--text3)}}
+.ftr .disclaimer{{font-size:9px;color:var(--text3);margin-top:8px;font-style:italic}}
+
+/* Risk Assessment */
+.risk-card{{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px}}
+.risk-header{{display:flex;align-items:center;gap:12px;margin-bottom:10px}}
+.risk-host{{font-family:var(--mono);font-size:13px;font-weight:600;color:var(--text1)}}
+.risk-score{{font-family:var(--mono);font-size:12px;padding:2px 10px;border-radius:12px;font-weight:600}}
+.risk-critical{{background:#f1606025;color:#f16060}}.risk-high{{background:#e8a83825;color:#e8a838}}
+.risk-medium{{background:#4f8ef725;color:#4f8ef7}}.risk-low{{background:#3ecf8e25;color:#3ecf8e}}.risk-info{{background:#8a96aa25;color:#8a96aa}}
+.risk-reasons{{margin:8px 0;padding-left:16px}}
+.risk-reason{{font-size:11px;color:var(--text2);padding:2px 0;list-style:none}}
+.risk-reason::before{{content:'→ ';color:var(--orange)}}
+.risk-paths{{margin-top:10px;padding-top:10px;border-top:1px solid var(--border)}}
+.risk-path{{font-size:11px;margin-bottom:6px}}
+.risk-path-name{{font-weight:600;font-family:var(--mono)}}
+.risk-path-sev{{font-size:9px;padding:1px 6px;border-radius:4px;margin-left:6px}}
+.risk-path-steps{{font-size:10px;color:var(--text3);padding-left:16px;margin-top:2px}}
+
+@media print{{
+  body{{background:#fff;color:#1a1a2e;-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+  .card,.exec,.details,.conf-overview{{border-color:#e0e0e0;background:#f8f9fa}}
+  .tag{{border:1px solid #ddd}}
+  table{{font-size:10px}}
+}}
+</style></head><body><div class="rpt">
+
+<!-- HEADER -->
+<div class="hdr">
+<div class="logo">GhostTrace Intelligence Report</div>
+<h1>{target_e}</h1>
+<div class="sub">Module: <b>{module_e}</b> — Generated by GhostTrace v{Config.VERSION}</div>
+<div class="meta">by Alsartawi · {dt}</div>
+</div>
+
+<!-- STATS -->
+<div class="grid">{cards_html}</div>
+
+<!-- CONFIDENCE OVERVIEW -->
+<div class="conf-overview">
+<h4>Confidence Distribution</h4>
+<div class="conf-bar-big">
+<div class="conf-seg" style="width:{conf_high_pct}%;background:var(--green)"></div>
+<div class="conf-seg" style="width:{conf_med_pct}%;background:var(--orange)"></div>
+<div class="conf-seg" style="width:{conf_low_pct}%;background:var(--red)"></div>
+</div>
+<div class="conf-legend">
+<span><span class="conf-dot" style="background:var(--green)"></span>{high_conf} High (≥80%)</span>
+<span><span class="conf-dot" style="background:var(--orange)"></span>{med_conf} Medium (50-79%)</span>
+<span><span class="conf-dot" style="background:var(--red)"></span>{total - high_conf - med_conf} Low (&lt;50%)</span>
+</div>
+</div>
+
+<!-- EXECUTIVE SUMMARY -->
+<div class="exec">
+<h3>Executive Summary</h3>
+{exec_body_html}
+</div>'''
+
+        # ═══════════════ RESULT TYPE CHART (SVG) ═══════════════
+        if len(active_cats) > 1:
+            chart_w, chart_h, bar_max = 500, 180, 140
+            max_count = max(len(v) for v in active_cats.values()) or 1
+            bar_w = max(20, min(60, chart_w // (len(active_cats) + 1)))
+            gap = max(5, (chart_w - bar_w * len(active_cats)) // (len(active_cats) + 1))
+            bars_svg = ""
+            for i, (t, items) in enumerate(active_cats.items()):
+                info = RESULT_TYPES.get(t, {})
+                color = info.get("color", "#4f8ef7")
+                h = max(4, int(len(items) / max_count * bar_max))
+                x = gap + i * (bar_w + gap)
+                y = chart_h - h - 30
+                label = info.get("label", t)[:8]
+                bars_svg += f'<rect x="{x}" y="{y}" width="{bar_w}" height="{h}" rx="4" fill="{color}" opacity="0.85"/>'
+                bars_svg += f'<text x="{x + bar_w//2}" y="{y - 5}" text-anchor="middle" font-size="11" font-weight="600" fill="#333">{len(items)}</text>'
+                bars_svg += f'<text x="{x + bar_w//2}" y="{chart_h - 12}" text-anchor="middle" font-size="9" fill="#666">{label}</text>'
+            html += f'''
+<div class="sec">
+<div class="sec-h"><span class="sec-icon">📊</span><span class="sec-title">Results by Type</span></div>
+<svg viewBox="0 0 {chart_w} {chart_h}" style="width:100%;max-width:500px;margin:10px auto;display:block">
+<line x1="0" y1="{chart_h-30}" x2="{chart_w}" y2="{chart_h-30}" stroke="#ddd" stroke-width="1"/>
+{bars_svg}
+</svg>
+</div>'''
+
+        # ═══════════════ KEY FINDINGS (Top 10) ═══════════════
+        # Sort all results by confidence, pick top 10 unique high-value findings
+        key_findings = sorted(all_items, key=lambda r: r.get("confidence", 0), reverse=True)
+        # Dedup by value
+        seen_kf = set()
+        unique_kf = []
+        for r in key_findings:
+            v = r.get("value", "")
+            if v not in seen_kf and r.get("confidence", 0) >= 0.5:
+                seen_kf.add(v)
+                unique_kf.append(r)
+                if len(unique_kf) >= 10:
+                    break
+
+        if unique_kf:
+            html += '''
+<div class="sec">
+<div class="sec-h"><span class="sec-icon">🎯</span><span class="sec-title">Key Findings</span><span class="sec-count">Top priority items</span></div>
+<table><thead><tr><th class="th-n">#</th><th>Type</th><th class="th-v">Finding</th><th class="th-s">Source</th><th class="th-c">Confidence</th></tr></thead><tbody>'''
+            for i, r in enumerate(unique_kf, 1):
+                conf = r.get('confidence', 0)
+                conf_cls = 'conf-high' if conf >= 0.8 else 'conf-med' if conf >= 0.5 else 'conf-low'
+                rtype = r.get('type', '')
+                info = RESULT_TYPES.get(rtype, {"icon": "?", "tag": "te"})
+                bar_w = max(2, int(conf * 100))
+                html += f'<tr><td class="td-n">{i}</td><td>{info["icon"]}</td>'
+                html += f'<td class="td-v">{escape(r.get("value", ""))}</td>'
+                html += f'<td><span class="tag {info["tag"]}">{escape(r.get("source", ""))}</span></td>'
+                html += f'<td class="td-c"><div class="conf-bar"><div class="conf-fill {conf_cls}" style="width:{bar_w}%"></div></div><span class="{conf_cls}">{conf:.0%}</span></td></tr>'
+            html += '</tbody></table></div>'
+
+        # ═══════════════ ENTITY TIMELINE ═══════════════
+        # Only show entities that appear in THIS scan — otherwise the timeline
+        # bleeds in recurring hosts from unrelated past scans (different targets).
+        scan_keys = set()
+        for r in results:
+            v = (r.get("value", "") or "").strip()
+            if not v:
+                continue
+            scan_keys.add(v)
+            host = v.split(" (")[0].split("→")[0].strip()  # normalize host/IP form
+            if host:
+                scan_keys.add(host)
+        try:
+            from database.manager import Database
+            with Database.connection() as conn:
+                rows = conn.execute(
+                    """SELECT value, type, first_seen, last_seen, scan_count
+                       FROM entities WHERE scan_count > 1
+                       ORDER BY scan_count DESC LIMIT 500""").fetchall()
+            recurring = [e for e in rows if e["value"] in scan_keys][:15]
+            if recurring:
+                html += '''
+<div class="sec">
+<div class="sec-h"><span class="sec-icon">🕐</span><span class="sec-title">Entity Timeline</span><span class="sec-count">Recurring findings</span></div>
+<table><thead><tr><th class="th-n">#</th><th>Entity</th><th>Type</th><th>First Seen</th><th>Last Seen</th><th>Count</th></tr></thead><tbody>'''
+                for i, e in enumerate(recurring, 1):
+                    first = e["first_seen"][:10] if e["first_seen"] else "—"
+                    last = e["last_seen"][:10] if e["last_seen"] else "—"
+                    html += f'<tr><td class="td-n">{i}</td><td class="td-v">{escape(e["value"])}</td>'
+                    html += f'<td>{escape(e["type"])}</td><td>{first}</td><td>{last}</td>'
+                    html += f'<td style="font-weight:600;color:var(--accent,#4f8ef7)">{e["scan_count"]}x</td></tr>'
+                html += '</tbody></table></div>'
+        except Exception:
+            pass  # DB may not be available in tests
+
+        # ═══════════════ RESULT SECTIONS ═══════════════
+        for t, items in active_cats.items():
+            info = RESULT_TYPES[t]
+            html += f'''
+<div class="sec">
+<div class="sec-h"><span class="sec-icon">{info["icon"]}</span><span class="sec-title">{info["label"]}</span><span class="sec-count">{len(items)} found</span></div>
+{tbl(items, info["tag"])}
+</div>'''
+
+        # ═══════════════ RISK ASSESSMENT (if recon data provided) ═══════════════
+        if recon_data:
+            scored = recon_data.get("scored_assets", [])
+            summary = recon_data.get("summary", {})
+            # ── Integrity guard ──────────────────────────────────────────────
+            # Only keep recon hosts that belong to THIS report's target. Stops a
+            # stale/foreign recon (e.g. an earlier run on a different domain)
+            # from being stapled onto an unrelated report. Only enforced when the
+            # target is domain-like (skip for username/phone/etc. targets).
+            base = ReportGenerator._base_domain(target)
+            if base and "." in base and scored:
+                in_scope = [a for a in scored
+                            if ReportGenerator._host_in_scope(a.get("hostname", ""), base)]
+                if len(in_scope) != len(scored):
+                    log.warning(
+                        f"Report: dropped {len(scored) - len(in_scope)} recon host(s) "
+                        f"not under target '{base}' (out-of-scope recon data)")
+                    scored = in_scope
+                    # Recompute the summary so stats/targets reflect in-scope hosts only
+                    from recon.risk_engine import RiskScorer
+                    summary = RiskScorer.executive_summary(scored) if scored else {}
+            if scored:
+                stats = summary.get("stats", {})
+                html += f'''
+<div class="sec">
+<div class="sec-h"><span class="sec-icon">🛡️</span><span class="sec-title">Risk Assessment</span><span class="sec-count">{len(scored)} host{"s" if len(scored) != 1 else ""} analyzed</span></div>'''
+
+                # Summary bar
+                if stats:
+                    html += f'''<div class="conf-overview" style="margin-bottom:16px">
+<h4>Risk Distribution</h4>
+<div class="conf-legend">
+<span><span class="conf-dot" style="background:#f16060"></span>{stats.get("critical",0)} Critical</span>
+<span><span class="conf-dot" style="background:#e8a838"></span>{stats.get("high",0)} High</span>
+<span><span class="conf-dot" style="background:#4f8ef7"></span>{stats.get("medium",0)} Medium</span>
+<span><span class="conf-dot" style="background:#3ecf8e"></span>{stats.get("low",0)} Low</span>
+</div></div>'''
+
+                # ═══════════════ PRIORITY TARGETS (attacker mindset) ═══════════════
+                # Only hosts scored LOW+ reach here (risk_engine._top_3_targets).
+                # Theme + heading follow the HIGHEST severity actually present, so an
+                # all-LOW result never wears critical-red "investigate first" styling.
+                top_targets = summary.get("top_3_targets", [])
+                level_color = {"critical": "#dc2626", "high": "#dc2626", "medium": "#d97706",
+                               "low": "#2563eb", "info": "#64748b"}
+                if top_targets:
+                    sev_order = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+                    top_level = max((t.get("level", "info") for t in top_targets),
+                                    key=lambda l: sev_order.get(l, 0))
+                    accent, grad, head_c, heading = {
+                        "critical": ("#dc2626", "#fef2f2,#fee2e2", "#991b1b", "Top Targets to Investigate First"),
+                        "high":     ("#dc2626", "#fef2f2,#fee2e2", "#991b1b", "Top Targets to Investigate First"),
+                        "medium":   ("#d97706", "#fffbeb,#fef3c7", "#92400e", "Priority Targets"),
+                        "low":      ("#2563eb", "#eff6ff,#dbeafe", "#1e40af", "Notable Targets"),
+                    }.get(top_level, ("#2563eb", "#eff6ff,#dbeafe", "#1e40af", "Notable Targets"))
+                    html += f'''<div style="background:linear-gradient(135deg,{grad});border-left:4px solid {accent};padding:16px;margin-bottom:16px;border-radius:6px">
+<h4 style="color:{head_c};margin-bottom:12px;font-size:13px;text-transform:uppercase;letter-spacing:1px">🎯 {heading}</h4>'''
+                    for t in top_targets:
+                        rank = t.get("rank", "?")
+                        hostname = escape(t.get("hostname", "?"))
+                        score = t.get("score", 0)
+                        level = t.get("level", "info")
+                        badge_c = level_color.get(level, "#64748b")
+                        why = t.get("why_matters", [])
+                        how = t.get("how_to_exploit", [])
+                        next_step = escape(t.get("next_action", ""))
+                        html += f'''<div style="background:white;padding:12px;margin-bottom:10px;border-radius:4px;box-shadow:0 1px 3px rgba(0,0,0,0.1)">
+<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+<span style="background:{accent};color:white;width:26px;height:26px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-weight:700">{rank}</span>
+<span style="font-family:var(--mono);font-weight:600;font-size:13px">{hostname}</span>
+<span style="margin-left:auto;background:{badge_c};color:white;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600">{score}/100 {level.upper()}</span>
+</div>
+<div style="margin-left:36px;font-size:11px;color:#444">
+<div style="margin-bottom:6px"><b style="color:{accent}">Why it matters:</b><ul style="margin:4px 0 0 16px;padding:0">'''
+                        for w in why[:3]:
+                            html += f'<li>{escape(w)}</li>'
+                        html += '</ul></div>'
+                        if how:
+                            html += '<div style="margin-bottom:6px"><b style="color:#d97706">How to exploit:</b><ul style="margin:4px 0 0 16px;padding:0">'
+                            for h in how[:2]:
+                                html += f'<li style="font-family:var(--mono);font-size:10px">{escape(h)}</li>'
+                            html += '</ul></div>'
+                        html += f'<div><b style="color:#059669">Next action:</b> {next_step}</div></div></div>'
+                    html += '</div>'
+                else:
+                    # Recon ran but nothing scored LOW or above — say so plainly
+                    # instead of leaving a confusing empty (or red) section.
+                    html += '''<div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:14px 16px;margin-bottom:16px;border-radius:6px">
+<b style="color:#15803d;font-size:12px">No high-risk hosts.</b>
+<span style="color:#444;font-size:12px"> All live assets scored INFO — no exposed admin panels, risky ports, or missing-header combinations that warrant priority investigation.</span>
+</div>'''
+
+                # Individual host cards — LOW+ only; INFO hosts have no reasons/
+                # paths and would render as empty rows duplicating the host list.
+                ranked_hosts = [a for a in scored if a.get("score", 0) >= 20][:15]
+                for a in ranked_hosts:
+                    level = a.get("level", "info")
+                    score = a.get("score", 0)
+                    hostname = escape(a.get("hostname", "?"))
+                    reasons = a.get("reasons", [])
+                    paths = a.get("attack_paths", [])
+
+                    html += f'<div class="risk-card"><div class="risk-header">'
+                    html += f'<span class="risk-host">{hostname}</span>'
+                    html += f'<span class="risk-score risk-{level}">{score}/100 {level.upper()}</span>'
+                    html += '</div>'
+
+                    # Top 3 reasons
+                    if reasons:
+                        html += '<div class="risk-reasons">'
+                        for r in reasons[:3]:
+                            html += f'<div class="risk-reason">{escape(r)}</div>'
+                        html += '</div>'
+
+                    # Attack paths
+                    if paths:
+                        html += '<div class="risk-paths">'
+                        for p in paths:
+                            sev = p.get("severity", "medium")
+                            sev_cls = f"risk-{sev}" if sev in ("critical","high") else "risk-medium"
+                            html += f'<div class="risk-path"><span class="risk-path-name">{escape(p.get("path",""))}</span>'
+                            html += f'<span class="risk-path-sev {sev_cls}">{sev.upper()}</span>'
+                            steps = p.get("steps", [])
+                            if steps:
+                                html += '<div class="risk-path-steps">' + " → ".join(escape(s) for s in steps[:3]) + '</div>'
+                            html += '</div>'
+                        html += '</div>'
+
+                    html += '</div>'
+
+                # Recommendations
+                recs = summary.get("recommendations", [])
+                if recs:
+                    html += '<div class="exec" style="margin-top:16px"><h3 style="color:var(--orange)">⚠ Recommendations</h3><p>'
+                    for rec in recs:
+                        html += f'• {escape(rec)}<br>'
+                    html += '</p></div>'
+
+                html += '</div>'
+
+        # ═══════════════ TECHNICAL DETAILS ═══════════════
+        html += f'''
+<div class="details">
+<h4>Technical Details</h4>
+<div class="detail-grid">
+<div><div class="detail-row"><span class="detail-key">Target</span><span class="detail-val">{target_e}</span></div>
+<div class="detail-row"><span class="detail-key">Module</span><span class="detail-val">{module_e}</span></div>
+<div class="detail-row"><span class="detail-key">Scan Date</span><span class="detail-val">{dt}</span></div></div>
+<div><div class="detail-row"><span class="detail-key">Total Results</span><span class="detail-val">{total}</span></div>
+<div class="detail-row"><span class="detail-key">High Confidence</span><span class="detail-val">{high_conf} ({conf_high_pct}%)</span></div>
+<div class="detail-row"><span class="detail-key">Tool Version</span><span class="detail-val">GhostTrace v{Config.VERSION}</span></div></div>
+</div></div>
+
+<!-- FOOTER -->
+<div class="ftr">
+<div class="brand">GHOSTTRACE v{Config.VERSION}</div>
+<div class="copy">by Alsartawi · {dt}</div>
+<div class="disclaimer">For authorized security research only. Handle results responsibly. Do not redistribute without permission.</div>
+</div>
+
+</div></body></html>'''
+
+        fn = f"ghosttrace_report_{ts}.html"
+        fp = os.path.join(Config.EXPORT_DIR, fn)
+        with open(fp, "w", encoding="utf-8") as f:
+            f.write(html)
+        log.info(f"Report generated: {fp}")
+        return {"filepath": fp, "filename": fn}
+
+    @staticmethod
+    def html_to_pdf(html_filename):
+        if ".." in html_filename or "/" in html_filename:
+            return {"error": "Invalid filename"}
+        html_path = os.path.join(Config.EXPORT_DIR, html_filename)
+        if not os.path.exists(html_path):
+            return {"error": "HTML report not found"}
+        pdf_fn = html_filename.replace(".html", ".pdf")
+        pdf_path = os.path.join(Config.EXPORT_DIR, pdf_fn)
+
+        # Try weasyprint first
+        try:
+            import weasyprint
+            # url_fetcher blocks file:// (and any non-network) resources from being
+            # pulled into the PDF — the web font still loads over https.
+            weasyprint.HTML(filename=html_path, url_fetcher=_pdf_url_fetcher).write_pdf(pdf_path)
+            if os.path.exists(pdf_path):
+                log.info(f"PDF generated via weasyprint: {pdf_path}")
+                return {"filename": pdf_fn, "filepath": pdf_path}
+        except ImportError:
+            pass
+        except Exception as e:
+            log.warning(f"weasyprint failed: {e}, trying wkhtmltopdf")
+
+        # Fallback to wkhtmltopdf
+        try:
+            subprocess.run([
+                "wkhtmltopdf", "--disable-local-file-access",
+                "--page-size", "A4", "--margin-top", "15mm", "--margin-bottom", "15mm",
+                "--margin-left", "15mm", "--margin-right", "15mm",
+                "--encoding", "UTF-8", "--no-background",
+                html_path, pdf_path
+            ], capture_output=True, text=True, timeout=30)
+            if os.path.exists(pdf_path):
+                log.info(f"PDF generated via wkhtmltopdf: {pdf_path}")
+                return {"filename": pdf_fn, "filepath": pdf_path}
+            return {"error": "PDF generation failed"}
+        except FileNotFoundError:
+            return {"error": "No PDF engine. Install: pip install weasyprint"}
+        except subprocess.TimeoutExpired:
+            return {"error": "PDF generation timed out"}
+        except Exception as e:
+            return {"error": str(e)}

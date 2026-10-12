@@ -1,0 +1,497 @@
+import datetime
+import logging
+import math
+import shutil
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.common.exceptions import (
+    NoSuchWindowException,
+    NoSuchElementException,
+    InvalidArgumentException,
+    TimeoutException,
+    WebDriverException,
+)
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.chrome.service import Service as ChromeService
+
+from .database import Database
+from .db_to_excel import Converter
+from .config import Config
+from .presence import ONLINE_WORDS, PresenceParser
+
+logger = logging.getLogger(__name__)
+
+# NOTE: ONLINE_WORDS is defined once, in presence.py (the canonical parser), and
+# imported here so the tracker's online-detection XPath and the parser can never
+# drift apart.
+ONLINE_STATUS = ONLINE_WORDS
+
+# XPath candidates for detecting a successful WhatsApp Web login.
+# Tried in order; the first match wins. Update here when WhatsApp changes their DOM.
+_LOGIN_READY_XPATHS = [
+    '//div[@data-testid="chat-list"]',
+    '//div[@aria-label="Chat list"]',
+    '//*[@id="side"]',
+    '//div[@role="textbox"][@data-tab="3"]',
+    '//div[@contenteditable="true"][@data-tab="3"]',
+    '//input[@role="searchbox"]',
+]
+
+# XPath candidates for the search input box.
+# WhatsApp Web uses either a Lexical rich-text editor (div[role="textbox"])
+# or a native <input role="searchbox"> depending on the build.
+_SEARCH_BOX_XPATHS = [
+    # Lexical editor: role="textbox" with contenteditable, data-tab may be on same or parent element
+    '//div[@role="textbox"][@data-tab="3"]',
+    '//div[@contenteditable="true"][@data-tab="3"]',
+    '//div[@data-tab="3"]//div[@role="textbox"]',
+    '//div[@data-tab="3"]//div[@contenteditable="true"]',
+    # Native input variant (newer WhatsApp builds)
+    '//input[@role="searchbox"]',
+    '//div[@data-tab="5"]//input[@type="text"]',
+    # Broad fallbacks scoped to the side panel
+    '//*[@id="side"]//div[@role="textbox"][@contenteditable="true"]',
+    '//*[@id="side"]//input[@type="text"]',
+]
+
+# XPath candidates for the first result in the search pane.
+_SEARCH_RESULT_XPATHS = [
+    '//div[@data-testid="cell-frame-container"]',
+    '//div[@role="listitem"]',
+    '//*[@id="pane-side"]//div[@data-testid="cell-frame-container"]',
+    '//*[@id="pane-side"]/div[1]/div/div/div[1]/div/div',
+    '//*[@id="pane-side"]/div[1]/div/div/div[2]/div/div',
+]
+
+
+# XPath candidates for the contact's presence / status subtitle.
+# The chat header shows "online", "last seen …" or "typing…" under the
+# contact name; the sidebar row shows the same on some builds. Best-effort:
+# if none match, presence capture is simply skipped for that poll.
+_STATUS_XPATHS = [
+    # Chat header status subtitle (title attribute on some builds, text on others)
+    '//header//span[contains(@title, "last seen") or contains(@title, "online") or contains(@title, "typing")]',
+    '//div[@data-testid="conversation-info-header"]//span[contains(@class, "status")]',
+    '//header//div[@data-testid="conversation-info-header"]//span',
+    '//header//span[contains(@class, "status")]',
+    # Sidebar subtitle fallback for the tracked chat
+    '//*[@id="pane-side"]//span[contains(@title, "last seen") or contains(@title, "online")]',
+]
+
+
+class WhatsAppBeacon:
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.db_path = Path(self.config.data_dir) / 'victims_logs.db'
+        self.database = Database(db_path=str(self.db_path))
+        self.driver: Optional[webdriver.Chrome] = None
+        # Presence-capture state (cached status xpath + write throttling)
+        self._last_status_xpath: Optional[str] = None
+        self._last_status_probe_ts: float = 0.0
+        self._last_presence_key: Optional[tuple] = None
+        self._last_presence_ts: float = 0.0
+
+    def get_current_time_parts(self) -> Dict[str, str]:
+        """Retrieves the current time split into date/hour/minute/second parts."""
+        now = datetime.datetime.now()
+        return {
+            'date': now.strftime('%Y-%m-%d'),
+            'hour': now.strftime('%H'),
+            'minute': now.strftime('%M'),
+            'second': now.strftime('%S'),
+        }
+
+    def check_online_status(self, xpath: str) -> bool:
+        """Verifies if the user is online"""
+        try:
+            self.driver.find_element(by=By.XPATH, value=xpath)
+            return True
+        except NoSuchElementException:
+            return False
+
+    def _find_first_present(self, xpaths: List[str], timeout: float = 20) -> Optional[str]:
+        """
+        Poll the page until one of the given XPaths is present.
+        Returns the matching XPath string, or None if the timeout expires.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for xpath in xpaths:
+                try:
+                    if self.driver.find_element(By.XPATH, xpath):
+                        return xpath
+                except (NoSuchElementException, WebDriverException):
+                    pass
+            time.sleep(0.5)
+        return None
+
+    def find_user_chat(self, user: str) -> bool:
+        """Search and goes to the user's chat"""
+        try:
+            search_xpath = self._find_first_present(_SEARCH_BOX_XPATHS, timeout=20)
+            if not search_xpath:
+                logger.warning(
+                    "Could not locate the WhatsApp search box. "
+                    "The DOM may have changed — check _SEARCH_BOX_XPATHS in beacon.py."
+                )
+                return False
+
+            search_box = self.driver.find_element(By.XPATH, search_xpath)
+            search_box.click()
+            time.sleep(0.5)
+
+            is_native_input = search_box.tag_name == 'input'
+            if is_native_input:
+                # Native <input> element: use clear() + send_keys()
+                search_box.clear()
+                search_box.send_keys(user)
+            else:
+                # Contenteditable div (Lexical editor): select-all, delete, type
+                search_box.send_keys(Keys.CONTROL + 'a')
+                search_box.send_keys(Keys.DELETE)
+                time.sleep(0.2)
+                ActionChains(self.driver).send_keys(user).perform()
+
+            logger.info(f'Trying to find: {user}')
+            time.sleep(1)  # allow search results to populate
+
+            result_xpath = self._find_first_present(_SEARCH_RESULT_XPATHS, timeout=30)
+            if not result_xpath:
+                logger.warning(f"No search results appeared for '{user}'.")
+                return False
+
+            user_element = self.driver.find_element(By.XPATH, result_xpath)
+            user_element.click()
+            logger.info('Found and clicked!')
+            return True
+        except Exception as e:
+            logger.warning(
+                f"{user} is not found. Error: {e}. "
+                "(Maybe your contact is in the archive or not in your chat list.)"
+            )
+            return False
+
+    def _resolve_chromedriver_path(self):
+        """Resolve the ChromeDriver binary path.
+
+        Priority: config chrome_driver_path > system chromedriver on PATH >
+        None (let Selenium Manager resolve a matching driver).
+        """
+        # 1. Explicit path from config / CLI
+        configured = self.config.chrome_driver_path
+        if configured:
+            p = Path(configured)
+            if p.is_file():
+                return str(p)
+            logger.warning(f"Configured chrome_driver_path not found: {configured}")
+
+        # 2. System chromedriver already on PATH
+        system_driver = shutil.which("chromedriver")
+        if system_driver:
+            return system_driver
+
+        # 3. Let Selenium Manager resolve a compatible driver for the detected browser
+        return None
+
+    def _resolve_chrome_binary_path(self):
+        """Resolve the Chrome/Chromium browser binary path.
+
+        Priority: config chrome_binary_path > common binaries on PATH >
+        common absolute install paths > None (let Selenium try auto-discovery).
+        """
+        configured = self.config.chrome_binary_path
+        if configured:
+            p = Path(configured)
+            if p.is_file():
+                return str(p)
+            logger.warning(f"Configured chrome_binary_path not found: {configured}")
+
+        binary_names = [
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "chrome",
+        ]
+        for binary_name in binary_names:
+            binary_path = shutil.which(binary_name)
+            if binary_path:
+                return binary_path
+
+        common_paths = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/chromium",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ]
+        for candidate in common_paths:
+            if Path(candidate).is_file():
+                return candidate
+
+        return None
+
+    def setup_driver(self):
+        """Sets up the Selenium driver."""
+        logger.info("Setting up WebDriver...")
+        options = webdriver.ChromeOptions()
+
+        # Cross-platform user data directory
+        user_data_dir = Path(self.config.data_dir) / "chrome_profile"
+        options.add_argument(f"user-data-dir={user_data_dir.absolute()}")
+
+        if self.config.headless:
+            logger.info("Running in Headless mode.")
+            options.add_argument("--headless=new")
+            options.add_argument("--window-size=1920,1080")
+            options.add_argument(
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+            )
+
+        # Stability flags (important on Linux/Docker and some Windows configs)
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+
+        browser_binary = self._resolve_chrome_binary_path()
+        if browser_binary:
+            logger.info(f"Using Chrome binary at: {browser_binary}")
+            options.binary_location = browser_binary
+
+        # Remove Selenium fingerprints that WhatsApp (and other sites) detect.
+        # Without these, WhatsApp Web detects automation and closes the connection.
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+        options.add_experimental_option("useAutomationExtension", False)
+
+        try:
+            driver_path = self._resolve_chromedriver_path()
+            if driver_path:
+                logger.info(f"Using ChromeDriver at: {driver_path}")
+                service = ChromeService(driver_path)
+            else:
+                service = ChromeService()
+            self.driver = webdriver.Chrome(service=service, options=options)
+            # Patch navigator.webdriver on every new document so it reads as undefined.
+            self.driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
+            )
+        except Exception as e:
+            if "cannot find chrome binary" in str(e).lower():
+                logger.critical(
+                    "Failed to initialize Chrome Driver: could not find a Chrome/Chromium browser binary. "
+                    "Install Google Chrome or Chromium, or pass --chrome-binary-path /path/to/browser."
+                )
+            else:
+                logger.critical(f"Failed to initialize Chrome Driver: {e}")
+            sys.exit(1)
+
+    def whatsapp_login(self):
+        """Logs into WhatsApp Web. Raises WebDriverException / TimeoutException on failure."""
+        try:
+            logger.info('Opening WhatsApp Web...')
+            self.driver.get('https://web.whatsapp.com')
+            logger.info("Waiting for WhatsApp to load...")
+
+            if self.config.headless:
+                time.sleep(5)  # let the page render before probing
+                matched = self._find_first_present(_LOGIN_READY_XPATHS, timeout=15)
+                if not matched:
+                    logger.warning("Not logged in. Saving QR code screenshot to qrcode.png ...")
+                    self.driver.save_screenshot("qrcode.png")
+                    logger.warning(
+                        "Scan qrcode.png with your phone, or run once without --headless to authenticate."
+                    )
+                    matched = self._find_first_present(_LOGIN_READY_XPATHS, timeout=60)
+                    if not matched:
+                        raise TimeoutException("Login timed out in headless mode.")
+            else:
+                matched = self._find_first_present(_LOGIN_READY_XPATHS, timeout=120)
+                if not matched:
+                    raise TimeoutException(
+                        "WhatsApp Web did not finish loading within 120 seconds. "
+                        "Check your internet connection or scan the QR code."
+                    )
+
+            logger.info("WhatsApp Web Loaded")
+
+        except InvalidArgumentException:
+            logger.error(
+                "ERROR: A Selenium browser may already be running with the same profile. "
+                "Close it and try again."
+            )
+            sys.exit(1)
+        except (TimeoutException, WebDriverException) as e:
+            logger.error(f"Error loading WhatsApp Web: {e}")
+            raise  # propagate so run() can clean up instead of stumbling forward
+
+    def _element_text_or_title(self, element) -> str:
+        """Reads an element's visible text, falling back to its title attribute."""
+        try:
+            text = (element.text or '').strip()
+            if text:
+                return text
+        except WebDriverException:
+            pass
+        try:
+            return (element.get_attribute('title') or '').strip()
+        except WebDriverException:
+            return ''
+
+    def _status_text_from(self, xpath: str) -> str:
+        """Reads the status text for one XPath, or '' when the node is gone."""
+        try:
+            element = self.driver.find_element(By.XPATH, xpath)
+        except (NoSuchElementException, WebDriverException):
+            return ''
+        return self._element_text_or_title(element)
+
+    def _read_status_text(self) -> str:
+        """Reads the current presence / status subtitle, if visible."""
+        if self._last_status_xpath:
+            text = self._status_text_from(self._last_status_xpath)
+            if text:
+                return text
+            # Cached xpath went stale (element disappeared); re-probe below.
+            self._last_status_xpath = None
+
+        # No cached xpath (or it went stale). Re-probe, but at most every 10s
+        # so a DOM change cannot stall the 1-second polling loop.
+        now = time.time()
+        if now - self._last_status_probe_ts < 10:
+            return ''
+        self._last_status_probe_ts = now
+
+        found = self._find_first_present(_STATUS_XPATHS, timeout=3)
+        if not found:
+            return ''
+        self._last_status_xpath = found
+        return self._status_text_from(found)
+
+    def _maybe_capture_presence(self, user_id: int) -> None:
+        """Best-effort recording of the contact's presence text.
+
+        Persists a row when the parsed signal changes, or when 30 seconds have
+        passed since the last write. Failures never break the tracking loop.
+        """
+        try:
+            text = self._read_status_text()
+            if not text:
+                return
+            snapshot = PresenceParser(language=self.config.language).parse(text)
+        except Exception as exc:  # noqa: BLE001 - DOM reads are best-effort
+            # Keep the loop alive, but leave evidence instead of swallowing silently.
+            logger.debug(f"Presence capture skipped: {exc}")
+            return
+
+        key = (snapshot.kind, snapshot.text)
+        now = time.time()
+        if key == self._last_presence_key and (now - self._last_presence_ts) < 30:
+            return
+
+        time_parts = self.get_current_time_parts()
+        observed_at = (
+            f"{time_parts['date']} {time_parts['hour']}:"
+            f"{time_parts['minute']}:{time_parts['second']}"
+        )
+        self.database.insert_presence(
+            user_id=user_id,
+            observed_at=observed_at,
+            status_kind=snapshot.kind,
+            status_text=snapshot.text,
+            last_seen=snapshot.last_seen,
+        )
+        self._last_presence_key = key
+        self._last_presence_ts = now
+
+    def run(self):
+        """Main execution loop."""
+        if self.config.excel:
+            excel_converter = Converter(db_path=str(self.db_path))
+            excel_converter.db_to_excel()
+
+        language = self.config.language
+        if language not in ONLINE_STATUS:
+            logger.error(
+                f"Error: Language '{language}' not supported. "
+                f"Supported languages: {list(ONLINE_STATUS.keys())}"
+            )
+            return
+
+        self.setup_driver()
+
+        try:
+            self.whatsapp_login()
+        except Exception:
+            # whatsapp_login already logged the error
+            if self.driver:
+                self.driver.quit()
+            return
+
+        user = self.config.username
+        if not self.find_user_chat(user):
+            self.driver.quit()
+            return
+
+        user_id = self.database.get_or_create_user(user)
+        # Close any sessions left open by a crashed/killed previous run so they
+        # stop inflating analytics with a never-ending "in progress" session.
+        self.database.close_open_sessions(self.get_current_time_parts())
+        online_lower = ONLINE_STATUS[language].lower()
+        xpath = (
+            f"//span[contains(translate(@title,"
+            f" 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'),"
+            f" '{online_lower}')]"
+        )
+        logger.info(f"Tracking {user}...")
+
+        previous_state = 'OFFLINE'
+        first_online = 0
+        current_session_id = None
+
+        try:
+            while True:
+                is_online = self.check_online_status(xpath)
+                time_parts = self.get_current_time_parts()
+
+                if is_online and previous_state == 'OFFLINE':
+                    logger.info(f"[ONLINE] {user}")
+                    current_session_id = self.database.insert_session_start(user_id, time_parts)
+                    first_online = time.time()
+                    previous_state = 'ONLINE'
+
+                elif not is_online and previous_state == 'ONLINE':
+                    total_online_time = time.time() - first_online
+                    if current_session_id:
+                        logger.info(
+                            f"[DISCONNECTED] {user} was online for {math.floor(total_online_time)} seconds."
+                        )
+                        self.database.update_session_end(
+                            current_session_id, time_parts, str(round(total_online_time))
+                        )
+                        previous_state = 'OFFLINE'
+                        current_session_id = None
+
+                # Passive presence evidence ("last seen …", typing, online)
+                self._maybe_capture_presence(user_id)
+
+                time.sleep(1)
+
+        except KeyboardInterrupt:
+            logger.info("\nStopping tracker...")
+        except NoSuchWindowException:
+            logger.error('ERROR: Your WhatsApp window has been minimized or closed.')
+        finally:
+            if self.driver:
+                self.driver.quit()
+            logger.info("Exited.")

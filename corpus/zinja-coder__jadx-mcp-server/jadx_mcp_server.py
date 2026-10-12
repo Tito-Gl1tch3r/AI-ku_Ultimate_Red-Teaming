@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [ "fastmcp>=3.0.2", "httpx" ]
+# ///
+
+"""
+Copyright (c) 2025 jadx mcp server developer(s) (https://github.com/zinja-coder/jadx-ai-mcp)
+See the file 'LICENSE' for copying permission
+"""
+
+import argparse
+import logging
+import os
+import sys
+
+# ---------------------------------------------------------------------------
+# Sanitise proxy-related environment variables BEFORE any library reads them.
+#
+# Problem (GitHub issue #99): if no_proxy (or any *_PROXY var) contains
+# non-printable characters such as trailing newlines — common when set via
+# .env files or proxy managers — httpx raises InvalidURL on the first request.
+# Our own httpx calls use trust_env=False, but third-party code (e.g.
+# fastmcp's version check) may not, so we clean the environment globally.
+# ---------------------------------------------------------------------------
+_PROXY_VARS = (
+    "HTTP_PROXY", "http_proxy",
+    "HTTPS_PROXY", "https_proxy",
+    "ALL_PROXY", "all_proxy",
+    "NO_PROXY", "no_proxy",
+)
+for _var in _PROXY_VARS:
+    _val = os.environ.get(_var)
+    if _val is not None:
+        _clean = _val.strip()
+        if _clean != _val:
+            os.environ[_var] = _clean
+        if not _clean:
+            del os.environ[_var]
+from fastmcp import FastMCP, Context
+from src.banner import jadx_mcp_server_banner
+from src.server import config, tools
+
+# Initialize MCP Server
+mcp = FastMCP("JADX-AI-MCP Plugin Reverse Engineering Server")
+
+# Bootstrap logger — always writes to stderr to keep stdout clean for stdio transport
+logger = logging.getLogger("jadx-mcp-server.bootstrap")
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+# Import and register ALL tools using correct FastMCP pattern
+from src.server.tools.class_tools import (
+    fetch_current_class, get_selected_text, get_class_source,
+    get_all_classes, get_methods_of_class, get_fields_of_class, get_smali_of_class,
+    get_main_application_classes_names, get_main_application_classes_code, get_main_activity_class,
+    get_package_tree, get_cache_stats, clear_cache
+)
+from src.server.tools.search_tools import (
+    get_method_by_name, search_method_by_name, search_classes_by_keyword
+)
+from src.server.tools.resource_tools import (
+    get_manifest_component, get_android_manifest, get_strings, get_all_resource_file_names,
+    get_resource_file
+)
+from src.server.tools.refactor_tools import (
+    rename_class, rename_method, rename_field, rename_package, rename_variable
+)
+from src.server.tools.comment_tools import (
+    add_comment, list_comments
+)
+from src.server.tools.debug_tools import (
+    debug_get_stack_frames, debug_get_threads, debug_get_variables
+)
+from src.server.tools.xrefs_tools import (
+    get_xrefs_to_class, get_xrefs_to_method, get_xrefs_to_field
+)
+
+
+# CORRECT REGISTRATION PATTERN for FastMCP
+@mcp.tool()
+async def fetch_current_class() -> dict:
+    """Fetch the currently selected class and its code from the JADX-GUI plugin."""
+    return await tools.class_tools.fetch_current_class()
+
+
+@mcp.tool()
+async def get_selected_text() -> dict:
+    """Returns the currently selected text in the decompiled code view."""
+    return await tools.class_tools.get_selected_text()
+
+
+@mcp.tool()
+async def get_method_by_name(class_name: str, method_name: str, method_signature: str | None = None) -> dict:
+    """Fetch the source code of a method from a specific class."""
+    return await tools.search_tools.get_method_by_name(class_name, method_name, method_signature)
+
+
+@mcp.tool()
+async def get_all_classes(offset: int = 0, count: int = 0) -> dict:
+    """Returns a list of all classes in the project with pagination support."""
+    return await tools.class_tools.get_all_classes(offset, count)
+
+
+@mcp.tool()
+async def get_class_source(class_name: str, with_line_numbers: bool = False) -> dict:
+    """Fetch the Java source of a specific class.
+
+    Set with_line_numbers=True to get every line prefixed with its 1-based line number.
+    Those are the numbers add_comment takes as its 'line' argument, so use this before
+    placing a line comment instead of counting lines yourself."""
+    return await tools.class_tools.get_class_source(class_name, with_line_numbers)
+
+
+@mcp.tool()
+async def search_method_by_name(method_name: str, ctx: Context = None) -> dict:
+    """Search for a method name across all classes."""
+    report_progress = ctx.report_progress if ctx else None
+    return await tools.search_tools.search_method_by_name(method_name, report_progress=report_progress)
+
+
+@mcp.tool()
+async def get_methods_of_class(class_name: str) -> dict:
+    """List all method names in a class."""
+    return await tools.class_tools.get_methods_of_class(class_name)
+
+
+@mcp.tool()
+async def search_classes_by_keyword(
+    search_term: str,
+    package: str = "",
+    search_in: str = "code",
+    offset: int = 0,
+    count: int = 20,
+    ctx: Context = None,
+) -> dict:
+    """Search for classes containing a specific keyword with flexible filtering options.
+
+    This tool performs a comprehensive search across decompiled Android code, allowing you to:
+    1. Search within specific packages by providing a package name
+    2. Target specific search scopes (class names, method names, fields, code content, comments)
+    3. Combine multiple search scopes for precise results
+
+    Args:
+        search_term: The keyword or string to search for. This is the main search query.
+
+        package (optional): Package name to limit the search scope.
+            - If empty string (default), searches across all packages in the APK
+            - If provided, only searches within classes belonging to the specified package
+            - Example: "com.example.app" to search only in that package
+
+        search_in (optional): Comma-separated list of search scopes to target.
+            Valid values:
+            - "class": Search in class names only
+            - "method": Search in method names only
+            - "field": Search in field names only
+            - "code": Search in code content (method bodies, statements, etc.)
+            - "comment": Search in comments
+
+            You can specify one or multiple scopes:
+            - Single scope: "class" (only class names)
+            - Multiple scopes: "class,method" (class names OR method names)
+            - Combined: "class,method,code" (searches in all three scopes)
+
+            Default: "code" (searches in code content)
+
+        offset (optional): Starting index for pagination. Default: 0
+        count (optional): Maximum number of results to return. Default: 20
+
+    Returns:
+        dict: Paginated list of classes containing the search term, with metadata about matches
+
+    MCP Tool: search_classes_by_keyword
+    Description: Advanced search tool that finds classes matching a keyword with package filtering
+                 and scope targeting capabilities. Use this when you need to find specific code
+                 patterns, class names, method names, or other identifiers across the decompiled APK."""
+    report_progress = ctx.report_progress if ctx else None
+    return await tools.search_tools.search_classes_by_keyword(
+        search_term, package, search_in, offset, count, report_progress=report_progress
+    )
+
+
+@mcp.tool()
+async def get_fields_of_class(class_name: str) -> dict:
+    """List all field names in a class."""
+    return await tools.class_tools.get_fields_of_class(class_name)
+
+
+@mcp.tool()
+async def get_smali_of_class(class_name: str) -> dict:
+    """Fetch the smali representation of a class."""
+    return await tools.class_tools.get_smali_of_class(class_name)
+
+
+@mcp.tool()
+async def get_manifest_component(component_type: str, only_exported: bool = False) -> dict:
+    """Retrieve specified component data from AndroidManifest.xml, support filter exported components.
+    Support standard Android components: activity, provider, service, receiver."""
+    return await tools.resource_tools.get_manifest_component(component_type, only_exported)
+
+
+@mcp.tool()
+async def get_android_manifest() -> dict:
+    """Retrieve and return the AndroidManifest.xml content."""
+    return await tools.resource_tools.get_android_manifest()
+
+
+@mcp.tool()
+async def get_strings(offset: int = 0, count: int = 0) -> dict:
+    """Retrieve contents of strings.xml files."""
+    return await tools.resource_tools.get_strings(offset, count)
+
+
+@mcp.tool()
+async def get_all_resource_file_names(offset: int = 0, count: int = 0) -> dict:
+    """Retrieve all resource files names."""
+    return await tools.resource_tools.get_all_resource_file_names(offset, count)
+
+
+@mcp.tool()
+async def get_resource_file(resource_name: str) -> dict:
+    """Retrieve resource file content."""
+    return await tools.resource_tools.get_resource_file(resource_name)
+
+
+@mcp.tool()
+async def get_main_application_classes_names() -> dict:
+    """Fetch main application classes' names from Manifest package."""
+    return await tools.class_tools.get_main_application_classes_names()
+
+
+@mcp.tool()
+async def get_main_application_classes_code(offset: int = 0, count: int = 0) -> dict:
+    """Fetch main application classes' code with pagination."""
+    return await tools.class_tools.get_main_application_classes_code(offset, count)
+
+
+@mcp.tool()
+async def get_main_activity_class() -> dict:
+    """Fetch the main activity class from AndroidManifest.xml."""
+    return await tools.class_tools.get_main_activity_class()
+
+
+@mcp.tool()
+async def get_package_tree() -> dict:
+    """Get all packages in the APK sorted by class count. Shows total_classes, total_packages, and per-package name, class_count, is_likely_library. Use this first to understand the APK structure before searching."""
+    return await tools.class_tools.get_package_tree()
+
+
+@mcp.tool()
+async def get_cache_stats() -> dict:
+    """Get decompilation cache statistics: hits, misses, hit_rate, cached_classes, compressed_mb, compression_ratio."""
+    return await tools.class_tools.get_cache_stats()
+
+
+@mcp.tool()
+async def clear_cache() -> dict:
+    """Clear the decompilation source cache and reset counters. Use when switching APKs or to free memory."""
+    return await tools.class_tools.clear_cache()
+
+
+@mcp.tool()
+async def rename_class(class_name: str, new_name: str) -> dict:
+    """Renames a specific class."""
+    return await tools.refactor_tools.rename_class(class_name, new_name)
+
+
+@mcp.tool()
+async def rename_method(
+    method_name: str,
+    new_name: str,
+    class_name: str | None = None,
+    method_signature: str | None = None,
+) -> dict:
+    """Renames a specific method, optionally scoped to class_name."""
+    return await tools.refactor_tools.rename_method(
+        method_name, new_name, class_name, method_signature
+    )
+
+
+@mcp.tool()
+async def rename_field(class_name: str, field_name: str, new_name: str) -> dict:
+    """Renames a specific field."""
+    return await tools.refactor_tools.rename_field(class_name, field_name, new_name)
+
+
+@mcp.tool()
+async def rename_package(old_package_name: str, new_package_name: str) -> dict:
+    """Renames a package and all its classes."""
+    return await tools.refactor_tools.rename_package(old_package_name, new_package_name)
+
+
+@mcp.tool()
+async def rename_variable(class_name: str, method_name: str, variable_name: str, new_name: str, reg: str | None = None, ssa: str | None = None) -> dict:
+    """Renames a specific variable in a method."""
+    return await tools.refactor_tools.rename_variable(class_name, method_name, variable_name, new_name, reg, ssa)
+
+
+@mcp.tool()
+async def add_comment(
+    class_name: str,
+    comment: str,
+    method_name: str | None = None,
+    method_signature: str | None = None,
+    field_name: str | None = None,
+    line: int | None = None,
+    style: str = "LINE",
+) -> dict:
+    """Add a comment to decompiled code, shown in JADX-GUI and saved with the project.
+
+    Comment a class by passing only class_name, a method by also passing method_name
+    (use method_signature such as '(I)V' to pick between overloads), or a field by
+    passing field_name.
+
+    To comment a code line, pass line=N, the 1-based line number in the decompiled source
+    of that class; get it from get_class_source(with_line_numbers=True) rather than
+    counting lines. The comment is appended to the end of that line, and on a class,
+    method or field declaration line it comments that declaration instead, matching what
+    the comment shortcut does in JADX-GUI. Braces and blank lines have nothing to comment
+    and are rejected, listing the nearest lines that work. Line numbers shift once a
+    comment is added above, so re-read the source before addressing another line.
+
+    Every write is verified against the freshly decompiled code and the response echoes
+    the rendered line, so there is no need to read the class back to check. A comment
+    that does not render is rolled back and returns an error rather than being silently
+    stored, which JADX itself does not detect.
+
+    A new comment on the same target replaces the previous one, so annotations can be
+    refined without creating duplicates, and passing an empty comment removes it.
+    style is one of LINE, BLOCK, BLOCK_CONDENSED, JAVADOC or JAVADOC_CONDENSED
+    (default: LINE).
+
+    Use this to record what a class or method actually does while reverse engineering:
+    the comments persist in the JADX project and are searchable later with
+    search_classes_by_keyword(search_in="comment")."""
+    return await tools.comment_tools.add_comment(
+        class_name, comment, method_name, method_signature, field_name, line, style
+    )
+
+
+@mcp.tool()
+async def list_comments(class_name: str = "") -> dict:
+    """List the comments already stored in the project, optionally filtered to one class.
+
+    Each entry reports class_name, node_type (CLASS/METHOD/FIELD), node_id, comment and
+    style. Use this before add_comment to see what is already annotated instead of
+    re-deriving it."""
+    return await tools.comment_tools.list_comments(class_name)
+
+
+@mcp.tool()
+async def debug_get_stack_frames() -> dict:
+    """Get current stack frames (call stack)."""
+    return await tools.debug_tools.debug_get_stack_frames()
+
+
+@mcp.tool()
+async def debug_get_threads() -> dict:
+    """Get all threads in the debugged process."""
+    return await tools.debug_tools.debug_get_threads()
+
+
+@mcp.tool()
+async def debug_get_variables() -> dict:
+    """Get current variables when process is suspended."""
+    return await tools.debug_tools.debug_get_variables()
+
+
+@mcp.tool()
+async def get_xrefs_to_class(class_name: str, offset: int = 0, count: int = 20) -> dict:
+    """Find all references to a class."""
+    return await tools.xrefs_tools.get_xrefs_to_class(class_name, offset, count)
+
+
+@mcp.tool()
+async def get_xrefs_to_method(
+    class_name: str, method_name: str, offset: int = 0, count: int = 20
+) -> dict:
+    """Find all references to a method."""
+    return await tools.xrefs_tools.get_xrefs_to_method(
+        class_name, method_name, offset, count
+    )
+
+
+@mcp.tool()
+async def get_xrefs_to_field(
+    class_name: str, field_name: str, offset: int = 0, count: int = 20
+) -> dict:
+    """Find all references to a field."""
+    return await tools.xrefs_tools.get_xrefs_to_field(
+        class_name, field_name, offset, count
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser("MCP Server for Jadx")
+    parser.add_argument(
+        "--http",
+        help="Serve MCP Server over HTTP stream.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--host",
+        help="Host address to bind for --http (default: 127.0.0.1, use 0.0.0.0 for remote access). "
+             "WARNING: non-localhost binds expose the server over plain HTTP with no authentication.",
+        default="127.0.0.1",
+        type=str
+    )
+    parser.add_argument(
+        "--port", help="Port for --http (default:8651)", default=8651, type=int
+    )
+    parser.add_argument(
+        "--jadx-port",
+        help="JADX AI MCP Plugin port (default:8650)",
+        default=8650,
+        type=int,
+    )
+    parser.add_argument(
+        "--jadx-host",
+        help="JADX AI MCP Plugin host (default:127.0.0.1). "
+             "Security: non-localhost may expose plugin to network; use trusted network/firewall.",
+        default="127.0.0.1",
+        type=str,
+    )
+    args = parser.parse_args()
+
+    # Configure
+    config.set_jadx_host(args.jadx_host)
+    config.set_jadx_port(args.jadx_port)
+
+    # Security warning for non-localhost bind address
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        logger.warning(
+            "\n⚠️  SECURITY WARNING: Binding to non-localhost address '%s'.\n"
+            "   The MCP server uses plain HTTP with NO authentication.\n"
+            "   Anyone on the network can connect and use all MCP tools.\n"
+            "   Only use this on trusted networks or behind a firewall.",
+            args.host
+        )
+
+    # Banner & Health Check — always logs to stderr to keep stdout clean for stdio transport
+    try:
+        logger.info(jadx_mcp_server_banner())
+    except Exception:
+        logger.info(
+            "[JADX AI MCP Server] v6.4.1 | MCP Port: %s | JADX Host: %s | JADX Port: %s",
+            args.port,
+            args.jadx_host,
+            args.jadx_port,
+        )
+
+    logger.info("Testing JADX AI MCP Plugin connectivity...")
+    result = config.health_ping()
+    logger.info("Health check result: %s", result)
+
+    # Run Server
+    if args.http:
+        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+    else:
+        # StdIO transport must keep stdout reserved for MCP frames.
+        # FastMCP's startup banner can pollute stdio MCP handshakes in some clients.
+        # Keep banner disabled for deterministic stdio initialization (issue #60).
+        try:
+            mcp.run(show_banner=False)
+        except KeyboardInterrupt:
+            logger.info("JADX MCP server interrupted; exiting cleanly")
+
+
+if __name__ == "__main__":
+    main()

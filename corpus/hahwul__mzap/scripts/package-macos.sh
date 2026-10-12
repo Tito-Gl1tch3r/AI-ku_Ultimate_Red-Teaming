@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Bundle Homebrew-linked dylibs next to a Crystal macOS binary so the
+# release tarball runs without a local OpenSSL (or other brew) install.
+#
+# Rewriting load commands with install_name_tool invalidates a Mach-O code
+# signature. The linker-signed main binary gets re-signed automatically, but
+# Homebrew's plainly ad-hoc-signed dylibs do not: they are left with a stale
+# signature, and arm64 SIGKILLs any process that maps one. So everything is
+# re-signed ad hoc after the last install_name_tool call, and the packaged
+# tarball is smoke-tested before the script reports success.
+#
+# Usage: scripts/package-macos.sh <binary-path> <output-tarball> [staged-name]
+#
+# Archive layout:
+#   <staged-name>
+#   lib/*.dylib
+set -euo pipefail
+
+BINARY="${1:?Usage: $0 <binary-path> <output-tarball> [staged-name]}"
+OUTPUT="${2:?Usage: $0 <binary-path> <output-tarball> [staged-name]}"
+NAME="${3:-$(basename "$BINARY")}"
+
+if [[ ! -f "$BINARY" ]]; then
+  echo "error: binary not found: $BINARY" >&2
+  exit 1
+fi
+
+for tool in otool install_name_tool codesign; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "error: $tool is required (macOS only)" >&2
+    exit 1
+  fi
+done
+
+STAGING="$(mktemp -d)"
+VERIFY_DIR="$(mktemp -d)"
+trap 'rm -rf "$STAGING" "$VERIFY_DIR"' EXIT
+
+mkdir -p "$STAGING/lib"
+cp "$BINARY" "$STAGING/$NAME"
+chmod +x "$STAGING/$NAME"
+
+BREW_PREFIX_RE='^(/opt/homebrew|/usr/local)/'
+
+homebrew_deps() {
+  local target="$1"
+  otool -L "$target" | awk 'NR>1 {print $1}' | grep -E "$BREW_PREFIX_RE" || true
+}
+
+DEPS_FILE="$STAGING/deps.txt"
+: > "$DEPS_FILE"
+
+while true; do
+  added=0
+  for target in "$STAGING/$NAME" "$STAGING"/lib/*.dylib; do
+    [[ -e "$target" ]] || continue
+    while IFS= read -r dep; do
+      [[ -z "$dep" ]] && continue
+      base="$(basename "$dep")"
+      if ! grep -Fxq "$dep" "$DEPS_FILE"; then
+        echo "$dep" >> "$DEPS_FILE"
+      fi
+      if [[ ! -f "$STAGING/lib/$base" ]]; then
+        cp "$dep" "$STAGING/lib/$base"
+        added=1
+      fi
+    done < <(homebrew_deps "$target")
+  done
+  [[ "$added" -eq 0 ]] && break
+done
+
+rewrite_paths() {
+  local target="$1"
+  while IFS= read -r dep; do
+    [[ -z "$dep" ]] && continue
+    install_name_tool -change "$dep" "@executable_path/lib/$(basename "$dep")" "$target"
+  done < "$DEPS_FILE"
+}
+
+rewrite_paths "$STAGING/$NAME"
+for lib in "$STAGING"/lib/*.dylib; do
+  [[ -e "$lib" ]] || continue
+  install_name_tool -id "@executable_path/lib/$(basename "$lib")" "$lib"
+  rewrite_paths "$lib"
+done
+
+# Check the dylibs too, not just the binary: a bundled dylib that still
+# points at /opt/homebrew for one of *its* deps leaves the archive broken on
+# any machine without that brew formula installed.
+for target in "$STAGING/$NAME" "$STAGING"/lib/*.dylib; do
+  [[ -e "$target" ]] || continue
+  if otool -L "$target" | awk 'NR>1 {print $1}' | grep -Eq "$BREW_PREFIX_RE"; then
+    echo "error: Homebrew paths remain after bundling: $target" >&2
+    otool -L "$target" >&2
+    exit 1
+  fi
+done
+
+# Re-sign ad hoc. This must come after every install_name_tool call above,
+# and dylibs must be signed before the binary that loads them.
+for lib in "$STAGING"/lib/*.dylib; do
+  [[ -e "$lib" ]] || continue
+  codesign --force --sign - "$lib"
+done
+codesign --force --sign - "$STAGING/$NAME"
+
+for target in "$STAGING/$NAME" "$STAGING"/lib/*.dylib; do
+  [[ -e "$target" ]] || continue
+  if ! codesign --verify --strict "$target"; then
+    echo "error: invalid code signature after packaging: $target" >&2
+    exit 1
+  fi
+done
+
+mkdir -p "$(dirname "$OUTPUT")"
+
+# Archive to a scratch path first. A tarball only becomes $OUTPUT once it has
+# proven it runs, so a failed smoke test cannot leave a finished-looking but
+# unrunnable artifact for a later step to upload.
+STAGED_OUTPUT="$VERIFY_DIR/$(basename "$OUTPUT")"
+tar -czf "$STAGED_OUTPUT" -C "$STAGING" "$NAME" lib
+
+# Smoke-test the packaged artifact rather than the staged tree: this is the
+# exact layout a user unpacks, and a stale signature is fatal only at exec
+# time. Guarding this behind `if` hid exactly the breakage it existed to catch.
+EXTRACT_DIR="$VERIFY_DIR/extracted"
+mkdir -p "$EXTRACT_DIR"
+tar -xzf "$STAGED_OUTPUT" -C "$EXTRACT_DIR"
+smoke_status=0
+# `version` is a subcommand, not a flag: mzap rejects `--version` with
+# "Unknown option" and exits 1, which looks exactly like a load failure here.
+VERSION_OUTPUT="$("$EXTRACT_DIR/$NAME" version 2>&1)" || smoke_status=$?
+if [[ "$smoke_status" -ne 0 ]]; then
+  echo "error: packaged binary failed to run (exit $smoke_status)" >&2
+  echo "       output was:" >&2
+  echo "$VERSION_OUTPUT" >&2
+  echo "       if it produced no output at all, suspect the signature:" >&2
+  echo "       arm64 SIGKILLs binaries and dylibs with an invalid one," >&2
+  echo "       so check the codesign step above." >&2
+  exit 1
+fi
+# Exit 0 alone is not evidence: a binary that prints nothing has not
+# demonstrated it loaded its dylibs and reached its own CLI.
+if [[ -z "${VERSION_OUTPUT//[[:space:]]/}" ]]; then
+  echo "error: packaged binary ran but printed no version" >&2
+  exit 1
+fi
+
+mv "$STAGED_OUTPUT" "$OUTPUT"
+
+echo "Created $OUTPUT"
+echo "$VERSION_OUTPUT"

@@ -7,11 +7,14 @@ __pycache__/
 *.pyc
 .venv/
 
-# Secretos — nunca versionar tokens
+# Secretos — el control real es el escaneo pre-push (grep de tokens reales).
+# NO se ignoran patrones de nombres: los repos upstream legítimos contienen "token"
+# en su nombre (p.ej. huami-token) y su contenido ya es público en GitHub.
 .env
-*token*
 .secrets/
 
 # OS
 .DS_Store
+
+# Manifiestos grandes: en partes (GitHub limita 100MB/archivo)
 results/full-1/manifest.jsonl

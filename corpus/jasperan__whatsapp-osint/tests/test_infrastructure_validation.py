@@ -1,0 +1,144 @@
+"""Validation tests to ensure the testing infrastructure is properly set up."""
+import re
+import sys
+from pathlib import Path
+
+import pytest
+
+
+@pytest.mark.unit
+def test_pytest_is_installed():
+    """Verify pytest is properly installed."""
+    assert 'pytest' in sys.modules or True  # pytest is running this test
+
+
+@pytest.mark.unit
+def test_testing_directory_structure():
+    """Verify the testing directory structure exists."""
+    test_root = Path(__file__).parent
+
+    assert test_root.exists()
+    assert test_root.name == 'tests'
+    assert (test_root / '__init__.py').exists()
+    assert (test_root / 'conftest.py').exists()
+    assert (test_root / 'unit' / '__init__.py').exists()
+    assert (test_root / 'integration' / '__init__.py').exists()
+
+
+@pytest.mark.unit
+def test_fixtures_available(temp_dir, mock_database, sample_config):
+    """Verify that common fixtures are available and working."""
+    # Test temp_dir fixture
+    assert temp_dir.exists()
+    assert temp_dir.is_dir()
+
+    # Test mock_database fixture
+    assert mock_database.endswith('.db')
+    assert Path(mock_database).exists()
+
+    # Test sample_config fixture
+    assert isinstance(sample_config, dict)
+    assert 'chrome_driver_path' in sample_config
+    assert 'database_path' in sample_config
+
+
+@pytest.mark.unit
+def test_coverage_configuration():
+    """Verify coverage is configured correctly."""
+    try:
+        import coverage
+        assert True, "Coverage module is available"
+    except ImportError:
+        pytest.skip("Coverage not yet installed")
+
+
+@pytest.mark.unit
+def test_mock_fixtures(mock_selenium_webdriver):
+    """Verify mock fixtures are working."""
+    assert mock_selenium_webdriver is not None
+
+
+@pytest.mark.unit
+def test_project_structure():
+    """Verify the project has the expected src-layout package structure."""
+    project_root = Path(__file__).parent.parent
+    package_root = project_root / 'src' / 'whatsapp_beacon'
+
+    assert (project_root / 'pyproject.toml').exists()
+    assert (project_root / 'setup.py').exists()
+    assert (project_root / 'requirements.txt').exists()
+    assert package_root.is_dir()
+    assert (package_root / '__init__.py').exists()
+    assert (package_root / 'beacon.py').exists()
+    assert (package_root / 'config.py').exists()
+
+
+@pytest.mark.integration
+def test_packaging_configuration():
+    """Verify setuptools and requirements metadata are present and current."""
+    project_root = Path(__file__).parent.parent
+    pyproject_path = project_root / 'pyproject.toml'
+    requirements_path = project_root / 'requirements.txt'
+    readme_path = project_root / 'README.md'
+
+    assert pyproject_path.exists()
+    assert requirements_path.exists()
+    assert readme_path.exists()
+
+    pyproject_content = pyproject_path.read_text()
+    assert 'name = "whatsapp-osint"' in pyproject_content
+    assert 'whatsapp-beacon = "whatsapp_beacon.main:main"' in pyproject_content
+    assert 'whatsapp-osint = "whatsapp_beacon.main:main"' in pyproject_content
+    assert 'version = { attr = "whatsapp_beacon.__version__" }' in pyproject_content
+
+    requirements_content = requirements_path.read_text()
+    assert 'selenium' in requirements_content
+    assert 'webdriver-manager' in requirements_content
+    assert 'pytest' in requirements_content
+
+    readme_content = readme_path.read_text()
+    assert 'pypi/v/whatsapp-osint' in readme_content
+
+
+@pytest.mark.slow
+def test_slow_marker():
+    """Verify the slow marker works correctly."""
+    import time
+    start = time.time()
+    time.sleep(0.1)  # Simulate slow test
+    duration = time.time() - start
+    assert duration >= 0.1
+
+
+@pytest.mark.unit
+def test_dashboard_escapes_attacker_controlled_fields():
+    """Guard: every attacker-influenced field interpolated into the dashboard is HTML-escaped.
+
+    Contact names, status text and "last seen" strings are read from the monitored WhatsApp
+    account, so they are attacker-controlled. The dashboard renders them via ``innerHTML``
+    template literals, where an unescaped value is a stored-XSS sink. This test fails if a new
+    interpolation of one of those fields is added without ``escapeHtml(...)``.
+    """
+    template = (Path(__file__).parent.parent / 'src' / 'whatsapp_beacon' / 'dashboard.html').read_text(
+        encoding='utf-8'
+    )
+
+    assert 'const escapeHtml =' in template, 'escapeHtml helper is missing from the dashboard'
+
+    # Field names whose values originate from the monitored account / database text columns.
+    sensitive = {
+        'user_name', 'status_text', 'last_seen', 'observed_at',
+        'lastSeen', 'last_seen_label',
+    }
+
+    unescaped = []
+    for match in re.finditer(r'\$\{([^{}\n]*(?:\{[^{}\n]*\}[^{}\n]*)*)\}', template):
+        expr = match.group(1).strip()
+        referenced = {name for name in sensitive if re.search(rf'\b{name}\b', expr)}
+        if referenced and not expr.startswith('escapeHtml('):
+            unescaped.append((expr, sorted(referenced)))
+
+    assert not unescaped, (
+        'attacker-controlled values interpolated without escapeHtml(): '
+        + '; '.join(f'{expr!r} (uses {refs})' for expr, refs in unescaped)
+    )

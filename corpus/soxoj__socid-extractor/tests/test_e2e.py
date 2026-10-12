@@ -1,0 +1,1834 @@
+#!/usr/bin/env python3
+import json
+
+import pytest
+
+from socid_extractor.activation import get_twitter_headers
+from socid_extractor.main import parse, extract, mutate_url, HEADERS
+
+
+@pytest.mark.skip(reason="VK web is SPA; static fetch has no embed with ownerId (2026)")
+def test_vk_user_profile_full():
+    """VK user profile"""
+    info = extract(parse('https://vk.com/idsvyatoslavs')[0])
+
+    assert info.get('vk_id') == '134173165'
+    assert info.get('vk_username') == 'idsvyatoslavs'
+    assert info.get('fullname') in ('Святослав Степанов', 'Svyatoslav Stepanov')
+
+
+@pytest.mark.skip(reason="VK web is SPA; static fetch has no embed with ownerId (2026)")
+def test_vk_user_profile_no_username():
+    """
+    VK user profile
+    VK user profile foaf page
+    """
+    info = extract(parse('https://vk.com/id352219887')[0])
+    assert info.get('vk_id') == '352219887'
+    assert info.get('vk_username') is None
+    assert info.get('fullname') in ('Роман Горелышев', 'Roman Gorelyshev')
+
+
+@pytest.mark.skip(reason="VK web is SPA; static fetch has no embed with ownerId (2026)")
+def test_vk_closed_user_profile():
+    """VK user profile"""
+    info = extract(parse('https://vk.com/alex')[0])
+    assert info.get('fullname') in ('Alexander Chudaev | VK', "Александр Чудаев | ВКонтакте")
+
+@pytest.mark.skip(reason="broken")
+def test_vk_blocked_user_profile():
+    """VK user profile"""
+    info = extract(parse('https://vk.com/alexaimephotography')[0])
+    assert info.get('fullname') in ('Alex Aimé', 'Alex Aim&#233;', 'Alex Aim&#233; | ВКонтакте', 'Alex Aim&#233; | VK')
+
+@pytest.mark.skip(reason="broken")
+def test_yandex_disk():  # Sometimes throws captcha, mostly because of fraudulent IPs
+    """Yandex Disk file"""
+    info = extract(parse('https://yadi.sk/d/xRJFp3s2QWYv8')[0])
+    assert info.get('yandex_uid') == '225171618'
+    assert info.get('name') == 'Trapl  Zdenek'
+
+
+@pytest.mark.rate_limited
+def test_yandex_reviews():
+    """Yandex Reviews user profile"""
+    info = extract(parse('https://reviews.yandex.ru/user/1a7dv00dqrdgjf6qkyn8kw37jw')[0])
+
+    assert info.get('yandex_public_id') == '1a7dv00dqrdgjf6qkyn8kw37jw'
+    assert info.get('fullname') == 'Darya Gindina'
+    assert info.get(
+        'image') == 'https://avatars.mds.yandex.net/get-yapic/59871/oLXpnRHSVknK56vRAYx2Iuya6U-1/islands-200'
+    assert info.get('is_verified') == 'False'
+    assert info.get('reviews_count') == '0'
+    assert info.get('following_count') == '0'
+    assert info.get('follower_count') == '0'
+
+
+@pytest.mark.skip(reason="broken. needs deeper rework")
+@pytest.mark.github_failed
+def test_instagram():  # Broken. Needs deeper rework
+    """
+    Instagram
+    Instagram page JSON
+    """
+    URLs = [
+        'https://www.instagram.com/zhanna/',
+        'https://www.instagram.com/zhanna/?__a=1',
+    ]
+    for url in URLs:
+        info = extract(parse(url, headers=HEADERS)[0])
+
+        assert info.get("username") == "zhanna"
+        assert info.get("fullname") == "Zhanna Shamis"
+        assert info.get("id") == "105153"
+        assert info.get(
+            "image") == "https://scontent-hel3-1.cdninstagram.com/v/t51.2885-19/11375383_434870180034484_1429353554_a.jpg?_nc_ht=scontent-hel3-1.cdninstagram.com&_nc_cat=104&_nc_ohc=25Ow2Br6xhwAX-ybdqd&edm=ABfd0MgBAAAA&ccb=7-4&oh=00_AT8c23cG3e2dwhT52s6pARMj_4Jhi9v7UWTt93jFJxNSyA&oe=61DE93D1&_nc_sid=7bff83"
+        assert info.get("external_url") == "http://twitter.com/zhanna"
+        assert info.get("facebook_uid") == "17841401234590001"
+        assert info.get("is_business") == "False"
+        assert info.get("is_joined_recently") == "False"
+        assert info.get("is_private") == "False"
+        assert info.get("is_verified") == "False"
+        assert "follower_count" in info
+        assert "following_count" in info
+
+
+@pytest.mark.github_failed
+def test_instagram_api():
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 9; SM-A102U Build/PPR1.180610.011; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/74.0.3729.136 Mobile Safari/537.36 Instagram 155.0.0.37.107 Android (28/9; 320dpi; 720x1468; samsung; SM-A102U; a10e; exynos7885; en_US; 239490550)',
+    }
+
+    info = extract(parse('https://i.instagram.com/api/v1/users/6828488622/info', headers=headers)[0])
+
+    assert info.get('id') == '6828488622'
+    assert info.get('username') == 'kusna_nana'
+    assert 'image' in info
+
+
+def test_medium():
+    info = extract(parse('https://medium.com/@lys1n', timeout=10)[0])
+
+    assert info.get('medium_id') == '4894fec6b289'
+    assert info.get('medium_username') == 'lys1n'
+    assert info.get('fullname') == 'Марк Лясин'
+    # assert info.get('twitter_username') == 'lys1n'
+    assert info.get('is_suspended') == 'False'
+    assert 'follower_count' in info
+    assert 'following_count' in info
+
+
+def test_odnoklassniki():
+    info = extract(parse('https://ok.ru/profile/46054003')[0])
+
+    assert info.get('ok_id') == '46054003'
+
+    info = extract(parse('https://ok.ru/andrey.ostashenya')[0])
+
+    assert info.get('ok_user_name_id') == 'andrey.ostashenya'
+    assert info.get('ok_id') == '576861363171'
+
+
+@pytest.mark.github_failed
+def test_habr():
+    """Habrahabr JSON"""
+    info = extract(parse('https://habr.com/ru/users/m1rko/')[0])
+
+    assert info.get("username") == "m1rko"
+    assert info.get("about") == "автор, переводчик, редактор"
+    assert info.get("gender") == "0"
+    assert info.get("rating") == "0"
+    assert int(info.get("karma")) >= 1284
+    assert info.get("fullname") == "Анатолий Ализар"
+    assert info.get("is_readonly") == "False"
+    assert info.get(
+        "image") == "//habrastorage.org/getpro/habr/avatars/4ec/bd0/85d/4ecbd085d692835a931d03174ff19539.png"
+
+
+@pytest.mark.github_failed
+def test_habr_no_image():
+    """Habrahabr JSON"""
+    info = extract(parse('https://habr.com/ru/users/ne555/')[0])
+
+    # assert info.get('uid') == '1800409'  # No more presented within the new site version
+    assert info.get('username') == 'ne555'
+    assert 'image' not in info
+
+
+@pytest.mark.skip(reason="down")
+def test_twitter_shadowban_no_account():
+    info = extract(parse('https://shadowban.eu/.api/sgfrgrrr')[0])
+
+    assert info.get('has_tweets') == 'False'
+    assert info.get('is_exists') == 'False'
+    assert info.get('username') == 'sgfrgrrr'
+    assert 'is_protected' not in info
+    assert 'has_ban' not in info
+    assert 'has_search_ban' not in info
+    assert 'has_banned_in_search_suggestions' not in info
+
+
+@pytest.mark.skip(reason="down")
+def test_twitter_shadowban():
+    info = extract(parse('https://shadowban.eu/.api/trump')[0])
+
+    assert info.get('has_tweets') == 'True'
+    assert info.get('is_exists') == 'True'
+    assert info.get('username') == 'Trump'
+    assert info.get('is_protected') == 'False'
+    assert info.get('has_ban') == 'False'
+    assert info.get('has_search_ban') == 'False'
+    assert info.get('has_banned_in_search_suggestions') == 'False'
+
+
+def test_twitter_api():
+    _, headers = get_twitter_headers({})
+    info = extract(parse(
+        'https://twitter.com/i/api/graphql/ZRnOhhXPwue_JGILb9TNug/UserByScreenName?variables=%7B%22screen_name%22%3A%22cardiakflatline%22%2C%22withHighlightedLabel%22%3Atrue%7D',
+        headers=headers)[0])
+
+    assert info.get('uid') == 'VXNlcjo0NTkyNjgxNg=='
+    assert info.get('fullname') == 'Cardiak'
+    assert info.get(
+        'bio') == '#Jersey Multi Platinum Grammy Award Winning Producer for J.Cole, DrDre,KendrickLamar, Eminem,MeekMill,RickRoss,Drake,Wale,Ace Hood,T.I,LloydBanks,Kanye,Fabolous'
+    assert info.get('created_at') == '2009-06-09 19:59:57+00:00'
+    assert info.get('image') == 'https://pbs.twimg.com/profile_images/745944619213557760/vgapfpjV.jpg'
+    assert info.get('image_bg') == 'https://pbs.twimg.com/profile_banners/45926816/1487198278'
+    assert info.get('is_protected') == 'False'
+    assert info.get('links') == "['http://www.flatlinekits.com']"
+    assert info.get('location') == 'Los Angeles, CA'
+    assert 'follower_count' in info
+    assert 'following_count' in info
+    assert 'favourites_count' in info
+
+
+@pytest.mark.skip(reason="broken")
+def test_reddit():  # Broken. Site move onto new version. Finding the right cookie for old version to load might help.
+    info = extract(parse('https://www.reddit.com/user/Diascamara/', timeout=10)[0])
+
+    assert info.get('reddit_id') == 't5_a8vxj'
+    assert info.get('reddit_username') == 'Diascamara'
+    assert info.get('fullname') == 'Diascamara'
+    assert info.get('is_employee') == 'False'
+    assert info.get('is_nsfw') == 'True'
+    assert info.get('is_mod') == 'True'
+    assert info.get('is_following') == 'True'
+    assert info.get('has_user_profile') == 'True'
+    assert info.get('created_at').startswith('2018-01-06')
+    assert info.get('hide_from_robots') == 'True'
+    assert int(info.get('total_karma')) > int(30000)
+    assert int(info.get('post_karma')) > int(7000)
+
+
+@pytest.mark.skip(reason="requires facebookexternalhit UA; use url_mutations via CLI")
+@pytest.mark.github_failed
+def test_facebook_user_profile():
+    info = extract(parse('https://www.facebook.com/zuck/',
+                         headers={'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)'})[0])
+
+    assert info.get('uid') == '4'
+    assert info.get('username') == 'zuck'
+    assert info.get('fullname') == 'Mark Zuckerberg'
+    assert 'image' in info
+    assert 'all' not in info
+
+
+@pytest.mark.skip(reason="broken")
+def test_facebook_group():
+    info = extract(parse('https://www.facebook.com/discordapp/')[0])
+
+    assert info.get('uid') == '858412104226521'
+    assert info.get('username') == 'discord'
+    assert 'all' not in info
+
+
+@pytest.mark.skip(reason="broken")
+def test_github_api():
+    info = extract(parse('https://api.github.com/users/soxoj')[0])
+
+    assert info.get('uid') == '31013580'
+    assert info.get('image') == 'https://avatars.githubusercontent.com/u/31013580?v=4'
+    assert info.get('created_at') == '2017-08-14T17:03:07Z'
+    assert 'follower_count' in info
+    assert 'following_count' in info
+    assert 'public_gists_count' in info
+    assert 'public_repos_count' in info
+    assert info.get('bio') == 'Head of OSINT Center of Excellence'
+    assert info.get('blog_url') == 'soxoj.com'
+
+@pytest.mark.skip(reason="it works but is skipped for the sake of successful tests")
+def test_yandex_disk_photos():  # Occasional captcha
+    info = extract(parse('https://yadi.sk/a/oiySK_wg3Vv5p4')[0])
+    assert info.get('yandex_uid') == '38569641'
+    assert info.get('name') == 'Вербочка'
+
+
+@pytest.mark.github_failed
+def test_my_mail_main():
+    info = extract(parse('https://my.mail.ru/mail/zubovo/')[0])
+
+    assert info.get('mail_id') == '13425818'
+    assert info.get('mail_uid') == '6667000454247668890'
+    # there is no auId
+    assert info.get('name') == 'Олег Зубов'
+    assert info.get('username') == 'zubovo'
+    assert info.get('email') == 'zubovo@mail.ru'
+    assert info.get('is_vip') == 'False'
+    assert info.get('is_community') == 'False'
+    assert info.get('is_video_channel') == 'False'
+
+
+@pytest.mark.github_failed
+def test_my_mail_communities():
+    # also video, apps, photo
+    info = extract(parse('https://my.mail.ru/mail/zubovo/communities/')[0])
+
+    assert info.get('mail_id') == '13425818'
+    assert info.get('mail_uid') == '6667000454247668890'
+    assert info.get('au_id') == '6667000454247668890'
+    assert info.get('name') == 'Олег Зубов'
+    assert info.get('username') == 'zubovo'
+    assert info.get('email') == 'zubovo@mail.ru'
+    assert info.get('is_vip') == 'False'
+    assert info.get('is_community') == 'False'
+    assert info.get('is_video_channel') == 'False'
+
+
+@pytest.mark.skip(reason="captcha")
+def test_yandex_music_user_profile():
+    """Yandex Music AJAX request"""
+    headers = {'referer': 'https://music.yandex.ru/users/pritisk/playlists'}
+    info = extract(parse('https://music.yandex.ru/handlers/library.jsx?owner=pritisk', headers=headers)[0])
+
+    assert info.get('yandex_uid') == '16480689'
+    assert info.get('username') == 'pritisk'
+    assert info.get('name') == 'Юрий Притиск'
+    assert info.get(
+        'image') == 'https://avatars.mds.yandex.net/get-yapic/29310/gK74BTyv8LrLRT0mQFIR2xcWv8-1/islands-200'
+    assert info.get('is_verified') == 'False'
+    assert info.get('liked_albums') == '0'
+    assert info.get('liked_artists') == '0'
+    assert info.get('email') == 'pritisk@yandex.ru'
+
+
+@pytest.mark.skip(reason="failed from github CI infra IPs")
+def test_yandex_zen_user_profile():
+    info = extract(parse('https://zen.yandex.ru/user/uyawkukxyf60ud6hjrxr2rq130')[0])
+
+    assert info.get('yandex_public_id') == 'uyawkukxyf60ud6hjrxr2rq130'
+    assert info.get('fullname') == 'Нина Кравченко'
+    assert info.get(
+        'image') == 'https://avatars.mds.yandex.net/get-yapic/51169/DKXVQdtL3tZ5cayBXnnicLaKcE-1/islands-200'
+    assert info.get('messenger_guid') == 'e4615300-548b-9a46-73cf-527d47fe57ed'
+    assert info.get('links') == '[]'
+    assert info.get('type') == 'user'
+    assert int(info.get('comments_count')) > 20
+    assert info.get('status') == 'active'
+    assert 'following_count' in info
+    assert 'follower_count' in info
+
+
+@pytest.mark.skip(reason="down. service no longer exists")
+def test_yandex_o_user_profile():  # The page parsed redirects to realty.ya.ru. Service is dead for now.
+    """Yandex O"""
+    info = extract(parse('https://o.yandex.ru/profile/9q4zmvn5437umdqqyge3tp3vpr/')[0])
+
+    assert info.get('yandex_public_id') == '9q4zmvn5437umdqqyge3tp3vpr'
+    assert info.get('fullname') == 'ТВОЙ-СЕЙФ'
+    assert info.get(
+        'image') == 'https://avatars.mds.yandex.net/get-yapic/64336/enc-0f3ec480eef5850e5ff4e08522ebb6639b998592a4246af4df656b59d2d95fd8/islands-retina-50'
+    assert info.get('score') == 'Ten'
+
+
+def test_yandex_znatoki_user_profile():
+    info = extract(parse('https://yandex.ru/q/profile/zftrw5fzczde6841qgmfn7d2ag/')[0])
+
+    assert info.get('yandex_znatoki_id') == '39eec711-5675-56b1-beb5-a1f393d2ee66'
+    assert info.get('bio') == 'Создатель проекта Nike Fans'
+    assert info.get('name') == 'Александр Яковлев'
+    # assert info.get('yandex_uid') == '52839599'  # Deprecated
+    assert info.get(
+        'image') == 'https://avatars.mds.yandex.net/get-yapic/39249/wpCNlu2qMFmQ3dtshEvhaZH4W7I-1/islands-200'
+    assert info.get('is_org') == 'False'
+    assert info.get('is_banned') == 'False'
+    assert info.get('is_deleted') == 'False'
+    assert info.get('created_at') == '2019-04-08T16:23:37.576163+00:00'
+    assert 'last_answer_at' in info
+    assert 'rating' in info
+    assert info.get('gender') == 'm'
+    assert info.get('links') == "['https://nikefans.ru']"
+    assert info.get('verified_categories') == "['спорт']"
+    # assert info.get('is_from_q') == 'False'  # Deprecated
+    # assert info.get('is_bad_or_shock') == 'False'
+    assert info.get('is_excluded_from_rating') == 'False'
+    assert info.get(
+        'teaser') == 'Люблю Nike, спорт и активный образ жизни. С 2012 года я изучаю все, что связано с брендом Nike, веду блог.'
+    # assert info.get('facebook_username') == 'nikefansru' #  Not presented
+    # assert info.get('instagram_username') == 'nike.fans.russia'  #  Not presented
+    assert info.get('telegram_username') == 'nikefansru'
+    assert info.get('vk_username') == 'nikejoy'
+
+
+@pytest.mark.skip(reason="non-actual, yandex updated bugbounty pages")
+def test_yandex_bugbounty():
+    info = extract(parse('https://yandex.ru/bugbounty/researchers/canyoutestit/')[0])
+
+    assert info.get('yandex_uid') == '690526182'
+    assert info.get('firstname') == 'Артем'
+    assert info.get('username') == 'canyoutestit'
+    assert info.get('email') == 'artebel@mail.ru'
+    assert info.get('url') == 'https://facebook.com/artembelch'
+
+    info = extract(parse('https://yandex.ru/bugbounty/researchers/bdanyok/')[0])
+    assert info.get('yandex_uid') == '65212420'
+    assert info.get('firstname') == 'Данил'
+    assert info.get('username') == 'bdanyok'
+    assert info.get('email') == 'bdanyok@yandex.ru'
+
+    info = extract(parse('https://yandex.ru/bugbounty/researchers/t-a-neo/')[0])
+    assert info.get('yandex_uid') == '584521278'
+    assert info.get('firstname') == 'taneo'
+    assert info.get('username') == 't-a-neo'
+
+
+@pytest.mark.skip(reason="broken")
+def test_behance():
+    info = extract(parse('https://www.behance.net/patrickseymour', 'gpv=behance.net:profile:appreciated; ilo0=true')[0])
+
+    assert info.get('uid') == '376641'
+    assert info.get('fullname') == 'Patrick Seymour'
+    assert info.get('last_name') == 'Seymour'
+    assert info.get('first_name') == 'Patrick'
+    assert info.get('username') == 'patrickseymour'
+    assert info.get('is_verified') == 'True'
+    assert info.get('bio') == 'False'
+    assert info.get('image').startswith('https://mir-s3-cdn-cf.behance.net/user/')
+    assert info.get('city') == 'Montreal'
+    assert info.get('country') == 'Canada'
+    assert info.get('location') == 'Montreal, Quebec, Canada'
+    assert info.get('created_at').startswith('2011-03-23')
+    assert info.get('occupation') == 'Art director • Illustrator '
+    assert info.get(
+        'links') == "['http://twitter.com/PatrickSeymour', 'http://facebook.com/patrickseymourillustrateur', 'http://linkedin.com/in/patrick-seymour-70334b2b?trk=hp-identity-photo', 'http://vimeo.com/user9401948', 'http://pinterest.com/patrickseymour', 'http://instagram.com/patrickseymour']"
+    assert info.get('twitter_username') == 'PatrickSeymour'
+    assert 'comments' in info
+    assert 'followers_count' in info
+    assert 'following_count' in info
+    assert 'profile_views' in info
+    assert 'project_views' in info
+    assert 'appreciations' in info
+
+
+def test_500px():
+    """500px GraphQL API"""
+    mutated_url = mutate_url('https://500px.com/p/the-maksimov')
+    url, add_headers = mutated_url[0]
+    info = extract(parse(url, headers=add_headers)[0])
+
+    assert info.get('uid') == 'dXJpOm5vZGU6VXNlcjoyMDQxNzc1MQ=='
+    assert info.get('legacy_id') == '20417751'
+    assert info.get('username') == 'the-maksimov'
+    assert info.get('fullname') == 'Max Max'
+    assert info.get('account_type') == 'BASIC'
+    assert info.get('created_at') == '2016-11-30T08:14:52.000+00:00'
+
+
+def test_google_documents():  # Does work on the second try
+    """Google Document API"""
+    URL = 'https://docs.google.com/spreadsheets/d/1HtZKMLRXNsZ0HjtBmo0Gi03nUPiJIA4CC4jTYbCAnXw/edit#gid=0'
+    info = extract(parse(URL)[0])
+
+    assert info.get('org_name') == 'Gooten'
+    assert info.get('mime_type') == 'application/vnd.google-apps.ritz'
+
+    mutated_url = mutate_url(URL)
+
+    assert len(mutated_url) == 1
+    url, add_headers = mutated_url[0]
+
+    info = extract(parse(url, headers=add_headers)[0])
+
+    assert info.get("created_at") == "2016-02-16T18:51:52.021Z"
+    assert info.get("updated_at") == "2019-10-23T17:15:47.157Z"
+    assert info.get("fake_gaia_id") == "08262007110170219638"
+    assert info.get("fullname") == "andy"
+    assert info.get("email") == "andy@gooten.com"
+    # assert info.get("image") == "https://lh3.googleusercontent.com/a-/AOh14GheZe1CyNa3NeJInWAl70qkip4oJ7qLsD8vDy6X=s64"
+    assert info.get("email_username") == "andy"
+
+
+@pytest.mark.skip(reason="Bitbucket UI/embed changed; test user URL 404 (2026)")
+def test_bitbucket():
+    info = extract(parse('https://bitbucket.org/arny/')[0])
+
+    assert info.get('uid') == '57ad342a-ec8f-42cb-af05-98175b72b8db'
+    assert info.get('fullname') == 'arny'
+    assert info.get('nickname') == 'arny'
+    assert info.get('created_at') == '2009-11-23T10:41:04.355755+00:00'
+    assert info.get('image') == 'https://bitbucket.org/account/arny/avatar/'
+    assert info.get('is_service') == 'False'
+    assert info.get('is_active') == 'True'
+
+
+@pytest.mark.skip(reason="cloudflare")
+def test_steam():
+    info = extract(parse('https://steamcommunity.com/id/GabrielSantosMariano/')[0])
+
+    assert info.get('uid') == '76561198315585536'
+    assert info.get('username') == 'GabrielSantosMariano'
+    assert info.get('nickname') == 'Gabriel! Santos, Mariano.'
+
+
+@pytest.mark.skip(reason="cloudflare")
+def test_steam_hidden():
+    info = extract(parse('https://steamcommunity.com/id/Elvoc/')[0])
+
+    assert info.get('uid') == '76561197976127725'
+    assert info.get('username') == 'Elvoc'
+    assert info.get('nickname') == 'Elvoc'
+
+
+@pytest.mark.requires_cookies
+def test_yandex_realty_offer_cookies():  # Occasional captcha
+    cookies = open('yandex.test.cookies').read()
+    info = extract(parse('https://realty.yandex.ru/offer/6693796897016240731/', cookies)[0])
+    assert info.get('yandex_uid') == '1260401477'
+    assert info.get('name') == 'Яндекс Аренда'
+
+
+@pytest.mark.requires_cookies
+def test_gitlab_cookies():
+    URL = 'https://gitlab.com/markglenfletcher'
+    cookies = open('gitlab.test.cookies').read()
+
+    info = extract(parse(URL, cookies)[0])
+
+    mutated_url = mutate_url(URL)
+    assert len(mutated_url) == 1
+    url, add_headers = mutated_url[0]
+
+    info = extract(parse(url, headers=add_headers)[0])
+
+    assert info.get('uid') == '419655'
+    assert info.get('fullname') == 'Mark Fletcher'
+    assert info.get('username') == 'markglenfletcher'
+    assert info.get('state') == 'active'
+    assert info.get('image') == 'https://gitlab.com/uploads/-/system/user/avatar/419655/avatar.png'
+
+
+@pytest.mark.skip(reason='Failed in GitHub CI')
+def test_blogger():
+    info = extract(parse('https://b0ltay.blogspot.ru')[0])
+
+    assert info.get('uid') == '10725121405978587846'
+    assert info.get('blog_id') == '9057808199412143402'
+
+
+@pytest.mark.github_failed
+def test_d3():
+    """D3.ru"""
+    info = extract(parse('https://d3.ru/user/nomad62')[0])
+
+    assert info.get('uid') == '126836'
+
+
+@pytest.mark.skip(reason="broken")
+def test_stack_exchange():
+    info = extract(parse('https://stackoverflow.com/users/198633/inspectorg4dget')[0])
+
+    assert info.get('uid') == '198633'
+    assert info.get('stack_exchange_uid') == '67986'
+    assert info.get('gravatar_url') == 'https://gravatar.com/5b9c04999233026354268c2ee4237e04'
+    assert info.get('gravatar_username') == 'inspectorg4dget'
+    assert info.get('gravatar_email_md5_hash') == '5b9c04999233026354268c2ee4237e04'
+
+
+@pytest.mark.skip(reason="SoundCloud returns 403 / empty embed for automated clients (2026)")
+def test_soundcloud():
+    """SoundCloud"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.82 Safari/537.36'}
+    info = extract(parse('https://soundcloud.com/danielpatterson', headers=headers)[0])
+
+    assert info.get('uid') == '78365'
+    assert info.get('username') == 'danielpatterson'
+    assert info.get('name') == 'Daniel Patterson'
+    assert info.get('following_count') == '23'
+    assert info.get('follower_count') == '36'
+    assert info.get('is_verified') == 'False'
+    assert info.get('image') == 'https://i1.sndcdn.com/avatars-000222811304-x9f1ao-large.jpg'
+    assert info.get('location') == 'Baton Rouge'
+    assert info.get('country_code') == 'US'
+    assert info.get('created_at') is None
+    assert info.get('updated_at') == '2018-08-23T17:22:43Z'
+    assert info.get('comments_count') == '0'
+    assert info.get('likes_count') == '17'
+
+
+@pytest.mark.skip(reason="broken")
+def test_vcru():
+    info = extract(parse('https://vc.ru/u/6587-pavel-stolyarov')[0])
+
+    assert info.get('uid') == '6587'
+    assert info.get('username') == '6587-pavel'
+    assert info.get('name') == 'Павел'
+
+
+@pytest.mark.github_failed
+def test_livejournal():
+    info = extract(parse('https://julia-klay.livejournal.com/')[0])
+
+    assert info.get('uid') == '83505610'
+    assert info.get('name') == 'julia_klay'
+    assert info.get('username') == 'julia_klay'
+    assert info.get('is_personal') == 'True'
+    assert info.get('is_community') == 'False'
+
+
+@pytest.mark.skip(reason="doesnt work without proxy, 503 error")
+def test_myspace():
+    info = extract(parse('https://myspace.com/katelynryry')[0])
+
+    assert info.get('uid') == '8158005'
+    assert info.get('username') == 'katelynryry'
+
+
+@pytest.mark.skip(reason="youtube remove google+ links from channel pages")
+def test_youtube():
+    info = extract(parse('https://www.youtube.com/channel/UCbeOQiPo5SjX8Q_IoSooBig')[0])
+
+    assert info.get('gaia_id') == '117503292148966883754'
+    assert info.get('name') == 'Art NI'
+
+
+@pytest.mark.skip(reason="broken")
+def test_google_maps():
+    info = extract(parse('https://www.google.com/maps/contrib/117503292148966883754')[0])
+
+    # assert info.get('contribution_level').startswith('Level 3 Local Guide')
+    assert info.get('name') == 'Art NI'
+    assert int(info.get('contributions_count')) >= 73
+
+@pytest.mark.skip(reason="it works but is skipped for the sake of successful tests")
+def test_deviantart():
+    info = extract(parse('https://www.deviantart.com/muse1908')[0])
+
+    assert info.get('country') == 'France'
+    # assert info.get('gender') == 'female' #  No longer specified within the test page
+    assert info.get('website') == 'www.purelymuse.com'
+    assert info.get('username') == 'MuseMercier'
+    assert info.get(
+        'links') == "['https://www.instagram.com/muse.mercier/', 'https://twitter.com/musenews']"
+    assert info.get('tagline') == 'Nothing worth having is easy...'
+    assert info.get('bio').startswith('Hi! My name is Muse Mercier,') is True
+    assert info.get('created_at').startswith('2005-06-16')
+
+
+@pytest.mark.github_failed
+def test_tumblr():
+    info = extract(parse('https://alexaimephotography.tumblr.com/')[0])
+
+    assert info.get('fullname') == 'Alex Aimé Photography'
+    assert info.get(
+        'title') == 'My name is Alex Aimé, and i am a freelance photographer. Originally from Burgundy in France .I am a man of 29 years. Follow me on : www.facebook.com/AlexAimePhotography/'
+    assert info.get(
+        'links') == "['https://www.facebook.com/AlexAimePhotography/', 'https://500px.com/alexaimephotography', 'https://www.instagram.com/alexaimephotography/', 'https://www.flickr.com/photos/photoambiance/']"
+    assert 'image' in info
+    assert 'image_bg' in info
+
+
+@pytest.mark.skip(reason="EyeEm returns 403 for automated clients (2026)")
+def test_eyeem():
+    info = extract(parse('https://www.eyeem.com/u/blue')[0])
+
+    assert info.get('eyeem_id') == '38760'
+    assert info.get('eyeem_username') == 'blue'
+    assert info.get('fullname') == 'Blue Lee'
+    assert info.get('bio') == 'hello!^_^'
+    assert info.get('follower_count') == '8'
+    assert info.get('friends_count') == '0'
+    assert info.get('liked_photos') == '0'
+    assert info.get('photos') == '3'
+    assert info.get('facebook_uid') == '1610716256'
+
+@pytest.mark.github_failed
+def test_vimeo_html_e2e():
+    """Vimeo HTML"""
+    info = extract(parse('https://vimeo.com/staff')[0])
+
+    assert info.get('uid') == '152184'
+    assert info.get('username') == 'staff'
+    assert info.get('fullname') == 'Vimeo'
+    assert 'innovative video experience platform' in info.get('bio', '')
+    assert 'i.vimeocdn.com/portrait/' in info.get('image', '')
+    assert info.get('created_at') == '2007-01-18T16:40:11Z'
+    assert info.get('updated_at')
+    assert int(info.get('follower_count', 0)) >= 30000
+    assert int(info.get('videos_count', 0)) >= 2000
+    # All 6 social crosslinks
+    assert info.get('twitter_url') == 'https://twitter.com/vimeo'
+    assert info.get('instagram_url') == 'https://www.instagram.com/vimeo/'
+    assert info.get('facebook_url') == 'https://www.facebook.com/Vimeo/'
+    assert info.get('youtube_url') == 'https://www.youtube.com/@vimeo/'
+    assert info.get('linkedin_url') == 'https://www.linkedin.com/company/vimeo/'
+    assert info.get('tiktok_url') == 'https://www.tiktok.com/@vimeo?lang=en'
+    # Combined `links` field excludes self vimeo.com URL
+    assert 'vimeo.com/staff' not in info.get('links', '')
+    assert 'twitter.com/vimeo' in info.get('links', '')
+
+
+@pytest.mark.skip(reason="broken")
+def test_gravatar():
+    info = extract(parse('https://en.gravatar.com/kostbebix.json')[0])
+
+    # assert info.get('gravatar_id') == '17467145'  # Doesn't exist within the page anymore
+    assert info.get('username') == 'kostbebix'
+    assert info.get('fullname') == 'kost BebiX'
+    assert info.get('location') in ('Kyiv, Ukraine', 'Kiev, Ukraine')
+    assert info.get('emails') == "['k-bx@k-bx.com']"
+    assert info.get('image') == 'https://2.gravatar.com/avatar/d6ac4c55425d6f9d28db9068dbb49e09'
+    #  assert info.get('links') == "['http://twitter.com/kost_bebix']" # Doesn't exist within the page anymore
+    assert 'emails_username' not in info
+
+
+def test_pinterest_account():
+    """Pinterest profile/board page"""
+    info = extract(parse('https://www.pinterest.com/melgaspar666/')[0])
+
+    assert info.get('uid') == '225109818782805421'
+    assert info.get('username') == 'melgaspar666'
+    assert info.get('fullname') == 'Mel Gaspar'
+    assert 'follower_count' in info
+    assert 'following_count' in info
+    assert 'created_at' in info
+
+
+def test_pinterest_boards_page():
+    """Pinterest profile/board page, /boards/ URL variant"""
+    info = extract(parse('https://www.pinterest.com/pinterest/boards/')[0])
+
+    assert info.get('uid') == '424605208526455283'
+    assert info.get('username') == 'pinterest'
+    assert info.get('fullname') == 'Pinterest'
+    assert info.get('bio') == 'Find your reason to go offline. 📌'
+    assert info.get('is_partner') == 'True'
+    assert int(info.get('board_count')) > 0
+    assert int(info.get('follower_count')) > 100
+
+
+@pytest.mark.skip(reason="service no longer public")
+def test_yandex_collections_api():  # Presumably dead. See https://yandex.ru/dev/collections/
+    info = extract(parse('http://yandex.uz/collections/api/users/gebial')[0])
+
+    assert info.get('yandex_public_id') == '20vpvmmwpnwyb0dpbnjvy3k14c'
+    assert info.get('fullname') == 'yellow_lolo'
+    assert info.get(
+        'image') == 'https://avatars.mds.yandex.net/get-yapic/62162/enc-325ec489adfdc84e00cb76315a5e214dc95d51408754cd21321958be4b59647a/islands-200'
+    assert info.get('gender') == 'm'
+    assert info.get('likes') is None
+    assert info.get('cards') == '0'
+    assert info.get('boards') == '0'
+    assert info.get('is_passport') == 'True'
+    assert info.get('is_restricted') == 'False'
+    assert info.get('is_forbid') == 'False'
+    assert info.get('is_km') == 'False'
+    assert info.get('is_business') == 'False'
+
+
+@pytest.mark.skip(reason="failed from github CI infra IPs")
+def test_yandex_market():
+    info = extract(parse('https://market.yandex.ru/user/z16yy5a9ae7uh030t5bgpkgyqg/reviews')[0])
+
+    assert info.get('username') == 'katerina.jaryschckina'
+    assert info.get('yandex_uid') == '207757917'
+    assert info.get('yandex_public_id') == 'z16yy5a9ae7uh030t5bgpkgyqg'
+    assert info.get('fullname') == 'Екатерина Ярышкинa'
+    assert info.get(
+        'image') == 'https://avatars.mds.yandex.net/get-yapic/15298/enc-b44c03912bc49d1ba01345b8a2a4facbf24874f4dc922b4eb50b455107676f1a/islands-200'
+    assert info.get('reviews_count') == '2'
+    assert info.get('is_deleted') == 'False'
+    assert info.get('is_hidden_name') == 'True'
+    assert info.get('is_verified') == 'False'
+    assert info.get(
+        'linked_social') == "[{'type': 'vkontakte', 'uid': '137002953', 'username': None, 'profile_id': 12075972}]"
+    assert info.get('links') == "['https://vk.com/id137002953']"
+
+
+@pytest.mark.github_failed
+def test_tiktok():
+    headers = {
+        'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.141 Safari/537.36'}
+    info = extract(parse('https://www.tiktok.com/@red', headers=headers)[0])
+
+    assert info.get('tiktok_id') == '6667977707978850310'
+    assert info.get('tiktok_username') == 'red'
+    assert info.get('fullname') == '(RED)'
+    assert 'bio' in info
+    assert 'tiktokcdn' in info.get('image')
+    assert info.get('is_verified') == 'True'
+    assert info.get('is_secret') == 'False'
+    assert info.get('sec_uid') == 'MS4wLjABAAAAVAp3JR-xHP7UnaDt4S9T9eyPqRDwgGiBRnzdZRm63jIGWy5s39a027nKJlu_UjOZ'
+    assert int(info.get('following_count')) > 300
+    assert int(info.get('follower_count')) > 36000
+    assert int(info.get('heart_count')) > 275900
+    assert int(info.get('video_count')) > 50
+    assert info.get('digg_count') == '0'
+
+
+@pytest.mark.github_failed
+def test_tiktok_hydration_e2e():
+    """
+    TikTok
+    TikTok (legacy SIGI_STATE)
+    """
+    info = extract(parse('https://www.tiktok.com/@tiktok', timeout=20)[0])
+
+    assert info.get('tiktok_username') == 'tiktok'
+    assert len(str(info.get('tiktok_id', ''))) > 5
+    assert str(info.get('sec_uid', '')).startswith('MS4wLjAB')
+    assert 'tiktokcdn' in (info.get('image') or '')
+    assert info.get('is_verified') in ('True', 'False')
+    assert 'follower_count' in info
+    assert 'fullname' in info
+
+
+@pytest.mark.github_failed
+def test_picsart_api_e2e():
+    """
+    Picsart API
+    """
+    URL = 'https://www.picsart.com/u/adam'
+    mutated = mutate_url(URL)
+    assert len(mutated) >= 1
+    url, add_headers = mutated[0]
+
+    info = extract(parse(url, headers=add_headers, timeout=15)[0])
+
+    assert info.get('picsart_username') == 'adam'
+    assert info.get('fullname') is not None
+    assert info.get('picsart_id') is not None
+    assert info.get('is_verified') in ('True', 'False')
+    assert 'follower_count' in info
+
+
+def test_imgur_api_e2e():
+    """
+    Imgur API
+    """
+    url = 'https://api.imgur.com/account/v1/accounts/imgur?client_id=546c25a59c58ad7'
+    info = extract(parse(url, timeout=15)[0])
+
+    assert info.get('imgur_username') == 'imgur'
+    assert info.get('imgur_profile_avatar_url') == 'https://imgur.com/user/imgur/avatar'
+    assert info.get('reputation_name') == 'Glorious'
+    assert float(info.get('reputation_count', 0)) > 1000
+
+
+@pytest.mark.skip(reason="failed from github CI infra IPs")
+def test_flickr():
+    info = extract(parse('https://www.flickr.com/photos/alexaimephotography2020/')[0])
+
+    assert info.get('flickr_id') == '187482857@N04'
+    assert info.get('flickr_username') == 'alexaimephotography2020'
+    assert info.get('flickr_nickname') == 'aaphotography2020'
+    assert info.get('fullname') == 'alexaim%E9 photography'
+    assert info.get(
+        'image') == 'https://farm66.staticflickr.com/65535/buddyicons/187482857@N04_r.jpg?1584445364#187482857@N04'
+    assert int(info.get('photos_count')) > 140
+    assert int(info.get('follower_count')) > 180
+    assert int(info.get('following_count')) > 70
+    assert info.get('created_at').startswith('2020-03-17')
+    assert info.get('is_pro') == 'False'
+    assert info.get('is_deleted') == 'False'
+
+
+def test_telegram():
+    info = extract(parse('https://t.me/buzovacoin')[0])
+
+    assert info.get('fullname') == 'Buzovacoin'
+    assert info.get('bio').startswith('ICO Ольги Бузовой - Платформа BUZAR')
+    assert 'image' in info
+
+
+@pytest.mark.skip(reason="broken")
+def test_mssg_me():
+    info = extract(parse('https://mssg.me/mr.adam')[0])
+
+    assert info.get('fullname') == 'Mr.Adam'
+    assert info.get('bio') == 'Бизнесмен'
+    assert info.get('messengers') == "['whatsapp', 'messenger']"
+    assert info.get('messenger_values') == "['+77026924715', 'adamcigelnik']"
+
+
+@pytest.mark.rate_limited  # Cloudflare challenges datacenter IPs; needs a residential proxy
+def test_patreon():
+    info = extract(parse('https://www.patreon.com/annetlovart')[0])
+
+    assert info.get('patreon_id') == '33913189'
+    assert info.get('patreon_username') == 'annetlovart'
+    assert info.get('fullname') == 'Annet Lovart'
+    assert info.get(
+        'links') == "['https://www.facebook.com/322598031832479', 'https://www.instagram.com/annet_lovart', 'https://twitter.com/annet_lovart', 'https://youtube.com/channel/UClDg4ntlOW_1j73zqSJxHHQ']"
+    assert info.get('is_nsfw') == 'False'
+    assert 'image' in info
+    assert 'image_bg' in info
+    assert info.get('created_at') == '2020-04-19T16:29:11.000+00:00'
+    assert 'bio' in info
+
+
+@pytest.mark.rate_limited  # Cloudflare challenges datacenter IPs; needs a residential proxy
+def test_patreon_rsc():
+    """Patreon RSC"""
+    # App Router profile: no __NEXT_DATA__, payload comes from the RSC stream.
+    info = extract(parse('https://www.patreon.com/kurzgesagt')[0])
+
+    assert info.get('patreon_id') == '43579'
+    assert info.get('patreon_username') == 'Kurzgesagt'
+    assert info.get('is_nsfw') == 'False'
+    assert info.get('created_at') == '2013-08-30T16:09:54.000+00:00'
+    assert 'https://www.instagram.com/kurzgesagt' in info.get('links', '')
+    # a "$38"-style RSC reference must be resolved to the real summary
+    assert info.get('bio', '').startswith('<p ')
+
+
+@pytest.mark.github_failed
+def test_last_fm():
+    info = extract(parse('https://www.last.fm/user/alex')[0])
+
+    assert info.get('fullname') == 'Alex'
+    assert info.get('bio') == '• scrobbling since 21 Feb 2003'
+    assert info.get('created_at') == '2003'
+    assert info.get('image') == 'https://lastfm.freetls.fastly.net/i/u/avatar170s/15e455555655c8503ed9ba6fce71d2d6.png'
+
+
+@pytest.mark.skip(reason="broken")
+def test_ask_fm():
+    info = extract(parse('https://ask.fm/sasha')[0])
+
+    assert info.get('username') == 'sasha'
+    assert info.get('fullname') == 'Александр Чубаров'
+    assert info.get('posts_count') == '18'
+    assert info.get('likes_count') == '1.06 K'
+    assert info.get('location') == 'Красноярск'
+    assert 'image' in info
+
+
+@pytest.mark.github_failed
+def test_launchpad():
+    info = extract(parse('https://launchpad.net/~antony')[0])
+
+    assert info.get('fullname') == 'Genelyk'
+    assert info.get('username') == 'antony'
+    assert info.get('languages') == 'Spanish'
+    assert info.get('karma') == '0'
+    assert info.get('created_at') == '2007-05-17'
+    assert info.get('timezone') == 'America/Lima (UTC-0500)'
+    assert info.get('openpgp_key') == '62FCE94A1E7871FBFE81F10AB9579C368DD41DF8'
+
+
+@pytest.mark.skip(reason="broken")
+def test_twitch():
+    info = extract(parse('https://m.twitch.tv/johnwolfe/profile')[0])
+
+    assert info.get('id') == '36536868'
+    assert info.get('username') == 'johnwolfe'
+    assert info.get('bio') == 'Horror games. Dead By Daylight. Charity streams. '
+    assert info.get('fullname') == 'JohnWolfe'
+    assert info.get(
+        'image') == 'https://static-cdn.jtvnw.net/jtv_user_pictures/johnwolfe-profile_image-61f8e374d34a8bbd-150x150.png'
+    assert info.get(
+        'image_bg') == 'https://static-cdn.jtvnw.net/jtv_user_pictures/9d88705b5a305a7e-profile_banner-480.jpeg'
+    # assert 'views_count' in info
+    assert 'likes_count' in info
+
+
+@pytest.mark.skip(reason="broken")
+def test_linktree():
+    info = extract(parse('https://linktr.ee/annetlovart')[0])
+
+    assert info.get('id') == '5420275'
+    assert info.get('username') == 'annetlovart'
+    assert info.get('image') == 'https://ugc.production.linktr.ee/MidfykWeQemDO5YVdRDv_35849b5fb49c69271d284ade7ffef659'
+    assert info.get('is_active') == 'True'
+    assert info.get('is_verified') == 'True'
+    assert info.get('is_email_verified') == 'True'
+    # assert info.get('tier') == 'free' # No longer present withing the page
+    assert info.get(
+        'links') == "['https://www.etsy.com/people/kwhbrxmb?ref=hdr_user_menu-profile', 'https://www.patreon.com/annetlovart', 'https://uk.wikipedia.org/wiki/Annet_Lovart', 'https://www.facebook.com/annetlovart', 'https://www.behance.net/gallery/96717659/Maya-flowers', 'https://youtu.be/mWU_Lyb9kw4', 'https://instagram.com/annet_lovart', 'https://creativemarket.com/annet_lovart/4945530-Trendy-Floral-Pattern', 'https://www.pinterest.com/annet_lovart/one-stroke-tutorial-annet_lovart/']"
+
+
+@pytest.mark.skip(reason="broken")
+def test_xakep():
+    info = extract(parse('https://xakep.ru/author/dmbaturin/')[0])
+
+    assert info.get('fullname') == 'Даниил Батурин'
+    assert info.get('image') == 'https://secure.gravatar.com/avatar/b1859c813547de1bba3c65bc4b1a217c?s=150&d=retro&r=g'
+    assert info.get(
+        'bio') == 'Координатор проекта VyOS (https://vyos.io), «языковед», функциональщик,  иногда сетевой администратор'
+    assert info.get('links') == "['https://www.baturin.org']"
+    assert info.get('created_at') == '2018'
+    assert info.get('gravatar_url') == 'https://gravatar.com/b1859c813547de1bba3c65bc4b1a217c'
+    assert info.get('gravatar_username') == 'https://gravatar.com/b1859c813547de1bba3c65bc4b1a217c'
+    assert info.get('gravatar_email_md5_hash') == 'b1859c813547de1bba3c65bc4b1a217c'
+
+
+@pytest.mark.skip(reason="no more author pages for now")
+def test_tproger_ru():
+    info = extract(parse('https://tproger.ru/author/NickPrice/')[0])
+
+    assert info.get('fullname') == 'Никита Прияцелюк'
+    assert info.get('image').startswith('https://secure.gravatar.com/avatar/b6c7803b43433349ff84b11093562594') is True
+
+
+@pytest.mark.skip(reason="broken")
+def test_jsfiddle():
+    info = extract(parse('https://jsfiddle.net/user/john')[0])
+
+    assert info.get('fullname') == 'John Michel'
+    assert info.get('company') == 'Philadelphia, PA'
+    assert info.get('links') == "['https://twitter.com/jhnmchl', 'https://github.com/johnmichel']"
+    assert info.get('image') == 'https://www.gravatar.com/avatar/eca9f115bdefbbdf0c0381a58bcaf601?s=80'
+    assert info.get('gravatar_url') == 'https://gravatar.com/eca9f115bdefbbdf0c0381a58bcaf601'
+    assert info.get('gravatar_username') == 'https://gravatar.com/eca9f115bdefbbdf0c0381a58bcaf601'
+    assert info.get('gravatar_email_md5_hash') == 'eca9f115bdefbbdf0c0381a58bcaf601'
+
+
+def test_disqus_api():
+    info = extract(parse(
+        'https://disqus.com/api/3.0/users/details?user=username%3Amargaret&attach=userFlaggedUser&api_key=E8Uh5l5fHZ6gD8U3KycjAIAk46f68Zw7C6eW8WSjZvCLXebZ7p0r1yrYDrLilk2F')[
+                       0])
+
+    assert info.get('id') == '1593'
+    assert info.get('fullname') == 'margaret'
+    assert float(info.get('reputation')) > 1
+    assert info.get('reputation_label') == 'Average'
+    assert info.get('following_count') == '0'
+    assert info.get('follower_count') == '0'
+    assert info.get('is_power_contributor') == 'False'
+    assert info.get('is_anonymous') == 'False'
+    assert info.get('created_at') == '2007-11-06T01:14:28'
+    assert info.get('upvotes_count') == '0'
+    assert info.get('forums_count') == '0'
+    assert info.get('image') == 'https://disqus.com/api/users/avatars/margaret.jpg'
+    assert info.get("forums_following_count") == "0"
+    assert info.get("is_private") == "False"
+    assert info.get("comments_count") == "0"
+
+
+def test_ucoz_1():
+    info = extract(parse('https://av.3dn.ru/index/8-0-Maikl_401')[0])
+
+    assert info.get('fullname') == 'Михаил ко'
+    assert info.get('gender') == 'Мужчина'
+    assert info.get('created_at') == 'Пятница, 23.01.2015, 15:02'
+    assert info.get('latest_activity_at') == 'Пятница, 23.01.2015, 15:07'
+    # uid.me deep link no longer present in static HTML (2026)
+    assert info.get('location') == 'Российская Федерация'
+    assert info.get('city') == 'Москва'
+    assert info.get('state') == 'Москва'
+    assert info.get('birthday') == '16 Декабря 1971'
+
+
+@pytest.mark.skip(reason="thaicat.ru often unreachable / connect timeout from CI and local (2026)")
+def test_ucoz_2():
+    info = extract(parse('http://www.thaicat.ru/index/8-0-koshka')[0])
+
+    assert info.get('fullname') == 'natalya Myunster'
+    assert info.get('url') == 'http://www.thaicat.ru/index/8-10419'
+    assert info.get('image') == 'http://www.thaicat.ru/avatar/00/20/419858.jpg'
+    assert info.get('gender') == 'Женщина'
+    assert info.get('created_at') == 'Суббота, 14.01.2012, 17:41'
+    assert info.get('latest_activity_at') == 'Суббота, 14.01.2012, 17:41'
+    assert info.get('country') == 'Италия'
+    assert info.get('city') == 'l\'aquila'
+    assert info.get('birthday') == '10 Июля 1975'
+
+
+def test_ucoz_3():
+    info = extract(parse('http://prenatal-club.ucoz.com/index/8-0-koshka')[0])
+
+    assert info.get('url') == 'https://prenatal-club.ucoz.com/index/8-128'
+    assert info.get('image') == 'https://425523249.uid.me/avatar.jpg'
+    assert info.get('created_at') == 'Среда, 10.03.2010, 09:42'
+    assert info.get('latest_activity_at') == 'Среда, 10.03.2010, 09:42'
+    # uid.me deep link no longer present in static HTML (2026)
+    assert info.get('location') == 'Российская Федерация'
+    assert info.get('city') == 'Санкт-Петербург'
+    assert info.get('state') == 'Санкт-Петербург'
+
+
+@pytest.mark.skip(reason="broken")
+def test_uidme():
+    info = extract(parse('http://uid.me/koshka', timeout=10)[0])
+
+    assert info.get('username') == 'koshka'
+    assert info.get('image') == 'https://uid.me/img/avatar/w/z/n/medium_m38dkp68.jpg'
+    assert info.get('headline') == '..Но в глубине души моей тоска по крови, ночи, дикости горит (Гессе).'
+    assert info.get(
+        'bio') == 'Студентка ВНУ, факультет философии (4й курс). Ищу, жду, иду, пишу... Не слишком отличаюсь от большинства людей моего возраста.'
+    assert info.get('contacts') == "['dariya-koshka@mail.ru']"
+    assert info.get('email') == 'dariya-koshka@mail.ru'
+    assert info.get('phone') == '380669243144'
+    assert info.get('skype') == 'Dariya Koshka'
+    assert info.get('location') == 'Луганск'
+    assert info.get('links') == "['http://www.proza.ru/avtor/dahakot']"
+
+
+@pytest.mark.skip(reason='down')
+def test_tapd():  # Broken. Site not responding.
+    info = extract(parse('https://tapd.co/api/user/getPublicProfile/betsyalvarezz')[0])
+
+    assert info.get('fullname') == 'Betsy Alvarez'
+    assert info.get('username') == 'betsyalvarezz'
+    assert int(info.get('views_count')) > 43124
+    assert info.get('image') == 'https://distro.tapd.co/x3fwD79IdB0LqOqf.jpeg'
+    assert info.get(
+        'links') == "['https://www.twitter.com/Betsyalvarezz', 'https://www.instagram.com/Betsyalvarezz', 'https://cash.app/$Betsyalvarezz', 'https://www.tiktok.com/@Betsyalvarezz', 'https://www.instagram.com/Brb.thelabel', 'https://www.youtube.com/c/BetsyAlvarezz', 'https://www.amazon.com/hz/wishlist/ls/2GNHXWNBBCIP0?ref_=wl_share', 'https://onlyfans.com/Betsyalvarezz']"
+
+
+@pytest.mark.github_failed
+def test_buzzfeed():
+    info = extract(parse('https://www.buzzfeed.com/lisa')[0])
+
+    assert info.get('uuid') == '408a7d54-6af9-452e-8614-7f44216ed983'
+    assert info.get('id') == '43876'
+    assert info.get('fullname') == 'lisa'
+    assert info.get('username') == 'lisa'
+    assert info.get(
+        'bio') == 'If I&#39;m not me than who am I? And if I&#39;m somebody else, than why do I look like me?'
+    assert info.get('posts_count') == '0'
+    assert info.get('created_at').startswith('2009-12-17')
+    assert info.get('is_community_user') == 'True'
+    assert info.get('is_deleted') == 'False'
+    assert info.get(
+        'image') == 'https://img.buzzfeed.com/buzzfeed-static/static/user_images/web02/2009/12/17/20/lisa-31169-1261100831-63_large.jpg'
+
+
+@pytest.mark.github_failed
+def test_freelancer():
+    info = extract(parse('https://www.freelancer.com/api/users/0.1/users?usernames%5B%5D=theDesignerz&compact=true')[0])
+
+    assert info.get('uid') == '6751536'
+    assert info.get('username') == 'theDesignerz'
+    assert info.get('fullname') == 'theDesignerz'
+    assert info.get('company') == 'theDesignerz'
+    assert info.get('country') == 'Pakistan'
+    assert info.get('city') == 'Islamabad'
+    assert info.get('created_at') == '1355079433'
+
+
+@pytest.mark.skip(reason="broken")
+def test_yelp_username():  # Site uses generated class names, BS captures might not work in near future
+    """Yelp"""
+    info = extract(parse('http://dima.yelp.com')[0])
+
+    assert info.get('yelp_userid') == 'b_a5icXGK-AXVYZKehgKLw'
+    assert info.get('fullname') == 'Dima M.'
+    assert info.get('location') == 'Brooklyn, NY'
+    assert info.get('image') == 'https://s3-media0.fl.yelpcdn.com/photo/bGiNMDL6FZAtPpMfljRGtg/ls.jpg'
+
+
+@pytest.mark.skip(reason="broken")
+def test_yelp_userid():  # Duplicate?
+    """Yelp"""
+    info = extract(parse('https://www.yelp.com/user_details?userid=b_a5icXGK-AXVYZKehgKLw')[0])
+
+    assert info.get('yelp_userid') == 'b_a5icXGK-AXVYZKehgKLw'
+    assert info.get('fullname') == 'Dima M.'
+    assert info.get('location') == 'Brooklyn, NY'
+    assert info.get('image') == 'https://s3-media0.fl.yelpcdn.com/photo/bGiNMDL6FZAtPpMfljRGtg/ls.jpg'
+
+
+def test_trello():
+    """Trello API"""
+    info = extract(parse('https://trello.com/1/Members/xFubuki')[0])
+
+    assert info.get("id") == "5e78cae55d711a6382e239c1"
+    assert info.get("username") == "xfubuki"
+    assert info.get("fullname") == "xFubuki"
+    assert info.get("type") == "normal"
+    assert info.get("is_verified") == "True"
+    assert 'image' in info
+
+
+@pytest.mark.github_failed
+@pytest.mark.requires_cookies
+@pytest.mark.skip(reason="needs rework")
+def test_weibo():  # Broken. Parser not handling redirect
+    headers = {
+        "cookie": "SUB=_2AkMSeduUf8NxqwFRmfoVzWrmao9wzQzEieKkJSpPJRMxHRl-yT9yqmYJtRB6Ofn1e89SjWihZwr-gsarV1BP4jfFgysA",
+        "cache-control": "no-cache"}
+    info = extract(parse('https://weibo.com/clairekuo?is_all=1', headers=headers, timeout=10)[0])
+
+    assert info.get("weibo_id") == "1733299783"
+    assert info.get("fullname") == "郭靜Claire"
+
+
+@pytest.mark.github_failed
+def test_weibo_api():
+    """Weibo API"""
+    URL = 'https://weibo.com/clairekuo'
+    mutated = mutate_url(URL)
+    assert len(mutated) >= 1
+    url, add_headers = mutated[0]
+
+    info = extract(parse(url, headers=add_headers, timeout=10)[0])
+
+    assert info.get('weibo_id') == '1733299783'
+    assert info.get('username') == 'clairekuo'
+    assert info.get('fullname') == '郭靜Claire'
+    assert info.get('gender') == 'f'
+    assert 'follower_count' in info
+    assert 'following_count' in info
+
+
+@pytest.mark.github_failed
+def test_weibo_api_by_id():
+    """Weibo API"""
+    URL = 'https://weibo.com/u/6215884155'
+    mutated = mutate_url(URL)
+    assert len(mutated) >= 1
+    url, add_headers = mutated[0]
+
+    info = extract(parse(url, headers=add_headers, timeout=10)[0])
+
+    assert info.get('weibo_id') == '6215884155'
+    assert 'fullname' in info
+    assert 'follower_count' in info
+
+
+@pytest.mark.skip(reason="broken forever")
+def test_icq():
+    info = extract(parse('https://icq.im/CaZaNoVa163')[0])
+
+    assert info.get("fullname") == "Cazanova Haxor"
+    assert info.get("username") == "CaZaNoVa163"
+    assert info.get("image") == "https://ub.icq.net/api/v26/files/avatar/get/?targetNick=CaZaNoVa163&size=1024"
+
+
+def test_pastebin():
+    info = extract(parse('https://pastebin.com/u/GCCXGeneral')[0])
+
+    assert info.get("image") == "https://pastebin.com/cache/img/1/2/20/726408.jpg"
+    # Contact email may be omitted on the public profile HTML
+    assert info.get("location").startswith("Eastern United States")
+    assert 'views_count' in info
+    assert 'all_views_count' in info
+    assert info.get("created_at") == "Monday 24th of June 2013 12:25:12 AM CDT"
+
+
+@pytest.mark.skip(reason="broken")
+def test_tinder():
+    info = extract(parse('https://tinder.com/@john')[0])
+
+    assert info.get("tinder_username") == "john"
+    assert info.get("birth_date").startswith("2001")
+    assert info.get("id") == "60a46f968cb03901004f78da"
+    assert info.get("fullname") == "Wilsonjs"
+    assert eval(info.get("education"))[0] == "Universidad de Investigacion Experimental Yachay-Tech"
+    assert info.get(
+        "image") == "https://images-ssl.gotinder.com/60a46f968cb03901004f78da/original_a9c10ce8-390b-456f-afce-7612941d6f93.jpeg"
+
+    images_list = eval(info.get("images"))
+    assert 'https://images-ssl.gotinder.com/60a46f968cb03901004f78da/original_d95eabb0-41a2-4858-b969-c9c8a725e625.jpeg' in images_list
+
+
+def test_ifunny_co():
+    info = extract(parse('https://ifunny.co/user/CuddleKinnz')[0])
+
+    assert info.get("id") == "5ab1fd49a2cf59ac948b456e"
+    assert info.get("username") == "CuddleKinnz"
+    assert info.get("bio") == "Humor Some Like, Some Hate"
+    assert info.get("image", "").startswith("https://")
+    assert "/noop/user_photos/" in info.get("image", "")
+    # assert int(info.get("follower_count")) >= 0
+    # assert int(info.get("following_count")) >= 70
+    # assert int(info.get("posts_count")) >= 127
+    # assert int(info.get("created_count")) >= 127
+    # assert info.get("featured_count") == "7"
+    # assert int(info.get("smile_count")) > 32000
+    # assert int(info.get("achievement_count")) >= 1
+    assert info.get("is_verified") == "False"
+
+
+@pytest.mark.skip(reason="Wattpad API endpoint is unavailable / unstable from CI (2026)")
+def test_wattpad_api():
+    # https://wattpad.com/user/JeniferBalanzar
+    info = extract(parse('https://www.wattpad.com/api/v3/users/JeniferBalanzar')[0])
+
+    assert info.get("username") == "JeniferBalanzar"
+    assert info.get("fullname") == "Jenifer Balanzar"
+    assert info.get("image") == "https://img.wattpad.com/useravatar/JeniferBalanzar.128.615375.jpg"
+    assert info.get("image_bg") == "https://img.wattpad.com/userbg/JeniferBalanzar.36464.jpg"
+    assert info.get("gender") == "Female"
+    assert info.get("locale") == "es_MX"
+    assert int(info.get("follower_count")) >= 266
+    assert int(info.get("following_count")) >= 89
+    assert info.get("created_at") == "2019-12-10T00:25:02Z"
+    assert info.get("updated_at") == "2020-09-08T08:24:38Z"
+    assert info.get("is_verified") == "False"
+    assert info.get("verified_email") == "True"
+
+
+@pytest.mark.skip(reason="broken")
+def test_kik():
+    info = extract(parse('https://ws2.kik.com/user/mksyx')[0])
+
+    assert info.get("fullname") == "experience true satisfaction"
+    assert info.get("image") == "http://profilepics.cf.kik.com/QUwticPE8XU7qm7qrTXbWgCfSu4/orig.jpg"
+
+
+def test_docker_hub_api():
+    # https://hub.docker.com/u/adastra2ankudinov
+    info = extract(parse('https://hub.docker.com/v2/users/adastra2ankudinov/')[0])
+
+    assert info.get("uid") == "b4f92258ad95428ea88ba498a883b40a"
+    assert info.get("username") == "adastra2ankudinov"
+    assert info.get("type") == "User"
+    assert info.get("image") is None
+
+
+def test_mixcloud_api():
+    # https://www.mixcloud.com/savath69/
+    info = extract(parse('https://api.mixcloud.com/savath69/')[0])
+
+    assert info.get("username") == "savath69"
+    assert info.get("country") == "France"
+    assert info.get("city") == "Lyon"
+    assert info.get("created_at") == "2017-08-06T11:41:02Z"
+    assert info.get("updated_at") == "2017-08-06T11:41:02Z"
+    assert info.get(
+        "image") == "https://thumbnailer.mixcloud.com/unsafe/640x640/profile/d/1/c/a/0f1c-60ec-4f2c-9b04-5a9536c96d51"
+    assert int(info.get("follower_count")) >= 25
+    assert int(info.get("following_count")) >= 6
+    assert int(info.get("cloudcast_count")) >= 5
+    assert int(info.get("favorite_count")) >= 0
+    assert int(info.get("listen_count")) >= 15
+    assert info.get("is_pro") == "False"
+    assert info.get("is_premium") == "False"
+
+
+@pytest.mark.skip(reason="down")
+def test_binarysearch_api():  # Broken. Site is not responding.
+    info = extract(parse('https://binarysearch.com/api/users/LarryNY/profile')[0])
+
+    assert int(info.get("uid")) >= 10435
+    assert info.get("username") == "LarryNY"
+    assert info.get("image") == "https://binarysearch.s3-us-west-2.amazonaws.com/LarryNY?hash=1599781403401"
+    assert info.get("location") == "New York, NY, USA"
+    assert info.get("bio") == "This is fun."
+    assert info.get("links") == "https://www.youtube.com/c/Algorithmist/"
+    assert info.get("is_admin") == "False"
+    assert info.get("is_verified") == "True"
+    assert info.get("HistoryPublic") == "False"
+    assert info.get("RoomPublic") == "True"
+    assert info.get("InviteOnly") == "False"
+
+
+def test_pr0gramm_api():
+    # https://pr0gramm.com/user/TheBorderCrash
+    info = extract(parse('https://pr0gramm.com/api/profile/info?name=TheBorderCrash')[0])
+
+    assert int(info.get("uid")) >= 323469
+    assert info.get("username") == "TheBorderCrash"
+    assert int(info.get("uploadCount")) >= 5859
+    assert int(info.get("commentCount")) >= 2497
+    assert int(info.get("tagCount")) >= 22900
+    assert info.get("likesArePublic") == "False"
+
+
+@pytest.mark.skip(reason="VK foaf.php returns empty body for unauthenticated clients (2026)")
+def test_vk_foaf():
+    """VK user profile foaf page"""
+    info = extract(parse('https://vk.com/foaf.php?id=1')[0])
+
+    assert info.get("is_private") == "True"
+    assert info.get("state") == "verified"
+    assert info.get("first_name") in ("Павел", "Pavel")
+    assert info.get("last_name") in ("Дуров", "Durov")
+    assert info.get("fullname") in ("Павел Дуров", "Pavel Durov")
+    assert info.get("gender") == "male"
+    assert info.get("created_at") == "2006-09-23 20:27:12+03:00"
+    assert info.get("updated_at") == "2018-01-30 01:51:19+03:00"
+    assert info.get("website") == "http://t.me/durov"
+
+
+@pytest.mark.skip(reason="broken")
+def test_aparat_api():
+    info = extract(parse('https://www.aparat.com/api/fa/v1/user/user/information/username/BoHBiG')[0])
+
+    assert info.get("uid") == "3935310"
+    assert info.get("username") == "BoHBiG"
+    assert info.get("fullname") == "عمو بیگ"
+    assert info.get("image") == "https://static.cdn.asset.aparat.cloud/profile-photo/3935310-182645-b.jpg"
+    assert 'follower_count' in info
+    assert 'following_count' in info
+    assert info.get("is_banned") == "False"
+    assert info.get("links") == ("['https://rubika.ir/AmooBiG', 'http://www.telegram.me/amobig', "
+                                 "'http://www.instagram.com/amobigstream']")
+    assert 'video_count' in info
+    assert info.get("bio") == "اینستاگرام:\r\nhttp://www.instagram.com/amobigstream"
+
+
+def test_memory_lol():
+    info = extract(parse('https://api.memory.lol/v1/tw/libsoftiktok')[0])
+
+    assert info.get("id") == "1326229737551912960"
+    assert info.get(
+        "known_usernames") == "['shaya69830552', 'shaya_ray', 'chayaraichik', 'chayathepatriot', 'cuomomustgo', 'houseplantpotus', 'libsoftiktok']"
+
+
+def test_duolingo_api():
+    info = extract(parse('https://www.duolingo.com/2017-06-30/users?username=maflow')[0])
+
+    assert info.get('uid') == '20353718'
+    assert info.get('username') == 'Maflow'
+    assert info.get('fullname') == 'Mafer'
+    assert info.get('image') == 'https://simg-ssl.duolingo.com/avatar/default_2'
+    assert info.get('created_at') == '2014-01-01 19:07:14 UTC'
+    assert info.get('url') == 'https://www.duolingo.com/profile/Maflow'
+    assert info.get('streak') == '0'
+    assert info.get('totalXp') == '411'
+    assert info.get('learningLanguage') == 'en'
+    assert info.get('fromLanguage') == 'es'
+    assert 'bio' not in info
+
+
+def test_chess_com_api_e2e():
+    """Chess.com API"""
+    info = extract(parse('https://api.chess.com/pub/player/john')[0])
+
+    assert info.get('chess_user_id') == '95037716'
+    assert info.get('username') == 'john'
+    assert info.get('fullname') == 'John'
+    assert info.get('follower_count').isdigit()
+    assert info.get('status') == 'basic'
+    assert info.get('country_code') == 'US'
+    assert 'chesscomfiles.com' in info.get('image', '')
+    assert info.get('is_streamer') == 'False'
+    assert info.get('is_verified') == 'False'
+
+
+@pytest.mark.skip(reason="chess.com HTML endpoint times out from CI (2026)")
+def test_chess_com_html_e2e():
+    """Chess.com HTML"""
+    info = extract(parse('https://www.chess.com/member/john')[0])
+
+    assert info.get('username') == 'John'
+    assert info.get('fullname') == 'John'
+    assert 'chess.com' in info.get('image', '')
+
+
+def test_roblox_api_e2e():
+    """Roblox user API"""
+    info = extract(parse('https://users.roblox.com/v1/users/2191')[0])
+
+    assert info.get('roblox_user_id') == '2191'
+    assert info.get('username') == 'john'
+    assert info.get('fullname') == 'john'
+    assert info.get('is_banned') == 'False'
+    assert info.get('is_verified') == 'False'
+    assert info.get('created_at') == '2006-08-24T08:42:25.047Z'
+
+
+def test_roblox_html_e2e():
+    """Roblox HTML"""
+    info = extract(parse('https://www.roblox.com/users/2191/profile')[0])
+
+    assert info.get('username') == 'john'
+    assert info.get('uid') == '2191'
+    assert 'rbxcdn.com' in info.get('image', '')
+
+
+@pytest.mark.rate_limited
+def test_stack_exchange_api_e2e():
+    """Stack Exchange API"""
+    info = extract(parse('https://api.stackexchange.com/2.3/users?order=desc&sort=name&inname=soxoj&site=stackoverflow')[0])
+
+    assert info.get('username') == 'Soxoj1'
+    assert info.get('uid') == '15880884'
+    assert info.get('account_id') == '21543594'
+    assert info.get('reputation') == '1'
+    assert 'gravatar.com' in info.get('image', '')
+    assert info.get('link') == 'https://stackoverflow.com/users/15880884/soxoj1'
+    assert info.get('created_at') == '1620592473'
+
+
+def test_leetcode_graphql_e2e():
+    """LeetCode GraphQL"""
+    graphql_url = 'https://leetcode.com/graphql?query=query%20userPublicProfile%28%24username%3A%20String%21%29%20%7B%20matchedUser%28username%3A%20%24username%29%20%7B%20username%20profile%20%7B%20realName%20aboutMe%20userAvatar%20countryName%20company%20school%20ranking%20%7D%20%7D%20%7D&variables=%7B%22username%22%3A%20%22votrubac%22%7D'
+
+    info = extract(parse(graphql_url)[0])
+
+    assert info.get('username') == 'votrubac'
+    assert info.get('fullname') == 'Vlad'
+    assert info.get('company') == 'Google'
+    assert info.get('ranking', '').isdigit()
+    assert int(info['ranking']) > 0
+    assert 'assets.leetcode.com' in info.get('image', '')
+
+
+def test_boosty_api_e2e():
+    """Boosty API"""
+    info = extract(parse('https://api.boosty.to/v1/blog/soxoj')[0])
+
+    assert info.get('uid') == '10276482'
+    assert info.get('fullname') == 'OSINT mindset'
+    assert 'boosty.to' in info.get('image', '')
+    assert 'митапы' in info.get('blog_title', '')
+    assert info.get('telegram_username') == 'soxoj'
+
+
+def test_warpcast_api_e2e():
+    """Warpcast API"""
+    info = extract(parse('https://client.warpcast.com/v2/user-by-username?username=dwr.eth')[0])
+
+    assert info.get('uid') == '3'
+    assert info.get('username') == 'dwr'
+    assert info.get('fullname') == 'Dan Romero'
+    assert info.get('bio')
+    assert info.get('follower_count')
+    assert info.get('twitter_username') == 'dwr'
+
+
+def test_paragraph_api_e2e():
+    """Paragraph API"""
+    info = extract(parse('https://paragraph.com/api/blogs/@vitalik')[0])
+
+    assert info.get('uid') == 'aLOC85RCnjhDinsLDfUr'
+    assert info.get('fullname') == 'vitalik.eth'
+    assert info.get('username') == 'vitalik'
+    assert info.get('twitter_username') == 'VitalikButerin'
+    assert info.get('wallet_address') == '0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045'
+
+
+@pytest.mark.skip(reason="broken")
+def test_fragment_e2e():  # Broken. The page is a bid list now, not one owner.
+    """Fragment"""
+    info = extract(parse('https://fragment.com/username/durov')[0])
+
+    assert info.get('telegram_username') == 'durov'
+    assert info.get('ton_wallet')
+    assert 'tonviewer.com' not in info.get('ton_wallet', '')
+    assert info.get('purchased_at')
+
+
+@pytest.mark.rate_limited
+def test_tonometerbot_e2e():
+    """Tonometerbot"""
+    info = extract(parse('https://tonometerbot.com/@/jaga1985')[0])
+
+    assert info.get('username') == 'jaga1985'
+    assert info.get('subscriber_count')
+    assert info.get('nft_count')
+
+
+@pytest.mark.github_failed
+def test_spatial_e2e():
+    """Spatial"""
+    info = extract(parse('https://www.spatial.io/@rammy')[0])
+
+    assert info.get('uid') == '5eceef2dfa7f113e938acf63'
+    assert info.get('username') == 'rammy'
+    assert info.get('fullname') == 'Rammy'
+    assert info.get('bio')
+    assert info.get('follower_count')
+
+
+def test_buymeacoffee():
+    """BuyMeACoffee"""
+    info = extract(parse('https://buymeacoffee.com/johndoe')[0])
+
+    assert info.get("fullname") == "John Doe"
+    assert info.get("bio") == "Designer &amp; Art Director, Growing brands.Welcome to my BMC page. If you like my content, please consider buying me a coffee. Thank you for your support!"
+    assert "15211" in info.get("image") or "cdn.buymeacoffee.com" in info.get("image")
+
+
+@pytest.mark.github_failed
+@pytest.mark.rate_limited
+def test_instagram_graphql_e2e():
+    """Instagram GraphQL"""
+    headers = {
+        'x-ig-app-id': '936619743392459',
+        'referer': 'https://www.instagram.com/',
+    }
+    body, status_code = parse('https://www.instagram.com/api/v1/users/web_profile_info/?username=cristiano', headers=headers)
+
+    # Gracefully skip if rate limited / blocked in current environment
+    if status_code in (403, 429) or not body:
+        pytest.skip(f"Rate limited or blocked by Instagram API (status {status_code})")
+
+    info = extract(body)
+
+    assert info.get('username') == 'cristiano'
+    assert info.get('fullname') == 'Cristiano Ronaldo'
+    assert info.get('id') == '173560420'
+    assert 'cdninstagram.com' in info.get('image', '')
+    assert info.get('is_business') == 'False'
+    assert info.get('is_private') == 'False'
+    assert info.get('is_verified') == 'True'
+    assert int(info.get('follower_count', 0)) > 500000000
+
+
+def test_instagram_graphql_bio_links_and_tagged_usernames():
+    """Instagram GraphQL"""
+    body = json.dumps({
+        'data': {
+            'user': {
+                'username': 'ronaldinho',
+                'full_name': 'Ronaldinho Gaúcho',
+                'biography': 'Instagram oficial de Ronaldinho Gaúcho.\n@tropadobruxo_',
+                'bio_links': [{'url': 'https://r10score.net/ronaldinho'}],
+                'biography_with_entities': {
+                    'entities': [
+                        {'user': {'username': 'tropadobruxo_'}},
+                        {'hashtag': 'melhor'},
+                    ]
+                },
+                'edge_followed_by': {'count': 80107703},
+                'edge_follow': {'count': 600},
+                'edge_owner_to_timeline_media': {'count': 3200},
+                'is_verified': True,
+                'is_private': False,
+                'profile_pic_url_hd': 'https://example.com/pic.jpg',
+            }
+        }
+    })
+
+    info = extract(body)
+
+    assert info.get('username') == 'ronaldinho'
+    assert info.get('fullname') == 'Ronaldinho Gaúcho'
+    assert 'tropadobruxo_' in info.get('bio')
+    assert info.get('links') == "['https://r10score.net/ronaldinho']"
+    assert info.get('usernames') == "['tropadobruxo_']"
+    assert info.get('post_count') == '3200'
+    assert info.get('follower_count') == '80107703'
+    assert info.get('following_count') == '600'
+
+
+def test_snapchat():
+    """Snapchat"""
+    info = extract(parse('https://www.snapchat.com/@teamsnapchat')[0])
+
+    assert info.get('username') == 'teamsnapchat'
+    assert info.get('fullname') == 'Team Snapchat'
+    # the bio is localised to whoever is looking ("is on" / "ist auf"), so only
+    # the handle inside it is worth asserting
+    assert '@teamsnapchat' in info.get('bio', '')
+    assert info.get('url') == 'https://www.snapchat.com/@teamsnapchat'
+    assert info.get('image') in {
+        'https://www.snapchat.com/web-capture/www.snapchat.com/@teamsnapchat/preview/square.jpeg?xp_id=1',
+        'https://us-east1-aws.api.snapchat.com/web-capture/www.snapchat.com/@teamsnapchat/preview/square.jpeg?xp_id=1',
+    }
+    assert info.get(
+        'snapcode_image') == 'https://app.snapchat.com/web/deeplink/snapcode?username=teamsnapchat&type=SVG&bitmoji=enable'
+    assert info.get('profile_type') == 'userInfo'
+
+
+def test_bio_site():
+    """Bio Site"""
+    info = extract(parse('https://bio.site/Fish')[0])
+
+    assert info.get('uid') == '900C1C86-7397-438A-A4BB-D5201C13A943'
+    assert info.get('username') == 'Fish'
+    assert info.get('fullname') == 'F.B_Studio'
+    assert info.get('bio') == '-\n平價男女裝｜飾品｜生活小物 \n𝐹𝑖𝑠ℎ.𝑏𝑎𝑒 𝑠𝑡𝑢𝑑𝑖𝑜 ✔︎\n'
+    assert info.get('image') == 'https://media.bio.site/sites/7pQNVV5qXgtSrGyhMQd8eY/qYkypfu4hmxAKnufxJqfQc.png'
+    assert info.get('image_bg') == 'https://media.bio.site/sites/7pQNVV5qXgtSrGyhMQd8eY/oqtWruzh467NWyWAJEbjRf.png'
+    assert info.get('created_at') == '2022-03-03 09:24:42 UTC'
+    assert info.get('updated_at') == '2022-10-16 11:59:42 UTC'
+    assert info.get('instagram_username') == 'fish_bae148'
+    assert 'https://www.instagram.com/fish_bae148' in info.get('links')
+    assert 'https://shopee.tw/kissyoumybaby' in info.get('links')
+    assert 'social_links' not in info
+
+
+def test_faceit_api():
+    """Faceit API"""
+    info = extract(parse('https://www.faceit.com/api/users/v1/nicknames/simple')[0])
+
+    assert info.get('uid') == 'c55fb0f8-e3d9-4fc0-b3fa-f2878513e588'
+    assert info.get('username') == 'simple'
+    assert info.get('country_code') == 'BJ'
+    assert info.get('created_at') == '2018-08-02 10:46:27.703000+00:00'
+    assert info.get('friends_count', '').isdigit()
+    assert info.get('faceit_game') == 'cs2'
+    assert info.get('faceit_region') == 'EU'
+    assert info.get('faceit_elo', '').isdigit()
+    assert info.get('faceit_skill_level', '').isdigit()
+    assert info.get('steam_id') == '76561198838222710'
+    assert info.get('steam_nickname') == 'kr1pton'
+    assert info.get('social_links') == "{'twitch': 'umarooff'}"
+    assert 'faceit-cdn.net' in info.get('image', '')
+    assert 'faceit-cdn.net' in info.get('image_bg', '')
+
+
+def test_fansly_api():
+    """Fansly API"""
+    info = extract(parse('https://apiv2.fansly.com/api/v1/account?usernames=karpathy')[0])
+
+    assert info.get('uid') == '913584311872020480'
+    assert info.get('username') == 'karpathy'
+
+
+def test_osu():
+    """osu!"""
+    info = extract(parse("https://osu.ppy.sh/users/peppy")[0])
+
+    assert info.get("uid") == "2"
+    assert info.get("username") == "peppy"
+    assert info.get("country") == "Australia"
+    assert info.get("country_code") == "AU"
+    assert info.get("created_at") == "2007-08-28T03:09:12+00:00"
+
+
+def test_lens_account():
+    """Lens (Hey/Orb/Buttrfly) account"""
+    # Real wire response from POST https://api.lens.xyz/graphql (compact JSON,
+    # no spaces after colons — Maigret feeds this body straight to extract()).
+    body = '{"data":{"account":{"address":"0x6a0DD735C2a2Ad6514E7dCBC854efC01228BeFE4","username":{"localName":"paulburke","namespace":"0x1aA55B9042f08f45825dC4b651B64c9F98Af4615"},"score":9996,"metadata":{"name":"Paul Burke","bio":"developer","picture":"https://ik.imagekit.io/lens/pic.webp","coverPicture":"https://ik.imagekit.io/lens/cover.png","attributes":[{"key":"location","value":"New York City","type":"STRING"},{"key":"website","value":"https://paulburke.co","type":"STRING"},{"key":"x","value":"ipaulpro","type":"STRING"},{"key":"timestamp","value":"2025-04-13T11:48:59.187Z","type":"STRING"}]},"createdAt":"2022-05-18T13:43:42+00:00"}}}'
+    info = extract(body)
+
+    assert info.get("uid") == "0x6a0DD735C2a2Ad6514E7dCBC854efC01228BeFE4"
+    assert info.get("username") == "paulburke"
+    assert info.get("lens_namespace") == "0x1aA55B9042f08f45825dC4b651B64c9F98Af4615"
+    assert info.get("fullname") == "Paul Burke"
+    assert info.get("bio") == "developer"
+    assert info.get("image") == "https://ik.imagekit.io/lens/pic.webp"
+    assert info.get("image_bg") == "https://ik.imagekit.io/lens/cover.png"
+    assert info.get("location") == "New York City"
+    assert info.get("website") == "https://paulburke.co"
+    assert info.get("twitter_username") == "ipaulpro"
+    assert info.get("lens_score") == "9996"
+    assert info.get("created_at") == "2022-05-18 13:43:42+00:00"
+
+
+def test_lens_account_absent():
+    """Lens (Hey/Orb/Buttrfly) account"""
+    # Missing account -> {"data":{"account":null}}; scheme must not fire.
+    assert extract('{"data":{"account":null}}') == {}
+def test_huggingface_api_e2e():
+    """HuggingFace API"""
+    info = extract(parse('https://huggingface.co/api/users/julien-c/overview')[0])
+
+    assert info.get('username') == 'julien-c'
+    assert info.get('fullname')
+    assert info.get('bio')
+    assert info.get('created_at')
+    assert 'cdn-avatars.huggingface.co' in info.get('image', '')
+    assert int(info.get('huggingface_models', -1)) >= 0
+    assert int(info.get('huggingface_datasets', -1)) >= 0
+    assert int(info.get('huggingface_spaces', -1)) >= 0
+    assert int(info.get('follower_count', -1)) > 0
+    assert int(info.get('following_count', -1)) >= 0
+
+
+def test_hackernews():
+    """HackerNews"""
+    html = '<tr class="athing"><td valign="top">user:</td><td timestamp="1160418092"><a href="user?id=pg" class="hnuser">pg</a></td></tr><tr><td valign="top">created:</td><td><span class="age"><a href="front?day=2006-10-09&birth=pg">October 9, 2006</a></span></td></tr><tr><td valign="top">karma:</td><td>157316</td></tr><tr><td valign="top">about:</td><td style="overflow:hidden">Bug fixer.</td></tr>'
+    info = extract(html)
+
+    assert info.get('username') == 'pg'
+    assert '2006' in info.get('created_at', '')
+    assert int(info.get('karma', -1)) > 100000
+    assert info.get('bio') == 'Bug fixer.'
+
+def test_teletype():
+    """Teletype"""
+    info = extract(parse('https://teletype.in/@johndoe')[0])
+
+    assert info.get('uid') == '133496'
+    assert info.get('username') == 'johndoe'
+    assert info.get('fullname') == 'John Doe'
+    assert info.get('image') == 'https://teletype.in/files/f4/f418d759-3732-429c-b28b-dbcc498560d0.png'
+    assert info.get('is_verified') == 'False'
+
+
+def test_gdbrowser_api_e2e():
+    """GDBrowser API"""
+    info = extract(parse('https://gdbrowser.com/api/profile/john')[0])
+
+    assert info.get('username') == 'John'
+    assert info.get('uid') == '3158367'
+    assert info.get('gd_account_id') == '2103'
+
+
+def test_streamelements_api_e2e():
+    """StreamElements API"""
+    info = extract(parse('https://api.streamelements.com/kappa/v2/channels/john')[0])
+
+    assert info.get('uid') == '5b02f77a398dff6c3fbd887d'
+    assert info.get('username') == 'john'
+    assert info.get('fullname') == 'John'
+    assert info.get('provider') == 'youtube'
+    assert info.get('provider_id') == 'UC_j3Wd_7i1mgyoxnU7_yFfg'
+
+
+def test_streamlabs_api_e2e():
+    """Streamlabs API"""
+    info = extract(parse('https://streamlabs.com/api/v6/user/john')[0])
+
+    assert info.get('uid') == '4350278'
+    assert info.get('primary_account_type') == 'youtube_account'
+    assert info.get('primary_account_id') == 'UCzzotlhxYmISG-HUidWa8VA'
+
+
+def test_donatty_api_e2e():
+    """Donatty API"""
+    info = extract(parse('https://api.donatty.com/users/find/john')[0])
+
+    assert info.get('uid')
+    assert info.get('username') == 'john'
+    assert info.get('fullname')
+    assert info.get('twitch_url')
+    assert info.get('created_at')
+
+
+@pytest.mark.github_failed
+def test_visnesscard_api_e2e():
+    """VisnessCard API"""
+    import requests as req
+    r = req.get('https://my.visnesscard.com/Home/GetCard/JOHN', verify=False, timeout=10)
+    info = extract(r.text)
+
+    assert info.get('uid') == '6700'
+    assert info.get('username') == 'JOHN'
+    assert info.get('fullname') == 'JOHN SMITH'
+    assert info.get('email')
+    assert info.get('company') == 'GRINDTIME FITNESS'
+    assert 'Detroit' in info.get('location', '')
+
+
+def test_discourse_api():
+    """Discourse API"""
+    # a host that is not in the url_hints list — the mutation has to carry it
+    url, _ = mutate_url('https://discuss.python.org/u/hugovk')[0]
+    info = extract(parse(url)[0])
+
+    assert info.get('uid') == '358'
+    assert info.get('username') == 'hugovk'
+    assert info.get('trust_level')
+    assert info.get('created_at')
+
+
+def test_discourse_html_profile():
+    """Discourse HTML profile"""
+    # the HTML shell, which is all that is left when an instance closes its API
+    info = extract(parse('https://discuss.python.org/u/hugovk')[0])
+
+    assert info.get('username') == 'hugovk'
+    assert info.get('bio')
+    assert 'user_avatar' in info.get('image', '')
+
+
+def test_xenforo():
+    """XenForo"""
+    # the URL shape maigret stores: a member search that redirects to the profile
+    info = extract(parse('https://nullcave.club/members/?username=lomba_ii')[0])
+
+    assert info.get('uid') == '36147'
+    assert info.get('username') == 'lomba_ii'
+    # XenForo renders times in the viewer's timezone, so only the date is stable
+    assert info.get('created_at', '').startswith('2024-01-3')
+    assert info.get('posts_count', '').isdigit()

@@ -1,0 +1,2371 @@
+#!/usr/bin/env python3
+
+import json
+import sys
+import os
+import argparse
+import base64
+import struct
+from datetime import datetime
+
+# ============================================================================
+# UAC FLAGS DEFINITION
+# ============================================================================
+# User Account Control flags mapping with severity and descriptions
+
+def load_uac_flags():
+    """
+    Load UAC flags from external JSON file
+    
+    Returns:
+        dict: UAC flags mapping with integer keys
+    """
+    base_dir = os.path.dirname(os.path.realpath(__file__))
+    uac_file = os.path.join(base_dir, "uac_flags.json")
+    
+    # Default minimal flags for fallback
+    default_flags = {
+        0x0200: {"name": "NORMAL_ACCOUNT", "severity": "info", "description": "Standard user account"},
+        0x0002: {"name": "ACCOUNTDISABLE", "severity": "critical", "description": "User account is disabled"},
+        0x10000: {"name": "DONT_EXPIRE_PASSWORD", "severity": "warning", "description": "Password never expires"}
+    }
+
+    try:
+        with open(uac_file, "r", encoding="utf-8") as f:
+            uac_data = json.load(f)
+        
+        # Convert hex string keys to integers
+        uac_flags = {}
+        for hex_key, flag_info in uac_data.items():
+            int_key = int(hex_key, 16)
+            uac_flags[int_key] = flag_info
+        
+        return uac_flags
+    except FileNotFoundError:
+        print(f"[!] Warning: UAC flags file '{uac_file}' not found. Using default flags.")
+        return default_flags
+    except json.JSONDecodeError:
+        print(f"[!] Warning: Invalid JSON in UAC flags file. Using default flags.")
+        return default_flags
+
+# Load UAC flags from JSON file or use defaults
+UAC_FLAGS = load_uac_flags()
+
+def get_combined_uac_flags(uac_value, uac_flags):
+    """
+    Returns a list of combined UAC flags that should be set based on the value.
+    """
+    combined_flags = []
+    # PRE_CREATED_COMPUTER_ACCOUNT: PASSWD_NOTREQD (0x20) + WORKSTATION_TRUST_ACCOUNT (0x1000)
+    if (uac_value & 0x20) and (uac_value & 0x1000):
+        pre_created_flag = uac_flags.get(0x1020)
+        if pre_created_flag:
+            combined_flags.append(pre_created_flag)
+    
+    return combined_flags
+
+def decode_uac_flags(uac_value):
+    """
+    Decode UAC flags from integer value
+    
+    Args:
+        uac_value: Integer value of userAccountControl
+        
+    Returns:
+        list: List of dictionaries with flag information
+    """
+    if not isinstance(uac_value, int):
+        try:
+            uac_value = int(uac_value)
+        except (ValueError, TypeError):
+            return []
+    
+    active_flags = []
+    for flag_value, flag_info in UAC_FLAGS.items():
+        # Skip combined flags, handled separately
+        if flag_info["name"] == "PRE_CREATED_COMPUTER_ACCOUNT":
+            continue
+        if uac_value & flag_value:
+            active_flags.append(flag_info)
+
+    # Add combined flags
+    active_flags.extend(get_combined_uac_flags(uac_value, UAC_FLAGS))
+    return active_flags
+
+def format_uac_display_html(uac_value, flags):
+    """
+    Format UAC value with flags for HTML display with enhanced styling
+    
+    Args:
+        uac_value: Original UAC value
+        flags: List of flag dictionaries
+        
+    Returns:
+        str: Formatted HTML string with enhanced UAC display
+    """
+    if not flags:
+        return f'<span class="uac-value">{uac_value}</span>'
+    
+    # Build flags HTML
+    flags_html = ""
+    for flag in flags:
+        name = flag["name"]
+        severity = flag["severity"]
+        description = flag["description"]
+        # Per-flag color (see "INDIVIDUAL UAC FLAG COLORS" in style.css) overrides
+        # the coarse severity color, so each of the 23 UAC flags is uniquely
+        # identifiable while flags from the same category share a color family
+        flag_slug = name.lower().replace('_', '-')
+        flags_html += f'<span class="uac-flag {severity} flag-{flag_slug}" data-flag="{name}" data-description="{description}">{name}</span>'
+    
+    return f'''
+    <div class="uac-container">
+        <div class="uac-value">{uac_value}</div>
+        <div class="uac-flags-grid">
+            {flags_html}
+        </div>
+    </div>
+    '''
+
+def getRIDFromObjectSID(objectSID):
+    """
+    Extract RID (Relative Identifier) from objectSID
+    
+    Args:
+        objectSID: objectSID value (string format like "S-1-5-21-...")
+        
+    Returns:
+        int: RID value or None if invalid
+    """
+    try:
+        if isinstance(objectSID, str) and objectSID.startswith('S-'):
+            # Split SID by dashes and get the last part (RID)
+            parts = objectSID.split('-')
+            if len(parts) >= 4:
+                return int(parts[-1])
+    except (ValueError, AttributeError, IndexError):
+        pass
+    return None
+
+# ============================================================================
+# LDAP DATA PROCESSING UTILITIES
+# ============================================================================
+# Helper functions to extract and process LDAP entry data
+
+def extract_display_name(attributes, dn):
+    """
+    Extract best display name from LDAP entry attributes or DN
+    
+    Args:
+        attributes (dict): LDAP entry attributes
+        dn (str): Distinguished Name
+        
+    Returns:
+        str: Display name (prefer sAMAccountName, fallback to CN, then DN)
+    """
+    # Priority 1 : sAMAccountName
+    sam = attributes.get("sAMAccountName", [])
+    if sam:
+        return sam[0]
+
+    # Priority 2 : CN
+    cn = attributes.get("cn", [])
+    if cn:
+        return cn[0]
+
+    # Priority 3 : DN fallback
+    if dn and dn.upper().startswith('CN='):
+        return dn.split(',')[0][3:]
+    return dn
+   
+def extract_group_names(memberof_values, attributes):
+    """
+    Extract group names from memberOf attribute values and primary group
+    
+    Args:
+        memberof_values (list): List of memberOf DN strings
+        attributes (dict): All LDAP attributes (to get primary group info)
+        
+    Returns:
+        list: List of clean group names including primary group
+    """
+    group_names = []
+    
+    # Extract groups from memberOf attribute
+    if memberof_values:
+        for memberof_entry in memberof_values:
+            if isinstance(memberof_entry, str):    
+                # Split by comma and take the first part
+                first_part = memberof_entry.split(',')[0].strip()
+                
+                if first_part.upper().startswith('CN='):
+                    # Extract group name after "CN="
+                    group_name = first_part[3:].strip()  # Remove "CN=" prefix
+                    
+                    if group_name and group_name not in group_names:
+                        group_names.append(group_name)
+    
+   
+    # Primary group ID to name mapping
+    PRIMARY_GROUP_MAPPING = {
+        512: "Domain Admins",
+        513: "Domain Users", 
+        514: "Domain Guests",
+        515: "Domain Computers",
+        516: "Domain Controllers",
+        517: "Cert Publishers",
+        518: "Schema Admins",
+        519: "Enterprise Admins",
+        520: "Group Policy Creator Owners",
+        521: "Read-only Domain Controllers",
+        522: "Cloneable Domain Controllers",
+        525: "Protected Users",
+        526: "Key Admins",
+        527: "Enterprise Key Admins"
+    }
+
+    # Add primary group (usually "Domain Users" for standard users)
+    # The primary group is determined by primaryGroupID attribute
+    primary_group_id = attributes.get("primaryGroupID", [])
+    if primary_group_id:
+        try:
+            group_id = int(primary_group_id[0])
+            primary_group_name = PRIMARY_GROUP_MAPPING.get(group_id, f"Primary Group ({group_id})")
+            
+            # Add primary group if not already in the list
+            if primary_group_name not in group_names:
+                group_names.append(primary_group_name)
+                
+        except (ValueError, TypeError, IndexError):
+            pass
+    
+    return group_names
+
+def gather_all_keys(data: list) -> list:
+    """
+    Collects all unique attribute keys from all LDAP entries
+    
+    Args:
+        data (list): List of LDAP entry dictionaries
+        
+    Returns:
+        list: Sorted list of all unique attribute names found across all entries
+    """
+    keys = set()
+    for entry in data:
+        attributes = entry.get("attributes", {})
+        keys.update(attributes.keys())
+    return sorted(keys)
+
+def is_kerberoastable(attributes):
+    """
+    Returns True if the user is kerberoastable (has servicePrincipalName).
+    """
+    spn_values = attributes.get("servicePrincipalName", [])
+    uac_values = attributes.get("userAccountControl", [])
+    if not spn_values:
+        return False
+    if uac_values:
+        try:
+            uac_value = int(uac_values[0])
+            # ACCOUNTDISABLE flag is 0x0002
+            if uac_value & 0x0002:
+                return False
+        except (ValueError, TypeError):
+            pass
+    return True
+
+def is_gmsa(attributes):
+    """Returns True if the entry is a gMSA (group Managed Service Account)."""
+    object_class = attributes.get("objectClass", [])
+    if "msDS-GroupManagedServiceAccount" in object_class:
+        return True
+    # adwsdomaindump sometimes only returns the most-derived objectClass
+    # value (e.g. "top"), dropping the inheritance chain - fall back to the
+    # gMSA-specific password-reader attribute, which is only ever set on gMSAs
+    return "msDS-GroupMSAMembership" in attributes
+
+def is_dmsa(attributes):
+    """Returns True if the entry is a dMSA (Delegated Managed Service Account)."""
+    object_class = attributes.get("objectClass", [])
+    if "msDS-DelegatedManagedServiceAccount" in object_class:
+        return True
+    # same objectClass truncation issue as is_gmsa() - fall back to the
+    # dMSA-specific migration-state attribute
+    return "msDS-DelegatedMSAState" in attributes
+
+
+LAPS_CLEARTEXT_ATTRIBUTES = {'ms-Mcs-AdmPwd', 'msLAPS-Password'}
+LAPS_ENCRYPTED_ATTRIBUTES = {
+    'msLAPS-EncryptedPassword', 'msLAPS-EncryptedPasswordHistory',
+    'msLAPS-EncryptedDSRMPassword', 'msLAPS-EncryptedDSRMPasswordHistory'
+}
+LAPS_ATTRIBUTES = LAPS_CLEARTEXT_ATTRIBUTES | LAPS_ENCRYPTED_ATTRIBUTES
+
+def is_laps_readable(attributes):
+    """Returns (readable, cleartext, attribute_name): whether the dump account could read a LAPS password."""
+    for attr in LAPS_CLEARTEXT_ATTRIBUTES:
+        values = attributes.get(attr, [])
+        if values and any(str(v).strip() for v in values):
+            return True, True, attr
+    for attr in LAPS_ENCRYPTED_ATTRIBUTES:
+        values = attributes.get(attr, [])
+        if values and any(str(v).strip() for v in values):
+            return True, False, attr
+    return False, False, None
+
+# msDS-DelegatedMSAState values (dMSA migration state machine)
+DMSA_STATE_FLAGS = {
+    0: {"name": "NOT_SET", "severity": "info",
+        "description": "No migration state set (standalone dMSA, not linked to any migration)"},
+    1: {"name": "MIGRATION_IN_PROGRESS", "severity": "warning",
+        "description": "dMSA migration in progress: linked to a superseded account via msDS-ManagedAccountPrecededByLink"},
+    2: {"name": "MIGRATION_COMPLETED", "severity": "critical",
+        "description": "Migration marked as completed: the KDC includes the superseded account's SID in this dMSA's PAC without verifying a real migration took place. This is the state abused by the BadSuccessor attack - verify legitimacy and check who could write these attributes / CreateChild rights on the parent OU."},
+    3: {"name": "STANDALONE", "severity": "info",
+        "description": "Standalone dMSA (not created from a migration)"},
+}
+
+def decode_delegated_msa_state(state_value):
+    """
+    Decode msDS-DelegatedMSAState into a flag list compatible with
+    format_uac_display_html(), so the same styling/tooltip UI is reused.
+    """
+    flag = DMSA_STATE_FLAGS.get(state_value)
+    if not flag:
+        return []
+    return [flag]
+
+def is_dmsa_migration_completed(attributes):
+    """
+    Returns True for a dMSA whose migration is marked "completed"
+    (msDS-DelegatedMSAState == 2) with msDS-ManagedAccountPrecededByLink set.
+
+    This is NOT a confirmed BadSuccessor vulnerability - a legitimate migration
+    ends up in the exact same state. Confirming actual exploitability requires
+    checking who has CreateChild / write rights on the dMSA or its parent OU,
+    which isn't part of an ldapdomaindump JSON export (use bloodyAD/netexec's
+    badsuccessor module for that). This only flags dMSA worth a manual review.
+    """
+    if not is_dmsa(attributes):
+        return False
+    preceded_by = attributes.get("msDS-ManagedAccountPrecededByLink", [])
+    if not preceded_by:
+        return False
+    state_values = attributes.get("msDS-DelegatedMSAState", [])
+    if not state_values:
+        return False
+    try:
+        return int(state_values[0]) == 2
+    except (ValueError, TypeError):
+        return False
+
+
+# ============================================================================
+# gMSA MEMBERSHIP DECODING (msDS-GroupMSAMembership)
+# ============================================================================
+# msDS-GroupMSAMembership is a self-relative NT security descriptor (MS-DTYP 2.4.6)
+# whose DACL lists which principals are allowed to retrieve the gMSA's password.
+
+WELL_KNOWN_SIDS = {
+    # Universal SIDs (identical on every Windows machine/domain)
+    "S-1-0-0": "Null Authority",
+    "S-1-1-0": "Everyone",
+    "S-1-2-0": "Local",
+    "S-1-3-0": "CREATOR OWNER",
+    "S-1-3-1": "CREATOR GROUP",
+    "S-1-3-2": "CREATOR OWNER SERVER",
+    "S-1-3-3": "CREATOR GROUP SERVER",
+    "S-1-3-4": "OWNER RIGHTS",
+    "S-1-5-1": "NT AUTHORITY\\DIALUP",
+    "S-1-5-2": "NT AUTHORITY\\NETWORK",
+    "S-1-5-3": "NT AUTHORITY\\BATCH",
+    "S-1-5-4": "NT AUTHORITY\\INTERACTIVE",
+    "S-1-5-6": "NT AUTHORITY\\SERVICE",
+    "S-1-5-7": "NT AUTHORITY\\ANONYMOUS LOGON",
+    "S-1-5-8": "NT AUTHORITY\\PROXY",
+    "S-1-5-9": "NT AUTHORITY\\ENTERPRISE DOMAIN CONTROLLERS",
+    "S-1-5-10": "NT AUTHORITY\\SELF",
+    "S-1-5-11": "NT AUTHORITY\\Authenticated Users",
+    "S-1-5-12": "NT AUTHORITY\\RESTRICTED CODE",
+    "S-1-5-13": "NT AUTHORITY\\TERMINAL SERVER USER",
+    "S-1-5-14": "NT AUTHORITY\\REMOTE INTERACTIVE LOGON",
+    "S-1-5-15": "NT AUTHORITY\\THIS ORGANIZATION",
+    "S-1-5-17": "NT AUTHORITY\\IUSR",
+    "S-1-5-18": "NT AUTHORITY\\SYSTEM",
+    "S-1-5-19": "NT AUTHORITY\\LOCAL SERVICE",
+    "S-1-5-20": "NT AUTHORITY\\NETWORK SERVICE",
+    "S-1-5-33": "NT AUTHORITY\\WRITE RESTRICTED CODE",
+    # BUILTIN local groups (identical on every domain)
+    "S-1-5-32-544": "BUILTIN\\Administrators",
+    "S-1-5-32-545": "BUILTIN\\Users",
+    "S-1-5-32-546": "BUILTIN\\Guests",
+    "S-1-5-32-547": "BUILTIN\\Power Users",
+    "S-1-5-32-548": "BUILTIN\\Account Operators",
+    "S-1-5-32-549": "BUILTIN\\Server Operators",
+    "S-1-5-32-550": "BUILTIN\\Print Operators",
+    "S-1-5-32-551": "BUILTIN\\Backup Operators",
+    "S-1-5-32-552": "BUILTIN\\Replicator",
+    "S-1-5-32-554": "BUILTIN\\Pre-Windows 2000 Compatible Access",
+    "S-1-5-32-555": "BUILTIN\\Remote Desktop Users",
+    "S-1-5-32-556": "BUILTIN\\Network Configuration Operators",
+    "S-1-5-32-557": "BUILTIN\\Incoming Forest Trust Builders",
+    "S-1-5-32-558": "BUILTIN\\Performance Monitor Users",
+    "S-1-5-32-559": "BUILTIN\\Performance Log Users",
+    "S-1-5-32-560": "BUILTIN\\Windows Authorization Access Group",
+    "S-1-5-32-561": "BUILTIN\\Terminal Server License Servers",
+    "S-1-5-32-562": "BUILTIN\\Distributed COM Users",
+    "S-1-5-32-569": "BUILTIN\\Cryptographic Operators",
+    "S-1-5-32-573": "BUILTIN\\Event Log Readers",
+    "S-1-5-32-574": "BUILTIN\\Certificate Service DCOM Access",
+    "S-1-5-32-575": "BUILTIN\\RDS Remote Access Servers",
+    "S-1-5-32-576": "BUILTIN\\RDS Endpoint Servers",
+    "S-1-5-32-577": "BUILTIN\\RDS Management Servers",
+    "S-1-5-32-578": "BUILTIN\\Hyper-V Administrators",
+    "S-1-5-32-579": "BUILTIN\\Access Control Assistance Operators",
+    "S-1-5-32-580": "BUILTIN\\Remote Management Users",
+    "S-1-5-32-582": "BUILTIN\\Storage Replica Administrators",
+}
+
+def _parse_sid(data, offset):
+    """
+    Parse a binary NT SID (MS-DTYP 2.4.2) starting at `offset`.
+
+    Returns:
+        tuple: (sid_string or None, bytes_consumed)
+    """
+    try:
+        revision = data[offset]
+        sub_count = data[offset + 1]
+        authority = int.from_bytes(data[offset + 2:offset + 8], 'big')
+        pos = offset + 8
+        sub_auths = []
+        for _ in range(sub_count):
+            sub_auths.append(int.from_bytes(data[pos:pos + 4], 'little'))
+            pos += 4
+        parts = "-".join(map(str, sub_auths))
+        sid_str = f"S-{revision}-{authority}-{parts}" if parts else f"S-{revision}-{authority}"
+        return sid_str, pos - offset
+    except (IndexError, struct.error):
+        return None, 0
+
+def _parse_guid(data, offset):
+    """Parse a binary GUID (MS-DTYP 2.3.4) at `offset` into its string form."""
+    try:
+        d1, d2, d3 = struct.unpack_from("<LHH", data, offset)
+        d4 = data[offset + 8:offset + 16]
+        return f"{d1:08x}-{d2:04x}-{d3:04x}-{d4[0]:02x}{d4[1]:02x}-{''.join(f'{b:02x}' for b in d4[2:])}"
+    except (struct.error, IndexError):
+        return None
+
+def _decode_security_descriptor_blob(values):
+    """Base64-decode a security-descriptor-style attribute's first value."""
+    if not values:
+        return None
+    raw = values[0]
+    if not (isinstance(raw, dict) and raw.get('encoding') == 'base64'):
+        return None
+    try:
+        return base64.b64decode(raw.get('encoded', ''))
+    except Exception:
+        return None
+
+def _iterate_dacl_aces(data):
+    """Parse a self-relative SECURITY_DESCRIPTOR's DACL (MS-DTYP 2.4.6), yielding each ACE as {type, inherited, mask, object_type, sid}."""
+    if len(data) < 20:
+        return
+    try:
+        control, = struct.unpack_from("<H", data, 2)
+        off_dacl, = struct.unpack_from("<L", data, 16)
+    except struct.error:
+        return
+
+    # SE_DACL_PRESENT (0x0004): no DACL means no ACE grants anything
+    if not (control & 0x0004) or off_dacl == 0 or off_dacl + 8 > len(data):
+        return
+
+    try:
+        ace_count, = struct.unpack_from("<H", data, off_dacl + 4)
+    except struct.error:
+        return
+
+    pos = off_dacl + 8
+    for _ in range(ace_count):
+        if pos + 8 > len(data):
+            break
+        ace_type = data[pos]
+        ace_flags = data[pos + 1]
+        ace_size, = struct.unpack_from("<H", data, pos + 2)
+        if ace_size <= 0 or pos + ace_size > len(data):
+            break
+
+        try:
+            mask, = struct.unpack_from("<L", data, pos + 4)
+        except struct.error:
+            break
+
+        object_type = None
+        sid_offset = pos + 8
+        if ace_type in (5, 6):  # ACCESS_ALLOWED/DENIED_OBJECT_ACE_TYPE
+            if pos + 12 > len(data):
+                pos += ace_size
+                continue
+            obj_flags, = struct.unpack_from("<L", data, pos + 8)
+            sid_offset = pos + 12
+            if obj_flags & 0x1:  # ACE_OBJECT_TYPE_PRESENT
+                object_type = _parse_guid(data, sid_offset)
+                sid_offset += 16
+            if obj_flags & 0x2:  # ACE_INHERITED_OBJECT_TYPE_PRESENT
+                sid_offset += 16
+
+        sid_str, _ = _parse_sid(data, sid_offset)
+        if sid_str:
+            yield {
+                'type': ace_type,
+                'inherited': bool(ace_flags & 0x10),  # INHERITED_ACE
+                'mask': mask,
+                'object_type': object_type,
+                'sid': sid_str,
+            }
+        pos += ace_size
+
+def _parse_sd_owner(data):
+    """Parse the Owner SID from a self-relative SECURITY_DESCRIPTOR (MS-DTYP 2.4.6)."""
+    if len(data) < 20:
+        return None
+    try:
+        off_owner, = struct.unpack_from("<L", data, 4)
+    except struct.error:
+        return None
+    if off_owner == 0 or off_owner >= len(data):
+        return None
+    sid_str, _ = _parse_sid(data, off_owner)
+    return sid_str
+
+def _render_principal_chips(principals, sid_map, empty_message):
+    """Render a flat list of principal SIDs as chips (gMSA readers, RBCD principals)."""
+    if not principals:
+        return f'<span class="gmsa-no-readers">⚠️ {empty_message}</span>'
+
+    sid_map = sid_map or {}
+    html = '<div class="gmsa-readers">'
+    for sid_str in principals:
+        label = WELL_KNOWN_SIDS.get(sid_str) or sid_map.get(sid_str)
+        if label is None and _looks_like_deleted_object(sid_str):
+            label = f'{sid_str} (unresolved - object likely deleted)'
+        label = label or sid_str
+        html += f'<span class="gmsa-reader-chip" title="{sid_str}">{label}</span>'
+    html += '</div>'
+    return html
+
+def _collect_gmsa_reader_sids(values):
+    """Raw SIDs allowed to retrieve a gMSA's password, from msDS-GroupMSAMembership's own DACL."""
+    data = _decode_security_descriptor_blob(values)
+    if data is None:
+        return []
+    return [ace['sid'] for ace in _iterate_dacl_aces(data) if ace['type'] == 0]
+
+def decode_group_msa_membership(values, sid_map=None):
+    """Decode msDS-GroupMSAMembership into the principals allowed to read the gMSA's password."""
+    if _decode_security_descriptor_blob(values) is None:
+        return None
+    return _render_principal_chips(_collect_gmsa_reader_sids(values), sid_map, "No principal can read this password")
+
+def decode_rbcd_principals(values, sid_map=None):
+    """Decode msDS-AllowedToActOnBehalfOfOtherIdentity into the principals allowed to RBCD as this computer."""
+    data = _decode_security_descriptor_blob(values)
+    if data is None:
+        return None
+    principals = [ace['sid'] for ace in _iterate_dacl_aces(data) if ace['type'] == 0]
+    return _render_principal_chips(principals, sid_map, "No principal configured for RBCD")
+
+# Extended-right GUIDs (MS-ADTS 5.1.3). The two DS-Replication-Get-Changes*
+# entries get merged into "DCSync" by decode_dangerous_aces() when both hold.
+INTERESTING_RIGHT_GUIDS = {
+    '00299570-246d-11d0-a768-00aa006e0529': 'ForceChangePassword',
+    '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2': 'DS-Replication-Get-Changes',
+    '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2': 'DS-Replication-Get-Changes-All',
+}
+
+# schemaIDGUID of properties whose WriteProperty ACE deserves its own name
+# instead of being lumped under GenericWrite
+INTERESTING_PROPERTY_GUIDS = {
+    'bf9679c0-0de6-11d0-a285-00aa003049e2': 'AddMember',            # member
+    '5b47d60f-6090-40b2-9f37-2a4de88f3063': 'AddKeyCredentialLink', # msDS-KeyCredentialLink (Shadow Credentials)
+    'f3a64788-5306-11d1-a9c5-0000f80367c1': 'WriteSPN',             # servicePrincipalName
+    '3f78c3e5-f79a-46bd-a0b8-9d18116ddc79': 'AllowedToAct',         # msDS-AllowedToActOnBehalfOfOtherIdentity (can configure RBCD)
+}
+
+# schemaIDGUID of confidential properties readable via ADS_RIGHT_DS_READ_PROP,
+# on top of is_laps_readable() (which only proves the dump account's access)
+INTERESTING_READ_PROPERTY_GUIDS = {
+    '657e154a-f8d8-44aa-9de5-bc5ddc1e7620': 'ReadLAPSPassword',  # ms-Mcs-AdmPwd (legacy LAPS)
+}
+
+DCSYNC_COMPONENT_RIGHTS = {'DS-Replication-Get-Changes', 'DS-Replication-Get-Changes-All'}
+
+# (badge CSS class, tooltip) per detected right, two severity tiers
+ACL_RIGHT_INFO = {
+    'GenericAll': ('acl-badge-critical', "Full control: can reset the password, add an SPN, modify any attribute, take ownership or rewrite the DACL."),
+    'WriteOwner': ('acl-badge-critical', "Can take ownership of the object, then grant itself further rights via WriteDacl."),
+    'WriteDacl': ('acl-badge-critical', "Can rewrite the object's DACL to grant itself (or anyone) further rights, e.g. GenericAll."),
+    'Owns': ('acl-badge-critical', "Owner of this object: owners implicitly get READ_CONTROL/WRITE_DAC and can grant themselves further rights (e.g. WriteDacl), even with no explicit ACE."),
+    'ForceChangePassword': ('acl-badge-critical', "Can reset this account's password without knowing the current one (User-Force-Change-Password extended right)."),
+    'AddMember': ('acl-badge-critical', "Can directly write the member attribute: add itself (or anyone) to this group."),
+    'AddKeyCredentialLink': ('acl-badge-critical', "Can write msDS-KeyCredentialLink: Shadow Credentials attack, add a certificate to authenticate as this principal without knowing its password."),
+    'AllowedToAct': ('acl-badge-critical', "Can write msDS-AllowedToActOnBehalfOfOtherIdentity: can configure Resource-Based Constrained Delegation on this computer and impersonate any user against it."),
+    'DCSync': ('acl-badge-critical', "Granted DS-Replication-Get-Changes + DS-Replication-Get-Changes-All: can perform a DCSync attack and dump every domain credential, including krbtgt."),
+    'AllExtendedRights': ('acl-badge-critical', "Granted every extended right on this object (e.g. ForceChangePassword, or DCSync rights if granted on the domain object)."),
+    'GenericWrite': ('acl-badge-warning', "Can write any non-protected attribute, e.g. set a logon script or SPN."),
+    'AddSelf': ('acl-badge-warning', "Validated write (Self): can add/remove itself as a member of this group."),
+    'WriteSPN': ('acl-badge-warning', "Can write servicePrincipalName: add an SPN to make this account Kerberoastable, or hijack an existing one."),
+    'ReadLAPSPassword': ('acl-badge-critical', "Can read the legacy LAPS local admin password (ms-Mcs-AdmPwd) directly, regardless of what the dump account itself could read."),
+    'DS-Replication-Get-Changes': ('acl-badge-warning', "Granted DS-Replication-Get-Changes alone: combined with DS-Replication-Get-Changes-All on the same principal, this enables a DCSync attack."),
+    'DS-Replication-Get-Changes-All': ('acl-badge-warning', "Granted DS-Replication-Get-Changes-All alone: combined with DS-Replication-Get-Changes on the same principal, this enables a DCSync attack."),
+    'CreateChild': ('acl-badge-warning', "Can create child objects under this container (e.g. computers, GPOs, users - or a dMSA on an OU, relevant to the BadSuccessor attack)."),
+    'ReadGMSAPassword': ('acl-badge-critical', "Allowed to retrieve this gMSA's current password (PrincipalsAllowedToRetrieveManagedPassword) - full impersonation of the service account."),
+}
+
+def classify_ace_rights(mask, object_type):
+    """Map an ACE's mask (+ ObjectType GUID) to the ACL_RIGHT_INFO keys it grants."""
+    FULL_CONTROL_MASK = 0x000F01FF
+    if (mask & 0x10000000) or ((mask & FULL_CONTROL_MASK) == FULL_CONTROL_MASK):  # GENERIC_ALL
+        return ['GenericAll']
+
+    rights = []
+    if mask & 0x20:  # ADS_RIGHT_DS_WRITE_PROP
+        if object_type is None:
+            rights.append('GenericWrite')  # write access to every property
+        elif object_type in INTERESTING_PROPERTY_GUIDS:
+            rights.append(INTERESTING_PROPERTY_GUIDS[object_type])
+    if mask & 0x40000000:  # GENERIC_WRITE
+        if 'GenericWrite' not in rights:
+            rights.append('GenericWrite')
+    if mask & 0x10:  # ADS_RIGHT_DS_READ_PROP
+        if object_type in INTERESTING_READ_PROPERTY_GUIDS:
+            rights.append(INTERESTING_READ_PROPERTY_GUIDS[object_type])
+    if mask & 0x80000:  # WRITE_OWNER
+        rights.append('WriteOwner')
+    if mask & 0x40000:  # WRITE_DAC
+        rights.append('WriteDacl')
+    if mask & 0x1:  # ADS_RIGHT_DS_CREATE_CHILD
+        rights.append('CreateChild')
+    if mask & 0x100:  # ADS_RIGHT_DS_CONTROL_ACCESS (extended right)
+        if object_type is None:
+            rights.append('AllExtendedRights')
+        elif object_type in INTERESTING_RIGHT_GUIDS:
+            rights.append(INTERESTING_RIGHT_GUIDS[object_type])
+    if mask & 0x8:  # ADS_RIGHT_DS_SELF (validated write)
+        rights.append('AddSelf')
+    return rights
+
+# principals whose grants are expected by AD design, not a misconfiguration
+DEFAULT_ACL_PRINCIPAL_SIDS = {
+    'S-1-5-18',      # NT AUTHORITY\SYSTEM
+    'S-1-5-10',      # NT AUTHORITY\SELF
+    'S-1-3-0',       # CREATOR OWNER
+    'S-1-5-32-544',  # BUILTIN\Administrators
+    'S-1-5-32-548',  # BUILTIN\Account Operators (GenericAll on non-protected objects, inherited from domain root)
+    'S-1-5-32-550',  # BUILTIN\Print Operators (default CreateChild rights on Domain Controllers)
+}
+DEFAULT_ACL_PRINCIPAL_RIDS = {512, 519, 500, 526, 527}  # Domain Admins, Enterprise Admins, Administrator, Key Admins, Enterprise Key Admins
+
+def _is_default_acl_principal(sid_str):
+    """Returns True for principals excluded from dangerous-ACE reporting (see DEFAULT_ACL_PRINCIPAL_SIDS)."""
+    if sid_str in DEFAULT_ACL_PRINCIPAL_SIDS:
+        return True
+    return getRIDFromObjectSID(sid_str) in DEFAULT_ACL_PRINCIPAL_RIDS
+
+def _looks_like_deleted_object(sid_str):
+    """A domain-style SID (non-default RID) that didn't resolve to any object in the dump is likely stale/deleted."""
+    if not sid_str.startswith('S-1-5-21-'):
+        return False
+    rid = getRIDFromObjectSID(sid_str)
+    return rid is not None and rid >= 1000
+
+def _collect_dangerous_aces(values):
+    """Returns {sid: set(rights)} from an nTSecurityDescriptor's DACL + owner, or None if unparseable."""
+    data = _decode_security_descriptor_blob(values)
+    if data is None:
+        return None
+
+    per_principal = {}
+
+    owner_sid = _parse_sd_owner(data)
+    if owner_sid:
+        per_principal.setdefault(owner_sid, set()).add('Owns')
+
+    for ace in _iterate_dacl_aces(data):
+        if ace['type'] not in (0, 5):  # only ALLOWED ACEs grant rights
+            continue
+        rights = classify_ace_rights(ace['mask'], ace['object_type'])
+        if rights:
+            per_principal.setdefault(ace['sid'], set()).update(rights)
+
+    # DS-Replication-Get-Changes(-All) only enable DCSync together
+    for rights in per_principal.values():
+        if DCSYNC_COMPONENT_RIGHTS <= rights:
+            rights -= DCSYNC_COMPONENT_RIGHTS
+            rights.add('DCSync')
+
+    return per_principal
+
+def _render_acl_rights(per_principal, sid_map=None):
+    """Render a {sid: set(rights)} dict (see _collect_dangerous_aces) as ⚔️ ACL rows."""
+    if not per_principal:
+        return '<span class="acl-no-findings">No dangerous right (GenericAll, WriteOwner, WriteDacl, Owns, ForceChangePassword, AllExtendedRights, AddSelf, AddMember, AddKeyCredentialLink, WriteSPN, AllowedToAct, ReadLAPSPassword, ReadGMSAPassword, DCSync, GenericWrite, CreateChild) found in the DACL</span>'
+
+    sid_map = sid_map or {}
+    html = '<div class="acl-rights">'
+    for sid_str, rights in per_principal.items():
+        label = WELL_KNOWN_SIDS.get(sid_str) or sid_map.get(sid_str)
+        stale = label is None and _looks_like_deleted_object(sid_str)
+        label = label or sid_str
+        if stale:
+            label += ' (unresolved - object likely deleted)'
+        row_class = 'acl-right-row acl-right-default' if (_is_default_acl_principal(sid_str) or stale) else 'acl-right-row acl-right-notable'
+        badges = ''.join(
+            f'<span class="acl-badge {ACL_RIGHT_INFO[r][0]}" title="{ACL_RIGHT_INFO[r][1]}">{r}</span>'
+            for r in sorted(rights)
+        )
+        html += f'<div class="{row_class}"><span class="acl-principal" title="{sid_str}">{label}</span>{badges}</div>'
+    html += '</div>'
+    return html
+
+def decode_dangerous_aces(values, sid_map=None):
+    """
+    Decode an nTSecurityDescriptor's DACL (+ owner) into every principal
+    granted a right in ACL_RIGHT_INFO - the edges BloodHound builds attack
+    paths from. Default principals (DEFAULT_ACL_PRINCIPAL_SIDS) are still
+    shown but dimmed ("acl-right-default" vs "acl-right-notable"), which is
+    what actually drives the ⚔️ chip / stats counter / ACL filter.
+    """
+    per_principal = _collect_dangerous_aces(values)
+    if per_principal is None:
+        return None
+    return _render_acl_rights(per_principal, sid_map)
+
+
+def build_global_sid_map(input_files):
+    """
+    Build a SID -> display name map by scanning objectSid across all provided
+    LDAP JSON files (users, computers, groups, ...), so gMSA password readers
+    (msDS-GroupMSAMembership) can be resolved to a readable name even when the
+    granted principal isn't a well-known SID.
+
+    Args:
+        input_files (list): Paths to all ldapdomaindump/adwsdomaindump JSON
+            files passed on the command line
+
+    Returns:
+        dict: Mapping of "S-1-5-..." SID strings to their display name
+    """
+    sid_map = {}
+    for input_file in input_files:
+        try:
+            with open(input_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+
+        data = normalize_ldap_data(data)
+        for entry in data:
+            attributes = entry.get("attributes", {})
+            dn = entry.get("dn", "")
+            object_sid = attributes.get("objectSid", [])
+            if object_sid:
+                sid_map[str(object_sid[0])] = extract_display_name(attributes, dn)
+    return sid_map
+
+
+# ============================================================================
+# ADWSDOMAINDUMP FORMAT SUPPORT
+# ============================================================================
+# adwsdomaindump (ADWS-based dumping) produces a JSON
+# structure that differs from ldapdomaindump's {"dn", "attributes": {...}}:
+# entries are flat dicts (no "attributes"/"dn" wrapper), every value is a
+# single scalar instead of a list, and several attributes use raw encodings
+# (FILETIME integers, AD generalized time, binary SID/GUID) instead of the
+# human-readable strings ldapdomaindump already resolves. These helpers
+# detect that format and normalize it into ldapdomaindump's structure so the
+# rest of the script can treat both formats identically.
+
+from datetime import datetime, timedelta
+
+# Attributes holding a Windows FILETIME (100ns intervals since 1601-01-01) as a decimal string
+ADWS_FILETIME_ATTRIBUTES = {
+    'lastLogon', 'lastLogonTimestamp', 'pwdLastSet', 'badPasswordTime',
+    'accountExpires', 'lastLogoff', 'lockoutTime'
+}
+# Attributes holding AD generalized time (e.g. "20250215072421.0Z")
+ADWS_GENERALIZED_TIME_ATTRIBUTES = {'whenCreated', 'whenChanged', 'dSCorePropagationData'}
+# Attributes holding a raw base64-encoded binary blob (ldapdomaindump wraps these
+# in {"encoding": "base64", "encoded": ...} dicts; adwsdomaindump doesn't)
+ADWS_BASE64_BLOB_ATTRIBUTES = {
+    'nTSecurityDescriptor', 'msDS-GroupMSAMembership', 'msDS-AllowedToActOnBehalfOfOtherIdentity'
+}
+
+def filetime_to_ad_string(value):
+    """
+    Convert a Windows FILETIME (100ns intervals since 1601-01-01) to the
+    same date string format ldapdomaindump uses, including its sentinel
+    values for "never" (0) and "no expiration" (0x7FFFFFFFFFFFFFFF).
+    """
+    try:
+        filetime = int(value)
+    except (ValueError, TypeError):
+        return value
+    if filetime <= 0:
+        return "1601-01-01 00:00:00+00:00"
+    if filetime >= 0x7FFFFFFFFFFFFFFF:
+        return "9999-12-31 23:59:59.999999+00:00"
+    try:
+        dt = datetime(1601, 1, 1) + timedelta(microseconds=filetime / 10)
+        return dt.strftime("%Y-%m-%d %H:%M:%S.%f") + "+00:00"
+    except (OverflowError, OSError, ValueError):
+        return "9999-12-31 23:59:59.999999+00:00"
+
+def generalized_time_to_ad_string(value):
+    """
+    Convert AD generalized time (e.g. "20250215072421.0Z") to ldapdomaindump's
+    date string format.
+    """
+    if not isinstance(value, str):
+        return value
+    try:
+        base = value.strip().split('.')[0]
+        dt = datetime.strptime(base, "%Y%m%d%H%M%S")
+        return dt.strftime("%Y-%m-%d %H:%M:%S") + "+00:00"
+    except ValueError:
+        return value
+
+def decode_raw_sid_base64(value):
+    """
+    Decode a base64-encoded raw binary SID (as produced by adwsdomaindump)
+    into the "S-1-5-..." string format ldapdomaindump already uses.
+    """
+    if not isinstance(value, str):
+        return value
+    try:
+        raw = base64.b64decode(value)
+        sid_str, _ = _parse_sid(raw, 0)
+        return sid_str if sid_str else value
+    except Exception:
+        return value
+
+def format_adws_object_guid(value):
+    """
+    Normalize adwsdomaindump's plain GUID string ("6827C777-...") to
+    ldapdomaindump's braced/lowercase format ("{6827c777-...}").
+    """
+    if isinstance(value, str) and not value.startswith('{'):
+        return '{' + value.lower() + '}'
+    return value
+
+def convert_adws_entry(entry: dict) -> dict:
+    """
+    Convert a single flat adwsdomaindump entry into the ldapdomaindump-style
+    {"dn": ..., "attributes": {key: [values]}} structure the rest of this
+    script expects.
+    """
+    dn = entry.get("distinguishedName", "")
+    attributes = {}
+    for key, value in entry.items():
+        if key == "distinguishedName":
+            continue
+        values = value if isinstance(value, list) else [value]
+        if key == "objectSid":
+            values = [decode_raw_sid_base64(v) for v in values]
+        elif key == "objectGUID":
+            values = [format_adws_object_guid(v) for v in values]
+        elif key in ADWS_FILETIME_ATTRIBUTES:
+            values = [filetime_to_ad_string(v) for v in values]
+        elif key in ADWS_GENERALIZED_TIME_ATTRIBUTES:
+            values = [generalized_time_to_ad_string(v) for v in values]
+        elif key in ADWS_BASE64_BLOB_ATTRIBUTES:
+            values = [{"encoding": "base64", "encoded": v} if isinstance(v, str) else v for v in values]
+        attributes[key] = values
+    return {"dn": dn, "attributes": attributes}
+
+def is_adws_dump_format(data: list) -> bool:
+    """
+    Detect adwsdomaindump JSON exports: flat dicts carrying
+    "distinguishedName" directly, instead of ldapdomaindump's
+    {"dn", "attributes"} wrapper.
+    """
+    if not data or not isinstance(data, list) or not isinstance(data[0], dict):
+        return False
+    first = data[0]
+    return "attributes" not in first and "distinguishedName" in first
+
+def normalize_ldap_data(data: list) -> list:
+    """
+    Normalize input data to ldapdomaindump's {"dn", "attributes"} structure,
+    converting adwsdomaindump exports on the fly. ldapdomaindump exports are
+    returned unchanged.
+    """
+    if is_adws_dump_format(data):
+        return [convert_adws_entry(entry) for entry in data]
+    return data
+
+
+# ============================================================================
+# STATISTICS CALCULATION FUNCTIONS
+# ============================================================================
+# Functions to calculate statistics from LDAP data
+
+def parse_ad_date(date_str):
+    """
+    Convert Windows FileTime to Python datetime
+    """
+    if '.' in date_str:
+        # Handle microseconds
+        return datetime.fromisoformat(date_str.split('.')[0])
+    else:
+        return datetime.fromisoformat(date_str.replace('+00:00', ''))
+    
+def calculate_ldap_statistics(data):
+    """
+    Calculate comprehensive statistics from LDAP data
+    
+    Args:
+        data (list): List of LDAP entry dictionaries
+        
+    Returns:
+        dict: Dictionary containing all calculated statistics
+    """
+    from datetime import datetime, timedelta, timezone
+    
+    total_objects = len(data)
+    stats = {
+        'global': {
+            'totalObjects': total_objects,
+            'recentlyCreated': 0,
+            'defaultObjects': 0,        # RID <= 1000
+            'nonDefaultObjects': 0,     # RID > 1000
+            'inactiveAccounts': 0,      # lastLogon > 90 days
+            'neverLoggedIn': 0          # logonCount == 0
+        },
+        'uac': {
+            # Security Critical
+            'disabledAccounts': 0,
+            'noKerberosPreAuth': 0,
+            'trustedForDelegation': 0,
+            'constrainedDelegation': 0,
+            'notDelegated': 0,
+            # Password Related
+            'passwordNotRequired': 0,
+            'passwordNeverExpires': 0,
+            'passwordCantChange': 0,
+            'passwordExpired': 0,
+            # Authentication & Access
+            'smartcardRequired': 0,
+            'accountLocked': 0,
+            'reversibleEncryption': 0,
+            'useDESKey': 0
+        },
+        'ldap': {
+            # Security Critical Attributes
+            'spnUsers': 0,
+            'adminCountUsers': 0,
+            'constrainedDelegationTarget': 0,
+            'resourceBasedConstrainedDelegation': 0,
+            'gmsaAccounts': 0,
+            'dmsaAccounts': 0,
+            'dangerousAclObjects': 0,
+            # Information Disclosure
+            'hasDescription': 0,
+            'unsupportedOS': 0,
+            'pxeBootServers': 0,
+            'sccmClients': 0,
+            'sccmManagementPoints': 0,
+            'lapsReadable': 0,
+        },
+        'groups': {},
+        'uacStats': {},
+        'objectTypes': {},
+        'osDistribution': {}
+    }
+    
+    # Date for recent accounts (30 days ago)
+    thirty_days_ago = datetime.now() - timedelta(days=30)
+    ninety_days_ago = datetime.now() - timedelta(days=90)
+    
+    for entry in data:
+        attributes = entry.get("attributes", {})
+        
+        ### Global Statistics -------------------------------------------------------------------------
+
+        # RID-based statistics (Default vs Non-default objects)
+        object_sid = attributes.get("objectSid", [])
+        if object_sid:
+            try:
+                rid = getRIDFromObjectSID(object_sid[0])
+                if rid is not None:
+                    if rid <= 1000:
+                        stats['global']['defaultObjects'] += 1
+                    else:
+                        stats['global']['nonDefaultObjects'] += 1
+            except (ValueError, TypeError, IndexError):
+                pass
+        
+        # Recently created check
+        when_created = attributes.get("whenCreated", [])
+        if when_created:
+            try:
+                # Parse date - handle different formats
+                date_str = when_created[0]
+                created_date = parse_ad_date(date_str)
+                if created_date > thirty_days_ago:
+                    stats['global']['recentlyCreated'] += 1
+            except (ValueError, TypeError):
+                pass
+
+        # Inactive Accounts (lastLogon > 90 jours)
+        last_logon = attributes.get("lastLogon", [])
+        if last_logon:
+            try:
+                last_logon_str = last_logon[0]
+                if last_logon_str != "1601-01-01 00:00:00+00:00":
+                    logon_time = parse_ad_date(last_logon_str)
+                    if logon_time and logon_time < ninety_days_ago:
+                        stats['global']['inactiveAccounts'] += 1
+            except (ValueError, TypeError):
+                pass
+
+        # Accounts never logged in (logonCount == 0)
+        logon_count = attributes.get("logonCount", [])
+        if logon_count:
+            try:
+                if int(logon_count[0]) == 0:
+                    stats['global']['neverLoggedIn'] += 1
+            except Exception:
+                pass
+        
+
+        ### UAC Statistics using UAC_FLAGS -------------------------------------------------------------------------
+        uac_values = attributes.get("userAccountControl", [])
+        if uac_values:
+            try:
+                uac_value = int(uac_values[0])
+                
+                # Security Critical
+                if uac_value & 0x0002:  # ACCOUNTDISABLE
+                    stats['uac']['disabledAccounts'] += 1
+                if uac_value & 0x400000:  # DONT_REQ_PREAUTH
+                    stats['uac']['noKerberosPreAuth'] += 1
+                if uac_value & 0x80000:  # TRUSTED_FOR_DELEGATION
+                    stats['uac']['trustedForDelegation'] += 1
+                if uac_value & 0x1000000:  # TRUSTED_TO_AUTH_FOR_DELEGATION
+                    stats['uac']['constrainedDelegation'] += 1
+                if uac_value & 0x100000:  # NOT_DELEGATED
+                    stats['uac']['notDelegated'] += 1
+                
+                # Password Related
+                if uac_value & 0x0020:  # PASSWD_NOTREQD
+                    stats['uac']['passwordNotRequired'] += 1
+                if uac_value & 0x10000:  # DONT_EXPIRE_PASSWORD
+                    stats['uac']['passwordNeverExpires'] += 1
+                if uac_value & 0x0040:  # PASSWD_CANT_CHANGE
+                    stats['uac']['passwordCantChange'] += 1
+                if uac_value & 0x800000:  # PASSWORD_EXPIRED
+                    stats['uac']['passwordExpired'] += 1
+                
+                # Authentication & Access
+                if uac_value & 0x40000:  # SMARTCARD_REQUIRED
+                    stats['uac']['smartcardRequired'] += 1
+                if uac_value & 0x0010:  # LOCKOUT
+                    stats['uac']['accountLocked'] += 1
+                if uac_value & 0x0080:  # ENCRYPTED_TEXT_PWD_ALLOWED
+                    stats['uac']['reversibleEncryption'] += 1
+                if uac_value & 0x200000:  # USE_DES_KEY_ONLY
+                    stats['uac']['useDESKey'] += 1
+                
+                # Count all UAC flags for detailed stats using UAC_FLAGS
+                for flag_value, flag_info in UAC_FLAGS.items():
+                    if uac_value & flag_value:
+                        flag_name = flag_info["name"]
+
+                        # Special case for PRE_CREATED_COMPUTER_ACCOUNT
+                        if flag_name == "PRE_CREATED_COMPUTER_ACCOUNT":
+                            # Only count if both PASSWD_NOTREQD (0x20) and WORKSTATION_TRUST_ACCOUNT (0x1000) are present
+                            if (uac_value & 0x0020) and (uac_value & 0x1000):
+                                stats['uacStats'][flag_name] = stats['uacStats'].get(flag_name, 0) + 1
+                        else:
+                            # Regular flag checking
+                            if uac_value & flag_value:
+                                stats['uacStats'][flag_name] = stats['uacStats'].get(flag_name, 0) + 1
+                        
+            except (ValueError, TypeError):
+                pass
+        
+        ### LDAP Statistics -------------------------------------------------------------------------
+        
+        # AdminCount check
+        admin_count = attributes.get("adminCount", [])
+        if admin_count:
+            try:
+                if int(admin_count[0]) == 1:
+                    stats['ldap']['adminCountUsers'] += 1
+            except (ValueError, TypeError):
+                pass
+        
+        # SPN check (Is Kerberoastable)
+        if is_kerberoastable(attributes):
+            stats['ldap']['spnUsers'] += 1
+        
+        # Constrained Delegation Target check
+        constrained_delegation = attributes.get("msDS-AllowedToDelegateTo", [])
+        if constrained_delegation and len(constrained_delegation) > 0:
+            stats['ldap']['constrainedDelegationTarget'] += 1
+            
+        # RBCD - Resource-Based Constrained Delegation check
+        rbcd_delegation = attributes.get("msDS-AllowedToActOnBehalfOfOtherIdentity", [])
+        if rbcd_delegation and len(rbcd_delegation) > 0:
+            stats['ldap']['resourceBasedConstrainedDelegation'] += 1
+        
+        ## OS Distribution + Unsupported OS stats
+        os_name = attributes.get("operatingSystem", [""])[0]
+        if os_name:
+            os_key = os_name.strip()
+            stats['osDistribution'][os_key] = stats['osDistribution'].get(os_key, 0) + 1
+            # Check for unsupported OS
+            if any(x in os_key.lower() for x in ["2000", "2003", "2008", "xp", "vista", "7", "me"]):
+                stats['ldap']['unsupportedOS'] += 1
+
+        # gMSA (group Managed Service Account) check
+        if is_gmsa(attributes):
+            stats['ldap']['gmsaAccounts'] += 1
+
+        # dMSA (Delegated Managed Service Account) check
+        if is_dmsa(attributes):
+            stats['ldap']['dmsaAccounts'] += 1
+
+        # Dangerous ACL check: any right in ACL_RIGHT_INFO granted to a non-default principal
+        acl_rights = _collect_dangerous_aces(attributes.get("nTSecurityDescriptor", [])) or {}
+        if is_gmsa(attributes):
+            for reader_sid in _collect_gmsa_reader_sids(attributes.get("msDS-GroupMSAMembership", [])):
+                acl_rights.setdefault(reader_sid, set()).add('ReadGMSAPassword')
+        if any(not _is_default_acl_principal(sid) for sid in acl_rights):
+            stats['ldap']['dangerousAclObjects'] += 1
+
+        # PXE Boot Server check
+        netboot_server = attributes.get("netbootServer", [])
+        if netboot_server and any(v.strip() for v in netboot_server):
+            stats['ldap']['pxeBootServers'] += 1
+
+        # SCCM Client check (msSMSSiteCode present = enrolled SCCM client)
+        sccm_site_code = attributes.get("msSMSSiteCode", [])
+        if sccm_site_code and any(v.strip() for v in sccm_site_code):
+            stats['ldap']['sccmClients'] += 1
+
+        # SCCM Management Point check (objectClass contains mSSMSManagementPoint)
+        object_class = attributes.get("objectClass", [])
+        if "mSSMSManagementPoint" in object_class:
+            stats['ldap']['sccmManagementPoints'] += 1
+
+        # LAPS password readable check (dump account has read rights on it)
+        laps_readable, _, _ = is_laps_readable(attributes)
+        if laps_readable:
+            stats['ldap']['lapsReadable'] += 1
+
+        # Has Description check
+        description = attributes.get("description", [])
+        if description and any(desc.strip() for desc in description):
+            stats['ldap']['hasDescription'] += 1
+
+
+        ### OTHER STATS -------------------------------------------------------------------------
+
+        ## Object type classification
+        object_class = attributes.get("objectClass", [])
+        if object_class:
+            # Take the most specific class (usually the last one)
+            main_class = object_class[-1] if isinstance(object_class, list) else str(object_class)
+            stats['objectTypes'][main_class] = stats['objectTypes'].get(main_class, 0) + 1
+
+        ## Group statistics
+        memberof_values = attributes.get("memberOf", [])
+        group_names = extract_group_names(memberof_values, attributes)
+        
+        for group_name in group_names:
+            stats['groups'][group_name] = stats['groups'].get(group_name, 0) + 1
+
+    return stats
+
+def render_statistics_html(stats, is_computers_file=False):
+    total_objects = stats['global']['totalObjects'] or 1
+    u = stats['uac']
+    l = stats['ldap']
+    g = stats['global']
+
+    sorted_groups    = sorted(stats['groups'].items(),   key=lambda x: x[1], reverse=True)
+    sorted_uac_stats = sorted(stats['uacStats'].items(), key=lambda x: x[1], reverse=True)
+
+    # ---- Distribution bar helper ----
+    def dist_rows(items, max_val, bar_class):
+        out = ""
+        for name, count in items:
+            w   = round((count / max_val) * 100, 1) if max_val else 0
+            pct = round(count / total_objects * 100, 1)
+            out += f'''
+                <div class="dist-row">
+                    <span class="dist-label" title="{name}">{name}</span>
+                    <div class="dist-bar-wrap"><div class="dist-bar {bar_class}" style="width:{w}%"></div></div>
+                    <span class="dist-count">{count}<span class="bar-pct"> {pct}%</span></span>
+                </div>'''
+        return out
+
+    groups_html    = dist_rows(sorted_groups,    sorted_groups[0][1]    if sorted_groups    else 1, "accent")   if sorted_groups    else ""
+    uac_flags_html = dist_rows(sorted_uac_stats, sorted_uac_stats[0][1] if sorted_uac_stats else 1, "security") if sorted_uac_stats else ""
+
+    os_section_html = ""
+    if stats['osDistribution']:
+        sorted_os     = sorted(stats['osDistribution'].items(), key=lambda x: x[1], reverse=True)
+        os_items_html = dist_rows(sorted_os, sorted_os[0][1] if sorted_os else 1, "success")
+        os_section_html = f'''
+            <div class="stats-section">
+                <h3>🖥️ OS Distribution</h3>
+                <div class="dist-list">{os_items_html}</div>
+            </div>'''
+
+    # ---- Security findings row helper ----
+    def sec_row(label, count, severity, max_val):
+        w   = round((count / max_val) * 100, 1) if max_val else 0
+        pct = round(count / total_objects * 100, 1)
+        hl  = " highlight" if count > 0 and severity in ("critical", "warning") else ""
+        return f'''
+            <div class="sec-row {severity}{hl}">
+                <div class="sec-sev"></div>
+                <span class="sec-label">{label}</span>
+                <span class="sec-count">{count}</span>
+                <div class="sec-track"><div class="sec-bar" style="width:{w}%"></div></div>
+                <span class="sec-pct">{pct}%</span>
+            </div>'''
+
+    # Attack surface
+    atk_max = max(u['noKerberosPreAuth'], l['spnUsers'], u['trustedForDelegation'],
+                  u['constrainedDelegation'], l['constrainedDelegationTarget'],
+                  l['resourceBasedConstrainedDelegation'], 1)
+    attack_rows = (
+        sec_row("No Kerberos PreAuth (ASREProastable)", u['noKerberosPreAuth'],                 "critical", atk_max) +
+        sec_row("Kerberoastable (Has SPN)",             l['spnUsers'],                           "critical", atk_max) +
+        sec_row("Unconstrained Delegation (KUD)",       u['trustedForDelegation'],               "critical", atk_max) +
+        sec_row("KCD w/ Protocol Transition",           u['constrainedDelegation'],              "warning",  atk_max) +
+        sec_row("KCD w/o Protocol Transition",          l['constrainedDelegationTarget'],        "warning",  atk_max) +
+        sec_row("RBCD Delegation",                      l['resourceBasedConstrainedDelegation'], "warning",  atk_max)
+    )
+
+    # Account status
+    acc_max = max(u['disabledAccounts'], u['accountLocked'], g['neverLoggedIn'],
+                  g['inactiveAccounts'], g['recentlyCreated'], l['adminCountUsers'], 1)
+    account_rows = (
+        sec_row("AdminCount = 1",             l['adminCountUsers'],  "warning", acc_max) +
+        sec_row("Account Disabled",           u['disabledAccounts'], "info",    acc_max) +
+        sec_row("Account Locked Out",         u['accountLocked'],    "info",    acc_max) +
+        sec_row("Never Logged In",            g['neverLoggedIn'],    "info",    acc_max) +
+        sec_row("Inactive (lastLogon > 90d)", g['inactiveAccounts'], "info",    acc_max) +
+        sec_row("Recently Created (30d)",     g['recentlyCreated'],  "info",    acc_max)
+    )
+
+    # Password policy
+    pwd_max = max(u['passwordNotRequired'], u['reversibleEncryption'], u['useDESKey'],
+                  u['passwordNeverExpires'], u['passwordCantChange'], u['passwordExpired'], 1)
+    password_rows = (
+        sec_row("Password Not Required",         u['passwordNotRequired'],  "critical", pwd_max) +
+        sec_row("Reversible Encryption Enabled", u['reversibleEncryption'], "critical", pwd_max) +
+        sec_row("Use DES Key Only",              u['useDESKey'],            "warning",  pwd_max) +
+        sec_row("Password Never Expires",        u['passwordNeverExpires'], "warning",  pwd_max) +
+        sec_row("User Cannot Change Password",   u['passwordCantChange'],   "warning",  pwd_max) +
+        sec_row("Password Expired",              u['passwordExpired'],      "info",     pwd_max)
+    )
+
+    # Other / info
+    other_max = max(l['hasDescription'], u['smartcardRequired'], u['notDelegated'], l['gmsaAccounts'],
+                    l['dangerousAclObjects'],
+                    l['dmsaAccounts'] if is_computers_file else 0,
+                    l['unsupportedOS'] if is_computers_file else 0,
+                    l['pxeBootServers'] if is_computers_file else 0,
+                    l['sccmClients'] if is_computers_file else 0,
+                    l['sccmManagementPoints'] if is_computers_file else 0,
+                    l['lapsReadable'] if is_computers_file else 0, 1)
+    other_rows = sec_row("Has Description", l['hasDescription'], "info", other_max)
+    other_rows += sec_row("Objects with a Dangerous ACL Grant (non-default principal)", l['dangerousAclObjects'], "warning", other_max)
+    if is_computers_file:
+        other_rows += sec_row("Unsupported OS",                      l['unsupportedOS'],          "critical", other_max)
+        other_rows += sec_row("LAPS Password Readable (dump account)", l['lapsReadable'],          "critical", other_max)
+        other_rows += sec_row("gMSA (Group Managed Service Account)", l['gmsaAccounts'],           "warning",  other_max)
+        other_rows += sec_row("DMSA Accounts (check for BadSuccessor)", l['dmsaAccounts'],         "warning",  other_max)
+        other_rows += sec_row("PXE Boot Server (netbootServer)",     l['pxeBootServers'],         "warning",  other_max)
+        other_rows += sec_row("SCCM Clients (msSMSSiteCode)",        l['sccmClients'],            "warning",  other_max)
+        other_rows += sec_row("SCCM Management Points",              l['sccmManagementPoints'],   "warning",  other_max)
+    other_rows += (
+        sec_row("Smartcard Required",  u['smartcardRequired'], "info", other_max) +
+        sec_row("Cannot Be Delegated", u['notDelegated'],      "info", other_max)
+    )
+
+    # Hero alerts — only show non-zero entries
+    hero_alerts = ""
+    hero_items = [
+        (u['noKerberosPreAuth'],    "ASREProastable",       "critical"),
+        (l['spnUsers'],             "Kerberoastable",       "critical"),
+        (u['trustedForDelegation'], "Unconstrained Deleg.", "critical"),
+        (u['passwordNotRequired'],  "No Pwd Required",      "critical"),
+        (u['reversibleEncryption'], "Reversible Enc.",      "critical"),
+        (l['adminCountUsers'],      "AdminCount=1",         "warning"),
+        (u['passwordNeverExpires'], "Pwd Never Expires",    "warning"),
+        (u['constrainedDelegation'],"KCD Proto. Trans.",    "warning"),
+    ]
+    if is_computers_file:
+        hero_items.append((l['unsupportedOS'], "Unsupported OS", "critical"))
+        hero_items.append((l['lapsReadable'], "LAPS Password Readable", "critical"))
+        hero_items.append((l['gmsaAccounts'], "gMSA Accounts", "warning"))
+        hero_items.append((l['dmsaAccounts'], "DMSA Accounts (check for BadSuccessor)", "warning"))
+
+    # Sort by severity (critical first, then warning) while keeping relative order within each group
+    severity_rank = {"critical": 0, "warning": 1}
+    hero_items.sort(key=lambda item: severity_rank.get(item[2], 2))
+
+    for count, label, sev in hero_items:
+        if count > 0:
+            hero_alerts += f'<div class="hero-alert {sev}"><span class="ha-count">{count}</span><span class="ha-label">{label}</span></div>'
+
+    html = f'''
+        <div class="dashboard-container">
+            <div class="stats-grid">
+
+                <!-- Hero -->
+                <div class="stats-hero full-width">
+                    <div class="hero-left">
+                        <div class="hero-total">
+                            <span class="hero-number">{total_objects}</span>
+                            <span class="hero-unit">objects</span>
+                        </div>
+                        <div class="hero-pills">
+                            <span class="hero-pill">🏛️ {g['defaultObjects']} default (RID ≤ 1000)</span>
+                            <span class="hero-pill">🛠️ {g['nonDefaultObjects']} non-default (RID > 1000)</span>
+                        </div>
+                    </div>
+                    <div class="hero-alerts">
+                        {hero_alerts if hero_alerts else '<span class="hero-no-alerts">✅ No critical findings detected</span>'}
+                    </div>
+                </div>
+
+                <!-- Security Findings — replaces old UAC + LDAP sections -->
+                <div class="stats-section full-width">
+                    <h3>🔍 Security Findings</h3>
+                    <div class="sec-categories">
+                        <div class="sec-category">
+                            <h5 class="sec-cat-title">⚔️ Attack Surface</h5>
+                            <div class="sec-rows">{attack_rows}</div>
+                        </div>
+                        <div class="sec-category">
+                            <h5 class="sec-cat-title">👤 Account Status</h5>
+                            <div class="sec-rows">{account_rows}</div>
+                        </div>
+                        <div class="sec-category">
+                            <h5 class="sec-cat-title">🔐 Password Policy</h5>
+                            <div class="sec-rows">{password_rows}</div>
+                        </div>
+                        <div class="sec-category">
+                            <h5 class="sec-cat-title">📋 Other</h5>
+                            <div class="sec-rows">{other_rows}</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Groups Distribution -->
+                <div class="stats-section full-width">
+                    <h3>👥 Groups Distribution ({len(sorted_groups)})</h3>
+                    <div class="dist-list">{groups_html}</div>
+                </div>
+
+                <!-- UAC Flags | OS side-by-side -->
+                <div class="stats-section">
+                    <h3>🛡️ UAC Flags ({len(sorted_uac_stats)})</h3>
+                    <div class="dist-list">{uac_flags_html}</div>
+                </div>
+                {os_section_html}
+
+            </div>
+        </div>
+    '''
+
+    return html
+
+# ============================================================================
+# HTML RENDERING FUNCTIONS
+# ============================================================================
+# Functions to convert LDAP data into HTML format for web display
+
+def format_groups_chips_html(group_names):
+    """
+    Format group names as HTML chips
+    
+    Args:
+        group_names (list): List of group names
+        
+    Returns:
+        str: HTML string with group chips
+    """
+    if not group_names:
+        return ""
+    
+    privileged_groups = {
+        "Account Operators", "Administrators", "Backup Operators", "Server Operators",
+        "DnsAdmins", "Domain Admins", "Enterprise Admins", "Schema Admins",
+        "Group Policy Creator Owners", "Cert Publishers"
+    }
+    
+    chips_html = '<div class="groups-chips">'
+    for group_name in group_names:
+        # Determine chip class based on group type
+        chip_class = "group-chip"
+        fire_icon_html = ""
+        if group_name in privileged_groups or "admin" in group_name.lower() or "domain controllers" in group_name.lower():
+            chip_class += " privileged-group"
+        elif group_name == "Users" or group_name == "Domain Users":
+            chip_class += " user-group"
+        elif group_name == "Remote Management Users" or group_name == "Remote Desktop Users":
+            chip_class += " remote-group"
+        else:
+            chip_class += " other-group"
+            
+        chips_html += f'<span class="{chip_class}" title="{group_name}">{group_name} {fire_icon_html}</span>'
+    
+    chips_html += '</div>'
+    return chips_html
+   
+def render_entry(entry: dict, index: int, sid_map: dict = None) -> str:
+    """
+    Renders a single LDAP entry as HTML for the detail view
+
+    Args:
+        entry (dict): LDAP entry containing 'dn' and 'attributes' keys
+        index (int): Unique index for generating HTML element IDs
+        sid_map (dict): Optional SID -> display name map (see build_global_sid_map)
+
+    Returns:
+        str: HTML string representing the entry with collapsible attributes
+    """
+    attributes = entry.get("attributes", {})
+    dn = entry.get("dn", "")
+
+    display_name = extract_display_name(attributes, dn)
+    
+    # Check if user is kerberoastable (has servicePrincipalName)
+    kerberoastable = is_kerberoastable(attributes)
+
+    # SPN icon HTML (can be styled via CSS)
+    spn_chip_html = ''
+    if kerberoastable:
+        spn_chip_html = '<span class="spn-chip" title="Kerberoastable: Has SPN">🎯</span>'
+
+    # decoded once, reused below for the 🔑 chip and the attribute row
+    gmsa_readers_html = decode_group_msa_membership(attributes.get("msDS-GroupMSAMembership", []), sid_map)
+    gmsa_has_readers = bool(gmsa_readers_html) and 'gmsa-reader-chip' in gmsa_readers_html
+
+    # only shown when the password is actually exposed to someone
+    gmsa_chip_html = ''
+    if is_gmsa(attributes) and gmsa_has_readers:
+        gmsa_chip_html = '<span class="gmsa-chip" title="gMSA: Group Managed Service Account - its password is readable by at least one principal (see msDS-GroupMSAMembership below)">🔑</span>'
+
+    # dMSA icon HTML + BadSuccessor risk icon (can be styled via CSS)
+    dmsa_chip_html = ''
+    dmsa_review_chip_html = ''
+    dmsa_migration_completed = is_dmsa_migration_completed(attributes)
+    if is_dmsa(attributes):
+        dmsa_chip_html = '<span class="dmsa-chip" title="dMSA: Delegated Managed Service Account">🧬</span>'
+        if dmsa_migration_completed:
+            dmsa_review_chip_html = (
+                '<span class="dmsa-review-chip" '
+                'title="BadSuccessor risk: msDS-DelegatedMSAState=2 (migration completed) with '
+                'msDS-ManagedAccountPrecededByLink set. The KDC embeds the linked account SID in this '
+                'dMSA PAC without verifying a real migration happened. Confirm legitimacy and check who '
+                'can write these attributes / has CreateChild on the parent OU (e.g. nxc ldap -M badsuccessor).">'
+                '💀</span>'
+            )
+
+    # Extract and format groups
+    memberof_values = attributes.get("memberOf", [])
+    group_names = extract_group_names(memberof_values, attributes)
+    groups_chips_html = format_groups_chips_html(group_names)
+
+    # decoded once, reused below for the LAPS/⚔️ chips and the attribute row.
+    # gMSA password readers (a separate attribute/DACL) are merged in as
+    # ReadGMSAPassword so they show up in the same unified ACL rights list.
+    acl_rights = _collect_dangerous_aces(attributes.get("nTSecurityDescriptor", [])) or {}
+    if is_gmsa(attributes):
+        for reader_sid in _collect_gmsa_reader_sids(attributes.get("msDS-GroupMSAMembership", [])):
+            acl_rights.setdefault(reader_sid, set()).add('ReadGMSAPassword')
+    dangerous_acl_html = _render_acl_rights(acl_rights, sid_map) if (attributes.get("nTSecurityDescriptor") or acl_rights) else None
+    has_dangerous_acl = bool(dangerous_acl_html) and 'acl-right-notable' in dangerous_acl_html
+
+    # dump account could read it directly, or ACL grants ReadLAPSPassword
+    laps_chip_html = ''
+    laps_readable, laps_cleartext, laps_attribute = is_laps_readable(attributes)
+    laps_readable_via_acl = bool(dangerous_acl_html) and 'ReadLAPSPassword' in dangerous_acl_html
+    if laps_readable or laps_readable_via_acl:
+        if laps_readable:
+            laps_kind = "cleartext" if laps_cleartext else "encrypted (DPAPI-NG, needs further decryption)"
+            laps_reason = f"the account used to run this dump has read rights on the local admin password ({laps_attribute}, {laps_kind})"
+        else:
+            laps_reason = "its DACL grants ReadLAPSPassword to at least one principal (see nTSecurityDescriptor below)"
+        laps_chip_html = f'<span class="laps-chip" title="LAPS password readable: {laps_reason}.">🔓</span>'
+
+    dangerous_acl_chip_html = ''
+    if has_dangerous_acl:
+        dangerous_acl_chip_html = (
+            '<span class="acl-chip" '
+            "title=\"This object's DACL grants a dangerous right (GenericAll, WriteOwner, "
+            'WriteDacl, Owns, ForceChangePassword, AllExtendedRights, GenericWrite, AddSelf, '
+            'AddMember, AddKeyCredentialLink, WriteSPN, AllowedToAct, ReadLAPSPassword, ReadGMSAPassword, '
+            'DCSync, CreateChild) to a non-default principal - review who they are.">'
+            '⚔️</span>'
+        )
+
+    # Create collapsible entry header with toggle functionality
+    html = f'''<div class="entry">
+<div class="entry-header" onclick="toggle('attr{index}')">
+    <h2>{display_name} {spn_chip_html}{gmsa_chip_html}{dmsa_chip_html}{dmsa_review_chip_html}{laps_chip_html}{dangerous_acl_chip_html}</h2>
+    {groups_chips_html}
+</div>
+<div class="attributes" id="attr{index}">'''
+
+    # Define minimal columns (same as ldapdomaindump)
+    minimal_columns = {
+        'cn', 'sAMAccountName', 'whenCreated', 'whenChanged', 'lastLogon',
+        'userAccountControl', 'pwdLastSet', 'objectSid', 'memberOf','description', 'servicePrincipalName',
+        'dNSHostName', 'operatingSystem', 'operatingSystemVersion', 'operatingSystemServicePack',
+        'securityIdentifier', 'trustAttributes', 'trustDirection', 'trustType',
+        'msDS-DelegatedMSAState', 'msDS-ManagedAccountPrecededByLink', 'nTSecurityDescriptor'
+    } | LAPS_ATTRIBUTES
+
+    # Build attributes table
+    html += '<table class="attr-table">'
+    for key, values in attributes.items():
+        # Add data attribute to identify minimal columns
+        row_class = 'minimal-column' if key in minimal_columns else 'extended-column'
+        
+        val = ', '.join(map(str, values))
+
+        # Special handling for userAccountControl
+        if key == "userAccountControl" and values:
+            try:
+                uac_value = int(values[0])
+                uac_flags = decode_uac_flags(uac_value)
+                val = format_uac_display_html(uac_value, uac_flags)
+            except (ValueError, TypeError):
+                pass
+
+        # Special handling for msDS-GroupMSAMembership (gMSA password readers)
+        if key == "msDS-GroupMSAMembership" and gmsa_readers_html:
+            val = gmsa_readers_html
+
+        # Special handling for msDS-AllowedToActOnBehalfOfOtherIdentity (RBCD principals)
+        if key == "msDS-AllowedToActOnBehalfOfOtherIdentity" and values:
+            decoded = decode_rbcd_principals(values, sid_map)
+            if decoded:
+                val = decoded
+
+        # Special handling for nTSecurityDescriptor (dangerous ACL rights)
+        if key == "nTSecurityDescriptor" and dangerous_acl_html:
+            val = dangerous_acl_html
+
+        # Special handling for msDS-DelegatedMSAState (dMSA migration state)
+        if key == "msDS-DelegatedMSAState" and values:
+            try:
+                state_value = int(values[0])
+                state_flags = decode_delegated_msa_state(state_value)
+                val = format_uac_display_html(state_value, state_flags)
+            except (ValueError, TypeError):
+                pass
+
+        # Highlight msDS-ManagedAccountPrecededByLink when the migration is marked completed (review for BadSuccessor)
+        if key == "msDS-ManagedAccountPrecededByLink" and values and dmsa_migration_completed:
+            val = f'<span class="dmsa-flagged-value" title="This dMSA is marked as migrated (state=2): the KDC will trust this link and embed the target account SID in the dMSA PAC.">⚠️ {val}</span>'
+
+        # Highlight LAPS password attributes: their presence means the dump account can read them
+        if key in LAPS_ATTRIBUTES and values and any(str(v).strip() for v in values):
+            title = "Cleartext local admin password" if key in LAPS_CLEARTEXT_ATTRIBUTES else "Encrypted local admin password (DPAPI-NG, needs further decryption)"
+            val = f'<span class="laps-flagged-value" title="{title} - readable by the dump account.">🔓 {val}</span>'
+
+        html += f'<tr class="{row_class}"><td class="key">{key}</td><td class="value">{val}</td></tr>\n'
+    html += "</table>\n</div>\n</div>\n"
+    return html
+
+def render_table(data: list, keys: list) -> str:
+    # Ordered minimal columns — only these are shown in the table view
+    minimal_columns_ordered = [
+        'sAMAccountName', 'cn', 'description', 'memberOf', 'userAccountControl',
+        'pwdLastSet', 'lastLogon', 'whenCreated', 'whenChanged',
+        'objectSid',
+        'servicePrincipalName',
+        'dNSHostName', 'operatingSystem', 'operatingSystemVersion', 'operatingSystemServicePack',
+        'securityIdentifier', 'trustAttributes', 'trustDirection', 'trustType',
+        'msDS-DelegatedMSAState', 'msDS-ManagedAccountPrecededByLink',
+        'ms-Mcs-AdmPwd', 'msLAPS-Password',
+    ]
+
+    # Keep only columns that actually exist in the data
+    present_keys = set(keys)
+    table_keys = [k for k in minimal_columns_ordered if k in present_keys]
+
+    html = "<table>\n<thead><tr><th>Name</th>"
+    for k in table_keys:
+        label = "RID" if k == "objectSid" else k
+        html += f"<th>{label}</th>"
+    html += "</tr></thead>\n<tbody>\n"
+
+    for idx, entry in enumerate(data):
+        attributes = entry.get("attributes", {})
+        dn = entry.get("dn", "")
+        display_name = extract_display_name(attributes, dn)
+
+        html += f'<tr data-attr-id="attr{idx}"><td>{display_name}</td>'
+
+        for k in table_keys:
+            values = attributes.get(k, [])
+
+            if k == "userAccountControl" and values:
+                try:
+                    uac_value = int(values[0])
+                    uac_flags = decode_uac_flags(uac_value)
+                    val = format_uac_display_html(uac_value, uac_flags)
+                except (ValueError, TypeError):
+                    val = str(values[0]) if values else ""
+
+            elif k == "msDS-DelegatedMSAState" and values:
+                try:
+                    state_value = int(values[0])
+                    state_flags = decode_delegated_msa_state(state_value)
+                    val = format_uac_display_html(state_value, state_flags)
+                except (ValueError, TypeError):
+                    val = str(values[0]) if values else ""
+
+            elif k == "msDS-ManagedAccountPrecededByLink" and values and is_dmsa_migration_completed(attributes):
+                val = f'<span class="dmsa-flagged-value">⚠️ {", ".join(map(str, values))}</span>'
+
+            elif k in LAPS_CLEARTEXT_ATTRIBUTES and values and any(str(v).strip() for v in values):
+                val = f'<span class="laps-flagged-value">🔓 {", ".join(map(str, values))}</span>'
+
+            elif k == "memberOf":
+                # Extract CN name from each DN, stripping the "CN=" prefix
+                group_names = []
+                for dn_val in values:
+                    if isinstance(dn_val, str):
+                        first = dn_val.split(',')[0].strip()
+                        if first.upper().startswith('CN='):
+                            group_names.append(first[3:])
+                        else:
+                            group_names.append(first)
+                val = ', '.join(group_names)
+
+            elif k == "objectSid" and values:
+                rid = getRIDFromObjectSID(str(values[0]))
+                val = str(rid) if rid is not None else str(values[0])
+
+            else:
+                val = ', '.join(map(str, values))
+
+            html += f"<td>{val}</td>"
+        html += "</tr>\n"
+
+    html += "</tbody>\n</table>\n"
+    return html
+
+# ============================================================================
+# MAIN PROCESSING FUNCTION
+# ============================================================================
+# Core function that orchestrates the HTML generation process
+
+def is_users_file(input_file) -> bool:
+    """
+    Determine if the file contains user objects
+    
+    Args:
+        input_file (str): Path to the input file
+        data (list): LDAP data entries
+        
+    Returns:
+        bool: True if file contains users, False otherwise
+    """
+    # Check filename first
+    filename = os.path.basename(input_file).lower()
+    if 'users' in filename:
+        return True
+    else:
+        return False
+    
+def is_computers_file(input_file) -> bool:
+    """
+    Determine if the file contains computer objects
+
+    Args:
+        input_file (str): Path to the input file
+        data (list): LDAP data entries
+        
+    Returns:
+        bool: True if file contains users, False otherwise
+    """
+    # Check filename first
+    filename = os.path.basename(input_file).lower()
+    if 'computer' in filename:
+        return True
+    else:
+        return False
+
+def is_policy_file(input_file) -> bool:
+    """
+    Determine if the file contains domain policy objects
+    
+    Args:
+        input_file (str): Path to the input file
+        
+    Returns:
+        bool: True if file contains policy, False otherwise
+    """
+    filename = os.path.basename(input_file).lower()
+    if 'policy' in filename:
+        return True
+    return False
+
+def is_trusts_file(input_file) -> bool:
+    """
+    Determine if the file contains domain trust objects
+    
+    Args:
+        input_file (str): Path to the input file
+        
+    Returns:
+        bool: True if file contains trusts, False otherwise
+    """
+    filename = os.path.basename(input_file).lower()
+    if 'trust' in filename:
+        return True
+    return False
+
+def render_policy_report(data, input_file):
+    """
+    Render a specific report for domain policy
+    """
+    output_file = "ldapviewer_" + os.path.splitext(os.path.basename(input_file))[0] + ".html"
+    filename = os.path.basename(input_file)
+    
+    # Helper for duration formatting
+    def format_duration(duration_str):
+        if not duration_str or duration_str == "-":
+            return duration_str
+        
+        # Handle "days" format (e.g. "42 days, 0:00:00")
+        if "day" in duration_str:
+            parts = duration_str.split(',')
+            days_part = parts[0].strip()
+            time_part = parts[1].strip() if len(parts) > 1 else "0:00:00"
+        else:
+            days_part = ""
+            time_part = duration_str.strip()
+            
+        try:
+            # Parse time part HH:MM:SS
+            if ':' in time_part:
+                time_part = time_part.split('.')[0] # Remove microseconds if present
+                h, m, s = map(int, time_part.split(':'))
+            else:
+                h, m, s = 0, 0, 0
+                
+            result = []
+            if days_part:
+                result.append(days_part)
+                
+            if h > 0:
+                result.append(f"{h} hour{'s' if h != 1 else ''}")
+            if m > 0:
+                result.append(f"{m} minute{'s' if m != 1 else ''}")
+            if s > 0:
+                result.append(f"{s} second{'s' if s != 1 else ''}")
+                
+            if not result:
+                return "0 seconds"
+                
+            return ", ".join(result)
+        except:
+            return duration_str
+
+    # Helper for pwdProperties decoding
+    def decode_pwd_properties(val_list):
+        if not val_list:
+            return "-"
+        try:
+            val = int(val_list[0])
+        except:
+            return str(val_list[0])
+            
+        flags = []
+        if val & 1: flags.append("DOMAIN_PASSWORD_COMPLEX")
+        if val & 2: flags.append("DOMAIN_PASSWORD_NO_ANON_CHANGE")
+        if val & 4: flags.append("DOMAIN_PASSWORD_NO_CLEAR_CHANGE")
+        if val & 8: flags.append("DOMAIN_LOCKOUT_ADMINS")
+        if val & 16: flags.append("DOMAIN_PASSWORD_STORE_CLEARTEXT")
+        if val & 32: flags.append("DOMAIN_REFUSE_PASSWORD_CHANGE")
+        
+        if not flags:
+            return str(val)
+            
+        return "<br>".join(flags)
+
+    # Load styles from frontend/style.css
+    base_dir = os.path.dirname(os.path.realpath(__file__))
+    style_file = os.path.join(base_dir, "frontend", "style.css")
+    try:
+        with open(style_file, "r", encoding="utf-8") as f:
+            style_content = f.read()
+    except:
+        style_content = ""
+    
+    content_html = ""
+    
+    # Define fields and their formatters
+    policy_fields = [
+        ("Distinguished Name", "distinguishedName", None),
+        ("Lockout Observation Window", "lockOutObservationWindow", format_duration),
+        ("Lockout Duration", "lockoutDuration", format_duration),
+        ("Lockout Threshold", "lockoutThreshold", None),
+        ("Max Password Age", "maxPwdAge", format_duration),
+        ("Min Password Age", "minPwdAge", format_duration),
+        ("Min Password Length", "minPwdLength", None),
+        ("Password History Length", "pwdHistoryLength", None),
+        ("Password Properties", "pwdProperties", decode_pwd_properties),
+        ("Machine Account Quota", "ms-DS-MachineAccountQuota", None)
+    ]
+
+    for entry in data:
+        attributes = entry.get("attributes", {})
+        dn = entry.get("dn", "")
+        display_name = extract_display_name(attributes, dn)
+        
+        entry_html = f'''
+        <div class="policy-card">
+            <div class="policy-header">
+                <h2>🛡️ Domain Policy: {display_name}</h2>
+            </div>
+            <table class="policy-table">
+        '''
+        
+        for label, key, formatter in policy_fields:
+            values = attributes.get(key, [])
+            
+            if key == "pwdProperties":
+                # Special handling for pwdProperties which needs the list/int
+                val_str = formatter(values)
+            else:
+                if values:
+                    raw_val = str(values[0])
+                    if formatter:
+                        val_str = formatter(raw_val)
+                    else:
+                        val_str = ', '.join(map(str, values))
+                else:
+                    val_str = "-"
+            
+            entry_html += f"<tr><td class='policy-key'>{label}</td><td class='policy-value'>{val_str}</td></tr>\n"
+            
+        entry_html += "</table>\n</div>\n"
+        content_html += entry_html
+
+    html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>LDAP Policy Viewer - {filename}</title>
+    <style>
+        {style_content}
+        
+        /* Overrides for Policy Report */
+        body {{
+            padding: 40px;
+            max-width: 1000px;
+            margin: 0 auto;
+        }}
+        
+        .header-container {{
+            margin-bottom: 30px;
+            border-bottom: 2px solid var(--border-light);
+            padding-bottom: 20px;
+        }}
+        
+        .policy-card {{
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            box-shadow: var(--shadow-medium);
+            border: 1px solid var(--border-light);
+            overflow: hidden;
+            margin-bottom: 30px;
+        }}
+        
+        .policy-header {{
+            background: var(--accent-secondary);
+            padding: 15px 25px;
+            color: white;
+        }}
+        
+        .policy-header h2 {{
+            margin: 0;
+            font-size: 18px;
+            color: white;
+        }}
+        
+        .policy-table {{
+            width: 100%;
+            border-collapse: collapse;
+        }}
+        
+        .policy-table td {{
+            padding: 12px 25px;
+            border-bottom: 1px solid var(--border-light);
+            color: var(--text-primary);
+        }}
+        
+        .policy-table tr:last-child td {{
+            border-bottom: none;
+        }}
+        
+        .policy-key {{
+            font-weight: 600;
+            color: var(--text-secondary);
+            width: 35%;
+            background-color: var(--bg-tertiary);
+        }}
+        
+        .policy-value {{
+            font-family: 'Consolas', monospace;
+        }}
+        
+        .footer {{
+            text-align: center;
+            margin-top: 50px;
+            color: var(--text-muted);
+            font-size: 12px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="header-container">
+        <h1>LDAP Viewer <span style="font-size: 0.6em; opacity: 0.7; font-weight: normal;">- {filename}</span></h1>
+    </div>
+
+    {content_html}
+</body>
+</html>'''
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"[+] Interactive HTML interface generated: {output_file}")
+
+def render_trusts_report(data, input_file):
+    """
+    Render a specific report for domain trusts
+    """
+    output_file = "ldapviewer_" + os.path.splitext(os.path.basename(input_file))[0] + ".html"
+    filename = os.path.basename(input_file)
+    
+    # Helpers for decoding
+    def decode_trust_direction(val_list):
+        if not val_list: return "-"
+        try:
+            val = int(val_list[0])
+        except: return str(val_list[0])
+        
+        mapping = {
+            0: "TRUST_DIRECTION_DISABLED",
+            1: "TRUST_DIRECTION_INBOUND",
+            2: "TRUST_DIRECTION_OUTBOUND",
+            3: "TRUST_DIRECTION_BIDIRECTIONAL"
+        }
+        
+        return mapping.get(val, f"Unknown ({val})")
+
+    def decode_trust_type(val_list):
+        if not val_list: return "-"
+        try:
+            val = int(val_list[0])
+        except: return str(val_list[0])
+        
+        mapping = {
+            1: ("TRUST_TYPE_DOWNLEVEL", "The trusted domain is a Windows domain not running AD"),
+            2: ("TRUST_TYPE_UPLEVEL", "The trusted domain is a Windows domain running AD"),
+            3: ("TRUST_TYPE_MIT", "The trusted domain is a Non-Windows with Kerberos"),
+            4: ("TRUST_TYPE_DCE", "Not used"),
+            5: ("TRUST_TYPE_AAD", "The trusted domain is in Azure Active Directory")
+        }
+        
+        if val in mapping:
+            const_name, desc = mapping[val]
+            return f"{const_name} ({desc})"
+        return f"Unknown ({val})"
+
+    def decode_trust_attributes(val_list):
+        if not val_list: return "-"
+        try:
+            val = int(val_list[0])
+        except: return str(val_list[0])
+        
+        flags_map = {
+            1: ("TRUST_ATTRIBUTE_NON_TRANSITIVE", "Trust is not transitive"),
+            2: ("TRUST_ATTRIBUTE_UPLEVEL_ONLY", "Only Windows 2000 and newer operating systems can use the trust"),
+            4: ("TRUST_ATTRIBUTE_QUARANTINED_DOMAIN", "Domain is quarantined and subject to SID filtering"),
+            8: ("TRUST_ATTRIBUTE_FOREST_TRANSITIVE", "Cross forest trust between forests"),
+            16: ("TRUST_ATTRIBUTE_CROSS_ORGANIZATION", "Domain or forest is not part of the organization"),
+            32: ("TRUST_ATTRIBUTE_WITHIN_FOREST", "Trusted domain is in the same forest"),
+            64: ("TRUST_ATTRIBUTE_TREAT_AS_EXTERNAL", "Trust is treated as an external trust for SID filtering"),
+            128: ("TRUST_ATTRIBUTE_USES_RC4_ENCRYPTION", "Set when trustType is TRUST_TYPE_MIT, which can use RC4 keys"),
+            256: ("TRUST_ATTRIBUTE_TRUST_USES_AES_KEYS", "Trust uses AES keys"),
+            512: ("TRUST_ATTRIBUTE_CROSS_ORGANIZATION_NO_TGT_DELEGATION", "Tickets under this trust are not trusted for delegation"),
+            1024: ("TRUST_ATTRIBUTE_PIM_TRUST", "Cross-forest trust to a domain is treated as Privileged Identity Management (PIM) trust for the purposes of SID filtering"),
+            2048: ("TRUST_ATTRIBUTE_CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION", "Tickets under this trust are trusted for delegation")
+        }
+        
+        active_flags = []
+        for bit, (const_name, desc) in flags_map.items():
+            if val & bit:
+                active_flags.append(f"{const_name} ({desc})")
+        
+        if not active_flags:
+            return str(val) if val != 0 else "-"
+            
+        html = '<div style="display: flex; flex-direction: column; gap: 4px;">'
+        for f in active_flags:
+            html += f'<span>{f}</span>'
+        html += '</div>'
+        return html
+
+    def decode_security_identifier(val_list):
+        if not val_list: return "-"
+        val = val_list[0]
+        
+        # Handle dictionary format from ldapdomaindump
+        if isinstance(val, dict) and val.get('encoding') == 'base64':
+            try:
+                encoded_data = val.get('encoded', '')
+                binary_data = base64.b64decode(encoded_data)
+                
+                revision = binary_data[0]
+                sub_authority_count = binary_data[1]
+                identifier_authority = int.from_bytes(binary_data[2:8], byteorder='big')
+                
+                sub_authorities = []
+                for i in range(sub_authority_count):
+                    start = 8 + (i * 4)
+                    end = start + 4
+                    sub_authorities.append(int.from_bytes(binary_data[start:end], byteorder='little'))
+                
+                return f"S-{revision}-{identifier_authority}-" + "-".join(map(str, sub_authorities))
+            except Exception:
+                return str(val)
+        return str(val)
+
+    # Load styles
+    base_dir = os.path.dirname(os.path.realpath(__file__))
+    style_file = os.path.join(base_dir, "frontend", "style.css")
+    try:
+        with open(style_file, "r", encoding="utf-8") as f:
+            style_content = f.read()
+    except:
+        style_content = ""
+        
+    # Extract current domain from the first entry's DN
+    current_domain = "Unknown"
+    if data:
+        for entry in data:
+            dn = entry.get("dn", "")
+            if "DC=" in dn.upper():
+                parts = dn.split(',')
+                dc_parts = [p.strip()[3:] for p in parts if p.strip().upper().startswith('DC=')]
+                if dc_parts:
+                    current_domain = '.'.join(dc_parts)
+                    break
+
+    content_html = ""
+    
+    # Fields to display
+    fields = [
+        ("CN", "cn", None),
+        ("NETBIOS Domain name", "flatName", None),
+        ("Security Identifier", "securityIdentifier", decode_security_identifier),
+        ("Trust Attributes", "trustAttributes", decode_trust_attributes),
+        ("Trust Direction", "trustDirection", decode_trust_direction),
+        ("Trust Type", "trustType", decode_trust_type)
+    ]
+    
+    for entry in data:
+        attributes = entry.get("attributes", {})
+        dn = entry.get("dn", "")
+        display_name = extract_display_name(attributes, dn)
+        
+        entry_html = f'''
+        <div class="policy-card">
+            <div class="policy-header">
+                <h2>🤝 Domain Trust: {display_name}</h2>
+            </div>
+            <table class="policy-table">
+        '''
+        
+        for label, key, formatter in fields:
+            values = attributes.get(key, [])
+            
+            if formatter:
+                val_str = formatter(values)
+            else:
+                if values:
+                    val_str = ', '.join(map(str, values))
+                else:
+                    val_str = "-"
+            
+            entry_html += f"<tr><td class='policy-key'>{label}</td><td class='policy-value'>{val_str}</td></tr>\n"
+            
+        entry_html += "</table>\n</div>\n"
+        content_html += entry_html
+
+    # Reusing policy report styles with overrides
+    html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>LDAP Trusts Viewer - {filename}</title>
+    <style>
+        {style_content}
+        
+        /* Overrides for Trust Report */
+        body {{
+            padding: 40px;
+            max-width: 1000px;
+            margin: 0 auto;
+        }}
+        
+        .header-container {{
+            margin-bottom: 30px;
+            border-bottom: 2px solid var(--border-light);
+            padding-bottom: 20px;
+        }}
+        
+        .policy-card {{
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            box-shadow: var(--shadow-medium);
+            border: 1px solid var(--border-light);
+            overflow: hidden;
+            margin-bottom: 30px;
+        }}
+        
+        .policy-header {{
+            background: var(--accent-secondary);
+            padding: 15px 25px;
+            color: white;
+        }}
+        
+        .policy-header h2 {{
+            margin: 0;
+            font-size: 18px;
+            color: white;
+        }}
+        
+        .policy-table {{
+            width: 100%;
+            border-collapse: collapse;
+        }}
+        
+        .policy-table td {{
+            padding: 12px 25px;
+            border-bottom: 1px solid var(--border-light);
+            color: var(--text-primary);
+        }}
+        
+        .policy-table tr:last-child td {{
+            border-bottom: none;
+        }}
+        
+        .policy-key {{
+            font-weight: 600;
+            color: var(--text-secondary);
+            width: 35%;
+            background-color: var(--bg-tertiary);
+        }}
+        
+        .policy-value {{
+            font-family: 'Consolas', monospace;
+        }}
+        
+        .trust-container {{
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        
+        .trust-value {{
+            font-weight: bold;
+            margin-right: 10px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="header-container">
+        <h1>LDAP Viewer <span style="font-size: 0.6em; opacity: 0.7; font-weight: normal;">- {filename}</span></h1>
+        <h3 style="margin: 5px 0 0 0; color: var(--text-secondary); font-weight: normal;">Current Domain: <strong>{current_domain}</strong></h3>
+    </div>
+
+    {content_html}
+</body>
+</html>'''
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"[+] Interactive HTML interface generated: {output_file}")
+
+def main(input_file, sid_map=None):
+    """
+    Main function that processes a JSON LDAP dump and generates an HTML viewer
+
+    Args:
+        input_file (str): Path to the input JSON file containing LDAP data
+        sid_map (dict): Optional SID -> display name map built across all
+            input files (see build_global_sid_map), used to resolve gMSA
+            password readers (msDS-GroupMSAMembership) to readable names
+    """
+    # Generate output filename based on input filename
+    output_file = "ldapviewer_" + os.path.splitext(os.path.basename(input_file))[0] + ".html"
+
+    # Determine paths to frontend resources (CSS, JS, HTML template)
+    base_dir = os.path.dirname(os.path.realpath(__file__))
+    frontend_dir = os.path.join(base_dir, "frontend")
+    template_file = os.path.join(frontend_dir, "template.html")
+    style_file = os.path.join(frontend_dir, "style.css")
+    script_file = os.path.join(frontend_dir, "script.js")
+    
+    # Load and parse the LDAP JSON data
+    try:
+        with open(input_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"[!] Error: Invalid JSON in file '{input_file}': {e}")
+        return
+    except Exception as e:
+        print(f"[!] Error reading file '{input_file}': {e}")
+        return
+
+    # Normalize adwsdomaindump's flat, single-valued export into ldapdomaindump's
+    # {"dn", "attributes"} structure so the rest of the pipeline is format-agnostic
+    if is_adws_dump_format(data):
+        print(f"[+] Detected adwsdomaindump format, converting to ldapdomaindump structure")
+        data = normalize_ldap_data(data)
+
+    print(f"Processing {len(data)} entries from '{input_file}'")
+
+    # Check if this is a policy file
+    if is_policy_file(input_file):
+        render_policy_report(data, input_file)
+        return
+
+    # Check if this is a trusts file
+    if is_trusts_file(input_file):
+        render_trusts_report(data, input_file)
+        return
+
+    # Check if this is a users file
+    is_users = is_users_file(input_file)
+
+    # Determine page title based on file type
+    filename = os.path.basename(input_file)
+    if is_users:
+        page_title = f"LDAP Users Viewer - {filename}"
+    elif is_computers_file(input_file):
+        page_title = f"LDAP Computers Viewer - {filename}"
+    elif 'group' in filename.lower():
+        page_title = f"LDAP Groups Viewer - {filename}"
+    else:
+        page_title = f"LDAP Viewer - {filename}"
+
+    # Generate HTML content for detail view
+    detail_html = ""
+    for idx, entry in enumerate(data):
+        detail_html += render_entry(entry, idx, sid_map)
+    
+    # Generate HTML content for table view
+    keys = gather_all_keys(data)
+    table_html = render_table(data, keys)
+    
+    # Calculate statistics and generate stats HTML
+    stats = calculate_ldap_statistics(data)
+    stats_html = render_statistics_html(stats, is_computers_file=is_computers_file(input_file))
+
+    # Load frontend template and assets
+    with open(template_file, "r", encoding="utf-8") as f:
+        template = f.read()
+    with open(style_file, "r", encoding="utf-8") as f:
+        style_content = f.read()
+    with open(script_file, "r", encoding="utf-8") as f:
+        script_content = f.read()
+
+    # Conditionally show/hide the group by button based on file type
+    if not is_users:
+        # Hide the group by button for non-user files
+        style_content += "\n#groupByBtn { display: none !important; }"
+
+    # Combine template with generated content and inline assets
+    full_html = template.format(
+        detail_content=detail_html,
+        table_content=table_html,
+        stats_content=stats_html,
+        filename=os.path.basename(input_file),
+        page_title=page_title,
+        style_content=style_content,
+        script_content=script_content
+    )
+
+    # Write the complete HTML file
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(full_html)
+
+    print(f"[+] Interactive HTML interface generated: {output_file}")
+
+
+logo_ascii = r"""
+    __    __          _    ___                       
+   / /___/ /___ _____| |  / (_)__ _      _____  _____
+  / / __  / __ `/ __ \ | / / / _ \ | /| / / _ \/ ___/
+ / / /_/ / /_/ / /_/ / |/ / /  __/ |/ |/ /  __/ /    
+/_/\__,_/\__,_/ .___/|___/_/\___/|__/|__/\___/_/     
+             /_/                                     
+"""
+
+if __name__ == "__main__":
+    print(logo_ascii)
+    print("LDAPViewer v5.0 - by NathanielSlw\n")
+    
+    parser = argparse.ArgumentParser(
+        description='Generates an interactive HTML interface to explore ldapdomaindump JSON files.',
+        epilog='Examples:\n  python ldapviewer.py domain_users.json\n  python ldapviewer.py domain_users.json domain_computers.json\n  python ldapviewer.py *.json',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser._positionals.title = 'arguments'
+    parser.add_argument('json_files', nargs='+', help='One or more ldapdomaindump JSON files (domain_users.json, domain_computers.json, etc.)')
+
+    args = parser.parse_args()
+    input_files = args.json_files
+    
+    # Validate input files
+    for input_file in input_files:
+        if not os.path.isfile(input_file):
+            print(f"[!] Error: Input file '{input_file}' not found.")
+            sys.exit(1)
+        if not input_file.lower().endswith('.json'):
+            print(f"[!] Error: Input file '{input_file}' must have a .json extension.")
+            sys.exit(1)
+
+    # Build a SID -> name map across ALL input files so gMSA password readers
+    # (msDS-GroupMSAMembership) can be resolved to a name even when the
+    # principal isn't a well-known SID
+    sid_map = build_global_sid_map(input_files)
+
+    # Process each file
+    for input_file in input_files:
+        main(input_file, sid_map)

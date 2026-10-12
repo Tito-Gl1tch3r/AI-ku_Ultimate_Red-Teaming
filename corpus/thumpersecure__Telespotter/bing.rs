@@ -1,0 +1,65 @@
+use crate::search::{is_blocked_page, BlockedError, SearchResult};
+use anyhow::Result;
+use scraper::{Html, Selector};
+
+/// Search Bing with default configuration
+#[allow(dead_code)]
+pub async fn search(query: &str, num_results: usize, client: &reqwest::Client) -> Result<Vec<SearchResult>> {
+    search_with_config(query, num_results, client).await
+}
+
+/// Search Bing with a shared client
+pub async fn search_with_config(query: &str, num_results: usize, client: &reqwest::Client) -> Result<Vec<SearchResult>> {
+    // Wrap query in quotes for exact phrase matching
+    let quoted_query = format!("\"{}\"", query);
+    let encoded_query = urlencoding::encode(&quoted_query);
+    let url = format!(
+        "https://www.bing.com/search?q={}&count={}",
+        encoded_query, num_results
+    );
+
+    let response = client.get(&url).send().await?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!("Bing search error: {}", response.status()));
+    }
+
+    let html = response.text().await?;
+
+    if is_blocked_page(&html) {
+        return Err(BlockedError { engine: "Bing".to_string() }.into());
+    }
+
+    let document = Html::parse_document(&html);
+
+    let mut results = Vec::new();
+
+    // Selector for Bing search results
+    let result_selector = Selector::parse("li.b_algo").unwrap();
+    let title_selector = Selector::parse("h2").unwrap();
+    let snippet_selector = Selector::parse("p").unwrap();
+
+    for element in document.select(&result_selector) {
+        let title = element
+            .select(&title_selector)
+            .next()
+            .map(|e| e.text().collect::<String>())
+            .unwrap_or_default();
+
+        let snippet = element
+            .select(&snippet_selector)
+            .next()
+            .map(|e| e.text().collect::<String>())
+            .unwrap_or_default();
+
+        if !title.is_empty() || !snippet.is_empty() {
+            results.push(SearchResult::new(
+                title,
+                snippet,
+                "Bing".to_string(),
+            ));
+        }
+    }
+
+    Ok(results)
+}

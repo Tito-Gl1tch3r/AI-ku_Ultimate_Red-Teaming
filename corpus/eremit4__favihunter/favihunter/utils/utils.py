@@ -1,0 +1,201 @@
+from os import listdir, remove
+from colorama import Fore, Style
+from requests import get
+from requests.exceptions import RequestException
+from urllib.parse import urlparse
+from hashlib import md5, sha256
+from mmh3 import hash as mmh3_calc
+from base64 import b64encode, encodebytes
+from argparse import ArgumentParser, HelpFormatter
+from importlib.metadata import version, PackageNotFoundError
+from packaging.version import parse as parse_version
+
+
+def get_parsed_arguments() -> ArgumentParser:
+    """
+    Stores all the arguments received from the terminal using the argparse lib.
+    :return: The argument parser object.
+    """
+    arg_style = lambda prog: HelpFormatter(prog, max_help_position=50, width=100)
+    args = ArgumentParser(description="Discover and track internet assets using favicon hashes through search engines.",
+                          add_help=False, formatter_class=arg_style)
+    group_favicon = args.add_argument_group(title="Favicon Options")
+    group_favicon.add_argument("-u", "--url", metavar="<address>", type=str, dest="url", required=False,
+                                help="Receives a URL, collects the favicon, and returns the hashes and search engine results.")
+    group_favicon.add_argument("-uf", "--urls", metavar="<file path>", type=str, dest="urls", required=False,
+                                help="Receives a file path with URLs, collects the favicons, and returns the hashes and search engine results.")
+    group_favicon.add_argument("-f", "--favicon", metavar="<favicon path>", type=str, dest="favicon", required=False,
+                                help="Receives the local file path of a favicon and returns the hashes and search engine results.")
+    group_favicon.add_argument("-r", "--remove", action="store_true", dest="remove", required=False,
+                                help="Cleans the favihunter/tmp/ directory.")
+    group_vt = args.add_argument_group(title="Virus Total Integration")
+    group_vt.add_argument("-va", "--vt-api-key", action="store_true", dest="vt_key", required=False,
+                                help="Saves the VirusTotal API key locally for future use. Use this flag only once per API key.")
+    group_vt.add_argument("-vt", "--virus-total", action="store_true", dest="vt", required=False,
+                                help="Sends the favicon to VirusTotal to retrieve intelligence about it. (Requires API key)")
+    group_help = args.add_argument_group(title="Help")
+    group_help.add_argument("-h", "--help", action="help", help="Displays this help screen.")
+
+    return args
+
+
+def get_project_version() -> None:
+    """
+    Get the project version defined in pyproject.toml and compare with PyPI version
+    :return: None
+    """
+    try:
+        current_version = version("favihunter")
+        response = get(url="https://pypi.org/pypi/favihunter/json", timeout=10)
+        response.raise_for_status()
+        latest_version = response.json()["info"]["version"]
+        if parse_version(latest_version) > parse_version(current_version):
+            print(f"[{Fore.BLUE}INF{Fore.RESET}] Current version: {current_version} ({Fore.LIGHTRED_EX}{Style.BRIGHT}outdated{Fore.RESET}{Style.NORMAL})")
+            print(f"[{Fore.LIGHTYELLOW_EX}WRN{Fore.RESET}] Please update the project by running {Fore.LIGHTRED_EX}{Style.BRIGHT}pip install --upgrade favihunter{Fore.RESET}{Style.NORMAL}")
+        else:
+            print(f"[{Fore.BLUE}INF{Fore.RESET}] Current version: {current_version} ({Fore.LIGHTGREEN_EX}{Style.BRIGHT}latest{Fore.RESET}{Style.NORMAL})")
+    except PackageNotFoundError:
+        print(f"[{Fore.LIGHTRED_EX}ERR{Fore.RESET}] Unable to get current project version")
+    except RequestException as e:
+        print(f"[{Fore.LIGHTRED_EX}ERR{Fore.RESET}] Unable to check possible updates: {e}")
+
+
+def is_valid_url(url: str) -> bool:
+    """
+    Validates if the given URL is valid.
+    :param url: The URL to validate.
+    :return: True if the URL is valid, False otherwise.
+    """
+    parsed_url = urlparse(url)
+    return all([parsed_url.scheme, parsed_url.netloc])
+
+
+def make_url_tiny(url: str) -> str:
+    """
+    Converts a long URL into a tiny URL using the TinyURL public endpoint.
+    Falls back to the original (long) URL if the shortener is unavailable, so a
+    single failed request doesn't abort the whole results listing.
+    :param url: URL to be transformed
+    :return: Shortened URL, or the original URL if shortening fails
+    """
+    try:
+        resp = get(
+            url="https://da.gd/s",
+            params={"url": url},
+            headers={
+                "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            },
+            timeout=6,
+        )
+        resp.raise_for_status()
+        short = resp.text.strip()
+        if not short.startswith("http"):
+            raise RequestException(f"DA shorter returned: {short}")
+        return short
+    except RequestException as e:
+        print(f"[{Fore.LIGHTYELLOW_EX}WRN{Fore.RESET}] Error creating tiny URL, using the original URL instead: {e}")
+        return url
+
+
+# Magic bytes (file signatures) for the raster formats favicons commonly use.
+# The signature is enough to reject junk (e.g. an HTML error page returned
+# instead of a real favicon) without needing a full image-decoding dependency:
+# search engines (FOFA/Shodan/Censys) hash the raw bytes regardless of whether
+# the image itself is fully decodable.
+_IMAGE_SIGNATURES = (
+    b"\x00\x00\x01\x00",  # ICO
+    b"\x89PNG\r\n\x1a\n",  # PNG
+    b"GIF87a",             # GIF
+    b"GIF89a",             # GIF
+    b"\xff\xd8\xff",       # JPEG
+    b"BM",                 # BMP
+)
+
+
+def is_valid_image(favicon_content: bytes, favicon_path: str) -> bool:
+    """
+    Checks if the favicon downloaded is an image
+    :param favicon_content: binary content of favicon downloaded
+    :param favicon_path: the favicon local path
+    :return: True if the image is valid and False if not
+    """
+    print(f"[{Fore.BLUE}INF{Fore.RESET}] Checking if the favicon downloaded is a valid image")
+
+    if is_svg_content(favicon_content=favicon_content):
+        return True
+
+    if favicon_content.startswith(_IMAGE_SIGNATURES):
+        return True
+
+    remove(path=favicon_path)
+    return False
+
+
+def is_svg_content(favicon_content: bytes) -> bool:
+    """
+    Checks if the given content looks like an SVG (XML) document
+    :param favicon_content: binary content of favicon downloaded
+    :return: True if the content looks like SVG and False if not
+    """
+    header = favicon_content.lstrip()[:256].lower()
+    return header.startswith(b"<svg") or (header.startswith(b"<?xml") and b"<svg" in header)
+
+
+def clean_tmp_dir() -> None:
+    """
+    Clean the /tmp directory
+    :return:  None
+    """
+    print(f"[{Fore.BLUE}INF{Fore.RESET}] Preparing to clean favihunter/tmp directory")
+    if len(listdir(path="./tmp")) == 0:
+        print(f"[{Fore.BLUE}INF{Fore.RESET}] Directory already empty")
+    for favicon_item in listdir(path="./tmp"):
+        remove(path=f"./tmp/{favicon_item}")
+        print(f"\t[{Fore.BLUE}INF{Fore.RESET}] {favicon_item} removed")
+
+
+def calculate_hashes(favicon_path: str, favicon: str, mmh3_value: int) -> dict:
+    """
+    Calculates the MD5, SHA256, and MMH3 hashes for the favicon.
+    :param favicon_path: Path to the favicon file.
+    :param favicon: Favicon identifier.
+    :param mmh3_value: MMH3 hash value.
+    :return: A dictionary with the calculated hashes.
+    """
+    with open(file=favicon_path, mode="rb") as fp:
+        content = fp.read()
+
+    new_favicon_md5 = md5()
+    new_favicon_sha256 = sha256()
+    new_favicon_md5.update(content)
+    new_favicon_sha256.update(content)
+
+    return {
+        "favicon": favicon,
+        "MMH3": mmh3_value,
+        "MMH3-HEX": str(hex(mmh3_value)).split("x")[1],
+        "MD5": new_favicon_md5.hexdigest(),
+        "SHA256": new_favicon_sha256.hexdigest(),
+    }
+
+
+def calculate_mmh3_hash(data: bytes) -> int:
+    """
+    Calculates the MMH3 hash
+    :param data:
+    :return:
+    """
+    encoded_data = encodebytes(data)
+    return mmh3_calc(encoded_data)
+
+
+def convert_fofa_query(mmh3_hash: int) -> str:
+    """
+    Creates a base64 from a mmh3 hash to add FOFA search URL
+    :param mmh3_hash: mmh3 hash value
+    :return: a ba
+    """
+    query = f'icon_hash="{mmh3_hash}"'.encode("utf-8")
+    encoded_query = b64encode(query)
+    return encoded_query.decode("utf-8")

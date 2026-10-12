@@ -1,0 +1,69 @@
+package types
+
+import (
+	"fmt"
+	"os"
+	"text/tabwriter"
+
+	"github.com/Yyax13/onTop-C2/src/misc"
+)
+
+type Chamber struct {
+	Name        string
+	Description string
+	Runes     map[string]*Rune
+	Parallel    bool
+	Execute     func(runes map[string]*Rune)
+}
+
+func (chb *Chamber) ListAvaliableRunes() {
+	if len(chb.Runes) == 0 {
+		misc.PanicWarn(fmt.Sprintf("The command %v haven't runes", chb.Name), false) // needs to be "incantation" and not "command"
+		return
+
+	}
+
+	fmt.Printf("Avaliable runes for %v:\n", chb.Name)
+	writer := tabwriter.NewWriter(os.Stdout, 0, 0, 4, ' ', 0)
+	fmt.Fprint(writer, "	\tName \tDescription \tCurrent Value \tRequired\n")
+	for _, opt := range chb.Runes {
+		req := "No"
+		if opt.Required {
+			req = "Yes"
+
+		}
+
+		fmt.Fprintf(writer, "	\t%s \t%s \t%s \t%s\n", opt.Name, opt.Description, fmt.Sprintf("%v", opt.Value), req)
+
+	}
+
+	writer.Flush()
+	fmt.Print("\n")
+
+}
+
+func (chb *Chamber) SetRuneVal(runeName string, RuneVal string) error {
+	opt, exists := chb.Runes[runeName]
+	if !exists {
+		return fmt.Errorf("not found the option %s", opt.Name) // todo: change option to rune
+
+	}
+
+	opt.Value = RuneVal
+	misc.SysLog(fmt.Sprintf("Successfuly set %s value to %v\n\n", opt.Name, opt.Value), false)
+	return nil
+
+}
+
+func (chb *Chamber) CheckRunesValue() error {
+	for _, opt := range chb.Runes {
+		if opt.Required && opt.Value == "" {
+			return fmt.Errorf("rune %v is required and not set by user", opt.Name)
+
+		}
+
+	}
+
+	return nil
+
+}

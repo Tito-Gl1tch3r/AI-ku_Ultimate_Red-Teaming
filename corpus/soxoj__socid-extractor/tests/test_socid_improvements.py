@@ -1,0 +1,2603 @@
+# -*- coding: utf-8 -*-
+"""
+Regression and unit-style checks for Maigret / LLM improvement log items.
+
+Each test documents *what* is verified (see docstrings on test functions and assertion comments).
+"""
+import json
+
+from socid_extractor.main import extract
+from socid_extractor.postprocessor import Gravatar, StripInvalidGravatarUrls
+from socid_extractor.schemes import schemes
+from socid_extractor.utils import (
+    imgur_profile_avatar_url, is_bare_gravatar_root_url, is_valid_gravatar_email_hash,
+    safe_deep_get, extract_next_data, next_data_page_props,
+)
+
+
+def test_tiktok_hydration_script_extracts_user_and_stats():
+    """
+    Verifies the **TikTok** scheme matches `__UNIVERSAL_DATA_FOR_REHYDRATION__` JSON (current web),
+    merges `user` + `stats`, and maps ids, nickname, bio, avatar, secUid, and counters.
+
+    **Check:** `tiktok_id`, `tiktok_username`, `fullname`, `bio`, `sec_uid`, `follower_count`,
+    `following_count`, `heart_count`, `video_count`, `digg_count`, and `image` are present and
+    match the embedded fixture values (legacy `SIGI_STATE` pages remain covered by a separate scheme).
+    """
+    user_blob = {
+        'id': '9001',
+        'uniqueId': 'fixtureuser',
+        'nickname': 'Fixture Nick',
+        'signature': 'Bio line',
+        'avatarMedium': 'https://example.cdn/avatar.jpg',
+        'verified': False,
+        'secret': False,
+        'secUid': 'MS4wLjABAAAAfixture',
+    }
+    stats_blob = {
+        'followerCount': 10,
+        'followingCount': 20,
+        'heartCount': 30,
+        'videoCount': 40,
+        'diggCount': 50,
+    }
+    payload = {
+        '__DEFAULT_SCOPE__': {
+            'webapp.user-detail': {
+                'userInfo': {
+                    'user': user_blob,
+                    'stats': stats_blob,
+                }
+            }
+        }
+    }
+    html = (
+        '<!DOCTYPE html><html><head></head><body>'
+        '<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">'
+        + json.dumps(payload)
+        + '</script></body></html>'
+    )
+    info = extract(html)
+    assert info.get('tiktok_id') == '9001'
+    assert info.get('tiktok_username') == 'fixtureuser'
+    assert info.get('fullname') == 'Fixture Nick'
+    assert info.get('bio') == 'Bio line'
+    assert info.get('sec_uid') == 'MS4wLjABAAAAfixture'
+    assert info.get('follower_count') == '10'
+    assert info.get('following_count') == '20'
+    assert info.get('heart_count') == '30'
+    assert info.get('video_count') == '40'
+    assert info.get('digg_count') == '50'
+    assert info.get('image') == 'https://example.cdn/avatar.jpg'
+
+
+def test_picsart_api_json_maps_profile_fields():
+    """
+    Verifies **Picsart API** scheme on a full JSON body: success payloads expose `picsart_id`,
+    username, display name, photo URL, and counters.
+
+    **Check:** `flags` match real `api.picsart.com/users/show/{user}.json` responses; numeric id is
+    stringified like other fields.
+    """
+    body = {
+        'status': 'success',  # not used as a flag; matching uses remix_score + dashboard_visibility
+        'id': 184924161000102,
+        'name': 'Adam',
+        'username': 'adam',
+        'photo': 'https://example.com/p.jpg',
+        'status_message': '',
+        'followers_count': 3,
+        'following_count': 5,
+        'likes_count': 0,
+        'photos_count': 0,
+        'remix_score': 0,
+        'dashboard_visibility': False,
+        'is_verified': False,
+    }
+    info = extract(json.dumps(body))
+    assert info.get('picsart_username') == 'adam'
+    assert info.get('fullname') == 'Adam'
+    assert info.get('picsart_id') == '184924161000102'
+    assert info.get('image') == 'https://example.com/p.jpg'
+    assert info.get('follower_count') == '3'
+    assert info.get('following_count') == '5'
+
+
+def test_imgur_api_adds_canonical_profile_avatar_url():
+    """
+    Verifies **Imgur API** field `imgur_profile_avatar_url`: stable `https://imgur.com/user/{user}/avatar`
+    alongside CDN `avatar_url` (per improvement log).
+
+    **Check:** helper `imgur_profile_avatar_url` matches the same string the scheme emits.
+    """
+    body = {
+        'id': 123,
+        'username': 'sardelkin',
+        'bio': '',
+        'reputation_count': 1,
+        'reputation_name': 'Neutral',
+        'avatar_url': 'https://i.imgur.com/x.png',
+        'created_at': '2010-01-01',
+    }
+    info = extract(json.dumps(body))
+    assert info.get('imgur_username') == 'sardelkin'
+    assert info.get('imgur_profile_avatar_url') == imgur_profile_avatar_url('sardelkin')
+    assert info.get('imgur_profile_avatar_url') == 'https://imgur.com/user/sardelkin/avatar'
+
+
+def test_strip_invalid_gravatar_urls_clears_bare_homepage():
+    """
+    Verifies **StripInvalidGravatarUrls**: values that are only `https://gravatar.com` (no `/avatar/hash`)
+    are cleared from `gravatar_url` and `image` so downstream tools do not treat them as images.
+
+    **Check:** bare root URL is detected; valid avatar URLs are untouched.
+    """
+    assert is_bare_gravatar_root_url('https://gravatar.com') is True
+    assert is_bare_gravatar_root_url('https://www.gravatar.com/') is True
+    assert is_bare_gravatar_root_url('https://secure.gravatar.com/avatar/abc') is False
+
+    cleared = StripInvalidGravatarUrls(
+        {'gravatar_url': 'https://gravatar.com', 'image': 'https://www.gravatar.com'}
+    ).process()
+    assert cleared.get('gravatar_url') == ''
+    assert cleared.get('image') == ''
+
+    untouched = StripInvalidGravatarUrls(
+        {'image': 'https://secure.gravatar.com/avatar/' + '0' * 32}
+    ).process()
+    assert untouched == {}
+
+
+def test_gravatar_postprocessor_requires_md5_hash():
+    """
+    Verifies **Gravatar** postprocessor only emits `gravatar_url` / hash fields when the image URL
+    contains a valid 32-char hex MD5 in `/avatar/{hash}` (avoids bogus homepage-derived output).
+
+    **Check:** `is_valid_gravatar_email_hash` gates emission; hash helper consistency.
+    """
+    assert is_valid_gravatar_email_hash('0' * 32) is True
+    assert is_valid_gravatar_email_hash('gg' * 16) is False
+
+    good = Gravatar(
+        {'username': 'me', 'image': 'https://www.gravatar.com/avatar/' + 'a' * 32 + '?d=retro'}
+    ).process()
+    assert good.get('gravatar_email_md5_hash') == 'a' * 32
+    assert 'gravatar.com' in good.get('gravatar_url', '')
+
+    bad = Gravatar({'username': 'me', 'image': 'https://gravatar.com'}).process()
+    assert bad == {}
+
+
+def test_twitchtracker_embedded_channel_script():
+    """TwitchTracker: `window.channel` JS literal with id, login, created_at."""
+    html = """<!DOCTYPE html><html><head>
+<meta property="og:site_name" content="TwitchTracker">
+</head><body>
+<script>\n\t\twindow.channel = {\n\t\t\tid: 37402112,\n\t\t\tname: 'shroud',\n\t\t\tcreated_at: '2012-11-03'\n\t\t}\n\t</script>
+</body></html>"""
+    info = extract(html)
+    assert info.get('twitch_channel_id') == '37402112'
+    assert info.get('twitch_username') == 'shroud'
+    assert info.get('created_at') == '2012-11-03'
+
+
+def test_chess_com_pub_api_json():
+    """Chess.com API: public `/pub/player/{user}` JSON (optional mutate from /member/)."""
+    body = (
+        '{"avatar":"https://images.chesscomfiles.com/uploads/v1/user/15448422.x.png",'
+        '"player_id":15448422,"username":"hikaru","name":"Hikaru Nakamura","title":"GM",'
+        '"followers":100,"country":"https://api.chess.com/pub/country/US",'
+        '"location":"Florida","last_online":1774140579,"joined":1389043258,'
+        '"status":"premium","is_streamer":true,"verified":false,"twitch_url":"https://twitch.tv/gmhikaru"}'
+    )
+    info = extract(body)
+    assert info.get('chess_user_id') == '15448422'
+    assert info.get('username') == 'hikaru'
+    assert info.get('fullname') == 'Hikaru Nakamura'
+    assert info.get('country_code') == 'US'
+    assert info.get('follower_count') == '100'
+    assert info.get('is_verified') == 'False'
+    assert info.get('created_at')
+    assert info.get('latest_activity_at')
+
+
+def test_codewars_api_json():
+    """Codewars API: public `/api/v1/users/{user}` JSON (real live response for `soxoj`).
+
+    **Check:** `uid` (hex id), `username`, `honor`, `leaderboard_position`, `rank`,
+    `rank_score`, `languages` (sorted keys of `ranks.languages`), and
+    `challenges_completed` are extracted. The real API returns no avatar or join date,
+    so the scheme must not invent those fields.
+    """
+    body = (
+        '{"id":"59c27ad8aeb28451ce0000d2","username":"soxoj","name":"","honor":149,'
+        '"clan":"","leaderboardPosition":631632,"skills":[],'
+        '"ranks":{"overall":{"rank":-6,"name":"6 kyu","color":"yellow","score":135},'
+        '"languages":{"python":{"rank":-6,"name":"6 kyu","color":"yellow","score":135}}},'
+        '"codeChallenges":{"totalAuthored":0,"totalCompleted":12}}'
+    )
+    info = extract(body)
+    assert info.get('uid') == '59c27ad8aeb28451ce0000d2'
+    assert info.get('username') == 'soxoj'
+    assert info.get('fullname') is None  # empty `name` must not become an empty fullname
+    assert info.get('honor') == '149'
+    assert info.get('leaderboard_position') == '631632'
+    assert info.get('rank') == '6 kyu'
+    assert info.get('rank_score') == '135'
+    assert info.get('languages') == "['python']"
+    assert info.get('challenges_completed') == '12'
+    assert 'image' not in info  # API has no avatar; scheme must not fabricate one
+
+
+def test_minds_channel_api_json():
+    """Minds API: public `/api/v1/channel/{user}` JSON (real live response for `mark`).
+
+    **Check:** the `{"channel": {...}}` envelope is unwrapped; `uid` (guid), `username`,
+    `fullname`, `location` (city), `gender`, `website`, `created_at` (unix→date), a derived
+    `image` URL, and `social_links` (values from `social_profiles`) are extracted. Empty
+    strings and `website:false` must resolve to absent fields, not blanks.
+    """
+    body = (
+        '{"status":"success","channel":{"guid":"100000000000000063","type":"user",'
+        '"time_created":"1348141290","name":"Mark Harding","username":"mark","language":"en",'
+        '"icontime":"1771583437","banned":"no","website":"minds.com/mark","briefdescription":"",'
+        '"gender":"male","city":"Preston, England, United Kingdom","boostProPlus":false,'
+        '"verified":true,"social_profiles":['
+        '{"key":"instagram","value":"instagram.com/mark.e.harding"},'
+        '{"key":"github","value":"github.com/markharding"}]}}'
+    )
+    info = extract(body)
+    assert info.get('uid') == '100000000000000063'
+    assert info.get('username') == 'mark'
+    assert info.get('fullname') == 'Mark Harding'
+    assert info.get('location') == 'Preston, England, United Kingdom'
+    assert info.get('gender') == 'male'
+    assert info.get('website') == 'minds.com/mark'
+    assert info.get('is_verified') == 'True'
+    assert info.get('created_at')  # unix 1348141290 → formatted date
+    assert info.get('image') == 'https://www.minds.com/icon/100000000000000063/large/1771583437'
+    assert info.get('social_links') == "['instagram.com/mark.e.harding', 'github.com/markharding']"
+    assert 'bio' not in info  # empty briefdescription must not become a blank bio
+
+
+def test_hackernoon_profiles_api_json():
+    """HackerNoon API: Firebase `profilesApi/?handle={h}` JSON (real live shape for `natasha`).
+
+    **Check:** the `{"profile": {...}}` envelope is unwrapped; `uid`, `username` (handle),
+    `fullname`, `bio`, `email`, `image`, and `social_accounts` (platform:value pairs) are
+    extracted. The case-mismatch `{"redirect": {...}}` response must NOT match this scheme.
+    """
+    body = (
+        '{"profile":{"id":"HrzvBX6xNSVZBKImURJl23sRwcQ2",'
+        '"avatar":"https://cdn.hackernoon.com/images/avatars/HrzvBX6xNSVZBKImURJl23sRwcQ2.jpg",'
+        '"displayName":"Natasha Nel","handle":"natasha","email":"natasha@hackernoon.com",'
+        '"bio":"VP of Growth Marketing","allowSubscribers":true,'
+        '"socialMedia":{"github":"hackernoon","twitter":"natashanoon",'
+        '"instagram":"https://www.instagram.com/hackernoon/?hl=en"}},'
+        '"profileStories":[],"annotations":[]}'
+    )
+    info = extract(body)
+    assert info.get('uid') == 'HrzvBX6xNSVZBKImURJl23sRwcQ2'
+    assert info.get('username') == 'natasha'
+    assert info.get('fullname') == 'Natasha Nel'
+    assert info.get('bio') == 'VP of Growth Marketing'
+    assert info.get('email') == 'natasha@hackernoon.com'
+    assert info.get('image') == 'https://cdn.hackernoon.com/images/avatars/HrzvBX6xNSVZBKImURJl23sRwcQ2.jpg'
+    assert info.get('social_accounts') == (
+        "['github:hackernoon', 'twitter:natashanoon', "
+        "'instagram:https://www.instagram.com/hackernoon/?hl=en']"
+    )
+    # Case-mismatch redirect response must not be parsed as a profile.
+    redirect = extract('{"redirect":{"destination":"https://hackernoon.com/u/David","permanent":true}}')
+    assert redirect.get('_extractor') != 'HackerNoon API'
+
+
+def test_polar_org_api_json():
+    """Polar API: `/v1/customer-portal/organizations/{slug}` JSON (real live shape, `polarsource`)."""
+    body = (
+        '{"organization":{"created_at":"2023-04-20T10:01:30.383594Z",'
+        '"id":"058c300d-c2b1-4d2c-9aa7-e3644e93140c","name":"Polarsource","slug":"polarsource",'
+        '"avatar_url":"https://avatars.githubusercontent.com/u/105373340?v=4",'
+        '"bio":"Building a creator platform for developers","company":null,"blog":"https://polar.sh",'
+        '"location":"Sweden","twitter_username":"polar_sh","email":"support@polar.sh",'
+        '"website":"https://polar.sh","socials":[]}}'
+    )
+    info = extract(body)
+    assert info.get('uid') == '058c300d-c2b1-4d2c-9aa7-e3644e93140c'
+    assert info.get('username') == 'polarsource'
+    assert info.get('location') == 'Sweden'
+    assert info.get('twitter_username') == 'polar_sh'
+    assert info.get('email') == 'support@polar.sh'
+    assert info.get('github_uid') == '105373340'  # derived from avatar_url → GitHub API crosslink
+    assert 'company' not in info  # null company must not appear
+
+
+def test_thanks_dev_api_json():
+    """thanks.dev API: `/v1/profile/gh/{user}` JSON. Shadow profiles (name==`gh/{h}`) drop fullname."""
+    real = extract(
+        '{"git":{"ghgl":"gh","name":"frontendmasters"},"name":"Frontend Masters",'
+        '"bio":"The training platform","resume":null,"url":"https://FrontendMasters.com",'
+        '"li":null,"tw":"frontendmasters","dc":null,"bs":null,"isUser":false,"isTdUser":true}'
+    )
+    assert real.get('github_username') == 'frontendmasters'
+    assert real.get('fullname') == 'Frontend Masters'
+    assert real.get('twitter_username') == 'frontendmasters'
+    assert real.get('website') == 'https://FrontendMasters.com'
+    assert real.get('is_thanks_dev_user') == 'True'
+    # shadow profile: name is the literal `gh/torvalds` → must not surface as fullname
+    shadow = extract(
+        '{"git":{"ghgl":"gh","name":"torvalds"},"name":"gh/torvalds","bio":null,"resume":null,'
+        '"url":null,"li":null,"tw":null,"dc":null,"bs":null,"isUser":true,"isTdUser":false}'
+    )
+    assert shadow.get('github_username') == 'torvalds'
+    assert 'fullname' not in shadow
+
+
+def test_matrix_profile_api_json():
+    """Matrix federated profile API: displayname + mxc→https avatar transform."""
+    info = extract('{"displayname":"Soxoj","avatar_url":"mxc://matrix.org/EpRcnMLuQJfRavlJsqImrAei"}')
+    assert info.get('fullname') == 'Soxoj'
+    assert info.get('image') == (
+        'https://matrix-client.matrix.org/_matrix/client/v1/media/thumbnail/'
+        'matrix.org/EpRcnMLuQJfRavlJsqImrAei?width=512&height=512&method=scale'
+    )
+
+
+def test_substack_public_profile_extended_fields():
+    """Substack public profile API: created_at, twitter, and publication crosslinks (real `soxoj`)."""
+    body = (
+        '{"id":131049184,"handle":"soxoj","name":"Soxoj","bio":"x",'
+        '"photo_url":"https://example/a.jpg","profile_set_up_at":"2023-02-24T08:50:43.727Z",'
+        '"twitterAccount":{"screen_name":"Sox0j","twitter_id":"1031199669488177153"},'
+        '"publicationUsers":[{"publication":{"subdomain":"soxoj","name":"Soxoj on Substack",'
+        '"hero_text":"OSINT mindset, methods, and tools"}}]}'
+    )
+    info = extract(body)
+    assert info.get('username') == 'soxoj'
+    assert info.get('created_at') == '2023-02-24T08:50:43.727Z'
+    assert info.get('twitter_username') == 'Sox0j'
+    assert info.get('twitter_id') == '1031199669488177153'
+    assert info.get('publication_subdomain') == 'soxoj'
+    assert info.get('publication_name') == 'Soxoj on Substack'
+    assert info.get('publication_bio') == 'OSINT mindset, methods, and tools'
+
+
+def test_youtube_ytinitialdata_about_and_socials():
+    """YouTube ytInitialData (moved from plugin): channel metadata + redirect-derived social
+    usernames + aboutChannelViewModel fields (country/joined/subscriber/views/videos).
+
+    **Check:** the scheme that wins is the merged main-repo `YouTube ytInitialData` (not a
+    shadowed duplicate), an instagram redirect URL resolves to a handle, and the about-panel
+    string fields land on `location`, `created_at`, `follower_count`, `views_count`, `videos_count`.
+    """
+    yt = {
+        'metadata': {'channelMetadataRenderer': {
+            'externalId': 'UCX6OQ3DkcsbYNE6H8uQQuVA',
+            'title': 'MrBeast',
+            'description': 'SUBSCRIBE FOR A COOKIE!',
+            'vanityChannelUrl': 'http://www.youtube.com/@MrBeast',
+            'avatar': {'thumbnails': [{'url': 'https://yt3.ggpht.com/av.jpg'}]},
+            'isFamilySafe': True,
+            'facebookProfileId': 'MrBeast6000',  # non-numeric → facebook_username, not facebook_id
+        }},
+        'onResponseReceivedEndpoints': [{'panel': {'aboutChannelViewModel': {
+            'country': 'United States',
+            'joinedDateText': {'content': 'Joined Feb 19, 2012'},
+            'subscriberCountText': '508M subscribers',
+            'viewCountText': '133,717,699,032 views',
+            'videoCountText': '993 videos',
+        }}}],
+        'redirectLink': 'https://www.youtube.com/redirect?q=https%3A%2F%2Fwww.instagram.com%2Fmrbeast%2F',
+    }
+    html = 'var ytInitialData = ' + json.dumps(yt) + ';</script>'
+    info = extract(html)
+    assert info.get('_extractor') == 'YouTube ytInitialData'
+    assert info.get('youtube_channel_id') == 'UCX6OQ3DkcsbYNE6H8uQQuVA'
+    assert info.get('fullname') == 'MrBeast'
+    assert info.get('location') == 'United States'
+    # "Joined Feb 19, 2012" → strip prefix → a date postprocessor normalises it to ISO.
+    assert info.get('created_at') == '2012-02-19 00:00:00 UTC'
+    assert info.get('follower_count') == '508M subscribers'
+    assert info.get('views_count') == '133,717,699,032 views'
+    assert info.get('videos_count') == '993 videos'
+    assert info.get('instagram_username') == 'mrbeast'  # decoded from youtube.com/redirect?q=
+    assert info.get('facebook_username') == 'MrBeast6000'
+    assert 'facebook_id' not in info  # non-numeric profile id must not become facebook_id
+
+
+def test_roblox_user_api_json():
+    """Roblox GET /v1/users/{id} envelope."""
+    body = (
+        '{"description":"x","created":"2006-02-27T21:06:40.3Z","isBanned":false,'
+        '"externalAppDisplayName":null,"hasVerifiedBadge":true,"id":1,'
+        '"name":"Roblox","displayName":"Roblox"}'
+    )
+    info = extract(body)
+    assert info.get('roblox_user_id') == '1'
+    assert info.get('username') == 'Roblox'
+    assert info.get('is_verified') == 'True'
+
+
+def test_roblox_username_lookup_api_json():
+    """Roblox POST /v1/usernames/users first user object."""
+    body = (
+        '{"data":[{"requestedUsername":"Roblox","hasVerifiedBadge":true,"id":1,'
+        '"name":"Roblox","displayName":"Roblox"}]}'
+    )
+    info = extract(body)
+    assert info.get('roblox_user_id') == '1'
+    assert info.get('username') == 'Roblox'
+
+
+def test_myanimelist_profile_regex():
+    """MAL profile: numeric uid from analytics param + username from og:url."""
+    html = """<!DOCTYPE html><html><head>
+<meta property="og:url" content="https://myanimelist.net/profile/Xinil">
+</head><body>
+<div class="user-profile">
+<a href="#" data-ga-click-param="uid:1" title="msg"><i></i></a>
+</div></body></html>"""
+    info = extract(html)
+    assert info.get('mal_username') == 'Xinil'
+    assert info.get('mal_uid') == '1'
+
+
+def test_xvideos_profile_full():
+    """XVideos profile: extract user id, username, display name, gender, country, subscribers, signed up."""
+    html = (
+        '<html lang="en" class="xv-responsive"><body>'
+        '<a href="https://www.xvideos.com/profiles/soxoj">p</a>'
+        '<script>"id_user":613639497,"username":"soxoj","display":"Soxoj","profile_picture_small":"","profile_picture":"","sex":"Man","url":"/profiles/soxoj"</script>'
+        '<div class="col-sm-4 col-xs-12 pfinfo-col" id="pfinfo-col-col1">'
+        '<p id="pinfo-sex"><strong>Gender:</strong> <span>Man</span></p>'
+        '<p id="pinfo-country"><strong>Country:</strong> <span>Honduras</span></p>'
+        '<p id="pinfo-profile-hits"><strong>Profile hits:</strong> <span>1,768</span></p>'
+        '<p id="pinfo-subscribers"><strong>Subscribers:</strong> <span>4</span></p>'
+        '<p id="pinfo-signedup"><strong>Signed up:</strong> <span>July 16, 2022 (1,354 days ago)</span></p>'
+        '</div></body></html>'
+    )
+    info = extract(html)
+    assert info.get('uid') == '613639497'
+    assert info.get('username') == 'soxoj'
+    assert info.get('fullname') == 'Soxoj'
+    assert info.get('gender') == 'Man'
+    assert info.get('country') == 'Honduras'
+    assert info.get('profile_hits') == '1,768'
+    assert info.get('follower_count') == '4'
+    assert info.get('created_at') == '2022-07-16 00:00:00 UTC'
+
+
+def test_lnk_bio_next_data_fixture():
+    """lnk.bio-style __NEXT_DATA__ with pageProps.profile (fixture; live HTML may differ)."""
+    next_data = {
+        'props': {
+            'pageProps': {
+                'profile': {
+                    'username': 'fixture',
+                    'displayName': 'Fixture User',
+                    'bio': 'Hello',
+                    'avatar': 'https://example.com/a.png',
+                    'links': [{'title': 'Site', 'url': 'https://example.org'}],
+                }
+            }
+        }
+    }
+    html = (
+        '<!DOCTYPE html><html><head><title>lnk.bio</title></head><body>'
+        '<link rel="canonical" href="https://lnk.bio/fixture" />'
+        '<script id="__NEXT_DATA__" type="application/json">'
+        + json.dumps(next_data)
+        + '</script>mention lnk.bio in body for flags</body></html>'
+    )
+    info = extract(html)
+    assert info.get('username') == 'fixture'
+    assert info.get('fullname') == 'Fixture User'
+    assert 'example.org' in info.get('links', '')
+
+
+def test_buzzfeed_next_data_extraction():
+    """
+    Verifies the **BuzzFeed** scheme matches pages containing `buzzfeed.com`
+    and `__NEXT_DATA__`, extracts user profile fields from the embedded JSON,
+    and correctly constructs image URLs.
+
+    **Check:** `uuid`, `id`, `fullname`, `username`, `bio`, `posts_count`,
+    `is_community_user`, `is_deleted`, `image`, and `social_links` are present.
+    """
+    next_data = {
+        'props': {
+            'pageProps': {
+                'user_uuid': 'abc-123-def',
+                'user': {
+                    'id': 99999,
+                    'displayName': 'TestUser',
+                    'username': 'testuser',
+                    'bio': 'Hello world',
+                    'memberSince': 1261100829,
+                    'isCommunityUser': True,
+                    'deleted': False,
+                    'social': [{'name': 'twitter', 'url': 'https://twitter.com/test'}],
+                    'image': '/static/user_images/test.jpg',
+                    'headerImage': '/static/enhanced/test_wide.jpg',
+                },
+                'buzz_count': 5,
+            }
+        },
+        'page': '/[username]',
+        'query': {'username': 'testuser'},
+        'buildId': 'fixture123',
+    }
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<link rel="canonical" href="https://www.buzzfeed.com/testuser">'
+        '</head><body>'
+        '<div>Content from buzzfeed.com</div>'
+        '<script id="__NEXT_DATA__" type="application/json">'
+        + json.dumps(next_data)
+        + '</script></body></html>'
+    )
+    info = extract(html)
+    assert info.get('uuid') == 'abc-123-def'
+    assert info.get('id') == '99999'
+    assert info.get('fullname') == 'TestUser'
+    assert info.get('username') == 'testuser'
+    assert info.get('bio') == 'Hello world'
+    assert info.get('posts_count') == '5'
+    assert info.get('is_community_user') == 'True'
+    assert info.get('is_deleted') == 'False'
+    assert 'buzzfeed-static' in info.get('image', '')
+    assert 'twitter.com/test' in info.get('social_links', '')
+
+
+def test_fandom_mediawiki_api_json():
+    """Fandom MediaWiki API: extract userid and canonical username from user query response."""
+    body = json.dumps({
+        "batchcomplete": "",
+        "query": {
+            "users": [
+                {"userid": 22693, "name": "Red"}
+            ]
+        }
+    })
+    info = extract(body)
+    assert info.get('uid') == '22693'
+    assert info.get('username') == 'Red'
+
+
+def test_fandom_mediawiki_api_missing_user():
+    """Fandom MediaWiki API: missing user has no userid — scheme should still match but yield empty uid."""
+    body = json.dumps({
+        "batchcomplete": "",
+        "query": {
+            "users": [
+                {"name": "NonexistentUser12345", "missing": ""}
+            ]
+        }
+    })
+    info = extract(body)
+    # missing user has no userid → uid should be absent or empty
+    assert info.get('username') == 'NonexistentUser12345'
+    assert not info.get('uid')
+
+
+def test_substack_public_profile_api_json():
+    """Substack public profile API: extract user fields from JSON response."""
+    body = json.dumps({
+        "id": 188506911,
+        "name": "Philip",
+        "handle": "user23",
+        "photo_url": "https://substack-post-media.s3.amazonaws.com/photo.jpg",
+        "bio": "Been Internettin' since 1997",
+        "profile_set_up_at": "2023-12-11T03:04:51.141Z",
+    })
+    info = extract(body)
+    assert info.get('uid') == '188506911'
+    assert info.get('username') == 'user23'
+    assert info.get('fullname') == 'Philip'
+    assert info.get('bio') == "Been Internettin' since 1997"
+    assert 'substack-post-media' in info.get('image', '')
+
+
+def test_hashnode_graphql_api_json():
+    """hashnode GraphQL API: extract username and fullname from GraphQL response."""
+    body = json.dumps({
+        "data": {
+            "user": {
+                "name": "Melwin D'Almeida",
+                "username": "melwinalm",
+                "tagline": "Cloud enthusiast",
+                "dateJoined": "2018-02-18T15:24:29.694Z",
+                "socialMediaLinks": {
+                    "twitter": "https://twitter.com/melwinalm",
+                    "github": "",
+                    "linkedin": None,
+                    "website": ""
+                }
+            }
+        }
+    })
+    info = extract(body)
+    assert info.get('username') == 'melwinalm'
+    assert info.get('fullname') == "Melwin D'Almeida"
+    assert info.get('bio') == 'Cloud enthusiast'
+    assert info.get('created_at') == '2018-02-18T15:24:29.694Z'
+    assert info.get('twitter_username') == 'melwinalm'
+
+
+def test_hashnode_graphql_api_null_user():
+    """hashnode GraphQL API: null user (unclaimed) should yield empty result."""
+    body = json.dumps({
+        "data": {
+            "user": None,
+            "dateJoined": None,
+            "socialMediaLinks": None
+        }
+    })
+    info = extract(body)
+    assert not info.get('username')
+    assert not info.get('fullname')
+
+
+def test_rarible_api_json():
+    """Rarible API: extract user ownership info from marketplace API response."""
+    body = json.dumps({
+        "createDate": "2020-07-21T15:18:51.758+00:00",
+        "id": "blue",
+        "owner": "0x0000000000000000000000000000000000000000",
+        "ref": "0x65d472172e4933aa4ddb995cf4ca8bef72a46576",
+        "type": "USER",
+        "version": 0,
+    })
+    info = extract(body)
+    assert info.get('rarible_id') == 'blue'
+    assert info.get('rarible_owner') == '0x0000000000000000000000000000000000000000'
+    assert info.get('rarible_ref') == '0x65d472172e4933aa4ddb995cf4ca8bef72a46576'
+    assert info.get('rarible_type') == 'USER'
+    assert info.get('created_at') == '2020-07-21T15:18:51.758+00:00'
+
+
+def test_cssbattle_next_data_fixture():
+    """CSSBattle: extract player stats from __NEXT_DATA__ embedded JSON."""
+    next_data = {
+        "props": {
+            "pageProps": {
+                "player": {
+                    "id": "8wBrf63WLOOv8JuCeknfYk7t94B3",
+                    "username": "beo",
+                    "gamesPlayed": 55,
+                    "score": 1234.56,
+                }
+            }
+        }
+    }
+    html = (
+        '<!DOCTYPE html><html><head><title>CSSBattle</title></head><body>'
+        '<link rel="canonical" href="https://cssbattle.dev/player/beo" />'
+        '<script id="__NEXT_DATA__" type="application/json">'
+        + json.dumps(next_data)
+        + '</script>cssbattle.dev footer</body></html>'
+    )
+    info = extract(html)
+    assert info.get('cssbattle_id') == '8wBrf63WLOOv8JuCeknfYk7t94B3'
+    assert info.get('cssbattle_username') == 'beo'
+    assert info.get('cssbattle_games_played') == '55'
+    assert info.get('cssbattle_score') == '1234.56'
+
+
+def test_max_ru_sveltekit_profile():
+    """Max (max.ru): extract channel info from SvelteKit hydration JS object."""
+    html = (
+        '<!DOCTYPE html><html><head></head><body>'
+        '<script>__sveltekit_start({data:[null,{type:"data",data:'
+        '{channel:{title:"Ирина Волк",description:"Канал генерал-лейтенанта",'
+        'icon:"https://i.oneme.ru/i?r=abc123",participantsCount:15599}}'
+        ',uses:{url:1}},null]})</script>'
+        '</body></html>'
+    )
+    info = extract(html)
+    assert info.get('max_title') == 'Ирина Волк'
+    assert info.get('max_description') == 'Канал генерал-лейтенанта'
+    assert 'oneme.ru' in info.get('max_icon', '')
+    assert info.get('max_participants_count') == '15599'
+
+
+def test_periscope_profile_extraction():
+    """Periscope (pscp.tv): extract user profile fields from data-store JSON."""
+    user_data = {
+        'id': 'abc123XYZ',
+        'created_at': '2016-04-10T18:22:05.411012300+00:00',
+        'username': 'Polina_Zograf',
+        'display_name': '🌸',
+        'description': 'Travel blogger',
+        'n_followers': 1200,
+        'n_following': 85,
+        'n_hearts': 54320,
+        'n_broadcasts': 42,
+        'is_beta_user': False,
+        'is_employee': False,
+        'isVerified': False,
+        'is_twitter_verified': True,
+        'twitterUserId': '78901234',
+        'twitter_screen_name': 'polina_z',
+        'profile_image_urls': [
+            {'url': 'https://pbs.twimg.com/profile_images/123/photo.jpg', 'width': 128, 'height': 128}
+        ],
+    }
+    data_store = {
+        'canonicalPeriscopeUrl': 'https://www.pscp.tv/Polina_Zograf',
+        'UserCache': {
+            'users': {
+                'abc123XYZ': {
+                    'user': user_data
+                }
+            }
+        },
+    }
+    escaped = json.dumps(data_store).replace('"', '&quot;')
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<meta property="og:site_name" content="Periscope"/>'
+        '<link rel="alternate" href="pscp://user/abc123XYZ"/>'
+        '</head><body>'
+        '<div data-store="' + escaped + '"><div id="PageView">'
+        '<div>page content</div>'
+        '</div></div></body></html>'
+    )
+    info = extract(html)
+    assert info.get('id') == 'abc123XYZ'
+    assert info.get('periscope_username') == 'Polina_Zograf'
+    assert info.get('fullname') == '🌸'
+    assert info.get('bio') == 'Travel blogger'
+    assert info.get('image') == 'https://pbs.twimg.com/profile_images/123/photo.jpg'
+    assert info.get('follower_count') == '1200'
+    assert info.get('following_count') == '85'
+    assert info.get('hearts_count') == '54320'
+    assert info.get('broadcasts_count') == '42'
+    assert info.get('is_beta_user') == 'False'
+    assert info.get('is_employee') == 'False'
+    assert info.get('is_verified') == 'False'
+    assert info.get('is_twitter_verified') == 'True'
+    assert info.get('twitter_uid') == '78901234'
+    assert info.get('twitter_screen_name') == 'polina_z'
+    assert info.get('created_at') == '2016-04-10T18:22:05.411012300+00:00'
+
+
+def test_bluesky_api_json():
+    """Bluesky API: extract profile fields from public AT Protocol API response."""
+    body = json.dumps({
+        "did": "did:plc:oky5czdrnfjpqslsw2a5iclo",
+        "handle": "jay.bsky.team",
+        "displayName": "Jay",
+        "description": "Building the AT Protocol",
+        "avatar": "https://cdn.bsky.app/img/avatar/plain/did:plc:oky5czdrnfjpqslsw2a5iclo/photo.jpg",
+        "banner": "https://cdn.bsky.app/img/banner/plain/did:plc:oky5czdrnfjpqslsw2a5iclo/banner.jpg",
+        "followersCount": 50000,
+        "followsCount": 200,
+        "postsCount": 1500,
+        "createdAt": "2022-11-17T06:31:40.296Z",
+        "labels": [],
+    })
+    info = extract(body)
+    assert info.get('uid') == 'did:plc:oky5czdrnfjpqslsw2a5iclo'
+    assert info.get('username') == 'jay.bsky.team'  # custom domain, no .bsky.social suffix
+    assert info.get('fullname') == 'Jay'
+    assert info.get('bio') == 'Building the AT Protocol'
+    assert 'cdn.bsky.app' in info.get('image', '')
+    assert info.get('follower_count') == '50000'
+    assert info.get('following_count') == '200'
+    assert info.get('posts_count') == '1500'
+    assert info.get('created_at') == '2022-11-17T06:31:40.296Z'
+
+
+def test_bluesky_api_strips_bsky_social_suffix():
+    """Bluesky API: .bsky.social suffix is stripped from handle."""
+    body = json.dumps({
+        "did": "did:plc:abc123",
+        "handle": "alice.bsky.social",
+        "displayName": "Alice",
+        "followersCount": 10,
+        "followsCount": 5,
+        "postsCount": 1,
+    })
+    info = extract(body)
+    assert info.get('username') == 'alice'
+
+
+def test_scratch_api_json():
+    """Scratch API: extract user profile from scratch.mit.edu API response."""
+    body = json.dumps({
+        "id": 1882674,
+        "username": "griffpatch",
+        "scratchteam": False,
+        "history": {"joined": "2012-11-20T16:43:15.000Z"},
+        "profile": {
+            "id": None,
+            "images": {"90x90": "https://cdn2.scratch.mit.edu/get_image/user/1882674_90x90.png"},
+            "status": "I make games!",
+            "bio": "Hi, I'm griffpatch. I love coding in Scratch!",
+            "country": "United Kingdom",
+        },
+    })
+    info = extract(body)
+    assert info.get('uid') == '1882674'
+    assert info.get('username') == 'griffpatch'
+    assert info.get('bio') == "Hi, I'm griffpatch. I love coding in Scratch!"
+    assert info.get('status') == 'I make games!'
+    assert info.get('country') == 'United Kingdom'
+    assert 'scratch.mit.edu' in info.get('image', '')
+    assert info.get('created_at') == '2012-11-20T16:43:15.000Z'
+    assert info.get('is_scratchteam') == 'False'
+
+
+def test_wikipedia_user_api_json():
+    """Wikipedia user API: extract user info from MediaWiki user query with editcount."""
+    body = json.dumps({
+        "batchcomplete": "",
+        "query": {
+            "users": [{
+                "userid": 24920566,
+                "name": "Example",
+                "editcount": 42,
+                "registration": "2015-04-24T07:00:51Z",
+                "gender": "male",
+            }]
+        }
+    })
+    info = extract(body)
+    assert info.get('uid') == '24920566'
+    assert info.get('username') == 'Example'
+    assert info.get('edit_count') == '42'
+    assert info.get('created_at') == '2015-04-24T07:00:51Z'
+    assert info.get('gender') == 'male'
+
+
+def test_dailymotion_api_json():
+    """DailyMotion API: extract user profile from API response."""
+    body = json.dumps({
+        "id": "x23k8rz",
+        "username": "cnn",
+        "screenname": "CNN",
+        "description": "CNN breaking news",
+        "avatar_720_url": "https://s2.dmcdn.net/d/5000002HraHpp/720x720",
+        "cover_250_url": "https://s2.dmcdn.net/d/cover/250",
+        "followers_total": 150000,
+        "following_total": 50,
+        "videos_total": 3200,
+        "country": "US",
+        "created_time": 1518206261,
+        "verified": True,
+        "url": "https://www.dailymotion.com/cnn",
+    })
+    info = extract(body)
+    assert info.get('uid') == 'x23k8rz'
+    assert info.get('username') == 'cnn'
+    assert info.get('fullname') == 'CNN'
+    assert info.get('bio') == 'CNN breaking news'
+    assert 'dmcdn.net' in info.get('image', '')
+    assert info.get('follower_count') == '150000'
+    assert info.get('videos_count') == '3200'
+    assert info.get('country') == 'US'
+    assert info.get('is_verified') == 'True'
+
+
+def test_slideshare_next_data_user():
+    """SlideShare: extract user from __NEXT_DATA__ embedded JSON."""
+    next_data = {
+        "props": {
+            "pageProps": {
+                "user": {
+                    "id": 133494799,
+                    "name": "Reed Hastings",
+                    "login": "ReedHastings",
+                    "photo": "https://public.slidesharecdn.com/v2/images/profile-picture.png",
+                    "description": "Co-founder of Netflix",
+                    "slideshowCount": 12,
+                    "followersCount": 500,
+                    "followingCount": 10,
+                    "city": "San Francisco",
+                    "country": "US",
+                    "organization": "Netflix",
+                    "occupation": "CEO",
+                    "url": "https://netflix.com",
+                    "suspended": False,
+                    "isOrganization": False,
+                }
+            }
+        }
+    }
+    html = (
+        '<!DOCTYPE html><html><head></head><body>'
+        '<link rel="stylesheet" href="https://public.slidesharecdn.com/v2/css/main.css">'
+        '<script id="__NEXT_DATA__" type="application/json">'
+        + json.dumps(next_data)
+        + '</script></body></html>'
+    )
+    info = extract(html)
+    assert info.get('uid') == '133494799'
+    assert info.get('fullname') == 'Reed Hastings'
+    assert info.get('username') == 'ReedHastings'
+    assert info.get('bio') == 'Co-founder of Netflix'
+    assert info.get('slideshow_count') == '12'
+    assert info.get('follower_count') == '500'
+    assert info.get('organization') == 'Netflix'
+    assert info.get('website') == 'https://netflix.com'
+    assert info.get('is_suspended') == 'False'
+
+
+def test_wordpress_org_profile():
+    """WordPress.org Profile: extract username and fullname from og:title meta tag."""
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<meta property="og:title" content="WordPress (@wordpress) - WordPress user profile">'
+        '<meta property="og:image" content="https://www.gravatar.com/avatar/834ffe?s=1024">'
+        '<li id="user-member-since"><div>Member Since</div></li>'
+        '<link rel="canonical" href="https://profiles.wordpress.org/wordpress/">'
+        '</head><body></body></html>'
+    )
+    info = extract(html)
+    assert info.get('fullname') == 'WordPress'
+    assert info.get('username') == 'wordpress'
+    assert 'gravatar.com' in info.get('image', '')
+
+
+def test_weebly_js_vars():
+    """Weebly: extract user_id and site_id from inline JS variables."""
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<link rel="stylesheet" href="https://cdn2.editmysite.com/css/main.css">'
+        '</head><body>'
+        '<script>com_currentSite = "183235046254098859"; com_userID = "125320777";</script>'
+        '</body></html>'
+    )
+    info = extract(html)
+    assert info.get('uid') == '125320777'
+    assert info.get('weebly_site_id') == '183235046254098859'
+
+
+def test_calendly_api_json():
+    """Calendly: extract booking profile fields from API JSON response."""
+    body = json.dumps({
+        "id": 7723,
+        "avatar_url": None,
+        "description": "Welcome to my scheduling page.",
+        "is_landing_page": False,
+        "locale": "en",
+        "logo_url": None,
+        "name": "admin google",
+        "organization_uuid": "DFBBGBHGHUHT7RGG",
+        "owner_type": "User",
+        "owning_user": {"id": 8173, "uuid": "27f70b874abf8cd45edcdb092001661b"},
+        "slug": "google",
+        "timezone": "America/New_York",
+        "unavailability_reason": None,
+        "unbranded": False,
+    })
+    info = extract(body)
+    assert info.get('uid') == '7723'
+    assert info.get('fullname') == 'admin google'
+    assert info.get('username') == 'google'
+    assert info.get('bio') == 'Welcome to my scheduling page.'
+    assert info.get('owner_uuid') == '27f70b874abf8cd45edcdb092001661b'
+    assert info.get('organization_uuid') == 'DFBBGBHGHUHT7RGG'
+    assert info.get('timezone') == 'America/New_York'
+
+
+def test_google_play_developer():
+    """Google Play Developer: extract developer name from og:title."""
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<meta property="og:title" content="Android Apps by Google LLC on Google Play">'
+        '<script>AF_initDataCallback({key:"ds:3"});</script>'
+        '<link rel="canonical" href="https://play.google.com/store/apps/developer?id=Google+LLC">'
+        '</head><body></body></html>'
+    )
+    info = extract(html)
+    assert info.get('developer_name') == 'Google LLC'
+
+
+def test_amazon_author_page():
+    """Amazon Author: extract author name, id and store id from inline JSON."""
+    html = (
+        '<!DOCTYPE html><html><head></head><body>'
+        '<div data-a-page-id="stores/author/B000AQ3RBI">'
+        '<script>var config = {"widgetType":"AuthorSubHeader","content":{"authorName":"Richard Dawkins"},'
+        '"pageContext":{"authorId":"B000AQ3RBI","storeId":"b55aba37-be09-3e56-80fb-da9cda3c406b"'
+        ',"pageDescription":"Follow Richard Dawkins"'
+        ',"brandLogo":{"image":"https://m.media-amazon.com/images/I/41viH8VtXtL.jpg"}'
+        '}};</script>'
+        '</body></html>'
+    )
+    info = extract(html)
+    assert info.get('author_name') == 'Richard Dawkins'
+    assert info.get('author_id') == 'B000AQ3RBI'
+    assert info.get('store_id') == 'b55aba37-be09-3e56-80fb-da9cda3c406b'
+
+
+def test_stack_overflow_user_init():
+    """Stack Overflow: extract userId and accountId from StackExchange.user.init call."""
+    html = (
+        '<!DOCTYPE html><html><head></head><body>'
+        '<script>StackExchange.user.init({ userId: 22656, accountId: 11683 });</script>'
+        '</body></html>'
+    )
+    info = extract(html)
+    assert info.get('uid') == '22656'
+    assert info.get('stack_exchange_uid') == '11683'
+
+
+def test_linktree_updated_flags():
+    """Linktree: verify updated flags work with current page format."""
+    next_data = {
+        "props": {
+            "pageProps": {
+                "account": {
+                    "id": 12345,
+                    "uuid": "6ba1b72b-4009-11eb-85b8-0a26086d88df",
+                    "isActive": True,
+                    "tier": "free",
+                    "links": [{"url": "https://example.com"}],
+                },
+                "username": "testuser",
+                "profilePictureUrl": "https://ugc.production.linktr.ee/pic.jpg",
+                "isProfileVerified": True,
+                "description": "My bio",
+                "socialLinks": [{"type": "TWITTER", "url": "https://twitter.com/test"}],
+            }
+        }
+    }
+    html = (
+        '<!DOCTYPE html><html><head></head><body>'
+        '<link rel="canonical" href="https://linktr.ee/testuser">'
+        '<script id="__NEXT_DATA__" type="application/json">'
+        + json.dumps(next_data)
+        + '</script></body></html>'
+    )
+    info = extract(html)
+    assert info.get('id') == '12345'
+    assert info.get('username') == 'testuser'
+    assert info.get('is_verified') == 'True'
+    assert info.get('bio') == 'My bio'
+
+
+def test_picsart_facebook_uid_from_photo():
+    """Picsart API: extract facebook_uid from graph.facebook.com photo URL."""
+    body = {
+        'id': 100,
+        'name': 'FbUser',
+        'username': 'fbuser',
+        'photo': 'https://graph.facebook.com/999888777/picture',
+        'followers_count': 0,
+        'following_count': 0,
+        'likes_count': 0,
+        'photos_count': 0,
+        'remix_score': 0,
+        'dashboard_visibility': False,
+        'is_verified': False,
+    }
+    info = extract(json.dumps(body))
+    assert info.get('facebook_uid') == '999888777'
+
+
+def test_picsart_no_facebook_uid_when_no_graph_url():
+    """Picsart API: facebook_uid is absent when photo is not a graph.facebook.com URL."""
+    body = {
+        'id': 101,
+        'name': 'NormalUser',
+        'username': 'normaluser',
+        'photo': 'https://example.com/pic.jpg',
+        'followers_count': 0,
+        'following_count': 0,
+        'likes_count': 0,
+        'photos_count': 0,
+        'remix_score': 0,
+        'dashboard_visibility': False,
+        'is_verified': False,
+    }
+    info = extract(json.dumps(body))
+    assert not info.get('facebook_uid')
+
+
+def test_habr_profile_extraction():
+    """Habr: extract fullname, username, and profile URL from og meta tags."""
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<meta property="og:site_name" content="Хабр">'
+        '<meta property="og:title" content="Иван Петров aka ipetrov  '
+        '\n- "'
+        '<meta property="og:url" content="https://habr.com/ru/users/ipetrov/">'
+        '</head><body>habr.com/ru/users/ipetrov</body></html>'
+    )
+    info = extract(html)
+    assert info.get('fullname') == 'Иван Петров'
+    assert info.get('username') == 'ipetrov'
+    assert 'habr.com/ru/users/ipetrov' in info.get('website', '')
+
+
+def test_taplink_profile_extraction():
+    """Taplink: extract image, fullname, and username from og meta tags."""
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<meta property="og:site_name" content="Taplink">'
+        '<meta property="og:image" content="https://taplink.st/p/8/a/2/photo.jpg">'
+        '<meta property="og:title" content="John Doe at Taplink">'
+        '<meta property="og:url" content="https://taplink.cc/johndoe">'
+        '</head><body>Welcome at Taplink</body></html>'
+    )
+    info = extract(html)
+    assert info.get('fullname') == 'John Doe'
+    assert info.get('username') == 'johndoe'
+    assert 'taplink.st' in info.get('image', '')
+
+
+def test_producthunt_profile_extraction():
+    """Product Hunt: extract twitter_username and username from meta tags."""
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<meta property="og:site_name" content="Product Hunt">'
+        '<meta property="og:type" content="profile">'
+        '<meta name="twitter:creator" content="@rrhoover">'
+        '<meta property="og:url" content="https://www.producthunt.com/@rrhoover">'
+        '</head><body></body></html>'
+    )
+    info = extract(html)
+    assert info.get('twitter_username') == 'rrhoover'
+    assert info.get('username') == 'rrhoover'
+
+
+def test_threads_profile_extraction():
+    """Threads: meta tags for flags matching, info from json extracted from script tag"""
+    """Reference page: https://www.threads.com/@zuck"""
+    html = r'<meta property="al:android:package" content="com.instagram.barcelona"><meta property="og:title" content="Mark Zuckerberg (@zuck) • Threads, Say more">{"require":[["ScheduledServerJS","handle",null,[{"__bbox":{"require":[["RelayPrefetchedStreamCache","next",[],["adp_BarcelonaProfilePageDirectQueryRelayPreloader_6a6a63d9180cb2047895700",{"__bbox":{"complete":true,"result":{"data":{"user":{"profile_pic_url":"https:\/\/scontent-fco2-1.cdninstagram.com\/v\/t51.82787-19\/550174606_17925811725103224_8363667901743352243_n.jpg?stp=dst-jpg_s150x150_tt6&efg=eyJ2ZW5jb2RlX3RhZyI6InByb2ZpbGVfcGljLmRqYW5nby4xMDgwLmMyIn0&_nc_ht=scontent-fco2-1.cdninstagram.com&_nc_cat=1&_nc_oc=Q6cZ2gEMkOHv7XIrcuKP2rmVA8iNXre2bDiMGH0Eci0gVMu8JtdfnQUNlPW3MeJsWSKawY8&_nc_ohc=vLH8jAZMCqoQ7kNvwHd8fK9&_nc_gid=PjgEQH13NsOtLYe04DBt4w&edm=APs17CUBAAAA&ccb=7-5&oh=00_AQC1i1A8NvOTFZ8seAvZw-OcQK4K9w8N1EqSO12dxh55Bg&oe=6A7024FE&_nc_sid=10d13b","friendship_status":null,"has_onboarded_to_text_post_app":true,"pk":"63055343223","text_post_app_is_private":false,"username":"zuck","text_post_app_remove_mention_entrypoint":null,"text_app_custom_feeds":null,"gating":null,"follower_count":5682725,"profile_context_facepile_users":null,"text_post_app_public_views":null,"hd_profile_pic_versions":[{"height":320,"url":"https:\/\/scontent-fco2-1.cdninstagram.com\/v\/t51.82787-19\/550174606_17925811725103224_8363667901743352243_n.jpg?stp=dst-jpg_s320x320_tt6&efg=eyJ2ZW5jb2RlX3RhZyI6InByb2ZpbGVfcGljLmRqYW5nby4xMDgwLmMyIn0&_nc_ht=scontent-fco2-1.cdninstagram.com&_nc_cat=1&_nc_oc=Q6cZ2gEMkOHv7XIrcuKP2rmVA8iNXre2bDiMGH0Eci0gVMu8JtdfnQUNlPW3MeJsWSKawY8&_nc_ohc=vLH8jAZMCqoQ7kNvwHd8fK9&_nc_gid=PjgEQH13NsOtLYe04DBt4w&edm=APs17CUBAAAA&ccb=7-5&oh=00_AQAINYp3OxkUL11VXhgfJZ6aK7JN-NrY9HM02Wy6kbmuXw&oe=6A7024FE&_nc_sid=10d13b","width":320},{"height":640,"url":"https:\/\/scontent-fco2-1.cdninstagram.com\/v\/t51.82787-19\/550174606_17925811725103224_8363667901743352243_n.jpg?stp=dst-jpg_s640x640_tt6&efg=eyJ2ZW5jb2RlX3RhZyI6InByb2ZpbGVfcGljLmRqYW5nby4xMDgwLmMyIn0&_nc_ht=scontent-fco2-1.cdninstagram.com&_nc_cat=1&_nc_oc=Q6cZ2gEMkOHv7XIrcuKP2rmVA8iNXre2bDiMGH0Eci0gVMu8JtdfnQUNlPW3MeJsWSKawY8&_nc_ohc=vLH8jAZMCqoQ7kNvwHd8fK9&_nc_gid=PjgEQH13NsOtLYe04DBt4w&edm=APs17CUBAAAA&ccb=7-5&oh=00_AQBNhNuXAjZJ55KPO-_ZpvN2UXEnXQ8Ix3kChz5OMpxwUQ&oe=6A7024FE&_nc_sid=10d13b","width":640}],"is_verified":true,"biography":"Mostly superintelligence and MMA takes","text_app_biography":{"text_fragments":{"fragments":[{"fragment_type":"plaintext","link_fragment":null,"mention_fragment":null,"plaintext":"Mostly superintelligence and MMA takes","inline_sticker_fragment":null,"linkified_web_url":null,"linkified_in_app_url":null,"styling_info":null}]}},"full_name":"Mark Zuckerberg","bio_links":[],"profile_tags":{"edges":[{"node":{"display_name":"AI Threads","name":"aithreads","id":"18399895213044171","is_community":false,"tag_cluster_name":"aithreads"}},{"node":{"display_name":"UFC Threads","name":"ufcthreads","id":"18398478472015746","is_community":false,"tag_cluster_name":"UFCThreads"}},{"node":{"display_name":"AI","name":"ai","id":"18392111818029156","is_community":false,"tag_cluster_name":"AI"}},{"node":{"display_name":"MMA","name":"mma","id":"18400625521011745","is_community":false,"tag_cluster_name":"mma"}},{"node":{"display_name":"memes","name":"memes","id":"18402364270062744","is_community":false,"tag_cluster_name":"memes"}}]},"transparency_label":null,"show_text_post_app_badge":true,"platform_podcast_info":null,"platform_podcast_episode_info":null,"id":"63055343223"}},"extensions":{"is_final":true}},"sequence_number":0}}]],["CometResourceScheduler","registerHighPriHashes",null,[["y9umSZA","1DFRiCY"]]]],"phd2_indexes":":454"}},{"__bbox":null},{"__bbox":null}]]]}'
+    
+    info = extract(html)
+    assert info.get('uid') == '63055343223'
+    assert info.get('username') == 'zuck'
+    assert info.get('fullname') == 'Mark Zuckerberg'
+    assert info.get('bio') == "Mostly superintelligence and MMA takes"
+    assert info.get('image', "").startswith('https://scontent')
+    assert int(info.get('follower_count', 0)) == 5682725
+    assert info.get('is_verified') == 'True'
+
+
+# ---------------------------------------------------------------------------
+# ORCID-keyed academic platforms (ORCID, OpenAlex, arXiv, DBLP, Scholia)
+# ---------------------------------------------------------------------------
+
+def test_orcid_api_extracts_profile_and_affiliations():
+    """ORCID public API (pub.orcid.org v3): JSON response with `orcid-identifier`
+    + `activities-summary` exposes orcid id, name, bio, researcher URLs, keywords,
+    country, current employer/role, education school/degree, works count.
+    """
+    payload = {
+        'orcid-identifier': {'path': '0000-0002-9322-3515', 'host': 'orcid.org'},
+        'history': {
+            'submission-date': {'value': 1407175067347},
+            'verified-primary-email': True,
+        },
+        'person': {
+            'name': {
+                'given-names': {'value': 'Yoshua'},
+                'family-name': {'value': 'Bengio'},
+                'credit-name': None,
+            },
+            'biography': {'content': 'Bio line.'},
+            'researcher-urls': {'researcher-url': [
+                {'url': {'value': 'http://www.iro.umontreal.ca/~bengioy'}},
+            ]},
+            'keywords': {'keyword': [{'content': 'deep learning'}, {'content': 'causality'}]},
+            'addresses': {'address': [{'country': {'value': 'CA'}}]},
+            'emails': {'email': []},
+            'other-names': {'other-name': []},
+            'external-identifiers': {'external-identifier': [
+                {'external-id-type': 'Scopus Author ID', 'external-id-value': '7003958103'},
+            ]},
+        },
+        'activities-summary': {
+            'employments': {'affiliation-group': [{'summaries': [{'employment-summary': {
+                'organization': {'name': 'Université de Montréal'},
+                'role-title': 'Professeur titulaire',
+            }}]}]},
+            'educations': {'affiliation-group': [{'summaries': [{'education-summary': {
+                'organization': {'name': 'McGill University'},
+                'role-title': 'PhD',
+            }}]}]},
+            'works': {'group': [{}, {}, {}]},
+        },
+    }
+    info = extract(json.dumps(payload))
+    assert info.get('_extractor') == 'ORCID API'
+    assert info.get('orcid') == '0000-0002-9322-3515'
+    assert info.get('fullname') == 'Yoshua Bengio'
+    assert info.get('bio') == 'Bio line.'
+    assert info.get('links') == "['http://www.iro.umontreal.ca/~bengioy']"
+    assert info.get('interests') == 'deep learning, causality'
+    assert info.get('country_code') == 'CA'
+    assert info.get('company') == 'Université de Montréal'
+    assert info.get('occupation') == 'Professeur titulaire'
+    assert info.get('education_school') == 'McGill University'
+    assert info.get('education_degree') == 'PhD'
+    assert info.get('posts_count') == '3'
+    assert info.get('is_verified') == 'True'
+    assert info.get('created_at') == '1407175067347'
+    assert "'Scopus Author ID': '7003958103'" in info.get('external_ids', '')
+
+
+def test_openalex_authors_api_maps_metrics_and_topics():
+    """OpenAlex Authors API: `works_count` + `cited_by_count` + `summary_stats`
+    flags, mapped to standard fields (posts_count, h_index, ...). ORCID and
+    OpenAlex IDs have URL prefixes stripped.
+    """
+    payload = {
+        'id': 'https://openalex.org/A5086198262',
+        'orcid': 'https://orcid.org/0000-0002-9322-3515',
+        'display_name': 'Yoshua Bengio',
+        'display_name_alternatives': ['Y. Bengio', 'Bengio Y.'],
+        'works_count': 1279,
+        'cited_by_count': 452107,
+        'summary_stats': {'h_index': 183, 'i10_index': 709},
+        'last_known_institutions': [
+            {'display_name': 'Mila', 'country_code': 'CA'},
+            {'display_name': 'Université de Montréal', 'country_code': 'CA'},
+        ],
+        'topics': [
+            {'display_name': 'Neural Networks'},
+            {'display_name': 'Topic Modeling'},
+        ],
+        'created_date': '2016-06-24T00:00:00',
+        'updated_date': '2026-05-25T12:27:37',
+    }
+    info = extract(json.dumps(payload))
+    assert info.get('_extractor') == 'OpenAlex Authors API'
+    assert info.get('orcid') == '0000-0002-9322-3515'
+    assert info.get('openalex_id') == 'A5086198262'
+    assert info.get('fullname') == 'Yoshua Bengio'
+    assert info.get('posts_count') == '1279'
+    assert info.get('cited_by_count') == '452107'
+    assert info.get('h_index') == '183'
+    assert info.get('i10_index') == '709'
+    assert info.get('company') == 'Mila'
+    assert info.get('country_code') == 'CA'
+    assert info.get('institutions') == "['Mila', 'Université de Montréal']"
+    assert info.get('interests') == 'Neural Networks, Topic Modeling'
+
+
+def test_arxiv_author_page_extracts_fullname_and_paper_ids():
+    """arXiv author page: `<h1>X's articles on arXiv</h1>` + `/abs/<id>` links."""
+    html = (
+        '<!DOCTYPE html><html><head><title>X</title></head><body>'
+        '<h1 class="arxiv-logo">logo</h1>'
+        "<h1>Yoshua Bengio's articles on arXiv</h1>"
+        '<dl>'
+        '<dt><a href="/abs/2305.14594">arXiv:2305.14594</a></dt>'
+        '<dt><a href="/abs/2310.04925">arXiv:2310.04925</a></dt>'
+        '<dt><a href="/abs/2305.14594">duplicate</a></dt>'
+        '</dl></body></html>'
+    )
+    info = extract(html)
+    assert info.get('_extractor') == 'arXiv author page'
+    assert info.get('fullname') == 'Yoshua Bengio'
+    assert info.get('arxiv_ids') == "['2305.14594', '2310.04925']"
+    assert info.get('posts_count') == '2'
+
+
+def test_dblp_person_record_xml_extracts_pid_affiliation_awards_links():
+    """DBLP XML person record: `<dblpperson name pid n>` + `<note type="affiliation">`
+    + `<note type="award">` + `<url>` (only those inside the `<person>` wrapper, not
+    the `<r>` per-publication URLs).
+    """
+    xml = (
+        '<?xml version="1.0"?>'
+        '<dblpperson name="Yoshua Bengio" pid="56/953" n="1236">'
+        '<person key="homepages/56/953">'
+        '<author pid="56/953">Yoshua Bengio</author>'
+        '<note type="affiliation">University of Montréal, Department of Computer Science</note>'
+        '<note label="2018" type="award">Turing Award</note>'
+        '<url>https://mila.quebec/en/yoshua-bengio/</url>'
+        '<url>https://orcid.org/0000-0002-9322-3515</url>'
+        '</person>'
+        '<r><article key="x"><url>https://example.com/paper.pdf</url></article></r>'
+        '</dblpperson>'
+    )
+    info = extract(xml)
+    assert info.get('_extractor') == 'DBLP person record'
+    assert info.get('fullname') == 'Yoshua Bengio'
+    assert info.get('dblp_pid') == '56/953'
+    assert info.get('posts_count') == '1236'
+    assert 'University of Montréal' in info.get('company', '')
+    assert info.get('awards') == "['2018: Turing Award']"
+    # Per-publication URL must NOT leak into `links`.
+    assert info.get('links') == "['https://mila.quebec/en/yoshua-bengio/', 'https://orcid.org/0000-0002-9322-3515']"
+
+
+def test_scholia_canonical_link_yields_wikidata_qid():
+    """Scholia author page: canonical link exposes Wikidata QID; the rest of
+    the page is JS-rendered, so QID is the only durable signal.
+    """
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<title>Scholia</title>'
+        '<link rel="canonical" href="https://scholia.toolforge.org/author/Q3572699">'
+        '</head><body><h1 id="h1">Author</h1></body></html>'
+    )
+    info = extract(html)
+    assert info.get('_extractor') == 'Scholia author profile'
+    assert info.get('wikidata_qid') == 'Q3572699'
+
+
+def test_orcid_url_mutations_target_five_platforms():
+    """A bare orcid.org/{id} URL fans out into the 5 ORCID-keyed endpoints."""
+    from socid_extractor.main import mutate_url
+    results = mutate_url('https://orcid.org/0000-0002-9322-3515')
+    urls = {u for u, _hdrs in results}
+    assert 'https://pub.orcid.org/v3.0/0000-0002-9322-3515/record' in urls
+    assert 'https://api.openalex.org/authors/orcid:0000-0002-9322-3515' in urls
+    assert 'https://arxiv.org/a/0000-0002-9322-3515' in urls
+    assert 'https://dblp.org/orcid/0000-0002-9322-3515.xml' in urls
+    assert 'https://scholia.toolforge.org/orcid/0000-0002-9322-3515' in urls
+    # ORCID API mutation must carry the Accept: application/json header
+    # (default content-negotiation returns XML).
+    orcid_api = next((h for u, h in results if u.endswith('/v3.0/0000-0002-9322-3515/record')), None)
+    assert orcid_api == {'Accept': 'application/json'}
+
+
+# ---------------------------------------------------------------------------
+# Structural / meta tests
+# ---------------------------------------------------------------------------
+
+def test_discourse_mutation_covers_the_shapes_maigret_stores():
+    """maigret keeps Discourse accounts as {urlMain}/u/{username}/summary."""
+    from socid_extractor.main import mutate_url
+
+    def mutated(url):
+        return [u for u, _ in mutate_url(url) if u.endswith('.json')]
+
+    # the plain profile link, and the /summary one that goes into the database
+    assert mutated('https://forum.ansible.com/u/sivel') == ['https://forum.ansible.com/u/sivel.json']
+    assert mutated('https://forum.ansible.com/u/sivel/summary') == ['https://forum.ansible.com/u/sivel.json']
+    # a forum living under a path, with the doubled slash the database renders
+    assert mutated('https://www.freecodecamp.org/forum//u/JeremyLT/summary') == [
+        'https://www.freecodecamp.org/forum/u/JeremyLT.json']
+    # dots belong in Discourse usernames
+    assert mutated('https://forum.cs-cart.ru/u/a.shishkin/summary') == [
+        'https://forum.cs-cart.ru/u/a.shishkin.json']
+    # but an already mutated URL must not collect a second .json
+    assert mutated('https://forum.ansible.com/u/sivel.json') == []
+    # and a thread is not a profile
+    assert mutated('https://discuss.python.org/t/some-thread/1234') == []
+
+
+def test_discourse_html_only_fires_on_a_profile():
+    """Every page of a forum has the generator tag and other people's avatars."""
+    shell = (
+        '<meta name="generator" content="Discourse 2026.9.0-latest - https://github.com/discourse/discourse">'
+        '<meta id="data-discourse-setup" data-discourse_theme_id="2">'
+        '<meta property="og:image" content="https://cdn/user_avatar/forum.example/someone/45/1_2.png">'
+    )
+    profile = shell + '<link rel="canonical" href="https://forum.example/u/sivel">'
+    topic = shell + '<link rel="canonical" href="https://forum.example/t/some-thread/1234">'
+
+    assert extract(profile).get('username') == 'sivel'
+    # a thread names whoever posted in it first — that is not the page's subject
+    assert extract(topic) == {}
+    # instances that refuse anonymous profiles still serve the canonical link, so a
+    # username with nothing of the account's own attached is the request echoed back
+    deny = ('<meta name="generator" content="Discourse 2026.9.0-latest">'
+            '<meta id="data-discourse-setup" data-discourse_theme_id="2">'
+            '<link rel="canonical" href="https://forum.example/u/sivel">')
+    assert extract(deny) == {}
+
+    
+def test_a_broken_transform_skips_only_its_own_scheme():
+    """A transform that gives up must not take the rest of the page with it."""
+    from socid_extractor.schemes import schemes
+
+    marker = '"pipeline-guard-fixture"'
+    # transform() turns a PROCESS_ERRORS failure into {} — a dict, not the '{}'
+    # string json.loads expects. Chains ending in json.dumps paper over it; this
+    # one ends on the failure, like Reddit, DeviantArt and SlideShare do.
+    broken = {
+        'flags': [marker],
+        'regex': r'^([\s\S]+)$',
+        'extract_json': True,
+        'transforms': [lambda x: json.loads(x)['missing']],
+    }
+    working = {
+        'flags': [marker],
+        'regex': r'^([\s\S]+)$',
+        'extract_json': True,
+        'transforms': [json.loads, lambda x: {'username': x['user']}, json.dumps],
+        'fields': {'username': lambda x: x.get('username')},
+    }
+
+    original = dict(schemes)
+    schemes.clear()
+    schemes.update({'Broken fixture': broken, 'Working fixture': working, **original})
+    try:
+        info = extract('{"pipeline-guard-fixture": 1, "user": "bob"}')
+    finally:
+        schemes.clear()
+        schemes.update(original)
+
+    assert info.get('username') == 'bob'
+    
+    
+def test_patreon_rsc_deref_reads_hex_row_ids():
+    """Patreon's RSC row ids are hex — a decimal pattern quietly loses row 10 and up."""
+    from socid_extractor.schemes import _patreon_rsc_deref
+
+    rsc = '2:{"a":1}\n5f:Tb,hello there\n60:T5,short\n'
+
+    assert _patreon_rsc_deref(rsc, '{"bio":"$5f"}') == '{"bio":"hello there"}'
+    assert _patreon_rsc_deref(rsc, '{"bio":"$60"}') == '{"bio":"short"}'
+    # a reference to a row that isn't there stays as it is, rather than blowing up
+    assert _patreon_rsc_deref(rsc, '{"bio":"$ff"}') == '{"bio":"$ff"}'
+    # and "$undefined" and friends are not row references at all
+    assert _patreon_rsc_deref(rsc, '{"bio":"$undefined"}') == '{"bio":"$undefined"}'
+
+    
+def test_xenforo_ignores_the_member_listing():
+    """A failed member search falls back to a listing full of other people's ids."""
+    header = ('<meta property="og:url" content="https://forum.example/members/manumuskin.35/" />'
+              '<span class="username" data-user-id="35">manumuskin</span>'
+              '<div class="memberHeader-blurb"><time datetime="2003-07-20T18:23:00-0400"></time>'
+              '<time datetime="2026-09-07T16:59:37-0400"></time></div>'
+              '<a href="/search/member?user_id=35">9,193</a>')
+    profile = extract(header)
+
+    assert profile.get('uid') == '35'
+    assert profile.get('username') == 'manumuskin'
+    assert profile.get('posts_count') == '9193'
+    assert profile.get('created_at') == '2003-07-20T18:23:00-0400'
+    assert profile.get('latest_activity_at') == '2026-09-07T16:59:37-0400'
+
+    # the listing carries member cards, so data-user-id is there — but it belongs
+    # to whoever the forum felt like showing, and og:url points at the listing
+    listing = ('<meta property="og:url" content="https://forum.example/members/" />'
+               '<a href="/members/someone-else.4242/" data-user-id="4242">Someone Else</a>')
+    assert extract(listing) == {}
+
+
+def test_no_flag_subset_shadows():
+    """Detect scheme pairs where one's flags are a subset of another's.
+
+    If scheme A's flags ⊂ scheme B's flags and A appears *before* B in the
+    dict, then B can never match because A always wins.  This test ensures
+    every pair where one is a strict subset is ordered correctly (more specific
+    first).
+    """
+    names = list(schemes.keys())
+    for i, name_a in enumerate(names):
+        flags_a = set(schemes[name_a]['flags'])
+        for j, name_b in enumerate(names):
+            if i == j:
+                continue
+            flags_b = set(schemes[name_b]['flags'])
+            if flags_a < flags_b and i > j:
+                # A has strictly fewer flags than B but comes AFTER B
+                # This means the more specific B can never be reached
+                # because less specific A matches first — that's fine.
+                # The problem is the REVERSE: less specific before more specific.
+                pass
+            if flags_b < flags_a and i < j:
+                # A (earlier) has MORE flags (more specific) than B (later) — correct order
+                pass
+            if flags_a < flags_b and i < j:
+                # A (earlier) is LESS specific than B (later) — B is shadowed!
+                raise AssertionError(
+                    f'Scheme "{name_a}" (pos {i}, flags={flags_a}) shadows '
+                    f'"{name_b}" (pos {j}, flags={flags_b}) because its flags '
+                    f'are a strict subset and it appears earlier. '
+                    f'Move "{name_b}" before "{name_a}".'
+                )
+
+
+def test_safe_deep_get():
+    """Verify safe_deep_get traverses nested structures without raising."""
+    data = {'a': {'b': [{'c': 42}]}}
+    assert safe_deep_get(data, 'a', 'b', 0, 'c') == 42
+    assert safe_deep_get(data, 'a', 'x') is None
+    assert safe_deep_get(data, 'a', 'b', 99) is None
+    assert safe_deep_get(None, 'a') is None
+    assert safe_deep_get(data, 'a', 'b', 0, 'c', default='fallback') == 42
+    assert safe_deep_get(data, 'z', default='fallback') == 'fallback'
+
+
+def test_extract_next_data_helper():
+    """Verify extract_next_data parses __NEXT_DATA__ from HTML."""
+    html = '<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"x":1}}}</script>'
+    result = extract_next_data(html)
+    assert result == {"props": {"pageProps": {"x": 1}}}
+    assert extract_next_data('no script here') == {}
+    assert extract_next_data('') == {}
+
+
+def test_next_data_page_props_helper():
+    """Verify next_data_page_props extracts nested pageProps subkeys."""
+    data = {"props": {"pageProps": {"user": {"name": "Alice"}}}}
+    html = '<script id="__NEXT_DATA__" type="application/json">' + json.dumps(data) + '</script>'
+    result = json.loads(next_data_page_props(html, 'user'))
+    assert result == {"name": "Alice"}
+    # Missing key returns empty dict serialized
+    result2 = json.loads(next_data_page_props(html, 'nonexistent'))
+    assert result2 == {}
+
+
+def test_youtube_ytinitialdata():
+    """YouTube ytInitialData: extract channel metadata from embedded JSON."""
+    yt_data = {
+        "metadata": {
+            "channelMetadataRenderer": {
+                "title": "Google",
+                "externalId": "UCK8sQmJBp8GCxrOtXWBpyEA",
+                "description": "Official Google channel",
+                "vanityChannelUrl": "http://www.youtube.com/@Google",
+                "avatar": {"thumbnails": [{"url": "https://yt3.googleusercontent.com/avatar.jpg"}]},
+                "keywords": "Google Technology",
+                "isFamilySafe": True,
+                "facebookProfileId": "Google",
+            }
+        }
+    }
+    html = (
+        '<!DOCTYPE html><html><head></head><body>'
+        '<script>var ytInitialData = '
+        + json.dumps(yt_data)
+        + ';</script><script>var ytInitialPlayerResponse = {};</script>'
+        '<div>channelMetadataRenderer present</div>'
+        '</body></html>'
+    )
+    info = extract(html)
+    assert info.get('youtube_channel_id') == 'UCK8sQmJBp8GCxrOtXWBpyEA'
+    assert info.get('fullname') == 'Google'
+    assert info.get('bio') == 'Official Google channel'
+    assert 'yt3.googleusercontent.com' in info.get('image', '')
+    assert info.get('channel_url') == 'http://www.youtube.com/@Google'
+    assert info.get('keywords') == 'Google Technology'
+    assert info.get('is_family_safe') == 'True'
+    # 'Google' is a username, not a numeric ID
+    assert info.get('facebook_username') == 'Google'
+    assert 'facebook_id' not in info
+
+
+def test_lesswrong_graphql_api():
+    """Lesswrong GraphQL API: extract user profile from GQL response."""
+    body = json.dumps({
+        "data": {
+            "user": {
+                "result": {
+                    "displayName": "Eliezer Yudkowsky",
+                    "slug": "eliezer_yudkowsky",
+                    "karma": 159624,
+                    "createdAt": "2009-02-23T21:58:56.739Z",
+                    "bio": "",
+                }
+            }
+        }
+    })
+    info = extract(body)
+    assert info.get('fullname') == 'Eliezer Yudkowsky'
+    assert info.get('username') == 'eliezer_yudkowsky'
+    assert info.get('karma') == '159624'
+    assert info.get('created_at') == '2009-02-23T21:58:56.739Z'
+
+
+def test_lesswrong_graphql_null_user():
+    """Lesswrong GraphQL API: null user returns empty."""
+    body = json.dumps({
+        "data": {"user": None}
+    })
+    # Should not match — no "slug" or "karma" flags
+    info = extract(body)
+    assert not info.get('fullname')
+
+
+def test_weibo_api_extracts_profile_fields():
+    """Verifies the Weibo API scheme extracts user profile fields from JSON response."""
+    body = json.dumps({
+        "ok": 1,
+        "data": {
+            "user": {
+                "id": 1733299783,
+                "idstr": "1733299783",
+                "screen_name": "郭靜Claire",
+                "profile_image_url": "https://tvax2.sinaimg.cn/crop.0.0.1080.1080.50/67500e47ly8hape352btfj20u00u0mz1.jpg",
+                "profile_url": "/u/1733299783",
+                "verified": True,
+                "verified_type": 0,
+                "domain": "clairekuo",
+                "avatar_large": "https://tvax2.sinaimg.cn/crop.0.0.1080.1080.180/67500e47ly8hape352btfj20u00u0mz1.jpg",
+                "avatar_hd": "https://tvax2.sinaimg.cn/crop.0.0.1080.1080.1024/67500e47ly8hape352btfj20u00u0mz1.jpg",
+                "verified_reason": "台湾女歌手",
+                "description": "歌手郭静",
+                "location": "台湾 台北市",
+                "gender": "f",
+                "followers_count": 3126727,
+                "friends_count": 217,
+                "statuses_count": 2248,
+            }
+        }
+    }, separators=(',', ':'))
+    info = extract(body)
+    assert info.get('weibo_id') == '1733299783'
+    assert info.get('username') == 'clairekuo'
+    assert info.get('fullname') == '郭靜Claire'
+    assert info.get('bio') == '歌手郭静'
+    assert info.get('image') == 'https://tvax2.sinaimg.cn/crop.0.0.1080.1080.1024/67500e47ly8hape352btfj20u00u0mz1.jpg'
+    assert info.get('gender') == 'f'
+    assert info.get('location') == '台湾 台北市'
+    assert info.get('verified') == 'True'
+    assert info.get('verified_reason') == '台湾女歌手'
+    assert info.get('follower_count') == '3126727'
+    assert info.get('following_count') == '217'
+    assert info.get('statuses_count') == '2248'
+
+
+def test_weibo_api_url_mutations():
+    """Verifies Weibo API url_mutations convert profile URLs to API endpoints."""
+    from socid_extractor.main import mutate_url
+
+    # Username URL pattern
+    results = mutate_url('https://weibo.com/clairekuo')
+    urls = [r[0] for r in results]
+    assert 'https://weibo.com/ajax/profile/info?custom=clairekuo' in urls
+
+    # User ID URL pattern
+    results = mutate_url('https://weibo.com/u/6215884155')
+    urls = [r[0] for r in results]
+    assert 'https://weibo.com/ajax/profile/info?uid=6215884155' in urls
+
+
+def test_picsart_facebook_uid_from_image():
+    """Picsart: extract facebook_uid from graph.facebook.com avatar URL."""
+    body = json.dumps({
+        "id": 12345,
+        "username": "testuser",
+        "name": "Test User",
+        "photo": "https://graph.facebook.com/231008367325211/picture?type=normal",
+        "status_message": "Hello",
+        "followers_count": 10,
+        "following_count": 5,
+        "likes_count": 100,
+        "photos_count": 50,
+        "is_verified": False,
+        "remix_score": 0,
+        "dashboard_visibility": True,
+    })
+    info = extract(body)
+    assert info.get('facebook_uid') == '231008367325211'
+    assert info.get('picsart_id') == '12345'
+
+
+def test_picsart_no_facebook_uid_for_regular_avatar():
+    """Picsart: no facebook_uid when avatar is not from graph.facebook.com."""
+    body = json.dumps({
+        "id": 99,
+        "username": "other",
+        "name": "Other",
+        "photo": "https://cdn.picsart.com/avatars/photo.jpg",
+        "remix_score": 0,
+        "dashboard_visibility": True,
+    })
+    info = extract(body)
+    assert not info.get('facebook_uid')
+    assert info.get('picsart_id') == '99'
+
+
+def test_habr_og_profile():
+    """Habr: extract fullname and username from og:title meta tag."""
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<meta property="og:site_name" content="Хабр">'
+        '<meta property="og:title" content="Олег Бунин aka olegbunin\n     - ">'
+        '<meta property="og:url" content="https://habr.com/ru/users/olegbunin/">'
+        '</head><body></body></html>'
+    )
+    info = extract(html)
+    assert info.get('fullname') == 'Олег Бунин'
+    assert info.get('username') == 'olegbunin'
+    assert 'habr.com' in info.get('website', '')
+
+
+def test_product_hunt_og_profile():
+    """Product Hunt: extract twitter_username and username from meta tags."""
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<meta property="og:site_name" content="Product Hunt">'
+        '<meta property="og:type" content="profile">'
+        '<meta name="twitter:creator" content="@rrhoover">'
+        '<meta property="og:url" content="https://www.producthunt.com/@rrhoover">'
+        '</head><body></body></html>'
+    )
+    info = extract(html)
+    assert info.get('twitter_username') == 'rrhoover'
+    assert info.get('username') == 'rrhoover'
+
+
+def test_taplink_og_profile():
+    """Taplink: extract username, fullname and avatar from og:meta tags."""
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<meta property="og:image" content="https://taplink.st/a/0/5/e/e/c325e9.jpg?1">'
+        '<meta property="og:type" content=website />'
+        '<meta property="og:title" content="Selenagomez at Taplink"/>'
+        '<meta property="og:url" content="https://taplink.cc/selenagomez"/>'
+        '<meta property="og:site_name" content="Taplink"/>'
+        '</head><body></body></html>'
+    )
+    info = extract(html)
+    assert info.get('fullname') == 'Selenagomez'
+    assert info.get('username') == 'selenagomez'
+    assert 'taplink.st' in info.get('image', '')
+
+
+def test_taplink_nonexistent_user_not_matched():
+    """Taplink: homepage (redirect for non-existent user) should NOT match."""
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<meta property="og:title" content="Taplink - landing page that drives your sales on Instagram">'
+        '<meta property="og:url" content="https://taplink.at/en/">'
+        '<meta property="og:site_name" content="Taplink">'
+        '</head><body></body></html>'
+    )
+    info = extract(html)
+    # Should not match Taplink scheme — no "at Taplink" in og:title
+    assert not info.get('username')
+
+
+def test_chess_com_html_profile():
+    """Chess.com HTML: extract fullname, username and image from og:meta."""
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<meta property="og:title" content="John (John) - Chess Profile">'
+        '<meta property="og:url" content="https://www.chess.com/member/john">'
+        '<meta property="og:site_name" content="Chess.com">'
+        '<meta property="og:image" content="https://www.chess.com/share/user/john">'
+        '</head><body></body></html>'
+    )
+    info = extract(html)
+    assert info.get('fullname') == 'John'
+    assert info.get('username') == 'John'
+    assert info.get('image') == 'https://www.chess.com/share/user/john'
+
+
+def test_roblox_html_profile():
+    """Roblox HTML: extract username, uid and avatar from og:meta after redirect."""
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<meta property="og:site_name" content="Roblox">'
+        '<meta property="og:title" content="john&#x27;s Profile">'
+        '<meta property="og:type" content="profile">'
+        '<meta property="og:url" content="https://www.roblox.com/users/2191/profile">'
+        '<meta property="og:image" content="https://tr.rbxcdn.com/30DAY-Avatar-A852E46C43BF1A5E01BD1FDA883FD398-Png/352/352/Avatar/Png/noFilter">'
+        '</head><body></body></html>'
+    )
+    info = extract(html)
+    assert info.get('username') == 'john'
+    assert info.get('uid') == '2191'
+    assert 'rbxcdn.com' in info.get('image', '')
+
+
+def test_stack_exchange_api_json():
+    """Stack Exchange API: extract user profile from /users?inname= JSON response."""
+    body = json.dumps({
+        "items": [{
+            "account_id": 21543594,
+            "reputation": 1,
+            "user_id": 15880884,
+            "user_type": "registered",
+            "link": "https://stackoverflow.com/users/15880884/soxoj1",
+            "profile_image": "https://www.gravatar.com/avatar/86d899547a5fce05b6a63e540878c69f",
+            "display_name": "Soxoj1",
+            "creation_date": 1620592473,
+        }],
+        "has_more": False,
+    })
+    info = extract(body)
+    assert info.get('uid') == '15880884'
+    assert info.get('account_id') == '21543594'
+    assert info.get('username') == 'Soxoj1'
+    assert 'gravatar.com' in info.get('image', '')
+    assert info.get('reputation') == '1'
+    assert info.get('link') == 'https://stackoverflow.com/users/15880884/soxoj1'
+    assert info.get('created_at') == '1620592473'
+
+
+def test_stack_exchange_api_empty_items():
+    """Stack Exchange API: empty items array should not match."""
+    body = json.dumps({"items": [], "has_more": False})
+    info = extract(body)
+    assert not info.get('uid')
+
+
+def test_leetcode_graphql_api_json():
+    """LeetCode GraphQL: extract user profile from matchedUser response."""
+    body = json.dumps({
+        "data": {
+            "matchedUser": {
+                "username": "soxoj",
+                "profile": {
+                    "realName": "Soxoj",
+                    "aboutMe": "OSINT researcher",
+                    "userAvatar": "https://assets.leetcode.com/users/soxoj/avatar_1561894548.png",
+                    "countryName": "Russia",
+                    "company": "Anthropic",
+                    "school": "MIT",
+                    "ranking": 5000001,
+                },
+            }
+        }
+    })
+    info = extract(body)
+    assert info.get('username') == 'soxoj'
+    assert info.get('fullname') == 'Soxoj'
+    assert info.get('bio') == 'OSINT researcher'
+    assert 'leetcode.com' in info.get('image', '')
+    assert info.get('country') == 'Russia'
+    assert info.get('company') == 'Anthropic'
+    assert info.get('school') == 'MIT'
+    assert info.get('ranking') == '5000001'
+
+
+def test_leetcode_graphql_empty_profile():
+    """LeetCode GraphQL: empty realName/aboutMe should return None, not empty string."""
+    body = json.dumps({
+        "data": {
+            "matchedUser": {
+                "username": "emptyuser",
+                "profile": {
+                    "realName": "",
+                    "aboutMe": "",
+                    "userAvatar": "https://assets.leetcode.com/users/default.png",
+                    "countryName": None,
+                    "company": None,
+                    "school": None,
+                    "ranking": 999999,
+                },
+            }
+        }
+    })
+    info = extract(body)
+    assert info.get('username') == 'emptyuser'
+    assert not info.get('fullname')
+    assert not info.get('bio')
+    assert not info.get('country')
+    assert not info.get('company')
+
+
+def test_boosty_api_json():
+    """Boosty API: extract blog owner profile with telegram crosslink."""
+    body = json.dumps({
+        "id": 123,
+        "title": "Организуем митапы",
+        "description": [
+            {"type": "text", "content": '["Канал про митапы","unstyled",[]]', "modificator": ""},
+            {"type": "text", "content": "", "modificator": "BLOCK_END"},
+        ],
+        "owner": {
+            "name": "OSINT mindset",
+            "id": 10276482,
+            "avatarUrl": "https://images.boosty.to/user/10276482/avatar",
+            "externalApps": {
+                "telegram": {"username": "soxoj", "hasAccount": True},
+            },
+        },
+        "signedQuery": "abc123",
+    })
+    info = extract(body)
+    assert info.get('uid') == '10276482'
+    assert info.get('fullname') == 'OSINT mindset'
+    assert 'boosty.to' in info.get('image', '')
+    assert info.get('blog_title') == 'Организуем митапы'
+    assert info.get('blog_description') == 'Канал про митапы'
+    assert info.get('telegram_username') == 'soxoj'
+
+
+def test_boosty_api_no_telegram():
+    """Boosty API: missing telegram should return None, not crash."""
+    body = json.dumps({
+        "id": 456,
+        "title": "Some Blog",
+        "description": "",
+        "owner": {
+            "name": "Author",
+            "id": 999,
+            "avatarUrl": "https://images.boosty.to/user/999/avatar",
+            "externalApps": {},
+        },
+        "signedQuery": "xyz",
+    })
+    info = extract(body)
+    assert info.get('uid') == '999'
+    assert info.get('fullname') == 'Author'
+    assert not info.get('telegram_username')
+
+
+def test_facebook_user_profile_meta_tags():
+    """
+    Verifies the **Facebook user profile** scheme extracts data from OG and app-link
+    meta tags (the format served to crawlers by Facebook).
+
+    **Check:** `uid`, `username`, `fullname`, `description`, and `image` are extracted
+    from the meta tags in the HTML fixture.
+    """
+    html = (
+        '<!DOCTYPE html>'
+        '<html id="facebook" class="_9dls" lang="en" dir="ltr"><head>'
+        '<title>Mark Zuckerberg</title>'
+        '<meta property="al:android:app_name" content="Facebook" />'
+        '<meta property="al:android:url" content="fb://profile/4" />'
+        '<meta property="og:title" content="Mark Zuckerberg" />'
+        '<meta property="og:description" content="Mark Zuckerberg. 121,000,000 likes" />'
+        '<meta property="og:url" content="https://www.facebook.com/zuck/" />'
+        '<meta property="og:image" content="https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=4" />'
+        '</head><body></body></html>'
+    )
+    info = extract(html)
+    assert info.get('uid') == '4'
+    assert info.get('username') == 'zuck'
+    assert info.get('fullname') == 'Mark Zuckerberg'
+    assert 'likes' in info.get('description', '')
+    assert 'lookaside' in info.get('image', '')
+
+
+def test_facebook_user_profile_no_match_without_og_title():
+    """
+    Verifies the **Facebook user profile** scheme does NOT match pages that lack
+    ``og:title`` meta tag (e.g. login/error pages).
+    """
+    html = (
+        '<!DOCTYPE html>'
+        '<html id="facebook" lang="en"><head>'
+        '<title>Error</title>'
+        '</head><body><h1>Sorry, something went wrong.</h1></body></html>'
+    )
+    info = extract(html)
+    assert not info.get('uid')
+    assert not info.get('fullname')
+
+
+def test_smule_profile_extraction():
+    """
+    Verifies the **Smule** scheme extracts user data from the inline
+    ``Profile: {"user": ...}`` JSON block found in Smule profile pages.
+    """
+    user_data = {
+        "user": {
+            "account_id": 173,
+            "handle": "Blue",
+            "pic_url": "https://c-sf.smule.com/rs-z0/account/icon/v4_defpic.png",
+            "url": "/Blue",
+            "followers": "155",
+            "followees": "0",
+            "num_performances": "0",
+            "is_following": False,
+        }
+    }
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<title>Blue on Smule</title>'
+        '</head><body>'
+        '<script>smule.com Profile: ' + json.dumps(user_data) + '\n</script>'
+        '</body></html>'
+    )
+    info = extract(html)
+    assert info.get('uid') == '173'
+    assert info.get('username') == 'Blue'
+    assert info.get('image') == 'https://c-sf.smule.com/rs-z0/account/icon/v4_defpic.png'
+    assert info.get('follower_count') == '155'
+    assert info.get('following_count') == '0'
+
+
+def test_warpcast_api_json():
+    """Warpcast API: extract Farcaster profile with connected accounts."""
+    body = json.dumps({
+        "result": {
+            "user": {
+                "fid": 3,
+                "displayName": "Dan Romero",
+                "profile": {
+                    "bio": {"text": "Building Farcaster", "mentions": []},
+                    "url": "https://danromero.org",
+                },
+                "followerCount": 345000,
+                "followingCount": 77,
+                "username": "dwr",
+                "pfp": {"url": "https://imagedelivery.net/abc/original", "verified": False},
+                "connectedAccounts": [
+                    {"connectedAccountId": "123", "platform": "x", "username": "dwr", "expired": False}
+                ],
+            },
+            "collectionsOwned": [],
+            "extras": {
+                "fid": 3,
+                "custodyAddress": "0x6b0bda3f2ffed5efc83fa8c024acff1dd45793f1",
+            },
+        }
+    })
+    info = extract(body)
+    assert info.get('uid') == '3'
+    assert info.get('username') == 'dwr'
+    assert info.get('fullname') == 'Dan Romero'
+    assert info.get('bio') == 'Building Farcaster'
+    assert info.get('url') == 'https://danromero.org'
+    assert 'imagedelivery.net' in info.get('image', '')
+    assert info.get('follower_count') == '345000'
+    assert info.get('following_count') == '77'
+    assert info.get('twitter_username') == 'dwr'
+
+
+def test_warpcast_api_no_connected_accounts():
+    """Warpcast API: user with no connected accounts."""
+    body = json.dumps({
+        "result": {
+            "user": {
+                "fid": 999,
+                "displayName": "Anon",
+                "profile": {"bio": {"text": "", "mentions": []}, "url": ""},
+                "followerCount": 0,
+                "followingCount": 0,
+                "username": "anon",
+                "pfp": {"url": "https://example.com/avatar.png", "verified": False},
+                "connectedAccounts": [],
+            },
+            "collectionsOwned": [],
+            "extras": {"fid": 999},
+        }
+    })
+    info = extract(body)
+    assert info.get('uid') == '999'
+    assert info.get('username') == 'anon'
+    assert info.get('bio') is None
+    assert info.get('twitter_username') is None
+
+
+def test_paragraph_api_json():
+    """Paragraph API: extract blog profile with wallet, bio, socials."""
+    body = json.dumps({
+        "id": "abc123",
+        "userId": "user456",
+        "name": "ZachXBT",
+        "reputation": "MEDIUM_LOW",
+        "needToSetup": False,
+        "lowercase_url": "@zachxbt",
+        "url": "@zachXBT",
+        "updatedAt": 1763923578663,
+        "latestPostModifiedTs": 1763923734274,
+        "social": {"twitter": "zachxbt"},
+        "logo_url": None,
+        "user": {
+            "id": "user456",
+            "displayName": {"name": "ZachXBT", "isTruncated": False, "fullName": "ZachXBT"},
+            "authorName": "ZachXBT",
+            "authorBio": "Scam survivor turned investigator",
+            "avatar_url": "https://storage.googleapis.com/papyrus_images/avatar.jpg",
+            "social": {"twitter": "zachxbt ", "github": "", "facebook": "", "instagram": ""},
+            "wallet_address": "0x23dBf06665155FA55E7944803D43580a73ffa9b0",
+        },
+    })
+    info = extract(body)
+    assert info.get('uid') == 'abc123'
+    assert info.get('paragraph_user_id') == 'user456'
+    assert info.get('fullname') == 'ZachXBT'
+    assert info.get('username') == 'zachxbt'
+    assert info.get('bio') == 'Scam survivor turned investigator'
+    assert 'papyrus_images' in info.get('image', '')
+    assert '2025' in info.get('updated_at', '')  # 1763923578663 → datetime string
+    assert '2025' in info.get('latest_activity_at', '')  # 1763923734274 → datetime string
+    assert info.get('twitter_username') == 'zachxbt'  # trailing space stripped
+    assert info.get('github_username') is None  # empty string → None
+    assert info.get('facebook_username') is None  # empty string → None
+    assert info.get('instagram_username') is None
+    assert info.get('wallet_address') == '0x23dBf06665155FA55E7944803D43580a73ffa9b0'
+
+
+def test_fragment_html():
+    """Fragment: extract Telegram username, TON wallet, sale price, and purchase date."""
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<title>durov – Fragment</title>'
+        '<meta property="og:site_name" content="Fragment Auctions">'
+        '</head><body>'
+        '<div class="table-cell-value tm-value icon-before icon-ton">3</div>'
+        '<a href="https://tonviewer.com/EQBsfrfaZbp2AZsMTXjrO5h7SxegzOkMfYkiHq8hEmspNtxl" '
+        'class="tm-wallet" target="_blank">EQBs...Ntxl</a>'
+        '<div class="tm-datetime"><time datetime="2024-03-17T19:36:21+00:00">17 Mar 2024</time></div>'
+        '</body></html>'
+    )
+    info = extract(html)
+    assert info.get('telegram_username') == 'durov'
+    assert info.get('ton_wallet') == 'EQBsfrfaZbp2AZsMTXjrO5h7SxegzOkMfYkiHq8hEmspNtxl'
+    assert info.get('sale_price') == '3'
+    assert info.get('purchased_at') == '2024-03-17T19:36:21+00:00'
+
+
+def test_tonometerbot_html():
+    """Tonometerbot: extract username and stats from OG meta tags."""
+    html = (
+        '<!DOCTYPE html><html lang="en"><head>'
+        '<meta property="og:title" content="@jaga1985"/>'
+        '<meta property="og:site_name" content="TonometerBot"/>'
+        '<meta property="og:description"\n'
+        '      content="@jaga1985, Subscribers: 21, NFT\'s: 111 "/>'
+        '</head><body></body></html>'
+    )
+    info = extract(html)
+    assert info.get('username') == 'jaga1985'
+    assert info.get('subscriber_count') == '21'
+    assert info.get('nft_count') == '111'
+
+
+def test_spatial_next_data():
+    """Spatial: extract profile from __NEXT_DATA__ with socialLinks."""
+    user_data = {
+        "isPrivate": False,
+        "userID": "5eceef2dfa7f113e938acf63",
+        "username": "rammy",
+        "displayName": "Rammy",
+        "about": "VR world builder",
+        "avatarImageURL": "https://api.avatarsdk.com/avatars/abc/preview/",
+        "numFollowers": 51,
+        "numFollowing": 64,
+        "socialLinks": {
+            "usernameDiscord": "rammy.b",
+            "usernameTwitter": "rammyvr",
+            "usernameInstagram": "",
+            "usernameLinkedin": "",
+            "usernameTiktok": "",
+        },
+        "totalSpacesCount": 8,
+    }
+    next_data = json.dumps({
+        "props": {
+            "pageProps": {
+                "dehydratedState": {
+                    "mutations": [],
+                    "queries": [{"state": {"data": user_data}}],
+                },
+                "username": "rammy",
+            }
+        }
+    })
+    html = f'<script id="__NEXT_DATA__" type="application/json">{next_data}</script>'
+    info = extract(html)
+    assert info.get('uid') == '5eceef2dfa7f113e938acf63'
+    assert info.get('username') == 'rammy'
+    assert info.get('fullname') == 'Rammy'
+    assert info.get('bio') == 'VR world builder'
+    assert 'avatarsdk.com' in info.get('image', '')
+    assert info.get('follower_count') == '51'
+    assert info.get('following_count') == '64'
+    assert info.get('discord_username') == 'rammy.b'
+    assert info.get('twitter_username') == 'rammyvr'
+    assert info.get('instagram_username') is None
+    assert info.get('tiktok_username') is None
+
+
+def test_opensea_full_profile():
+    """OpenSea: extract profile from ld+json with bio, image, links."""
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<meta property="og:title" content="Zachxbt - Profile | OpenSea">'
+        '<script type="application/ld+json">'
+        '{"@context":"https://schema.org","@type":"ProfilePage","name":"Zachxbt",'
+        '"image":"https://i2c.seadn.io/profiles/0x67d890/avatar.jpeg",'
+        '"mainEntity":{"@type":"Person","name":"Zachxbt",'
+        '"image":"https://i2c.seadn.io/profiles/0x67d890/avatar.jpeg",'
+        '"description":"On-chain sleuth",'
+        '"url":"https://opensea.io/Zachxbt",'
+        '"sameAs":["https://investigations.notion.site/"]}}'
+        '</script></head><body></body></html>'
+    )
+    info = extract(html)
+    assert info.get('username') == 'Zachxbt'
+    assert info.get('uid') == 'Zachxbt'
+    assert info.get('bio') == 'On-chain sleuth'
+    assert 'seadn.io' in info.get('image', '')
+    assert 'notion.site' in info.get('links', '')
+
+
+def test_opensea_minimal_profile():
+    """OpenSea: profile without bio/image (wallet as uid)."""
+    html = (
+        '<!DOCTYPE html><html><head>'
+        '<meta property="og:title" content="vitalik - Profile | OpenSea">'
+        '<script type="application/ld+json">'
+        '{"@context":"https://schema.org","@type":"ProfilePage","name":"vitalik",'
+        '"image":"",'
+        '"mainEntity":{"@type":"Person","name":"vitalik",'
+        '"image":"","description":"",'
+        '"url":"https://opensea.io/0xd0770174161c0de87242775e7ef32c733e144ac4"}}'
+        '</script></head><body></body></html>'
+    )
+    info = extract(html)
+    assert info.get('username') == 'vitalik'
+    assert info.get('uid') == '0xd0770174161c0de87242775e7ef32c733e144ac4'
+    assert info.get('bio') is None
+    assert info.get('image') is None
+
+
+def test_hive_blog_full_profile():
+    """Hive Blog: extract profile from inline JSON with stats."""
+    profile_data = {
+        "community": {},
+        "global": {},
+        "offchain": {},
+        "user": {},
+        "transaction": {},
+        "discussion": {},
+        "routing": {},
+        "app": {},
+        "userProfiles": {
+            "profiles": {
+                "blocktrades": {
+                    "active": "2026-04-03T15:42:30",
+                    "created": "2016-03-30T00:04:33",
+                    "name": "blocktrades",
+                    "context": {"followed": False, "muted": False},
+                    "metadata": {
+                        "profile": {
+                            "about": "Exchange cryptocurrency fast and easy",
+                            "cover_image": "https://example.com/cover.jpg",
+                            "location": "Worldwide",
+                            "name": "BlockTrades",
+                            "profile_image": "https://example.com/avatar.png",
+                            "website": "https://blocktrades.us",
+                        }
+                    },
+                    "post_count": 4904,
+                    "reputation": 79.75,
+                    "id": 441,
+                    "stats": {"followers": 30932, "following": 47, "rank": 0},
+                }
+            }
+        },
+        "search": {},
+    }
+    html = f'<script type="application/json" data-iso-key="_0">{json.dumps(profile_data)}</script>'
+    info = extract(html)
+    assert info.get('uid') == '441'
+    assert info.get('username') == 'blocktrades'
+    assert info.get('fullname') == 'BlockTrades'
+    assert info.get('bio') == 'Exchange cryptocurrency fast and easy'
+    assert info.get('image') == 'https://example.com/avatar.png'
+    assert info.get('image_bg') == 'https://example.com/cover.jpg'
+    assert info.get('website') == 'https://blocktrades.us'
+    assert info.get('location') == 'Worldwide'
+    assert info.get('reputation') == '79.75'
+    assert info.get('posts_count') == '4904'
+    assert info.get('follower_count') == '30932'
+    assert info.get('following_count') == '47'
+    assert info.get('created_at') == '2016-03-30T00:04:33'
+    assert info.get('latest_activity_at') == '2026-04-03T15:42:30'
+
+
+def test_hive_blog_empty_profile():
+    """Hive Blog: user with empty metadata fields returns None for optional fields."""
+    profile_data = {
+        "community": {},
+        "global": {},
+        "userProfiles": {
+            "profiles": {
+                "newuser": {
+                    "active": "2025-01-01T00:00:00",
+                    "created": "2025-01-01T00:00:00",
+                    "name": "newuser",
+                    "metadata": {
+                        "profile": {
+                            "about": "",
+                            "cover_image": "",
+                            "location": "",
+                            "name": "",
+                            "profile_image": "",
+                            "website": "",
+                        }
+                    },
+                    "post_count": 0,
+                    "reputation": 25,
+                    "id": 999999,
+                    "stats": {"followers": 0, "following": 0},
+                }
+            }
+        },
+    }
+    html = f'<script type="application/json" data-iso-key="_0">{json.dumps(profile_data)}</script>'
+    info = extract(html)
+    assert info.get('uid') == '999999'
+    assert info.get('username') == 'newuser'
+    assert info.get('fullname') is None
+    assert info.get('bio') is None
+    assert info.get('image') is None
+    assert info.get('website') is None
+
+
+def test_vimeo_html_ld_json():
+    """Vimeo HTML: extract profile from ld+json ProfilePage with social crosslinks."""
+    ld_json = json.dumps([{
+        "dateCreated": "2006-12-11T19:57:24Z",
+        "dateModified": "2022-08-01T02:48:55Z",
+        "url": "https://vimeo.com/testuser",
+        "mainEntity": {
+            "@type": "Person",
+            "name": "Test User",
+            "identifier": 12345,
+            "alternateName": "testuser",
+            "interactionStatistic": {
+                "@type": "InteractionCounter",
+                "interactionType": "https://schema.org/FollowAction",
+                "userInteractionCount": 1621,
+            },
+            "agentInteractionStatistic": {
+                "@type": "InteractionCounter",
+                "interactionType": "https://schema.org/WriteAction",
+                "userInteractionCount": 519,
+            },
+            "description": "Bio with &#039;quotes&#039; and entities",
+            "image": "https://i.vimeocdn.com/portrait/12345_640x640",
+            "url": "/testuser",
+            "sameAs": [
+                "https://vimeo.com/testuser",
+                "http://testuser.example.com",
+                "http://twitter.com/testuser",
+                "https://www.instagram.com/testuser/",
+                "https://www.facebook.com/testuser/",
+                "https://www.youtube.com/@testuser/",
+                "https://www.tiktok.com/@testuser",
+                "https://www.linkedin.com/in/testuser/",
+            ],
+        },
+        "potentialAction": {
+            "@type": "ViewAction",
+            "target": "vimeo://app.vimeo.com/users/12345",
+        },
+        "@type": "ProfilePage",
+        "@context": "http://schema.org",
+    }])
+    html_page = (
+        '<!DOCTYPE html><html><head>'
+        f'<script type="application/ld+json">{ld_json}</script>'
+        '</head><body></body></html>'
+    )
+    info = extract(html_page)
+    assert info.get('uid') == '12345'
+    assert info.get('username') == 'testuser'
+    assert info.get('fullname') == 'Test User'
+    assert info.get('bio') == "Bio with 'quotes' and entities"
+    assert 'vimeocdn.com' in info.get('image', '')
+    assert info.get('created_at') == '2006-12-11T19:57:24Z'
+    assert info.get('updated_at') == '2022-08-01T02:48:55Z'
+    assert info.get('follower_count') == '1621'
+    assert info.get('videos_count') == '519'
+    assert info.get('twitter_url') == 'http://twitter.com/testuser'
+    assert info.get('instagram_url') == 'https://www.instagram.com/testuser/'
+    assert info.get('facebook_url') == 'https://www.facebook.com/testuser/'
+    assert info.get('youtube_url') == 'https://www.youtube.com/@testuser/'
+    assert info.get('tiktok_url') == 'https://www.tiktok.com/@testuser'
+    assert info.get('linkedin_url') == 'https://www.linkedin.com/in/testuser/'
+    # vimeo.com self-link should be excluded from `links`
+    assert 'vimeo.com/testuser' not in info.get('links', '')
+    assert 'testuser.example.com' in info.get('links', '')
+
+
+def test_vimeo_html_minimal_profile():
+    """Vimeo HTML: profile with no external links and no description."""
+    ld_json = json.dumps([{
+        "dateCreated": "2020-01-01T00:00:00Z",
+        "dateModified": "2020-01-01T00:00:00Z",
+        "url": "https://vimeo.com/minimal",
+        "mainEntity": {
+            "@type": "Person",
+            "name": "Minimal",
+            "identifier": 99999,
+            "alternateName": "minimal",
+            "image": "https://i.vimeocdn.com/portrait/default",
+            "sameAs": ["https://vimeo.com/minimal"],
+        },
+        "potentialAction": {"target": "vimeo://app.vimeo.com/users/99999"},
+        "@type": "ProfilePage",
+    }])
+    html_page = (
+        '<!DOCTYPE html><html><head>'
+        f'<script type="application/ld+json">{ld_json}</script>'
+        '</head><body></body></html>'
+    )
+    info = extract(html_page)
+    assert info.get('uid') == '99999'
+    assert info.get('username') == 'minimal'
+    assert info.get('fullname') == 'Minimal'
+    assert info.get('bio') is None
+    assert info.get('twitter_url') is None
+    assert info.get('links') is None
+
+
+def test_discourse_api_json():
+    """Discourse API: extract user fields from JSON response."""
+    body = json.dumps({
+        "user": {
+            "id": 42,
+            "username": "jdoe",
+            "name": "John Doe",
+            "title": "Regular",
+            "bio_raw": "Hello from Discourse.",
+            "website": "https://example.com",
+            "location": "New York",
+            "avatar_template": "/user_avatar/meta.discourse.org/jdoe/{size}/1234.png",
+            "trust_level": 2,
+            "moderator": False,
+            "admin": False,
+            "badge_count": 5,
+            "profile_view_count": 100,
+            "created_at": "2020-01-15T10:00:00.000Z",
+            "last_seen_at": "2024-03-01T08:30:00.000Z",
+        },
+        "trust_level": 2,
+        "badge_count": 5,
+        "profile_view_count": 100,
+    })
+    info = extract(body)
+    assert info.get('uid') == '42'
+    assert info.get('username') == 'jdoe'
+    assert info.get('fullname') == 'John Doe'
+    assert info.get('title') == 'Regular'
+    assert info.get('bio') == 'Hello from Discourse.'
+    assert info.get('website') == 'https://example.com'
+    assert info.get('location') == 'New York'
+    assert '240' in info.get('image', '')
+    assert info.get('trust_level') == '2'
+    assert info.get('badge_count') == '5'
+    assert info.get('views_count') == '100'
+    assert info.get('created_at') == '2020-01-15T10:00:00.000Z'
+    assert info.get('latest_activity_at') == '2024-03-01T08:30:00.000Z'
+
+
+def test_github_api_url_mutations():
+    """GitHub API: profile URLs of shape `github.com/{username}` are
+    rewritten to the REST endpoint `api.github.com/users/{username}`
+    so the CLI can fetch the JSON user object automatically. The
+    mutation must match the bare profile path only — repo paths
+    (e.g. `github.com/torvalds/linux`) must not fire so we don't
+    waste an API hit on `/users/torvalds/linux`."""
+    from socid_extractor.main import mutate_url
+
+    # Bare profile URL → API user endpoint
+    for url in (
+        'https://github.com/soxoj',
+        'http://github.com/soxoj',
+        'https://www.github.com/soxoj',
+        'https://github.com/soxoj/',
+    ):
+        urls = [r[0] for r in mutate_url(url)]
+        assert 'https://api.github.com/users/soxoj' in urls, url
+
+    # Repo URL must NOT be rewritten to /users/torvalds/linux
+    urls = [r[0] for r in mutate_url('https://github.com/torvalds/linux')]
+    assert not any('api.github.com/users/' in u for u in urls)
+
+
+def test_github_social_accounts_api():
+    """GitHub /users/{u}/social_accounts: separate endpoint that lists
+    accounts the main /users/{u} response doesn't expose. Schema must
+    fire on this array shape, surface every URL in `links`, and parse
+    handles for each known provider (twitter, bluesky, mastodon,
+    linkedin, youtube, twitch, facebook, instagram, reddit)."""
+    # Real GitHub API responses are compact (no whitespace) — flag
+    # `'"provider":"'` won't match if json.dumps adds default spaces.
+    page = json.dumps([
+        {"provider": "twitter",   "url": "https://twitter.com/sox0j"},
+        {"provider": "bluesky",   "url": "https://bsky.app/profile/soxoj.bsky.social"},
+        {"provider": "mastodon",  "url": "https://infosec.exchange/@soxoj"},
+        {"provider": "linkedin",  "url": "https://www.linkedin.com/in/soxoj/"},
+        {"provider": "youtube",   "url": "https://www.youtube.com/@soxoj"},
+        {"provider": "twitch",    "url": "https://www.twitch.tv/soxoj"},
+        {"provider": "facebook",  "url": "https://www.facebook.com/soxoj"},
+        {"provider": "instagram", "url": "https://www.instagram.com/soxoj"},
+        {"provider": "reddit",    "url": "https://www.reddit.com/user/soxoj"},
+    ], separators=(',', ':'))
+    info = extract(page)
+    assert info.get('_extractor') == 'GitHub Social Accounts API'
+    assert info.get('twitter_username') == 'sox0j'
+    assert info.get('bluesky_username') == 'soxoj'
+    assert info.get('mastodon_username') == 'soxoj'
+    assert info.get('linkedin_username') == 'soxoj'
+    assert info.get('youtube_username') == 'soxoj'
+    assert info.get('twitch_username') == 'soxoj'
+    assert info.get('facebook_username') == 'soxoj'
+    assert info.get('instagram_username') == 'soxoj'
+    assert info.get('reddit_username') == 'soxoj'
+    assert 'https://bsky.app/profile/soxoj.bsky.social' in info.get('links', '')
+    assert 'https://infosec.exchange/@soxoj' in info.get('links', '')
+
+
+def test_github_social_accounts_api_keeps_bluesky_custom_domain():
+    """GitHub social accounts: custom Bluesky domains are preserved."""
+    page = json.dumps([
+        {"provider": "bluesky", "url": "https://bsky.app/profile/jay.bsky.team"},
+    ], separators=(',', ':'))
+    info = extract(page)
+    assert info.get('bluesky_username') == 'jay.bsky.team'
+
+
+def test_github_social_accounts_url_mutation():
+    """GitHub Social Accounts API: bare profile URL `github.com/{u}`
+    auto-mutates to the social_accounts endpoint so the CLI can fetch
+    Bluesky/Mastodon/etc. without a second manual call."""
+    from socid_extractor.main import mutate_url
+    urls = [r[0] for r in mutate_url('https://github.com/soxoj')]
+    assert 'https://api.github.com/users/soxoj/social_accounts' in urls
+
+
+def test_gitlab_api_with_public_email():
+    """Gitlab API: response from /api/v4/users?username=… exposes
+    `public_email` and `web_url` in addition to the basic identity
+    fields. The scheme requires `"public_email"` in flags so it only
+    fires on the array-form user-search response, then surfaces the
+    email as both `email` and `emails`, and the profile URL as
+    `website`."""
+    page = json.dumps([{
+        "id": 1244269,
+        "username": "ainslie",
+        "public_email": "ainslie@example.com",
+        "name": "ainslie cleverdon",
+        "state": "active",
+        "avatar_url": "https://secure.gravatar.com/avatar/eb7d.jpg",
+        "web_url": "https://gitlab.com/ainslie",
+    }])
+    info = extract(page)
+    assert info.get('_extractor') == 'Gitlab API'
+    assert info.get('uid') == '1244269'
+    assert info.get('username') == 'ainslie'
+    assert info.get('fullname') == 'ainslie cleverdon'
+    assert info.get('state') == 'active'
+    assert info.get('email') == 'ainslie@example.com'
+    assert 'ainslie@example.com' in info.get('emails', '')
+    assert info.get('website') == 'https://gitlab.com/ainslie'
+
+
+def _deviantart_fixture(extra_user_fields=''):
+    """Build a minimal page that triggers the DeviantArt scheme.
+
+    The embedded user object is in the same escaped-JSON shape DeviantArt
+    uses (`\\"key\\":\\"val\\"`). `extra_user_fields` lets a test append
+    fields *after* `legacyTextEditUrl` — the position where the old
+    regex terminator would stop, leaving unbalanced braces.
+    """
+    user = (
+        r'{\"username\":\"rootkea\",\"country\":\"Antarctica\",'
+        r'\"gender\":\"\",\"tagline\":\"hi\",\"website\":\"x.com\",'
+        r'\"socialLinks\":[],\"twitterUsername\":\"\",'
+        r'\"textContent\":{\"excerpt\":\"bio\"},'
+        r'\"devidDeviation\":{\"author\":{\"usericon\":\"u.jpg\"}},'
+        r'\"deviantFor\":352125671,'
+        r'\"legacyTextEditUrl\":\"\\\/users\\\/edit\"'
+        + (',' + extra_user_fields if extra_user_fields else '')
+        + r'}'
+    )
+    return '<script>window.deviantART = {};\n' + user + '\n</script>'
+
+
+def test_deviantart_user_object_with_trailing_fields_does_not_crash():
+    """Regression for soxoj/socid-extractor#255.
+
+    Some DeviantArt profiles embed user fields *after* `legacyTextEditUrl`
+    (e.g. `isNewDeviant`). The old regex terminator `legacyTextEditUrl.+?})`
+    stopped at the first `})` inside `devidDeviation`, leaving the captured
+    slice with unbalanced braces and crashing `json.loads` in `extract()`.
+    The fix widens the regex and uses `raw_decode` to trim at the real
+    matching brace.
+    """
+    page = _deviantart_fixture(
+        extra_user_fields=r'\"isNewDeviant\":false,\"isWatching\":false'
+    )
+    info = extract(page)
+    assert info.get('_extractor') == 'DeviantArt'
+    assert info.get('username') == 'rootkea'
+    assert info.get('country') == 'Antarctica'
+
+
+def test_deviantart_user_object_without_trailing_fields_still_works():
+    """The fix must not regress the simpler shape (no fields after
+    `legacyTextEditUrl`) that the original regex was written for.
+    """
+    info = extract(_deviantart_fixture())
+    assert info.get('_extractor') == 'DeviantArt'
+    assert info.get('username') == 'rootkea'
+    assert info.get('country') == 'Antarctica'

@@ -1,0 +1,127 @@
+package runner
+
+import (
+	"errors"
+	"fmt"
+	"github.com/vflame6/leaker/logger"
+	"github.com/vflame6/leaker/runner/sources"
+	"github.com/vflame6/leaker/utils"
+	"io"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"time"
+)
+
+var (
+	configDir                     = utils.AppConfigDirOrDefault(".", "leaker")
+	defaultProviderConfigLocation = utils.GetEnvOrDefault("LEAKER_PROVIDER_CONFIG", filepath.Join(configDir, "provider-config.yaml"))
+	defaultDBLocation             = filepath.Join(configDir, "leaker.db")
+)
+
+// Options struct is used to store leaker options. Sort alphabetically
+type Options struct {
+	DBPath          string // DBPath is the local SQLite cache path (empty = use default)
+	Debug           bool
+	Metadata        bool // Metadata includes metadata fields (database) in output
+	Insecure        bool // Insecure disables TLS certificate verification when true
+	JSON            bool // JSON outputs results as JSONL (one JSON object per line)
+	ListSources     bool
+	NoColor         bool // NoColor disables colored output
+	NoDeduplication bool // NoDeduplication disables deduplication of results across sources
+	NoFilter        bool
+	NoRateLimit     bool
+	NoWriteDB       bool // NoWriteDB disables writing to the local SQLite cache
+	Output          io.Writer
+	OutputFile      string
+	Overwrite       bool
+	ProviderConfig  string // ProviderConfig contains the location of the provider config file
+	Proxy           string
+	Quiet           bool
+	Sources         []string
+	Stdin           bool
+	Targets         string
+	Timeout         time.Duration
+	Type            sources.ScanType
+	UserAgent       string
+	Verbose         bool
+	Verify          bool // Verify enriches results with HIBP password checks and hash identification
+	Version         string
+}
+
+// ResolvedDBPath returns the effective local DB path: the user-provided
+// DBPath if non-empty, otherwise the default under the user config dir.
+func (options *Options) ResolvedDBPath() string {
+	if options.DBPath != "" {
+		return options.DBPath
+	}
+	return defaultDBLocation
+}
+
+// ListSources prints all available sources to stdout.
+func ListSources(options *Options) {
+	if options == nil {
+		options = &Options{}
+	}
+	if options.ProviderConfig == "" {
+		options.ProviderConfig = defaultProviderConfigLocation
+	}
+	if options.Output == nil {
+		options.Output = os.Stdout
+	}
+	options.ConfigureOutput()
+	listSources(options)
+}
+
+func listSources(options *Options) {
+	logger.Infof("Current list of available sources. [%d]", len(AllSources))
+	logger.Infof("Sources marked with an * require key(s) or token(s) to work.")
+	logger.Infof("You can modify %s to configure your keys/tokens.\n", options.ProviderConfig)
+
+	fmt.Println("Source groups:")
+	fmt.Println("  online   all online API sources (default)")
+	fmt.Println("  all      every source including local")
+	fmt.Println("  local    local SQLite database")
+	fmt.Println()
+	fmt.Println("Available sources:")
+
+	sorted := make([]sources.Source, len(AllSources))
+	copy(sorted, AllSources[:])
+	slices.SortFunc(sorted, func(a, b sources.Source) int {
+		return strings.Compare(strings.ToLower(a.Name()), strings.ToLower(b.Name()))
+	})
+
+	for _, source := range sorted {
+		sourceName := source.Name()
+		if source.NeedsKey() {
+			_, _ = fmt.Fprintf(options.Output, "  %s *\n", sourceName)
+		} else {
+			_, _ = fmt.Fprintf(options.Output, "  %s\n", sourceName)
+		}
+	}
+}
+
+// loadProvidersFrom runs the app with source config
+func (options *Options) loadProvidersFrom(location string) {
+	if err := UnmarshalFrom(location); err != nil && (!strings.Contains(err.Error(), "file doesn't exist") || errors.Is(err, os.ErrNotExist)) {
+		logger.Errorf("Could not read providers from %s: %s\n", location, err)
+	}
+}
+
+// ConfigureOutput configures the output on the screen
+func (options *Options) ConfigureOutput() {
+	logger.DefaultLogger.SetMaxLevel(logger.LevelInfo)
+	logger.SetNoColor(false)
+
+	// If the user desires verbose output, show verbose output
+	if options.Debug {
+		logger.DefaultLogger.SetMaxLevel(logger.LevelVerbose)
+	}
+	if options.Quiet {
+		logger.DefaultLogger.SetMaxLevel(logger.LevelFatal)
+	}
+	if options.NoColor {
+		logger.SetNoColor(true)
+	}
+}
