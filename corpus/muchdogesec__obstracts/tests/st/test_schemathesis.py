@@ -1,0 +1,96 @@
+from unittest.mock import patch
+import uuid
+import schemathesis
+import pytest
+from obstracts.wsgi import application as wsgi_app
+from hypothesis import settings
+from hypothesis import strategies
+from schemathesis.specs.openapi.checks import negative_data_rejection, positive_data_acceptance
+from schemathesis.config import GenerationConfig
+from datetime import datetime, date, UTC
+
+from tests.utils import Transport
+# restrict date and datetime generation to reasonable ranges to avoid issues with database limits
+schemathesis.openapi.format("date-time", strategies.datetimes(max_value=datetime(2050, 1, 1), min_value=datetime(1970, 1, 1)).map(lambda dt: dt.replace(tzinfo=dt.tzinfo or UTC).isoformat()))
+schemathesis.openapi.format("date", strategies.dates(max_value=date(2050, 1, 1), min_value=date(1970, 1, 1)).map(date.isoformat))
+
+schema = schemathesis.openapi.from_wsgi("/api/schema/?format=json", wsgi_app)
+schema.config.base_url = "http://localhost:8001/"
+schema.config.generation = GenerationConfig(allow_x00=False)
+
+feed_ids = strategies.sampled_from([uuid.uuid4() for _ in range(3)]+["6ca6ce37-1c69-4a81-8490-89c91b57e557"])
+post_ids = strategies.sampled_from([uuid.uuid4() for _ in range(3)]+["561ed102-7584-4b7d-a302-43d4bca5605b", "345c8d0b-c6ca-4419-b1f7-0daeb4e9278b", "72e1ad04-8ce9-413d-b620-fe7c75dc0a39", "42a5d042-26fa-41f3-8850-307be3f330cf"])
+job_ids  = strategies.sampled_from([uuid.uuid4() for _ in range(3)]+["164716d9-85af-4a81-8f71-9168db3fadf0"])
+profile_ids  = strategies.sampled_from([uuid.uuid4() for _ in range(3)]+["a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d"])
+
+
+@pytest.fixture(autouse=True)
+def override_transport(monkeypatch, client):
+    ## patch transport.get
+    from schemathesis import transport
+    monkeypatch.setattr(transport, "get", lambda _: Transport())
+
+
+
+@pytest.fixture(autouse=True)
+def db_setup(feed_with_posts, stixifier_profile, obstracts_job):
+    from obstracts.cjob.celery import app
+    app.conf.task_always_eager = False
+    yield
+
+@pytest.mark.django_db(transaction=True)
+@schema.given(
+    post_id=post_ids,
+    feed_id=feed_ids,
+    profile_id=profile_ids,
+    job_id=job_ids
+)
+@schema.exclude(method=["POST", "PATCH"]).parametrize()
+@settings(max_examples=30)
+def test_api(case: schemathesis.Case, **kwargs):
+    for k, v in kwargs.items():
+        if k in case.path_parameters:
+            case.path_parameters[k] = v
+    case.call_and_validate(excluded_checks=[negative_data_rejection, positive_data_acceptance])
+
+
+@pytest.mark.django_db(transaction=True)
+@schema.given(
+    post_id=post_ids,
+    feed_id=feed_ids,
+    profile_id=profile_ids,
+    job_id=job_ids
+)
+@schema.include(method=["POST", "PATCH"]).exclude(path="/api/v1/feeds/").parametrize()
+@patch('celery.app.task.Task.run')
+def test_imports(mock, case: schemathesis.Case, **kwargs):
+    for k, v in kwargs.items():
+        if k in case.path_parameters:
+            case.path_parameters[k] = v
+    case.call_and_validate(excluded_checks=[negative_data_rejection, positive_data_acceptance])
+
+
+@pytest.mark.django_db(transaction=True)
+@schema.given(
+    feed_id=feed_ids,
+    profile_id=profile_ids,
+    url=strategies.sampled_from([
+        "https://muchdogesec.github.io/fakeblog123/feeds/rss-feed-cdata-partial.xml",
+        "https://muchdogesec.github.io/fakeblog123/feeds/rss-feed-cdata.xml",
+        "https://blog.eclecticiq.com/rss.xml",
+        "https://example.com/1",
+        "https://example.com/2",
+        "https://example.com/3",
+        "https://example.com/2",
+        "https://example.com/2",
+    ])
+)
+@schema.include(method="POST", path="/api/v1/feeds/").parametrize()
+@patch('celery.app.task.Task.run')
+def test_create_feed(mock, case: schemathesis.Case, url, **kwargs):
+    for k, v in kwargs.items():
+        if k in case.path_parameters:
+            case.path_parameters[k] = v
+    if isinstance(case.body, dict) and 'url' in case.body:
+        case.body['url'] = url
+    case.call_and_validate(excluded_checks=[positive_data_acceptance])

@@ -1,0 +1,123 @@
+"use client";
+
+import { MarkGithubIcon } from "@primer/octicons-react";
+import { type ReactElement, useState } from "react";
+
+import GhostButton from "@/components/GhostButton";
+import Tabs, { Tab } from "@/components/Tabs";
+import type { ScratchUser } from "@/lib/api/types";
+import { userGithubHtmlUrl } from "@/lib/api/urls";
+
+import PresetsTab from "./tabs/PresetsTab";
+import ScratchesTab from "./tabs/ScratchesTab";
+import UserAvatar from "./UserAvatar";
+
+enum TabId {
+    SCRATCHES = "user_scratches",
+    PRESETS = "user_presets",
+}
+
+interface TabLayout {
+    activeTab: string;
+    tabs: string[];
+}
+
+const defaultTabLayout: TabLayout = {
+    activeTab: TabId.SCRATCHES,
+    tabs: [TabId.SCRATCHES],
+};
+
+interface Props {
+    layout: TabLayout;
+    renderTab: (id: string) => ReactElement<typeof Tab>;
+    onChange: (layout: TabLayout) => void;
+}
+
+function CustomLayout({ renderTab, layout, onChange }: Props) {
+    const els = [];
+
+    for (const id of layout.tabs) {
+        els.push(renderTab(id));
+    }
+
+    return (
+        <Tabs
+            activeTab={layout.activeTab}
+            onChange={(activeTab) => onChange({ ...layout, activeTab })}
+        >
+            {els}
+        </Tabs>
+    );
+}
+
+export default function Profile({ user }: { user: ScratchUser }) {
+    const [layout, setLayout] = useState<TabLayout>({
+        ...defaultTabLayout,
+        tabs:
+            user.num_presets > 0
+                ? [...defaultTabLayout.tabs, TabId.PRESETS]
+                : defaultTabLayout.tabs,
+    });
+
+    const renderTab = (id: string) => {
+        switch (id as TabId) {
+            case TabId.SCRATCHES:
+                return (
+                    <Tab
+                        key={id}
+                        tabKey={id}
+                        label={`Scratches (${user.num_scratches.toLocaleString("en-US")})`}
+                    >
+                        {() => <ScratchesTab user={user} />}
+                    </Tab>
+                );
+            case TabId.PRESETS:
+                return (
+                    <Tab
+                        key={id}
+                        tabKey={id}
+                        label={`Presets (${user.num_presets.toLocaleString("en-US")})`}
+                    >
+                        {() => <PresetsTab user={user} />}
+                    </Tab>
+                );
+            default:
+                return <Tab key={id} tabKey={id} label={id} disabled />;
+        }
+    };
+
+    return (
+        <div className="mx-auto w-full max-w-3xl p-4">
+            <header className="flex flex-col items-center gap-6 pt-4 md:flex-row">
+                <UserAvatar className="size-16" user={user} />
+                <div>
+                    <h1 className="text-center font-medium text-2xl tracking-tight md:text-left">
+                        {user.username}
+                    </h1>
+
+                    <div className="flex flex-wrap items-center justify-center gap-2 pt-1 text-gray-11 text-sm md:justify-start">
+                        <GhostButton href={userGithubHtmlUrl(user)}>
+                            <div className="flex items-center gap-1">
+                                {userGithubHtmlUrl(user) && (
+                                    <MarkGithubIcon
+                                        size={16}
+                                        aria-label="GitHub username"
+                                    />
+                                )}
+                                <span>{user.username}</span>
+                            </div>
+                        </GhostButton>
+                    </div>
+                </div>
+            </header>
+
+            {layout && (
+                <CustomLayout
+                    layout={layout}
+                    onChange={setLayout}
+                    renderTab={renderTab}
+                />
+            )}
+        </div>
+    );
+}

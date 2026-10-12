@@ -1,0 +1,326 @@
+from unittest.mock import patch
+
+from django.conf import settings
+import pytest
+from obstracts.server import models
+from obstracts.server.models import JobState
+from history4feed.app import models as h4f_models
+from datetime import datetime as dt
+from dogesec_commons.objects.helpers import ArangoDBHelper
+
+
+@pytest.mark.django_db
+def test_create_feed_adds_collection_name():
+    h4f_feed = h4f_models.Feed.objects.create(
+        title="Example Feed-Name",
+        url="https://example.com/",
+        id="fcb679d4-243a-4eca-a58c-f9dc82099d54",
+    )
+    feed: models.FeedProfile = h4f_feed.obstracts_feed
+    assert (
+        feed.collection_name == "example_feed_name_fcb679d4243a4ecaa58cf9dc82099d54"
+    ), "save should generate deterministic collection_name"
+
+    # test that collection_name is never updated even when the title changes
+    h4f_feed.title = "A new title"
+    feed.save()
+    assert (
+        feed.collection_name == "example_feed_name_fcb679d4243a4ecaa58cf9dc82099d54"
+    ), "collection_name should not change on subsequent saves"
+
+
+@pytest.mark.django_db
+def test_feed_generate_collection_name():
+    h4f_feed = h4f_models.Feed.objects.create(
+        title="Example Feed Name (2)",
+        url="https://example.com/2",
+        id="79c488e3-b1c8-40f1-8b8f-2d90e660e47c",
+    )
+    feed: models.FeedProfile = h4f_feed.obstracts_feed
+    assert (
+        feed.generate_collection_name()
+        == "example_feed_name_2_79c488e3b1c840f18b8f2d90e660e47c"
+    )
+
+
+@pytest.mark.django_db
+def test_feed_generate_collection_name__too_long__truncates():
+    h4f_feed = h4f_models.Feed.objects.create(
+        title="Example Feed Name with a very long title that should be truncated to fit within the maximum length allowed for collection names in ArangoDB",
+        url="https://example.com/2",
+        id="79c488e3-b1c8-40f1-8b8f-2d90e660e47c",
+    )
+    feed: models.FeedProfile = h4f_feed.obstracts_feed
+    assert (
+        feed.generate_collection_name()
+        == "example_feed_name_with_a_very_lo_79c488e3b1c840f18b8f2d90e660e47c"
+    ), "collection name should be truncated to fit within limits"
+
+
+@pytest.mark.django_db
+def test_feed_generate_collection_name__starts_with_number():
+    h4f_feed = h4f_models.Feed.objects.create(
+        title="2Example Feed Name (2)",
+        url="https://example.com/2",
+        id="79c488e3-b1c8-40f1-8b8f-2d90e660e47c",
+    )
+    feed: models.FeedProfile = h4f_feed.obstracts_feed
+    assert (
+        feed.generate_collection_name()
+        == "obs_2example_feed_name_2_79c488e3b1c840f18b8f2d90e660e47c"
+    )
+
+
+@pytest.mark.django_db
+def test_feed_create_signals():
+    with (
+        patch(
+            "obstracts.server.models.create_collection"
+        ) as mock_auto_create_collection,
+        patch("obstracts.server.models.update_identities") as mock_auto_update_identity,
+    ):
+        h4f_feed = h4f_models.Feed.objects.create(
+            title="Example Feed Name (2)",
+            url="https://example.com/2",
+            id="79c488e3-b1c8-40f1-8b8f-2d90e660e47c",
+        )
+        assert h4f_feed.obstracts_feed != None
+        mock_auto_create_collection.assert_called_once()
+        mock_auto_update_identity.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_create_collection():
+    h4f_feed = h4f_models.Feed.objects.create(
+        title="Example Feed Name (2)",
+        url="https://example.com/2",
+        id="79c488e3-b1c8-40f1-8b8f-2d90e660e47c",
+    )
+    feed: models.FeedProfile = h4f_feed.obstracts_feed
+    models.create_collection(feed)
+
+    helper = ArangoDBHelper(settings.VIEW_NAME, None)
+    assert helper.db.has_collection(feed.vertex_collection)
+    assert helper.db.has_collection(feed.edge_collection)
+    for doc in helper.db.collection(feed.vertex_collection).all():
+        if doc["id"] == feed.identity["id"]:
+            assert doc["name"] == "Example Feed Name (2)"
+            assert doc["id"] == "identity--79c488e3-b1c8-40f1-8b8f-2d90e660e47c"
+            break
+    else:
+        raise AssertionError("identity not uploaded")
+
+
+@pytest.mark.django_db
+def test_update_identities():
+    h4f_feed = h4f_models.Feed.objects.create(
+        title="Example Feed Name (2)",
+        url="https://example.com/2",
+        id="79c488e3-b1c8-40f1-8b8f-2d90e660e47c",
+    )
+    feed: models.FeedProfile = h4f_feed.obstracts_feed
+    helper = ArangoDBHelper(settings.VIEW_NAME, None)
+    with patch.object(
+        models.FeedProfile,
+        "identity_dict",
+        {
+            "name": "Totaly new name",
+            "id": "identity--79c488e3-b1c8-40f1-8b8f-2d90e660e47c",
+        },
+    ) as mock_identity:
+        models.update_identities(feed)
+        for doc in helper.db.collection(feed.vertex_collection).all():
+            if doc["id"] == feed.identity["id"]:
+                assert doc["name"] == "Totaly new name", "name should have been updated"
+                break
+        else:
+            raise AssertionError("identity not found")
+
+
+@pytest.mark.django_db
+def test_feed_modify_signals():
+    h4f_feed = h4f_models.Feed.objects.create(
+        title="Example Feed Name (2)",
+        url="https://example.com/2",
+        id="79c488e3-b1c8-40f1-8b8f-2d90e660e47c",
+    )
+    feed: models.FeedProfile = h4f_feed.obstracts_feed
+    with (
+        patch(
+            "obstracts.server.models.create_collection"
+        ) as mock_auto_create_collection,
+        patch("obstracts.server.models.update_identities") as mock_auto_update_identity,
+    ):
+        h4f_feed.title = "New title"
+        h4f_feed.save()
+        mock_auto_create_collection.assert_not_called()
+        mock_auto_update_identity.assert_called_once_with(feed)
+
+
+@pytest.mark.django_db
+def test_feed_delete_signals():
+    h4f_feed = h4f_models.Feed.objects.create(
+        title="Example Feed Name (2)",
+        url="https://example.com/2",
+        id="79c488e3-b1c8-40f1-8b8f-2d90e660e47c",
+    )
+    feed: models.FeedProfile = h4f_feed.obstracts_feed
+    helper = ArangoDBHelper(settings.VIEW_NAME, None)
+    h4f_feed.delete()
+    assert not helper.db.has_collection(
+        feed.vertex_collection
+    ), "vertex collection should already be deleted"
+    assert not helper.db.has_collection(
+        feed.edge_collection
+    ), "eddge collection should already be deleted"
+
+
+@pytest.mark.django_db
+def test_feed_identity():
+    h4f_feed = h4f_models.Feed.objects.create(
+        title="Example Feed Name (2)",
+        url="https://example.com/2",
+        id="79c488e3-b1c8-40f1-8b8f-2d90e660e47c",
+        description="my descr",
+        datetime_modified=dt(2025, 2, 7, 5, 25),
+    )
+    h4f_feed.datetime_added = dt(2024, 1, 1, 5, 25)
+    h4f_feed.save()
+    feed: models.FeedProfile = h4f_feed.obstracts_feed
+    print(feed.identity_dict)
+    assert feed.identity_dict == {
+        "type": "identity",
+        "spec_version": "2.1",
+        "id": "identity--79c488e3-b1c8-40f1-8b8f-2d90e660e47c",
+        "created_by_ref": "identity--a1f2e3ed-6241-5f05-ac2e-3394213b8e08",
+        "created": "2024-01-01T05:25:00.000Z",
+        "modified": "2025-02-07T05:25:00.000Z",
+        "name": "Example Feed Name (2)",
+        "description": "my descr",
+        "contact_information": "https://example.com/2",
+    }
+
+
+@pytest.mark.django_db
+def test_feed_identity__no_date_modified():
+    h4f_feed = h4f_models.Feed.objects.create(
+        title="Example Feed Name (2)",
+        url="https://example.com/2",
+        id="79c488e3-b1c8-40f1-8b8f-2d90e660e47c",
+        description="my description 3",
+    )
+    h4f_feed.datetime_added = dt(2024, 1, 1, 5, 25)
+    h4f_feed.datetime_modified = None
+    h4f_feed.save()
+    feed: models.FeedProfile = h4f_feed.obstracts_feed
+    assert feed.identity_dict == {
+        "type": "identity",
+        "spec_version": "2.1",
+        "id": "identity--79c488e3-b1c8-40f1-8b8f-2d90e660e47c",
+        "created_by_ref": "identity--a1f2e3ed-6241-5f05-ac2e-3394213b8e08",
+        "created": "2024-01-01T05:25:00.000Z",
+        "modified": "2024-01-01T05:25:00.000Z",
+        "name": "Example Feed Name (2)",
+        "description": "my description 3",
+        "contact_information": "https://example.com/2",
+    }
+
+
+@pytest.mark.django_db
+def test_upload_to(feed_with_posts):
+    file = models.File.objects.get(pk="345c8d0b-c6ca-4419-b1f7-0daeb4e9278b")
+    image = models.FileImage.objects.create(report=file)
+    assert (
+        models.upload_to_func(file, "markdown.md")
+        == "6ca6ce37-1c69-4a81-8490-89c91b57e557/posts/345c8d0b-c6ca-4419-b1f7-0daeb4e9278b/345c8d0b-c6ca-4419-b1f7-0daeb4e9278b_markdown.md"
+    )
+    assert (
+        models.upload_to_func(image, "0_image_0.png")
+        == "6ca6ce37-1c69-4a81-8490-89c91b57e557/posts/345c8d0b-c6ca-4419-b1f7-0daeb4e9278b/345c8d0b-c6ca-4419-b1f7-0daeb4e9278b_0_image_0.png"
+    )
+    assert (
+        models.upload_to_func(
+            file,
+            "this is a test for very looooooong filenames, so lets see the output.pdf",
+        )
+        == "6ca6ce37-1c69-4a81-8490-89c91b57e557/posts/345c8d0b-c6ca-4419-b1f7-0daeb4e9278b/345c8d0b-c6ca-4419-b1f7-0daeb4e9278b_this-is-a-test-for-very-looooooo.pdf"
+    )
+
+
+@pytest.mark.django_db
+def test_file_create_embedding_skips_non_incident_by_default(feed_with_posts):
+    file = models.File.objects.filter(feed=feed_with_posts).first()
+    file.ai_describes_incident = False
+    file.embedding = None
+    file.save(update_fields=["ai_describes_incident", "embedding"])
+
+    with patch("obstracts.server.models.compute_embedding_for_document") as mock_compute:
+        file.create_embedding(force=False, include_non_incident=False)
+
+    file.refresh_from_db()
+    assert file.embedding is None
+    mock_compute.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_file_create_embedding_includes_non_incident_when_flag_enabled(feed_with_posts):
+    file = models.File.objects.filter(feed=feed_with_posts).first()
+    file.ai_describes_incident = False
+    file.embedding = None
+    file.save(update_fields=["ai_describes_incident", "embedding"])
+
+    with patch("obstracts.server.models.compute_embedding_for_document") as mock_compute:
+        file.create_embedding(force=False, include_non_incident=True)
+
+    file.refresh_from_db()
+    assert file.embedding_id == file.pk
+    assert file.embedding is not None
+    mock_compute.assert_called_once()
+
+
+@pytest.mark.django_db
+def test_file_create_embedding_defaults_to_false_for_non_incident(feed_with_posts):
+    file = models.File.objects.filter(feed=feed_with_posts).first()
+    file.ai_describes_incident = False
+    file.embedding = None
+    file.save(update_fields=["ai_describes_incident", "embedding"])
+
+    with patch("obstracts.server.models.compute_embedding_for_document") as mock_compute:
+        file.create_embedding(force=False)
+
+    file.refresh_from_db()
+    assert file.embedding is None
+    mock_compute.assert_not_called()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "original_state, new_state, expected_state, has_completion_time",
+    [
+        (JobState.RETRIEVING, JobState.CANCELLED, JobState.CANCELLED, True),
+        (JobState.PROCESSING, JobState.CANCELLED, JobState.CANCELLED, True),
+        (JobState.PROCESSING, JobState.PROCESS_FAILED, JobState.PROCESS_FAILED, True),
+        (JobState.PROCESSING, JobState.RETRIEVE_FAILED, JobState.RETRIEVE_FAILED, True),
+        (JobState.PROCESSING, JobState.PROCESSED, JobState.PROCESSED, True),
+        (JobState.PROCESSED, JobState.CANCELLED, JobState.PROCESSED, False),
+        (JobState.CANCELLING, JobState.CANCELLED, JobState.CANCELLED, True),
+        (JobState.QUEUED, JobState.PROCESSING, JobState.PROCESSING, False),
+        (JobState.RETRIEVING, JobState.PROCESSING, JobState.PROCESSING, False),
+    ],
+)
+def test_update_state_behavior(
+    obstracts_job, original_state, new_state, expected_state, has_completion_time
+):
+    obstracts_job.state = original_state
+    obstracts_job.save()
+
+    result = obstracts_job.update_state(new_state)
+    obstracts_job.refresh_from_db()
+
+    assert obstracts_job.state == expected_state
+    assert result == expected_state
+
+    if has_completion_time:
+        assert obstracts_job.completion_time is not None
+    else:
+        assert obstracts_job.completion_time is None

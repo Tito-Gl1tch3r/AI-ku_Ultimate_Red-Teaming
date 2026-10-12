@@ -1,0 +1,619 @@
+use anyhow::Result;
+use colored::Colorize;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
+
+use crate::jwt;
+use crate::printing::theme;
+use crate::utils;
+
+/// Options for encoding operations
+#[allow(dead_code)]
+pub struct EncodeOptions {
+    pub secret: Option<String>,
+    pub private_key_path: Option<PathBuf>,
+    pub algorithm: String,
+    pub no_signature: bool,
+    pub headers: Vec<(String, String)>,
+    pub compress: bool,
+    pub jwe: bool,
+}
+
+/// Encodes JSON data into a JWT token with various algorithm and signing options
+#[allow(clippy::too_many_arguments)]
+pub fn execute(
+    json_str: &str,
+    secret: Option<&str>,
+    private_key_path: Option<&PathBuf>,
+    algorithm: &str,
+    no_signature: bool,
+    headers: &[(String, String)],
+    compress: bool,
+    jwe: bool,
+) {
+    if jwe {
+        if let Err(e) = encode_jwe(json_str, secret) {
+            utils::log_error(format!("JWE Encode Error: {e}"));
+            utils::log_error("e.g jwt-hack encode {JSON} --jwe --secret={YOUR_SECRET}");
+        }
+    } else if let Err(e) = encode_json(
+        json_str,
+        secret,
+        private_key_path,
+        algorithm,
+        no_signature,
+        headers,
+        compress,
+    ) {
+        utils::log_error(format!("JSON Encode Error: {e}"));
+        utils::log_error("e.g jwt-hack encode {JSON} --secret={YOUR_SECRET}");
+        utils::log_error(
+            "or with RSA: jwt-hack encode {JSON} --private-key=private.pem --algorithm=RS256",
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_json(
+    json_str: &str,
+    secret: Option<&str>,
+    private_key_path: Option<&PathBuf>,
+    algorithm: &str,
+    no_signature: bool,
+    headers: &[(String, String)],
+    compress: bool,
+    jwe: bool,
+) -> Result<Value> {
+    if jwe {
+        // Validate the payload is JSON before encrypting.
+        let _: Value = serde_json::from_str(json_str)?;
+        let key = secret.ok_or_else(|| {
+            anyhow::anyhow!(
+                "JWE encryption requires --secret as the raw content-encryption key (16 bytes for A128GCM, 32 for A256GCM)"
+            )
+        })?;
+        let (content_enc, enc_name) = jwe_dir_encryption(key)?;
+        let token = jwt::encode_jwe(json_str, jwt::JweKeyManagement::Direct(key), content_enc)?;
+        return Ok(serde_json::json!({
+            "success": true,
+            "token_type": "jwe",
+            "key_mgmt": "dir",
+            "encryption": enc_name,
+            "token": token
+        }));
+    }
+
+    let claims: Value = serde_json::from_str(json_str)?;
+    let header_map = create_header_map(headers);
+
+    let (token, key_info, effective_alg) = if no_signature {
+        let options = jwt::EncodeOptions {
+            algorithm: "none",
+            key_data: jwt::KeyData::None,
+            header_params: header_map,
+            compress_payload: compress,
+        };
+        (
+            jwt::encode_with_options(&claims, &options)?,
+            "none".to_string(),
+            "none".to_string(),
+        )
+    } else if let Some(path) = private_key_path {
+        let key_content = fs::read_to_string(path)?;
+        let options = jwt::EncodeOptions {
+            algorithm,
+            key_data: jwt::KeyData::PrivateKeyPem(&key_content),
+            header_params: header_map,
+            compress_payload: compress,
+        };
+        (
+            jwt::encode_with_options(&claims, &options)?,
+            path.display().to_string(),
+            algorithm.to_string(),
+        )
+    } else {
+        let options = jwt::EncodeOptions {
+            algorithm,
+            key_data: jwt::KeyData::Secret(secret.unwrap_or("")),
+            header_params: header_map,
+            compress_payload: compress,
+        };
+        (
+            jwt::encode_with_options(&claims, &options)?,
+            if secret.unwrap_or("").is_empty() {
+                // Still an HMAC signature, just keyed with an empty secret — not unsigned.
+                "empty (signed)".to_string()
+            } else {
+                "****".to_string()
+            },
+            algorithm.to_string(),
+        )
+    };
+
+    Ok(serde_json::json!({
+        "success": true,
+        "token_type": "jwt",
+        "algorithm": effective_alg,
+        "key": key_info,
+        "headers": headers,
+        "compress": compress,
+        "token": token
+    }))
+}
+
+/// Helper function to convert header vector to optional hashmap
+fn create_header_map(headers: &[(String, String)]) -> Option<HashMap<&str, &str>> {
+    if headers.is_empty() {
+        None
+    } else {
+        let mut map = HashMap::new();
+        for (key, value) in headers {
+            map.insert(key.as_str(), value.as_str());
+        }
+        Some(map)
+    }
+}
+
+/// Helper function to display encoding success information
+fn display_encoding_result(
+    token: &str,
+    algorithm: &str,
+    key_info: &str,
+    headers: &[(String, String)],
+) {
+    println!("{}", theme::section_line("Encode"));
+    println!();
+    println!("{}", theme::kv("Algorithm", algorithm.cyan()));
+    println!("{}", theme::kv("Key", key_info));
+
+    if !headers.is_empty() {
+        println!("\n{}", theme::subsection_line("Headers"));
+        for (key, value) in headers {
+            println!("{}", theme::kv(key, value));
+        }
+    }
+
+    println!("\n{}", theme::subsection_line("Token"));
+    println!("{}{}", theme::INDENT, utils::format_jwt_token(token));
+}
+
+fn encode_json(
+    json_str: &str,
+    secret: Option<&str>,
+    private_key_path: Option<&PathBuf>,
+    algorithm: &str,
+    no_signature: bool,
+    headers: &[(String, String)],
+    compress: bool,
+) -> Result<()> {
+    // Parse the input JSON into a Value object
+    let claims: Value = serde_json::from_str(json_str)?;
+
+    // Convert custom header key-value pairs into a hashmap for JWT encoding
+    let header_map = create_header_map(headers);
+
+    // Build JWT encoding options based on provided parameters
+    // Private key option is handled separately due to Rust lifetime requirements
+    let options = if no_signature {
+        // Use 'none' algorithm (creates unsigned JWT token)
+        jwt::EncodeOptions {
+            algorithm: "none",
+            key_data: jwt::KeyData::None,
+            header_params: header_map,
+            compress_payload: compress,
+        }
+    } else if let Some(path) = private_key_path {
+        // Read RSA/EC private key from file for asymmetric algorithms
+        let key_content = fs::read_to_string(path)?;
+
+        // Create encoding options with the private key content (keeping ownership in this scope)
+        let options = jwt::EncodeOptions {
+            algorithm,
+            key_data: jwt::KeyData::PrivateKeyPem(&key_content),
+            header_params: header_map,
+            compress_payload: compress,
+        };
+
+        // Encode JWT immediately while private key content is in scope
+        let token = jwt::encode_with_options(&claims, &options)?;
+
+        let key_info = format!("{} ({})", path.display(), "Private Key".dimmed());
+        display_encoding_result(&token, algorithm, &key_info, headers);
+
+        return Ok(());
+    } else {
+        // Default case: use HMAC with provided secret (or empty string)
+        jwt::EncodeOptions {
+            algorithm,
+            key_data: jwt::KeyData::Secret(secret.unwrap_or("")),
+            header_params: header_map,
+            compress_payload: compress,
+        }
+    };
+
+    // Encode the JWT token using the configured options
+    let token = jwt::encode_with_options(&claims, &options)?;
+
+    // Determine key information display based on signature type. An empty secret
+    // still produces a real (forgeable) HMAC signature, so it must not be reported
+    // as "unsigned" — only the explicit `--no-signature` (none) path is unsigned.
+    let key_info = if no_signature {
+        "None (unsigned)".dimmed().to_string()
+    } else if secret.unwrap_or("").is_empty() {
+        "empty secret (signed)".dimmed().to_string()
+    } else {
+        "****".to_string()
+    };
+
+    // Reflect the actual algorithm written into the token: --no-signature emits "none".
+    let effective_alg = if no_signature { "none" } else { algorithm };
+    display_encoding_result(&token, effective_alg, &key_info, headers);
+
+    Ok(())
+}
+
+/// Select the direct-mode content encryption from the raw key length.
+///
+/// In JWE `dir` mode the supplied key *is* the content-encryption key, so its
+/// length fixes the cipher: 16 bytes → A128GCM, 32 bytes → A256GCM. Any other
+/// length is rejected with actionable guidance instead of silently producing a
+/// bogus token.
+fn jwe_dir_encryption(key: &str) -> Result<(jwt::JweContentEncryption, &'static str)> {
+    match key.len() {
+        16 => Ok((jwt::JweContentEncryption::A128GCM, "A128GCM")),
+        32 => Ok((jwt::JweContentEncryption::A256GCM, "A256GCM")),
+        n => Err(anyhow::anyhow!(
+            "JWE direct encryption requires a 16-byte (A128GCM) or 32-byte (A256GCM) key via --secret, got {n} bytes"
+        )),
+    }
+}
+
+fn encode_jwe(json_str: &str, secret: Option<&str>) -> Result<()> {
+    // Validate the payload is JSON before encrypting (preserves prior behaviour).
+    let _claims: Value = serde_json::from_str(json_str)?;
+    let key = secret.ok_or_else(|| {
+        anyhow::anyhow!(
+            "JWE encryption requires --secret as the raw content-encryption key (16 bytes for A128GCM, 32 for A256GCM)"
+        )
+    })?;
+    let (content_enc, enc_name) = jwe_dir_encryption(key)?;
+
+    // Real AES-GCM encryption via josekit; previously this emitted a deprecated
+    // demo token whose "ciphertext" was just the base64url of the plaintext.
+    let token = jwt::encode_jwe(json_str, jwt::JweKeyManagement::Direct(key), content_enc)?;
+
+    println!("{}", theme::section_line("Encode · JWE"));
+    println!();
+    println!("{}", theme::kv("Key Mgmt", "dir".cyan()));
+    println!("{}", theme::kv("Encryption", enc_name.cyan()));
+
+    println!("\n{}", theme::subsection_line("Token"));
+    println!("{}{}", theme::INDENT, token);
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_jwe_dir_encryption_key_lengths() {
+        assert_eq!(jwe_dir_encryption(&"a".repeat(16)).unwrap().1, "A128GCM");
+        assert_eq!(jwe_dir_encryption(&"a".repeat(32)).unwrap().1, "A256GCM");
+        // Any other length must be rejected, not silently accepted.
+        assert!(jwe_dir_encryption("short").is_err());
+        assert!(jwe_dir_encryption(&"a".repeat(24)).is_err());
+    }
+
+    #[test]
+    fn test_execute_json_jwe_actually_encrypts_and_roundtrips() {
+        use base64::Engine;
+        let plaintext = r#"{"secret_data":"TOP-SECRET"}"#;
+        let key = "01234567890123456789012345678901"; // 32 bytes -> A256GCM
+
+        let value = execute_json(plaintext, Some(key), None, "HS256", false, &[], false, true)
+            .expect("jwe encode");
+        assert_eq!(value["encryption"], "A256GCM");
+        let token = value["token"].as_str().expect("token string");
+
+        // The ciphertext segment must NOT be the base64url of the plaintext
+        // (the old demo path leaked the payload verbatim).
+        let ct_seg = token.split('.').nth(3).expect("ciphertext segment");
+        let plaintext_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(plaintext.as_bytes());
+        assert_ne!(
+            ct_seg, plaintext_b64,
+            "ciphertext must be encrypted, not base64(plaintext)"
+        );
+
+        // And it must round-trip back to the original plaintext with the key.
+        let decrypted = jwt::decrypt_jwe_with_josekit(token, jwt::JweKeyManagement::Direct(key))
+            .expect("jwe decrypt");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_execute_json_jwe_rejects_bad_key_length() {
+        // No usable key length -> error instead of a bogus token.
+        let result = execute_json(
+            r#"{"a":1}"#,
+            Some("tooshort"),
+            None,
+            "HS256",
+            false,
+            &[],
+            false,
+            true,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_header_map() {
+        // Test empty headers
+        let headers = Vec::new();
+        assert_eq!(create_header_map(&headers), None);
+
+        // Test single header
+        let headers = vec![("key1".to_string(), "value1".to_string())];
+        let map = create_header_map(&headers).expect("Should return Some map");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("key1"), Some(&"value1"));
+
+        // Test multiple headers
+        let headers = vec![
+            ("key1".to_string(), "value1".to_string()),
+            ("key2".to_string(), "value2".to_string()),
+        ];
+        let map = create_header_map(&headers).expect("Should return Some map");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("key1"), Some(&"value1"));
+        assert_eq!(map.get("key2"), Some(&"value2"));
+    }
+
+    #[test]
+    fn test_execute_with_secret() {
+        // Create a simple JSON payload
+        let json_str = r#"{"sub":"1234567890","name":"John Doe"}"#;
+        let secret = Some("test_secret");
+        let private_key_path = None;
+        let algorithm = "HS256";
+        let no_signature = false;
+        let headers = Vec::new();
+
+        // Execute should not panic
+        let result = std::panic::catch_unwind(|| {
+            execute(
+                json_str,
+                secret,
+                private_key_path,
+                algorithm,
+                no_signature,
+                &headers,
+                false, // compress
+                false, // jwe
+            );
+        });
+
+        assert!(result.is_ok(), "execute() panicked with valid parameters");
+    }
+
+    #[test]
+    fn test_execute_with_no_signature() {
+        // Create a simple JSON payload
+        let json_str = r#"{"sub":"1234567890","name":"John Doe"}"#;
+        let secret = None;
+        let private_key_path = None;
+        let algorithm = "none";
+        let no_signature = true;
+        let headers = Vec::new();
+
+        // Execute should not panic
+        let result = std::panic::catch_unwind(|| {
+            execute(
+                json_str,
+                secret,
+                private_key_path,
+                algorithm,
+                no_signature,
+                &headers,
+                false, // compress
+                false, // jwe
+            );
+        });
+
+        assert!(result.is_ok(), "execute() panicked with no signature");
+    }
+
+    #[test]
+    fn test_execute_with_custom_headers() {
+        // Create a simple JSON payload
+        let json_str = r#"{"sub":"1234567890","name":"John Doe"}"#;
+        let secret = Some("test_secret");
+        let private_key_path = None;
+        let algorithm = "HS256";
+        let no_signature = false;
+        let headers = vec![
+            ("kid".to_string(), "1234".to_string()),
+            ("typ".to_string(), "JWT+AT".to_string()),
+        ];
+
+        // Execute should not panic
+        let result = std::panic::catch_unwind(|| {
+            execute(
+                json_str,
+                secret,
+                private_key_path,
+                algorithm,
+                no_signature,
+                &headers,
+                false, // compress
+                false, // jwe
+            );
+        });
+
+        assert!(result.is_ok(), "execute() panicked with custom headers");
+    }
+
+    #[test]
+    fn test_execute_with_invalid_json() {
+        // Create an invalid JSON payload
+        let json_str = r#"{"sub":"1234567890","name":"John Doe"#; // Missing closing brace
+        let secret = Some("test_secret");
+        let private_key_path = None;
+        let algorithm = "HS256";
+        let no_signature = false;
+        let headers = Vec::new();
+
+        // Execute should handle the error and not panic
+        let result = std::panic::catch_unwind(|| {
+            execute(
+                json_str,
+                secret,
+                private_key_path,
+                algorithm,
+                no_signature,
+                &headers,
+                false, // compress
+                false, // jwe
+            );
+        });
+
+        assert!(result.is_ok(), "execute() panicked with invalid JSON");
+    }
+
+    #[test]
+    fn test_encode_json_with_rsa_key() {
+        // This test requires creating a temporary RSA key file
+        let temp_dir = tempdir().expect("Failed to create temp directory");
+        let key_path = temp_dir.path().join("test_key.pem");
+
+        // Write sample RSA private key (this is just a placeholder for testing)
+        let sample_key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEogIBAAKCAQEAnzyis1ZjfNB0bBgKFMSvvkTtwlvBsaJq7S5wA+kzeVOVpVWw\nkWdVha4s38XM/pa/yr47av7+z3VTmvDRyAHcaT92whREFpLv9cj5lTeJSibyr/Mr\nm/YtjCZVWgaOYIhwrXwKLqPr/11inWsAkfIytvHWTxZYEcXLgAXFuUuaS3uF9gEi\nNQwzGTU1v0FqkqTBr4B8nW3HCN47XUu0t8Y0e+lf4s4OxQawWD79J9/5d3Ry0vbV\n3Am1FtGJiJvOwRsIfVChDpYStTcHTCMqtvWbV6L11BWkpzGXSW4Hv43qa+GSYOD2\nQU68Mb59oSk2OB+BtOLpJofmbGEGgvmwyCI9MwIDAQAB\n-----END RSA PRIVATE KEY-----";
+        std::fs::write(&key_path, sample_key).expect("Failed to write test key file");
+
+        // Create a simple JSON payload
+        let json_str = r#"{"sub":"1234567890","name":"John Doe"}"#;
+        let secret = None;
+        let private_key_path = Some(&key_path);
+        let algorithm = "RS256";
+        let no_signature = false;
+        let headers = Vec::new();
+
+        // Execute with RSA key shouldn't panic (even if the key is invalid for actual signing)
+        let result = std::panic::catch_unwind(|| {
+            encode_json(
+                json_str,
+                secret,
+                private_key_path,
+                algorithm,
+                no_signature,
+                &headers,
+                false, // compress
+            )
+        });
+
+        assert!(
+            result.is_err() || result.is_ok(),
+            "Properly handled RSA key attempt"
+        );
+
+        // Clean up
+        temp_dir.close().expect("Failed to clean up temp directory");
+    }
+
+    #[test]
+    fn test_execute_with_jwe_flag() {
+        // Test JWE encoding execution
+        let json_str = r#"{"sub":"test","name":"JWE User"}"#;
+        let secret = Some("test_secret");
+        let private_key_path = None;
+        let algorithm = "HS256";
+        let no_signature = false;
+        let headers = Vec::new();
+        let compress = false;
+        let jwe = true;
+
+        // Execute with JWE flag shouldn't panic
+        let result = std::panic::catch_unwind(|| {
+            execute(
+                json_str,
+                secret,
+                private_key_path,
+                algorithm,
+                no_signature,
+                &headers,
+                compress,
+                jwe,
+            );
+        });
+
+        assert!(result.is_ok(), "execute() with JWE flag should not panic");
+    }
+
+    #[test]
+    fn test_encode_jwe_function() {
+        // Test the encode_jwe function directly. Real `dir` encryption needs a
+        // 16- or 32-byte key, so use a valid 32-byte one (A256GCM).
+        let json_str = r#"{"sub":"test","name":"JWE User"}"#;
+        let secret = Some("01234567890123456789012345678901");
+
+        let result = encode_jwe(json_str, secret);
+        assert!(
+            result.is_ok(),
+            "encode_jwe should succeed with valid JSON and a 32-byte key"
+        );
+
+        // A too-short key must be rejected rather than silently accepted.
+        assert!(encode_jwe(json_str, Some("test_secret")).is_err());
+    }
+
+    #[test]
+    fn test_execute_json_hs256() {
+        let json_str = r#"{"sub":"123"}"#;
+        let value = execute_json(json_str, Some("s"), None, "HS256", false, &[], false, false)
+            .expect("encode json");
+        assert_eq!(value.get("success").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            value.get("token_type").and_then(|v| v.as_str()),
+            Some("jwt")
+        );
+        assert!(value
+            .get("token")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .contains('.'));
+    }
+
+    #[test]
+    fn test_compressed_token_header_uses_canonical_alg() {
+        // `--algorithm hs256 --compress` wrote the raw string into the header,
+        // producing `"alg":"hs256"` — rejected by conforming JWT libraries.
+        let value = execute_json(
+            r#"{"sub":"x"}"#,
+            Some("s"),
+            None,
+            "hs256",
+            false,
+            &[],
+            true,
+            false,
+        )
+        .expect("encode");
+        let token = value["token"].as_str().expect("token");
+        let decoded = jwt::decode(token).expect("decode");
+        assert_eq!(
+            decoded.header.get("alg").and_then(|v| v.as_str()),
+            Some("HS256")
+        );
+        assert_eq!(
+            decoded.header.get("zip").and_then(|v| v.as_str()),
+            Some("DEF")
+        );
+        assert_eq!(decoded.claims["sub"], "x");
+    }
+}

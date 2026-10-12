@@ -1,0 +1,160 @@
+package remove
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+
+	"github.com/urfave/cli/v3"
+
+	"github.com/foohq/foojank/cmd/foojank/flags"
+
+	"github.com/foohq/foojank/cmd/foojank/actions"
+	"github.com/foohq/foojank/internal/clients/agent"
+	"github.com/foohq/foojank/internal/config"
+	"github.com/foohq/foojank/internal/path"
+)
+
+func NewCommand() *cli.Command {
+	return &cli.Command{
+		Name:      "remove",
+		ArgsUsage: "<storage>:<file>...",
+		Usage:     "Remove file from a storage",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:  flags.ServerURL,
+				Usage: "set server URL",
+			},
+			&cli.StringFlag{
+				Name:      flags.ServerCertificate,
+				Usage:     "set path to server's certificate",
+				TakesFile: true,
+			},
+			&cli.StringFlag{
+				Name:  flags.Credential,
+				Usage: "set credential",
+			},
+			&cli.StringFlag{
+				Name:  flags.ConfigDir,
+				Usage: "set path to a configuration directory",
+			},
+		},
+		Before:          before,
+		Action:          action,
+		Aliases:         []string{"rm"},
+		ShellComplete:   actions.CompleteFlags,
+		OnUsageError:    actions.UsageError,
+		HideHelpCommand: true,
+	}
+}
+
+func before(ctx context.Context, c *cli.Command) (context.Context, error) {
+	ctx, err := actions.LoadConfig(os.Stderr, validateConfiguration)(ctx, c)
+	if err != nil {
+		return ctx, err
+	}
+
+	ctx, err = actions.SetupLogger(os.Stderr)(ctx, c)
+	if err != nil {
+		return ctx, err
+	}
+
+	ctx, err = actions.SetupServer(os.Stderr)(ctx, c)
+	if err != nil {
+		return ctx, err
+	}
+
+	return ctx, nil
+}
+
+func action(ctx context.Context, c *cli.Command) error {
+	logger := actions.GetLoggerFromContext(ctx)
+	srv := actions.GetServerFromContext(ctx)
+
+	client := agent.New(srv)
+
+	if c.Args().Len() == 0 {
+		logger.ErrorContext(ctx, "Command expects the following arguments: %s", c.ArgsUsage)
+		return errors.New("not enough arguments")
+	}
+
+	for _, file := range c.Args().Slice() {
+		filePath, err := path.Parse(file)
+		if err != nil {
+			logger.ErrorContext(ctx, "Invalid path %q: %v.", file, err)
+			continue
+		}
+
+		if filePath.IsLocal() {
+			logger.ErrorContext(ctx, "Path %q is a local path. Files can only be removed from a storage.", filePath)
+			continue
+		}
+
+		err = removeFile(ctx, client, filePath.Storage, filePath.FilePath)
+		if err != nil {
+			logger.ErrorContext(ctx, "Cannot delete file %q from a storage %q: %v.", filePath.FilePath, filePath.Storage, err)
+			continue
+		}
+	}
+
+	return nil
+
+}
+
+func removeFile(ctx context.Context, client *agent.Client, name, file string) error {
+	storageName, err := client.GetStorageName(ctx, name)
+	if err != nil {
+		return err
+	}
+
+	storage, err := client.GetStorage(ctx, storageName)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = storage.Close()
+	}()
+
+	err = storage.Wait(ctx)
+	if err != nil {
+		return err
+	}
+
+	info, err := storage.Stat(file)
+	if err != nil {
+		return err
+	}
+
+	if info.IsDir() {
+		return fmt.Errorf("file %q is a directory", file)
+	}
+
+	err = storage.Remove(file)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func validateConfiguration(conf *config.Config) error {
+	for _, opt := range []string{
+		flags.ServerURL,
+		flags.Credential,
+	} {
+		switch opt {
+		case flags.ServerURL:
+			v, ok := conf.String(opt)
+			if !ok || v == "" {
+				return errors.New("server URL not configured")
+			}
+		case flags.Credential:
+			v, ok := conf.String(opt)
+			if !ok || v == "" {
+				return errors.New("credential not configured")
+			}
+		}
+	}
+	return nil
+}

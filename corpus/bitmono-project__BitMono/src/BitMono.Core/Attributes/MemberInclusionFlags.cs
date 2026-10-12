@@ -1,0 +1,38 @@
+﻿namespace BitMono.Core.Attributes;
+
+/// <summary>
+/// Flags that specify which types of members should be excluded from resolution (obfuscation).
+/// Used with the <see cref="DoNotResolveAttribute"/> to control which members are protected from obfuscation.
+/// </summary>
+[Flags]
+public enum MemberInclusionFlags
+{
+    /// <summary>
+    /// Exclude special runtime members from obfuscation (e.g., special methods, properties, or fields used by the runtime).
+    /// </summary>
+    SpecialRuntime = 0x1,
+    
+    /// <summary>
+    /// Exclude model members from obfuscation (e.g., data models, DTOs, or entities that should preserve their structure).
+    /// </summary>
+    Model = 0x2,
+    
+    /// <summary>
+    /// Exclude members that are used in reflection from obfuscation (e.g., methods, fields, properties accessed via reflection).
+    /// </summary>
+    Reflection = 0x4,
+
+    /// <summary>
+    /// Exclude members referenced by compiled WPF XAML (BAML) from obfuscation, so renaming or
+    /// namespace-stripping doesn't leave the BAML pointing at names that no longer exist.
+    /// </summary>
+    Baml = 0x8,
+
+    /// <summary>
+    /// Exclude a method from IL-mutating protections when its raw IL is read back at runtime via
+    /// reflection (<c>MethodBody.GetILAsByteArray</c>/<c>MethodBase.GetMethodBody</c>). Renaming is
+    /// unaffected - this guards against control-flow and other body rewriters changing bytes the
+    /// program inspects. See ConfuserEx#39.
+    /// </summary>
+    MethodBody = 0x10,
+}

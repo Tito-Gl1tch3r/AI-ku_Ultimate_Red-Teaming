@@ -1,0 +1,51 @@
+import UserAvatar from "components/badges/UserAvatar";
+import { AuthContext } from "contexts/AuthContext";
+import useToggle from "hooks/useToggle";
+import { useContext } from "react";
+import { useTranslation } from "react-i18next";
+import { Link } from "react-router-dom";
+import AuthService from "services/auth";
+
+const HeaderUserMenu = () => {
+    const [t] = useTranslation();
+    const { user, logout } = useContext(AuthContext);
+
+    const { value, toggle } = useToggle(false);
+
+    return (
+        <div className={`dropdown ${value ? "is-active" : ""}`}>
+            <div className="dropdown-trigger">
+                <button
+                    className="button"
+                    aria-haspopup="true"
+                    aria-controls="dropdown-menu"
+                    onClick={toggle}
+                >
+                    <span>
+                        <UserAvatar />{" "}
+                        <span color="gray.500">
+                            {AuthService.getUsername()}
+                        </span>{" "}
+                        (<span>{user.role}</span>)
+                    </span>
+                    <span className="icon is-small">
+                        <i className="fas fa-angle-down" aria-hidden="true"></i>
+                    </span>
+                </button>
+            </div>{" "}
+            <div className="dropdown-menu" id="dropdown-menu" role="menu">
+                <div className="dropdown-content">
+                    <Link className="dropdown-item" to={`/users/${user.id}`}>
+                        <div>Your profile</div>
+                    </Link>
+                    <hr className="dropdown-divider" />
+                    <Link className="dropdown-item" to="/" onClick={logout}>
+                        {t("Logout")}
+                    </Link>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+export default HeaderUserMenu;

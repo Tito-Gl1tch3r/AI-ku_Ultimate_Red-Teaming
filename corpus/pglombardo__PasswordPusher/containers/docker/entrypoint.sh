@@ -1,0 +1,150 @@
+#!/bin/bash
+set -e
+
+export RAILS_ENV=production
+
+# Read app version for startup banner.
+if [ -r "/opt/PasswordPusher/VERSION" ]; then
+    APP_VERSION=$(tr -d '[:space:]' < /opt/PasswordPusher/VERSION)
+else
+    APP_VERSION="unknown"
+fi
+
+# If arguments are passed, execute them directly (e.g., "bundle exec rails secret")
+# This allows running utility commands without starting the full application
+if [ $# -gt 0 ]; then
+    exec "$@"
+fi
+
+echo "
+██████╗  █████╗ ███████╗███████╗██╗    ██╗ ██████╗ ██████╗ ██████╗
+██╔══██╗██╔══██╗██╔════╝██╔════╝██║    ██║██╔═══██╗██╔══██╗██╔══██╗
+██████╔╝███████║███████╗███████╗██║ █╗ ██║██║   ██║██████╔╝██║  ██║
+██╔═══╝ ██╔══██║╚════██║╚════██║██║███╗██║██║   ██║██╔══██╗██║  ██║
+██║     ██║  ██║███████║███████║╚███╔███╔╝╚██████╔╝██║  ██║██████╔╝
+╚═╝     ╚═╝  ╚═╝╚══════╝╚══════╝ ╚══╝╚══╝  ╚═════╝ ╚═╝  ╚═╝╚═════╝
+
+██████╗ ██╗   ██╗███████╗██╗  ██╗███████╗██████╗
+██╔══██╗██║   ██║██╔════╝██║  ██║██╔════╝██╔══██╗
+██████╔╝██║   ██║███████╗███████║█████╗  ██████╔╝
+██╔═══╝ ██║   ██║╚════██║██╔══██║██╔══╝  ██╔══██╗
+██║     ╚██████╔╝███████║██║  ██║███████╗██║  ██║
+╚═╝      ╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝
+
+ ██████╗ ███████╗███████╗
+██╔═══██╗██╔════╝██╔════╝
+██║   ██║███████╗███████╗
+██║   ██║╚════██║╚════██║
+╚██████╔╝███████║███████║
+ ╚═════╝ ╚══════╝╚══════╝
+
+Version: ${APP_VERSION}
+
+By Apnotic, LLC
+
+Github: https://github.com/pglombardo/PasswordPusher
+Documentation: https://docs.pwpush.com
+Support: https://docs.pwpush.com/docs/support/
+"
+
+# Resolve SECRET_KEY_BASE from a Docker secrets-style file when the env var is unset.
+# SECRET_KEY_BASE wins when both are set. Fail loudly if _FILE is set but unreadable.
+if [ -z "$SECRET_KEY_BASE" ] && [ -n "$SECRET_KEY_BASE_FILE" ]; then
+    if [ ! -r "$SECRET_KEY_BASE_FILE" ]; then
+        echo "ERROR: SECRET_KEY_BASE_FILE is set but not readable: $SECRET_KEY_BASE_FILE" >&2
+        exit 1
+    fi
+    SECRET_KEY_BASE="$(tr -d '[:space:]' < "$SECRET_KEY_BASE_FILE")"
+    if [ -z "$SECRET_KEY_BASE" ]; then
+        echo "ERROR: SECRET_KEY_BASE_FILE is set but the file is empty: $SECRET_KEY_BASE_FILE" >&2
+        exit 1
+    fi
+    export SECRET_KEY_BASE
+fi
+
+# Validate or generate SECRET_KEY_BASE
+if [ -z "$SECRET_KEY_BASE" ]; then
+    echo "⚠️  SECRET_KEY_BASE not set; generating a random key for this boot."
+    echo " → Effect: Users will need to login again after container restart."
+    echo " → Set SECRET_KEY_BASE for persistent sessions (required for multi-node deployments)."
+    echo " → Generator: docker run --rm pglombardo/pwpush bundle exec rails secret"
+    export SECRET_KEY_BASE=$(ruby -e "require 'securerandom'; puts SecureRandom.hex(64)")
+else
+    echo "✓ SECRET_KEY_BASE is set"
+fi
+
+echo ""
+if [ -z "$DATABASE_URL" ]
+then
+    # Check if old database path exists, otherwise use new path based on RAILS_ENV
+    if [ -f "/opt/PasswordPusher/db/db.sqlite3" ]
+    then
+        echo "⚠️ Using deprecated database path: /opt/PasswordPusher/db/db.sqlite3"
+        echo ""
+        echo "EPHEMERAL (no action): Database will be recreated on restart."
+        echo ""
+        echo "PERSISTENT (migration advised):"
+        echo "  1. Inside container:"
+        echo "     mkdir -p /opt/PasswordPusher/storage/db"
+        echo "     mv /opt/PasswordPusher/db/db.sqlite3 /opt/PasswordPusher/storage/db/production.sqlite3"
+        echo "     [ -f /opt/PasswordPusher/db/db.sqlite3-wal ] && mv /opt/PasswordPusher/db/db.sqlite3-wal /opt/PasswordPusher/storage/db/production.sqlite3-wal || true"
+        echo "     [ -f /opt/PasswordPusher/db/db.sqlite3-shm ] && mv /opt/PasswordPusher/db/db.sqlite3-shm /opt/PasswordPusher/storage/db/production.sqlite3-shm || true"
+        echo "  2. Make sure that storage is a persistent volume: -v pwpush-storage:/opt/PasswordPusher/storage"
+        echo ""
+        export DATABASE_URL=sqlite3:db/db.sqlite3
+    else
+        export DATABASE_URL=sqlite3:storage/db/production.sqlite3
+    fi
+else
+    echo "According to DATABASE_URL database backend is set to $(echo $DATABASE_URL|cut -d ":" -f 1):..."
+fi
+echo ""
+
+# db/migrate must come from the image. A volume mounted over /opt/PasswordPusher/db hides it.
+if [ ! -d "/opt/PasswordPusher/db/migrate" ] || [ -z "$(ls -A /opt/PasswordPusher/db/migrate 2>/dev/null)" ]; then
+    echo "ERROR: /opt/PasswordPusher/db/migrate is missing or empty."
+    echo "A volume is likely mounted over /opt/PasswordPusher/db, which hides migration files from the image."
+    echo "Mount persistent data at /opt/PasswordPusher/storage instead (see docker-compose.yml)."
+    echo "Docs: https://docs.pwpush.com/docs/database_url/"
+    exit 1
+fi
+
+
+# Upgrade guidance for users migrating from 1.x.
+echo "Running Password Pusher ${APP_VERSION}. Migrating from 1.x? Read: https://github.com/pglombardo/PasswordPusher/blob/master/UPGRADE-2.0.md"
+echo ""
+
+# Persist DATABASE_URL and RAILS_ENV for shell access (skip when running as arbitrary user, e.g. OpenShift)
+# Create .env.production if missing (no-op if we lack permission; avoids exit due to set -e)
+touch /opt/PasswordPusher/.env.production 2>/dev/null || true
+if [ -w /opt/PasswordPusher/.env.production ]; then
+  echo "export DATABASE_URL=\"${DATABASE_URL}\"" >> /opt/PasswordPusher/.env.production
+  echo "export RAILS_ENV=\"${RAILS_ENV}\"" >> /opt/PasswordPusher/.env.production
+  echo "export SECRET_KEY_BASE=\"${SECRET_KEY_BASE}\"" >> /opt/PasswordPusher/.env.production
+fi
+
+echo "Password Pusher: migrating database to latest..."
+bundle exec rake db:migrate
+
+if [ -n "$PWP_PRECOMPILE" ] || [ -n "$PWP__THEME" ]; then
+    echo "Password Pusher: rebuilding CSS for selected theme (custom overlays)..."
+    BUILD_CSS_SINGLE=1 yarn build:css:single
+    echo "Password Pusher: precompiling assets..."
+    bundle exec rails assets:precompile
+fi
+
+# Set the default port if not specified
+if [ -n "$PORT" ]; then
+    export TARGET_PORT=$PORT
+else
+    export TARGET_PORT=5100
+fi
+
+echo "Password Pusher: starting foreman..."
+if [ -n "$PWP__NO_WORKER" ] || [ -n "$PWP_PUBLIC_GATEWAY" ]; then
+    exec bundle exec foreman start -m web=1
+else
+    export SOLID_QUEUE_SUPERVISOR_MODE="${SOLID_QUEUE_SUPERVISOR_MODE:-async}"
+    echo "Password Pusher: Solid Queue supervisor mode: ${SOLID_QUEUE_SUPERVISOR_MODE}"
+    exec bundle exec foreman start -m web=1,worker=1
+fi

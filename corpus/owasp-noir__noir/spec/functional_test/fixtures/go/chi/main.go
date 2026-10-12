@@ -1,0 +1,184 @@
+import (
+	//...
+	"context"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+  )
+  
+  func main() {
+	r := chi.NewRouter()
+  
+	// A good base middleware stack
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+  
+	// Set a timeout value on the request context (ctx), that will signal
+	// through ctx.Done() that the request has timed out and further
+	// processing should be stopped.
+	r.Use(middleware.Timeout(60 * time.Second))
+  
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+	  w.Write([]byte("hi"))
+	})
+  
+	// RESTy routes for "articles" resource
+	r.Route("/articles", func(r chi.Router) {
+	  r.With(paginate).Get("/", listArticles)                           // GET /articles
+	  r.With(paginate).Get("/{month}-{day}-{year}", listArticlesByDate) // GET /articles/01-16-2017
+  
+	  r.Post("/", createArticle)                                        // POST /articles
+	  r.Get("/search", searchArticles)                                  // GET /articles/search
+  
+	  // Regexp url parameters:
+	  r.Get("/{articleSlug:[a-z-]+}", getArticleBySlug)                // GET /articles/home-is-toronto
+  
+	  // Subrouters:
+	  r.Route("/{articleID}", func(r chi.Router) {
+		r.Use(ArticleCtx)
+		r.Get("/", getArticle)                                          // GET /articles/123
+		r.Put("/", updateArticle)                                       // PUT /articles/123
+		r.Delete("/", deleteArticle)                                    // DELETE /articles/123
+	  })
+	})
+  
+	// Mount the admin sub-router
+	r.Mount("/admin", adminRouter())
+  
+	// Routes to test parameter extraction with inline handlers
+	r.Get("/search-test", func(w http.ResponseWriter, r *http.Request) {
+		// Test query parameters
+		query := r.URL.Query().Get("q")
+		page := r.URL.Query().Get("page")
+		limit := r.URL.Query().Get("limit")
+		_ = query
+		_ = page
+		_ = limit
+	})
+	
+	r.Post("/login-test", func(w http.ResponseWriter, r *http.Request) {
+		// Test form parameters
+		username := r.FormValue("username")
+		password := r.FormValue("password")
+		_ = username
+		_ = password
+	})
+	
+	r.Post("/register-test", func(w http.ResponseWriter, r *http.Request) {
+		// Test POST form parameters
+		email := r.PostFormValue("email")
+		name := r.PostFormValue("name")
+		_ = email
+		_ = name
+	})
+	
+	r.Get("/api-test", func(w http.ResponseWriter, r *http.Request) {
+		// Test header extraction
+		apiKey := r.Header.Get("X-API-Key")
+		userAgent := r.Header.Get("User-Agent")
+		_ = apiKey
+		_ = userAgent
+	})
+	
+	r.Get("/profile-test", func(w http.ResponseWriter, r *http.Request) {
+		// Test cookie extraction
+		sessionCookie, _ := r.Cookie("session")
+		authCookie, _ := r.Cookie("auth_token")
+		_ = sessionCookie
+		_ = authCookie
+	})
+	
+	// Test multi-line route definition
+	r.Get(
+		"/multiline",
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("multiline"))
+		},
+	)
+	
+	// Test uppercase methods
+	r.GET("/uppercase", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("uppercase"))
+	})
+	
+	r.POST("/uppercase-post", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("uppercase post"))
+	})
+  
+	// Test .Group() for middleware grouping (no prefix change)
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.Logger)
+		r.Get("/grouped", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("grouped"))
+		})
+	})
+
+	// Test .Group() nested inside .Route()
+	r.Route("/api", func(r chi.Router) {
+		r.Group(func(r chi.Router) {
+			r.Get("/users", func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte("api users"))
+			})
+		})
+		r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("api health"))
+		})
+	})
+
+	http.ListenAndServe(":3333", r)
+  }
+  
+  func ArticleCtx(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	  articleID := chi.URLParam(r, "articleID")
+	  article, err := dbGetArticle(articleID)
+	  if err != nil {
+		http.Error(w, http.StatusText(404), 404)
+		return
+	  }
+	  ctx := context.WithValue(r.Context(), "article", article)
+	  next.ServeHTTP(w, r.WithContext(ctx))
+	})
+  }
+  
+  func getArticle(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	article, ok := ctx.Value("article").(*Article)
+	if !ok {
+	  http.Error(w, http.StatusText(422), 422)
+	  return
+	}
+	w.Write([]byte(fmt.Sprintf("title:%s", article.Title)))
+  }
+  
+  // A completely separate router for administrator routes
+  func adminRouter() http.Handler {
+	r := chi.NewRouter()
+	r.Use(AdminOnly)
+	r.Get("/", adminIndex)
+	r.Get("/accounts", adminListAccounts)
+	r.Route("/settings", func(r chi.Router) {
+		r.Get("/", settingsIndex)
+		r.Put("/", updateSettings)
+	})
+	// Inline handler inside mounted router (tests analyze_router_function inline handler tracking)
+	r.Post("/webhook", func(w http.ResponseWriter, r *http.Request) {
+		payload := r.FormValue("payload")
+		_ = payload
+		w.Write([]byte("webhook received"))
+	})
+	return r
+  }
+  
+  func AdminOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	  ctx := r.Context()
+	  perm, ok := ctx.Value("acl.permission").(YourPermissionType)
+	  if !ok || !perm.IsAdmin() {
+		http.Error(w, http.StatusText(403), 403)
+		return
+	  }
+	  next.ServeHTTP(w, r)
+	})
+  }

@@ -1,0 +1,824 @@
+import base64
+import fnmatch
+import re
+from dataclasses import dataclass
+from datetime import datetime
+from functools import cached_property
+from typing import Any, ClassVar
+
+import yaml  # type: ignore[import-untyped]
+from dlt.common.libs.pydantic import DltConfig
+from openhound.core.asset import (  # type: ignore[import-untyped]
+    BaseAsset,
+    EdgeDef,
+    NodeDef,
+)
+from openhound.core.models.entries_dataclass import (  # type: ignore[import-untyped]
+    Edge,
+    EdgePath,
+    EdgeProperties,
+)
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+
+from openhound_github.graph import GHNode, GHNodeProperties
+from openhound_github.kinds import edges as ek
+from openhound_github.kinds import nodes as nk
+from openhound_github.main import app
+from openhound_github.models.permissions import normalize_permission_declaration
+
+
+class GithubActionsLoader(yaml.SafeLoader):
+    pass
+
+
+GithubActionsLoader.yaml_implicit_resolvers = {
+    key: list(value) for key, value in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+for first, mappings in list(GithubActionsLoader.yaml_implicit_resolvers.items()):
+    GithubActionsLoader.yaml_implicit_resolvers[first] = [
+        (tag, regexp) for tag, regexp in mappings if tag != "tag:yaml.org,2002:bool"
+    ]
+
+
+SECRET_REFERENCE_RE = re.compile(r"\$\{\{\s*secrets\.(\w+)\s*\}\}")
+VARIABLE_REFERENCE_RE = re.compile(r"\$\{\{\s*vars\.(\w+)\s*\}\}")
+ACTION_RE = re.compile(r"^(?P<owner>[^/]+)/(?P<name>[^@]+)@(?P<ref>.+)$")
+PINNED_REF_RE = re.compile(r"^[0-9a-f]{40}$")
+TEMPLATE_RE = re.compile(r"\$\{\{\s*[^}]+?\s*\}\}")
+
+
+class WorkflowStepDefinition(BaseModel):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    name: str | None = None
+    uses: str | None = None
+    run: str | None = None
+    with_: dict[str, str] = Field(default_factory=dict, alias="with")
+    env: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("with_", "env", mode="before")
+    @classmethod
+    def dict_or_empty(cls, value: Any) -> dict[str, Any]:
+        return value if isinstance(value, dict) else {}
+
+    @property
+    def display_name(self) -> str | None:
+        if self.name:
+            return self.name
+        if self.uses:
+            return self.uses
+        if self.run:
+            first_line = self.run.split("\n", 1)[0].strip()
+            return f"{first_line[:80]}..." if len(first_line) > 80 else first_line
+        return None
+
+    @property
+    def type(self) -> str:
+        if self.uses:
+            return "uses"
+        if self.run:
+            return "run"
+        return "unknown"
+
+
+class Container(BaseModel):
+    image: str
+    credentials: dict[str, str] | None = None
+    env: dict[str, str] | None = None
+    ports: list[int] | None = None
+
+    def __str__(self) -> str:
+        return self.image
+
+
+class RunsOn(BaseModel):
+    group: str | None = None
+    labels: list[str] | str | None = None
+
+
+class RunsOnSelector(BaseModel):
+    group: str | None = None
+    labels: list[str] = Field(default_factory=list)
+    is_dynamic: bool = False
+
+
+GITHUB_TOKEN_PERMISSION_SCOPES = (
+    "actions",
+    "artifact-metadata",
+    "attestations",
+    "checks",
+    "code-quality",
+    "contents",
+    "deployments",
+    "discussions",
+    "id-token",
+    "issues",
+    "models",
+    "packages",
+    "pages",
+    "pull-requests",
+    "security-events",
+    "statuses",
+    "vulnerability-alerts",
+)
+READ_ONLY_GITHUB_TOKEN_PERMISSION_SCOPES = {"models", "vulnerability-alerts"}
+WRITE_ONLY_GITHUB_TOKEN_PERMISSION_SCOPES = {"id-token"}
+
+
+def _empty_github_token_permissions() -> dict[str, str]:
+    return {scope: "none" for scope in GITHUB_TOKEN_PERMISSION_SCOPES}
+
+
+def _all_github_token_permissions(
+    access: str, *, include_id_token: bool = True
+) -> dict[str, str]:
+    permissions = _empty_github_token_permissions()
+    for scope in GITHUB_TOKEN_PERMISSION_SCOPES:
+        if scope in WRITE_ONLY_GITHUB_TOKEN_PERMISSION_SCOPES:
+            permissions[scope] = (
+                "write" if access == "write" and include_id_token else "none"
+            )
+        elif scope in READ_ONLY_GITHUB_TOKEN_PERMISSION_SCOPES:
+            permissions[scope] = "read"
+        else:
+            permissions[scope] = access
+    return permissions
+
+
+def _default_github_token_permissions(default_workflow_permissions: str | None):
+    if default_workflow_permissions is None:
+        return None
+
+    default = default_workflow_permissions.casefold()
+    if default == "read":
+        permissions = _empty_github_token_permissions()
+        permissions["contents"] = "read"
+        permissions["packages"] = "read"
+        return permissions
+    if default == "write":
+        return _all_github_token_permissions("write", include_id_token=False)
+    return None
+
+
+def _expand_permission_declaration(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        declaration = value.casefold()
+        if declaration == "read-all":
+            return _all_github_token_permissions("read")
+        if declaration == "write-all":
+            return _all_github_token_permissions("write")
+        return None
+
+    if isinstance(value, list):
+        if not value:
+            return _empty_github_token_permissions()
+        if len(value) == 1 and ":" not in str(value[0]):
+            return _expand_permission_declaration(str(value[0]))
+
+        normalized: dict[str, str] = {}
+        for item in value:
+            scope, separator, access = str(item).partition(":")
+            if not separator:
+                return None
+            normalized[scope] = access
+        value = normalized
+
+    if not isinstance(value, dict):
+        return None
+
+    permissions = _empty_github_token_permissions()
+    for raw_scope, raw_access in value.items():
+        scope = str(raw_scope).casefold()
+        permissions[scope] = str(raw_access).casefold()
+    return permissions
+
+
+def resolve_effective_github_token_permissions(
+    default_workflow_permissions: str | None,
+    workflow_permissions: Any,
+    job_permissions: Any,
+) -> list[str] | None:
+    permissions = _default_github_token_permissions(default_workflow_permissions)
+
+    for declaration in (workflow_permissions, job_permissions):
+        if declaration is None:
+            continue
+        expanded = _expand_permission_declaration(declaration)
+        if expanded is None:
+            return None
+        permissions = expanded
+
+    if permissions is None:
+        return None
+
+    return [f"{scope}:{access}" for scope, access in permissions.items()]
+
+
+def parse_runs_on_selector(value: Any) -> RunsOnSelector:
+    """Normalize a workflow job's runs-on declaration without losing group data."""
+    if value is None:
+        return RunsOnSelector()
+
+    if isinstance(value, RunsOn):
+        value = value.model_dump()
+
+    group: str | None = None
+    labels: list[str] = []
+
+    if isinstance(value, str):
+        labels = [value]
+    elif isinstance(value, list):
+        labels = [str(item) for item in value]
+    elif isinstance(value, dict):
+        raw_group = value.get("group")
+        if raw_group is not None:
+            group = str(raw_group)
+
+        raw_labels = value.get("labels")
+        if isinstance(raw_labels, str):
+            labels = [raw_labels]
+        elif isinstance(raw_labels, list):
+            labels = [str(item) for item in raw_labels]
+        elif raw_labels is not None:
+            labels = [str(raw_labels)]
+    else:
+        labels = [str(value)]
+
+    is_dynamic = any(TEMPLATE_RE.search(item) for item in labels)
+    if group:
+        is_dynamic = is_dynamic or bool(TEMPLATE_RE.search(group))
+
+    return RunsOnSelector(group=group, labels=labels, is_dynamic=is_dynamic)
+
+
+class WorkflowJobDefinition(BaseModel):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    runs_on: str | list[str] | RunsOn | None = Field(default=None, alias="runs-on")
+    needs: str | list[str] | None = None
+    environment: str | dict[str, str] | None = None
+    permissions: str | dict[str, str] | None = None
+    uses: str | None = None
+    container: str | Container | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+    secrets: dict[str, str] = Field(default_factory=dict)
+    steps: list[WorkflowStepDefinition] = Field(default_factory=list)
+
+    # This may seem strange, but the GitHub yaml format accepts empty values for keys
+    # additionally, to prevent other yaml parsing issues, make sure we always convert the key/value to string first
+    # for both env and secrets
+    @field_validator("env", "secrets", mode="before")
+    @classmethod
+    def dict_or_empty(cls, value: Any) -> dict[str, str]:
+        return (
+            {f"{str(key)}": f"{str(value)}" for key, value in value.items()}
+            if isinstance(value, dict)
+            else {}
+        )
+
+    @field_validator("steps", mode="before")
+    @classmethod
+    def valid_step_dicts(cls, value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        return [step for step in value if isinstance(step, dict)]
+
+    @property
+    def needs_list(self) -> list[str]:
+        if isinstance(self.needs, str):
+            return [self.needs]
+        if isinstance(self.needs, list):
+            return [str(item) for item in self.needs]
+        return []
+
+    @property
+    def environment_name(self) -> str | None:
+        if isinstance(self.environment, str):
+            return self.environment
+        if (
+            isinstance(self.environment, dict)
+            and self.environment.get("name") is not None
+        ):
+            return str(self.environment["name"])
+        return None
+
+    @property
+    def container_value(self) -> str | None:
+        return str(self.container) if self.container else None
+
+    @property
+    def runs_on_selector(self) -> RunsOnSelector:
+        return parse_runs_on_selector(self.runs_on)
+
+
+class WorkflowDocument(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    permissions: str | dict[str, str] | None = None
+    jobs: dict[str, WorkflowJobDefinition] = Field(default_factory=dict)
+
+    @field_validator("jobs", mode="before")
+    @classmethod
+    def jobs_dict_or_empty(cls, value: Any) -> dict[str, Any]:
+        return value if isinstance(value, dict) else {}
+
+
+def workflow_job_node_id(workflow_node_id: str, job_key: str) -> str:
+    return f"GH_WorkflowJob_{workflow_node_id}_{job_key}"
+
+
+def workflow_step_node_id(workflow_node_id: str, job_key: str, step_index: int) -> str:
+    return f"GH_WorkflowStep_{workflow_node_id}_{job_key}_{step_index}"
+
+
+def references(
+    pattern: re.Pattern[str], text: Any, context: str
+) -> list[dict[str, str]]:
+    if text is None:
+        return []
+    return [
+        {"name": name, "context": context}
+        for name in dict.fromkeys(
+            match.group(1) for match in pattern.finditer(str(text))
+        )
+    ]
+
+
+def unique_references(items: list[dict[str, str]]) -> list[dict[str, str]]:
+    unique = []
+    seen = set()
+    for item in items:
+        key = (item["name"], item.get("context"))
+        if key not in seen:
+            unique.append(item)
+            seen.add(key)
+    return unique
+
+
+def mapping_references(
+    pattern: re.Pattern[str], mapping: dict[str, Any], context_prefix: str
+) -> list[dict[str, str]]:
+    refs = []
+    for key, value in mapping.items():
+        refs.extend(references(pattern, value, f"{context_prefix}:{key}"))
+    return refs
+
+
+def action_parts(action: str | None) -> dict[str, Any]:
+    parts: dict[str, Any] = {
+        "action_owner": None,
+        "action_name": None,
+        "action_ref": None,
+        "action_slug": None,
+        "is_pinned": False,
+    }
+    if not action:
+        return parts
+    match = ACTION_RE.match(action)
+    if not match:
+        return parts
+    owner = match.group("owner")
+    name = match.group("name")
+    ref = match.group("ref")
+    parts.update(
+        {
+            "action_owner": owner,
+            "action_name": name,
+            "action_ref": ref,
+            "action_slug": f"{owner}/{name}",
+            "is_pinned": bool(PINNED_REF_RE.match(ref)),
+        }
+    )
+    return parts
+
+
+@dataclass
+class GHWorkflowProperties(GHNodeProperties):
+    """Workflow-specific properties and accordion panel queries.
+
+    Attributes:
+        short_name: The workflow's display name.
+        path: The file path of the workflow definition (e.g., `.github/workflows/ci.yml`).
+        state: The workflow state (e.g., `active`, `disabled_manually`).
+        url: The API URL for the workflow.
+        repository_name: The full name of the containing repository.
+        repository_id: The node_id of the containing repository.
+        html_url: The GitHub web URL for the workflow file.
+        branch: The branch where the workflow file was found.
+        contents: The content of the workflow file.
+        workflow_permissions: Permissions declared at the workflow level.
+        query_repository: Query for repository.
+        query_jobs: Query for workflow jobs.
+        query_execution: Query for workflow executions.
+        query_references: Query for workflow references (secrets and variables).
+        query_editors: Query for editors.
+        environment_name: The name of the environment (GitHub organization).
+    """
+
+    short_name: str | None = None
+    path: str | None = None
+    state: str | None = None
+    url: str | None = None
+    repository_name: str | None = None
+    repository_id: str | None = None
+    html_url: str | None = None
+    branch: str | None = None
+    contents: str | None = None
+    workflow_permissions: list[str] | None = None
+    triggers: list[str] | None = None
+    trigger_dispatch_inputs: list[str] | None = None
+    is_pwn_requestable: bool = False
+    query_repository: str | None = None
+    query_jobs: str | None = None
+    query_execution: str | None = None
+    query_references: str | None = None
+    query_editors: str | None = None
+    environment_name: str | None = None
+
+
+@app.asset(
+    node=NodeDef(
+        kind=nk.WORKFLOW,
+        description="GitHub Actions Workflow",
+        icon="cogs",
+        properties=GHWorkflowProperties,
+    ),
+    edges=[
+        EdgeDef(
+            start=nk.REPOSITORY,
+            end=nk.WORKFLOW,
+            kind=ek.CONTAINS,
+            description="Repository contains workflow",
+            traversable=False,
+        ),
+        EdgeDef(
+            start=nk.REPO_ROLE,
+            end=nk.REPOSITORY,
+            kind=ek.CAN_PWN_REQUEST,
+            description="Repo role can exploit a pwn-requestable workflow on the repository",
+            traversable=True,
+        ),
+        EdgeDef(
+            start=nk.REPO_ROLE,
+            end=nk.BRANCH,
+            kind=ek.CAN_PWN_REQUEST,
+            description="Repo role can exploit a pwn-requestable workflow on a targeted branch",
+            traversable=True,
+        ),
+    ],
+)
+class Workflow(BaseAsset):
+    """One record from `workflows` → one GH_Workflow node + GH_Contains edge from repo."""
+
+    dlt_config: ClassVar[DltConfig] = {"return_validated_models": True}
+
+    id: int
+    node_id: str
+    name: str
+    path: str
+    state: str
+    created_at: datetime
+    updated_at: datetime
+    url: str
+    html_url: str | None = None
+    branch: str | None = None
+    contents: str | None = None
+
+    # Custom fields added
+    org_login: str
+    repository_name: str
+    repository_node_id: str
+    repository_default_workflow_permissions: str | None = None
+    repository_can_approve_pull_request_reviews: bool | None = None
+
+    @property
+    def org_node_id(self) -> str | None:
+        return self._lookup.org_id_for_login(self.org_login)
+
+    @computed_field()
+    @cached_property
+    def document(self) -> WorkflowDocument | None:
+        if not self.contents or not self.contents.strip():
+            return None
+        try:
+            decoded = base64.b64decode(self.contents)
+            parsed = yaml.load(decoded, Loader=GithubActionsLoader)
+            if not isinstance(parsed, dict):
+                return None
+
+            return WorkflowDocument.model_validate(parsed)
+        except Exception:
+            return None
+
+    @property
+    def trigger_events(self) -> list[str] | None:
+        document = self.document
+        if not document:
+            return None
+
+        on_value = document.model_extra.get("on")
+        if isinstance(on_value, str):
+            return [on_value]
+        if isinstance(on_value, list):
+            return [str(item) for item in on_value]
+        if isinstance(on_value, dict):
+            return [str(key) for key in on_value.keys()]
+
+        return None
+
+    @property
+    def workflow_dispatch_inputs(self) -> list[str] | None:
+        document = self.document
+        if not document:
+            return None
+
+        on_value = document.model_extra.get("on")
+        if not isinstance(on_value, dict):
+            return None
+
+        workflow_dispatch = on_value.get("workflow_dispatch")
+        if not isinstance(workflow_dispatch, dict):
+            return None
+
+        inputs = workflow_dispatch.get("inputs")
+        if not isinstance(inputs, dict):
+            return None
+
+        return [str(key) for key in inputs.keys()]
+
+    @property
+    def workflow_permissions(self) -> list[str] | None:
+        document = self.document
+        if not document:
+            return None
+        return normalize_permission_declaration(document.permissions)
+
+    @property
+    def pull_request_target_branches(self) -> list[str] | None:
+        document = self.document
+        if not document:
+            return None
+
+        on_value = document.model_extra.get("on")
+        if not isinstance(on_value, dict):
+            return None
+
+        pull_request_target = on_value.get("pull_request_target")
+        if pull_request_target is None:
+            return None
+        if isinstance(pull_request_target, dict):
+            branches = pull_request_target.get("branches")
+            if isinstance(branches, str):
+                return [branches]
+            if isinstance(branches, list):
+                return [str(branch) for branch in branches]
+        return None
+
+    @property
+    def is_pwn_requestable(self) -> bool:
+        document = self.document
+        if not document:
+            return False
+
+        on_value = document.model_extra.get("on")
+        has_pull_request_target = False
+        if isinstance(on_value, str):
+            has_pull_request_target = on_value == "pull_request_target"
+        elif isinstance(on_value, list):
+            has_pull_request_target = "pull_request_target" in [
+                str(item) for item in on_value
+            ]
+        elif isinstance(on_value, dict):
+            has_pull_request_target = "pull_request_target" in on_value
+
+        if not has_pull_request_target:
+            return False
+
+        for job in document.jobs.values():
+            for step in job.steps:
+                if not step.uses or not step.with_:
+                    continue
+                action = action_parts(step.uses)
+                if action["action_slug"] != "actions/checkout":
+                    continue
+                ref = step.with_.get("ref")
+                if str(ref).strip() in {
+                    "${{ github.event.pull_request.head.sha }}",
+                    "${{ github.event.pull_request.head.ref }}",
+                    "${{ github.head_ref }}",
+                }:
+                    return True
+        return False
+
+    @property
+    def _repo_is_forkable_for_pwn_request(self) -> bool:
+        visibility, allow_forking = self._lookup.repository_allow_forking(
+            self.repository_node_id
+        )
+
+        if visibility == "public":
+            return True
+        if visibility in {"private", "internal"}:
+            can_fork = self._lookup.members_can_fork_private_repositories(
+                self.org_login
+            )
+            return allow_forking and can_fork
+        return False
+
+    @property
+    def _can_pwn_request_edges(self):
+        if not self.is_pwn_requestable or not self._repo_is_forkable_for_pwn_request:
+            return
+
+        read_contents = self._lookup.repo_role_node_ids_with_read_repo_contents(
+            self.repository_node_id
+        )
+
+        patterns = self.pull_request_target_branches
+        branches = self._lookup.branches_for_repository(self.repository_node_id)
+        target_branch_ids = []
+        for branch_id, branch_name, _protected in branches:
+            if not patterns or any(
+                fnmatch.fnmatchcase(branch_name, pattern) for pattern in patterns
+            ):
+                target_branch_ids.append(branch_id)
+
+        for (role_node_id,) in read_contents:
+            yield Edge(
+                kind=ek.CAN_PWN_REQUEST,
+                start=EdgePath(value=role_node_id, match_by="id"),
+                end=EdgePath(value=self.repository_node_id, match_by="id"),
+                properties=EdgeProperties(traversable=True),
+            )
+
+            for branch_id in target_branch_ids:
+                yield Edge(
+                    kind=ek.CAN_PWN_REQUEST,
+                    start=EdgePath(value=role_node_id, match_by="id"),
+                    end=EdgePath(value=branch_id, match_by="id"),
+                    properties=EdgeProperties(traversable=True),
+                )
+
+    def workflow_job_rows(self) -> list[dict[str, Any]]:
+        document = self.document
+        if not document:
+            return []
+
+        job_ids = {
+            job_key: workflow_job_node_id(self.node_id, job_key)
+            for job_key in document.jobs.keys()
+        }
+        rows = []
+        for job_key, job in document.jobs.items():
+            runs_on_selector = job.runs_on_selector
+            secret_refs = []
+            variable_refs = []
+            secret_refs.extend(
+                mapping_references(SECRET_REFERENCE_RE, job.secrets, "secrets")
+            )
+            secret_refs.extend(mapping_references(SECRET_REFERENCE_RE, job.env, "env"))
+            variable_refs.extend(
+                mapping_references(VARIABLE_REFERENCE_RE, job.env, "env")
+            )
+
+            rows.append(
+                {
+                    "node_id": job_ids[job_key],
+                    "name": f"{self.repository_name}\\{job_key}",
+                    "job_key": job_key,
+                    "runs_on": job.runs_on,
+                    "runs_on_group": runs_on_selector.group,
+                    "runs_on_labels": runs_on_selector.labels or None,
+                    "runs_on_is_dynamic": runs_on_selector.is_dynamic,
+                    "container": job.container_value,
+                    "environment": job.environment_name,
+                    "permissions": job.permissions
+                    if job.permissions is not None
+                    else document.permissions,
+                    "job_permissions": job.permissions,
+                    "effective_github_token_permissions": resolve_effective_github_token_permissions(
+                        self.repository_default_workflow_permissions,
+                        document.permissions,
+                        job.permissions,
+                    ),
+                    "uses_reusable": job.uses,
+                    "workflow_node_id": self.node_id,
+                    "repository_name": self.repository_name,
+                    "repository_node_id": self.repository_node_id,
+                    "org_login": self.org_login,
+                    "dependency_node_ids": [
+                        job_ids[dep] for dep in job.needs_list if dep in job_ids
+                    ],
+                    "secret_references": unique_references(secret_refs),
+                    "variable_references": unique_references(variable_refs),
+                }
+            )
+        return rows
+
+    def workflow_step_rows(self) -> list[dict[str, Any]]:
+        document = self.document
+        if not document:
+            return []
+
+        rows = []
+        for job_key, job in document.jobs.items():
+            job_node_id = workflow_job_node_id(self.node_id, job_key)
+            for step_index, step in enumerate(job.steps):
+                secret_refs = []
+                variable_refs = []
+                secret_refs.extend(
+                    mapping_references(SECRET_REFERENCE_RE, step.with_, "with")
+                )
+                variable_refs.extend(
+                    mapping_references(VARIABLE_REFERENCE_RE, step.with_, "with")
+                )
+                secret_refs.extend(references(SECRET_REFERENCE_RE, step.run, "run"))
+                variable_refs.extend(references(VARIABLE_REFERENCE_RE, step.run, "run"))
+                secret_refs.extend(
+                    mapping_references(SECRET_REFERENCE_RE, step.env, "env")
+                )
+                variable_refs.extend(
+                    mapping_references(VARIABLE_REFERENCE_RE, step.env, "env")
+                )
+
+                rows.append(
+                    {
+                        "node_id": workflow_step_node_id(
+                            self.node_id, job_key, step_index
+                        ),
+                        "name": step.display_name,
+                        "step_index": step_index,
+                        "type": step.type,
+                        "action": step.uses,
+                        **action_parts(step.uses),
+                        "run": step.run,
+                        "with_args": step.with_ or None,
+                        "contents": step.model_dump(by_alias=True, exclude_none=True),
+                        "job_node_id": job_node_id,
+                        "job_environment": job.environment_name,
+                        "workflow_node_id": self.node_id,
+                        "repository_name": self.repository_name,
+                        "repository_node_id": self.repository_node_id,
+                        "org_login": self.org_login,
+                        "secret_references": unique_references(secret_refs),
+                        "variable_references": unique_references(variable_refs),
+                    }
+                )
+        return rows
+
+    @property
+    def _decoded_contents(self):
+        return base64.b64decode(self.contents).decode() if self.contents else None
+
+    @property
+    def as_node(self) -> GHNode:
+        wid = self.node_id
+        return GHNode(
+            kinds=[nk.WORKFLOW],
+            properties=GHWorkflowProperties(
+                name=f"{self.repository_name}/{self.name}",
+                displayname=self.name,
+                node_id=wid,
+                short_name=self.name,
+                path=self.path,
+                state=self.state,
+                url=self.url,
+                html_url=self.html_url,
+                branch=self.branch,
+                contents=self._decoded_contents,
+                workflow_permissions=self.workflow_permissions,
+                triggers=self.trigger_events,
+                trigger_dispatch_inputs=self.workflow_dispatch_inputs,
+                # is_pwn_requestable=self.is_pwn_requestable,
+                repository_name=self.repository_name,
+                repository_id=self.repository_node_id,
+                environment_name=self.org_login,
+                environmentid=self.org_node_id,
+                query_repository=f"MATCH p=(:GH_Repository)-[:GH_Contains]->(:GH_Workflow {{node_id:'{wid}'}}) RETURN p",
+                query_jobs=f"MATCH p=(:GH_Workflow {{node_id:'{wid}'}})-[:GH_Contains]->(:GH_WorkflowJob) RETURN p",
+                query_execution=f"MATCH p=(:GH_Workflow {{node_id:'{wid}'}})-[:GH_Contains]->(:GH_WorkflowJob)-[:GH_Contains]->(:GH_WorkflowStep) RETURN p",
+                query_references=f"MATCH p=(:GH_Workflow {{node_id:'{wid}'}})-[:GH_Contains]->(:GH_WorkflowJob)-[:GH_Contains]->(step:GH_WorkflowStep) OPTIONAL MATCH p1=(step)-[:GH_UsesSecret]->() OPTIONAL MATCH p2=(step)-[:GH_UsesVariable]->() RETURN p,p1,p2",
+                query_editors=(
+                    f"MATCH p=(role:GH_Role)-[:GH_HasRole|GH_HasBaseRole|GH_MemberOf|GH_WriteRepoContents|GH_WriteRepoPullRequests*1..]->"
+                    f"(:GH_Repository)-[:GH_Contains]->(:GH_Workflow {{node_id:'{wid}'}}) "
+                    f"MATCH p1=(role)<-[:GH_HasRole]-(:GH_User) RETURN p,p1"
+                ),
+            ),
+        )
+
+    @property
+    def _has_workflow_edge(self):
+        yield Edge(
+            kind=ek.CONTAINS,
+            start=EdgePath(value=self.repository_node_id, match_by="id"),
+            end=EdgePath(value=self.node_id, match_by="id"),
+            properties=EdgeProperties(traversable=False),
+        )
+
+    @property
+    def edges(self):
+        yield from self._has_workflow_edge
+        yield from self._can_pwn_request_edges

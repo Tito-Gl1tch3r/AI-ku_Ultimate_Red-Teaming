@@ -1,0 +1,2500 @@
+use crate::error::{Result, SmugglexError};
+use crate::http::{send_request, send_request_bytes};
+use crate::model::{CheckResult, Confidence};
+use crate::utils::{export_payload, parse_status_code};
+use chrono::Utc;
+use colored::*;
+use indicatif::ProgressBar;
+use std::time::Duration;
+
+/// Multiplier applied to baseline timing to determine anomaly threshold
+pub const TIMING_MULTIPLIER: u128 = 3;
+/// Minimum response delay in milliseconds to consider as suspicious
+pub const MIN_DELAY_MS: u128 = 1000;
+/// Default number of baseline requests for timing measurement
+pub const DEFAULT_BASELINE_COUNT: usize = 3;
+/// Number of retries used to confirm a detected vulnerability.
+/// A larger value enables strict-majority confirmation (>N/2) which reduces
+/// false positives caused by single transient spikes.
+pub const CONFIRMATION_RETRIES: usize = 3;
+/// Absolute buffer in milliseconds added to the *maximum* baseline duration
+/// when computing the timing threshold. Protects against noisy baselines where
+/// natural per-request variance approaches the smuggling-induced delay.
+pub const BASELINE_NOISE_BUFFER_MS: u128 = 500;
+/// Ratio (control_ms * 100 / attack_ms) at or above which a control request is
+/// considered "suspiciously similar" to the attack. When the smuggling-stripped
+/// control takes nearly as long as the attack, the slowness was not caused by
+/// the smuggling artifacts and the finding is rejected as a false positive.
+pub const CONTROL_SIMILARITY_PCT: u128 = 60;
+/// Number of differential control samples to send. The maximum observed control
+/// duration is compared against the attack — using max (rather than median) is
+/// conservative against control flukes that would otherwise let an FP slip
+/// through.
+pub const CONTROL_SAMPLES: usize = 2;
+/// Body-size ratio (smaller_len * 100 / larger_len) at or below which the attack
+/// and control responses are considered structurally different. A large body
+/// divergence is a strong smuggling signal that overrides the timing/status
+/// similarity FP rule.
+pub const CONTROL_BODY_DIVERGENCE_PCT: u128 = 75;
+/// Minimum body size (bytes) required on both sides before the body-divergence
+/// rule kicks in. Avoids tripping the heuristic on near-empty responses where
+/// a few bytes of difference are noise.
+pub const CONTROL_BODY_MIN_BYTES: usize = 32;
+/// Number of fresh follow-up GET probes sent after confirmation+control to
+/// detect proxy↔backend desync that persists past the attack — the classic
+/// "second-request" smuggling signature.
+pub const FOLLOWUP_PROBE_COUNT: usize = 3;
+/// When this many consecutive payloads in the same check all detect AND get
+/// rejected by the control-FP rule, abandon the rest of the check. The
+/// backend is producing the same shape-dependent anomaly for every payload
+/// variant, so further iteration is wasted scan time and a strong signal
+/// that the responses are not smuggling-induced. Recorded as a `diagnostics`
+/// note on the CheckResult.
+pub const CONSECUTIVE_FP_REJECTIONS_LIMIT: usize = 3;
+
+/// Parameters for running vulnerability checks
+pub struct CheckParams<'a> {
+    /// Progress bar for displaying scan status
+    pub pb: &'a ProgressBar,
+    /// Name of the check type (e.g., "CL.TE", "TE.CL")
+    pub check_name: &'a str,
+    /// Target hostname
+    pub host: &'a str,
+    /// Target port number
+    pub port: u16,
+    /// Request path on the target
+    pub path: &'a str,
+    /// List of raw HTTP attack payloads to test
+    pub attack_requests: Vec<Vec<u8>>,
+    /// Socket timeout in seconds
+    pub timeout: u64,
+    /// Whether to print verbose debug output
+    pub verbose: bool,
+    /// Whether to use TLS for connections
+    pub use_tls: bool,
+    /// Directory to export successful payloads to
+    pub export_dir: Option<&'a str>,
+    /// Index of the current check (for progress display)
+    pub current_check: usize,
+    /// Total number of checks to run (for progress display)
+    pub total_checks: usize,
+    /// Delay in milliseconds between requests
+    pub delay: u64,
+    /// Number of baseline requests for timing measurement (values < 1 are clamped to 1)
+    pub baseline_count: usize,
+}
+
+struct VulnerabilityInfo {
+    status: String,
+    status_code: Option<u16>,
+    duration: Duration,
+    /// Size of the semantic response body in bytes (post-headers and, for
+    /// chunked responses, excluding transfer framing).
+    /// Used to detect structural divergence between attack and control responses.
+    body_length: usize,
+    /// Fingerprint of response headers that frequently shift on desync
+    /// (Content-Type, Server, Content-Length value). Compared between attack
+    /// and control as an orthogonal divergence signal alongside body length.
+    header_fingerprint: ResponseHeaderFingerprint,
+    is_connection_timeout: bool,
+}
+
+/// Compact fingerprint of response headers used for divergence comparison.
+/// Stores lowercased values for case-insensitive comparison.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ResponseHeaderFingerprint {
+    content_type: Option<String>,
+    server: Option<String>,
+    content_length: Option<String>,
+}
+
+impl ResponseHeaderFingerprint {
+    /// Parse the header section of an HTTP response into a comparison fingerprint.
+    fn from_response(response: &str) -> Self {
+        let head = match response.split_once("\r\n\r\n") {
+            Some((h, _)) => h,
+            None => response,
+        };
+        let mut fp = ResponseHeaderFingerprint::default();
+        for line in head.lines() {
+            if let Some((name, value)) = line.split_once(':') {
+                let name = name.trim();
+                // Only allocate the lowercased value for the three headers we
+                // track, instead of lowercasing every header's name and value.
+                if name.eq_ignore_ascii_case("content-type") {
+                    fp.content_type = Some(value.trim().to_ascii_lowercase());
+                } else if name.eq_ignore_ascii_case("server") {
+                    fp.server = Some(value.trim().to_ascii_lowercase());
+                } else if name.eq_ignore_ascii_case("content-length") {
+                    fp.content_length = Some(value.trim().to_ascii_lowercase());
+                }
+            }
+        }
+        fp
+    }
+
+    /// Count of fields where attack and control disagree. A bare presence vs
+    /// absence counts as a disagreement.
+    fn divergence_count(&self, other: &Self) -> u32 {
+        let mut diff = 0u32;
+        if self.content_type != other.content_type {
+            diff += 1;
+        }
+        if self.server != other.server {
+            diff += 1;
+        }
+        if self.content_length != other.content_length {
+            diff += 1;
+        }
+        diff
+    }
+}
+
+/// Extract the semantic response body length, excluding HTTP chunk framing.
+/// Returns the raw post-header length when the response is malformed or a
+/// chunked body cannot be decoded, preserving useful evidence for truncated
+/// responses without mistaking framing bytes for application content.
+pub(crate) fn response_body_length(response: &str) -> usize {
+    let Some((head, body)) = response.split_once("\r\n\r\n") else {
+        return 0;
+    };
+    let is_chunked = head.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("transfer-encoding")
+                && value
+                    .split(',')
+                    .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
+        })
+    });
+    if is_chunked {
+        decode_chunked_body_length(body.as_bytes()).unwrap_or(body.len())
+    } else {
+        body.len()
+    }
+}
+
+fn decode_chunked_body_length(body: &[u8]) -> Option<usize> {
+    let mut offset = 0usize;
+    let mut total = 0usize;
+
+    loop {
+        let line_end = body[offset..]
+            .windows(2)
+            .position(|window| window == b"\r\n")?
+            .checked_add(offset)?;
+        let mut size = &body[offset..line_end];
+        while size
+            .first()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            size = &size[1..];
+        }
+        size = size.split(|&byte| byte == b';').next().unwrap_or_default();
+        while size.last().is_some_and(|byte| matches!(byte, b' ' | b'\t')) {
+            size = &size[..size.len() - 1];
+        }
+        let size = usize::from_str_radix(std::str::from_utf8(size).ok()?, 16).ok()?;
+        offset = line_end.checked_add(2)?;
+
+        if size == 0 {
+            if body[offset..].starts_with(b"\r\n") {
+                return Some(total);
+            }
+            body[offset..]
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")?;
+            return Some(total);
+        }
+
+        let chunk_end = offset.checked_add(size)?;
+        let framed_end = chunk_end.checked_add(2)?;
+        if framed_end > body.len() || &body[chunk_end..framed_end] != b"\r\n" {
+            return None;
+        }
+        total = total.checked_add(size)?;
+        offset = framed_end;
+    }
+}
+
+struct BaselineMeasurement {
+    status: String,
+    /// Representative HTTP status code from the successful baseline probes.
+    status_code: Option<u16>,
+    /// Median baseline duration.
+    duration: Duration,
+    /// Maximum baseline duration. Used to derive a noise-aware timing threshold
+    /// so that natural per-request variance does not trigger false positives.
+    max_duration: Duration,
+    /// Median semantic response body length for the representative status.
+    /// Used by follow-up probes to detect post-attack body divergence.
+    body_length: usize,
+    observed_status_codes: Vec<Option<u16>>,
+}
+
+/// True when the majority of baseline responses are gateway-timeout codes (408/504).
+/// Used to suppress status-only smuggling signals on backends that naturally return those codes.
+/// A single transient timeout in baseline does NOT suppress the signal, which reduces false negatives.
+fn baseline_majority_timeout(baseline_status_codes: &[Option<u16>]) -> bool {
+    if baseline_status_codes.is_empty() {
+        return false;
+    }
+    let timeouts = baseline_status_codes
+        .iter()
+        .filter(|c| matches!(c, Some(408) | Some(504)))
+        .count();
+    timeouts * 2 > baseline_status_codes.len()
+}
+
+/// Median of a non-empty slice of durations. Mutates input by sorting.
+fn median_duration(durations: &mut [Duration]) -> Duration {
+    debug_assert!(!durations.is_empty(), "median of empty slice");
+    durations.sort();
+    durations[durations.len() / 2]
+}
+
+/// Extract the HTTP method (first whitespace-delimited token of the first line)
+/// from a raw request payload. Returns uppercased method. Accepts raw bytes
+/// because a payload may carry non-UTF-8 obfuscation bytes; the method token is
+/// ASCII, so a lossy view suffices to read it.
+fn payload_method(payload: &[u8]) -> String {
+    let text = String::from_utf8_lossy(payload);
+    text.lines()
+        .next()
+        .and_then(|l| l.split_whitespace().next())
+        .map(|m| m.to_ascii_uppercase())
+        .unwrap_or_else(|| "GET".to_string())
+}
+
+/// Read the first `Host` header from a generated request. The socket hostname
+/// can differ from the HTTP authority when `--vhost` or `--raw-request` is used.
+fn payload_authority(payload: &[u8]) -> Option<&str> {
+    let head_end = payload
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap_or(payload.len());
+    payload[..head_end]
+        .split(|&byte| byte == b'\n')
+        .skip(1)
+        .find_map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let colon = line.iter().position(|&byte| byte == b':')?;
+            if !line[..colon].eq_ignore_ascii_case(b"host") {
+                return None;
+            }
+            std::str::from_utf8(&line[colon + 1..])
+                .ok()
+                .map(str::trim_ascii)
+                .filter(|value| !value.is_empty())
+        })
+}
+
+/// Normalize a possibly-obfuscated header name for framing comparisons.
+///
+/// The payload corpus deliberately includes separators, control bytes, and
+/// percent-encoded characters inside framing names. Ignoring non-letters and
+/// decoding ASCII percent escapes lets the control request remove those
+/// framing variants without treating unrelated names such as
+/// `Content-Encoding` or `X-Content-Length-Policy` as framing headers.
+fn normalized_header_name(name: &str) -> String {
+    fn hex_value(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = name.as_bytes();
+    let mut normalized = String::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                index += 3;
+                (high << 4) | low
+            } else {
+                index += 1;
+                continue;
+            }
+        } else {
+            let byte = bytes[index];
+            index += 1;
+            byte
+        };
+
+        if byte.is_ascii_alphabetic() {
+            normalized.push(byte.to_ascii_lowercase() as char);
+        }
+    }
+    normalized
+}
+
+fn is_transfer_encoding_header_name(name: &str) -> bool {
+    let normalized = normalized_header_name(name);
+    // `nsfer-Encoding` is part of the existing obfuscation corpus. A single
+    // junk character after the canonical name is also intentionally covered by
+    // the corpus (`Transfer-Encoding x`). Do not use a broad substring match:
+    // application headers such as `X-Transfer-Encoding` are not framing.
+    normalized == "transferencoding"
+        || normalized == "nsferencoding"
+        || (normalized.starts_with("transferencoding")
+            && normalized.len() == "transferencoding".len() + 1)
+}
+
+fn is_content_length_header_name(name: &str) -> bool {
+    normalized_header_name(name) == "contentlength"
+}
+
+/// Send `count` shape-matched baseline probes that mirror the attack method but
+/// carry no smuggling artifacts (Content-Length: 0, empty body). Used to
+/// augment the GET baseline so timing thresholds account for backend's natural
+/// per-method latency overhead. Returns the durations observed; failures are
+/// silently dropped (the augmentation is best-effort).
+#[allow(clippy::too_many_arguments)]
+async fn method_matched_baseline_durations(
+    host: &str,
+    authority: &str,
+    port: u16,
+    path: &str,
+    method: &str,
+    count: usize,
+    timeout: u64,
+    verbose: bool,
+    use_tls: bool,
+) -> Vec<Duration> {
+    let probe = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        method, path, authority
+    );
+    let mut futures = Vec::with_capacity(count);
+    for _ in 0..count {
+        futures.push(send_request(host, port, &probe, timeout, verbose, use_tls));
+    }
+    futures::future::join_all(futures)
+        .await
+        .into_iter()
+        .filter_map(|r| r.ok().map(|(_, d)| d))
+        .collect()
+}
+
+/// Measure baseline by sending normal requests and computing median timing.
+/// Requests are sent concurrently for faster baseline establishment.
+async fn measure_baseline(
+    params: &CheckParams<'_>,
+    authority: &str,
+) -> Result<BaselineMeasurement> {
+    // Clamp to a minimum of 1 to avoid empty-slice panic and meaningless thresholds.
+    let count = params.baseline_count.max(1);
+
+    let normal_request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        params.path, authority
+    );
+
+    let mut futures = Vec::with_capacity(count);
+    for _ in 0..count {
+        futures.push(send_request(
+            params.host,
+            params.port,
+            &normal_request,
+            params.timeout,
+            params.verbose,
+            params.use_tls,
+        ));
+    }
+
+    let results = futures::future::join_all(futures).await;
+    aggregate_baseline(results)
+}
+
+/// Aggregate the concurrent baseline probe results into a [`BaselineMeasurement`].
+///
+/// Failed probes (connection reset, timeout, EOF on a flaky network) are
+/// dropped rather than aborting the whole measurement — discarding the
+/// surviving samples over a single transient failure would turn an otherwise
+/// viable check into a false negative. Only when *every* probe failed is an
+/// error returned, since there is then nothing to measure against. This mirrors
+/// the best-effort behavior of `method_matched_baseline_durations`.
+fn aggregate_baseline(results: Vec<Result<(String, Duration)>>) -> Result<BaselineMeasurement> {
+    let mut samples: Vec<(String, Duration, Option<u16>, usize)> =
+        Vec::with_capacity(results.len());
+    let mut observed_status_codes = Vec::with_capacity(results.len());
+    let mut last_error: Option<SmugglexError> = None;
+
+    for result in results {
+        match result {
+            Ok((response, duration)) => {
+                let status_line = response.lines().next().unwrap_or("");
+                let status_code = parse_status_code(status_line);
+                let body_length = response_body_length(&response);
+                observed_status_codes.push(status_code);
+                samples.push((status_line.to_string(), duration, status_code, body_length));
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    if samples.is_empty() {
+        return Err(last_error.unwrap_or_else(|| {
+            SmugglexError::Io("baseline measurement produced no samples".into())
+        }));
+    }
+
+    let mut durations: Vec<Duration> = samples
+        .iter()
+        .map(|(_, duration, _, _)| *duration)
+        .collect();
+    let max_duration = durations.iter().copied().max().unwrap_or_default();
+    let median = median_duration(&mut durations);
+
+    // A response arriving last is not a representative baseline: one
+    // transient gateway error or dynamic body can otherwise become the oracle
+    // for every follow-up comparison. Use the modal status code and median body
+    // length from the representative status instead.
+    //
+    // Prefer a known status code when it ties with malformed samples. A single
+    // unparseable response must not erase an otherwise usable baseline and
+    // disable all status-based follow-up comparisons.
+    let mut modal_known_status = None;
+    let mut modal_known_count = 0usize;
+    for status_code in observed_status_codes.iter().flatten() {
+        let count = observed_status_codes
+            .iter()
+            .filter(|candidate| **candidate == Some(*status_code))
+            .count();
+        if count > modal_known_count {
+            modal_known_status = Some(*status_code);
+            modal_known_count = count;
+        }
+    }
+    let malformed_count = observed_status_codes
+        .iter()
+        .filter(|status_code| status_code.is_none())
+        .count();
+    let status_code = if modal_known_count >= malformed_count {
+        modal_known_status
+    } else {
+        None
+    };
+    let status = samples
+        .iter()
+        .find(|(_, _, sample_status, _)| *sample_status == status_code)
+        .map(|(status, _, _, _)| status.clone())
+        .unwrap_or_default();
+    let mut body_lengths: Vec<usize> = samples
+        .iter()
+        .filter(|(_, _, sample_status, _)| *sample_status == status_code)
+        .map(|(_, _, _, length)| *length)
+        .collect();
+    if body_lengths.is_empty() {
+        body_lengths = samples.iter().map(|(_, _, _, length)| *length).collect();
+    }
+    body_lengths.sort_unstable();
+    let body_length = body_lengths[body_lengths.len() / 2];
+
+    Ok(BaselineMeasurement {
+        status,
+        status_code,
+        duration: median,
+        max_duration,
+        body_length,
+        observed_status_codes,
+    })
+}
+
+struct PayloadCheckParams<'a> {
+    host: &'a str,
+    port: u16,
+    attack_request: &'a [u8],
+    timeout: u64,
+    verbose: bool,
+    use_tls: bool,
+    timing_threshold: u128,
+    baseline_status_codes: &'a [Option<u16>],
+}
+
+async fn check_single_payload(
+    params: &PayloadCheckParams<'_>,
+) -> Result<Option<VulnerabilityInfo>> {
+    match send_request_bytes(
+        params.host,
+        params.port,
+        params.attack_request,
+        params.timeout,
+        params.verbose,
+        params.use_tls,
+    )
+    .await
+    {
+        Ok((attack_response, attack_duration)) => {
+            let attack_status_line = attack_response.lines().next().unwrap_or("");
+            let attack_millis = attack_duration.as_millis();
+            let status_code = parse_status_code(attack_status_line);
+
+            // Only treat 408/504 as a smuggling signal if the baseline did NOT
+            // produce such codes for the majority of probes.
+            let baseline_timeout_majority = baseline_majority_timeout(params.baseline_status_codes);
+            let is_timeout_error =
+                matches!(status_code, Some(408) | Some(504)) && !baseline_timeout_majority;
+            let is_delayed =
+                attack_millis > params.timing_threshold && attack_millis > MIN_DELAY_MS;
+
+            if is_timeout_error || is_delayed {
+                Ok(Some(VulnerabilityInfo {
+                    status: attack_status_line.to_string(),
+                    status_code,
+                    duration: attack_duration,
+                    body_length: response_body_length(&attack_response),
+                    header_fingerprint: ResponseHeaderFingerprint::from_response(&attack_response),
+                    is_connection_timeout: false,
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(e) => {
+            if matches!(e, SmugglexError::Timeout(_)) {
+                Ok(Some(VulnerabilityInfo {
+                    status: "Connection Timeout".to_string(),
+                    status_code: None,
+                    duration: Duration::from_secs(params.timeout),
+                    body_length: 0,
+                    header_fingerprint: ResponseHeaderFingerprint::default(),
+                    is_connection_timeout: true,
+                }))
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Outcome of vulnerability confirmation across retries.
+struct ConfirmationResult {
+    confirmed: bool,
+    /// Attack durations from each successful confirmation retry.
+    durations: Vec<Duration>,
+}
+
+/// Observation from a "control" request — a smuggling-stripped sibling of the
+/// attack payload used to validate that the detected anomaly is caused by the
+/// smuggling artifacts themselves, not by the backend's general behavior for
+/// requests of this shape.
+struct ControlObservation {
+    duration: Duration,
+    status_code: Option<u16>,
+    body_length: usize,
+    header_fingerprint: ResponseHeaderFingerprint,
+    is_connection_timeout: bool,
+}
+
+/// True when a payload carries smuggling-specific markers that the control
+/// comparison knows how to strip. Plain HTTP requests (no TE artifact) and
+/// Upgrade/HTTP-2-shaped payloads are excluded because stripping wouldn't
+/// produce a meaningful control.
+fn payload_eligible_for_control(payload: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(payload);
+    let head_end = text.find("\r\n\r\n").unwrap_or(text.len());
+    let head = &text[..head_end];
+
+    // Skip Upgrade-based / HTTP/2-shaped payloads — stripping TE does not
+    // disable the H2C/H2 smuggling vector, so a control would not be a
+    // meaningful reference.
+    let request_line = head.lines().next().unwrap_or_default();
+    let is_http2_request = request_line
+        .split_whitespace()
+        .any(|token| token.eq_ignore_ascii_case("HTTP/2") || token.starts_with("HTTP/2."));
+    let has_upgrade_header = head.lines().skip(1).any(|line| {
+        line.split_once(':')
+            .is_some_and(|(name, _)| normalized_header_name(name) == "upgrade")
+    });
+    if is_http2_request || has_upgrade_header {
+        return false;
+    }
+
+    // Apply control only to payloads that actually carry TE-related artifacts.
+    // Inspect header names rather than searching the whole header block so a
+    // path or an unrelated `X-Transfer-Encoding` header cannot opt a payload
+    // into a misleading control comparison.
+    head.lines().skip(1).any(|line| {
+        line.split_once(':')
+            .is_some_and(|(name, _)| is_transfer_encoding_header_name(name))
+    })
+}
+
+/// Maximum bytes of synthetic body padding emitted by the control request.
+/// Caps the request size to avoid sending large payloads even if the attack
+/// declared a huge Content-Length.
+const CONTROL_BODY_MAX_BYTES: usize = 4096;
+
+/// Build a "control" version of `payload` with smuggling artifacts removed.
+///
+/// Drops any Transfer-Encoding header (including common obfuscated variants)
+/// and the original Content-Length / body, then re-emits a well-formed request
+/// with a benign body whose size matches the original attack body length
+/// (capped at `CONTROL_BODY_MAX_BYTES`). Matching the body size is important
+/// for shape parity — some backends route requests through different code
+/// paths based on body length, and a zero-length control would not reflect
+/// that timing.
+///
+/// All other headers (Host, Cookie, custom headers, Connection, etc.) are
+/// preserved so the backend processes a request shaped as closely as possible
+/// to the attack minus the smuggling-specific bits. A `Transfer-Encoding` token
+/// is also removed from `Connection`, because that hop-by-hop token can keep a
+/// parser discrepancy active after the framing header itself is stripped.
+pub(crate) fn build_control_request(payload: &[u8]) -> String {
+    // The control request is always pure ASCII (it strips the smuggling-specific
+    // headers and re-emits a benign body), so a lossy view of the attack payload
+    // is sufficient to read its headers even when the payload carries raw
+    // obfuscation bytes.
+    let text = String::from_utf8_lossy(payload);
+    let head = match text.find("\r\n\r\n") {
+        Some(idx) => &text[..idx],
+        None => text.as_ref(),
+    };
+    // Measure the body length from the RAW bytes, not the lossy view: a non-ASCII
+    // body byte renders as the 3-byte U+FFFD sequence in `text`, which would
+    // inflate the control's Content-Length and skew the body-divergence FP
+    // comparison. (Today's payloads have ASCII bodies, so this is hardening
+    // against a future extended-ASCII body.)
+    let original_body_len = payload
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|idx| payload.len() - (idx + 4))
+        .unwrap_or(0);
+
+    let mut kept: Vec<String> = Vec::new();
+    let mut skip_continuation = false;
+    for (i, line) in head.lines().enumerate() {
+        if i == 0 {
+            kept.push(line.to_string());
+            continue;
+        }
+        if skip_continuation
+            && line
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            continue;
+        }
+        skip_continuation = false;
+
+        let Some((header_name, _)) = line.split_once(':') else {
+            kept.push(line.to_string());
+            continue;
+        };
+        if is_transfer_encoding_header_name(header_name)
+            || is_content_length_header_name(header_name)
+        {
+            // Drop folded continuation lines belonging to this framing header
+            // as well; retaining one would leave an invalid fragment in the
+            // supposedly benign control request.
+            skip_continuation = true;
+            continue;
+        }
+        if normalized_header_name(header_name) == "connection" {
+            let (_, value) = line.split_once(':').expect("header name was split above");
+            let tokens: Vec<&str> = value.split(',').collect();
+            let filtered: Vec<&str> = tokens
+                .iter()
+                .copied()
+                .filter(|token| !token.trim().eq_ignore_ascii_case("transfer-encoding"))
+                .collect();
+            if filtered.len() != tokens.len() {
+                if filtered.is_empty() {
+                    continue;
+                }
+                let colon = line.find(':').expect("header name was split above");
+                kept.push(format!(
+                    "{}: {}",
+                    &line[..colon],
+                    filtered
+                        .iter()
+                        .map(|token| token.trim())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                continue;
+            }
+        }
+        kept.push(line.to_string());
+    }
+
+    // Match the original body size (capped) with benign ASCII padding so the
+    // backend takes the same shape-conditional code paths it would for the
+    // attack, minus the smuggling tricks.
+    let body_len = original_body_len.min(CONTROL_BODY_MAX_BYTES);
+    let mut result = String::with_capacity(payload.len());
+    for line in kept {
+        result.push_str(&line);
+        result.push_str("\r\n");
+    }
+    result.push_str(&format!("Content-Length: {}\r\n\r\n", body_len));
+    if body_len > 0 {
+        result.extend(std::iter::repeat_n('x', body_len));
+    }
+    result
+}
+
+/// Send a single control request and observe its timing/status/body. Returns
+/// `None` if the network layer errored in a way the caller cannot reason about.
+async fn observe_control_once(
+    params: &PayloadCheckParams<'_>,
+    control_request: &str,
+) -> Option<ControlObservation> {
+    match send_request(
+        params.host,
+        params.port,
+        control_request,
+        params.timeout,
+        params.verbose,
+        params.use_tls,
+    )
+    .await
+    {
+        Ok((response, duration)) => {
+            let status_line = response.lines().next().unwrap_or("");
+            Some(ControlObservation {
+                duration,
+                status_code: parse_status_code(status_line),
+                body_length: response_body_length(&response),
+                header_fingerprint: ResponseHeaderFingerprint::from_response(&response),
+                is_connection_timeout: false,
+            })
+        }
+        Err(SmugglexError::Timeout(_)) => Some(ControlObservation {
+            duration: Duration::from_secs(params.timeout),
+            status_code: None,
+            body_length: 0,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: true,
+        }),
+        Err(_) => None,
+    }
+}
+
+/// Send `CONTROL_SAMPLES` control requests and aggregate them conservatively:
+/// duration is the MAX (worst case favors FP rejection of borderline detections),
+/// structural fields come from the fastest known non-5xx sample, and connection
+/// timeout is set if ANY sample timed out. A 408/504 from ANY control sample is
+/// retained as the status so matching timeout detections are rejected too.
+///
+/// Multiple samples protect against single-control flukes (a transient fast
+/// response that would otherwise let a real FP slip through) at the cost of one
+/// extra request per confirmed vulnerability.
+async fn observe_control(
+    params: &PayloadCheckParams<'_>,
+    control_request: &str,
+) -> Option<ControlObservation> {
+    let mut samples: Vec<ControlObservation> = Vec::with_capacity(CONTROL_SAMPLES);
+    for _ in 0..CONTROL_SAMPLES {
+        if let Some(obs) = observe_control_once(params, control_request).await {
+            samples.push(obs);
+        }
+    }
+    if samples.is_empty() {
+        return None;
+    }
+    let worst_idx = samples
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, s)| s.duration)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let structural_idx = control_structure_index(&samples);
+    let any_timeout = samples.iter().any(|s| s.is_connection_timeout);
+    let worst = &samples[worst_idx];
+    let structural = &samples[structural_idx];
+    let status_code = control_status_code(&samples, structural_idx);
+    Some(ControlObservation {
+        duration: worst.duration,
+        status_code,
+        body_length: structural.body_length,
+        header_fingerprint: structural.header_fingerprint.clone(),
+        is_connection_timeout: any_timeout,
+    })
+}
+
+fn control_structure_index(samples: &[ControlObservation]) -> usize {
+    samples
+        .iter()
+        .enumerate()
+        .filter(|(_, sample)| sample.status_code.is_some_and(|code| code < 500))
+        .min_by_key(|(_, sample)| sample.duration)
+        .or_else(|| {
+            samples
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, sample)| sample.duration)
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+fn control_status_code(samples: &[ControlObservation], structural_idx: usize) -> Option<u16> {
+    samples
+        .iter()
+        .find_map(|sample| sample.status_code.filter(|code| matches!(*code, 408 | 504)))
+        .or_else(|| {
+            samples
+                .get(structural_idx)
+                .and_then(|sample| sample.status_code)
+        })
+}
+
+/// Aggregated observation from `FOLLOWUP_PROBE_COUNT` post-attack follow-up
+/// GETs, used to detect persistent proxy↔backend desync that outlives the
+/// attack request itself.
+struct FollowupObservation {
+    /// Number of follow-up probes whose response diverged from baseline (by
+    /// status code or substantial body-length difference).
+    diverging: usize,
+    /// Total number of follow-up probes actually sent (failures excluded).
+    total: usize,
+    /// True when this observation came from the unconditional second-request
+    /// desync probe (i.e., the attack itself carried no direct anomaly and the
+    /// finding rests entirely on follow-up corruption). Used to emit the
+    /// `second_request_desync` signal.
+    second_request: bool,
+}
+
+impl FollowupObservation {
+    fn has_divergence(&self) -> bool {
+        self.diverging > 0
+    }
+
+    /// Whether the follow-up divergence is corroborated strongly enough to
+    /// override a control-based false-positive verdict. A single flaky probe —
+    /// one transient timeout or a lone status change — must NOT be enough, or a
+    /// uniformly slow backend (exactly the population the control check exists
+    /// to reject) gets promoted to a confirmed finding on one fluke. So the
+    /// main path requires a *majority* of the probes to diverge. The
+    /// unconditional second-request path already proves reproduction across two
+    /// independent plant+probe sequences, so a single divergence counts there
+    /// (it does not currently flow through the control FP check, but the guard
+    /// keeps the contract correct if it ever does).
+    fn has_corroborated_divergence(&self) -> bool {
+        if self.second_request {
+            self.diverging > 0
+        } else {
+            // One successful response after the other probes failed is not
+            // corroboration. A strict majority is meaningful only when at
+            // least two observations survived the transport layer.
+            self.total >= 2 && self.diverging * 2 > self.total
+        }
+    }
+}
+
+/// Send `FOLLOWUP_PROBE_COUNT` fresh-connection GET probes against the target
+/// path and count how many returned a response that diverges from the baseline
+/// (status code differs, or body length differs structurally per
+/// `bodies_diverge`). Each probe uses `Connection: close` so the scanner does
+/// not reuse the attack socket — divergence here therefore reflects state
+/// shared between the proxy and the backend pool, the canonical desync
+/// signature for HTTP request smuggling.
+async fn observe_followup_divergence(
+    params: &PayloadCheckParams<'_>,
+    path: &str,
+    baseline: &BaselineMeasurement,
+) -> FollowupObservation {
+    let authority = payload_authority(params.attack_request).unwrap_or(params.host);
+    let probe = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        path, authority
+    );
+    let mut diverging = 0usize;
+    let mut total = 0usize;
+    for _ in 0..FOLLOWUP_PROBE_COUNT {
+        let res = send_request(
+            params.host,
+            params.port,
+            &probe,
+            params.timeout,
+            params.verbose,
+            params.use_tls,
+        )
+        .await;
+        match res {
+            Ok((response, _)) => {
+                total += 1;
+                let status_line = response.lines().next().unwrap_or("");
+                let status_code = parse_status_code(status_line);
+                let body_len = response_body_length(&response);
+                // Use structural status/body checks that exclude flake-prone 5xx
+                // and malformed responses so a transient gateway error cannot
+                // count as desync divergence.
+                let status_diverged = followup_status_diverged(status_code, baseline.status_code);
+                let body_diverged = followup_body_diverged(
+                    status_code,
+                    baseline.status_code,
+                    body_len,
+                    baseline.body_length,
+                );
+                if status_diverged || body_diverged {
+                    diverging += 1;
+                }
+            }
+            // A follow-up *timeout* is counted toward the total (a probe was
+            // sent and observed) but NOT toward divergence. On a uniformly slow
+            // backend every follow-up times out; counting those as divergence
+            // would let `has_corroborated_divergence` (a majority rule) trip and
+            // override the control-based false-positive verdict — promoting a
+            // merely-slow backend to a confirmed finding, exactly the population
+            // the control check exists to reject. Counting it toward the total
+            // only makes it *harder* to reach the divergence majority, which is
+            // the conservative choice, and mirrors
+            // `count_structural_followup_divergence`, which ignores timeouts.
+            Err(SmugglexError::Timeout(_)) => {
+                total += 1;
+            }
+            Err(_) => {
+                // Other connection errors aren't reliable signals — skip.
+            }
+        }
+    }
+    FollowupObservation {
+        diverging,
+        total,
+        second_request: false,
+    }
+}
+
+/// True when a follow-up probe status structurally diverges from the baseline:
+/// it differs from the baseline status AND is not a 5xx gateway/server error.
+/// 5xx responses (502/503/504) are flake-prone and already covered by the
+/// timing/status confirmation path, so excluding them keeps the unconditional
+/// second-request probe from firing on transient upstream errors.
+fn followup_status_diverged(status_code: Option<u16>, baseline_status: Option<u16>) -> bool {
+    match status_code {
+        // A divergence can only be established against a *known* baseline. If the
+        // baseline status was unparseable (`None`), a follow-up that merely parses
+        // (e.g. a normal `200`) must not be treated as diverged — otherwise every
+        // clean follow-up would look like a shift and trivially corroborate a
+        // false positive.
+        Some(c) if c < 500 => baseline_status.is_some() && status_code != baseline_status,
+        _ => false,
+    }
+}
+
+fn followup_body_diverged(
+    status_code: Option<u16>,
+    baseline_status: Option<u16>,
+    body_length: usize,
+    baseline_body_length: usize,
+) -> bool {
+    // A malformed response or a transient 5xx error page is not reliable body
+    // evidence. Require both sides to have a known, non-5xx status before a
+    // size difference can corroborate a persistent desynchronization.
+    status_code.is_some_and(|code| code < 500)
+        && baseline_status.is_some_and(|code| code < 500)
+        && bodies_diverge(body_length, baseline_body_length)
+}
+
+/// Send `FOLLOWUP_PROBE_COUNT` fresh-connection GET probes and count how many
+/// returned a response that *structurally* diverges from the baseline — a
+/// non-5xx status change (per `followup_status_diverged`) or a body-length
+/// divergence (per `bodies_diverge`). Stricter than `observe_followup_divergence`
+/// because it backs the unconditional second-request probe, where there is no
+/// prior anomaly to corroborate the finding.
+async fn count_structural_followup_divergence(
+    params: &PayloadCheckParams<'_>,
+    path: &str,
+    baseline: &BaselineMeasurement,
+) -> usize {
+    let authority = payload_authority(params.attack_request).unwrap_or(params.host);
+    let probe = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        path, authority
+    );
+    let mut diverging = 0usize;
+    for _ in 0..FOLLOWUP_PROBE_COUNT {
+        if let Ok((response, _)) = send_request(
+            params.host,
+            params.port,
+            &probe,
+            params.timeout,
+            params.verbose,
+            params.use_tls,
+        )
+        .await
+        {
+            let status_line = response.lines().next().unwrap_or("");
+            let status_code = parse_status_code(status_line);
+            // Skip 5xx responses entirely — gateway/server errors are
+            // flake-prone (overload, transient upstream failures) and are
+            // handled by the timing/status confirmation path, not the
+            // second-request probe. This also prevents a small 5xx error-page
+            // body from tripping the body-divergence check below.
+            if matches!(status_code, Some(c) if c >= 500) {
+                continue;
+            }
+            let body_len = response_body_length(&response);
+            if followup_status_diverged(status_code, baseline.status_code)
+                || followup_body_diverged(
+                    status_code,
+                    baseline.status_code,
+                    body_len,
+                    baseline.body_length,
+                )
+            {
+                diverging += 1;
+            }
+        }
+    }
+    diverging
+}
+
+/// Unconditional second-request desync probe, run only when the main payload
+/// loop found no direct anomaly. Some CL.TE desyncs return a perfectly normal
+/// response to the smuggling request itself and only corrupt the *following*
+/// request on the shared proxy↔backend connection (the classic "second-request"
+/// smuggling signature). We plant the first TE-carrying payload, then send
+/// fresh follow-up GETs and look for structural divergence from the baseline.
+///
+/// To suppress transient backend flakiness the divergence must reproduce across
+/// two independent plant+probe sequences — a single corrupted follow-up is not
+/// enough. Returns a `FollowupObservation` (with `second_request = true`) only
+/// when both sequences observed divergence.
+async fn probe_second_request_desync(
+    params: &PayloadCheckParams<'_>,
+    path: &str,
+    baseline: &BaselineMeasurement,
+) -> Option<FollowupObservation> {
+    const PLANT_PROBE_SEQUENCES: usize = 2;
+    let mut diverging_min = usize::MAX;
+    for _ in 0..PLANT_PROBE_SEQUENCES {
+        // Plant: send the smuggling payload to corrupt the shared upstream
+        // connection. Its own response is irrelevant here — the main loop has
+        // already established it carries no direct anomaly.
+        let _ = send_request_bytes(
+            params.host,
+            params.port,
+            params.attack_request,
+            params.timeout,
+            params.verbose,
+            params.use_tls,
+        )
+        .await;
+        let d = count_structural_followup_divergence(params, path, baseline).await;
+        if d == 0 {
+            // Not reproduced → transient backend behavior, not a desync.
+            return None;
+        }
+        diverging_min = diverging_min.min(d);
+    }
+    Some(FollowupObservation {
+        diverging: diverging_min,
+        total: FOLLOWUP_PROBE_COUNT,
+        second_request: true,
+    })
+}
+
+/// True if attack and control responses have structurally different bodies
+/// (the smaller body is less than `CONTROL_BODY_DIVERGENCE_PCT`% of the larger).
+///
+/// Requires the LARGER body to exceed `CONTROL_BODY_MIN_BYTES` so divergence
+/// is only claimed when there is enough material on at least one side to be
+/// confident the difference is structural — both sides being tiny (e.g., empty
+/// or minimal error pages) carries too little signal.
+fn bodies_diverge(attack_body: usize, control_body: usize) -> bool {
+    let larger = attack_body.max(control_body);
+    if larger < CONTROL_BODY_MIN_BYTES {
+        return false;
+    }
+    let smaller = attack_body.min(control_body) as u128;
+    let larger = larger as u128;
+    smaller.saturating_mul(100) < larger.saturating_mul(CONTROL_BODY_DIVERGENCE_PCT)
+}
+
+/// Decide whether the control response is "suspiciously similar" to the attack
+/// response, indicating the detected signal stems from the backend's natural
+/// behavior for this request shape rather than from smuggling artifacts.
+fn control_indicates_false_positive(
+    attack: &VulnerabilityInfo,
+    control: &ControlObservation,
+    followup: Option<&FollowupObservation>,
+) -> bool {
+    // ESCAPE: post-attack follow-up GETs diverged from baseline → backend state
+    // was perturbed by the attack and persisted into a subsequent request.
+    // This is the canonical "second-request" smuggling signature and overrides
+    // any timing/status FP rule — but only when *corroborated* (a majority of
+    // probes diverged). A single flaky follow-up (one transient timeout or a
+    // lone 5xx) must not override the control rejection, otherwise a uniformly
+    // slow backend is promoted to a finding on one fluke.
+    if followup.is_some_and(|f| f.has_corroborated_divergence()) {
+        return false;
+    }
+
+    // ESCAPE: attack and control returned structurally different response
+    // bodies → the smuggling artifacts changed how the backend interpreted the
+    // request (the canonical desync signature). Keep the finding regardless of
+    // timing/status similarity.
+    if bodies_diverge(attack.body_length, control.body_length) {
+        return false;
+    }
+
+    // ESCAPE: response header set diverges between attack and control. A change
+    // in Content-Type, Server, or the Content-Length header value is a strong
+    // signal that the backend interpreted the request differently — i.e. a
+    // desync — even when body lengths happen to be similar.
+    if attack
+        .header_fingerprint
+        .divergence_count(&control.header_fingerprint)
+        >= 2
+    {
+        return false;
+    }
+
+    // Connection-level timeout on the control too → backend cannot handle the
+    // request shape at all, irrespective of smuggling tricks.
+    if attack.is_connection_timeout && control.is_connection_timeout {
+        return true;
+    }
+
+    // Both attack and control returned a gateway-timeout status → the backend
+    // returns 408/504 for this shape independent of smuggling artifacts.
+    let attack_is_timeout_status = matches!(attack.status_code, Some(408) | Some(504));
+    let control_is_timeout_status = matches!(control.status_code, Some(408) | Some(504));
+    if attack_is_timeout_status && control_is_timeout_status {
+        return true;
+    }
+
+    // Control duration is within CONTROL_SIMILARITY_PCT% of the attack duration
+    // → the slowness is intrinsic to the request shape, not the smuggling.
+    let attack_ms = attack.duration.as_millis();
+    let control_ms = control.duration.as_millis();
+    if attack_ms > 0
+        && control_ms.saturating_mul(100) >= attack_ms.saturating_mul(CONTROL_SIMILARITY_PCT)
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Confirm a detected vulnerability by retrying CONFIRMATION_RETRIES times.
+/// - Connection-level timeouts: ALL retries must reproduce (strict; networks are noisy).
+/// - Status-only (408/504 without timing anomaly): ALL retries must reproduce —
+///   intermittent gateway-timeout responses are a common non-smuggling cause
+///   and would otherwise pass strict-majority on a single fluke.
+/// - Status+timing or timing-only signals: strict majority (>N/2) must reproduce.
+async fn confirm_vulnerability(
+    params: &PayloadCheckParams<'_>,
+    initial: &VulnerabilityInfo,
+) -> ConfirmationResult {
+    let mut durations = Vec::with_capacity(CONFIRMATION_RETRIES);
+    for _ in 0..CONFIRMATION_RETRIES {
+        if let Ok(Some(info)) = check_single_payload(params).await {
+            durations.push(info.duration);
+        }
+    }
+
+    // "Status-only" means detection fired on the 408/504 status WITHOUT a timing
+    // anomaly. A timing anomaly requires BOTH duration > timing_threshold AND
+    // duration > MIN_DELAY_MS (see `is_delayed` in check_single_payload), so "no
+    // timing anomaly" is the negation of that conjunction — not merely
+    // `duration <= timing_threshold`. The old check missed the gray zone where
+    // timing_threshold < duration <= MIN_DELAY_MS, wrongly applying lenient
+    // strict-majority confirmation to what is really a status-only signal.
+    let attack_millis = initial.duration.as_millis();
+    let initial_has_timing_anomaly =
+        attack_millis > params.timing_threshold && attack_millis > MIN_DELAY_MS;
+    let initial_is_status_only = !initial.is_connection_timeout
+        && matches!(initial.status_code, Some(408) | Some(504))
+        && !initial_has_timing_anomaly;
+
+    let confirmed = if initial.is_connection_timeout || initial_is_status_only {
+        durations.len() == CONFIRMATION_RETRIES
+    } else {
+        durations.len() * 2 > CONFIRMATION_RETRIES
+    };
+
+    ConfirmationResult {
+        confirmed,
+        durations,
+    }
+}
+
+/// True when the baseline shows enough natural variance (spread between max
+/// and median exceeding `BASELINE_NOISE_BUFFER_MS`) that pure timing
+/// detections become unreliable. Used to demote confidence — the finding
+/// still stands but is reported as Low so users know to verify manually.
+fn baseline_is_noisy(median: Duration, max: Duration) -> bool {
+    max.as_millis() > median.as_millis() + BASELINE_NOISE_BUFFER_MS
+}
+
+/// Compute confidence level based on the nature of the detection signals.
+///
+/// `timing_threshold` is the per-target dynamic threshold; the absolute floor
+/// (`MIN_DELAY_MS * 2`) prevents fast targets where any timing-detected attack
+/// would trivially exceed `threshold * 2` from always reaching High confidence.
+///
+/// `baseline_noisy` reflects whether the baseline carries enough variance that
+/// a pure-timing signal cannot be trusted at face value — such detections are
+/// demoted to Low so the user knows to corroborate manually.
+fn compute_confidence(
+    info: &VulnerabilityInfo,
+    timing_threshold: u128,
+    baseline_noisy: bool,
+) -> Confidence {
+    if info.is_connection_timeout {
+        return Confidence::Low;
+    }
+
+    let is_timeout_status = matches!(info.status_code, Some(408) | Some(504));
+    let attack_millis = info.duration.as_millis();
+    let is_timing_anomaly = attack_millis > timing_threshold && attack_millis > MIN_DELAY_MS;
+    let is_extreme_timing = timing_threshold > 0
+        && attack_millis > timing_threshold * 2
+        && attack_millis > MIN_DELAY_MS * 2;
+
+    // Demote timing-only detections from a noisy baseline to Low — the timing
+    // delta isn't reliable evidence on its own.
+    if baseline_noisy && !is_timeout_status && !is_extreme_timing {
+        return Confidence::Low;
+    }
+
+    if (is_timeout_status && is_timing_anomaly) || is_extreme_timing {
+        Confidence::High
+    } else {
+        Confidence::Medium
+    }
+}
+
+/// Collect the discrete signals that contributed to detection, for transparency.
+/// Returned as human-readable tags; ordering is stable across runs.
+fn collect_detection_signals(
+    info: &VulnerabilityInfo,
+    normal_duration: Duration,
+    timing_threshold: u128,
+    baseline_noisy: bool,
+    control: Option<&ControlObservation>,
+    followup: Option<&FollowupObservation>,
+) -> Vec<String> {
+    let mut signals = Vec::new();
+    if info.is_connection_timeout {
+        signals.push("connection_timeout".to_string());
+    }
+    match info.status_code {
+        Some(408) => signals.push("status_408".to_string()),
+        Some(504) => signals.push("status_504".to_string()),
+        _ => {}
+    }
+    let attack_ms = info.duration.as_millis();
+    let normal_ms = normal_duration.as_millis();
+    if attack_ms > timing_threshold && attack_ms > MIN_DELAY_MS {
+        let ratio = if normal_ms > 0 {
+            attack_ms as f64 / normal_ms as f64
+        } else {
+            attack_ms as f64 / 1.0
+        };
+        signals.push(format!("timing_anomaly:{:.1}x", ratio));
+    }
+    if timing_threshold > 0 && attack_ms > timing_threshold * 2 && attack_ms > MIN_DELAY_MS * 2 {
+        signals.push("extreme_timing".to_string());
+    }
+    if baseline_noisy {
+        signals.push("baseline_noisy".to_string());
+    }
+    if let Some(c) = control {
+        if bodies_diverge(info.body_length, c.body_length) {
+            signals.push("body_divergence_vs_control".to_string());
+        }
+        let header_diff = info
+            .header_fingerprint
+            .divergence_count(&c.header_fingerprint);
+        if header_diff >= 2 {
+            signals.push(format!("header_divergence_vs_control:{}", header_diff));
+        }
+    }
+    if let Some(f) = followup {
+        if f.has_divergence() {
+            signals.push(format!("followup_divergence:{}/{}", f.diverging, f.total));
+        }
+        if f.second_request {
+            signals.push("second_request_desync".to_string());
+        }
+    }
+    signals
+}
+
+/// Build the final `CheckResult` from collected scan state.
+#[allow(clippy::type_complexity)]
+fn build_check_result(
+    check_name: &str,
+    normal_status: String,
+    normal_duration: Duration,
+    vulnerability: Option<(
+        usize,
+        Vec<u8>,
+        VulnerabilityInfo,
+        Option<ControlObservation>,
+        Option<FollowupObservation>,
+    )>,
+    timing_threshold: u128,
+    baseline_noisy: bool,
+    diagnostics: Vec<String>,
+) -> (CheckResult, Option<(usize, Vec<u8>)>) {
+    if let Some((idx, payload, info, control, followup)) = vulnerability {
+        let confidence = compute_confidence(&info, timing_threshold, baseline_noisy);
+        let detection_signals = collect_detection_signals(
+            &info,
+            normal_duration,
+            timing_threshold,
+            baseline_noisy,
+            control.as_ref(),
+            followup.as_ref(),
+        );
+        let attack_status = info.status;
+        let attack_duration_ms = info.duration.as_millis() as u64;
+        let result = CheckResult {
+            check_type: check_name.to_string(),
+            vulnerable: true,
+            payload_index: Some(idx),
+            normal_status,
+            attack_status: Some(attack_status),
+            normal_duration_ms: normal_duration.as_millis() as u64,
+            attack_duration_ms: Some(attack_duration_ms),
+            timestamp: Utc::now().to_rfc3339(),
+            // The reported `payload` is a textual echo (a JSON string must be
+            // valid UTF-8), so a non-UTF-8 obfuscation byte renders lossily here.
+            // The byte-accurate request is preserved via `Some((idx, payload))`
+            // below and written verbatim by payload export.
+            payload: Some(String::from_utf8_lossy(&payload).into_owned()),
+            confidence: Some(confidence),
+            detection_signals,
+            diagnostics,
+        };
+        (result, Some((idx, payload)))
+    } else {
+        let result = CheckResult {
+            check_type: check_name.to_string(),
+            vulnerable: false,
+            payload_index: None,
+            normal_status,
+            attack_status: None,
+            normal_duration_ms: normal_duration.as_millis() as u64,
+            attack_duration_ms: None,
+            timestamp: Utc::now().to_rfc3339(),
+            payload: None,
+            confidence: None,
+            detection_signals: Vec::new(),
+            diagnostics,
+        };
+        (result, None)
+    }
+}
+
+/// Runs a set of attack requests for a given check type.
+/// A confirmed finding carried out of the attack loop: `(payload index, payload
+/// string, anomaly info, optional differential-control observation, optional
+/// follow-up divergence)`.
+type VulnerabilityFinding = (
+    usize,
+    Vec<u8>,
+    VulnerabilityInfo,
+    Option<ControlObservation>,
+    Option<FollowupObservation>,
+);
+
+/// Baseline timing measurement together with the derived anomaly threshold.
+struct TimingContext {
+    baseline: BaselineMeasurement,
+    /// Milliseconds at or above which an attack response is timing-anomalous.
+    timing_threshold: u128,
+    /// Whether per-request baseline variance is large enough to demote
+    /// timing-only findings (see [`baseline_is_noisy`]).
+    baseline_noisy: bool,
+}
+
+/// Measure the timing baseline and compute the noise-aware anomaly threshold.
+///
+/// A slow attack must beat BOTH the relative multiplier over the median AND the
+/// worst observed baseline plus a buffer, so a single slow baseline sample can't
+/// inflate noise into a false anomaly. When attacks use a non-GET method the GET
+/// baseline is augmented with method-matched probes — backends where POST is
+/// naturally slower than GET are a common false-positive source, and the plain
+/// GET baseline would otherwise understate the per-request floor for the real
+/// attack shape.
+async fn establish_timing_context(params: &CheckParams<'_>) -> Result<TimingContext> {
+    let authority = params
+        .attack_requests
+        .first()
+        .and_then(|payload| payload_authority(payload))
+        .unwrap_or(params.host);
+    let baseline = measure_baseline(params, authority).await?;
+
+    let attack_method = params
+        .attack_requests
+        .first()
+        .map(|p| payload_method(p))
+        .unwrap_or_else(|| "GET".to_string());
+    let mut max_baseline = baseline.max_duration;
+    let mut median_baseline = baseline.duration;
+    if attack_method != "GET" && !attack_method.is_empty() {
+        let extra = method_matched_baseline_durations(
+            params.host,
+            authority,
+            params.port,
+            params.path,
+            &attack_method,
+            params.baseline_count.max(1),
+            params.timeout,
+            params.verbose,
+            params.use_tls,
+        )
+        .await;
+        if !extra.is_empty() {
+            if let Some(extra_max) = extra.iter().copied().max()
+                && extra_max > max_baseline
+            {
+                max_baseline = extra_max;
+            }
+            let mut combined: Vec<Duration> = extra;
+            combined.push(baseline.duration);
+            median_baseline = median_duration(&mut combined);
+        }
+    }
+
+    let timing_threshold = std::cmp::max(
+        median_baseline.as_millis() * TIMING_MULTIPLIER,
+        max_baseline.as_millis() + BASELINE_NOISE_BUFFER_MS,
+    );
+    let baseline_noisy = baseline_is_noisy(median_baseline, max_baseline);
+
+    Ok(TimingContext {
+        baseline,
+        timing_threshold,
+        baseline_noisy,
+    })
+}
+
+/// Fallback probe, run only when the main loop found no direct anomaly and did
+/// not early-terminate. Catches CL.TE desyncs whose attack response is itself
+/// benign and only the FOLLOWING request on the shared upstream connection is
+/// corrupted. Returns a synthesized (benign-info) finding when the follow-up
+/// probes diverge from baseline, or `None` when there is no eligible plant
+/// payload or the follow-up probes stay clean.
+async fn attempt_second_request_desync(
+    params: &CheckParams<'_>,
+    baseline: &BaselineMeasurement,
+    timing_threshold: u128,
+) -> Option<VulnerabilityFinding> {
+    let (idx, plant_payload) = params
+        .attack_requests
+        .iter()
+        .enumerate()
+        .find(|(_, p)| payload_eligible_for_control(p))?;
+
+    let payload_params = PayloadCheckParams {
+        host: params.host,
+        port: params.port,
+        attack_request: plant_payload,
+        timeout: params.timeout,
+        verbose: params.verbose,
+        use_tls: params.use_tls,
+        timing_threshold,
+        baseline_status_codes: &baseline.observed_status_codes,
+    };
+    let followup = probe_second_request_desync(&payload_params, params.path, baseline).await?;
+
+    if params.verbose {
+        println!(
+            "  {} {} second-request desync detected: {}/{} follow-up probes diverged from baseline",
+            "[+]".green(),
+            params.check_name,
+            followup.diverging,
+            followup.total,
+        );
+    }
+    // The attack request itself carried no anomaly — synthesize a benign
+    // VulnerabilityInfo so the finding is reported as a medium-confidence
+    // second-request desync.
+    let info = VulnerabilityInfo {
+        status: baseline.status.clone(),
+        status_code: baseline.status_code,
+        duration: baseline.duration,
+        body_length: baseline.body_length,
+        header_fingerprint: ResponseHeaderFingerprint::default(),
+        is_connection_timeout: false,
+    };
+    Some((idx, plant_payload.clone(), info, None, Some(followup)))
+}
+
+pub async fn run_checks_for_type(params: CheckParams<'_>) -> Result<CheckResult> {
+    let total_requests = params.attack_requests.len();
+
+    if !params.verbose {
+        params.pb.set_message(format!(
+            "[{}/{}] checking {} (0/{})",
+            params.current_check, params.total_checks, params.check_name, total_requests
+        ));
+    }
+
+    let TimingContext {
+        baseline,
+        timing_threshold,
+        baseline_noisy,
+    } = establish_timing_context(&params).await?;
+    let normal_status = baseline.status.clone();
+    let normal_duration = baseline.duration;
+
+    let mut vulnerability_info: Option<VulnerabilityFinding> = None;
+
+    // Track consecutive control-FP rejections so we can abandon the check if
+    // the backend produces the same shape-dependent anomaly for every
+    // variant — that's a strong signal the responses are not smuggling.
+    let mut consecutive_fp_rejections: usize = 0;
+    let mut early_termination: Option<String> = None;
+
+    for (i, attack_request) in params.attack_requests.iter().enumerate() {
+        if params.delay > 0 && i > 0 {
+            tokio::time::sleep(Duration::from_millis(params.delay)).await;
+        }
+
+        if !params.verbose {
+            let current = i + 1;
+            let percentage = (current as u32 * 100) / total_requests as u32;
+            params.pb.set_message(format!(
+                "[{}/{}] checking {} ({}/{} - {}%)",
+                params.current_check,
+                params.total_checks,
+                params.check_name,
+                current,
+                total_requests,
+                percentage
+            ));
+        }
+
+        let payload_params = PayloadCheckParams {
+            host: params.host,
+            port: params.port,
+            attack_request,
+            timeout: params.timeout,
+            verbose: params.verbose,
+            use_tls: params.use_tls,
+            timing_threshold,
+            baseline_status_codes: &baseline.observed_status_codes,
+        };
+
+        match check_single_payload(&payload_params).await {
+            Ok(Some(mut info)) => {
+                let confirmation = confirm_vulnerability(&payload_params, &info).await;
+                if confirmation.confirmed {
+                    // Use the median of (initial + retry) durations to dampen
+                    // the influence of a single transient spike on confidence.
+                    let mut all_durations = Vec::with_capacity(confirmation.durations.len() + 1);
+                    all_durations.push(info.duration);
+                    all_durations.extend(confirmation.durations);
+                    info.duration = median_duration(&mut all_durations);
+
+                    // Differential control check: send a smuggling-stripped
+                    // sibling of the payload. Skipped for payloads where
+                    // stripping isn't meaningful (H2C/H2 or non-TE payloads).
+                    let mut control_observation: Option<ControlObservation> = None;
+                    if payload_eligible_for_control(attack_request) {
+                        let control_request = build_control_request(attack_request);
+                        if let Some(control) =
+                            observe_control(&payload_params, &control_request).await
+                        {
+                            control_observation = Some(control);
+                        }
+                    }
+
+                    // Post-attack follow-up probes: detect proxy↔backend
+                    // desync that persists past the attack. Strong escape
+                    // signal — overrides the control FP rule.
+                    let followup_observation = Some(
+                        observe_followup_divergence(&payload_params, params.path, &baseline).await,
+                    );
+
+                    // FP rejection considers both control similarity AND the
+                    // absence of follow-up divergence. If the follow-up
+                    // diverged, the finding survives FP rejection.
+                    if let Some(control) = control_observation.as_ref()
+                        && control_indicates_false_positive(
+                            &info,
+                            control,
+                            followup_observation.as_ref(),
+                        )
+                    {
+                        if params.verbose {
+                            println!(
+                                "  {} {} payload #{} rejected as false positive (control matched attack: status={:?}, attack={}ms, control={}ms)",
+                                "[*]".cyan(),
+                                params.check_name,
+                                i,
+                                control.status_code,
+                                info.duration.as_millis(),
+                                control.duration.as_millis(),
+                            );
+                        }
+                        consecutive_fp_rejections += 1;
+                        if consecutive_fp_rejections >= CONSECUTIVE_FP_REJECTIONS_LIMIT {
+                            early_termination = Some(format!(
+                                "early_termination:consecutive_fp_rejections={}",
+                                consecutive_fp_rejections
+                            ));
+                            if params.verbose {
+                                println!(
+                                    "  {} {} abandoning check after {} consecutive control-FP rejections",
+                                    "[*]".cyan(),
+                                    params.check_name,
+                                    consecutive_fp_rejections,
+                                );
+                            }
+                            break;
+                        }
+                        continue;
+                    }
+
+                    vulnerability_info = Some((
+                        i,
+                        attack_request.clone(),
+                        info,
+                        control_observation,
+                        followup_observation,
+                    ));
+                    break;
+                } else {
+                    // Initial detection didn't confirm — payload was not a
+                    // shape-dependent FP, so this run does not contribute to
+                    // the consecutive-rejection streak.
+                    consecutive_fp_rejections = 0;
+                }
+            }
+            Ok(None) => {
+                // No detection signal at all → reset the streak.
+                consecutive_fp_rejections = 0;
+            }
+            Err(e) => {
+                if params.verbose {
+                    println!(
+                        "\n{} Error during {} attack request (payload {}): {}",
+                        "[!]".yellow(),
+                        params.check_name,
+                        i,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    // Second-request desync probe: only when the main loop found no direct
+    // anomaly and did not early-terminate.
+    if vulnerability_info.is_none() && early_termination.is_none() {
+        vulnerability_info =
+            attempt_second_request_desync(&params, &baseline, timing_threshold).await;
+    }
+
+    let diagnostics: Vec<String> = early_termination.into_iter().collect();
+    let (result, exported) = build_check_result(
+        params.check_name,
+        normal_status,
+        normal_duration,
+        vulnerability_info,
+        timing_threshold,
+        baseline_noisy,
+        diagnostics,
+    );
+
+    if let (Some((payload_index, payload)), Some(export_dir)) = (exported, params.export_dir)
+        && let Err(e) = export_payload(
+            export_dir,
+            params.host,
+            params.check_name,
+            payload_index,
+            &payload,
+            params.use_tls,
+        )
+        && params.verbose
+    {
+        println!("  {} Failed to export payload: {}", "[!]".yellow(), e);
+    }
+
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_authority_reads_host_header_case_insensitively() {
+        let payload = b"GET / HTTP/1.1\r\nhOsT: vhost.example:8443\r\nConnection: close\r\n\r\n";
+        assert_eq!(payload_authority(payload), Some("vhost.example:8443"));
+        assert_eq!(payload_authority(b"GET / HTTP/1.1\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn baseline_majority_timeout_empty_is_false() {
+        assert!(!baseline_majority_timeout(&[]));
+    }
+
+    #[test]
+    fn baseline_majority_timeout_single_504_is_majority() {
+        assert!(baseline_majority_timeout(&[Some(504)]));
+    }
+
+    #[test]
+    fn baseline_majority_timeout_minority_not_flagged() {
+        // 1 of 3 is NOT majority (used to be "any" → now requires majority)
+        assert!(!baseline_majority_timeout(&[
+            Some(504),
+            Some(200),
+            Some(200)
+        ]));
+    }
+
+    #[test]
+    fn baseline_majority_timeout_majority_flagged() {
+        assert!(baseline_majority_timeout(&[
+            Some(504),
+            Some(504),
+            Some(200)
+        ]));
+    }
+
+    #[test]
+    fn payload_eligible_skips_plain_request() {
+        let p = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert!(!payload_eligible_for_control(p.as_bytes()));
+    }
+
+    #[test]
+    fn payload_eligible_for_te_payload() {
+        let p = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\nG";
+        assert!(payload_eligible_for_control(p.as_bytes()));
+    }
+
+    #[test]
+    fn payload_eligible_skips_h2c_upgrade() {
+        // H2C payload has TE-related body but the Upgrade header makes control
+        // comparison meaningless (TE stripping doesn't disable H2C smuggling).
+        let p = "POST / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: h2c\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert!(!payload_eligible_for_control(p.as_bytes()));
+    }
+
+    #[test]
+    fn payload_eligibility_ignores_upgrade_text_in_request_target() {
+        let p = "POST /upgrade:marker/http/2 HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nG";
+        assert!(payload_eligible_for_control(p.as_bytes()));
+    }
+
+    #[test]
+    fn build_control_strips_transfer_encoding() {
+        // Original attack body "0\r\n\r\nG" is 6 bytes — control should match
+        // that size with benign ASCII padding.
+        let p = "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\nG";
+        let control = build_control_request(p.as_bytes());
+        let lower = control.to_ascii_lowercase();
+        assert!(!lower.contains("transfer-encoding"));
+        assert!(lower.contains("content-length: 6\r\n"));
+        // Headers preserved
+        assert!(control.starts_with("POST /a HTTP/1.1\r\n"));
+        assert!(control.contains("Host: x"));
+        // Body present, of declared length, benign padding only.
+        let (_, body) = control.rsplit_once("\r\n\r\n").unwrap();
+        assert_eq!(body.len(), 6);
+        assert!(body.chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn build_control_zero_body_when_attack_has_none() {
+        let p = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let control = build_control_request(p.as_bytes());
+        assert!(control.contains("Content-Length: 0\r\n"));
+        let (_, body) = control.rsplit_once("\r\n\r\n").unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn build_control_caps_body_at_max_bytes() {
+        // Construct an attack payload with a body bigger than the cap.
+        let huge_body = "z".repeat(CONTROL_BODY_MAX_BYTES + 1000);
+        let p = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 99999\r\n\r\n{}",
+            huge_body
+        );
+        let control = build_control_request(p.as_bytes());
+        assert!(control.contains(&format!("Content-Length: {}\r\n", CONTROL_BODY_MAX_BYTES)));
+        let (_, body) = control.rsplit_once("\r\n\r\n").unwrap();
+        assert_eq!(body.len(), CONTROL_BODY_MAX_BYTES);
+    }
+
+    #[test]
+    fn build_control_preserves_custom_headers() {
+        let p = "POST / HTTP/1.1\r\nHost: x\r\nCookie: s=1\r\nX-Custom: v\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\nG";
+        let control = build_control_request(p.as_bytes());
+        assert!(control.contains("Cookie: s=1"));
+        assert!(control.contains("X-Custom: v"));
+    }
+
+    #[test]
+    fn build_control_preserves_application_encoding_headers() {
+        let p = "POST / HTTP/1.1\r\nHost: x\r\nContent-Encoding: gzip\r\nX-Content-Length-Policy: strict\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\nG";
+        let control = build_control_request(p.as_bytes());
+        assert!(control.contains("Content-Encoding: gzip\r\n"));
+        assert!(control.contains("X-Content-Length-Policy: strict\r\n"));
+        assert!(!control.contains("Transfer-Encoding:"));
+    }
+
+    #[test]
+    fn build_control_removes_transfer_encoding_connection_token() {
+        let p = "POST / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, Transfer-Encoding\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\nG";
+        let control = build_control_request(p.as_bytes());
+        assert!(control.contains("Connection: keep-alive\r\n"));
+        assert!(!control.contains("Connection: keep-alive, Transfer-Encoding"));
+    }
+
+    #[test]
+    fn control_fp_when_both_504() {
+        let attack = VulnerabilityInfo {
+            status: "HTTP/1.1 504".into(),
+            status_code: Some(504),
+            duration: Duration::from_millis(500),
+            body_length: 20,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        let control = ControlObservation {
+            duration: Duration::from_millis(50),
+            status_code: Some(504),
+            body_length: 20,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        assert!(control_indicates_false_positive(&attack, &control, None));
+    }
+
+    #[test]
+    fn control_fp_when_similar_timing() {
+        let attack = VulnerabilityInfo {
+            status: "HTTP/1.1 200".into(),
+            status_code: Some(200),
+            duration: Duration::from_millis(2000),
+            body_length: 13,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        let control = ControlObservation {
+            duration: Duration::from_millis(1500), // 75% of attack
+            status_code: Some(200),
+            body_length: 13,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        assert!(control_indicates_false_positive(&attack, &control, None));
+    }
+
+    #[test]
+    fn control_structure_prefers_fast_known_non_5xx_sample() {
+        let samples = vec![
+            ControlObservation {
+                duration: Duration::from_millis(20),
+                status_code: Some(200),
+                body_length: 13,
+                header_fingerprint: ResponseHeaderFingerprint::default(),
+                is_connection_timeout: false,
+            },
+            ControlObservation {
+                duration: Duration::from_millis(100),
+                status_code: Some(503),
+                body_length: 1000,
+                header_fingerprint: ResponseHeaderFingerprint::default(),
+                is_connection_timeout: false,
+            },
+        ];
+        let index = control_structure_index(&samples);
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn control_structure_retains_any_gateway_timeout_status() {
+        let samples = vec![
+            ControlObservation {
+                duration: Duration::from_millis(20),
+                status_code: Some(200),
+                body_length: 13,
+                header_fingerprint: ResponseHeaderFingerprint::default(),
+                is_connection_timeout: false,
+            },
+            ControlObservation {
+                duration: Duration::from_millis(100),
+                status_code: Some(504),
+                body_length: 0,
+                header_fingerprint: ResponseHeaderFingerprint::default(),
+                is_connection_timeout: false,
+            },
+        ];
+        let status_code = control_status_code(&samples, control_structure_index(&samples));
+        assert_eq!(status_code, Some(504));
+    }
+
+    #[test]
+    fn control_kept_when_fast_and_different_status() {
+        let attack = VulnerabilityInfo {
+            status: "HTTP/1.1 504".into(),
+            status_code: Some(504),
+            duration: Duration::from_millis(2000),
+            body_length: 0,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        let control = ControlObservation {
+            duration: Duration::from_millis(50), // 2.5% of attack — different shape
+            status_code: Some(200),
+            body_length: 13,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        assert!(!control_indicates_false_positive(&attack, &control, None));
+    }
+
+    #[test]
+    fn body_divergence_ignores_when_both_tiny() {
+        // Both sides below CONTROL_BODY_MIN_BYTES → not enough signal.
+        assert!(!bodies_diverge(5, 5));
+        assert!(!bodies_diverge(20, 30));
+    }
+
+    #[test]
+    fn body_divergence_detects_tiny_vs_large() {
+        // One side tiny, the other substantial — that IS structural divergence.
+        // (Real smuggling case: attack returns small error page, control returns
+        // full normal response.)
+        assert!(bodies_diverge(10, 1000));
+        assert!(bodies_diverge(1000, 10));
+    }
+
+    #[test]
+    fn body_divergence_detects_large_size_difference() {
+        // 200 bytes vs 50 bytes: 50/200 = 25% < 75% threshold → diverge.
+        assert!(bodies_diverge(200, 50));
+        assert!(bodies_diverge(50, 200));
+    }
+
+    #[test]
+    fn body_divergence_skips_close_sizes() {
+        // 200 bytes vs 180 bytes: 180/200 = 90% > 75% → not divergent.
+        assert!(!bodies_diverge(200, 180));
+    }
+
+    #[test]
+    fn control_kept_when_bodies_diverge_despite_similar_timing() {
+        // Attack and control have similar timing (would normally trigger FP)
+        // but bodies differ substantially → escape clause keeps the finding.
+        let attack = VulnerabilityInfo {
+            status: "HTTP/1.1 200".into(),
+            status_code: Some(200),
+            duration: Duration::from_millis(2000),
+            body_length: 50, // small response (e.g., error page)
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        let control = ControlObservation {
+            duration: Duration::from_millis(1900), // 95% of attack — very similar timing
+            status_code: Some(200),
+            body_length: 5000, // large response (normal content)
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        assert!(!control_indicates_false_positive(&attack, &control, None));
+    }
+
+    #[test]
+    fn consecutive_fp_rejections_limit_constant() {
+        // Document the limit so future tuning is intentional. Value chosen
+        // small enough to abandon noisy backends quickly but large enough
+        // that a few real noisy retries don't trigger early termination.
+        const _: () = assert!(
+            CONSECUTIVE_FP_REJECTIONS_LIMIT >= 2,
+            "limit should require at least 2 consecutive rejections"
+        );
+    }
+
+    #[test]
+    fn payload_method_extracts_post() {
+        let p = "POST /a HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert_eq!(payload_method(p.as_bytes()), "POST");
+    }
+
+    #[test]
+    fn payload_method_uppercases() {
+        let p = "patch /a HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert_eq!(payload_method(p.as_bytes()), "PATCH");
+    }
+
+    #[test]
+    fn payload_method_defaults_to_get_on_empty() {
+        assert_eq!(payload_method(b""), "GET");
+    }
+
+    #[test]
+    fn followup_status_diverged_requires_known_baseline() {
+        // A parseable non-5xx follow-up genuinely differing from a known
+        // baseline diverges.
+        assert!(followup_status_diverged(Some(200), Some(404)));
+        // Same status → no divergence.
+        assert!(!followup_status_diverged(Some(200), Some(200)));
+        // 5xx follow-ups are never treated as divergence (flake-prone).
+        assert!(!followup_status_diverged(Some(503), Some(200)));
+        // Unparseable baseline (None): a clean follow-up must NOT be counted as
+        // diverged, otherwise every follow-up trivially corroborates a false
+        // positive when the baseline status line was unreadable.
+        assert!(!followup_status_diverged(Some(200), None));
+        // Unparseable follow-up is not a divergence either.
+        assert!(!followup_status_diverged(None, Some(200)));
+    }
+
+    #[test]
+    fn baseline_noisy_when_spread_exceeds_buffer() {
+        assert!(baseline_is_noisy(
+            Duration::from_millis(100),
+            Duration::from_millis(700)
+        ));
+    }
+
+    #[test]
+    fn baseline_not_noisy_when_spread_within_buffer() {
+        assert!(!baseline_is_noisy(
+            Duration::from_millis(400),
+            Duration::from_millis(400)
+        ));
+        assert!(!baseline_is_noisy(
+            Duration::from_millis(100),
+            Duration::from_millis(599)
+        ));
+    }
+
+    #[test]
+    fn timing_only_demoted_to_low_on_noisy_baseline() {
+        let info = VulnerabilityInfo {
+            status: "HTTP/1.1 200".into(),
+            status_code: Some(200),
+            duration: Duration::from_millis(2000),
+            body_length: 13,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        // Noisy baseline, timing-only signal → Low.
+        assert_eq!(compute_confidence(&info, 1200, true), Confidence::Low);
+    }
+
+    #[test]
+    fn status_signal_keeps_confidence_on_noisy_baseline() {
+        let info = VulnerabilityInfo {
+            status: "HTTP/1.1 504".into(),
+            status_code: Some(504),
+            duration: Duration::from_millis(2000),
+            body_length: 0,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        // 504 + timing anomaly is High regardless of baseline noise.
+        assert_eq!(compute_confidence(&info, 1200, true), Confidence::High);
+    }
+
+    #[test]
+    fn extreme_timing_keeps_confidence_on_noisy_baseline() {
+        let info = VulnerabilityInfo {
+            status: "HTTP/1.1 200".into(),
+            status_code: Some(200),
+            duration: Duration::from_millis(5000),
+            body_length: 13,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        // 5000ms > 1200*2=2400 AND > MIN_DELAY_MS*2=2000 → extreme → High even
+        // on noisy baseline.
+        assert_eq!(compute_confidence(&info, 1200, true), Confidence::High);
+    }
+
+    #[test]
+    fn header_fingerprint_extracts_known_fields() {
+        let r = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nServer: nginx\r\nContent-Length: 123\r\nX-Other: ignore\r\n\r\nbody";
+        let fp = ResponseHeaderFingerprint::from_response(r);
+        assert_eq!(fp.content_type.as_deref(), Some("text/html"));
+        assert_eq!(fp.server.as_deref(), Some("nginx"));
+        assert_eq!(fp.content_length.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn header_fingerprint_divergence_count() {
+        let a = ResponseHeaderFingerprint::from_response(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nServer: nginx\r\nContent-Length: 100\r\n\r\nb",
+        );
+        let b = ResponseHeaderFingerprint::from_response(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nServer: nginx\r\nContent-Length: 99\r\n\r\nb",
+        );
+        // content-type differs, content-length differs, server same → 2.
+        assert_eq!(a.divergence_count(&b), 2);
+    }
+
+    #[test]
+    fn control_kept_when_headers_diverge_despite_similar_timing() {
+        // Attack and control have similar timing AND similar body length, but
+        // response headers differ in two fields → escape via header divergence.
+        let attack = VulnerabilityInfo {
+            status: "HTTP/1.1 200".into(),
+            status_code: Some(200),
+            duration: Duration::from_millis(2000),
+            body_length: 200,
+            header_fingerprint: ResponseHeaderFingerprint::from_response(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nServer: backend-v2\r\nContent-Length: 200\r\n\r\n",
+            ),
+            is_connection_timeout: false,
+        };
+        let control = ControlObservation {
+            duration: Duration::from_millis(1900),
+            status_code: Some(200),
+            body_length: 210,
+            header_fingerprint: ResponseHeaderFingerprint::from_response(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nServer: proxy-edge\r\nContent-Length: 210\r\n\r\n",
+            ),
+            is_connection_timeout: false,
+        };
+        // bodies are 200 vs 210 (95% similar — not divergent). Headers differ
+        // in content-type, server, content-length (3 fields) → ≥2 → escape.
+        assert!(!control_indicates_false_positive(&attack, &control, None));
+    }
+
+    #[test]
+    fn control_fp_when_only_one_header_diverges() {
+        // A single header divergence is not enough — could be reverse proxy
+        // metadata noise. Need ≥2 to escape.
+        let attack = VulnerabilityInfo {
+            status: "HTTP/1.1 200".into(),
+            status_code: Some(200),
+            duration: Duration::from_millis(2000),
+            body_length: 13,
+            header_fingerprint: ResponseHeaderFingerprint::from_response(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nServer: nginx\r\nContent-Length: 13\r\n\r\n",
+            ),
+            is_connection_timeout: false,
+        };
+        let control = ControlObservation {
+            duration: Duration::from_millis(1800),
+            status_code: Some(200),
+            body_length: 13,
+            header_fingerprint: ResponseHeaderFingerprint::from_response(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nServer: nginx-alt\r\nContent-Length: 13\r\n\r\n",
+            ),
+            is_connection_timeout: false,
+        };
+        assert!(control_indicates_false_positive(&attack, &control, None));
+    }
+
+    #[test]
+    fn followup_divergence_signals_keep_finding() {
+        let attack = VulnerabilityInfo {
+            status: "HTTP/1.1 200".into(),
+            status_code: Some(200),
+            duration: Duration::from_millis(2000),
+            body_length: 13,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        let control = ControlObservation {
+            duration: Duration::from_millis(1900), // very similar timing
+            status_code: Some(200),
+            body_length: 13,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        let followup = FollowupObservation {
+            diverging: 2,
+            total: 3,
+            second_request: false,
+        };
+        // Without follow-up: timing similarity would reject as FP. With
+        // follow-up divergence: escape clause keeps the finding.
+        assert!(!control_indicates_false_positive(
+            &attack,
+            &control,
+            Some(&followup)
+        ));
+    }
+
+    #[test]
+    fn followup_no_divergence_lets_fp_rule_fire() {
+        let attack = VulnerabilityInfo {
+            status: "HTTP/1.1 200".into(),
+            status_code: Some(200),
+            duration: Duration::from_millis(2000),
+            body_length: 13,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        let control = ControlObservation {
+            duration: Duration::from_millis(1900),
+            status_code: Some(200),
+            body_length: 13,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        let followup = FollowupObservation {
+            diverging: 0,
+            total: 3,
+            second_request: false,
+        };
+        // No follow-up divergence + similar timing → standard FP rule fires.
+        assert!(control_indicates_false_positive(
+            &attack,
+            &control,
+            Some(&followup)
+        ));
+    }
+
+    #[test]
+    fn followup_status_diverged_flags_non_5xx_change() {
+        // A 4xx/3xx follow-up where the baseline was 200 is a structural divergence.
+        assert!(followup_status_diverged(Some(405), Some(200)));
+        assert!(followup_status_diverged(Some(400), Some(200)));
+        assert!(followup_status_diverged(Some(301), Some(200)));
+    }
+
+    #[test]
+    fn followup_status_diverged_ignores_5xx() {
+        // 5xx responses are flake-prone and must NOT drive the second-request
+        // probe, even when they differ from the baseline.
+        assert!(!followup_status_diverged(Some(504), Some(200)));
+        assert!(!followup_status_diverged(Some(502), Some(200)));
+        assert!(!followup_status_diverged(Some(503), Some(200)));
+        assert!(!followup_status_diverged(None, Some(200)));
+    }
+
+    #[test]
+    fn followup_status_diverged_false_when_matching() {
+        assert!(!followup_status_diverged(Some(200), Some(200)));
+        assert!(!followup_status_diverged(Some(404), Some(404)));
+    }
+
+    #[test]
+    fn followup_body_divergence_requires_known_non_5xx_statuses() {
+        assert!(followup_body_diverged(Some(200), Some(200), 100, 32));
+        assert!(!followup_body_diverged(Some(503), Some(200), 1000, 32));
+        assert!(!followup_body_diverged(None, Some(200), 1000, 32));
+        assert!(!followup_body_diverged(Some(200), None, 1000, 32));
+    }
+
+    #[test]
+    fn second_request_signal_emitted() {
+        let info = VulnerabilityInfo {
+            status: "HTTP/1.1 200 OK".into(),
+            status_code: Some(200),
+            duration: Duration::from_millis(5),
+            body_length: 500,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        let followup = FollowupObservation {
+            diverging: 1,
+            total: 3,
+            second_request: true,
+        };
+        let signals = collect_detection_signals(
+            &info,
+            Duration::from_millis(5),
+            100,
+            false,
+            None,
+            Some(&followup),
+        );
+        assert!(signals.iter().any(|s| s == "second_request_desync"));
+        assert!(
+            signals
+                .iter()
+                .any(|s| s.starts_with("followup_divergence:"))
+        );
+    }
+
+    #[test]
+    fn followup_observation_reports_divergence() {
+        let f = FollowupObservation {
+            diverging: 1,
+            total: 3,
+            second_request: false,
+        };
+        assert!(f.has_divergence());
+        let none = FollowupObservation {
+            diverging: 0,
+            total: 3,
+            second_request: false,
+        };
+        assert!(!none.has_divergence());
+    }
+
+    #[test]
+    fn control_kept_when_bodies_diverge_despite_both_504() {
+        let attack = VulnerabilityInfo {
+            status: "HTTP/1.1 504".into(),
+            status_code: Some(504),
+            duration: Duration::from_millis(2000),
+            body_length: 100,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        let control = ControlObservation {
+            duration: Duration::from_millis(50),
+            status_code: Some(504),
+            body_length: 1000,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        // Both 504 would normally be FP, but body divergence overrides.
+        assert!(!control_indicates_false_positive(&attack, &control, None));
+    }
+
+    #[test]
+    fn followup_single_flake_does_not_override_control_fp() {
+        // A uniformly-slow backend (control timing ~= attack) where exactly ONE
+        // of the 3 follow-up probes flaked. The control-FP rule must still fire:
+        // a single flaky follow-up is not corroboration.
+        let attack = VulnerabilityInfo {
+            status: "HTTP/1.1 200".into(),
+            status_code: Some(200),
+            duration: Duration::from_millis(2000),
+            body_length: 13,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        let control = ControlObservation {
+            duration: Duration::from_millis(1900), // very similar timing
+            status_code: Some(200),
+            body_length: 13,
+            header_fingerprint: ResponseHeaderFingerprint::default(),
+            is_connection_timeout: false,
+        };
+        let single_flake = FollowupObservation {
+            diverging: 1,
+            total: 3,
+            second_request: false,
+        };
+        assert!(
+            control_indicates_false_positive(&attack, &control, Some(&single_flake)),
+            "one flaky follow-up must not override the control rejection"
+        );
+    }
+
+    #[test]
+    fn has_corroborated_divergence_requires_majority_on_main_path() {
+        let one = FollowupObservation {
+            diverging: 1,
+            total: 3,
+            second_request: false,
+        };
+        let two = FollowupObservation {
+            diverging: 2,
+            total: 3,
+            second_request: false,
+        };
+        assert!(!one.has_corroborated_divergence(), "1/3 is not a majority");
+        assert!(two.has_corroborated_divergence(), "2/3 is a majority");
+        // The second-request path already reproduced across sequences, so a
+        // single divergence there is corroboration enough.
+        let second_req = FollowupObservation {
+            diverging: 1,
+            total: 3,
+            second_request: true,
+        };
+        assert!(second_req.has_corroborated_divergence());
+    }
+
+    #[test]
+    fn one_surviving_followup_is_not_corroboration() {
+        let one_response = FollowupObservation {
+            diverging: 1,
+            total: 1,
+            second_request: false,
+        };
+        assert!(!one_response.has_corroborated_divergence());
+    }
+
+    #[test]
+    fn aggregate_baseline_tolerates_partial_probe_failure() {
+        // A single failed probe among successes must not discard the baseline.
+        let results: Vec<Result<(String, Duration)>> = vec![
+            Ok((
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
+                Duration::from_millis(100),
+            )),
+            Err(SmugglexError::Io("connection reset".into())),
+            Ok((
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
+                Duration::from_millis(120),
+            )),
+        ];
+        let baseline = aggregate_baseline(results).expect("survivors should yield a baseline");
+        assert_eq!(
+            baseline.observed_status_codes.len(),
+            2,
+            "only the successful probes contribute status codes"
+        );
+        assert_eq!(baseline.status_code, Some(200));
+    }
+
+    #[test]
+    fn aggregate_baseline_errors_only_when_all_probes_fail() {
+        let results: Vec<Result<(String, Duration)>> = vec![
+            Err(SmugglexError::Io("reset".into())),
+            Err(SmugglexError::Timeout("timed out".into())),
+        ];
+        assert!(
+            aggregate_baseline(results).is_err(),
+            "no surviving samples → error"
+        );
+    }
+
+    #[test]
+    fn aggregate_baseline_ignores_a_last_sample_outlier() {
+        let results: Vec<Result<(String, Duration)>> = vec![
+            Ok((
+                "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nhey".to_string(),
+                Duration::from_millis(100),
+            )),
+            Ok((
+                "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nhey".to_string(),
+                Duration::from_millis(120),
+            )),
+            Ok((
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 64\r\n\r\nerror body"
+                    .to_string(),
+                Duration::from_millis(130),
+            )),
+        ];
+        let baseline = aggregate_baseline(results).expect("successful samples yield a baseline");
+        assert_eq!(baseline.status_code, Some(200));
+        assert_eq!(baseline.body_length, 3);
+        assert_eq!(baseline.status, "HTTP/1.1 200 OK");
+    }
+
+    #[test]
+    fn aggregate_baseline_prefers_known_status_on_a_tie() {
+        let results: Vec<Result<(String, Duration)>> = vec![
+            Ok(("malformed response".to_string(), Duration::from_millis(10))),
+            Ok((
+                "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nhey".to_string(),
+                Duration::from_millis(20),
+            )),
+        ];
+        let baseline = aggregate_baseline(results).expect("successful samples yield a baseline");
+        assert_eq!(baseline.status_code, Some(200));
+        assert_eq!(baseline.status, "HTTP/1.1 200 OK");
+        assert_eq!(baseline.body_length, 3);
+    }
+
+    #[test]
+    fn response_body_length_excludes_chunk_framing() {
+        let chunked =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let with_trailer = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Trace: 1\r\n\r\n";
+        assert_eq!(response_body_length(chunked), 5);
+        assert_eq!(response_body_length(with_trailer), 5);
+    }
+}

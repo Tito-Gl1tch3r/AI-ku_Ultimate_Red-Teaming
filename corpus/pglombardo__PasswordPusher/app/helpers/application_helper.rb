@@ -1,0 +1,103 @@
+# frozen_string_literal: true
+
+module ApplicationHelper
+  STOCK_LIGHT_LOGO = "logo-transparent-sm-bare.png"
+  STOCK_DARK_LOGO = "logo-transparent-sm-dark-bare.png"
+
+  # Resolves light/dark brand logo URLs.
+  #
+  # If only one of light_logo / dark_logo is set, that custom file is used for
+  # both theme modes. Stock Password Pusher assets are used only when neither
+  # custom logo is configured.
+  #
+  # @return [Hash] keys :light and :dark with logo src strings
+  def brand_logo_srcs
+    light = Settings.brand&.light_logo.presence
+    dark = Settings.brand&.dark_logo.presence
+    {
+      light: light || dark || asset_path(STOCK_LIGHT_LOGO),
+      dark: dark || light || asset_path(STOCK_DARK_LOGO)
+    }
+  end
+
+  # Set the HTML title for the page with a trailing site identifier.
+  def title(content)
+    content_for(:html_title) { "#{content} | #{Settings.brand.title}" }
+  end
+
+  # Set the HTML title for the page _without_ the trailing site identifier.
+  # Used in Password#show/show_expired to hide Password Pusher branding
+  def plain_title(content)
+    content_for(:html_title) { content }
+  end
+
+  # Used in the topname to set the active tab
+  def current_controller?(names)
+    names.include?(params[:controller])
+  end
+
+  # Constructs a fully qualified secret URL for a push.
+  #
+  # @param [Push] push - The push to generate a URL for
+  # @param [Boolean] with_retrieval_step - Whether to include the retrieval step in the URL
+  # @return [String] - The fully qualified URL
+  def secret_url(push, with_retrieval_step: true, locale: nil)
+    raw_url = if push.retrieval_step && with_retrieval_step
+      Settings.override_base_url ? Settings.override_base_url + preliminary_push_path(push) : preliminary_push_url(push)
+    else
+      Settings.override_base_url ? Settings.override_base_url + push_path(push) : push_url(push)
+    end
+
+    # Delete any existing ?locale= query parameter
+    raw_url = raw_url.split("?").first
+
+    # Append the locale query parameter
+    if params["push_locale"].present? && Settings.enabled_language_codes.include?(params["push_locale"])
+      raw_url += "?locale=#{params["push_locale"]}"
+    elsif locale.present? && Settings.enabled_language_codes.include?(locale)
+      raw_url += "?locale=#{locale}"
+    end
+
+    # Support forced https links with FORCE_SSL env var
+    raw_url = raw_url.sub(%r{\Ahttp://}i, "https://") if ENV.key?("FORCE_SSL") && !request.ssl?
+    raw_url
+  end
+
+  # qr_code
+  #
+  # Generates a QR code for the given URL
+  #
+  # @param [String] url - The URL to generate the QR code for
+  # @return [String] - The SVG QR code
+  def qr_code(url)
+    svg = RQRCode::QRCode.new(url).as_svg(
+      offset: 0,
+      color: :currentColor,
+      shape_rendering: "crispEdges",
+      module_size: 6,
+      standalone: true
+    )
+    # Strip XML declaration so the SVG is valid when embedded in HTML.
+    svg.sub(/\A<\?xml[^>]*\?>\s*/, "").html_safe
+  end
+
+  # Renders custom CSS from database as a style tag
+  # Returns nil if no custom CSS is set
+  def custom_css_style_tag
+    css = SiteSetting.custom_css
+    return if css.blank?
+
+    tag.style(css.html_safe, data: {turbo_track: "reload"})
+  end
+
+  def pwgen_default_language
+    locale = I18n.locale.to_s.split(/[-_]/).first
+    return locale if Pwpush::Generator::LANGUAGES.include?(locale)
+
+    Settings.gen.language
+  end
+
+  def pwgen_wordlist_sizes
+    Pwpush::Generator::LANGUAGES.index_with { |language| Pwpush::Generator::Wordlists.size_for(language) }
+  end
+end

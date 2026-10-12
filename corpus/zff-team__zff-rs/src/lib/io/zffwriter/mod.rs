@@ -1,0 +1,1500 @@
+//! Module for writing zff containers.
+//!
+//! This module provides the `ZffWriter` type for creating and extending zff containers.
+//! It supports writing physical, logical, and virtual objects with various options
+//! including compression, encryption, and deduplication.
+//!
+//! Features include streaming write operations, automatic segmentation for large containers,
+//! support for multiple objects per container, and configurable compression and encryption.
+
+// - STD
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::ops::{Add, AddAssign};
+use std::path::PathBuf;
+
+// - internal
+use super::{ZffCreationParameters, ZffExtenderParameter};
+use crate::prelude::*;
+use crate::{
+    EncodingState, ObjectEncoder, PreparedData, Segment, file_extension_next_value,
+    io::{
+        prepare_object_header, setup_logical_object_encoder, setup_physical_object_encoder,
+        setup_virtual_object_encoder,
+    },
+};
+
+#[derive(Debug, Clone, Default)]
+enum ReadBytes {
+    Read(u64),
+    #[default]
+    NotRead,
+    Finished,
+}
+
+#[derive(Debug, Clone, Default)]
+enum ReadState {
+    #[default]
+    SegmentHeader,
+    ObjectHeader,
+    Chunking,
+    ChunkHeaderMap,
+    ChunkSamebytesMap,
+    ChunkDeduplicationMap,
+    LastChunkHeaderMapOfObject,
+    LastChunkSamebytesMapOfObject,
+    LastChunkDeduplicationMapOfObject,
+    ObjectFooter,
+    SegmentFooter,
+    MainFooter,
+}
+
+#[derive(Debug, Clone, Default)]
+enum PreparedDataQueueState {
+    SameBytes,
+    Deduplication,
+    Data,
+    #[default]
+    None,
+}
+
+#[derive(Debug, Clone)]
+enum SegmentationInnerState {
+    Full(u64),                // current segment number | The current segment is full
+    Partial(u64),             // current segment number | The current segment is not full yet
+    Finished(u64), // current segment number  | The current segment is finished (you should switch to the next segment)
+    FullLastSegment(u64), // the last segment is full
+    FinishedLastSegment(u64), // the last segment is finished
+}
+
+/// The current segmentation state, returned by the `next_segment` method.
+///
+/// This enum indicates the progress of segmentation when writing data to a zff container.
+pub enum SegmentationState {
+    /// The segmentation is currently unfinished and the read progress can be proceeded.
+    SegmentNotFinished,
+    /// The segmentation is finished and the next segment file should be used.
+    SegmentFinished,
+    /// The last segment is finished.
+    LastSegmentFinished,
+}
+
+impl Default for SegmentationInnerState {
+    fn default() -> Self {
+        SegmentationInnerState::Partial(INITIAL_SEGMENT_NUMBER)
+    }
+}
+
+// - external
+#[cfg(feature = "log")]
+use log::trace;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd)]
+struct BytesRead {
+    pub total: u64,           // the number of bytes read from this streamer,
+    pub current_segment: u64, // the number of bytes read from the current segment,
+}
+
+impl BytesRead {
+    fn clean(&mut self) {
+        self.current_segment = 0;
+    }
+}
+
+impl Add<u64> for BytesRead {
+    type Output = Self;
+
+    fn add(self, other: u64) -> Self {
+        Self {
+            total: self.total + other,
+            current_segment: self.current_segment + other,
+        }
+    }
+}
+
+impl AddAssign<u64> for BytesRead {
+    fn add_assign(&mut self, other: u64) {
+        self.total += other;
+        self.current_segment += other;
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ZffWriterInProgressData {
+    bytes_read: BytesRead,
+    /// Payload bytes written into the current segment. A segment is only closed
+    /// once this is non-zero, so that a target segment size too small to hold a
+    /// single chunk cannot produce an endless run of empty segments.
+    payload_bytes_in_current_segment: u64,
+    encoded_segment_header: Vec<u8>, // the encoded segment header,
+    encoded_segment_header_read_bytes: ReadBytes, // the number of bytes read from the encoded segment header,
+    segment_footer: SegmentFooter,                // the segment footer,
+    current_encoded_segment_footer: Vec<u8>,      // the current encoded segment footer,
+    current_encoded_segment_footer_read_bytes: ReadBytes, // the number of bytes read from the current encoded segment footer,
+    current_encoded_object_header: Vec<u8>, // the encoded object header of the current object,
+    current_encoded_object_header_read_bytes: ReadBytes, // the number of bytes read from the encoded object header of the current object,
+    chunkmaps: ChunkMaps,                                // The current chunkmaps,
+    current_encoded_chunk_header_map: Vec<u8>,           // the current encoded chunk offset map,
+    current_encoded_chunk_header_map_read_bytes: ReadBytes, // the number of bytes read from the current encoded chunk offset map,
+    current_encoded_chunk_samebytes_map: Vec<u8>, // the current encoded chunk samebytes map,
+    current_encoded_chunk_samebytes_map_read_bytes: ReadBytes, // the number of bytes read from the current encoded chunk samebytes map,
+    current_encoded_chunk_deduplication_map: Vec<u8>, // the current encoded chunk deduplication map,
+    current_encoded_chunk_deduplication_map_read_bytes: ReadBytes, // the number of bytes read from the current encoded chunk deduplication map,
+    current_prepared_data_queue: Option<PreparedData>, // the current prepared data in queue,
+    current_prepared_data_queue_state: PreparedDataQueueState, // the current state of the prepared data queue,
+    current_encoded_chunked_data: Vec<u8>,                     // the current encoded chunked data,
+    current_encoded_chunked_data_read_bytes: ReadBytes, // the number of bytes read from the current encoded chunked data,
+    current_encoded_object_footer: Vec<u8>,             // the current encoded object footer,
+    current_encoded_object_footer_read_bytes: ReadBytes, // the number of bytes read from the current encoded object footer,
+    main_footer: MainFooter,                             // the main footer,
+    encoded_main_footer: Vec<u8>,                        // the encoded main footer,
+    encoded_main_footer_read_bytes: ReadBytes, // the number of bytes read from the encoded main footer,
+}
+
+impl ZffWriterInProgressData {
+    fn new() -> Self {
+        Self {
+            current_encoded_chunk_header_map_read_bytes: ReadBytes::Finished,
+            ..Default::default()
+        }
+    }
+}
+
+/// Defines the output mode for a [ZffWriter].
+///
+/// This enum determines whether the [ZffWriter] will create a new container,
+/// extend an existing one, or stream the data.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub enum ZffFilesOutput {
+    #[default]
+    /// Stream the data via the implemented Read trait.
+    Stream,
+    /// Build a new container by using the appropriate path prefix.
+    /// For example, if "/home/user/zff_container" is given, "/home/user/zff_container.z01", ".z02", etc. will be used.
+    NewContainer(PathBuf),
+    /// Extend an existing zff container by adding to the given segment files.
+    ExtendContainer(Vec<PathBuf>),
+}
+
+/// ZffWriter is a struct that is used to create a new zff container while using the appropriate Read implementation of this struct.
+///
+/// ZffWriter only supports to create a new zff container in a single segment.
+/// Main writer type for zff containers.
+///
+/// The `ZffWriter` provides functionality to create and write data to zff containers.
+/// It supports writing physical, logical, and virtual objects with various options
+/// including compression, encryption, and deduplication.
+///
+/// # Type Parameters
+///
+/// - `R`: The type of reader for source data (must implement [`Read`])
+/// - `C`: The type of reader for chunk data (must implement [`ReadAt`] for random access)
+///
+/// # Examples
+///
+/// ```ignore
+/// use zff::io::zffwriter::{ZffWriter, ZffFilesOutput};
+/// use zff::io::ZffCreationParameters;
+/// use std::io::Read;
+/// use std::fs::File;
+/// use std::collections::HashMap;
+/// use std::path::PathBuf;
+///
+/// // Create a writer for a new container
+/// let write = ZffWriter::new(
+///     HashMap::new(),
+///     HashMap::new(),
+///     HashMap::new(),
+///     vec![],
+///     ZffCreationParameters::default(),
+///     ZffFilesOutput::NewContainer(PathBuf::from("output.zff"))
+/// ).unwrap();
+/// ```
+pub struct ZffWriter<R: Read, C: ReadAt> {
+    object_encoder: Vec<ObjectEncoder<R>>,
+    current_object_encoder: ObjectEncoder<R>, //the current object encoder
+    /// The field target_segment_size will be ignored.
+    optional_parameters: ZffCreationParameters<C>,
+    in_progress_data: ZffWriterInProgressData,
+    read_state: ReadState,
+    segmentation_state: SegmentationInnerState,
+    output: ZffFilesOutput,
+}
+
+impl<R: Read, C: ReadAt> ZffWriter<R, C> {
+    /// Returns a new ZffWriter with the given values.
+    pub fn new(
+        physical_objects: HashMap<ObjectHeader, R>, // <ObjectHeader, input_data stream>
+        logical_objects: HashMap<ObjectHeader, Box<dyn LogicalObjectSource>>, //<ObjectHeader, input_files>
+        virtual_obects: HashMap<ObjectHeader, Box<dyn VirtualObjectSource>>,
+        hash_types: Vec<HashType>,
+        params: ZffCreationParameters<C>,
+        output: ZffFilesOutput,
+    ) -> Result<Self> {
+        setup_container(
+            physical_objects,
+            logical_objects,
+            virtual_obects,
+            hash_types,
+            params,
+            output,
+        )
+    }
+
+    /// Returns the current chunk number.
+    pub fn current_chunk_number(&self) -> u64 {
+        self.current_object_encoder.current_chunk_number()
+    }
+
+    /// Returns the number of left files of the inner logical object (if the given object number refers to a logical object).
+    pub fn files_left(&self, object_number: u64) -> Option<u64> {
+        if self.current_object_encoder.obj_number() == object_number {
+            return self.current_object_encoder.files_left();
+        }
+        for obj_encoder in &self.object_encoder {
+            if obj_encoder.obj_number() == object_number {
+                return obj_encoder.files_left();
+            }
+        }
+        None
+    }
+
+    /// Returns the number of left files of the current object encoder.
+    pub fn files_left_current(&self) -> Option<u64> {
+        self.current_object_encoder.files_left()
+    }
+
+    /// Returns the number of left files of all inner logical objects.
+    pub fn files_left_total(&self) -> u64 {
+        let mut total_files = self.current_object_encoder.files_left().unwrap_or(0);
+        for obj_encoder in &self.object_encoder {
+            total_files += obj_encoder.files_left().unwrap_or(0);
+        }
+        total_files
+    }
+
+    /// Returns a reference to the outputfile of the encoder.
+    pub fn output_path(&self) -> Option<PathBuf> {
+        match &self.output {
+            ZffFilesOutput::Stream => None,
+            ZffFilesOutput::NewContainer(path) => Some(path.clone()),
+            ZffFilesOutput::ExtendContainer(path_vec) => path_vec.first().cloned(),
+        }
+    }
+
+    /// sets the next segment.
+    pub fn next_segment(&mut self) -> SegmentationState {
+        // check if the current segment is already finished
+        match self.segmentation_state {
+            SegmentationInnerState::Partial(_) => SegmentationState::SegmentNotFinished,
+            SegmentationInnerState::Full(_) => SegmentationState::SegmentNotFinished,
+            SegmentationInnerState::Finished(segment_number) => {
+                self.segmentation_state = SegmentationInnerState::Partial(segment_number + 1);
+                self.read_state = ReadState::SegmentHeader;
+                self.in_progress_data.encoded_segment_header_read_bytes = ReadBytes::NotRead;
+                self.in_progress_data.encoded_segment_header = SegmentHeader::new(
+                    self.optional_parameters.unique_identifier,
+                    segment_number + 1,
+                    self.optional_parameters
+                        .chunkmap_size
+                        .unwrap_or(DEFAULT_CHUNKMAP_SIZE),
+                )
+                .encode_directly();
+                self.in_progress_data.segment_footer = SegmentFooter::default();
+                self.in_progress_data.segment_footer.first_chunk_number =
+                    self.current_object_encoder.current_chunk_number();
+                self.in_progress_data.bytes_read.clean();
+                self.in_progress_data.payload_bytes_in_current_segment = 0;
+                SegmentationState::SegmentFinished
+            }
+            SegmentationInnerState::FullLastSegment(_) => SegmentationState::SegmentNotFinished,
+            SegmentationInnerState::FinishedLastSegment(_) => {
+                SegmentationState::LastSegmentFinished
+            }
+        }
+    }
+
+    /// Generates the files for the current state of the ZFF container.
+    /// Returns a Vec of generated file paths.
+    pub fn generate_files(&mut self) -> Result<Vec<PathBuf>> {
+        let mut generated_files = Vec::new();
+        let mut file_extension = String::from(FILE_EXTENSION_INITIALIZER);
+        let mut initial_extend = match &self.output {
+            ZffFilesOutput::Stream => {
+                return Err(ZffError::new(
+                    ZffErrorKind::Invalid,
+                    ERROR_ZFFWRITER_GENERATE_FILES_STREAM,
+                ));
+            }
+            ZffFilesOutput::NewContainer(_) => false,
+            ZffFilesOutput::ExtendContainer(_) => true,
+        };
+
+        loop {
+            file_extension = file_extension_next_value(&file_extension)?;
+            let mut segment_filename = match &self.output {
+                // Rejected at the top of this method.
+                ZffFilesOutput::Stream => {
+                    return Err(unexpected_internal_state("generate_files: stream output"));
+                }
+                ZffFilesOutput::NewContainer(path) => path.clone(),
+                ZffFilesOutput::ExtendContainer(path_vec) => path_vec[0].clone(), // should never get out of bound when fn setup_container was used before.
+            };
+
+            let mut output_file = match initial_extend {
+                false => {
+                    segment_filename.set_extension(&file_extension);
+                    File::create(&segment_filename)?
+                }
+                true => {
+                    // this is only necessary to extend the existing file.
+                    initial_extend = false;
+                    // Prepare the appropriate file to write to.
+                    let mut file = OpenOptions::new()
+                        .append(true)
+                        .read(true)
+                        .open(&segment_filename)?;
+                    file.seek(SeekFrom::End(0))?;
+                    file
+                }
+            };
+
+            // Record the path only once the final file name is known: the
+            // extension is applied above, so pushing earlier would return paths
+            // that do not name the files this method actually writes.
+            generated_files.push(segment_filename.clone());
+
+            let mut buffer = vec![0u8; DEFAULT_BUFFER_SIZE];
+
+            loop {
+                match self.read(&mut buffer) {
+                    Ok(0) => {
+                        break;
+                    }
+                    Ok(n) => output_file.write_all(&buffer[..n])?,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            match self.next_segment() {
+                SegmentationState::LastSegmentFinished => return Ok(generated_files),
+                SegmentationState::SegmentNotFinished => {
+                    return Err(unexpected_internal_state(
+                        "generate_files: segment not finished after a full read",
+                    ));
+                }
+                SegmentationState::SegmentFinished => (),
+            };
+        }
+    }
+
+    /// Returns true if the chunkmap was full and flushed.
+    fn check_chunkmap_is_full_and_flush(&mut self, chunk_map_type: ChunkMapType) -> Result<bool> {
+        match chunk_map_type {
+            ChunkMapType::HeaderMap => {
+                if self.in_progress_data.chunkmaps.header_map.is_full() {
+                    self.flush_chunkmap(chunk_map_type)?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            ChunkMapType::SamebytesMap => {
+                if self.in_progress_data.chunkmaps.same_bytes_map.is_full() {
+                    self.flush_chunkmap(chunk_map_type)?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            ChunkMapType::DeduplicationMap => {
+                if self.in_progress_data.chunkmaps.duplicate_chunks.is_full() {
+                    self.flush_chunkmap(chunk_map_type)?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    /// checks if the appropriate object has an encryption header and encrypts the chunkmap if necessary.
+    fn encode_chunkmap<M>(&self, chunkmap: &M, last_chunk_no: u64) -> Result<Vec<u8>>
+    where
+        M: ChunkMap + HeaderCoding,
+    {
+        if let Some(encryption_header) = &self
+            .current_object_encoder
+            .get_obj_header()
+            .encryption_header
+        {
+            // The key is present whenever the object is being written encrypted;
+            // report its absence rather than aborting a running acquisition.
+            let key = encryption_header.get_encryption_key_ref().ok_or_else(|| {
+                ZffError::new(
+                    ZffErrorKind::EncryptionError,
+                    ERROR_MISSING_ENCRYPTION_HEADER_KEY,
+                )
+            })?;
+            let algorithm = &encryption_header.algorithm;
+            Ok(chunkmap.encrypt_encoded_map(key, algorithm, last_chunk_no)?)
+        } else {
+            Ok(chunkmap.encode_directly())
+        }
+    }
+
+    /// Returns an upper bound of the bytes that closing the current segment will
+    /// still append to it: the three chunkmaps that have to be flushed, plus the
+    /// segment footer including the table entries those flushes add to it.
+    fn closing_overhead(&self) -> u64 {
+        let chunkmaps = &self.in_progress_data.chunkmaps;
+        let mut overhead = 0;
+        for map_size in [
+            chunkmaps.header_map.current_size(),
+            chunkmaps.same_bytes_map.current_size(),
+            chunkmaps.duplicate_chunks.current_size(),
+        ] {
+            // An empty map is not written at all.
+            if map_size > 0 {
+                overhead += map_size as u64 + CHUNKMAP_ENCODING_OVERHEAD;
+            }
+        }
+        overhead
+            + self.in_progress_data.segment_footer.encoded_size() as u64
+            + SEGMENT_FOOTER_CLOSING_GROWTH
+    }
+
+    /// Returns an upper bound of the bytes one more chunk would add to the
+    /// current segment.
+    ///
+    /// The largest chunk size of any object still to be written is used, because
+    /// the next chunk may already belong to the next object.
+    fn next_chunk_allowance(&self) -> u64 {
+        let largest_chunk_size = self
+            .object_encoder
+            .iter()
+            .map(|encoder| encoder.get_obj_header().chunk_size)
+            .chain(std::iter::once(
+                self.current_object_encoder.get_obj_header().chunk_size,
+            ))
+            .max()
+            .unwrap_or_default();
+        largest_chunk_size + CHUNK_SEGMENT_OVERHEAD
+    }
+
+    /// Returns true if the current segment has to be closed before another chunk
+    /// is written, so that the finished segment stays within the configured
+    /// target segment size.
+    ///
+    /// A segment always holds at least one chunk. If the target is too small to
+    /// hold a single chunk plus the segment metadata, it cannot be honoured and
+    /// the segment will be larger than requested.
+    fn segment_is_full(&self) -> bool {
+        let Some(target_segment_size) = self.optional_parameters.target_segment_size else {
+            return false;
+        };
+        // Never close a segment that has not received any payload yet: the
+        // segment header alone can already exceed a very small target, and
+        // closing here would make no progress at all.
+        if self.in_progress_data.payload_bytes_in_current_segment == 0 {
+            return false;
+        }
+        self.in_progress_data.bytes_read.current_segment
+            + self.closing_overhead()
+            + self.next_chunk_allowance()
+            > target_segment_size
+    }
+
+    /// flushes the current chunkmap.
+    fn flush_chunkmap(&mut self, chunk_map_type: ChunkMapType) -> Result<()> {
+        let segment_number = self.current_segment_no();
+
+        #[cfg(feature = "log")]
+        trace!(
+            "Flush chunkmap {chunk_map_type} in segment {segment_number} at offset {}",
+            self.in_progress_data.bytes_read.current_segment
+        );
+
+        match chunk_map_type {
+            ChunkMapType::HeaderMap => {
+                if let Some(chunk_no) = self
+                    .in_progress_data
+                    .chunkmaps
+                    .header_map
+                    .chunkmap()
+                    .keys()
+                    .max()
+                {
+                    self.in_progress_data
+                        .main_footer
+                        .chunk_header_maps
+                        .insert(*chunk_no, segment_number);
+                    self.in_progress_data
+                        .segment_footer
+                        .chunk_header_map_table
+                        .insert(*chunk_no, self.in_progress_data.bytes_read.current_segment);
+                    self.in_progress_data.current_encoded_chunk_header_map = self
+                        .encode_chunkmap(&self.in_progress_data.chunkmaps.header_map, *chunk_no)?;
+                    self.in_progress_data
+                        .current_encoded_chunk_header_map_read_bytes = ReadBytes::NotRead;
+                    self.in_progress_data.chunkmaps.header_map.flush();
+                }
+            }
+            ChunkMapType::SamebytesMap => {
+                if let Some(chunk_no) = self
+                    .in_progress_data
+                    .chunkmaps
+                    .same_bytes_map
+                    .chunkmap()
+                    .keys()
+                    .max()
+                {
+                    self.in_progress_data
+                        .main_footer
+                        .chunk_samebytes_maps
+                        .insert(*chunk_no, segment_number);
+                    self.in_progress_data
+                        .segment_footer
+                        .chunk_samebytes_map_table
+                        .insert(*chunk_no, self.in_progress_data.bytes_read.current_segment);
+                    self.in_progress_data.current_encoded_chunk_samebytes_map = self
+                        .encode_chunkmap(
+                            &self.in_progress_data.chunkmaps.same_bytes_map,
+                            *chunk_no,
+                        )?;
+                    self.in_progress_data
+                        .current_encoded_chunk_samebytes_map_read_bytes = ReadBytes::NotRead;
+                    self.in_progress_data.chunkmaps.same_bytes_map.flush();
+                }
+            }
+            ChunkMapType::DeduplicationMap => {
+                if let Some(chunk_no) = self
+                    .in_progress_data
+                    .chunkmaps
+                    .duplicate_chunks
+                    .chunkmap()
+                    .keys()
+                    .max()
+                {
+                    self.in_progress_data
+                        .main_footer
+                        .chunk_dedup_maps
+                        .insert(*chunk_no, segment_number);
+                    self.in_progress_data
+                        .segment_footer
+                        .chunk_dedup_map_table
+                        .insert(*chunk_no, self.in_progress_data.bytes_read.current_segment);
+                    self.in_progress_data
+                        .current_encoded_chunk_deduplication_map = self.encode_chunkmap(
+                        &self.in_progress_data.chunkmaps.duplicate_chunks,
+                        *chunk_no,
+                    )?;
+                    self.in_progress_data
+                        .current_encoded_chunk_deduplication_map_read_bytes = ReadBytes::NotRead;
+                    self.in_progress_data.chunkmaps.duplicate_chunks.flush();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn current_segment_no(&self) -> u64 {
+        match self.segmentation_state {
+            SegmentationInnerState::Partial(segment_number) => segment_number,
+            SegmentationInnerState::Full(segment_number) => segment_number,
+            SegmentationInnerState::Finished(segment_number) => segment_number,
+            SegmentationInnerState::FullLastSegment(segment_number) => segment_number,
+            SegmentationInnerState::FinishedLastSegment(segment_number) => segment_number,
+        }
+    }
+}
+
+/// Builds the error used when the writer observes a state combination that the
+/// segmentation state machine is not supposed to produce.
+///
+/// These conditions are unreachable as long as the state machine is correct.
+/// They are reported as errors rather than panics so that a bug cannot abort a
+/// running acquisition and leave a partially written container behind: the
+/// caller gets a chance to fail cleanly and to clean up.
+fn unexpected_internal_state(context: &str) -> ZffError {
+    ZffError::new(
+        ZffErrorKind::Invalid,
+        format!("{ERROR_ZFFWRITER_UNEXPECTED_INTERNAL_STATE}{context}"),
+    )
+}
+
+impl<R: Read, C: ReadAt> Read for ZffWriter<R, C> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut bytes_written_to_buffer = 0; // the number of bytes which are written to the current buffer,
+
+        // may improve performance in different cases.
+        let buf_len = buf.len();
+
+        'read_loop: loop {
+            match self.segmentation_state {
+                SegmentationInnerState::Finished(_) => {
+                    return Ok(bytes_written_to_buffer);
+                }
+                SegmentationInnerState::FinishedLastSegment(_) => {
+                    return Ok(bytes_written_to_buffer);
+                }
+                _ => {}
+            }
+
+            match self.read_state {
+                ReadState::SegmentHeader => {
+                    #[cfg(feature = "log")]
+                    trace!("ReadState::SegmentHeader");
+                    // reads the segment header if not already read
+                    // this is the initial state.
+                    let read_bytes = fill_buffer(
+                        &self.in_progress_data.encoded_segment_header,
+                        &mut self.in_progress_data.encoded_segment_header_read_bytes,
+                        buf,
+                        &mut bytes_written_to_buffer,
+                    )?;
+                    self.in_progress_data.bytes_read += read_bytes as u64;
+                    if bytes_written_to_buffer >= buf_len {
+                        return Ok(bytes_written_to_buffer);
+                    };
+
+                    // switch to the next state
+                    match self
+                        .in_progress_data
+                        .current_encoded_object_header_read_bytes
+                    {
+                        ReadBytes::Finished => {
+                            self.read_state = ReadState::Chunking;
+                        }
+                        _ => {
+                            self.read_state = ReadState::ObjectHeader;
+                            self.in_progress_data.main_footer.object_header.insert(
+                                self.current_object_encoder.obj_number(),
+                                self.current_segment_no(),
+                            );
+                            // prepare the current object header
+                            self.in_progress_data.current_encoded_object_header = self
+                                .current_object_encoder
+                                .get_encoded_header()
+                                .map_err(std::io::Error::other)?;
+                            self.in_progress_data
+                                .segment_footer
+                                .object_header_offsets
+                                .insert(
+                                    self.current_object_encoder.obj_number(),
+                                    self.in_progress_data.bytes_read.current_segment,
+                                );
+                        }
+                    }
+                }
+                ReadState::ObjectHeader => {
+                    #[cfg(feature = "log")]
+                    trace!("ReadState::ObjectHeader");
+                    // reads the current object header if not already read
+                    let read_bytes = fill_buffer(
+                        &self.in_progress_data.current_encoded_object_header,
+                        &mut self
+                            .in_progress_data
+                            .current_encoded_object_header_read_bytes,
+                        buf,
+                        &mut bytes_written_to_buffer,
+                    )?;
+                    self.in_progress_data.bytes_read += read_bytes as u64;
+                    if bytes_written_to_buffer >= buf_len {
+                        return Ok(bytes_written_to_buffer);
+                    };
+
+                    // switch to the next state
+                    self.read_state = ReadState::ChunkHeaderMap;
+                }
+                ReadState::ChunkHeaderMap => {
+                    #[cfg(feature = "log")]
+                    trace!("ReadState::ChunkOffsetMap");
+                    // reads the chunkmap if not already read
+                    let read_bytes = fill_buffer(
+                        &self.in_progress_data.current_encoded_chunk_header_map,
+                        &mut self
+                            .in_progress_data
+                            .current_encoded_chunk_header_map_read_bytes,
+                        buf,
+                        &mut bytes_written_to_buffer,
+                    )?;
+                    self.in_progress_data.bytes_read += read_bytes as u64;
+                    if bytes_written_to_buffer >= buf_len {
+                        return Ok(bytes_written_to_buffer);
+                    };
+
+                    // switch to the next state
+                    match self.segmentation_state {
+                        SegmentationInnerState::Partial(_) => self.read_state = ReadState::Chunking,
+                        SegmentationInnerState::Full(_) => {
+                            self.read_state = ReadState::ChunkSamebytesMap;
+                            self.flush_chunkmap(ChunkMapType::SamebytesMap)?;
+                        }
+                        SegmentationInnerState::Finished(_)
+                        | SegmentationInnerState::FullLastSegment(_)
+                        | SegmentationInnerState::FinishedLastSegment(_) => {
+                            return Err(
+                                unexpected_internal_state("ReadState::ChunkHeaderMap").into()
+                            );
+                        }
+                    };
+                }
+
+                ReadState::ChunkSamebytesMap => {
+                    #[cfg(feature = "log")]
+                    trace!("ReadState::ChunkSamebytesMap");
+                    // reads the chunkmap if not already read
+                    let read_bytes = fill_buffer(
+                        &self.in_progress_data.current_encoded_chunk_samebytes_map,
+                        &mut self
+                            .in_progress_data
+                            .current_encoded_chunk_samebytes_map_read_bytes,
+                        buf,
+                        &mut bytes_written_to_buffer,
+                    )?;
+                    self.in_progress_data.bytes_read += read_bytes as u64;
+                    if bytes_written_to_buffer >= buf_len {
+                        return Ok(bytes_written_to_buffer);
+                    };
+                    // switch to the next state
+                    match self.segmentation_state {
+                        SegmentationInnerState::Partial(_) => self.read_state = ReadState::Chunking,
+                        SegmentationInnerState::Full(_) => {
+                            self.read_state = ReadState::ChunkDeduplicationMap;
+                            self.flush_chunkmap(ChunkMapType::DeduplicationMap)?;
+                        }
+                        SegmentationInnerState::Finished(_)
+                        | SegmentationInnerState::FullLastSegment(_)
+                        | SegmentationInnerState::FinishedLastSegment(_) => {
+                            return Err(
+                                unexpected_internal_state("ReadState::ChunkSamebytesMap").into()
+                            );
+                        }
+                    };
+                }
+
+                ReadState::ChunkDeduplicationMap => {
+                    #[cfg(feature = "log")]
+                    trace!("ReadState::ChunkDeduplicationMap");
+                    // reads the chunkmap if not already read
+                    let read_bytes = fill_buffer(
+                        &self
+                            .in_progress_data
+                            .current_encoded_chunk_deduplication_map,
+                        &mut self
+                            .in_progress_data
+                            .current_encoded_chunk_deduplication_map_read_bytes,
+                        buf,
+                        &mut bytes_written_to_buffer,
+                    )?;
+                    self.in_progress_data.bytes_read += read_bytes as u64;
+                    if bytes_written_to_buffer >= buf_len {
+                        return Ok(bytes_written_to_buffer);
+                    };
+
+                    // switch to the next state
+                    match self.segmentation_state {
+                        SegmentationInnerState::Partial(_) => self.read_state = ReadState::Chunking,
+                        SegmentationInnerState::Full(_) => {
+                            self.read_state = ReadState::SegmentFooter
+                        }
+                        SegmentationInnerState::Finished(_)
+                        | SegmentationInnerState::FullLastSegment(_)
+                        | SegmentationInnerState::FinishedLastSegment(_) => {
+                            return Err(unexpected_internal_state(
+                                "ReadState::ChunkDeduplicationMap",
+                            )
+                            .into());
+                        }
+                    };
+
+                    if let ReadState::SegmentFooter = self.read_state {
+                        self.in_progress_data.segment_footer.footer_offset =
+                            self.in_progress_data.bytes_read.current_segment;
+
+                        self.in_progress_data.segment_footer.length_of_segment =
+                            self.in_progress_data.bytes_read.current_segment
+                                + self.in_progress_data.segment_footer.header_size() as u64;
+
+                        self.in_progress_data.current_encoded_segment_footer =
+                            self.in_progress_data.segment_footer.encode_directly();
+                        self.in_progress_data
+                            .current_encoded_segment_footer_read_bytes = ReadBytes::NotRead;
+                    }
+                }
+
+                ReadState::LastChunkHeaderMapOfObject => {
+                    #[cfg(feature = "log")]
+                    trace!("ReadState::LastChunkOffsetMapOfObject");
+                    // reads the chunkmap if not already read
+                    let read_bytes = fill_buffer(
+                        &self.in_progress_data.current_encoded_chunk_header_map,
+                        &mut self
+                            .in_progress_data
+                            .current_encoded_chunk_header_map_read_bytes,
+                        buf,
+                        &mut bytes_written_to_buffer,
+                    )?;
+                    self.in_progress_data.bytes_read += read_bytes as u64;
+                    if bytes_written_to_buffer >= buf_len {
+                        return Ok(bytes_written_to_buffer);
+                    };
+
+                    // prepare and switch to the next state
+                    // write the chunk samebytes map even there is some space left in map to ensure
+                    // that this map will be written if there is no next object.
+                    self.flush_chunkmap(ChunkMapType::SamebytesMap)?;
+                    self.read_state = ReadState::LastChunkSamebytesMapOfObject;
+                }
+
+                ReadState::LastChunkSamebytesMapOfObject => {
+                    #[cfg(feature = "log")]
+                    trace!("ReadState::LastChunkSamebytesMapOfObject");
+                    // reads the chunkmap if not already read
+                    let read_bytes = fill_buffer(
+                        &self.in_progress_data.current_encoded_chunk_samebytes_map,
+                        &mut self
+                            .in_progress_data
+                            .current_encoded_chunk_samebytes_map_read_bytes,
+                        buf,
+                        &mut bytes_written_to_buffer,
+                    )?;
+                    self.in_progress_data.bytes_read += read_bytes as u64;
+                    if bytes_written_to_buffer >= buf_len {
+                        return Ok(bytes_written_to_buffer);
+                    };
+
+                    // prepare and switch to the next state
+                    // write the chunk deduplication map even there is some space left in map to ensure
+                    // that this map will be written if there is no next object.
+                    self.flush_chunkmap(ChunkMapType::DeduplicationMap)?;
+                    self.read_state = ReadState::LastChunkDeduplicationMapOfObject;
+                }
+
+                ReadState::LastChunkDeduplicationMapOfObject => {
+                    #[cfg(feature = "log")]
+                    trace!("ReadState::LastChunkDeduplicationMapOfObject");
+                    // reads the chunkmap if not already read
+                    let read_bytes = fill_buffer(
+                        &self
+                            .in_progress_data
+                            .current_encoded_chunk_deduplication_map,
+                        &mut self
+                            .in_progress_data
+                            .current_encoded_chunk_deduplication_map_read_bytes,
+                        buf,
+                        &mut bytes_written_to_buffer,
+                    )?;
+                    self.in_progress_data.bytes_read += read_bytes as u64;
+                    if bytes_written_to_buffer >= buf_len {
+                        return Ok(bytes_written_to_buffer);
+                    };
+
+                    // prepare and switch to the next state
+                    // this will only fail in case of encryption errrors - which should be happend before
+                    let object_footer = match self.current_object_encoder.get_encoded_footer() {
+                        Ok(obj_footer) => obj_footer,
+                        Err(e) => return Err(std::io::Error::other(e)),
+                    };
+                    self.in_progress_data
+                        .segment_footer
+                        .object_footer_offsets
+                        .insert(
+                            self.current_object_encoder.obj_number(),
+                            self.in_progress_data.bytes_read.current_segment,
+                        );
+                    self.in_progress_data.current_encoded_object_footer = object_footer;
+                    self.in_progress_data
+                        .current_encoded_object_footer_read_bytes = ReadBytes::NotRead;
+                    self.in_progress_data.main_footer.object_footer.insert(
+                        self.current_object_encoder.obj_number(),
+                        self.current_segment_no(),
+                    );
+                    self.read_state = ReadState::ObjectFooter;
+                }
+
+                ReadState::Chunking => {
+                    #[cfg(feature = "log")]
+                    trace!("ReadState::Chunking");
+                    let current_chunk_number = self.current_object_encoder.current_chunk_number();
+
+                    // reads the chunking data
+                    let read_bytes = fill_buffer(
+                        &self.in_progress_data.current_encoded_chunked_data,
+                        &mut self
+                            .in_progress_data
+                            .current_encoded_chunked_data_read_bytes,
+                        buf,
+                        &mut bytes_written_to_buffer,
+                    )?;
+                    self.in_progress_data.bytes_read += read_bytes as u64;
+                    self.in_progress_data.payload_bytes_in_current_segment += read_bytes as u64;
+                    if bytes_written_to_buffer >= buf_len {
+                        return Ok(bytes_written_to_buffer);
+                    };
+
+                    // Close the segment if one more chunk plus the metadata that
+                    // closing writes would push it past the target segment size.
+                    // The check has to happen before the next chunk is prepared:
+                    // preparing it records its offset in the current segment, so a
+                    // prepared chunk can no longer be moved to the next one.
+                    if self.segment_is_full() {
+                        // set the appropriate segmentation state to full (with the next segment number)
+                        self.segmentation_state = match self.segmentation_state {
+                            SegmentationInnerState::Partial(segment_number) => {
+                                SegmentationInnerState::Full(segment_number)
+                            }
+                            _ => {
+                                return Err(unexpected_internal_state(
+                                    "target segment size reached outside a partial segment",
+                                )
+                                .into());
+                            }
+                        };
+                        // flush the first chunkmap and set the appropriate read state
+                        self.flush_chunkmap(ChunkMapType::HeaderMap)?;
+                        self.read_state = ReadState::ChunkHeaderMap;
+                        continue;
+                    }
+
+                    // check if the chunkmaps are full - this lines are necessary to ensure
+                    // the correct file footer offset is set while e.g. reading a bunch of empty files.
+                    if self.check_chunkmap_is_full_and_flush(ChunkMapType::HeaderMap)? {
+                        self.read_state = ReadState::ChunkHeaderMap;
+                        continue;
+                    };
+
+                    if self.check_chunkmap_is_full_and_flush(ChunkMapType::SamebytesMap)? {
+                        self.read_state = ReadState::ChunkSamebytesMap;
+                        continue;
+                    };
+
+                    if self.check_chunkmap_is_full_and_flush(ChunkMapType::DeduplicationMap)? {
+                        self.read_state = ReadState::ChunkDeduplicationMap;
+                        continue;
+                    };
+                    // handles the prepared data queue
+                    loop {
+                        match self.in_progress_data.current_prepared_data_queue_state {
+                            PreparedDataQueueState::None => {
+                                // read next chunk
+                                let data = match self.current_object_encoder.get_next_data(
+                                    self.in_progress_data.bytes_read.current_segment,
+                                    self.current_segment_no(),
+                                    self.optional_parameters.deduplication_metadata.as_mut(),
+                                )? {
+                                    EncodingState::PreparedData(data) => data,
+                                    EncodingState::ReadEOF => {
+                                        // write the chunk offset map even there is some space left in map to ensure
+                                        // that this map will be written if there is no next object.
+                                        self.flush_chunkmap(ChunkMapType::HeaderMap)?;
+                                        self.read_state = ReadState::LastChunkHeaderMapOfObject;
+                                        break;
+                                    }
+                                    EncodingState::PreparedChunk(_) => {
+                                        return Err(unexpected_internal_state(
+                                            "object encoder returned a bare chunk",
+                                        )
+                                        .into());
+                                    }
+                                };
+
+                                match data {
+                                    PreparedData::PreparedChunk(ref prepared_chunk) => {
+                                        // sets the appropriate offset in chunk header.
+                                        let mut chunk_header = prepared_chunk.chunk_header;
+                                        chunk_header.offset =
+                                            self.in_progress_data.bytes_read.current_segment;
+                                        if self.in_progress_data.chunkmaps.header_map.is_full() {
+                                            self.flush_chunkmap(ChunkMapType::HeaderMap)?;
+                                        };
+                                        self.in_progress_data
+                                            .chunkmaps
+                                            .header_map
+                                            .add_chunk_entry(current_chunk_number, chunk_header);
+                                        self.in_progress_data.current_prepared_data_queue_state =
+                                            PreparedDataQueueState::SameBytes;
+                                    }
+                                    _ => {
+                                        self.in_progress_data.current_prepared_data_queue_state =
+                                            PreparedDataQueueState::Data;
+                                    }
+                                }
+                                self.in_progress_data.current_prepared_data_queue = Some(data);
+                            }
+                            PreparedDataQueueState::SameBytes => {
+                                let samebytes =
+                                    match &self.in_progress_data.current_prepared_data_queue {
+                                        Some(PreparedData::PreparedChunk(prepared_chunk)) => {
+                                            prepared_chunk.samebytes
+                                        }
+                                        _ => {
+                                            return Err(unexpected_internal_state(
+                                                "PreparedDataQueueState::SameBytes",
+                                            )
+                                            .into());
+                                        }
+                                    };
+                                if let Some(samebytes) = samebytes
+                                    && !self
+                                        .in_progress_data
+                                        .chunkmaps
+                                        .same_bytes_map
+                                        .add_chunk_entry(current_chunk_number, samebytes)
+                                {
+                                    self.flush_chunkmap(ChunkMapType::SamebytesMap)?;
+                                    self.read_state = ReadState::ChunkSamebytesMap;
+                                    self.in_progress_data
+                                        .chunkmaps
+                                        .same_bytes_map
+                                        .add_chunk_entry(current_chunk_number, samebytes);
+                                    continue 'read_loop;
+                                }
+                                self.in_progress_data.current_prepared_data_queue_state =
+                                    PreparedDataQueueState::Deduplication;
+                                continue;
+                            }
+                            PreparedDataQueueState::Deduplication => {
+                                let deduplication =
+                                    match &self.in_progress_data.current_prepared_data_queue {
+                                        Some(PreparedData::PreparedChunk(prepared_chunk)) => {
+                                            prepared_chunk.duplicated
+                                        }
+                                        _ => {
+                                            return Err(unexpected_internal_state(
+                                                "PreparedDataQueueState::Deduplication",
+                                            )
+                                            .into());
+                                        }
+                                    };
+                                if let Some(deduplication) = deduplication
+                                    && !self
+                                        .in_progress_data
+                                        .chunkmaps
+                                        .duplicate_chunks
+                                        .add_chunk_entry(current_chunk_number, deduplication)
+                                {
+                                    self.flush_chunkmap(ChunkMapType::DeduplicationMap)?;
+                                    self.read_state = ReadState::ChunkDeduplicationMap;
+                                    self.in_progress_data
+                                        .chunkmaps
+                                        .duplicate_chunks
+                                        .add_chunk_entry(current_chunk_number, deduplication);
+                                    continue 'read_loop;
+                                }
+                                self.in_progress_data.current_prepared_data_queue_state =
+                                    PreparedDataQueueState::Data;
+                                continue;
+                            }
+                            PreparedDataQueueState::Data => {
+                                let data = match &self.in_progress_data.current_prepared_data_queue
+                                {
+                                    Some(prepared_data) => prepared_data.inner_data_ref(),
+                                    None => {
+                                        return Err(unexpected_internal_state(
+                                            "PreparedDataQueueState::Data without queued data",
+                                        )
+                                        .into());
+                                    }
+                                };
+                                self.in_progress_data.current_encoded_chunked_data = data.to_vec();
+                                self.in_progress_data
+                                    .current_encoded_chunked_data_read_bytes = ReadBytes::NotRead;
+                                self.in_progress_data.current_prepared_data_queue_state =
+                                    PreparedDataQueueState::None;
+                                self.in_progress_data.current_prepared_data_queue = None;
+                                break;
+                            }
+                        }
+                    }
+                }
+                ReadState::ObjectFooter => {
+                    #[cfg(feature = "log")]
+                    trace!("ReadState::ObjectFooter");
+                    // reads the current object footer if not already read
+                    let read_bytes = fill_buffer(
+                        &self.in_progress_data.current_encoded_object_footer,
+                        &mut self
+                            .in_progress_data
+                            .current_encoded_object_footer_read_bytes,
+                        buf,
+                        &mut bytes_written_to_buffer,
+                    )?;
+                    self.in_progress_data.bytes_read += read_bytes as u64;
+                    if bytes_written_to_buffer >= buf_len {
+                        return Ok(bytes_written_to_buffer);
+                    };
+
+                    // switch to the next state
+                    let next_chunk_number = self.current_object_encoder.current_chunk_number();
+                    self.current_object_encoder = match self.object_encoder.pop() {
+                        Some(creator_obj_encoder) => creator_obj_encoder,
+                        None => {
+                            self.in_progress_data.segment_footer.footer_offset =
+                                self.in_progress_data.bytes_read.current_segment;
+
+                            self.in_progress_data.segment_footer.length_of_segment =
+                                self.in_progress_data.bytes_read.current_segment
+                                    + self.in_progress_data.segment_footer.header_size() as u64
+                                    + self.in_progress_data.main_footer.header_size() as u64;
+
+                            self.in_progress_data.current_encoded_segment_footer =
+                                self.in_progress_data.segment_footer.encode_directly();
+                            self.in_progress_data
+                                .current_encoded_segment_footer_read_bytes = ReadBytes::NotRead;
+                            self.segmentation_state =
+                                SegmentationInnerState::FullLastSegment(self.current_segment_no());
+                            self.read_state = ReadState::SegmentFooter;
+                            continue;
+                        }
+                    };
+                    self.current_object_encoder
+                        .set_initial_chunk_number(next_chunk_number);
+                    self.in_progress_data.main_footer.object_header.insert(
+                        self.current_object_encoder.obj_number(),
+                        self.current_segment_no(),
+                    );
+                    self.in_progress_data
+                        .chunkmaps
+                        .set_object_number(self.current_object_encoder.obj_number());
+                    self.read_state = ReadState::ObjectHeader;
+                    self.in_progress_data.current_encoded_object_header = self
+                        .current_object_encoder
+                        .get_encoded_header()
+                        .map_err(std::io::Error::other)?;
+                    self.in_progress_data
+                        .current_encoded_object_header_read_bytes = ReadBytes::NotRead;
+                    self.in_progress_data
+                        .segment_footer
+                        .object_header_offsets
+                        .insert(
+                            self.current_object_encoder.obj_number(),
+                            self.in_progress_data.bytes_read.current_segment,
+                        );
+                }
+                ReadState::SegmentFooter => {
+                    #[cfg(feature = "log")]
+                    trace!("ReadState::SegmentFooter");
+                    // reads the current segment footer if not already read
+                    let read_bytes = fill_buffer(
+                        &self.in_progress_data.current_encoded_segment_footer,
+                        &mut self
+                            .in_progress_data
+                            .current_encoded_segment_footer_read_bytes,
+                        buf,
+                        &mut bytes_written_to_buffer,
+                    )?;
+                    self.in_progress_data.bytes_read += read_bytes as u64;
+                    if bytes_written_to_buffer >= buf_len {
+                        return Ok(bytes_written_to_buffer);
+                    };
+
+                    // switch to the next state
+                    self.in_progress_data.main_footer.footer_offset =
+                        self.in_progress_data.bytes_read.current_segment;
+                    self.in_progress_data.main_footer.number_of_segments =
+                        self.current_segment_no();
+                    self.in_progress_data.encoded_main_footer =
+                        self.in_progress_data.main_footer.encode_directly();
+                    self.in_progress_data.encoded_main_footer_read_bytes = ReadBytes::NotRead;
+
+                    match self.segmentation_state {
+                        SegmentationInnerState::Full(segment_number) => {
+                            self.segmentation_state =
+                                SegmentationInnerState::Finished(segment_number)
+                        }
+                        SegmentationInnerState::FullLastSegment(_) => {
+                            self.read_state = ReadState::MainFooter
+                        }
+                        SegmentationInnerState::Partial(_)
+                        | SegmentationInnerState::Finished(_)
+                        | SegmentationInnerState::FinishedLastSegment(_) => {
+                            return Err(
+                                unexpected_internal_state("ReadState::SegmentFooter").into()
+                            );
+                        }
+                    }
+                }
+                ReadState::MainFooter => {
+                    #[cfg(feature = "log")]
+                    trace!("ReadState::MainFooter");
+                    // reads the main footer if not already read
+                    let read_bytes = fill_buffer(
+                        &self.in_progress_data.encoded_main_footer,
+                        &mut self.in_progress_data.encoded_main_footer_read_bytes,
+                        buf,
+                        &mut bytes_written_to_buffer,
+                    )?;
+                    self.in_progress_data.bytes_read += read_bytes as u64;
+                    if bytes_written_to_buffer < buf_len {
+                        self.segmentation_state =
+                            SegmentationInnerState::FinishedLastSegment(self.current_segment_no());
+                    }
+                    return Ok(bytes_written_to_buffer);
+                }
+            }
+        }
+    }
+}
+
+fn setup_container<R: Read, C: ReadAt>(
+    physical_objects: HashMap<ObjectHeader, R>,
+    logical_objects: HashMap<ObjectHeader, Box<dyn LogicalObjectSource>>,
+    virtual_objects: HashMap<ObjectHeader, Box<dyn VirtualObjectSource>>,
+    hash_types: Vec<HashType>,
+    params: ZffCreationParameters<C>,
+    output: ZffFilesOutput,
+) -> Result<ZffWriter<R, C>> {
+    // The specification requires the chunkmap size of the segment header to be
+    // a multiple of 16. Reject a violating value here instead of writing a
+    // container that other implementations are not required to read.
+    if let Some(chunkmap_size) = params.chunkmap_size
+        && chunkmap_size % CHUNKMAP_SIZE_ALIGNMENT != 0
+    {
+        return Err(ZffError::new(
+            ZffErrorKind::Invalid,
+            format!("{ERROR_INVALID_CHUNKMAP_SIZE}{chunkmap_size}"),
+        ));
+    }
+
+    let mut physical_objects = physical_objects;
+    let mut logical_objects = logical_objects;
+    let mut virtual_objects = virtual_objects;
+
+    let mut total_bytes_read = 0;
+
+    // check if an existing container should be extended or a new container should be created
+    let extender_parameter = match output {
+        ZffFilesOutput::ExtendContainer(ref files_to_extend) => {
+            let mut extension_parameter = None;
+            for ext_file in files_to_extend {
+                let mut raw_segment = File::open(ext_file)?;
+                if let Ok(mf) = decode_main_footer(&mut raw_segment) {
+                    let current_segment = ext_file.to_path_buf();
+
+                    let segment = Segment::new_from_reader(&raw_segment)?;
+                    //self.segmentation_state = SegmentationInnerState::Partial(segment.header().segment_number);
+                    let segment_number = segment.header().segment_number;
+                    let initial_chunk_number =
+                        match segment.footer().chunk_header_map_table.keys().max() {
+                            Some(x) => *x + 1,
+                            None => return Err(ZffError::new(ZffErrorKind::NoDataLeft, "")), // no chunks left
+                        };
+                    let next_object_no = match mf.object_footer.keys().max() {
+                        Some(x) => *x + 1,
+                        None => return Err(ZffError::new(ZffErrorKind::NoDataLeft, "")), // no objects left
+                    };
+                    let segment_footer = segment.footer().clone();
+
+                    extension_parameter = Some(ZffExtenderParameter::new(
+                        current_segment,
+                        next_object_no,
+                        initial_chunk_number,
+                        segment_number,
+                        segment_footer,
+                        mf,
+                    ));
+                    total_bytes_read += raw_segment.seek(SeekFrom::End(0))?;
+                    raw_segment.seek(SeekFrom::Start(0))?;
+                }
+                // try to decode the segment header to check if the file is a valid segment.
+                let _ = Segment::new_from_reader(raw_segment)?;
+            }
+            extension_parameter
+        }
+        _ => None,
+    };
+
+    //initially check if all EncryptionHeader are contain a decrypted encryption key for physical and logical objects.
+    // uses check_encryption_key_in_header for all ObjectHeader in physical_objects and logical_objects:
+    prepare_object_header(
+        &mut physical_objects,
+        &mut logical_objects,
+        &mut virtual_objects,
+        &extender_parameter,
+    )?;
+
+    let signature_key_bytes = &params
+        .signature_key
+        .as_ref()
+        .map(|signing_key| signing_key.to_bytes().to_vec());
+    let mut object_encoder =
+        Vec::with_capacity(physical_objects.len() + logical_objects.len() + virtual_objects.len());
+
+    let initial_chunk_number = if let Some(extender_parameter) = &extender_parameter {
+        extender_parameter.initial_chunk_number
+    } else {
+        INITIAL_CHUNK_NUMBER
+    };
+
+    setup_physical_object_encoder(
+        physical_objects,
+        &hash_types,
+        signature_key_bytes,
+        initial_chunk_number,
+        &mut object_encoder,
+    )?;
+
+    setup_logical_object_encoder(
+        logical_objects,
+        &hash_types,
+        signature_key_bytes,
+        initial_chunk_number,
+        &mut object_encoder,
+    )?;
+
+    setup_virtual_object_encoder(virtual_objects, signature_key_bytes, &mut object_encoder)?;
+
+    object_encoder.reverse();
+    let mut current_object_encoder = match object_encoder.pop() {
+        Some(creator_obj_encoder) => creator_obj_encoder,
+        None => return Err(ZffError::new(ZffErrorKind::NoDataLeft, "")), // no objects left
+    };
+
+    let mut segmentation_state = SegmentationInnerState::default();
+
+    let mut in_progress_data = build_in_progress_data(&params);
+    let mut output = output;
+
+    let read_state = if extender_parameter.is_some() {
+        ReadState::ObjectHeader
+    } else {
+        ReadState::SegmentHeader
+    };
+
+    if let Some(extender_parameter) = extender_parameter {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .read(true)
+            .open(&extender_parameter.current_segment)?;
+        let offset = file.seek(SeekFrom::End(0))?;
+        in_progress_data.bytes_read.current_segment = offset;
+        in_progress_data.current_encoded_object_header =
+            current_object_encoder.get_encoded_header()?;
+        in_progress_data.segment_footer = extender_parameter.segment_footer;
+        in_progress_data
+            .segment_footer
+            .object_header_offsets
+            .insert(
+                current_object_encoder.obj_number(),
+                in_progress_data.bytes_read.current_segment,
+            );
+        segmentation_state = SegmentationInnerState::Partial(extender_parameter.segment_number);
+        in_progress_data.main_footer = extender_parameter.main_footer;
+        output = ZffFilesOutput::ExtendContainer(vec![extender_parameter.current_segment]);
+        in_progress_data.bytes_read.total = total_bytes_read;
+        in_progress_data.encoded_segment_header_read_bytes = ReadBytes::Finished;
+        in_progress_data.main_footer.object_header.insert(
+            current_object_encoder.obj_number(),
+            extender_parameter.segment_number,
+        );
+    }
+
+    in_progress_data
+        .chunkmaps
+        .set_object_number(current_object_encoder.obj_number());
+
+    Ok(ZffWriter {
+        read_state,
+        object_encoder,
+        current_object_encoder,
+        in_progress_data,
+        segmentation_state,
+        optional_parameters: params,
+        output,
+    })
+}
+
+fn build_in_progress_data<C: ReadAt>(params: &ZffCreationParameters<C>) -> ZffWriterInProgressData {
+    let mut in_progress_data = ZffWriterInProgressData::new();
+    in_progress_data.main_footer.description_notes = params.description_notes.clone();
+
+    // setup default chunkmap_size if not set in parameters
+    let chunkmap_size = params.chunkmap_size.unwrap_or(DEFAULT_CHUNKMAP_SIZE);
+
+    // setup the segment header
+    let segment_header = SegmentHeader::new(
+        params.unique_identifier,
+        INITIAL_SEGMENT_NUMBER,
+        chunkmap_size,
+    );
+    let encoded_segment_header = segment_header.encode_directly();
+    in_progress_data.encoded_segment_header = encoded_segment_header;
+
+    // set chunkmaps target size
+    in_progress_data
+        .chunkmaps
+        .header_map
+        .set_target_size(chunkmap_size as usize);
+    in_progress_data
+        .chunkmaps
+        .same_bytes_map
+        .set_target_size(chunkmap_size as usize);
+    in_progress_data
+        .chunkmaps
+        .duplicate_chunks
+        .set_target_size(chunkmap_size as usize);
+
+    in_progress_data
+}
+
+fn fill_buffer(
+    in_progress_data: &[u8],
+    in_progress_data_read_bytes: &mut ReadBytes,
+    buf: &mut [u8],
+    bytes_written_to_buffer: &mut usize,
+) -> std::io::Result<usize> {
+    let mut bytes_read = 0;
+    match in_progress_data_read_bytes {
+        ReadBytes::NotRead => {
+            let data_length = in_progress_data.len();
+            let bytes_to_read = (buf.len() - *bytes_written_to_buffer).min(data_length);
+            buf[*bytes_written_to_buffer..bytes_to_read + *bytes_written_to_buffer]
+                .copy_from_slice(&in_progress_data[..bytes_to_read]);
+            bytes_read = bytes_to_read;
+            *bytes_written_to_buffer += bytes_to_read;
+            *in_progress_data_read_bytes = if bytes_to_read == data_length {
+                ReadBytes::Finished
+            } else {
+                ReadBytes::Read(bytes_to_read as u64)
+            };
+        }
+        ReadBytes::Read(read) => {
+            let data_length = in_progress_data.len();
+            let bytes_to_read =
+                (buf.len() - *bytes_written_to_buffer).min(data_length - *read as usize);
+            buf[*bytes_written_to_buffer..bytes_to_read + *bytes_written_to_buffer]
+                .copy_from_slice(&in_progress_data[*read as usize..*read as usize + bytes_to_read]);
+            bytes_read = bytes_to_read;
+            *bytes_written_to_buffer += bytes_to_read;
+            *in_progress_data_read_bytes = if *read + bytes_to_read as u64 == data_length as u64 {
+                ReadBytes::Finished
+            } else {
+                ReadBytes::Read(*read + bytes_to_read as u64)
+            };
+        }
+        ReadBytes::Finished => {}
+    }
+    Ok(bytes_read)
+}
+
+fn decode_main_footer<R: Read + Seek>(raw_segment: &mut R) -> Result<MainFooter> {
+    raw_segment.seek(SeekFrom::End(-8))?;
+    let footer_offset = u64::decode_directly(raw_segment)?;
+    raw_segment.seek(SeekFrom::Start(footer_offset))?;
+    match MainFooter::decode_directly(raw_segment) {
+        Ok(mf) => {
+            raw_segment.rewind()?;
+            Ok(mf)
+        }
+        Err(e) => match e.kind_ref() {
+            ZffErrorKind::Invalid => {
+                raw_segment.rewind()?;
+                Err(e)
+            }
+            _ => Err(e),
+        },
+    }
+}

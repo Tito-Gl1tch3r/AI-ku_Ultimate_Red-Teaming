@@ -1,0 +1,238 @@
+# frozen_string_literal: true
+
+require "test_helper"
+
+class AdminDashboardTest < ActionDispatch::IntegrationTest
+  include Devise::Test::IntegrationHelpers
+
+  # Admin routes are always defined but wrapped in authenticated :user; unauthenticated
+  # requests get 404 (Devise authenticated block; no route match for guests).
+
+  # Test that admin routes are not available to unauthenticated users
+  def test_admin_routes_not_available_to_unauthenticated_users
+    get admin_root_path
+    assert_response :not_found
+
+    get admin_users_path
+    assert_response :not_found
+
+    get "/admin/jobs"
+    assert_response :not_found
+
+    get "/admin/dbexplore"
+    assert_response :not_found
+  end
+
+  # Test that admin routes are not available to non-admin users
+  def test_admin_routes_not_available_to_non_admin_users
+    @luca = users(:luca)
+    sign_in @luca
+
+    get admin_root_path
+    assert_response :not_found
+
+    get admin_users_path
+    assert_response :not_found
+
+    get "/admin/jobs"
+    assert_response :not_found
+
+    get madmin_root_path
+    assert_response :not_found
+  end
+
+  # Test that admin routes are available to admin users
+  def test_admin_routes_available_to_admin_users
+    @mr_admin = users(:mr_admin)
+    sign_in @mr_admin
+
+    get admin_root_path
+    assert_response :success
+    assert_select "h1", "Administration Center"
+    assert_select ".badge", text: /OSS Version/
+
+    get admin_users_path
+    assert_response :success
+    assert_select "a", text: "Admin Users"
+
+    get "/admin/jobs"
+    assert_response :success
+
+    get "/admin/dbexplore"
+    assert_response :success
+    assert_select "h4", "Direct Database Access"
+  end
+
+  # Test admin user management functionality
+  def test_admin_user_management_functionality
+    @mr_admin = users(:mr_admin)
+    @luca = users(:luca)
+    sign_in @mr_admin
+
+    # Test promote user to admin
+    patch promote_admin_user_path(@luca)
+    assert_response :redirect
+    @luca.reload
+    assert @luca.admin?
+
+    # Test revoke admin privileges
+    patch revoke_admin_user_path(@luca)
+    assert_response :redirect
+    @luca.reload
+    assert_not @luca.admin?
+
+    # Test that admin cannot revoke their own privileges
+    patch revoke_admin_user_path(@mr_admin)
+    assert_response :redirect
+    @mr_admin.reload
+    assert @mr_admin.admin?
+  end
+
+  # Test that non-admin users cannot access user management
+  def test_user_management_not_available_to_non_admin_users
+    @luca = users(:luca)
+    @giuliana = users(:giuliana)
+    sign_in @luca
+
+    # Test promote action
+    patch promote_admin_user_path(@giuliana)
+    assert_response :not_found
+
+    # Test revoke action
+    patch revoke_admin_user_path(@giuliana)
+    assert_response :not_found
+  end
+
+  # Test Data Explorer (Madmin) functionality
+  def test_data_explorer_functionality
+    @mr_admin = users(:mr_admin)
+    sign_in @mr_admin
+
+    # Test main dashboard
+    get madmin_root_path
+    assert_response :success
+    assert_select "h4", "Direct Database Access"
+
+    # Test users resource
+    get madmin_users_path
+    assert_response :success
+    assert_select ".pagination-info", text: "Displaying 1-#{[User.count, Madmin.per_page].min} of #{User.count}"
+
+    # Test pushes resource
+    get madmin_pushes_path
+    assert_response :success
+    assert_select ".pagination-info", text: "Displaying 1-#{[Push.count, Madmin.per_page].min} of #{Push.count}"
+
+    # Test audit logs resource
+    get madmin_audit_logs_path
+    assert_response :success
+    assert_select ".pagination-info", text: "Displaying 1-#{[AuditLog.count, Madmin.per_page].min} of #{AuditLog.count}"
+
+    # Test Active Storage resources
+    get madmin_active_storage_blobs_path
+    assert_response :success
+
+    get madmin_active_storage_attachments_path
+    assert_response :success
+
+    get madmin_active_storage_variant_records_path
+    assert_response :success
+  end
+
+  # Test that Data Explorer is not available to non-admin users
+  def test_data_explorer_not_available_to_non_admin_users
+    @luca = users(:luca)
+    sign_in @luca
+
+    get madmin_root_path
+    assert_response :not_found
+
+    get madmin_users_path
+    assert_response :not_found
+
+    get madmin_pushes_path
+    assert_response :not_found
+
+    get madmin_audit_logs_path
+    assert_response :not_found
+  end
+
+  # Test Background Jobs (MissionControl::Jobs) functionality
+  def test_background_jobs_functionality
+    @mr_admin = users(:mr_admin)
+    sign_in @mr_admin
+
+    get "/admin/jobs"
+    assert_response :success
+    assert_select "h1", "Background Jobs"
+  end
+
+  # Test that Background Jobs is not available to non-admin users
+  def test_background_jobs_not_available_to_non_admin_users
+    @luca = users(:luca)
+    sign_in @luca
+
+    get "/admin/jobs"
+    assert_response :not_found
+  end
+
+  def test_version_is_visible_in_admin_navigation_when_present
+    @mr_admin = users(:mr_admin)
+    sign_in @mr_admin
+
+    Version.stub :current, "1.0.53" do
+      get admin_root_path
+      assert_response :success
+      assert_match(/v1\.0\.53/, response.body)
+
+      get admin_users_path
+      assert_response :success
+      assert_match(/v1\.0\.53/, response.body)
+    end
+  end
+
+  def test_version_is_not_visible_in_admin_navigation_when_nil
+    @mr_admin = users(:mr_admin)
+    sign_in @mr_admin
+
+    Version.stub :current, nil do
+      get admin_users_path
+      assert_response :success
+      assert_no_match(/\bv\d+\.\d+/, response.body)
+    end
+  end
+
+  def test_version_is_not_visible_in_admin_navigation_when_blank
+    @mr_admin = users(:mr_admin)
+    sign_in @mr_admin
+
+    Version.stub :current, "" do
+      get admin_users_path
+      assert_response :success
+      assert_no_match(/\bv\d+\.\d+/, response.body)
+    end
+  end
+
+  # Test admin dashboard content and statistics
+  def test_admin_dashboard_content
+    @mr_admin = users(:mr_admin)
+    sign_in @mr_admin
+
+    get admin_root_path
+    assert_response :success
+
+    # Test that statistics are displayed
+    assert_select ".card", minimum: 4  # At least 4 stat cards
+    assert_select "p", text: /Total Users/
+    assert_select "p", text: /Total Pushes/
+    assert_select "p", text: /Total Audit Logs/
+
+    # Test that main sections are present
+    assert_select "h2", text: /System Administration/
+    assert_select "h2", text: /Database Administration/
+    assert_select "h2", text: /Resources & Support/
+
+    # Test that Getting Started section is present
+    assert_select "h2", text: /Getting Started/
+  end
+end

@@ -1,0 +1,315 @@
+import ctypes
+import os
+import random
+import sys
+import time
+from typing import Optional
+
+from chomper.arch import arm64_arch
+from chomper.const import TLS_ADDRESS
+from chomper.exceptions import SystemOperationFailed
+from chomper.loader import ELFLoader
+from chomper.os.device import NullDevice, RandomDevice, UrandomDevice
+from chomper.os.posix import FileProperty, PosixOs, SyscallError
+from chomper.utils import log_call, struct_to_bytes, to_unsigned
+
+from .hooks import get_hooks
+from .structs import Dirent, Stat64, Timespec
+from .syscall import AndroidSyscallHandler
+
+
+ENVIRON_VARIABLES = """"""
+
+# Virtual device files
+DEVICES_FILES = {
+    "/dev/null": NullDevice,
+    "/dev/random": RandomDevice,
+    "/dev/urandom": UrandomDevice,
+}
+
+FILE_PROPERTIES = [
+    # path, is_dir, readable, writeable, executable
+    ("/", True, True, True, False),
+]
+
+
+class AndroidOs(PosixOs):
+    """Provide Android environment."""
+
+    AT_FDCWD = to_unsigned(-100, size=4)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self._loader = ELFLoader(self.emu)
+        self._syscall_handler = AndroidSyscallHandler(self.emu)
+
+        self._uid = random.randint(10000, 20000)
+
+        self._pid = random.randint(1000, 2000)
+
+        # Used by `getdents`
+        self._dir_read_offset = {}
+
+    @property
+    def loader(self) -> ELFLoader:
+        return self._loader
+
+    @property
+    def syscall_handler(self) -> AndroidSyscallHandler:
+        return self._syscall_handler
+
+    def get_errno(self) -> int:
+        return self.emu.read_s32(TLS_ADDRESS + 0x10)
+
+    def set_errno(self, value: int):
+        self.emu.write_s32(TLS_ADDRESS + 0x10, value)
+
+    @staticmethod
+    def _resolve_flags(flags: int) -> int:
+        """Create flags that will be actually passed into the host machine.
+
+        On Windows, the meaning of flags is different with Unix-like operating systems.
+        """
+        _flags = 0
+
+        access_mode = flags & 3
+        if access_mode == 0:
+            _flags |= os.O_RDONLY
+        elif access_mode == 1:
+            _flags |= os.O_WRONLY
+        elif access_mode == 2:
+            _flags |= os.O_RDWR
+
+        if flags & 0x400:
+            _flags |= os.O_APPEND
+        if flags & 0x40:
+            _flags |= os.O_CREAT
+        if flags & 0x200:
+            _flags |= os.O_TRUNC
+        if flags & 0x80:
+            _flags |= os.O_EXCL
+
+        if sys.platform == "win32":
+            _flags |= os.O_BINARY
+
+        return _flags
+
+    def _construct_stat(self, st: os.stat_result) -> ctypes.Structure:
+        if sys.platform == "win32":
+            block_size = 4096
+
+            rdev = 0
+            blocks = st.st_size // (block_size // 8) + 1
+            blksize = block_size
+        else:
+            rdev = st.st_rdev
+            blocks = st.st_blocks
+            blksize = st.st_blksize
+
+        atime = Timespec.from_time_ns(st.st_atime_ns)
+        mtime = Timespec.from_time_ns(st.st_mtime_ns)
+        ctime = Timespec.from_time_ns(st.st_ctime_ns)
+
+        return Stat64(
+            st_dev=st.st_dev,
+            st_ino=st.st_ino,
+            st_mode=st.st_mode,
+            st_nlink=st.st_nlink,
+            st_uid=st.st_uid,
+            st_gid=st.st_gid,
+            st_rdev=rdev,
+            st_size=st.st_size,
+            st_blksize=blksize,
+            st_blocks=blocks,
+            st_atim=atime,
+            st_mtim=mtime,
+            st_ctim=ctime,
+        )
+
+    def _construct_device_stat(self) -> ctypes.Structure:
+        atime = Timespec.from_time_ns(0)
+        mtime = Timespec.from_time_ns(0)
+        ctime = Timespec.from_time_ns(0)
+
+        return Stat64(
+            st_dev=0,
+            st_ino=0,
+            st_mode=0x2000,
+            st_nlink=0,
+            st_uid=0,
+            st_gid=0,
+            st_rdev=0,
+            st_size=0,
+            st_blksize=0,
+            st_blocks=0,
+            st_atim=atime,
+            st_mtim=mtime,
+            st_ctim=ctime,
+        )
+
+    def _construct_statfs(self) -> ctypes.Structure:
+        return ctypes.Structure()
+
+    def _construct_sockaddr_in(self, address: str, port: int) -> ctypes.Structure:
+        return ctypes.Structure()
+
+    def _construct_flock(self, lock_type: int) -> ctypes.Structure:
+        return ctypes.Structure()
+
+    def getuid(self) -> int:
+        return self._uid
+
+    def getgid(self) -> int:
+        return self._uid
+
+    def getpid(self) -> int:
+        return self._pid
+
+    def getpgid(self) -> int:
+        return 1
+
+    def gettid(self) -> int:
+        return self._pid
+
+    @log_call
+    def getdents(self, fd: int) -> Optional[bytes]:
+        if not self._is_dir_fd(fd):
+            raise SystemOperationFailed(f"Not a directory: {fd}", SyscallError.ENOTDIR)
+
+        path = self._get_fd_path(fd)
+        real_path = self._get_real_path(path)
+
+        if fd in self._dir_read_offset:
+            offset = self._dir_read_offset[fd]
+        else:
+            offset = 0
+
+        dir_entries = list(os.scandir(real_path))
+        if offset >= len(dir_entries):
+            if fd in self._dir_read_offset:
+                del self._dir_read_offset[fd]
+            return None
+
+        dir_entry = dir_entries[offset]
+        self._dir_read_offset[fd] = offset + 1
+
+        # On 64-bit architectures, dirent and linux_dirent64 are the same.
+        st = Dirent(
+            d_ino=dir_entry.inode(),
+            d_seekoff=0,
+            d_reclen=ctypes.sizeof(Dirent),
+            d_type=(4 if dir_entry.is_dir() else 0),
+            d_name=dir_entry.name.encode("utf-8"),
+        )
+        return struct_to_bytes(st)
+
+    @log_call
+    def clock_gettime(self) -> bytes:
+        time_ns = time.time_ns()
+        st = Timespec.from_time_ns(time_ns)
+        return struct_to_bytes(st)
+
+    @log_call
+    def clock_getres(self) -> bytes:
+        st = Timespec(
+            tv_sec=0,
+            tv_nsec=1,
+        )
+        return struct_to_bytes(st)
+
+    def _setup_tls(self):
+        """Initialize thread local storage (TLS)."""
+        if self.emu.arch == arm64_arch:
+            thread_ptr = self.emu.create_buffer(0x18)
+            errno_ptr = self.emu.create_buffer(0x4)
+
+            self.emu.write_u32(thread_ptr + 0x10, self.gettid())
+            self.emu.write_u32(thread_ptr + 0x14, self.getpid())
+
+            self.emu.write_pointer(TLS_ADDRESS + 0x8, thread_ptr)
+            self.emu.write_pointer(TLS_ADDRESS + 0x10, errno_ptr)
+
+    def _setup_file_properties(self):
+        """Initialize file properties."""
+        for path, is_dir, readable, writeable, executable in FILE_PROPERTIES:
+            file_prop = FileProperty(
+                path=path,
+                is_dir=is_dir,
+                readable=readable,
+                writeable=writeable,
+                executable=executable,
+            )
+            self.add_file_property(file_prop)
+
+    def _enable_libc(self) -> bool:
+        """Attempt to load libc."""
+        if not self.rootfs_path:
+            return False
+
+        if self.emu.arch == arm64_arch:
+            lib_dir = "system/lib64"
+        else:
+            lib_dir = "system/lib"
+
+        libc_path = os.path.join(self.rootfs_path, lib_dir, "libc.so")
+
+        if not os.path.exists(libc_path):
+            return False
+
+        self.emu.load_module(libc_path, exec_init_array=False)
+        return True
+
+    def _create_fp(self, fd: int, mode: str, unbuffered: bool = False) -> int:
+        """Wrap file descriptor to file object by calling `fdopen`."""
+        with self.emu.memory_scope() as mem:
+            mode_ptr = mem.create_string(mode)
+
+            fp = self.emu.call_symbol("fdopen", fd, mode_ptr)
+            flags = self.emu.read_u32(fp + 16)
+
+            if unbuffered:
+                flags |= 0x2
+
+            self.emu.write_u32(fp + 16, flags)
+            return fp
+
+    def _setup_stdio(self):
+        """Convert standard Input/Output file descriptors to FILE objects and assign
+        them to target symbols.
+        """
+        stdin = self.emu.get_symbol("stdin")
+        stdout = self.emu.get_symbol("stdout")
+        stderr = self.emu.get_symbol("stderr")
+
+        if self._stdin_fd:
+            stdin_fp = self._create_fp(self._stdin_fd, "r")
+            self.emu.write_pointer(stdin.address, stdin_fp)
+
+        stdout_fp = self._create_fp(self._stdout_fd, "w", unbuffered=True)
+        self.emu.write_pointer(stdout.address, stdout_fp)
+
+        stderr_fp = self._create_fp(self._stderr_fd, "w", unbuffered=True)
+        self.emu.write_pointer(stderr.address, stderr_fp)
+
+    def _setup_environ(self):
+        """Initialize global variable `environ`."""
+        environ_buf = self.emu.create_buffer(8)
+        self.emu.write_pointer(environ_buf, self._create_environ(ENVIRON_VARIABLES))
+
+        environ = self.emu.get_symbol("environ")
+        self.emu.write_pointer(environ.address, environ_buf)
+
+    def initialize(self):
+        # Setup hooks
+        self.emu.hooks.update(get_hooks())
+
+        # Mount virtual device files
+        self.mount_devices(DEVICES_FILES)
+
+        self._setup_tls()
+        self._setup_file_properties()
+
+        if self._enable_libc():
+            self._setup_stdio()
+            self._setup_environ()

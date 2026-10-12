@@ -1,0 +1,64 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+
+	"github.com/taymour/elysiandb/internal/boot"
+	"github.com/taymour/elysiandb/internal/cmd"
+	"github.com/taymour/elysiandb/internal/configuration"
+	"github.com/taymour/elysiandb/internal/globals"
+	"github.com/taymour/elysiandb/internal/log"
+	"github.com/taymour/elysiandb/internal/security"
+)
+
+func banner() {
+	fmt.Printf("\n%s", globals.Blue)
+	fmt.Println(" ╔═══════════════════════════════════════════════════════════════════╗")
+	fmt.Printf(" ║ %s%-63s%s   ║\n", globals.Gold+globals.Bold, "ElysianDB", globals.Reset+globals.Blue)
+	fmt.Printf(" ║ %s%-63s%s   ║\n", globals.Gray, "A modern, lightweight KV datastore", globals.Reset+globals.Blue)
+	fmt.Printf(" ║ %s%-63s%s   ║\n", globals.Gold, "→ Instant REST API, out of the box", globals.Reset+globals.Blue)
+	fmt.Println(" ╚═══════════════════════════════════════════════════════════════════╝" + globals.Reset)
+}
+
+func main() {
+	banner()
+
+	configFilename := flag.String("config", "elysian.yaml", "Path to configuration file")
+	flag.Parse()
+
+	cfg, err := configuration.LoadConfig(*configFilename)
+	if err != nil {
+		log.DirectError("Error loading config:", err)
+		return
+	}
+
+	globals.SetConfig(cfg)
+
+	boot.InitDB()
+	security.InitAdminUserIfNotExists()
+
+	args := flag.Args()
+
+	if len(args) == 0 {
+		cmd.StartServer()
+		return
+	}
+
+	handlers := cmd.GetHandlers()
+
+	if handler, ok := handlers[args[0]]; ok {
+		handler()
+	} else {
+		fmt.Printf("%sUnknown command: %s%s\n", globals.Gold, args[0], globals.Reset)
+		printListOfCommands()
+	}
+}
+
+func printListOfCommands() {
+	commands := cmd.GetAvailableCommands()
+
+	for name, description := range commands {
+		fmt.Printf("  %s%s%s  %s\n", globals.Bold, name, globals.Reset, description)
+	}
+}

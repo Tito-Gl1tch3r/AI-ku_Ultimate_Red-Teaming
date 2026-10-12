@@ -1,0 +1,620 @@
+use anyhow::Result;
+use rmcp::{
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::*,
+    schemars,
+    service::RequestContext,
+    tool, tool_handler, tool_router,
+    transport::stdio,
+    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
+};
+#[allow(unused_imports)]
+use std::future::Future;
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DecodeArgs {
+    /// JWT token to decode
+    pub token: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct EncodeArgs {
+    /// JSON data to encode
+    pub json: String,
+    /// Secret key for HMAC algorithms
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    /// Algorithm to use (default: HS256)
+    #[serde(default = "default_algorithm")]
+    pub algorithm: String,
+    /// Use 'none' algorithm (no signature)
+    #[serde(default)]
+    pub no_signature: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct VerifyArgs {
+    /// JWT token to verify
+    pub token: String,
+    /// Secret key for HMAC algorithms
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    /// Validate expiration claim (exp)
+    #[serde(default)]
+    pub validate_exp: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CrackArgs {
+    /// JWT token to crack
+    pub token: String,
+    /// Cracking mode: 'dict' or 'brute'
+    #[serde(default = "default_crack_mode")]
+    pub mode: String,
+    /// Character list for bruteforce attack
+    #[serde(default = "default_chars")]
+    pub chars: String,
+    /// Character set preset: az, AZ, aZ, 19, aZ19, ascii
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// Min length for bruteforce attack
+    #[serde(default = "default_min_length")]
+    pub min: usize,
+    /// Max length for bruteforce attack
+    #[serde(default = "default_max_length")]
+    pub max: usize,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct PayloadArgs {
+    /// JWT token to use for payload generation
+    pub token: String,
+    /// Target payload types (e.g., "none", "jku", "x5u", "alg_confusion", "kid_sql")
+    #[serde(default = "default_payload_target")]
+    pub target: String,
+    /// Attack domain for jku&x5u attacks
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwk_attack: Option<String>,
+    /// Protocol for jku&x5u attacks (http/https)
+    #[serde(default = "default_protocol")]
+    pub jwk_protocol: String,
+    /// Server public key (PEM literal or file path) — forges a fully signed
+    /// RS/ES→HS alg-confusion HMAC token using the key bytes as the secret
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+}
+
+fn default_algorithm() -> String {
+    "HS256".to_string()
+}
+
+fn default_crack_mode() -> String {
+    "dict".to_string()
+}
+
+fn default_chars() -> String {
+    "abcdefghijklmnopqrstuvwxyz0123456789".to_string()
+}
+
+fn default_min_length() -> usize {
+    1
+}
+
+fn default_max_length() -> usize {
+    4
+}
+
+fn default_payload_target() -> String {
+    "all".to_string()
+}
+
+fn default_protocol() -> String {
+    "https".to_string()
+}
+
+#[derive(Clone)]
+pub struct JwtHackServer {
+    // Populated by the #[tool_router] macro and consumed by rmcp internally;
+    // direct reads don't appear in this file.
+    #[allow(dead_code)]
+    tool_router: ToolRouter<JwtHackServer>,
+}
+
+#[tool_router]
+impl JwtHackServer {
+    pub fn new() -> Self {
+        Self {
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    #[tool(description = "Decode a JWT token and display its header, payload, and validation info")]
+    async fn decode(
+        &self,
+        Parameters(args): Parameters<DecodeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // Use existing decode functionality
+        let decoded = crate::jwt::decode(&args.token);
+
+        match decoded {
+            Ok(token_info) => {
+                let output = format!(
+                    "Header: {}\nClaims: {}\nAlgorithm: {}",
+                    serde_json::to_string_pretty(&token_info.header)
+                        .unwrap_or_else(|_| "Invalid header".to_string()),
+                    serde_json::to_string_pretty(&token_info.claims)
+                        .unwrap_or_else(|_| "Invalid claims".to_string()),
+                    token_info.alg_str()
+                );
+                Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
+            }
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "Failed to decode JWT: {}",
+                e
+            ))])),
+        }
+    }
+
+    #[tool(description = "Encode JSON data into a JWT token with specified algorithm")]
+    async fn encode(
+        &self,
+        Parameters(args): Parameters<EncodeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // Parse JSON claims
+        let claims: serde_json::Value = match serde_json::from_str(&args.json) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Invalid JSON: {}",
+                    e
+                ))]))
+            }
+        };
+
+        // Build encoding options
+        let key_data = if args.no_signature {
+            crate::jwt::KeyData::None
+        } else if let Some(ref secret) = args.secret {
+            crate::jwt::KeyData::Secret(secret.as_str())
+        } else {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "No secret provided for signed token".to_string(),
+            )]));
+        };
+
+        // For an unsigned token the algorithm must be "none"; otherwise the
+        // requested/default algorithm (e.g. HS256) is paired with KeyData::None and
+        // encode_with_options fails with "No key or secret provided".
+        let algorithm: &str = if args.no_signature {
+            "none"
+        } else {
+            &args.algorithm
+        };
+
+        let options = crate::jwt::EncodeOptions {
+            algorithm,
+            key_data,
+            header_params: None::<std::collections::HashMap<&str, &str>>,
+            compress_payload: false,
+        };
+
+        match crate::jwt::encode_with_options(&claims, &options) {
+            Ok(token) => Ok(CallToolResult::success(vec![ContentBlock::text(token)])),
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "Failed to encode JWT: {}",
+                e
+            ))])),
+        }
+    }
+
+    #[tool(description = "Verify a JWT token's signature and optionally validate expiration")]
+    async fn verify(
+        &self,
+        Parameters(args): Parameters<VerifyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Some(secret) = &args.secret {
+            // A 'none' token carries no signature. If a (non-empty) secret was supplied,
+            // verifying against it would silently ignore the secret — the classic
+            // alg:none bypass — so report the token as invalid instead, matching the CLI
+            // and REST verify surfaces.
+            if !secret.is_empty() {
+                if let Ok(decoded) = crate::jwt::decode(&args.token) {
+                    let is_none = decoded
+                        .header
+                        .get("alg")
+                        .and_then(|v| v.as_str())
+                        .map(|a| a.eq_ignore_ascii_case("none"))
+                        .unwrap_or(false);
+                    if is_none {
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(
+                            "✗ Token uses 'none' algorithm and carries no signature; cannot be verified against the provided secret".to_string(),
+                        )]));
+                    }
+                }
+            }
+
+            // Honor the advertised `validate_exp` option instead of silently ignoring
+            // it: route through verify_with_options so an expired token is reported as
+            // expired rather than "valid" when the caller asked for expiration checks.
+            let options = crate::jwt::VerifyOptions {
+                key_data: crate::jwt::VerifyKeyData::Secret(secret),
+                validate_exp: args.validate_exp,
+                validate_nbf: false,
+                leeway: 0,
+            };
+            let result = crate::jwt::verify_with_options(&args.token, &options);
+
+            match result {
+                Ok(is_valid) => {
+                    let message = if is_valid {
+                        "✓ JWT signature is valid"
+                    } else {
+                        "✗ JWT signature is invalid"
+                    };
+                    Ok(CallToolResult::success(vec![ContentBlock::text(
+                        message.to_string(),
+                    )]))
+                }
+                Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Verification failed: {}",
+                    e
+                ))])),
+            }
+        } else {
+            Ok(CallToolResult::error(vec![ContentBlock::text(
+                "No secret provided for verification".to_string(),
+            )]))
+        }
+    }
+
+    #[tool(description = "Attempt to crack a JWT token using dictionary or bruteforce methods")]
+    async fn crack(
+        &self,
+        Parameters(args): Parameters<CrackArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // For MCP mode, we'll use a simplified approach without file I/O
+        // since we can't reliably access wordlist files
+        if args.mode == "dict" {
+            // Use a built-in small wordlist for demo purposes
+            let common_passwords = crate::config::COMMON_SECRETS;
+
+            for password in common_passwords {
+                if let Ok(is_valid) = crate::jwt::verify(&args.token, password) {
+                    if is_valid {
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                            "✓ JWT cracked! Secret found: {}",
+                            password
+                        ))]));
+                    }
+                }
+            }
+
+            Ok(CallToolResult::success(vec![ContentBlock::text(
+                "✗ Dictionary attack failed. Secret not found in built-in wordlist.".to_string(),
+            )]))
+        } else if args.mode == "brute" {
+            // Resolve character set from preset or use provided chars
+            let chars_to_use = if let Some(preset) = &args.preset {
+                match crate::cmd::crack::get_preset_chars(preset) {
+                    Some(preset_chars) => preset_chars,
+                    None => {
+                        return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                            "Unknown preset: '{}'. Available presets: az, AZ, aZ, 19, aZ19, ascii",
+                            preset
+                        ))]));
+                    }
+                }
+            } else {
+                args.chars.clone()
+            };
+
+            // For brute force, only try very short combinations due to performance constraints
+            if args.min < 1 || args.min > args.max {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Invalid min/max lengths: min must be >= 1 and <= max (got min={}, max={})",
+                    args.min, args.max
+                ))]));
+            }
+            const MCP_MAX_BRUTE_LEN: usize = 3;
+            const MCP_MAX_CHARSET: usize = 10;
+            const MCP_MAX_ATTEMPTS: usize = 100;
+            let max_len = std::cmp::min(args.max, MCP_MAX_BRUTE_LEN); // Limit length for MCP
+            let chars: String = chars_to_use.chars().take(MCP_MAX_CHARSET).collect(); // Limit charset
+
+            let min_len = std::cmp::max(args.min, 1);
+            // Without this guard, a requested min length above the MCP cap yields an
+            // empty range (min_len > max_len) and the tool silently reports "not found"
+            // having searched nothing. Reject it explicitly so the caller is not misled.
+            if min_len > max_len {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "MCP brute-force is capped at {} characters; requested min length {} cannot be searched.",
+                    MCP_MAX_BRUTE_LEN, min_len
+                ))]));
+            }
+            for len in min_len..=max_len {
+                for combination in crate::crack::brute::generate_combinations_chunked(
+                    &chars,
+                    len,
+                    MCP_MAX_ATTEMPTS,
+                )
+                .flatten()
+                .take(MCP_MAX_ATTEMPTS)
+                {
+                    // Limit attempts
+                    if let Ok(is_valid) = crate::jwt::verify(&args.token, &combination) {
+                        if is_valid {
+                            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                                "✓ JWT cracked! Secret found: {}",
+                                combination
+                            ))]));
+                        }
+                    }
+                }
+            }
+
+            Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "✗ Brute force attack failed. Secret not found in the limited MCP search space \
+                 (lengths {}-{}, charset capped at {} chars, {} attempts per length).",
+                min_len, max_len, MCP_MAX_CHARSET, MCP_MAX_ATTEMPTS
+            ))]))
+        } else {
+            Ok(CallToolResult::error(vec![ContentBlock::text(
+                "Invalid crack mode. Use 'dict' or 'brute'.".to_string(),
+            )]))
+        }
+    }
+
+    #[tool(description = "Generate various JWT attack payloads for security testing")]
+    async fn payload(
+        &self,
+        Parameters(args): Parameters<PayloadArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let target = if args.target == "all" {
+            None
+        } else {
+            Some(args.target.as_str())
+        };
+
+        let resolved_key = super::payload::resolve_public_key(args.public_key.as_deref());
+        let result = crate::payload::generate_all_payloads(
+            &args.token,
+            None, // jwk_trust
+            args.jwk_attack.as_deref(),
+            &args.jwk_protocol,
+            target,
+            resolved_key.as_deref(),
+        );
+
+        match result {
+            Ok(payloads) => {
+                let output = payloads.join("\n");
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Generated {} attack payloads:\n{}",
+                    payloads.len(),
+                    output
+                ))]))
+            }
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "Failed to generate payloads: {}",
+                e
+            ))])),
+        }
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for JwtHackServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+        .with_protocol_version(ProtocolVersion::V_2024_11_05)
+        .with_server_info(
+            Implementation::new("jwt-hack", env!("CARGO_PKG_VERSION"))
+                .with_title("JWT-HACK")
+                .with_website_url(env!("CARGO_PKG_REPOSITORY")),
+        )
+        .with_instructions("JWT-HACK MCP Server - Provides tools for JWT security testing including decode, encode, verify, crack, and payload generation.")
+    }
+
+    async fn initialize(
+        &self,
+        _request: InitializeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        Ok(self.get_info())
+    }
+}
+
+/// Execute the MCP server
+pub fn execute() {
+    // Set up async runtime for MCP server
+    if let Err(e) = tokio::runtime::Runtime::new()
+        .expect("failed to create tokio runtime")
+        .block_on(run_mcp_server())
+    {
+        crate::utils::log_error(format!("MCP server error: {}", e));
+        std::process::exit(1);
+    }
+}
+
+async fn run_mcp_server() -> Result<()> {
+    crate::utils::log_info("Starting JWT-HACK MCP server...");
+
+    // Create the MCP server
+    let service = JwtHackServer::new();
+
+    // Start the server with stdio transport
+    let server = service.serve(stdio()).await?;
+
+    crate::utils::log_info("MCP server started. Waiting for requests...");
+
+    // Wait for the server to complete
+    server.waiting().await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_mcp_server_creation() {
+        let server = JwtHackServer::new();
+        let info = server.get_info();
+
+        assert_eq!(info.server_info.name, "jwt-hack");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        assert!(info.capabilities.tools.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_decode_tool() {
+        let server = JwtHackServer::new();
+        let args = DecodeArgs {
+            token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.5mhBHqs5_DTLdINd9p5m7ZJ6XD0Xc55kIaCRY5r6HRA".to_string(),
+        };
+
+        let result = server.decode(Parameters(args)).await;
+        assert!(result.is_ok());
+
+        let call_result = result.unwrap();
+        assert!(call_result.is_error != Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_encode_tool() {
+        let server = JwtHackServer::new();
+        let args = EncodeArgs {
+            json: r#"{"sub":"1234567890","name":"John Doe","iat":1516239022}"#.to_string(),
+            secret: Some("secret".to_string()),
+            algorithm: "HS256".to_string(),
+            no_signature: false,
+        };
+
+        let result = server.encode(Parameters(args)).await;
+        assert!(result.is_ok());
+
+        let call_result = result.unwrap();
+        assert!(call_result.is_error != Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_encode_tool_no_signature_emits_none() {
+        // no_signature must produce an alg:none token, not fail because the default
+        // algorithm (HS256) was left paired with KeyData::None.
+        let server = JwtHackServer::new();
+        let args = EncodeArgs {
+            json: r#"{"sub":"x"}"#.to_string(),
+            secret: None,
+            algorithm: default_algorithm(), // "HS256"
+            no_signature: true,
+        };
+        let call_result = server.encode(Parameters(args)).await.unwrap();
+        assert!(
+            call_result.is_error != Some(true),
+            "no_signature encode errored"
+        );
+        let text = call_result
+            .content
+            .first()
+            .and_then(|c| c.as_text().map(|t| t.text.clone()))
+            .expect("token text");
+        let decoded = crate::jwt::decode(&text).expect("decode none token");
+        assert_eq!(
+            decoded.header.get("alg").and_then(|v| v.as_str()),
+            Some("none")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_tool_rejects_none_with_secret() {
+        let server = JwtHackServer::new();
+        // Build an unsigned 'none' token.
+        let options = crate::jwt::EncodeOptions {
+            algorithm: "none",
+            key_data: crate::jwt::KeyData::None,
+            header_params: None,
+            compress_payload: false,
+        };
+        let token = crate::jwt::encode_with_options(&serde_json::json!({"sub": "admin"}), &options)
+            .unwrap();
+
+        let args = VerifyArgs {
+            token,
+            secret: Some("any-secret".to_string()),
+            validate_exp: false,
+        };
+        let call_result = server.verify(Parameters(args)).await.unwrap();
+        if let Some(content) = call_result.content.first() {
+            if let Some(text) = content.as_text() {
+                assert!(
+                    !text.text.contains("✓ JWT signature is valid"),
+                    "a none token with a secret must not be reported valid: {}",
+                    text.text
+                );
+                assert!(
+                    text.text.contains("none"),
+                    "expected a 'none' explanation, got: {}",
+                    text.text
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_crack_tool() {
+        let server = JwtHackServer::new();
+
+        // Create a JWT with a known secret from our built-in list
+        let test_token =
+            crate::jwt::encode(&serde_json::json!({"test": "data"}), "secret", "HS256").unwrap();
+
+        let args = CrackArgs {
+            token: test_token,
+            mode: "dict".to_string(),
+            chars: "abc".to_string(),
+            preset: None, // preset
+            min: 1,
+            max: 2,
+        };
+
+        let result = server.crack(Parameters(args)).await;
+        assert!(result.is_ok());
+
+        let call_result = result.unwrap();
+        assert!(call_result.is_error != Some(true));
+
+        // Check that the content contains a meaningful response
+        if let Some(content) = call_result.content.first() {
+            if let Some(text) = content.as_text() {
+                assert!(
+                    text.text.contains("JWT cracked!")
+                        || text.text.contains("Dictionary attack failed")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_crack_tool_brute() {
+        let server = JwtHackServer::new();
+        let token =
+            crate::jwt::encode(&serde_json::json!({"test": "data"}), "ba", "HS256").unwrap();
+        let args = CrackArgs {
+            token,
+            mode: "brute".to_string(),
+            chars: "ab".to_string(),
+            preset: None,
+            min: 2,
+            max: 2,
+        };
+
+        let result = server.crack(Parameters(args)).await.unwrap();
+        let text = result.content[0].as_text().unwrap().text.clone();
+        assert!(text.contains("Secret found: ba"));
+    }
+}

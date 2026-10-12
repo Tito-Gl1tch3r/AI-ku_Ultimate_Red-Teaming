@@ -1,0 +1,201 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import useSWR, { type Middleware, SWRConfig, useSWRConfig } from "swr";
+
+import Scratch from "@/components/Scratch";
+import useWarnBeforeScratchUnload from "@/components/Scratch/hooks/useWarnBeforeScratchUnload";
+import SetPageTitle from "@/components/SetPageTitle";
+import * as api from "@/lib/api";
+import { scratchUrl } from "@/lib/api/urls";
+import { ignoreNextWarnBeforeUnload } from "@/lib/hooks";
+
+function ScratchPageTitle({ scratch }: { scratch: api.Scratch }) {
+    const isSaved = api.useIsScratchSaved(scratch);
+
+    let title = isSaved ? "" : "(unsaved) ";
+    title += scratch.name || scratch.slug;
+
+    return <SetPageTitle title={title} />;
+}
+
+function ScratchEditorInner({
+    initialScratch,
+    parentScratch,
+    initialCompilation,
+    offline,
+}: Props) {
+    const [scratch, setScratch] = useState(initialScratch);
+    const [isDeleting, setIsDeleting] = useState(false);
+    const isDeletingRef = useRef(false);
+    const { mutate } = useSWRConfig();
+    const currentScratchUrl = scratchUrl(scratch);
+    const initialScratchUrl = scratchUrl(initialScratch);
+
+    useWarnBeforeScratchUnload(scratch, !isDeleting);
+
+    // If the server scratch owner changes (i.e. scratch was claimed), update local scratch owner.
+    // You can trigger this by:
+    // 1. Logging out
+    // 2. Creating a new scratch
+    // 3. Logging in
+    // 4. Notice the scratch owner (in the About panel) has changed to your newly-logged-in user
+    const ownerMayChange = !scratch.owner || scratch.owner.is_anonymous;
+    const cached = useSWR<api.Scratch>(
+        ownerMayChange && !isDeleting && currentScratchUrl,
+        api.get,
+    )?.data;
+    useEffect(() => {
+        if (
+            ownerMayChange &&
+            cached?.owner &&
+            !api.isUserEq(scratch.owner, cached?.owner)
+        ) {
+            console.info("Scratch owner updated", cached.owner);
+            setScratch((scratch) => ({ ...scratch, owner: cached.owner }));
+        }
+    }, [cached?.owner, ownerMayChange, scratch.owner]);
+
+    // On initial page load, request the latest scratch from the server, and
+    // update `scratch` if it's newer.
+    // This can happen when navigating back to a scratch page that was already loaded, but
+    // was updated, so the originally-loaded initialScratch prop becomes stale.
+    // https://github.com/decompme/decomp.me/issues/711
+    useEffect(() => {
+        if (isDeleting) return;
+
+        let isCurrent = true;
+
+        api.get(initialScratchUrl)
+            .then((updatedScratch) => {
+                if (!isCurrent) return;
+
+                const updateTime = new Date(updatedScratch.last_updated);
+
+                setScratch((scratch) => {
+                    const scratchTime = new Date(scratch.last_updated);
+
+                    if (scratchTime < updateTime) {
+                        console.info(
+                            "Client got updated scratch",
+                            updatedScratch,
+                        );
+                        mutate(initialScratchUrl, updatedScratch, {
+                            revalidate: false,
+                        });
+                        return updatedScratch;
+                    }
+
+                    return scratch;
+                });
+            })
+            .catch((error) => {
+                if (!isCurrent) return;
+
+                if (
+                    error instanceof api.ResponseError &&
+                    error.status === 404 &&
+                    isDeletingRef.current
+                ) {
+                    return;
+                }
+
+                throw error;
+            });
+
+        return () => {
+            isCurrent = false;
+        };
+    }, [initialScratchUrl, isDeleting, mutate]);
+
+    const deleteScratch = useCallback(async () => {
+        isDeletingRef.current = true;
+        setIsDeleting(true);
+
+        try {
+            await api.delete_(currentScratchUrl, {});
+        } catch (error) {
+            isDeletingRef.current = false;
+            setIsDeleting(false);
+            throw error;
+        }
+
+        ignoreNextWarnBeforeUnload();
+        window.location.href = scratch.project ? `/${scratch.project}` : "/";
+    }, [currentScratchUrl, scratch.project]);
+
+    if (isDeleting) {
+        return (
+            <main className="grow">
+                <div className="p-4">Deleting scratch...</div>
+            </main>
+        );
+    }
+
+    return (
+        <>
+            <ScratchPageTitle scratch={scratch} />
+            <main className="grow">
+                <Scratch
+                    scratch={scratch}
+                    parentScratch={parentScratch}
+                    initialCompilation={initialCompilation}
+                    onChange={(partial) => {
+                        setScratch((scratch) => {
+                            return { ...scratch, ...partial };
+                        });
+                    }}
+                    deleteScratch={deleteScratch}
+                    offline={offline}
+                />
+            </main>
+        </>
+    );
+}
+
+export interface Props {
+    initialScratch: api.Scratch;
+    parentScratch?: api.Scratch;
+    initialCompilation?: api.Compilation;
+    offline?: boolean;
+}
+
+export default function ScratchEditor(props: Props) {
+    const [offline, setOffline] = useState(false);
+    const initialScratchUrl = scratchUrl(props.initialScratch);
+
+    const offlineMiddleware = useMemo<Middleware>(() => {
+        return (_useSWRNext) => {
+            return function useOfflineMiddleware(key, fetcher, config) {
+                const swr = _useSWRNext(key, fetcher, config);
+
+                if (swr.error instanceof api.RequestFailedError) {
+                    return Object.assign({}, swr, { error: null });
+                }
+
+                return swr;
+            };
+        };
+    }, []);
+
+    const onSuccess = useCallback(() => {
+        setOffline(false);
+    }, []);
+
+    const onError = useCallback((error: unknown) => {
+        if (error instanceof api.RequestFailedError) {
+            setOffline(true);
+        }
+    }, []);
+
+    return (
+        <SWRConfig value={{ use: [offlineMiddleware], onSuccess, onError }}>
+            <ScratchEditorInner
+                key={initialScratchUrl}
+                {...props}
+                offline={offline}
+            />
+        </SWRConfig>
+    );
+}

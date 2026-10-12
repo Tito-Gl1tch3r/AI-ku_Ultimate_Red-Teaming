@@ -1,0 +1,66 @@
+import { Component, OnInit, ChangeDetectionStrategy } from '@angular/core';
+import { Inject } from '@angular/core';
+import { MatDialogRef, MAT_DIALOG_DATA } from '@angular/material/dialog';
+import { Router } from '@angular/router';
+import { IndexeddbService } from '../indexeddb.service';
+import { UntypedFormControl } from '@angular/forms';
+
+@Component({
+  standalone: false,
+  //imports: [],
+  selector: 'app-dialog-pass',
+  templateUrl: './dialog-pass.component.html',
+  changeDetection: ChangeDetectionStrategy.Eager,
+  styleUrls: ['./dialog-pass.component.scss']
+})
+export class DialogPassComponent implements OnInit {
+  hide = true;
+  msg = '';
+  insertpass = new UntypedFormControl();
+  // @ts-ignore
+  constructor(@Inject(MAT_DIALOG_DATA) public data, public router: Router, private indexeddbService: IndexeddbService,
+    public dialogRef: MatDialogRef<DialogPassComponent>) {
+    }
+
+  cancel(): void {
+    this.dialogRef.close();
+    this.router.navigate(['/my-reports']);
+  }
+  ngOnInit() {
+    this.insertpass.setValue("");
+  }
+
+  onKeydown(event: any, pass: string, report_id: string) {
+    if (event.key === 'Enter') {
+      this.decrypt(pass, report_id);
+    }
+  }
+
+  decrypt(pass: string, report_id: string) {
+    this.msg = 'Report is decrypted, please wait...';
+
+    this.indexeddbService.decrypt(pass, report_id).then(returned => {
+      if (returned) {
+        this.dialogRef.close({ data: pass });
+      } else {
+
+        this.indexeddbService.decodeAES(this.data, pass).then(result => {
+          if (result) {
+            this.insertpass.setErrors(null);
+            this.dialogRef.close({ data: pass });
+          } else {
+            this.msg = '';
+            this.insertpass.setErrors({'incorrect': true});
+          }
+        }).catch(() => {
+          this.msg = '';
+          this.insertpass.setErrors({'incorrect': true});
+        });
+
+      }
+
+  });
+
+  }
+
+}

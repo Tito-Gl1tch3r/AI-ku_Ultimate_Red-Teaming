@@ -1,0 +1,587 @@
+package modules
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func resetGlobalStats() {
+	globalStats.mutex.Lock()
+	defer globalStats.mutex.Unlock()
+
+	globalStats.StartTime = time.Now()
+	globalStats.EndTime = time.Time{}
+	globalStats.TotalAttempts = 0
+	globalStats.SuccessfulAttempts = 0
+	globalStats.FailedAttempts = 0
+	globalStats.ConnectionErrors = 0
+	globalStats.AuthenticationErrors = 0
+	globalStats.SuccessRate = 0
+	globalStats.AttemptsPerSecond = 0
+	globalStats.AverageResponseTime = 0
+	globalStats.PeakConcurrency = 0
+	globalStats.TotalHosts = 0
+	globalStats.TotalServices = 0
+	globalStats.SuccessfulResults = make([]SuccessResult, 0)
+	globalStats.ServiceBreakdown = make(map[string]int)
+	globalStats.HostBreakdown = make(map[string]int)
+	globalStats.ConnectionErrorHosts = make(map[string]int)
+}
+
+func TestFormatCredentialMsgUsesPasswordOnlyMetadataForRedis(t *testing.T) {
+	msg := formatCredentialMsg("redis", "127.0.0.1", 6379, "", "redis-secret", "FAILED", "")
+	if strings.Contains(msg, "User") {
+		t.Fatalf("redis attempt message includes user field: %s", msg)
+	}
+	want := "[redis] 127.0.0.1:6379 - Password 'redis-secret' - FAILED"
+	if msg != want {
+		t.Fatalf("redis attempt message = %q, want %q", msg, want)
+	}
+}
+
+func TestPrintSummaryToConsoleUsesPasswordOnlyMetadataForRedis(t *testing.T) {
+	stats := &OutputStatsCopy{
+		StartTime: time.Now(),
+		EndTime:   time.Now(),
+		SuccessfulResults: []SuccessResult{{
+			Service:  "redis",
+			Host:     "127.0.0.1",
+			Port:     6379,
+			User:     "",
+			Password: "redis-secret",
+		}},
+	}
+
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Pipe: %v", err)
+	}
+	os.Stdout = w
+	printSummaryToConsole(stats)
+	_ = w.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(r)
+
+	if strings.Contains(string(out), "User:") {
+		t.Fatalf("redis console summary includes user field: %s", string(out))
+	}
+	want := "[redis] 127.0.0.1:6379 - Password: redis-secret"
+	if !strings.Contains(string(out), want) {
+		t.Fatalf("redis console summary missing %q: %s", want, string(out))
+	}
+}
+
+func TestWriteHumanReadableSummaryUsesPasswordOnlyMetadataForRedis(t *testing.T) {
+	stats := &OutputStatsCopy{
+		StartTime: time.Now(),
+		EndTime:   time.Now(),
+		SuccessfulResults: []SuccessResult{{
+			Service:  "redis",
+			Host:     "127.0.0.1",
+			Port:     6379,
+			User:     "",
+			Password: "redis-secret",
+		}},
+	}
+
+	dir := t.TempDir()
+	writeHumanReadableSummary(stats, dir)
+	data, err := os.ReadFile(filepath.Join(dir, "brutespray-summary.txt"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, "User:") {
+		t.Fatalf("redis human-readable summary includes user field: %s", text)
+	}
+	want := "[redis] 127.0.0.1:6379 - Password: redis-secret"
+	if !strings.Contains(text, want) {
+		t.Fatalf("redis human-readable summary missing %q: %s", want, text)
+	}
+}
+
+func TestRecordSuccess(t *testing.T) {
+	resetGlobalStats()
+
+	RecordSuccess("ssh", "10.0.0.1", 22, "root", "toor", 500*time.Millisecond)
+	RecordSuccess("ftp", "10.0.0.2", 21, "admin", "admin", 300*time.Millisecond)
+
+	stats := GetStats()
+	if stats.SuccessfulAttempts != 2 {
+		t.Fatalf("expected 2 successful attempts, got %d", stats.SuccessfulAttempts)
+	}
+	if len(stats.SuccessfulResults) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(stats.SuccessfulResults))
+	}
+	if stats.ServiceBreakdown["ssh"] != 1 {
+		t.Fatalf("expected ssh breakdown of 1, got %d", stats.ServiceBreakdown["ssh"])
+	}
+	if stats.HostBreakdown["10.0.0.1"] != 1 {
+		t.Fatalf("expected host breakdown of 1, got %d", stats.HostBreakdown["10.0.0.1"])
+	}
+}
+
+func TestRecordAttempt(t *testing.T) {
+	resetGlobalStats()
+
+	RecordAttempt(true)
+	RecordAttempt(false)
+	RecordAttempt(false)
+
+	stats := GetStats()
+	if stats.TotalAttempts != 3 {
+		t.Fatalf("expected 3 total attempts, got %d", stats.TotalAttempts)
+	}
+	if stats.FailedAttempts != 2 {
+		t.Fatalf("expected 2 failed attempts, got %d", stats.FailedAttempts)
+	}
+}
+
+func TestRecordError(t *testing.T) {
+	resetGlobalStats()
+
+	RecordError(true)  // connection error
+	RecordError(true)  // connection error
+	RecordError(false) // auth error
+
+	stats := GetStats()
+	if stats.ConnectionErrors != 2 {
+		t.Fatalf("expected 2 connection errors, got %d", stats.ConnectionErrors)
+	}
+	if stats.AuthenticationErrors != 1 {
+		t.Fatalf("expected 1 auth error, got %d", stats.AuthenticationErrors)
+	}
+}
+
+func TestRecordConnectionError(t *testing.T) {
+	resetGlobalStats()
+
+	RecordConnectionError("10.0.0.1")
+	RecordConnectionError("10.0.0.1")
+	RecordConnectionError("10.0.0.2")
+
+	stats := GetStats()
+	if stats.ConnectionErrors != 3 {
+		t.Fatalf("expected 3 connection errors, got %d", stats.ConnectionErrors)
+	}
+	if stats.ConnectionErrorHosts["10.0.0.1"] != 2 {
+		t.Fatalf("expected 2 errors for 10.0.0.1, got %d", stats.ConnectionErrorHosts["10.0.0.1"])
+	}
+}
+
+func TestCalculateFinalStats(t *testing.T) {
+	resetGlobalStats()
+
+	RecordAttempt(true)
+	RecordAttempt(false)
+	RecordSuccess("ssh", "10.0.0.1", 22, "root", "toor", 100*time.Millisecond)
+
+	stats := CalculateFinalStats()
+	if stats.TotalAttempts != 2 {
+		t.Fatalf("expected 2 total attempts, got %d", stats.TotalAttempts)
+	}
+	if stats.SuccessRate == 0 {
+		t.Fatal("expected non-zero success rate")
+	}
+	if stats.EndTime.IsZero() {
+		t.Fatal("expected end time to be set")
+	}
+}
+
+func TestWriteToFile(t *testing.T) {
+	dir := t.TempDir()
+	content := "[ssh] 10.0.0.1:22 - User 'root' - Pass 'toor' - SUCCESS\n"
+
+	err := WriteToFile("ssh", content, 22, dir)
+	if err != nil {
+		t.Fatalf("WriteToFile failed: %v", err)
+	}
+
+	// Verify file exists and has correct content
+	filename := filepath.Join(dir, "22-ssh-success.txt")
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatalf("failed to read output file: %v", err)
+	}
+	if string(data) != content {
+		t.Fatalf("file content mismatch: got %q, want %q", string(data), content)
+	}
+
+	// Write again to verify append
+	err = WriteToFile("ssh", content, 22, dir)
+	if err != nil {
+		t.Fatalf("second WriteToFile failed: %v", err)
+	}
+	data, err = os.ReadFile(filename)
+	if err != nil {
+		t.Fatalf("failed to read output file: %v", err)
+	}
+	if string(data) != content+content {
+		t.Fatalf("expected appended content, got %q", string(data))
+	}
+}
+
+func TestGetStatsCopiesData(t *testing.T) {
+	resetGlobalStats()
+	RecordSuccess("ssh", "10.0.0.1", 22, "root", "toor", 100*time.Millisecond)
+
+	stats := GetStats()
+	// Mutating the copy should not affect the global state
+	stats.SuccessfulResults = append(stats.SuccessfulResults, SuccessResult{Service: "fake"})
+	stats.ServiceBreakdown["fake"] = 99
+
+	original := GetStats()
+	if len(original.SuccessfulResults) != 1 {
+		t.Fatal("global stats should not have been modified")
+	}
+	if original.ServiceBreakdown["fake"] != 0 {
+		t.Fatal("global stats should not have been modified")
+	}
+}
+
+func TestPrintResultJSON(t *testing.T) {
+	resetGlobalStats()
+
+	// Save and restore global state
+	origFormat := OutputFormatMode
+	origSilent := Silent
+	origTUI := TUIMode
+	origNoColor := NoColorMode
+	defer func() {
+		OutputFormatMode = origFormat
+		Silent = origSilent
+		TUIMode = origTUI
+		NoColorMode = origNoColor
+	}()
+
+	OutputFormatMode = "json"
+	Silent = false
+	TUIMode = false
+	NoColorMode = true
+
+	// Capture stdout
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	dir := t.TempDir()
+	PrintResult("ssh", "10.0.0.1", 22, "root", "toor", true, true, false, dir, 0, "OpenSSH_8.9")
+
+	_ = w.Close()
+	os.Stdout = old
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	output := strings.TrimSpace(buf.String())
+
+	if output == "" {
+		t.Fatal("expected JSON output, got empty string")
+	}
+
+	var attempt AttemptResult
+	if err := json.Unmarshal([]byte(output), &attempt); err != nil {
+		t.Fatalf("invalid JSON output: %v\nraw: %s", err, output)
+	}
+
+	if attempt.Service != "ssh" {
+		t.Errorf("expected service ssh, got %s", attempt.Service)
+	}
+	if attempt.Host != "10.0.0.1" {
+		t.Errorf("expected host 10.0.0.1, got %s", attempt.Host)
+	}
+	if attempt.Port != 22 {
+		t.Errorf("expected port 22, got %d", attempt.Port)
+	}
+	if !attempt.Success {
+		t.Error("expected success=true")
+	}
+	if !attempt.Connected {
+		t.Error("expected connected=true")
+	}
+	if attempt.Banner != "OpenSSH_8.9" {
+		t.Errorf("expected banner OpenSSH_8.9, got %s", attempt.Banner)
+	}
+	if attempt.Status != "SUCCESS" {
+		t.Errorf("expected status SUCCESS, got %s", attempt.Status)
+	}
+	if attempt.StatusCode != "" {
+		t.Errorf("expected empty status_code for compatibility wrapper, got %s", attempt.StatusCode)
+	}
+}
+
+func TestPrintResultWithStatusIncludesStatusCode(t *testing.T) {
+	resetGlobalStats()
+
+	origFormat := OutputFormatMode
+	origSilent := Silent
+	origTUI := TUIMode
+	origNoColor := NoColorMode
+	defer func() {
+		OutputFormatMode = origFormat
+		Silent = origSilent
+		TUIMode = origTUI
+		NoColorMode = origNoColor
+	}()
+
+	OutputFormatMode = "json"
+	Silent = false
+	TUIMode = false
+	NoColorMode = true
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	dir := t.TempDir()
+	PrintResultWithStatus("ssh", "10.0.0.1", 22, "root", "toor", false, false, false, dir, 0, "connection_failure")
+
+	_ = w.Close()
+	os.Stdout = old
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	output := strings.TrimSpace(buf.String())
+
+	var attempt AttemptResult
+	if err := json.Unmarshal([]byte(output), &attempt); err != nil {
+		t.Fatalf("invalid JSON output: %v\nraw: %s", err, output)
+	}
+	if attempt.StatusCode != "connection_failure" {
+		t.Fatalf("status_code = %q, want connection_failure", attempt.StatusCode)
+	}
+	if attempt.Timestamp == "" {
+		t.Error("expected non-empty timestamp")
+	}
+}
+
+func TestPrintResultWithStatusAndProofIncludesProof(t *testing.T) {
+	resetGlobalStats()
+
+	origFormat := OutputFormatMode
+	origSilent := Silent
+	origTUI := TUIMode
+	origNoColor := NoColorMode
+	defer func() {
+		OutputFormatMode = origFormat
+		Silent = origSilent
+		TUIMode = origTUI
+		NoColorMode = origNoColor
+	}()
+
+	OutputFormatMode = "json"
+	Silent = false
+	TUIMode = false
+	NoColorMode = true
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	PrintResultWithStatusAndProof("ssh", "10.0.0.1", 22, "root", "toor", true, true, false, t.TempDir(), 0, "success", "confirmed", "auth_protocol_success", "ssh module result")
+
+	_ = w.Close()
+	os.Stdout = old
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	output := strings.TrimSpace(buf.String())
+
+	var attempt AttemptResult
+	if err := json.Unmarshal([]byte(output), &attempt); err != nil {
+		t.Fatalf("invalid JSON output: %v\nraw: %s", err, output)
+	}
+	if attempt.Confidence != "confirmed" || attempt.ProofType != "auth_protocol_success" || attempt.ProofDetail != "ssh module result" {
+		t.Fatalf("proof fields = %+v", attempt)
+	}
+}
+
+func TestWriteFindingWithProofIncludesProof(t *testing.T) {
+	origFormat := OutputFormatMode
+	origTUI := TUIMode
+	defer func() {
+		OutputFormatMode = origFormat
+		TUIMode = origTUI
+	}()
+	OutputFormatMode = "json"
+	TUIMode = false
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	WriteFindingWithProof("HIGH", "redis-no-auth", "redis", "127.0.0.1", 6379, "open redis", "", "probable", "preauth_probe", "PING")
+
+	_ = w.Close()
+	os.Stdout = old
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	var rec map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &rec); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if rec["confidence"] != "probable" || rec["proof_type"] != "preauth_probe" || rec["proof_detail"] != "PING" {
+		t.Fatalf("proof fields missing: %+v", rec)
+	}
+}
+
+func TestPrintResultJSONRedactsPasswordInEvidenceMode(t *testing.T) {
+	resetGlobalStats()
+
+	origFormat := OutputFormatMode
+	origSilent := Silent
+	origTUI := TUIMode
+	origNoColor := NoColorMode
+	origEvidence := GetEvidenceConfig()
+	defer func() {
+		OutputFormatMode = origFormat
+		Silent = origSilent
+		TUIMode = origTUI
+		NoColorMode = origNoColor
+		SetEvidenceConfig(origEvidence)
+	}()
+
+	OutputFormatMode = "json"
+	Silent = false
+	TUIMode = false
+	NoColorMode = true
+	SetEvidenceConfig(EvidenceConfig{Mode: EvidenceHash, HMACKey: []byte("engagement-key")})
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	dir := t.TempDir()
+	PrintResult("ssh", "10.0.0.1", 22, "root", "toor", true, true, false, dir, 0, "OpenSSH_8.9")
+
+	_ = w.Close()
+	os.Stdout = old
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	output := strings.TrimSpace(buf.String())
+	if strings.Contains(output, "toor") {
+		t.Fatalf("raw password leaked in JSON output: %s", output)
+	}
+
+	var attempt AttemptResult
+	if err := json.Unmarshal([]byte(output), &attempt); err != nil {
+		t.Fatalf("invalid JSON output: %v\nraw: %s", err, output)
+	}
+	if attempt.Password != "[REDACTED]" {
+		t.Fatalf("password = %q, want redacted", attempt.Password)
+	}
+	if !attempt.SecretRedacted {
+		t.Fatal("expected secret_redacted=true")
+	}
+	if attempt.SecretHMACSHA256 == "" {
+		t.Fatal("expected secret_hmac_sha256")
+	}
+}
+
+func TestPrintResultWriteErrorDoesNotEchoRawCredential(t *testing.T) {
+	resetGlobalStats()
+
+	origFormat := OutputFormatMode
+	origSilent := Silent
+	origTUI := TUIMode
+	origNoColor := NoColorMode
+	origEvidence := GetEvidenceConfig()
+	defer func() {
+		OutputFormatMode = origFormat
+		Silent = origSilent
+		TUIMode = origTUI
+		NoColorMode = origNoColor
+		SetEvidenceConfig(origEvidence)
+	}()
+
+	OutputFormatMode = "json"
+	Silent = false
+	TUIMode = false
+	NoColorMode = true
+	SetEvidenceConfig(EvidenceConfig{Mode: EvidenceHash, HMACKey: []byte("engagement-key")})
+
+	outputPath := filepath.Join(t.TempDir(), "regular-file-output-target")
+	if err := os.WriteFile(outputPath, []byte("not a directory"), 0600); err != nil {
+		t.Fatalf("create regular output file: %v", err)
+	}
+
+	const (
+		host      = "10.0.0.1"
+		user      = "root"
+		password  = "raw-write-error-secret-9f2d6c"
+		banner    = "OpenSSH_write_error_regression"
+		rawRecord = "[ssh] 10.0.0.1:22 - User 'root' - Pass 'raw-write-error-secret-9f2d6c' - SUCCESS [Banner: OpenSSH_write_error_regression]"
+	)
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	PrintResult("ssh", host, 22, user, password, true, true, false, outputPath, 0, banner)
+
+	_ = w.Close()
+	os.Stdout = old
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	output := buf.String()
+
+	if !strings.Contains(output, "WRITE ERROR: could not save credential to file") {
+		t.Fatalf("expected write error in stdout, got: %s", output)
+	}
+	if strings.Contains(output, password) {
+		t.Fatalf("raw password leaked in write-error output: %s", output)
+	}
+	if strings.Contains(output, rawRecord) {
+		t.Fatalf("raw credential record leaked in write-error output: %s", output)
+	}
+}
+
+func TestPrintComprehensiveSummary(t *testing.T) {
+	resetGlobalStats()
+
+	RecordSuccess("ssh", "10.0.0.1", 22, "root", "toor", 100*time.Millisecond)
+	SetTotalHostsAndServices(1, 1)
+
+	dir := t.TempDir()
+	PrintComprehensiveSummary(dir)
+
+	// Check that all expected files were created
+	expectedFiles := []string{
+		"brutespray-summary.json",
+		"brutespray-summary.csv",
+		"brutespray-summary.txt",
+		"brutespray-msf.rc",
+		"brutespray-nxc.sh",
+	}
+
+	for _, f := range expectedFiles {
+		path := filepath.Join(dir, f)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			t.Errorf("expected file %s to exist", f)
+		}
+	}
+
+	// Verify MSF script contains the module
+	msfData, _ := os.ReadFile(filepath.Join(dir, "brutespray-msf.rc"))
+	if !strings.Contains(string(msfData), "ssh_login") {
+		t.Error("MSF script should contain ssh_login module")
+	}
+	if !strings.Contains(string(msfData), "set RHOSTS 10.0.0.1") {
+		t.Error("MSF script should contain the host")
+	}
+
+	// Verify NXC script contains the command
+	nxcData, _ := os.ReadFile(filepath.Join(dir, "brutespray-nxc.sh"))
+	if !strings.Contains(string(nxcData), "nxc ssh 10.0.0.1") {
+		t.Error("NXC script should contain ssh command")
+	}
+}

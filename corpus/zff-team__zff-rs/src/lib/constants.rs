@@ -1,0 +1,497 @@
+//! Module containing all constants used in the zff crate.
+//!
+//! This module defines magic bytes, identifiers, version numbers, default values,
+//! error messages, and other constants that are used throughout the zff format implementation.
+
+// - external
+use ed25519_dalek::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
+use redb::TableDefinition;
+
+// identifier: magic bytes
+/// The identifier of the [DescriptionHeader](crate::header::DescriptionHeader).
+pub const HEADER_IDENTIFIER_DESCRIPTION_HEADER: u32 = 0x7A666664;
+/// The identifier of the [SegmentHeader](crate::header::SegmentHeader).
+pub const HEADER_IDENTIFIER_SEGMENT_HEADER: u32 = 0x7A66666D;
+/// The identifier of the [CompressionHeader](crate::header::CompressionHeader).
+pub const HEADER_IDENTIFIER_COMPRESSION_HEADER: u32 = 0x7A666663;
+/// The identifier of the [PBEHeader](crate::header::PBEHeader).
+pub const HEADER_IDENTIFIER_PBE_HEADER: u32 = 0x7A666670;
+/// The identifier of the [EncryptionHeader](crate::header::EncryptionHeader).
+pub const HEADER_IDENTIFIER_ENCRYPTION_HEADER: u32 = 0x7A666665;
+/// The identifier of the [ChunkHeader](crate::header::ChunkHeader).
+pub const HEADER_IDENTIFIER_CHUNK_HEADER: u32 = 0x7A666643;
+/// The identifier of the [HashHeader](crate::header::HashHeader).
+pub const HEADER_IDENTIFIER_HASH_HEADER: u32 = 0x7A666668;
+/// The identifier of the [HashValue](crate::header::HashValue).
+pub const HEADER_IDENTIFIER_HASH_VALUE: u32 = 0x7A666648;
+/// The identifier of the [ObjectHeader](crate::header::ObjectHeader).
+pub const HEADER_IDENTIFIER_OBJECT_HEADER: u32 = 0x7A66664F;
+/// The identifier of the [FileHeader](crate::header::FileHeader).
+pub const HEADER_IDENTIFIER_FILE_HEADER: u32 = 0x7A666666;
+/// The identifier of the chunk offset map header.
+pub const HEADER_IDENTIFIER_CHUNK_OFFSET_MAP: u32 = 0x7A666678;
+/// The identifier of the chunk size map header.
+pub const HEADER_IDENTIFIER_CHUNK_SIZE_MAP: u32 = 0x7A666679;
+/// The identifier of the chunk flag map header.
+pub const HEADER_IDENTIFIER_CHUNK_FLAG_MAP: u32 = 0x7A66667A;
+/// The identifier of the chunk xxhash map header.
+pub const HEADER_IDENTIFIER_CHUNK_XXHASH_MAP: u32 = 0x7a666669;
+/// The identifier of the chunk samebytes map header.
+pub const HEADER_IDENTIFIER_CHUNK_SAMEBYTES_MAP: u32 = 0x7a666653;
+/// The identifier of the chunk deduplication map header.
+pub const HEADER_IDENTIFIER_CHUNK_DEDUPLICATION_MAP: u32 = 0x7a666644;
+/// The identifier of the virtual mapping information header.
+pub const HEADER_IDENTIFIER_VIRTUAL_MAPPING_INFORMATION: u32 = 0x7a666676;
+/// The identifier of the virtual object map header.
+pub const HEADER_IDENTIFIER_VIRTUAL_OBJECT_MAP: u32 = 0x7a666631;
+
+pub(crate) const FOOTER_IDENTIFIER_SEGMENT_FOOTER: u32 = 0x7A666646;
+pub(crate) const FOOTER_IDENTIFIER_MAIN_FOOTER: u32 = 0x7A66664D;
+pub(crate) const FOOTER_IDENTIFIER_OBJECT_FOOTER_PHYSICAL: u32 = 0x7A666650;
+pub(crate) const FOOTER_IDENTIFIER_OBJECT_FOOTER_LOGICAL: u32 = 0x7A66664C;
+pub(crate) const FOOTER_IDENTIFIER_OBJECT_FOOTER_VIRTUAL: u32 = 0x7a666636;
+pub(crate) const FOOTER_IDENTIFIER_VIRTUAL_FILE_FOOTER: u32 = 0x7a666637;
+pub(crate) const FOOTER_IDENTIFIER_VIRTUAL_FILE_MAP: u32 = 0x7a666638;
+pub(crate) const FOOTER_IDENTIFIER_FILE_FOOTER: u32 = 0x7A666649;
+
+pub(crate) const PBE_KDF_PARAMETERS_PBKDF2: u32 = 0x6B646670;
+pub(crate) const PBE_KDF_PARAMETERS_SCRYPT: u32 = 0x6b646673;
+pub(crate) const PBE_KDF_PARAMETERS_ARGON2ID: u32 = 0x6b646661;
+
+// Encoding keys
+/// Encoding key for the case number.
+pub const ENCODING_KEY_CASE_NUMBER: &str = "cn";
+/// Encoding key for the evidence number.
+pub const ENCODING_KEY_EVIDENCE_NUMBER: &str = "ev";
+/// Encoding key for the examiner name.
+pub const ENCODING_KEY_EXAMINER_NAME: &str = "ex";
+/// Encoding key for the notes.
+pub const ENCODING_KEY_NOTES: &str = "no";
+/// Encoding key for the name of the acquisition tool.
+pub const ENCODING_KEY_TOOL_NAME: &str = "tn";
+/// Encoding key for the version of the acquisition tool.
+pub const ENCODING_KEY_TOOL_VERSION: &str = "tv";
+/// Encoding key for the global description notes.
+pub const ENCODING_KEY_DESCRIPTION_NOTES: &str = "dn";
+
+// chunk header flags
+pub(crate) const ERROR_FLAG_VALUE: u8 = 1 << 0;
+pub(crate) const COMPRESSION_FLAG_VALUE: u8 = 1 << 1;
+pub(crate) const SAME_BYTES_FLAG_VALUE: u8 = 1 << 2;
+pub(crate) const DUPLICATION_FLAG_VALUE: u8 = 1 << 3;
+pub(crate) const ENCRYPTION_FLAG_VALUE: u8 = 1 << 4;
+pub(crate) const EMPTY_FILE_FLAG_VALUE: u8 = 1 << 5;
+pub(crate) const VIRTUAL_FLAG_VALUE: u8 = 1 << 6;
+
+// object header flags
+pub(crate) const ENCRYPT_OBJECT_FLAG_VALUE: u8 = 1 << 0;
+pub(crate) const SIGN_HASH_FLAG_VALUE: u8 = 1 << 1;
+pub(crate) const PASSIVE_OBJECT_FLAG: u8 = 1 << 2;
+
+// - Error messages
+pub(crate) const ERROR_HEADER_DECODER_UNKNOWN_HASH_TYPE: &str = "Unknown hash type value.";
+pub(crate) const ERROR_HEADER_DECODER_MISMATCH_IDENTIFIER_KDF: &str =
+    "The read identifier does not match to any known KDF header identifier.";
+pub(crate) const ERROR_HEADER_DECODER_UNKNOWN_PBE_SCHEME: &str =
+    "Unknown PBEncryption scheme value.";
+pub(crate) const ERROR_HEADER_DECODER_UNKNOWN_KDF_SCHEME: &str = "Unknown KDF scheme value.";
+pub(crate) const ERROR_HEADER_DECODER_UNKNOWN_ENCRYPTION_ALGORITHM: &str =
+    "Unknown encryption algorithm value.";
+pub(crate) const FILE_EXTENSION_PARSER_ERROR: &str = "Error while trying to parse extension value";
+pub(crate) const ERROR_HEADER_DECODER_HEADER_LENGTH: &str =
+    "Unable to read header length from given data.";
+pub(crate) const ERROR_HEADER_DECODER_KEY_POSITION: &str = "Key not in position.";
+pub(crate) const ERROR_HEADER_DECODER_COMPRESSION_ALGORITHM: &str =
+    "unknown compression algorithm value";
+pub(crate) const ERROR_HEADER_DECODER_MISMATCH_IDENTIFIER: &str =
+    "The read identifier does not match the header identifier.";
+pub(crate) const ERROR_MISSING_SEGMENT_MAIN_FOOTER: &str =
+    "A segment with a valid zff main footer is missing.";
+pub(crate) const ERROR_MISSING_SEGMENT: &str = "A segment is missing. Segment no: ";
+pub(crate) const ERROR_MISSING_OBJECT_HEADER_IN_SEGMENT: &str =
+    "Missing object header in segment with following object number: ";
+pub(crate) const ERROR_MISSING_OBJECT_FOOTER_IN_SEGMENT: &str =
+    "Missing object footer in segment with following object number: ";
+pub(crate) const ERROR_MALFORMED_SEGMENT: &str = "A Segment is malformed.";
+pub(crate) const ERROR_MISSING_OBJECT_NO: &str = "Missing object number: ";
+pub(crate) const ERROR_MISSING_FILE_NUMBER: &str = "Missing filenumber: ";
+pub(crate) const ERROR_ENCRYPTION_PRECONDITION_FAILED: &str =
+    "Encryption and encoding precondition failed.";
+pub(crate) const ERROR_MISSING_ENCRYPTION_HEADER_KEY: &str =
+    "Trying to decode encrypted content, but encryption header or key is missing.";
+pub(crate) const ERROR_DERIVED_KEY_LENGTH_MISMATCH: &str =
+    "The derived key does not have the length required by the selected PBE scheme.";
+pub(crate) const ERROR_MISSING_FILE_CHUNK_INFORMATION: &str =
+    "The file metadata does not contain the expected chunk information.";
+pub(crate) const ERROR_UNEXPECTED_DUPLICATE_CHUNK_CONTENT: &str =
+    "Encountered a duplicate chunk content, which should already have been resolved.";
+#[cfg(any(feature = "los_tar", feature = "vos_tar"))]
+pub(crate) const ERROR_UNSUPPORTED_SPECIAL_FILE_TYPE: &str =
+    "Unsupported special file type for file number: ";
+#[cfg(feature = "los_tar")]
+pub(crate) const ERROR_MISSING_SPECIAL_FILE_INFORMATION: &str =
+    "Missing special file information for file number: ";
+#[cfg(target_family = "windows")]
+pub(crate) const ERROR_SPECIAL_FILES_UNSUPPORTED_ON_WINDOWS: &str =
+    "Special files are not supported on Windows.";
+pub(crate) const ERROR_UNEXPECTED_ENCODING_STATE: &str =
+    "The encoder returned an unexpected encoding state.";
+
+// - encoded sizes of primitive building blocks
+/// Encoded size of an u64 value.
+pub(crate) const ENCODED_U64_SIZE: usize = 8;
+/// Encoded size of a header version byte.
+pub(crate) const ENCODED_VERSION_SIZE: usize = 1;
+/// Encoded size of the length prefix that precedes an encoded map.
+pub(crate) const ENCODED_MAP_LENGTH_SIZE: usize = 8;
+/// Encoded size of one u64 key / u64 value pair inside an encoded map.
+pub(crate) const ENCODED_U64_PAIR_SIZE: usize = 16;
+
+// - segment size accounting
+/// Upper bound of the bytes a flushed chunkmap costs on top of its payload size
+/// (as reported by [ChunkMap::current_size](crate::header::ChunkMap::current_size)):
+/// the header identifier (4), the header length (8), the version (1), the object
+/// number (8) and, for encrypted objects, the AEAD tag (16). Rounded up.
+pub(crate) const CHUNKMAP_ENCODING_OVERHEAD: u64 = 40;
+
+/// Upper bound of the bytes the segment footer grows by while a segment is being
+/// closed. Closing flushes the three chunkmaps, and each flush inserts one
+/// (chunk number, offset) pair into the matching footer table. Rounded up.
+pub(crate) const SEGMENT_FOOTER_CLOSING_GROWTH: u64 = 64;
+
+/// Upper bound of the bytes a single additional chunk costs inside a segment, on
+/// top of the chunk payload itself: the AEAD tag of an encrypted chunk (16), one
+/// chunk header map entry (46), one same bytes map entry (9) and one
+/// deduplication map entry (16). Rounded up.
+pub(crate) const CHUNK_SEGMENT_OVERHEAD: u64 = 96;
+
+/// Upper bound for a single allocation step while reading chunk data. A chunk
+/// size decoded from a container is untrusted, so the buffer grows in steps of
+/// this size as data is actually read instead of being allocated up front.
+/// Upper bound for the capacity reserved up front when decoding a collection.
+///
+/// The element count is decoded from the container and is therefore untrusted:
+/// reserving it directly turns a corrupted count into an allocation of
+/// `count * size_of::<T>()` bytes. Only this many elements are reserved; the
+/// collection then grows as elements are actually decoded, which stops at the
+/// end of the input.
+pub(crate) const MAX_PREALLOCATED_ELEMENTS: usize = 1024;
+/// Encoded size of one chunk header map entry: the chunk number (8) plus the
+/// encoded [ChunkHeader](crate::header::ChunkHeader) (38).
+pub(crate) const CHUNK_HEADER_MAP_ENTRY_SIZE: u64 = 8 + 38;
+pub(crate) const ERROR_SEGMENT_OFFSET_OVERFLOW: &str =
+    "The offsets stored in this segment are inconsistent for chunk number: ";
+/// Maximum number of deduplication hops followed while resolving a chunk.
+///
+/// A duplicate chunk refers to the chunk that first held the data, and that one
+/// is stored directly, so a well formed container needs a single hop. A
+/// corrupted or hostile container can chain duplicates or point them at each
+/// other in a cycle; following that without a limit exhausts the stack.
+pub(crate) const MAX_CHUNK_DEDUPLICATION_HOPS: usize = 8;
+pub(crate) const ERROR_TOO_MANY_DEDUPLICATION_HOPS: &str =
+    "Too many deduplication hops while resolving chunk number: ";
+pub(crate) const CHUNK_READ_ALLOCATION_STEP: usize = 1024 * 1024;
+pub(crate) const ERROR_CHUNK_SIZE_EXCEEDS_SEGMENT: &str =
+    "The chunk exceeds the segment it is stored in, for chunk number: ";
+pub(crate) const ERROR_CHUNK_ALLOCATION_FAILED: &str =
+    "Could not allocate the buffer for chunk number: ";
+pub(crate) const ERROR_INVALID_CHUNKMAP_SIZE: &str =
+    "The chunkmap size has to be a multiple of 16, as required by the zff specification, but is: ";
+pub(crate) const ERROR_ZFFWRITER_UNEXPECTED_INTERNAL_STATE: &str =
+    "The zff writer reached an unexpected internal state at: ";
+pub(crate) const ERROR_MISSING_OBJECT_HEADER_FOR_OBJECT_NO: &str =
+    "No object header available for object number: ";
+pub(crate) const ERROR_OBJECT_FOOTER_TYPE_MISMATCH: &str =
+    "The object footer does not match the expected object type for object number: ";
+pub(crate) const ERROR_MISSING_VIRTUAL_FILE_MAP: &str =
+    "The virtual file map is missing, but was expected to be present.";
+pub(crate) const NO_ENCRYPTION_DETECTED: &str = "No encryption detected.";
+pub(crate) const ERROR_DECODE_UNENCRYPTED_OBJECT_WITH_DECRYPTION_FN: &str =
+    "Trying to decrypt unencryted object.";
+pub(crate) const ERROR_INVALID_TYPE_FLAG_VALUE: &str = "Invalid type flag value:";
+pub(crate) const ERROR_UNSUPPORTED_VERSION: &str = "Unsupported version: ";
+pub(crate) const ERROR_WRONG_SIGNATURE_KEY_LENGTH: &str = "Wrong signature key length.";
+pub(crate) const ERROR_COULD_NOT_FIND_EXPECTED_SAMEBYTE: &str =
+    "Could not find expected samebyte in chunk content.";
+pub(crate) const ERROR_COULD_NOT_FIND_EXPECTED_CHUNK_NUMBER_IN_MAP: &str =
+    "Could not find expected chunk number in map: ";
+pub(crate) const ERROR_NOT_IN_MAP: &str = "Data not in map";
+pub(crate) const ERROR_NO_INPUT_FILE: &str = "There is no input file";
+pub(crate) const ERROR_UNKNOWN_SPECIAL_FILETYPE: &str = "Unknown file type";
+#[cfg(any(feature = "los_tar", feature = "vos_tar"))]
+pub(crate) const ERROR_FILE_NOT_IN_ROOT_PATH: &str = "File not in Root-path.";
+pub(crate) const ERROR_UNREADABLE_OBJECT_HEADER_OFFSET_NO: &str =
+    "Could not read header offsets of object no. ";
+pub(crate) const ERROR_UNSUPPORTED_METADATA_EXT: &str =
+    "Unsupported metadata extended type identifier: ";
+pub(crate) const ERROR_UNDECODABLE_SEGMENT_FOOTER: &str = "Could not decode segment footer";
+pub(crate) const ERROR_UNDECODABLE_MAIN_FOOTER: &str = "Could not decode main footer";
+pub(crate) const ERROR_CHUNK_IS_ENCRYPTED_: &str = "The chunk is encrypted; chunk no ";
+pub(crate) const ERROR_ZFFREADER_SEGMENT_NOT_FOUND: &str =
+    "The segment of the chunk was not found.";
+pub(crate) const ERROR_ZFFREADER_OPERATION: &str = "Operation not available.";
+pub(crate) const ERROR_ZFFREADER_OPERATION_ENCRYPTED_OBJECT: &str =
+    "Operation not available for encrypted objects.";
+pub(crate) const ERROR_ZFFREADER_OPERATION_PHYSICAL_OBJECT: &str =
+    "Operation not available for physical objects.";
+pub(crate) const ERROR_ZFFREADER_MISSING_VFM: &str =
+    "Missing virtual file map information for virtual file: ";
+pub(crate) const ERROR_ZFFREADER_MISSING_VALUE_VFM: &str = "Missing offset in virtual file map: ";
+pub(crate) const ERROR_ZFFREADER_MISSING_PASSIVE_OBJECT: &str =
+    "Necessary passive object is not initialized/decrypted correctly: Object no. ";
+pub(crate) const ERROR_ZFFWRITER_GENERATE_FILES_STREAM: &str =
+    "could not generate files using the Stream output type";
+pub(crate) const ERROR_IO_NOT_SEEKABLE_NEGATIVE_POSITION: &str =
+    "Unseekable position (position is negative).";
+
+pub(crate) const ERROR_ZFFREADER_MISSING_OBJECT: &str = "Missing object number in zffreader: ";
+
+#[cfg(any(feature = "los_tar", feature = "vos_tar"))]
+pub(crate) const ERROR_TAR_ENCODING_ERROR_NO_FILENAME: &str = "Missing filename for tar entry ";
+#[cfg(feature = "los_tar")]
+pub(crate) const ERROR_ERROR_ENCODING_TAR_UNEXPECTED_EOF: &str = "unexpected EOF in tar entry";
+#[cfg(feature = "los_tar")]
+pub(crate) const ERROR_ENCODING_TAR_NO_BACKWARD: &str =
+    "cannot seek backwards in forward tar stream";
+#[cfg(any(feature = "los_tar", feature = "vos_tar"))]
+pub(crate) const ERROR_TAR_PREPROCESSED_ENTRY: &str = "cannot process the entry type. This tar entry type should already be preprocessed. This is an application bug. The appropriate entry type is: ";
+#[cfg(any(feature = "los_tar", feature = "vos_tar"))]
+pub(crate) const ERROR_TAR_MISSING_HARDLINK_TARGET: &str = "Missing hardlink target for tar entry";
+
+// Default values
+pub(crate) const DEFAULT_LENGTH_HEADER_IDENTIFIER: usize = 4;
+pub(crate) const DEFAULT_LENGTH_VALUE_HEADER_LENGTH: usize = 8;
+
+pub(crate) const DEFAULT_WAIT_TIME_IO_INTERRUPT_RETRY: u64 = 6000; // in milliseconds
+pub(crate) const DEFAULT_NUMBER_OF_RETRIES_IO_INTERRUPT: u8 = 11;
+
+pub(crate) const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024; // 1 MiB
+
+pub(crate) const DEFAULT_CHUNK_CACHE_CAPACITY: u64 = 10;
+
+/// The number of the first object in a zff container.
+pub const INITIAL_OBJECT_NUMBER: u64 = 1;
+
+/// The first chunk number in a zff container.
+pub const INITIAL_CHUNK_NUMBER: u64 = 1;
+
+/// The first segment number in a zff container.
+pub const INITIAL_SEGMENT_NUMBER: u64 = 1;
+
+/// The default compression ratio threshold
+pub const DEFAULT_COMPRESSION_RATIO_THRESHOLD: &str = "1.05";
+
+/// the default key length of a public signature key
+pub const ED25519_DALEK_PUBKEY_LEN: usize = PUBLIC_KEY_LENGTH;
+/// the default length of an ed25519 signature
+pub const ED25519_DALEK_SIGNATURE_LEN: usize = SIGNATURE_LENGTH;
+
+//ZFF File extension
+/// the start value for file extensions. a file-extension always starts with a 'z', followed by the segment number (e.g. "z01", "z02", ..., "z99", "z100", ...).
+pub const FILE_EXTENSION_START: char = 'z';
+/// the start value for file extensions for the first 9 numbers (starting at 01). A file-extension always starts with a 'z', followed by the segment number (e.g. "z01", "z02", ..., "z99", "z100", ...).
+pub const FILE_EXTENSION_START_PRE9: &str = "z0";
+/// Initializer to count the file extension numbers.
+pub const FILE_EXTENSION_INITIALIZER: &str = "z00";
+/// the file extension for the first segment.
+pub const FIRST_FILE_EXTENSION: &str = "z01";
+
+// default versions
+/// current header version for the [ChunkHeader](crate::header::ChunkHeader).
+pub const DEFAULT_HEADER_VERSION_CHUNK_HEADER: u8 = 2;
+/// current header version for the [HashValue](crate::header::HashValue) structure.
+pub const DEFAULT_HEADER_VERSION_HASH_VALUE_HEADER: u8 = 2;
+/// current header version for the [HashHeader](crate::header::HashHeader).
+pub const DEFAULT_HEADER_VERSION_HASH_HEADER: u8 = 2;
+/// current header version for the [SegmentHeader](crate::header::SegmentHeader).
+pub const DEFAULT_HEADER_VERSION_SEGMENT_HEADER: u8 = 3;
+/// current header version for the [CompressionHeader](crate::header::CompressionHeader).
+pub const DEFAULT_HEADER_VERSION_COMPRESSION_HEADER: u8 = 1;
+/// current header version for the [DescriptionHeader](crate::header::DescriptionHeader).
+pub const DEFAULT_HEADER_VERSION_DESCRIPTION_HEADER: u8 = 2;
+/// current header version for the [PBEHeader](crate::header::PBEHeader).
+pub const DEFAULT_HEADER_VERSION_PBE_HEADER: u8 = 3;
+/// current header version for the [EncryptionHeader](crate::header::EncryptionHeader).
+pub const DEFAULT_HEADER_VERSION_ENCRYPTION_HEADER: u8 = 3;
+/// current header version for the [FileHeader](crate::header::FileHeader).
+pub const DEFAULT_HEADER_VERSION_FILE_HEADER: u8 = 2;
+/// current header version for the [ObjectHeader](crate::header::ObjectHeader).
+pub const DEFAULT_HEADER_VERSION_OBJECT_HEADER: u8 = 2;
+/// current header version for the chunk offset map structure.
+pub const DEFAULT_HEADER_VERSION_CHUNK_OFFSET_MAP: u8 = 1;
+/// current header version for the chunk size map structure.
+pub const DEFAULT_HEADER_VERSION_CHUNK_SIZE_MAP: u8 = 1;
+/// current header version for the chunk flag map structure.
+pub const DEFAULT_HEADER_VERSION_CHUNK_FLAG_MAP: u8 = 1;
+/// current header version for the chunk xxhash map structure.
+pub const DEFAULT_HEADER_VERSION_CHUNK_XXHASH_MAP: u8 = 1;
+/// current header version for the ChunkSamebytesMap structure.
+pub const DEFAULT_HEADER_VERSION_CHUNK_SAMEBYTES_MAP: u8 = 1;
+/// current header version for the ChunkDeduplicationMap structure.
+pub const DEFAULT_HEADER_VERSION_CHUNK_DEDUPLICATION_MAP: u8 = 1;
+/// current header version for the virtual mapping information structure.
+pub const DEFAULT_HEADER_VERSION_VIRTUAL_MAPPING_INFORMATION: u8 = 1;
+/// current header version for the virtual object map structure.
+pub const DEFAULT_HEADER_VERSION_VIRTUAL_OBJECT_MAP: u8 = 1;
+/// current footer version for the ObjectFooterPhysical.
+pub const DEFAULT_FOOTER_VERSION_OBJECT_FOOTER_PHYSICAL: u8 = 2;
+/// current footer version for the ObjectFooterLogical.
+pub const DEFAULT_FOOTER_VERSION_OBJECT_FOOTER_LOGICAL: u8 = 2;
+/// current footer version for the ObjectFooterVirtual.
+pub const DEFAULT_FOOTER_VERSION_OBJECT_FOOTER_VIRTUAL: u8 = 1;
+/// current footer version of the VirtualFileFooter.
+pub const DEFAULT_FOOTER_VERSION_VIRTUAL_FILE_FOOTER: u8 = 1;
+/// current footer version of the VirtualFileMap.
+pub const DEFAULT_FOOTER_VERSION_VIRTUAL_FILE_MAP: u8 = 1;
+/// current footer version for the [SegmentFooter](crate::footer::SegmentFooter).
+pub const DEFAULT_FOOTER_VERSION_SEGMENT_FOOTER: u8 = 3;
+/// current footer version for the [MainFooter](crate::footer::MainFooter).
+pub const DEFAULT_FOOTER_VERSION_MAIN_FOOTER: u8 = 2;
+/// current footer version for the [FileFooter](crate::footer::FileFooter).
+pub const DEFAULT_FOOTER_VERSION_FILE_FOOTER: u8 = 2;
+
+/// The default header signature length.
+pub const HEADER_SIGNATURE_LENGTH: usize = 4;
+/// The default size of the field "header length".
+pub const HEADER_LENGTH_LENGTH: usize = 8;
+/// The default size of the field "header version".
+pub const HEADER_VERSION_LENGTH: usize = 1;
+/// The default chunkmap size
+pub const DEFAULT_CHUNKMAP_SIZE: u64 = 32768;
+/// The chunkmap size has to be a multiple of this value, as required by the
+/// zff specification for the segment header's chunkmap size field.
+pub const CHUNKMAP_SIZE_ALIGNMENT: u64 = 16;
+/// Default buffer size for read operations (64KB)
+pub const DEFAULT_READ_BUFFER_SIZE: usize = 65536;
+/// Small buffer size for metadata operations
+pub const SMALL_BUFFER_SIZE: usize = 8192;
+
+// file metadata extended values
+#[cfg(target_family = "unix")]
+pub(crate) const METADATA_EXT_KEY_DEVID: &str = "devid";
+#[cfg(target_family = "unix")]
+pub(crate) const METADATA_EXT_KEY_INODE: &str = "inode";
+#[cfg(any(target_family = "unix", feature = "los_tar", feature = "vos_tar"))]
+pub(crate) const METADATA_EXT_KEY_MODE: &str = "mode";
+#[cfg(any(target_family = "unix", feature = "los_tar", feature = "vos_tar"))]
+pub(crate) const METADATA_EXT_KEY_UID: &str = "uid";
+#[cfg(any(target_family = "unix", feature = "los_tar", feature = "vos_tar"))]
+pub(crate) const METADATA_EXT_KEY_GID: &str = "gid";
+#[cfg(target_os = "windows")]
+pub(crate) const METADATA_EXT_DW_FILE_ATTRIBUTES: &str = "dwFileAttributes";
+pub(crate) const METADATA_EXT_KEY_UNACCESSABLE_FILE: &str = "ua";
+
+/// The metadata key for atime.
+pub const METADATA_ATIME: &str = "atime";
+/// The metadata key for mtime.
+pub const METADATA_MTIME: &str = "mtime";
+/// The metadata key for ctime.
+pub const METADATA_CTIME: &str = "ctime";
+/// The metadata key for btime.
+pub const METADATA_BTIME: &str = "btime";
+
+// - ChunkMap
+/// Table name for the redb deduplication chunkmap (xxhashes)
+pub const CHUNK_MAP_TABLE: TableDefinition<u64, Vec<u64>> = TableDefinition::new("map");
+/// Table name for the redb deduplication chunkmap (blake3 hashes)
+pub const CHUNK_MAP_B3_TABLE: TableDefinition<u64, &[u8; 32]> = TableDefinition::new("b3_map");
+/// Table name for the redb preloaded chunk offset map
+pub const PRELOADED_CHUNK_OFFSET_MAP_TABLE: TableDefinition<u64, u64> =
+    TableDefinition::new("preloaded_offset_map");
+/// Table name for the redb preloaded chunk size map
+pub const PRELOADED_CHUNK_SIZE_MAP_TABLE: TableDefinition<u64, u64> =
+    TableDefinition::new("preloaded_size_map");
+/// Table name for the redb preloaded chunk flags map
+pub const PRELOADED_CHUNK_FLAGS_MAP_TABLE: TableDefinition<u64, u8> =
+    TableDefinition::new("preloaded_flags_map");
+/// Table name for the redb preloaded chunk xxhash map
+pub const PRELOADED_CHUNK_XXHASH_MAP_TABLE: TableDefinition<u64, u64> =
+    TableDefinition::new("preloaded_xxhash_map");
+/// Table name for the redb preloaded same byte data
+pub const PRELOADED_CHUNK_SAME_BYTES_MAP_TABLE: TableDefinition<u64, u8> =
+    TableDefinition::new("preloaded_same_bytes");
+/// Table name for the redb preloaded chunk duplication map
+pub const PRELOADED_CHUNK_DUPLICATION_MAP_TABLE: TableDefinition<u64, u64> =
+    TableDefinition::new("preloaded_dedup_map");
+
+// Unix ACLs
+#[cfg(all(target_os = "linux", feature = "posix-acl"))]
+pub(crate) const ACL_PREFIX: &str = "acl";
+#[cfg(all(target_os = "linux", feature = "posix-acl"))]
+pub(crate) const ACL_DEFAULT_PREFIX: &str = "acl::d";
+
+// XAttr
+#[cfg(target_family = "unix")]
+pub(crate) const XATTR_ATTRNAME_POSIX_ACL: &str = "system.posix_acl_access";
+#[cfg(target_family = "unix")]
+pub(crate) const XATTR_ATTRNAME_POSIX_ACL_DEFAULT: &str = "system.posix_acl_default";
+
+// type identifier values for metadata extended map values.
+// - primitive types
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_U8: u8 = 0x00;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_U16: u8 = 0x01;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_U32: u8 = 0x02;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_U64: u8 = 0x03;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_I8: u8 = 0x04;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_I16: u8 = 0x05;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_I32: u8 = 0x06;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_I64: u8 = 0x07;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_STRING: u8 = 0x08;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_HASHMAP: u8 = 0x09;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_BTREEMAP: u8 = 0x0A;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_BYTEARRAY: u8 = 0x0B;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_F32: u8 = 0x0C;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_F64: u8 = 0x0D;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_VEC: u8 = 0x0E;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_BOOL: u8 = 0x0F;
+// - self defined types
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_PLATFORM_STRING: u8 = 0xFB;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_VFFC: u8 = 0xFC;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_VLFE: u8 = 0xFD;
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_CHUNK_HEADER: u8 = 0xFE;
+// - unknown type
+pub(crate) const METADATA_EXT_TYPE_IDENTIFIER_UNKNOWN: u8 = 0xFF;
+
+// Virtual file footer content flags
+pub(crate) const VIRTUALFILEFOOTERCONTENT_VFM: u8 = 0x00000000;
+pub(crate) const VIRTUALFILEFOOTERCONTENT_DIRECTORY: u8 = 0x00000001;
+pub(crate) const VIRTUALFILEFOOTERCONTENT_SYMLINK: u8 = 0x00000002;
+pub(crate) const VIRTUALFILEFOOTERCONTENT_HARDLINK: u8 = 0x00000003;
+pub(crate) const VIRTUALFILEFOOTERCONTENT_SPECIAL_FILE: u8 = 0x00000004;
+
+// crypto nonce padding
+/// Crypto nonce padding used for `FileHeader`.
+pub const CRYPTO_NONCE_PADDING_FILE_HEADER: u8 = 0b00000100;
+/// Crypto nonce padding used for `FileFooter` and `VirtualFileFooter`.
+pub const CRYPTO_NONCE_PADDING_FILE_FOOTER: u8 = 0b00001000;
+/// Crypto nonce padding used for `VirtualFileMap`.
+pub const CRYPTO_NONCE_PADDING_VIRTUAL_FILE_MAP: u8 = 0b01111111;
+/// Crypto nonce padding used for `ObjectHeader`.
+pub const CRYPTO_NONCE_PADDING_OBJECT_HEADER: u8 = 0b00010000;
+/// Crypto nonce padding used for `ObjectFooter`.
+pub const CRYPTO_NONCE_PADDING_OBJECT_FOOTER: u8 = 0b00100000;
+/// Crypto nonce padding used for `DeduplicationChunkMap`.
+pub const CRYPTO_NONCE_PADDING_DEDUPLICATION_CHUNKMAP: u8 = 0b00111111;
+/// Crypto nonce padding used for `ChunkHeaderMap`.
+pub const CRYPTO_NONCE_PADDING_CHUNKHEADER_MAP: u8 = 0b00000001;
+/// Crypto nonce padding used for `SameBytesMap`.
+pub const CRYPTO_NONCE_PADDING_SAMEBYTES_MAP: u8 = 0b00011111;
+/// Crypto nonce padding used for chunk content.
+pub const CRYPTO_NONCE_PADDING_CHUNK_CONTENT: u8 = 0b00000000;
+
+/// Encoding key for the logical sector size of the source device.
+pub const ENCODING_KEY_LOGICAL_SECTOR_SIZE: &str = "lss";
+/// Encoding key for the physical sector size of the source device.
+pub const ENCODING_KEY_PHYSICAL_SECTOR_SIZE: &str = "pss";
+/// Encoding key for the model name/number of the source device.
+pub const ENCODING_KEY_MODEL: &str = "mdl";
+/// Encoding key for the serial number of the source device.
+pub const ENCODING_KEY_SERIAL_NUMBER: &str = "sn";
+/// Encoding key for the firmware version of the source device.
+pub const ENCODING_KEY_FIRMWARE: &str = "fw";
+/// Encoding key for the media type of the source device.
+pub const ENCODING_KEY_MEDIA_TYPE: &str = "mt";
+/// Encoding key for the input source path.
+pub const ENCODING_KEY_INPUT_SOURCE: &str = "is";
+/// Encoding key for the operating system/platform.
+pub const ENCODING_KEY_OPERATING_SYSTEM: &str = "os";

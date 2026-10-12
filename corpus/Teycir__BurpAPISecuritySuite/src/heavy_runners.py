@@ -1,0 +1,5160 @@
+# -*- coding: utf-8 -*-
+"""Heavy external-tool runner methods extracted to reduce Jython method size pressure."""
+
+import json
+import os
+import re
+import subprocess
+import tempfile
+import threading
+import time
+
+from java.io import FileWriter
+from java.net import URL
+from javax.swing import SwingUtilities
+
+def _discover_auth_associated_targets_shared(self, target_list, error_label):
+    """Split deduplicated base targets into auth-associated vs unauth-associated sets."""
+    target_by_key = {}
+    for target_url in list(target_list or []):
+        key = self._apihunter_target_key(target_url)
+        if key and key not in target_by_key:
+            target_by_key[key] = target_url
+
+    summary = {
+        "auth_targets": [],
+        "unauth_targets": [],
+        "matched_entries": 0,
+        "auth_entries": 0,
+        "header_auth_entries": 0,
+        "signal_only_entries": 0,
+    }
+    if not target_by_key:
+        return summary
+
+    filtered_source = {}
+    try:
+        filtered_source = dict(self._filter_endpoints())
+    except Exception as e:
+        self._callbacks.printError(
+            "{}: {}".format(self._ascii_safe(error_label), str(e))
+        )
+        filtered_source = {}
+
+    def _entry_header_value(entry, header_name):
+        headers = entry.get("headers") if isinstance(entry, dict) else {}
+        if not isinstance(headers, dict):
+            return ""
+        target = self._ascii_safe(header_name or "", lower=True).strip()
+        for raw_name, raw_value in headers.items():
+            safe_name = self._ascii_safe(raw_name or "", lower=True).strip()
+            if safe_name != target:
+                continue
+            return self._ascii_safe(raw_value or "").strip()
+        return ""
+
+    auth_param_name_markers = set(
+        [
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "token",
+            "jwt",
+            "session",
+            "sessionid",
+            "sid",
+            "auth",
+            "authorization",
+            "api_key",
+            "apikey",
+            "api-key",
+        ]
+    )
+    auth_text_markers = [
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "jwt",
+        "bearer ",
+        "api_key",
+        "apikey",
+        "api-key",
+        "sessionid",
+        "session=",
+    ]
+    extra_header_candidates = [
+        "x-api-key",
+        "api-key",
+        "apikey",
+        "x-auth-token",
+        "x-access-token",
+    ]
+
+    def _entry_has_non_header_auth_signal(entry):
+        auth_detected = [
+            self._ascii_safe(x, lower=True).strip()
+            for x in (entry.get("auth_detected", []) or [])
+        ]
+        if any(x and x != "none" for x in auth_detected):
+            return True
+
+        parameters = entry.get("parameters") if isinstance(entry, dict) else {}
+        if isinstance(parameters, dict):
+            for bucket_name in ["url", "body", "cookie", "json"]:
+                bucket = parameters.get(bucket_name) or {}
+                if not isinstance(bucket, dict):
+                    continue
+                for param_name in bucket.keys():
+                    lower_name = self._ascii_safe(param_name, lower=True).strip()
+                    if lower_name in auth_param_name_markers:
+                        return True
+
+        query_text = self._ascii_safe(entry.get("query_string") or "", lower=True)
+        body_text = self._ascii_safe(entry.get("request_body") or "", lower=True)
+        combined = "{}\n{}".format(query_text, body_text)
+        for marker in auth_text_markers:
+            if marker in combined:
+                return True
+        return False
+
+    auth_target_keys = set()
+    for entries in filtered_source.values():
+        entries_list = entries if isinstance(entries, list) else [entries]
+        for entry in entries_list:
+            if not isinstance(entry, dict):
+                continue
+            host = self._ascii_safe(entry.get("host"), lower=True).strip()
+            if not host:
+                continue
+            protocol = self._ascii_safe(entry.get("protocol"), lower=True).strip() or "https"
+            port = entry.get("port", -1)
+            if port == -1:
+                port = 443 if protocol == "https" else 80
+            if (protocol == "https" and port == 443) or (
+                protocol == "http" and port == 80
+            ):
+                scoped_url = "{}://{}/".format(protocol, host)
+            else:
+                scoped_url = "{}://{}:{}/".format(protocol, host, port)
+            target_key = self._apihunter_target_key(scoped_url)
+            if target_key not in target_by_key:
+                continue
+            summary["matched_entries"] += 1
+
+            has_header_auth = bool(
+                _entry_header_value(entry, "authorization")
+                or _entry_header_value(entry, "cookie")
+            )
+            if not has_header_auth:
+                for header_name in extra_header_candidates:
+                    if _entry_header_value(entry, header_name):
+                        has_header_auth = True
+                        break
+
+            has_non_header_auth_signal = _entry_has_non_header_auth_signal(entry)
+            has_auth_signal = has_header_auth or has_non_header_auth_signal
+            if not has_auth_signal:
+                continue
+
+            if has_header_auth:
+                summary["header_auth_entries"] += 1
+            elif has_non_header_auth_signal:
+                summary["signal_only_entries"] += 1
+            summary["auth_entries"] += 1
+            auth_target_keys.add(target_key)
+
+    ordered_auth = []
+    ordered_unauth = []
+    seen = set()
+    for target_url in list(target_list or []):
+        key = self._apihunter_target_key(target_url)
+        if (not key) or (key in seen):
+            continue
+        seen.add(key)
+        if key in auth_target_keys:
+            ordered_auth.append(target_url)
+        else:
+            ordered_unauth.append(target_url)
+    summary["auth_targets"] = ordered_auth
+    summary["unauth_targets"] = ordered_unauth
+    return summary
+
+def _run_graphql_analysis(self, event):
+    """Run GraphQL-focused analysis using available external tools."""
+    import os
+    import tempfile
+
+    max_targets = self._parse_positive_int(
+        self.graphql_max_targets_field.getText(), 12, 1, 50
+    )
+    targets = self._collect_graphql_targets(max_targets)
+    if not targets:
+        self.graphql_area.setText(
+            "[!] No GraphQL targets found.\n[*] Enter targets manually or capture GraphQL traffic in Recon first.\n"
+        )
+        return
+
+    self.graphql_area.setText("[*] GraphQL analysis starting...\n")
+    self.graphql_area.append("[*] Targets: {}\n".format(len(targets)))
+    for target in targets:
+        self.graphql_area.append("  - {}\n".format(target))
+    self.graphql_area.append("\n")
+    self._clear_tool_cancel("graphqlanalysis")
+
+    def run_analysis():
+        temp_dir = tempfile.mkdtemp(prefix="burp_graphql_")
+        discovered_urls = set(targets)
+        findings = []
+        recon_candidates = []
+        for target_url in targets:
+            clean_target = self._clean_url(target_url)
+            if clean_target:
+                recon_candidates.append({"method": "GET", "url": clean_target})
+        tool_available = {}
+        available_tools = []
+        missing_tools = []
+
+        def append_line(text):
+            SwingUtilities.invokeLater(
+                lambda t=self._ascii_safe(text): self.graphql_area.append(t)
+            )
+
+        def check_tool(name, path, required_tokens, forbidden_tokens=None):
+            forbidden_tokens = forbidden_tokens or []
+            if not path:
+                append_line("[MISSING] {} path not configured\n".format(name))
+                missing_tools.append(name)
+                return False
+            probe_ok, help_text, probe_error = self._probe_binary_help(path)
+            if not probe_ok:
+                append_line(
+                    "[MISSING] {} -> {} ({})\n".format(
+                        name,
+                        path,
+                        self._ascii_safe(probe_error or "binary probe failed"),
+                    )
+                )
+                missing_tools.append(name)
+                return False
+            sig = self._evaluate_help_text(
+                help_text,
+                required_tokens=required_tokens,
+                forbidden_tokens=forbidden_tokens,
+            )
+            if not sig.get("healthy"):
+                append_line(
+                    "[MISSING] {} incompatible: missing={} forbidden={}\n".format(
+                        name,
+                        ",".join(sig.get("missing") or []),
+                        ",".join(sig.get("forbidden_found") or []),
+                    )
+                )
+                missing_tools.append(name)
+                return False
+            append_line("[USED] {} -> {}\n".format(name, path))
+            available_tools.append(name)
+            return True
+
+        try:
+            append_line("=" * 80 + "\n")
+            append_line("GRAPHQL ANALYSIS - TOOL STATUS\n")
+            append_line("=" * 80 + "\n")
+
+            httpx_path = self._resolve_graphql_tool_path(
+                "httpx_path_field",
+                [
+                    os.path.expanduser("~/go/bin/httpx"),
+                    "httpx",
+                ],
+            )
+            katana_path = self._resolve_graphql_tool_path(
+                "katana_path_field",
+                [
+                    os.path.expanduser("~/go/bin/katana"),
+                    "katana",
+                ],
+            )
+            ffuf_path = self._resolve_graphql_tool_path(
+                "ffuf_path_field",
+                [
+                    os.path.expanduser("~/go/bin/ffuf"),
+                    "ffuf",
+                ],
+            )
+            nuclei_path = self._resolve_graphql_tool_path(
+                "nuclei_path_field",
+                [
+                    os.path.expanduser("~/go/bin/nuclei"),
+                    "nuclei",
+                ],
+            )
+            dalfox_path = self._resolve_graphql_tool_path(
+                "dalfox_path_field",
+                [
+                    os.path.expanduser("~/go/bin/dalfox"),
+                    "dalfox",
+                ],
+            )
+            sqlmap_path = self._resolve_graphql_tool_path(
+                "sqlmap_path_field",
+                [
+                    os.path.expanduser("~/.local/bin/sqlmap"),
+                    "sqlmap",
+                ],
+            )
+
+            tool_available["HTTPX"] = check_tool(
+                "HTTPX",
+                httpx_path,
+                ["-l", "-status-code", "-silent"],
+                [
+                    "a next generation http client",
+                    "usage: httpx <url> [options]",
+                ],
+            )
+            tool_available["Katana"] = check_tool(
+                "Katana", katana_path, ["-u", "-d"]
+            )
+            tool_available["FFUF"] = check_tool("FFUF", ffuf_path, ["-u", "-w"])
+            tool_available["Nuclei"] = check_tool(
+                "Nuclei", nuclei_path, ["-list", "-tags", "-etags", "-jsonl"]
+            )
+            tool_available["Dalfox"] = check_tool(
+                "Dalfox", dalfox_path, ["url", "--format", "-o"]
+            )
+            tool_available["SQLMap"] = check_tool(
+                "SQLMap", sqlmap_path, ["-u", "--batch", "--level"]
+            )
+            append_line(
+                "[*] Available: {}\n".format(
+                    ", ".join(available_tools) if available_tools else "none"
+                )
+            )
+            append_line(
+                "[*] Missing: {}\n\n".format(
+                    ", ".join(missing_tools) if missing_tools else "none"
+                )
+            )
+
+            # Stage 0: Passive GraphQL synthesis from captured Recon traffic
+            passive_graphql_hits = []
+            passive_seen_urls = set()
+            target_set = set()
+            for url in targets:
+                clean_target = self._clean_url(url)
+                if clean_target:
+                    target_set.add(clean_target)
+            target_bases = set(self._graphql_base_urls(targets))
+            with self.lock:
+                api_snapshot = list(self.api_data.values())
+            for records in api_snapshot:
+                rows = records if isinstance(records, list) else [records]
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    score = int(self._graphql_target_candidate_score(row) or 0)
+                    candidate_url = self._clean_url(self._build_url(row, True))
+                    if not candidate_url:
+                        continue
+                    low_url = self._ascii_safe(candidate_url, lower=True)
+                    url_has_graphql_marker = any(
+                        marker in low_url
+                        for marker in ["graphql", "graphiql", "playground"]
+                    )
+                    if (score <= 0) and (not url_has_graphql_marker):
+                        continue
+                    base_candidates = self._graphql_base_urls([candidate_url])
+                    candidate_base = base_candidates[0] if base_candidates else ""
+                    in_scope = candidate_url in target_set or (
+                        candidate_base and candidate_base in target_bases
+                    )
+                    if (score <= 0) and (not in_scope):
+                        continue
+                    if (
+                        target_bases
+                        and candidate_base
+                        and (candidate_base not in target_bases)
+                        and (candidate_url not in target_set)
+                    ):
+                        continue
+
+                    discovered_urls.add(candidate_url)
+                    if candidate_url in passive_seen_urls:
+                        continue
+                    passive_seen_urls.add(candidate_url)
+                    passive_graphql_hits.append(candidate_url)
+
+                    method_text = self._ascii_safe(
+                        row.get("method") or "GET", lower=True
+                    ).strip().upper()
+                    if not method_text:
+                        method_text = "GET"
+                    status_value = self._ascii_safe(
+                        row.get("response_status") or row.get("status") or ""
+                    ).strip()
+                    auth_values = row.get("auth_detected") or []
+                    auth_tokens = []
+                    if isinstance(auth_values, list):
+                        for auth in auth_values[:3]:
+                            token = self._ascii_safe(auth).strip()
+                            if token:
+                                auth_tokens.append(token)
+                    auth_text = ",".join(auth_tokens) if auth_tokens else "-"
+
+                    recon_candidates.append(
+                        {"method": method_text, "url": candidate_url}
+                    )
+                    findings.append(
+                        "[CAPTURE] {} {} | status={} | score={} | auth={}".format(
+                            method_text,
+                            candidate_url,
+                            status_value or "?",
+                            score,
+                            auth_text,
+                        )
+                    )
+                    if len(passive_graphql_hits) >= 250:
+                        break
+                if len(passive_graphql_hits) >= 250:
+                    break
+            append_line(
+                "[*] Passive capture GraphQL matches: {}\n".format(
+                    len(passive_graphql_hits)
+                )
+            )
+
+            # Stage 1: HTTPX validation
+            alive_urls = []
+            if tool_available.get("HTTPX"):
+                httpx_targets_file = os.path.join(temp_dir, "httpx_targets.txt")
+                httpx_json = os.path.join(temp_dir, "httpx.jsonl")
+                with open(httpx_targets_file, "w") as writer:
+                    for url in sorted(discovered_urls):
+                        writer.write(url + "\n")
+                cmd = [
+                    httpx_path,
+                    "-l",
+                    httpx_targets_file,
+                    "-silent",
+                    "-sc",
+                    "-title",
+                    "-json",
+                    "-timeout",
+                    "12",
+                    "-o",
+                    httpx_json,
+                ]
+                append_line("[*] Tool: HTTPX\n")
+                append_line("[*] CMD: {}\n".format(" ".join(cmd)))
+                ok, cancelled, _, err = self._run_command_stage(
+                    "graphqlanalysis",
+                    "HTTPX",
+                    cmd,
+                    self.graphql_area,
+                    180,
+                    heartbeat_seconds=10,
+                )
+                if cancelled:
+                    append_line("[!] GraphQL analysis cancelled by user\n")
+                    return
+                if not ok:
+                    append_line("[!] HTTPX error: {}\n".format(self._ascii_safe(err)))
+                if os.path.exists(httpx_json):
+                    with open(httpx_json, "r") as reader:
+                        for line in reader:
+                            safe_line = self._ascii_safe(line).strip()
+                            if not safe_line:
+                                continue
+                            try:
+                                row = json.loads(safe_line)
+                            except Exception as parse_err:
+                                self._callbacks.printError(
+                                    "GraphQL HTTPX JSON parse error: {}".format(
+                                        str(parse_err)
+                                    )
+                                )
+                                continue
+                            url_value = self._ascii_safe(row.get("url") or "").strip()
+                            status_code = int(row.get("status_code") or 0)
+                            if url_value and status_code >= 200 and status_code < 500:
+                                alive_urls.append(url_value)
+                                discovered_urls.add(url_value)
+                                recon_candidates.append(
+                                    {"method": "GET", "url": url_value}
+                                )
+
+            # Stage 2: Katana crawl
+            katana_found = []
+            if tool_available.get("Katana"):
+                for idx, base in enumerate(self._graphql_base_urls(alive_urls or targets)[:5]):
+                    katana_out = os.path.join(temp_dir, "katana_{}.txt".format(idx))
+                    cmd = [
+                        katana_path,
+                        "-u",
+                        base,
+                        "-silent",
+                        "-d",
+                        "1",
+                        "-c",
+                        "5",
+                        "-p",
+                        "5",
+                        "-rl",
+                        "5",
+                        "-o",
+                        katana_out,
+                    ]
+                    append_line("[*] Tool: Katana\n")
+                    append_line("[*] CMD: {}\n".format(" ".join(cmd)))
+                    ok, cancelled, _, err = self._run_command_stage(
+                        "graphqlanalysis",
+                        "Katana",
+                        cmd,
+                        self.graphql_area,
+                        120,
+                        heartbeat_seconds=8,
+                    )
+                    if cancelled:
+                        append_line("[!] GraphQL analysis cancelled by user\n")
+                        return
+                    if not ok:
+                        append_line("[!] Katana error: {}\n".format(self._ascii_safe(err)))
+                    if os.path.exists(katana_out):
+                        with open(katana_out, "r") as reader:
+                            for line in reader:
+                                url_value = self._clean_url(line)
+                                low = self._ascii_safe(url_value, lower=True)
+                                if not url_value:
+                                    continue
+                                if any(
+                                    marker in low
+                                    for marker in [
+                                        "graphql",
+                                        "graphiql",
+                                        "playground",
+                                        "swagger",
+                                        "openapi",
+                                        "api-docs",
+                                    ]
+                                ):
+                                    katana_found.append(url_value)
+                                    discovered_urls.add(url_value)
+                                    recon_candidates.append(
+                                        {"method": "GET", "url": url_value}
+                                    )
+
+            # Stage 3: FFUF GraphQL path probing
+            ffuf_found = []
+            if tool_available.get("FFUF"):
+                words_file = os.path.join(temp_dir, "graphql_words.txt")
+                with open(words_file, "w") as writer:
+                    writer.write(
+                        "\n".join(
+                            [
+                                "graphql",
+                                "api/graphql",
+                                "v1/graphql",
+                                "v2/graphql",
+                                "graphiql",
+                                "playground",
+                                "api-docs",
+                                "swagger.json",
+                                "openapi.json",
+                            ]
+                        )
+                    )
+                for idx, base in enumerate(self._graphql_base_urls(alive_urls or targets)[:5]):
+                    ffuf_json = os.path.join(temp_dir, "ffuf_{}.json".format(idx))
+                    cmd = [
+                        ffuf_path,
+                        "-u",
+                        base.rstrip("/") + "/FUZZ",
+                        "-w",
+                        words_file,
+                        "-mc",
+                        "200,204,301,302,307,401,403",
+                        "-s",
+                        "-timeout",
+                        "5",
+                        "-rate",
+                        "20",
+                        "-of",
+                        "json",
+                        "-o",
+                        ffuf_json,
+                    ]
+                    append_line("[*] Tool: FFUF\n")
+                    append_line("[*] CMD: {}\n".format(" ".join(cmd)))
+                    ok, cancelled, _, err = self._run_command_stage(
+                        "graphqlanalysis",
+                        "FFUF",
+                        cmd,
+                        self.graphql_area,
+                        80,
+                        heartbeat_seconds=8,
+                    )
+                    if cancelled:
+                        append_line("[!] GraphQL analysis cancelled by user\n")
+                        return
+                    if not ok:
+                        append_line("[!] FFUF error: {}\n".format(self._ascii_safe(err)))
+                    if os.path.exists(ffuf_json):
+                        try:
+                            with open(ffuf_json, "r") as reader:
+                                data = json.loads(self._ascii_safe(reader.read()))
+                            for item in data.get("results", []):
+                                url_value = self._clean_url(item.get("url") or "")
+                                if url_value:
+                                    ffuf_found.append(url_value)
+                                    discovered_urls.add(url_value)
+                                    recon_candidates.append(
+                                        {"method": "GET", "url": url_value}
+                                    )
+                        except Exception as parse_err:
+                            append_line(
+                                "[!] FFUF parse error: {}\n".format(
+                                    self._ascii_safe(parse_err)
+                                )
+                            )
+
+            # Stage 4: Focused Nuclei
+            nuclei_lines = []
+            if tool_available.get("Nuclei"):
+                nuclei_targets = sorted(
+                    [
+                        url
+                        for url in discovered_urls
+                        if any(
+                            token in self._ascii_safe(url, lower=True)
+                            for token in ["graphql", "graphiql", "playground"]
+                        )
+                    ]
+                )
+                if not nuclei_targets:
+                    nuclei_targets = list(sorted(set(alive_urls or targets)))
+                nuclei_targets_file = os.path.join(temp_dir, "nuclei_targets.txt")
+                nuclei_txt = os.path.join(temp_dir, "nuclei.txt")
+                nuclei_json = os.path.join(temp_dir, "nuclei.jsonl")
+                with open(nuclei_targets_file, "w") as writer:
+                    for url in nuclei_targets[:40]:
+                        writer.write(url + "\n")
+                cmd = [
+                    nuclei_path,
+                    "-list",
+                    nuclei_targets_file,
+                    "-tags",
+                    "swagger,openapi,graphql,auth,jwt",
+                    "-etags",
+                    "dos,intrusive,headless,cve,fuzz,fuzzing,brute-force",
+                    "-timeout",
+                    "10",
+                    "-retries",
+                    "1",
+                    "-rate-limit",
+                    "40",
+                    "-c",
+                    "8",
+                    "-silent",
+                    "-disable-update-check",
+                    "-no-httpx",
+                    "-jsonl-export",
+                    nuclei_json,
+                    "-o",
+                    nuclei_txt,
+                ]
+                append_line("[*] Tool: Nuclei\n")
+                append_line("[*] CMD: {}\n".format(" ".join(cmd)))
+                ok, cancelled, _, err = self._run_command_stage(
+                    "graphqlanalysis",
+                    "Nuclei",
+                    cmd,
+                    self.graphql_area,
+                    240,
+                    heartbeat_seconds=12,
+                )
+                if cancelled:
+                    append_line("[!] GraphQL analysis cancelled by user\n")
+                    return
+                if not ok:
+                    append_line("[!] Nuclei error: {}\n".format(self._ascii_safe(err)))
+                if os.path.exists(nuclei_txt):
+                    with open(nuclei_txt, "r") as reader:
+                        for line in reader:
+                            clean_line = self._ascii_safe(line).strip()
+                            if clean_line:
+                                nuclei_lines.append(clean_line)
+                                findings.append("[NUCLEI] {}".format(clean_line))
+
+            # Stage 5: Dalfox/SQLMap on query targets
+            query_targets = [
+                url for url in sorted(discovered_urls) if "?" in self._ascii_safe(url)
+            ][:3]
+            if tool_available.get("Dalfox"):
+                if not query_targets:
+                    append_line("[SKIP] Dalfox: no query-string targets available\n")
+                else:
+                    for idx, url_value in enumerate(query_targets):
+                        dalfox_out = os.path.join(temp_dir, "dalfox_{}.jsonl".format(idx))
+                        cmd = [
+                            dalfox_path,
+                            "url",
+                            url_value,
+                            "--format",
+                            "jsonl",
+                            "-o",
+                            dalfox_out,
+                            "-S",
+                            "--no-color",
+                            "--timeout",
+                            "8",
+                            "--worker",
+                            "20",
+                            "--skip-bav",
+                            "--skip-mining-all",
+                            "--skip-mining-dom",
+                            "--skip-headless",
+                        ]
+                        append_line("[*] Tool: Dalfox\n")
+                        append_line("[*] CMD: {}\n".format(" ".join(cmd)))
+                        ok, cancelled, _, err = self._run_command_stage(
+                            "graphqlanalysis",
+                            "Dalfox",
+                            cmd,
+                            self.graphql_area,
+                            120,
+                            heartbeat_seconds=10,
+                        )
+                        if cancelled:
+                            append_line("[!] GraphQL analysis cancelled by user\n")
+                            return
+                        if not ok:
+                            append_line("[!] Dalfox error: {}\n".format(self._ascii_safe(err)))
+                        if os.path.exists(dalfox_out) and os.path.getsize(dalfox_out) > 0:
+                            with open(dalfox_out, "r") as reader:
+                                for line in reader:
+                                    clean_line = self._ascii_safe(line).strip()
+                                    if clean_line:
+                                        findings.append("[DALFOX] {}".format(clean_line[:300]))
+
+            if tool_available.get("SQLMap"):
+                if not query_targets:
+                    append_line("[SKIP] SQLMap: no query-string targets available\n")
+                else:
+                    for url_value in query_targets[:2]:
+                        cmd = [
+                            sqlmap_path,
+                            "-u",
+                            url_value,
+                            "--batch",
+                            "--level",
+                            "1",
+                            "--risk",
+                            "1",
+                            "--threads",
+                            "1",
+                            "--timeout",
+                            "6",
+                            "--retries",
+                            "0",
+                            "--flush-session",
+                        ]
+                        append_line("[*] Tool: SQLMap\n")
+                        append_line("[*] CMD: {}\n".format(" ".join(cmd)))
+                        ok, cancelled, stdout_data, err = self._run_command_stage(
+                            "graphqlanalysis",
+                            "SQLMap",
+                            cmd,
+                            self.graphql_area,
+                            120,
+                            heartbeat_seconds=10,
+                        )
+                        if cancelled:
+                            append_line("[!] GraphQL analysis cancelled by user\n")
+                            return
+                        evidence = self._extract_sqlmap_evidence(
+                            "{}\n{}".format(stdout_data or "", err or "")
+                        )
+                        if evidence:
+                            findings.append(
+                                "[SQLMAP] {} | {}".format(url_value, evidence)
+                            )
+
+            # Final summary
+            cleaned_candidates = []
+            candidate_seen = set()
+            for candidate in recon_candidates:
+                url_value = self._clean_url(candidate.get("url") or "")
+                if not url_value or url_value in candidate_seen:
+                    continue
+                candidate_seen.add(url_value)
+                method_value = self._ascii_safe(
+                    candidate.get("method") or "GET", lower=True
+                ).strip().upper()
+                if not method_value:
+                    method_value = "GET"
+                cleaned_candidates.append({"method": method_value, "url": url_value})
+
+            summary_lines = []
+            summary_lines.append("\n" + "=" * 80)
+            summary_lines.append("GRAPHQL ANALYSIS RESULTS")
+            summary_lines.append("=" * 80)
+            summary_lines.append("[*] Targets input: {}".format(len(targets)))
+            summary_lines.append(
+                "[*] Captured GraphQL matches: {}".format(len(passive_graphql_hits))
+            )
+            summary_lines.append("[*] Tools available: {}".format(len(available_tools)))
+            summary_lines.append("[*] Tools missing: {}".format(len(missing_tools)))
+            summary_lines.append("[*] HTTPX alive URLs: {}".format(len(alive_urls)))
+            summary_lines.append("[*] Katana GraphQL-like URLs: {}".format(len(katana_found)))
+            summary_lines.append("[*] FFUF hits: {}".format(len(ffuf_found)))
+            summary_lines.append("[*] Nuclei findings: {}".format(len(nuclei_lines)))
+            summary_lines.append("[*] Total findings lines: {}".format(len(findings)))
+            summary_lines.append(
+                "[*] Recon candidates prepared: {}".format(len(cleaned_candidates))
+            )
+            summary_lines.append("")
+            if missing_tools:
+                summary_lines.append("[!] Missing tools: {}".format(", ".join(missing_tools)))
+                summary_lines.append("")
+            summary_lines.extend(
+                findings[:80] if findings else ["[+] No findings from focused checks"]
+            )
+            if len(findings) > 80:
+                summary_lines.append(
+                    "[*] {} more findings lines not shown".format(len(findings) - 80)
+                )
+
+            with self.graphql_lock:
+                self.graphql_results = list(summary_lines)
+                self.graphql_recon_candidates = list(cleaned_candidates)
+
+            append_line("\n".join(summary_lines) + "\n")
+            SwingUtilities.invokeLater(
+                lambda: self.log_to_ui(
+                    "[+] GraphQL analysis complete: {} findings, {} recon candidates".format(
+                        len(findings), len(cleaned_candidates)
+                    )
+                )
+            )
+        except Exception as e:
+            append_line("[!] GraphQL analysis error: {}\n".format(self._ascii_safe(e)))
+            err_msg = self._ascii_safe(e)
+            SwingUtilities.invokeLater(
+                lambda m=err_msg: self.log_to_ui(
+                    "[!] GraphQL analysis error: {}".format(m)
+                )
+            )
+        finally:
+            self._clear_tool_cancel("graphqlanalysis")
+            self._cleanup_temp_dir(temp_dir, "graphql analysis")
+
+    worker = threading.Thread(target=run_analysis)
+    worker.daemon = True
+    worker.start()
+
+def _run_nuclei(self):
+    """Run Nuclei scanner on endpoints from Recon tab"""
+    import os
+    import subprocess
+
+    nuclei_path = self.nuclei_path_field.getText().strip()
+    if not nuclei_path:
+        self.nuclei_area.setText("[!] Configure Nuclei path first\n")
+        return
+    if not self.api_data:
+        self.nuclei_area.setText(
+            "[!] No endpoints in Recon tab. Capture or import first\n"
+        )
+        return
+    if not self._validate_binary_signature(
+        "Nuclei",
+        nuclei_path,
+        self.nuclei_area,
+        required_tokens=["-list", "-jsonl", "-tags", "-etags"],
+        forbidden_tokens=[],
+        fix_hint="Set Nuclei Path to your local ProjectDiscovery nuclei binary (for example: /home/teycir/go/bin/nuclei).",
+    ):
+        return
+
+    # Create temp file in /tmp instead of auto-saving to user directory
+    import tempfile
+
+    temp_dir = tempfile.mkdtemp(prefix="burp_nuclei_")
+    targets_file = os.path.join(temp_dir, "targets.txt")
+    output_file = os.path.join(temp_dir, "results.txt")
+    json_file = os.path.join(temp_dir, "results.json")
+
+    targets, target_meta = self._collect_nuclei_targets()
+    if not targets:
+        self._cleanup_temp_dir(temp_dir, "nuclei empty target set")
+        self.nuclei_area.setText(
+            "[!] No Nuclei targets after filtering. Capture more first-party API traffic or adjust host filter.\n"
+        )
+        return
+
+    # Write scoped targets for endpoint discovery
+    writer = None
+    try:
+        writer = FileWriter(targets_file)
+        for target in targets:
+            writer.write(target + "\n")
+    finally:
+        if writer:
+            try:
+                writer.close()
+            except Exception as e:
+                self._callbacks.printError(
+                    "Error closing nuclei scan targets file: {}".format(str(e))
+                )
+    target_count = len(targets)
+    profile_value = self._selected_profile_value(
+        getattr(self, "nuclei_profile_combo", None)
+    )
+    nuclei_profile_cfg = self._nuclei_profile_settings(profile_value)
+
+    use_custom_nuclei, custom_nuclei_command = self._resolve_custom_command(
+        "Nuclei",
+        self.nuclei_custom_cmd_checkbox,
+        self.nuclei_custom_cmd_field,
+        {
+            "nuclei_path": nuclei_path,
+            "targets_file": targets_file,
+            "output_file": output_file,
+            "json_file": json_file,
+        },
+        self.nuclei_area,
+    )
+    if use_custom_nuclei and not custom_nuclei_command:
+        self._cleanup_temp_dir(temp_dir, "nuclei custom command validation")
+        return
+    auth_mode = "Auth + Unauth"
+    try:
+        auth_mode = str(self.nuclei_auth_mode_combo.getSelectedItem())
+    except Exception as e:
+        self._callbacks.printError("Nuclei auth mode read error: {}".format(str(e)))
+
+    if use_custom_nuclei and self._ascii_safe(auth_mode, lower=True).strip() in [
+        "auth + unauth",
+        "auth+unauth",
+    ]:
+        self._cleanup_temp_dir(temp_dir, "nuclei custom command dual-pass validation")
+        self.nuclei_area.setText(
+            "[!] Auth + Unauth mode is not supported when 'Enable Custom' is active\n"
+        )
+        self.nuclei_area.append(
+            "[*] Disable custom mode to run dual-pass, or keep custom mode with Auth Only/Unauth Only.\n"
+        )
+        return
+
+    probe_ok, help_text, _ = self._probe_binary_help(nuclei_path)
+    supports_jsonl_export = bool(
+        probe_ok and "-jsonl-export" in (help_text or "").lower()
+    )
+    help_text_lower = (help_text or "").lower()
+    supports_max_host_error = bool(probe_ok and "-max-host-error" in help_text_lower)
+    supports_bulk_size = bool(probe_ok and "-bulk-size" in help_text_lower)
+    supports_scan_strategy = bool(probe_ok and "-scan-strategy" in help_text_lower)
+    supports_no_httpx = bool(probe_ok and "-no-httpx" in help_text_lower)
+    supports_project_mode = bool(probe_ok and "-project" in help_text_lower)
+
+    self.log_to_ui("[*] Nuclei discovery: {} scoped targets".format(target_count))
+    self.log_to_ui("[*] Targets: {}".format(targets_file))
+    self.log_to_ui("[*] Output: {}".format(output_file))
+    self.nuclei_area.setText("[*] Initializing Nuclei (WAF EVASION MODE)...\n")
+    self.nuclei_area.append(
+        "[*] Profile: {}\n".format(nuclei_profile_cfg.get("profile", profile_value))
+    )
+    self.nuclei_area.append("[*] Auth Mode: {}\n".format(auth_mode))
+    self.nuclei_area.append(
+        "[*] Discovery targets: {} (scoped first-party hosts/paths)\n".format(
+            target_count
+        )
+    )
+    if target_meta.get("manual_scope_enabled"):
+        self.nuclei_area.append(
+            "[*] Target base scope: {} lines | hosts={} | bases={}\n".format(
+                target_meta.get("manual_scope_line_count", 0),
+                target_meta.get("manual_scope_host_count", 0),
+                target_meta.get("manual_scope_base_count", 0),
+            )
+        )
+        preview = target_meta.get("manual_scope_preview", [])
+        if preview:
+            self.nuclei_area.append(
+                "[*] Scope preview: {}\n".format(", ".join(preview))
+            )
+    elif target_meta.get("force_host"):
+        self.nuclei_area.append(
+            "[*] Host scope: {}\n".format(target_meta.get("selected_host", "unknown"))
+        )
+    else:
+        allowed_bases = target_meta.get("allowed_bases", [])
+        if allowed_bases:
+            self.nuclei_area.append(
+                "[*] First-party base scope: {}\n".format(", ".join(allowed_bases))
+            )
+    self.nuclei_area.append(
+        "[*] Filtered out: noise-host={} scope-host={} path-noise={}\n".format(
+            target_meta.get("dropped_noise_host", 0),
+            target_meta.get("dropped_scope_host", 0),
+            target_meta.get("dropped_path", 0),
+        )
+    )
+    if target_meta.get("truncated", 0) > 0:
+        self.nuclei_area.append(
+            "[*] Target cap applied: {} skipped (max {})\n".format(
+                target_meta.get("truncated", 0), self.NUCLEI_MAX_TARGETS
+            )
+        )
+    self.nuclei_area.append(
+        "[*] Tags: {}\n".format(nuclei_profile_cfg.get("include_tags", ""))
+    )
+    self.nuclei_area.append(
+        "[*] Excluding: {}\n".format(nuclei_profile_cfg.get("exclude_tags", ""))
+    )
+    self.nuclei_area.append(
+        "[*] Timeout: {}s, Retries: {} (resilient mode)\n".format(
+            nuclei_profile_cfg.get("request_timeout", self.NUCLEI_REQUEST_TIMEOUT_SECONDS),
+            nuclei_profile_cfg.get("retries", self.NUCLEI_RETRIES),
+        )
+    )
+    self.nuclei_area.append(
+        "[*] Rate: {} req/s, Concurrency: {} (balanced mode)\n".format(
+            nuclei_profile_cfg.get("rate_limit", self.NUCLEI_RATE_LIMIT),
+            nuclei_profile_cfg.get("concurrency", self.NUCLEI_CONCURRENCY),
+        )
+    )
+    self.nuclei_area.append(
+        "[*] Scan strategy: {} | Bulk size: {} | Max host errors: {}\n".format(
+            nuclei_profile_cfg.get("scan_strategy", self.NUCLEI_SCAN_STRATEGY),
+            nuclei_profile_cfg.get("bulk_size", self.NUCLEI_BULK_SIZE),
+            nuclei_profile_cfg.get("max_host_error", self.NUCLEI_MAX_HOST_ERROR),
+        )
+    )
+    self.nuclei_area.append("[*] Evasion: Header-based spoofing (X-Forwarded-For)\n\n")
+    self._clear_tool_cancel("nuclei")
+
+    def _pick_best_frequency_value(counter_map):
+        items = list((counter_map or {}).items())
+        if not items:
+            return ""
+        ordered = sorted(
+            items,
+            key=lambda item: (
+                -int(item[1]),
+                -len(self._ascii_safe(item[0])),
+                self._ascii_safe(item[0]),
+            ),
+        )
+        return self._ascii_safe(ordered[0][0]).strip()
+
+    def _entry_header_value(entry, header_name):
+        headers = entry.get("headers") if isinstance(entry, dict) else {}
+        if not isinstance(headers, dict):
+            return ""
+        target = self._ascii_safe(header_name or "", lower=True).strip()
+        for raw_name, raw_value in headers.items():
+            safe_name = self._ascii_safe(raw_name or "", lower=True).strip()
+            if safe_name != target:
+                continue
+            return self._ascii_safe(raw_value or "").strip()
+        return ""
+
+    def _cookie_header_to_pairs(raw_cookie):
+        text = self._ascii_safe(raw_cookie or "").strip()
+        if not text:
+            return []
+        ignored_cookie_attrs = set(
+            [
+                "path",
+                "domain",
+                "expires",
+                "max-age",
+                "secure",
+                "httponly",
+                "samesite",
+                "priority",
+            ]
+        )
+        pairs = []
+        seen = set()
+        for chunk in text.split(";"):
+            part = self._ascii_safe(chunk or "").strip()
+            if (not part) or ("=" not in part):
+                continue
+            name, value = part.split("=", 1)
+            name = self._ascii_safe(name).strip()
+            value = self._ascii_safe(value).strip()
+            lower_name = self._ascii_safe(name, lower=True)
+            if (not name) or (not value) or (lower_name in ignored_cookie_attrs):
+                continue
+            if lower_name in seen:
+                continue
+            seen.add(lower_name)
+            pairs.append("{}={}".format(name, value))
+            if len(pairs) >= 20:
+                break
+        return pairs
+
+    def _discover_auth_associated_targets(target_list):
+        return _discover_auth_associated_targets_shared(
+            self,
+            target_list,
+            "Nuclei auth target discovery snapshot error",
+        )
+
+    def _collect_auth_context_for_targets(target_list):
+        target_keys = set()
+        for target_url in list(target_list or []):
+            key = self._apihunter_target_key(target_url)
+            if key:
+                target_keys.add(key)
+
+        context = {
+            "headers": [],
+            "cookies": [],
+            "matched_entries": 0,
+            "auth_candidates_found": 0,
+        }
+        if not target_keys:
+            return context
+
+        filtered_source = {}
+        try:
+            filtered_source = dict(self._filter_endpoints())
+        except Exception as e:
+            self._callbacks.printError(
+                "Nuclei auth context source snapshot error: {}".format(str(e))
+            )
+            filtered_source = {}
+
+        interesting_auth_headers = [
+            ("x-api-key", "X-API-Key"),
+            ("api-key", "Api-Key"),
+            ("apikey", "ApiKey"),
+            ("x-auth-token", "X-Auth-Token"),
+            ("x-access-token", "X-Access-Token"),
+        ]
+        authorization_counts = {}
+        cookie_counts = {}
+        extra_header_counts = {}
+
+        for entries in filtered_source.values():
+            entries_list = entries if isinstance(entries, list) else [entries]
+            for entry in entries_list:
+                if not isinstance(entry, dict):
+                    continue
+                host = self._ascii_safe(entry.get("host"), lower=True).strip()
+                if not host:
+                    continue
+                protocol = (
+                    self._ascii_safe(entry.get("protocol"), lower=True).strip()
+                    or "https"
+                )
+                port = entry.get("port", -1)
+                if port == -1:
+                    port = 443 if protocol == "https" else 80
+                if (protocol == "https" and port == 443) or (
+                    protocol == "http" and port == 80
+                ):
+                    scoped_url = "{}://{}/".format(protocol, host)
+                else:
+                    scoped_url = "{}://{}:{}/".format(protocol, host, port)
+                target_key = self._apihunter_target_key(scoped_url)
+                if target_key not in target_keys:
+                    continue
+
+                context["matched_entries"] += 1
+                authorization_value = _entry_header_value(entry, "authorization")
+                if authorization_value:
+                    authorization_counts[authorization_value] = (
+                        authorization_counts.get(authorization_value, 0) + 1
+                    )
+                cookie_value = _entry_header_value(entry, "cookie")
+                if cookie_value:
+                    cookie_counts[cookie_value] = (
+                        cookie_counts.get(cookie_value, 0) + 1
+                    )
+                for lower_header_name, display_header_name in interesting_auth_headers:
+                    header_value = _entry_header_value(entry, lower_header_name)
+                    if not header_value:
+                        continue
+                    rendered = "{}: {}".format(display_header_name, header_value)
+                    extra_header_counts[rendered] = (
+                        extra_header_counts.get(rendered, 0) + 1
+                    )
+
+        selected_authorization = _pick_best_frequency_value(authorization_counts)
+        if selected_authorization:
+            context["headers"].append("Authorization: {}".format(selected_authorization))
+            context["auth_candidates_found"] += 1
+
+        for rendered_header, _count in sorted(
+            extra_header_counts.items(), key=lambda item: (-item[1], item[0])
+        ):
+            context["headers"].append(rendered_header)
+            context["auth_candidates_found"] += 1
+            if len(context["headers"]) >= 6:
+                break
+
+        selected_cookie = _pick_best_frequency_value(cookie_counts)
+        cookie_pairs = _cookie_header_to_pairs(selected_cookie)
+        if cookie_pairs:
+            context["cookies"] = cookie_pairs
+            context["auth_candidates_found"] += len(cookie_pairs)
+        return context
+
+    def _append_auth_context_to_nuclei_command(base_cmd, auth_context):
+        cmd_local = list(base_cmd or [])
+        for header_line in list(auth_context.get("headers", []) or []):
+            clean_header = self._ascii_safe(header_line).strip()
+            if clean_header:
+                cmd_local.extend(["-header", clean_header])
+        cookies = list(auth_context.get("cookies", []) or [])
+        if cookies:
+            cmd_local.extend(["-header", "Cookie: {}".format("; ".join(cookies))])
+        return cmd_local
+
+    def _append_auth_context_to_custom_nuclei_command(command_text, auth_context):
+        rendered = self._ascii_safe(command_text or "").strip()
+        for header_line in list(auth_context.get("headers", []) or []):
+            clean_header = self._ascii_safe(header_line).strip()
+            if clean_header:
+                rendered += " -header {}".format(
+                    self._quote_custom_command_value(clean_header)
+                )
+        cookies = list(auth_context.get("cookies", []) or [])
+        if cookies:
+            rendered += " -header {}".format(
+                self._quote_custom_command_value(
+                    "Cookie: {}".format("; ".join(cookies))
+                )
+            )
+        return rendered
+
+    def run_scan():
+        process = None
+        try:
+            include_tags = nuclei_profile_cfg.get(
+                "include_tags", "swagger,openapi,graphql,auth,jwt"
+            )
+            exclude_tags = nuclei_profile_cfg.get(
+                "exclude_tags", "dos,intrusive,headless,cve,fuzz,fuzzing,brute-force"
+            )
+            normalized_auth_mode = self._ascii_safe(auth_mode, lower=True).strip()
+            if normalized_auth_mode in ["auth only", "authonly"]:
+                run_plans = [("Auth", True)]
+            elif normalized_auth_mode in ["unauth only", "unauthonly"]:
+                run_plans = [("Unauth", False)]
+            else:
+                run_plans = [("Unauth", False), ("Auth", True)]
+
+            auth_context = {
+                "headers": [],
+                "cookies": [],
+                "matched_entries": 0,
+                "auth_candidates_found": 0,
+            }
+            auth_targets = []
+            unauth_targets = list(targets)
+            auth_targets_file = os.path.join(temp_dir, "targets_auth.txt")
+            unauth_targets_file = os.path.join(temp_dir, "targets_unauth.txt")
+            auth_targets_file_ready = False
+            unauth_targets_file_ready = False
+            if any(use_auth_pass for _, use_auth_pass in run_plans):
+                auth_discovery = _discover_auth_associated_targets(targets)
+                auth_targets = list(auth_discovery.get("auth_targets", []) or [])
+                unauth_targets = list(auth_discovery.get("unauth_targets", []) or [])
+                matched_entries = int(auth_discovery.get("matched_entries", 0) or 0)
+                auth_entries = int(auth_discovery.get("auth_entries", 0) or 0)
+                header_auth_entries = int(
+                    auth_discovery.get("header_auth_entries", 0) or 0
+                )
+                signal_only_entries = int(
+                    auth_discovery.get("signal_only_entries", 0) or 0
+                )
+                associated_count = len(auth_targets)
+                unauth_count = len(unauth_targets)
+                SwingUtilities.invokeLater(
+                    lambda m=matched_entries, a=auth_entries, c=associated_count: self.nuclei_area.append(
+                        "[*] Auth discovery: matched_entries={} auth_entries={} associated_targets={}\n".format(
+                            m, a, c
+                        )
+                    )
+                )
+                SwingUtilities.invokeLater(
+                    lambda c=associated_count, u=unauth_count: self.nuclei_area.append(
+                        "[*] Auth split: auth_targets={} unauth_targets={}\n".format(
+                            c, u
+                        )
+                    )
+                )
+                SwingUtilities.invokeLater(
+                    lambda h=header_auth_entries, s=signal_only_entries: self.nuclei_area.append(
+                        "[*] Auth discovery detail: header_auth_entries={} signal_only_entries={}\n".format(
+                            h, s
+                        )
+                    )
+                )
+
+                if auth_targets:
+                    auth_lines = ["[*] Auth-associated target URLs:"]
+                    for auth_target_url in auth_targets:
+                        auth_lines.append(
+                            "    {}".format(self._ascii_safe(auth_target_url))
+                        )
+                    SwingUtilities.invokeLater(
+                        lambda t="\n".join(auth_lines) + "\n": self.nuclei_area.append(t)
+                    )
+                    auth_context = _collect_auth_context_for_targets(auth_targets)
+                    has_auth_material = bool(
+                        auth_context.get("headers") or auth_context.get("cookies")
+                    )
+                    if has_auth_material:
+                        SwingUtilities.invokeLater(
+                            lambda: self.nuclei_area.append(
+                                "[*] Auth context prepared: headers={} cookies={} matched_entries={}\n".format(
+                                    len(auth_context.get("headers", []) or []),
+                                    len(auth_context.get("cookies", []) or []),
+                                    int(auth_context.get("matched_entries", 0) or 0),
+                                )
+                            )
+                        )
+                    else:
+                        SwingUtilities.invokeLater(
+                            lambda c=associated_count: self.nuclei_area.append(
+                                "[*] Auth discovery note: {} auth-associated target(s) detected, but reusable Authorization/Cookie/API-key header context was not found. Auth pass will run with target split only.\n".format(
+                                    c
+                                )
+                            )
+                        )
+
+                if unauth_targets:
+                    unauth_lines = ["[*] Unauth target URLs:"]
+                    for unauth_target_url in unauth_targets:
+                        unauth_lines.append(
+                            "    {}".format(self._ascii_safe(unauth_target_url))
+                        )
+                    SwingUtilities.invokeLater(
+                        lambda t="\n".join(unauth_lines) + "\n": self.nuclei_area.append(t)
+                    )
+
+                if not auth_targets:
+                    SwingUtilities.invokeLater(
+                        lambda: self.nuclei_area.append(
+                            "[*] Auth discovery: found none in Recon filtered scope.\n"
+                        )
+                    )
+                    if matched_entries > 0 and header_auth_entries == 0:
+                        SwingUtilities.invokeLater(
+                            lambda m=matched_entries: self.nuclei_area.append(
+                                "[*] Auth discovery note: matched {} target-scoped entries, but none had Authorization/Cookie/API-key request headers or auth signals.\n".format(
+                                    m
+                                )
+                            )
+                        )
+                    if normalized_auth_mode in ["auth only", "authonly"]:
+                        SwingUtilities.invokeLater(
+                            lambda: self.nuclei_area.append(
+                                "[!] Auth mode selected but no associated auth data was found.\n"
+                            )
+                        )
+                        return
+                if normalized_auth_mode not in ["auth only", "authonly", "unauth only", "unauthonly"]:
+                    split_plans = []
+                    if unauth_targets:
+                        split_plans.append(("Unauth", False))
+                    else:
+                        SwingUtilities.invokeLater(
+                            lambda: self.nuclei_area.append(
+                                "[*] Unauth pass skipped: no unauth-associated targets found.\n"
+                            )
+                        )
+                    if auth_targets:
+                        split_plans.append(("Auth", True))
+                    else:
+                        SwingUtilities.invokeLater(
+                            lambda: self.nuclei_area.append(
+                                "[*] Auth pass skipped: no auth-associated targets found.\n"
+                            )
+                        )
+                    run_plans = split_plans
+
+            if not run_plans:
+                SwingUtilities.invokeLater(
+                    lambda: self.nuclei_area.append("[!] No Nuclei passes selected\n")
+                )
+                return
+
+            total_passes = len(run_plans)
+
+            total_findings_all_passes = 0
+            total_elapsed_all_passes = 0
+            total_counts_by_severity = {
+                "critical": 0,
+                "high": 0,
+                "medium": 0,
+                "low": 0,
+                "info": 0,
+            }
+
+            import time as time_module
+
+            for pass_index, plan in enumerate(run_plans, 1):
+                pass_label = self._ascii_safe(plan[0]).strip() or "Unauth"
+                use_auth_pass = bool(plan[1])
+                pass_slug = self._ascii_safe(pass_label, lower=True).replace(" ", "")
+                if not pass_slug:
+                    pass_slug = "run{}".format(pass_index)
+
+                output_file = os.path.join(temp_dir, "results.txt")
+                json_file = os.path.join(temp_dir, "results.json")
+                if total_passes > 1:
+                    output_file = os.path.join(
+                        temp_dir, "results_{}.txt".format(pass_slug)
+                    )
+                    json_file = os.path.join(
+                        temp_dir, "results_{}.json".format(pass_slug)
+                    )
+                parse_file = json_file
+                pass_targets = auth_targets if use_auth_pass else unauth_targets
+                if not pass_targets:
+                    continue
+                pass_target_count = len(pass_targets)
+                pass_targets_file = targets_file
+                if pass_targets != targets:
+                    if use_auth_pass:
+                        if not auth_targets_file_ready:
+                            writer = None
+                            try:
+                                writer = FileWriter(auth_targets_file)
+                                for target_url in pass_targets:
+                                    writer.write(self._ascii_safe(target_url) + "\n")
+                            finally:
+                                if writer:
+                                    writer.close()
+                            auth_targets_file_ready = True
+                        pass_targets_file = auth_targets_file
+                    else:
+                        if not unauth_targets_file_ready:
+                            writer = None
+                            try:
+                                writer = FileWriter(unauth_targets_file)
+                                for target_url in pass_targets:
+                                    writer.write(self._ascii_safe(target_url) + "\n")
+                            finally:
+                                if writer:
+                                    writer.close()
+                            unauth_targets_file_ready = True
+                        pass_targets_file = unauth_targets_file
+
+                if use_custom_nuclei and custom_nuclei_command:
+                    command_for_pass = custom_nuclei_command
+                    if pass_targets_file != targets_file:
+                        command_for_pass = command_for_pass.replace(
+                            targets_file, pass_targets_file
+                        )
+                    if use_auth_pass:
+                        command_for_pass = _append_auth_context_to_custom_nuclei_command(
+                            command_for_pass, auth_context
+                        )
+                    cmd = self._build_shell_command(command_for_pass)
+                    display_cmd = command_for_pass
+                    if use_auth_pass:
+                        display_cmd = "{} [auth headers/cookies redacted]".format(display_cmd)
+                    SwingUtilities.invokeLater(
+                        lambda p=pass_label: self.nuclei_area.append(
+                            "[*] Pass {}: custom command override enabled\n".format(p)
+                        )
+                    )
+                else:
+                    cmd = [
+                        nuclei_path,
+                        "-list",
+                        pass_targets_file,
+                        "-o",
+                        output_file,
+                        "-tags",
+                        include_tags,
+                        "-etags",
+                        exclude_tags,
+                        "-no-color",
+                        "-timeout",
+                        str(
+                            nuclei_profile_cfg.get(
+                                "request_timeout",
+                                self.NUCLEI_REQUEST_TIMEOUT_SECONDS,
+                            )
+                        ),
+                        "-retries",
+                        str(nuclei_profile_cfg.get("retries", self.NUCLEI_RETRIES)),
+                        "-rate-limit",
+                        str(
+                            nuclei_profile_cfg.get(
+                                "rate_limit", self.NUCLEI_RATE_LIMIT
+                            )
+                        ),
+                        "-c",
+                        str(
+                            nuclei_profile_cfg.get(
+                                "concurrency", self.NUCLEI_CONCURRENCY
+                            )
+                        ),
+                        "-disable-update-check",
+                        "-silent",
+                        "-header",
+                        "X-Forwarded-For: 127.0.0.1",
+                    ]
+                    if supports_bulk_size:
+                        cmd.extend(
+                            [
+                                "-bs",
+                                str(
+                                    nuclei_profile_cfg.get(
+                                        "bulk_size", self.NUCLEI_BULK_SIZE
+                                    )
+                                ),
+                            ]
+                        )
+                    if supports_max_host_error:
+                        cmd.extend(
+                            [
+                                "-mhe",
+                                str(
+                                    nuclei_profile_cfg.get(
+                                        "max_host_error",
+                                        self.NUCLEI_MAX_HOST_ERROR,
+                                    )
+                                ),
+                            ]
+                        )
+                    if supports_scan_strategy:
+                        cmd.extend(
+                            [
+                                "-ss",
+                                nuclei_profile_cfg.get(
+                                    "scan_strategy", self.NUCLEI_SCAN_STRATEGY
+                                ),
+                            ]
+                        )
+                    if supports_no_httpx:
+                        cmd.append("-no-httpx")
+                    if supports_project_mode:
+                        cmd.extend(["-project", "-project-path", temp_dir])
+                    if supports_jsonl_export:
+                        cmd.extend(["-jsonl-export", json_file])
+                    else:
+                        cmd.append("-jsonl")
+                        parse_file = output_file
+                        SwingUtilities.invokeLater(
+                            lambda: self.nuclei_area.append(
+                                "[*] Compatibility: using -jsonl fallback (upgrade nuclei for -jsonl-export)\n"
+                            )
+                        )
+                    if use_auth_pass:
+                        cmd = _append_auth_context_to_nuclei_command(cmd, auth_context)
+                    display_cmd = " ".join(cmd)
+                    if use_auth_pass:
+                        display_cmd = "{} [auth headers/cookies redacted]".format(
+                            display_cmd
+                        )
+
+                SwingUtilities.invokeLater(
+                    lambda i=pass_index, t=total_passes, p=pass_label: self.nuclei_area.append(
+                        "\n[*] Pass {}/{}: {}\n".format(i, t, p)
+                    )
+                )
+                SwingUtilities.invokeLater(
+                    lambda c=pass_target_count: self.nuclei_area.append(
+                        "[*] Pass Targets: {}\n".format(c)
+                    )
+                )
+                SwingUtilities.invokeLater(
+                    lambda d=display_cmd: self.nuclei_area.append(
+                        "[*] Command: {}\n\n".format(d)
+                    )
+                )
+                SwingUtilities.invokeLater(
+                    lambda d=display_cmd: self.log_to_ui("[*] Nuclei cmd: {}".format(d))
+                )
+                SwingUtilities.invokeLater(
+                    lambda p=pass_label: self.nuclei_area.append(
+                        "[*] Discovery mode [{}]: Scanning scoped targets to find NEW endpoints\n\n".format(
+                            p
+                        )
+                    )
+                )
+
+                start_time = time_module.time()
+                timed_out = False
+                capture_path = os.path.join(temp_dir, "nuclei_runtime.log")
+                if total_passes > 1:
+                    capture_path = os.path.join(
+                        temp_dir, "nuclei_runtime_{}.log".format(pass_slug)
+                    )
+                try:
+                    capture_handle = open(capture_path, "wb")
+                    try:
+                        process = subprocess.Popen(  # nosec B603
+                            cmd,
+                            stdout=capture_handle,
+                            stderr=subprocess.STDOUT,
+                            shell=False,
+                        )
+                    finally:
+                        capture_handle.close()
+                    self._set_active_tool_process("nuclei", process)
+                except Exception as e:
+                    err_msg = str(e)
+                    SwingUtilities.invokeLater(
+                        lambda m=err_msg: self.nuclei_area.append(
+                            "[!] Failed to start nuclei: {}\n".format(m)
+                        )
+                    )
+                    return
+
+                adaptive_timeout = max(360, pass_target_count * 30)
+                max_timeout = min(
+                    nuclei_profile_cfg.get(
+                        "max_scan_seconds", self.NUCLEI_MAX_SCAN_SECONDS
+                    ),
+                    adaptive_timeout,
+                )
+
+                SwingUtilities.invokeLater(
+                    lambda t=max_timeout, c=pass_target_count: self.nuclei_area.append(
+                        "[*] Scanning (max {}s for {} targets)...\n\n".format(t, c)
+                    )
+                )
+
+                start_wait = time_module.time()
+                last_update = start_wait
+                cancelled_by_user = False
+                while process.poll() is None:
+                    current = time_module.time()
+                    elapsed = int(current - start_wait)
+                    if self._is_tool_cancelled("nuclei"):
+                        cancelled_by_user = True
+                        self._terminate_process_cross_platform(process, "Nuclei")
+                        break
+                    if elapsed > max_timeout:
+                        timed_out = True
+                        try:
+                            process.kill()
+                            process.wait()
+                        except Exception as e:
+                            self._callbacks.printError("Kill failed: {}".format(str(e)))
+                        SwingUtilities.invokeLater(
+                            lambda t=max_timeout, p=pass_label: self.nuclei_area.append(
+                                "\n[!] {} pass timeout after {}s\n".format(p, t)
+                            )
+                        )
+                        break
+                    if current - last_update > 30:
+                        SwingUtilities.invokeLater(
+                            lambda e=elapsed: self.nuclei_area.append(
+                                "[*] {}s elapsed...\n".format(e)
+                            )
+                        )
+                        last_update = current
+                    time_module.sleep(2)
+
+                process.wait()
+                elapsed = int(time_module.time() - start_time)
+                total_elapsed_all_passes += elapsed
+                combined_output = ""
+                if os.path.exists(capture_path):
+                    try:
+                        with open(capture_path, "rb") as capture_reader:
+                            combined_output = self._decode_process_data(
+                                capture_reader.read(), "Nuclei output"
+                            )
+                    except Exception as capture_err:
+                        self._callbacks.printError(
+                            "Nuclei output read error: {}".format(str(capture_err))
+                        )
+
+                if cancelled_by_user:
+                    SwingUtilities.invokeLater(
+                        lambda: self.nuclei_area.append(
+                            "\n[!] Nuclei run cancelled by user\n"
+                        )
+                    )
+                    SwingUtilities.invokeLater(
+                        lambda: self.log_to_ui("[!] Nuclei cancelled by user")
+                    )
+                    return
+
+                output_preview = self._ascii_safe(combined_output or "").strip()
+
+                SwingUtilities.invokeLater(
+                    lambda e=elapsed, code=process.returncode, p=pass_label: self.log_to_ui(
+                        "[*] Nuclei {}: {}s, exit code {}".format(p, e, code)
+                    )
+                )
+
+                partial_results_mode = False
+                if process.returncode != 0:
+                    partial_parse_file = None
+                    try:
+                        if os.path.exists(json_file) and os.path.getsize(json_file) > 0:
+                            partial_parse_file = json_file
+                        elif os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+                            partial_parse_file = output_file
+                    except Exception as partial_err:
+                        self._callbacks.printError(
+                            "Nuclei partial-results check failed: {}".format(
+                                str(partial_err)
+                            )
+                        )
+
+                    can_timeout_recover = bool(
+                        timed_out or process.returncode in [137, 143]
+                    )
+                    can_parse_partial = bool(partial_parse_file and can_timeout_recover)
+                    if can_parse_partial:
+                        partial_results_mode = True
+                        parse_file = partial_parse_file
+                        partial_notice = [
+                            "",
+                            "[!] Nuclei did not exit cleanly (code: {})".format(
+                                process.returncode
+                            ),
+                            "[*] Continuing with partial results from: {}".format(
+                                parse_file
+                            ),
+                        ]
+                        SwingUtilities.invokeLater(
+                            lambda t="\n".join(partial_notice)
+                            + "\n": self.nuclei_area.append(t)
+                        )
+                        SwingUtilities.invokeLater(
+                            lambda code=process.returncode: self.log_to_ui(
+                                "[*] Nuclei partial-parse mode enabled (exit {})".format(
+                                    code
+                                )
+                            )
+                        )
+                    elif can_timeout_recover:
+                        synthesized_partial_file = os.path.join(
+                            temp_dir, "partial_results_{}.jsonl".format(pass_slug)
+                        )
+                        recovered_count = self._write_nuclei_partial_results_jsonl(
+                            combined_output, synthesized_partial_file
+                        )
+                        if os.path.exists(synthesized_partial_file):
+                            partial_results_mode = True
+                            parse_file = synthesized_partial_file
+                            partial_notice = [
+                                "",
+                                "[!] Nuclei did not exit cleanly (code: {})".format(
+                                    process.returncode
+                                ),
+                                "[*] Recovered {} plain-output findings into partial JSONL".format(
+                                    recovered_count
+                                ),
+                                "[*] Continuing with synthesized partial results: {}".format(
+                                    parse_file
+                                ),
+                            ]
+                            SwingUtilities.invokeLater(
+                                lambda t="\n".join(partial_notice)
+                                + "\n": self.nuclei_area.append(t)
+                            )
+                            SwingUtilities.invokeLater(
+                                lambda code=process.returncode: self.log_to_ui(
+                                    "[*] Nuclei synthesized partial mode enabled (exit {})".format(
+                                        code
+                                    )
+                                )
+                            )
+                        else:
+                            fail_lines = [
+                                "",
+                                "[!] Nuclei command failed",
+                                "[!] Exit code: {}".format(process.returncode),
+                                "[!] Command: {}".format(display_cmd),
+                                "[*] Timeout recovery was attempted but no parseable output was produced.",
+                            ]
+                            fail_text = "\n".join(fail_lines) + "\n"
+                            SwingUtilities.invokeLater(
+                                lambda t=fail_text: self.nuclei_area.append(t)
+                            )
+                            return
+                    else:
+                        fail_lines = [
+                            "",
+                            "[!] Nuclei command failed",
+                            "[!] Exit code: {}".format(process.returncode),
+                            "[!] Command: {}".format(display_cmd),
+                        ]
+                        if output_preview:
+                            fail_lines.append("[!] Output:")
+                            fail_lines.append(output_preview[:3000])
+                        if "flag provided but not defined" in combined_output:
+                            fail_lines.append(
+                                "[*] Tip: your Nuclei version does not support one of these flags."
+                            )
+                            fail_lines.append(
+                                "[*] Try removing unsupported flags from Custom Cmd (for example: -random-agent)."
+                            )
+                        if use_custom_nuclei:
+                            fail_lines.append(
+                                "[*] Tip: ensure custom command writes JSON lines to {json_file}"
+                            )
+                        fail_text = "\n".join(fail_lines) + "\n"
+                        SwingUtilities.invokeLater(
+                            lambda t=fail_text: self.nuclei_area.append(t)
+                        )
+                        SwingUtilities.invokeLater(
+                            lambda code=process.returncode: self.log_to_ui(
+                                "[!] Nuclei failed with exit code {}".format(code)
+                            )
+                        )
+                        return
+
+                if not partial_results_mode:
+                    if os.path.exists(json_file):
+                        parse_file = json_file
+                    elif os.path.exists(output_file):
+                        parse_file = output_file
+                        SwingUtilities.invokeLater(
+                            lambda p=output_file: self.nuclei_area.append(
+                                "[*] Using output fallback parser: {}\n".format(p)
+                            )
+                        )
+                    else:
+                        warn_lines = [
+                            "",
+                            "[!] Nuclei completed but expected results file was not created",
+                            "[!] Expected JSON file: {}".format(json_file),
+                            "[!] Fallback output file: {}".format(output_file),
+                            "[!] Command: {}".format(display_cmd),
+                        ]
+                        if output_preview:
+                            warn_lines.append("[!] Output:")
+                            warn_lines.append(output_preview[:3000])
+                        if use_custom_nuclei:
+                            warn_lines.append(
+                                "[*] Tip: include {json_file} in Custom Cmd and make nuclei write json output there"
+                            )
+                        warn_text = "\n".join(warn_lines) + "\n"
+                        SwingUtilities.invokeLater(
+                            lambda t=warn_text: self.nuclei_area.append(t)
+                        )
+                        SwingUtilities.invokeLater(
+                            lambda: self.log_to_ui(
+                                "[!] Nuclei produced no parseable results file"
+                            )
+                        )
+                        return
+
+                findings_by_severity = {
+                    "critical": [],
+                    "high": [],
+                    "medium": [],
+                    "low": [],
+                    "info": [],
+                }
+                vuln_count = 0
+                json_parse_errors = 0
+
+                try:
+                    with open(parse_file, "r") as f:
+                        for line in f:
+                            if line.strip():
+                                try:
+                                    vuln = json.loads(line)
+                                    vuln_count += 1
+                                    severity = (
+                                        vuln.get("info", {})
+                                        .get("severity", "info")
+                                        .lower()
+                                    )
+                                    template = vuln.get("template-id", "unknown")
+                                    matched = vuln.get(
+                                        "matched-at", vuln.get("host", "")
+                                    )
+                                    findings_by_severity.get(
+                                        severity, findings_by_severity["info"]
+                                    ).append("[{}] {}".format(template, matched))
+                                except Exception as json_err:
+                                    json_parse_errors += 1
+                                    self._callbacks.printError(
+                                        "Nuclei JSON parse error: {}".format(
+                                            str(json_err)
+                                        )
+                                    )
+                except Exception as e:
+                    self._callbacks.printError("Error reading JSON: {}".format(str(e)))
+                    read_fail = (
+                        "\n[!] Failed to read Nuclei JSON results from {}: {}\n".format(
+                            parse_file, str(e)
+                        )
+                    )
+                    SwingUtilities.invokeLater(
+                        lambda t=read_fail: self.nuclei_area.append(t)
+                    )
+                    return
+
+                uses_recon_target_list = (not use_custom_nuclei) or (
+                    pass_targets_file in display_cmd
+                )
+                target_summary = (
+                    str(pass_target_count)
+                    if uses_recon_target_list
+                    else "Custom command (not using generated target list)"
+                )
+                result_title = "NUCLEI SCAN RESULTS"
+                if total_passes > 1:
+                    result_title = "NUCLEI SCAN RESULTS [{}]".format(pass_label)
+                result = ["\n" + "=" * 80, result_title, "=" * 80, ""]
+                result.append("[*] Scan Time: {}s".format(elapsed))
+                result.append("[*] Auth Pass: {}".format("Yes" if use_auth_pass else "No"))
+                result.append("[*] Targets: {}".format(target_summary))
+                result.append("[*] Total Findings: {}".format(vuln_count))
+                result.append("[*] Parsed results file: {}".format(parse_file))
+                if partial_results_mode:
+                    result.append(
+                        "[*] Run status: partial results (process exited {})".format(
+                            process.returncode
+                        )
+                    )
+                if json_parse_errors > 0:
+                    result.append(
+                        "[*] Ignored non-JSON lines: {}".format(json_parse_errors)
+                    )
+                result.append("")
+
+                total_findings_all_passes += vuln_count
+                for severity in ["critical", "high", "medium", "low", "info"]:
+                    total_counts_by_severity[severity] += len(
+                        findings_by_severity[severity]
+                    )
+
+                if vuln_count > 0:
+                    for severity in ["critical", "high", "medium", "low", "info"]:
+                        findings = findings_by_severity[severity]
+                        if findings:
+                            result.append("=" * 80)
+                            result.append(
+                                "{} - {} findings".format(
+                                    severity.upper(), len(findings)
+                                )
+                            )
+                            result.append("=" * 80)
+                            for finding in findings[:10]:
+                                result.append(finding)
+                            if len(findings) > 10:
+                                result.append(
+                                    "... ({} more)".format(len(findings) - 10)
+                                )
+                            result.append("")
+
+                    result.append("=" * 80)
+                    result.append("SUMMARY")
+                    result.append("=" * 80)
+                    for severity in ["critical", "high", "medium", "low", "info"]:
+                        count = len(findings_by_severity[severity])
+                        if count > 0:
+                            pct = int((count / float(vuln_count)) * 100)
+                            result.append(
+                                "[+] {}: {} ({}%)".format(
+                                    severity.upper(), count, pct
+                                )
+                            )
+
+                    result.append("")
+                    result.append("[*] Key Actions:")
+                    if findings_by_severity["critical"]:
+                        result.append(
+                            "    - Address {} critical vulnerabilities immediately".format(
+                                len(findings_by_severity["critical"])
+                            )
+                        )
+                    if findings_by_severity["high"]:
+                        result.append(
+                            "    - Review {} high severity findings".format(
+                                len(findings_by_severity["high"])
+                            )
+                        )
+                    result.append("    - Full results: {}".format(parse_file))
+
+                    SwingUtilities.invokeLater(
+                        lambda count=vuln_count, p=pass_label: self.log_to_ui(
+                            "[+] {} pass found {} vulnerabilities".format(p, count)
+                        )
+                    )
+                else:
+                    result.append("[+] No vulnerabilities found")
+                    if uses_recon_target_list:
+                        result.append(
+                            "[*] All {} targets scanned successfully".format(
+                                pass_target_count
+                            )
+                        )
+                    else:
+                        result.append("[*] Custom command completed successfully")
+                        result.append(
+                            "[*] Note: target count is defined by your custom command"
+                        )
+                    SwingUtilities.invokeLater(
+                        lambda p=pass_label: self.log_to_ui(
+                            "[+] {} pass found no vulnerabilities".format(p)
+                        )
+                    )
+
+                SwingUtilities.invokeLater(
+                    lambda r="\n".join(result): self.nuclei_area.append(r)
+                )
+                SwingUtilities.invokeLater(
+                    lambda o=output_file: self.log_to_ui("[+] Complete: {}".format(o))
+                )
+
+            if total_passes > 1:
+                summary = [
+                    "\n" + "=" * 80,
+                    "NUCLEI MULTI-PASS SUMMARY",
+                    "=" * 80,
+                    "",
+                    "[*] Passes: {}".format(
+                        ", ".join([self._ascii_safe(x[0]) for x in run_plans])
+                    ),
+                    "[*] Total scan time (all passes): {}s".format(
+                        total_elapsed_all_passes
+                    ),
+                    "[*] Total findings (all passes): {}".format(
+                        total_findings_all_passes
+                    ),
+                ]
+                for severity in ["critical", "high", "medium", "low", "info"]:
+                    count = total_counts_by_severity.get(severity, 0)
+                    if count > 0:
+                        summary.append("[+] {}: {}".format(severity.upper(), count))
+                SwingUtilities.invokeLater(
+                    lambda t="\n".join(summary) + "\n": self.nuclei_area.append(t)
+                )
+        except Exception as e:
+            err = "[!] Failed: {}\n\nCheck: nuclei -version".format(str(e))
+            SwingUtilities.invokeLater(lambda: self.nuclei_area.setText(err))
+            err_msg = str(e)
+            SwingUtilities.invokeLater(
+                lambda m=err_msg: self.log_to_ui("[!] Error: {}".format(m))
+            )
+        finally:
+            self._clear_active_tool_process("nuclei", process)
+            self._clear_tool_cancel("nuclei")
+            self._cleanup_temp_dir(temp_dir, "nuclei scan")
+
+    thread = threading.Thread(target=run_scan)
+    thread.daemon = True
+    thread.start()
+
+def _run_httpx(self, event):
+    """Run HTTPX probe on endpoints from Recon tab"""
+    import os
+    import subprocess
+    import tempfile
+    import threading
+    import time as time_module
+
+    httpx_path = self.httpx_path_field.getText().strip()
+    if not httpx_path:
+        self.httpx_area.setText("[!] Configure HTTPX path first\n")
+        return
+    if not self.api_data:
+        self.httpx_area.setText(
+            "[!] No endpoints in Recon tab. Capture or import first\n"
+        )
+        return
+    if not self._validate_binary_signature(
+        "HTTPX",
+        httpx_path,
+        self.httpx_area,
+        required_tokens=["-status-code", "-tech-detect", "-title"],
+        forbidden_tokens=[
+            "a next generation http client",
+            "usage: httpx <url> [options]",
+        ],
+        fix_hint="Use ProjectDiscovery httpx (for example: /home/teycir/go/bin/httpx), not the Python httpx client CLI.",
+    ):
+        return
+
+    # Use temp directory instead of auto-saving
+    temp_dir = tempfile.mkdtemp(prefix="burp_httpx_")
+    urls_file = os.path.join(temp_dir, "urls.txt")
+
+    # Export all URLs to file with cleaning
+    writer = None
+    try:
+        writer = FileWriter(urls_file)
+        with self.lock:
+            target_count = len(self.api_data)
+            for entries in self.api_data.values():
+                raw_url = self._build_url(self._get_entry(entries), True)
+                clean_url = self._clean_url(raw_url)
+                writer.write(clean_url + "\n")
+    finally:
+        if writer:
+            writer.close()
+
+    use_custom_httpx, custom_httpx_command = self._resolve_custom_command(
+        "HTTPX",
+        self.httpx_custom_cmd_checkbox,
+        self.httpx_custom_cmd_field,
+        {"httpx_path": httpx_path, "urls_file": urls_file},
+        self.httpx_area,
+    )
+    if use_custom_httpx and not custom_httpx_command:
+        self._cleanup_temp_dir(temp_dir, "httpx custom command validation")
+        return
+
+    self.httpx_area.setText("[*] Initializing HTTPX...\n")
+    self.httpx_area.append("[*] Targets: {} URLs\n".format(target_count))
+    self.log_to_ui("[*] HTTPX: Starting scan on {} URLs".format(target_count))
+    self._clear_tool_cancel("httpx")
+
+    def run_scan():
+        process = None
+        try:
+            if use_custom_httpx and custom_httpx_command:
+                cmd = self._build_shell_command(custom_httpx_command)
+                display_cmd = custom_httpx_command
+                SwingUtilities.invokeLater(
+                    lambda: self.httpx_area.append(
+                        "[*] Custom command override enabled\n"
+                    )
+                )
+            else:
+                cmd = [
+                    httpx_path,
+                    "-l",
+                    urls_file,
+                    "-status-code",
+                    "-nc",
+                    "-silent",
+                ]
+                display_cmd = " ".join(cmd)
+            SwingUtilities.invokeLater(
+                lambda: self.httpx_area.append(
+                    "[*] Command: {}\n\n".format(display_cmd)
+                )
+            )
+
+            start_time = time_module.time()
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+                shell=False,
+            )
+            self._set_active_tool_process("httpx", process)
+
+            # Collect results grouped by status
+            results_by_status = {'2xx': [], '3xx': [], '4xx': [], '5xx': []}
+            last_update = start_time
+            cancelled_by_user = False
+
+            while True:
+                line = process.stdout.readline()
+                if not line:
+                    if process.poll() is not None:
+                        break
+                    if self._is_tool_cancelled("httpx"):
+                        cancelled_by_user = True
+                        self._terminate_process_cross_platform(process, "HTTPX")
+                        break
+                    current_time = time_module.time()
+                    if current_time - last_update > 2:
+                        elapsed = int(current_time - start_time)
+                        SwingUtilities.invokeLater(
+                            lambda e=elapsed: self.httpx_area.append(
+                                "[*] Running: {}s...\n".format(e)
+                            )
+                        )
+                        last_update = current_time
+                    time_module.sleep(0.1)
+                    continue
+
+                line_text = self._decode_process_data(line, "HTTPX stdout line")
+                clean_line = re.sub(r"\x1b\[[0-9;]*[mK]", "", line_text).strip()
+                if clean_line and "http" in clean_line and "[" in clean_line:
+                    try:
+                        status = clean_line[clean_line.rfind('[')+1:clean_line.rfind(']')]
+                        if status.startswith('2'):
+                            results_by_status['2xx'].append(clean_line)
+                        elif status.startswith('3'):
+                            results_by_status['3xx'].append(clean_line)
+                        elif status.startswith('4'):
+                            results_by_status['4xx'].append(clean_line)
+                        elif status.startswith('5'):
+                            results_by_status['5xx'].append(clean_line)
+                    except Exception as parse_err:
+                        self._callbacks.printError(
+                            "HTTPX status parse error: {}".format(str(parse_err))
+                        )
+
+            process.wait()
+            elapsed = int(time_module.time() - start_time)
+            if cancelled_by_user:
+                SwingUtilities.invokeLater(
+                    lambda: self.httpx_area.append(
+                        "\n[!] HTTPX run cancelled by user\n"
+                    )
+                )
+                SwingUtilities.invokeLater(
+                    lambda: self.log_to_ui("[!] HTTPX cancelled by user")
+                )
+                return
+            total_count = sum(len(v) for v in results_by_status.values())
+
+            # Build grouped output
+            output = []
+            output.append("="*80)
+            output.append("HTTPX PROBE RESULTS")
+            output.append("="*80)
+            output.append("")
+            output.append("[*] Scan Time: {}s".format(elapsed))
+            output.append("[*] Total URLs: {}".format(total_count))
+            output.append("")
+
+            category_names = {
+                '2xx': 'SUCCESS (2xx)',
+                '3xx': 'REDIRECTS (3xx)',
+                '4xx': 'CLIENT ERRORS (4xx)',
+                '5xx': 'SERVER ERRORS (5xx)'
+            }
+
+            for category in ['2xx', '3xx', '4xx', '5xx']:
+                urls = results_by_status[category]
+                if urls:
+                    output.append("="*80)
+                    output.append("{} - {} URLs".format(category_names[category], len(urls)))
+                    output.append("="*80)
+                    for url in urls[:10]:
+                        output.append(url)
+                    if len(urls) > 10:
+                        output.append("... ({} more)".format(len(urls) - 10))
+                    output.append("")
+
+            output.append("="*80)
+            output.append("SUMMARY")
+            output.append("="*80)
+            for category in ['2xx', '3xx', '4xx', '5xx']:
+                urls = results_by_status[category]
+                if urls and total_count > 0:
+                    pct = int((len(urls) / float(total_count)) * 100)
+                    output.append("[+] {}: {} ({}%)".format(
+                        category_names[category].split(' ')[0], len(urls), pct
+                    ))
+
+            output.append("")
+            output.append("[*] Key Findings:")
+            if results_by_status['4xx']:
+                output.append("    - Review {} 4xx responses for client errors".format(len(results_by_status['4xx'])))
+            if results_by_status['5xx']:
+                output.append("    - Investigate {} 5xx responses for server issues".format(len(results_by_status['5xx'])))
+            if results_by_status['2xx'] and total_count > 0:
+                success_rate = int((len(results_by_status['2xx']) / float(total_count)) * 100)
+                output.append("    - {}% success rate indicates {} endpoints".format(
+                    success_rate, "healthy" if success_rate > 80 else "problematic"
+                ))
+            output.append("="*80)
+
+            summary = "\n".join(output)
+            SwingUtilities.invokeLater(lambda: self.httpx_area.append(summary))
+            SwingUtilities.invokeLater(
+                lambda: self.log_to_ui(
+                    "[+] HTTPX: {}s, {} responses".format(elapsed, total_count)
+                )
+            )
+        except Exception as e:
+            err = "[!] Error: {}\n".format(str(e))
+            SwingUtilities.invokeLater(lambda: self.httpx_area.append(err))
+            err_msg = str(e)
+            SwingUtilities.invokeLater(
+                lambda m=err_msg: self.log_to_ui("[!] HTTPX error: {}".format(m))
+            )
+        finally:
+            self._clear_active_tool_process("httpx", process)
+            self._clear_tool_cancel("httpx")
+            self._cleanup_temp_dir(temp_dir, "httpx scan")
+
+    thread = threading.Thread(target=run_scan)
+    thread.daemon = True
+    thread.start()
+
+def _run_katana(self, event):
+    """Run Katana crawler on endpoints from Recon tab"""
+    import os
+    import subprocess
+    import tempfile
+    import threading
+    import time as time_module
+
+    katana_path = self.katana_path_field.getText().strip()
+    if not katana_path:
+        self.katana_area.setText("[!] Configure Katana path first\n")
+        return
+    if not self.api_data:
+        self.katana_area.setText(
+            "[!] No endpoints in Recon tab. Capture or import first\n"
+        )
+        return
+    if not self._validate_binary_signature(
+        "Katana",
+        katana_path,
+        self.katana_area,
+        required_tokens=["-depth", "-js-crawl", "-silent"],
+        forbidden_tokens=[],
+        fix_hint="Set Katana Path to your local ProjectDiscovery katana binary (for example: /home/teycir/go/bin/katana).",
+    ):
+        return
+
+    # Use temp directory instead of auto-saving
+    temp_dir = tempfile.mkdtemp(prefix="burp_katana_")
+    urls_file = os.path.join(temp_dir, "urls.txt")
+
+    seed_urls, target_meta = self._collect_katana_seed_urls()
+    if not seed_urls:
+        self._cleanup_temp_dir(temp_dir, "katana empty target set")
+        self.katana_area.setText(
+            "[!] No Katana targets after filtering. Capture more first-party API traffic or adjust host filter.\n"
+        )
+        return
+
+    writer = None
+    try:
+        writer = FileWriter(urls_file)
+        for seed in seed_urls:
+            writer.write(seed + "\n")
+    finally:
+        if writer:
+            writer.close()
+
+    use_custom_katana, custom_katana_command = self._resolve_custom_command(
+        "Katana",
+        self.katana_custom_cmd_checkbox,
+        self.katana_custom_cmd_field,
+        {"katana_path": katana_path, "urls_file": urls_file},
+        self.katana_area,
+    )
+    if use_custom_katana and not custom_katana_command:
+        self._cleanup_temp_dir(temp_dir, "katana custom command validation")
+        return
+    uses_recon_host_list = (not use_custom_katana) or (urls_file in custom_katana_command)
+
+    self.katana_area.setText("[*] Initializing Katana...\n")
+    self.katana_area.append(
+        "[*] Targets: {} hosts ({} raw candidates)\n".format(
+            len(seed_urls), target_meta.get("raw_candidates", len(seed_urls))
+        )
+    )
+    if target_meta.get("manual_scope_enabled"):
+        self.katana_area.append(
+            "[*] Target base scope: {} lines | hosts={} | bases={}\n".format(
+                target_meta.get("manual_scope_line_count", 0),
+                target_meta.get("manual_scope_host_count", 0),
+                target_meta.get("manual_scope_base_count", 0),
+            )
+        )
+        preview = target_meta.get("manual_scope_preview", [])
+        if preview:
+            self.katana_area.append(
+                "[*] Scope preview: {}\n".format(", ".join(preview))
+            )
+    elif target_meta.get("force_host"):
+        self.katana_area.append(
+            "[*] Host scope: {}\n".format(target_meta.get("selected_host", "unknown"))
+        )
+    else:
+        allowed_bases = target_meta.get("allowed_bases", [])
+        if allowed_bases:
+            self.katana_area.append(
+                "[*] First-party base scope: {}\n".format(", ".join(allowed_bases))
+            )
+    self.katana_area.append(
+        "[*] Filtered out: noise-host={} scope-host={}\n".format(
+            target_meta.get("dropped_noise_host", 0),
+            target_meta.get("dropped_scope_host", 0),
+        )
+    )
+    if target_meta.get("truncated", 0) > 0:
+        self.katana_area.append(
+            "[*] Target cap applied: {} skipped (max {})\n".format(
+                target_meta.get("truncated", 0), self.KATANA_MAX_TARGETS
+            )
+        )
+    if use_custom_katana and not uses_recon_host_list:
+        self.katana_area.append(
+            "[*] Note: custom command defines target scope (generated host list not referenced)\n"
+        )
+    self.log_to_ui("[*] Katana: Starting crawl on {} hosts".format(len(seed_urls)))
+    self._clear_tool_cancel("katana")
+
+    def run_scan():
+        process = None
+        try:
+            if use_custom_katana and custom_katana_command:
+                cmd = self._build_shell_command(custom_katana_command)
+                display_cmd = custom_katana_command
+                SwingUtilities.invokeLater(
+                    lambda: self.katana_area.append(
+                        "[*] Custom command override enabled\n"
+                    )
+                )
+            else:
+                cmd = [
+                    katana_path,
+                    "-list",
+                    urls_file,
+                    "-d",
+                    "1",
+                    "-jc",
+                    "-silent",
+                ]
+                display_cmd = " ".join(cmd)
+            SwingUtilities.invokeLater(
+                lambda: self.katana_area.append(
+                    "[*] Command: {}\n\n".format(display_cmd)
+                )
+            )
+
+            start_time = time_module.time()
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+                shell=False,
+            )
+            self._set_active_tool_process("katana", process)
+
+            line_count = 0
+            last_update = start_time
+            results = []
+            while True:
+                line = process.stdout.readline()
+                if not line:
+                    if process.poll() is not None:
+                        break
+                    if self._is_tool_cancelled("katana"):
+                        self._terminate_process_cross_platform(process, "Katana")
+                        break
+                    current_time = time_module.time()
+                    if current_time - last_update > 2:
+                        elapsed = int(current_time - start_time)
+                        SwingUtilities.invokeLater(
+                            lambda e=elapsed: self.katana_area.append(
+                                "[*] Crawling: {}s...\n".format(e)
+                            )
+                        )
+                        last_update = current_time
+                    time_module.sleep(0.1)
+                    continue
+                line_text = self._decode_process_data(line, "Katana stdout line")
+                clean_line = re.sub(r"\x1b\[[0-9;]*[mK]", "", line_text.strip())
+                if clean_line:
+                    if uses_recon_host_list and not self._katana_result_in_scope(
+                        clean_line, target_meta
+                    ):
+                        continue
+                    results.append(clean_line)
+                    SwingUtilities.invokeLater(
+                        lambda l=clean_line: self.katana_area.append(l + "\n")
+                    )
+                    line_count += 1
+
+            process.wait()
+            elapsed = int(time_module.time() - start_time)
+            if self._is_tool_cancelled("katana"):
+                SwingUtilities.invokeLater(
+                    lambda: self.katana_area.append(
+                        "\n[!] Katana run cancelled by user\n"
+                    )
+                )
+                SwingUtilities.invokeLater(
+                    lambda: self.log_to_ui("[!] Katana cancelled by user")
+                )
+                return
+            stderr_data = process.stderr.read() if process.stderr else ""
+            if not isinstance(stderr_data, str):
+                try:
+                    stderr_data = stderr_data.decode("utf-8", errors="ignore")
+                except Exception as e:
+                    self._callbacks.printError(
+                        "Katana stderr decode error: {}".format(str(e))
+                    )
+                    stderr_data = str(stderr_data)
+
+            # Store results in memory only - don't auto-save
+            with self.katana_lock:
+                self.katana_discovered = results
+
+            if process.returncode != 0:
+                fail_lines = [
+                    "",
+                    "[!] Katana command failed",
+                    "[!] Exit code: {}".format(process.returncode),
+                    "[!] Command: {}".format(display_cmd),
+                ]
+                if results:
+                    fail_lines.append(
+                        "[!] Partial output captured: {} URLs".format(len(results))
+                    )
+                if stderr_data and stderr_data.strip():
+                    fail_lines.append("[!] STDERR:")
+                    fail_lines.append(stderr_data.strip()[:3000])
+                fail_text = "\n".join(fail_lines) + "\n"
+                SwingUtilities.invokeLater(
+                    lambda t=fail_text: self.katana_area.append(t)
+                )
+                SwingUtilities.invokeLater(
+                    lambda: self.log_to_ui(
+                        "[!] Katana failed with exit code {}".format(
+                            process.returncode
+                        )
+                    )
+                )
+                return
+
+            # Categorize results
+            api_endpoints = []
+            static_files = []
+            js_files = []
+            css_files = []
+            images = []
+            other = []
+
+            for url in results:
+                lower = url.lower()
+                if (
+                    "/api/" in lower
+                    or "/v1/" in lower
+                    or "/v2/" in lower
+                    or "/v3/" in lower
+                ):
+                    api_endpoints.append(url)
+                elif lower.endswith((".js", ".mjs")):
+                    js_files.append(url)
+                elif lower.endswith(".css"):
+                    css_files.append(url)
+                elif lower.endswith(
+                    (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico")
+                ):
+                    images.append(url)
+                elif lower.endswith((".html", ".xml", ".json", ".txt")):
+                    static_files.append(url)
+                else:
+                    other.append(url)
+
+            summary = "\n" + "=" * 80 + "\n"
+            summary += "KATANA CRAWL RESULTS\n"
+            summary += "=" * 80 + "\n"
+            summary += "[*] Crawl Time: {}s\n".format(elapsed)
+            if uses_recon_host_list:
+                summary += "[*] Targets: {} hosts\n".format(len(seed_urls))
+            else:
+                summary += "[*] Targets: Custom command (scope defined by command)\n"
+            summary += "[*] Total Discovered: {} URLs\n".format(len(results))
+            summary += "\n"
+
+            # Show breakdown by type
+            categories = [
+                ('API Endpoints', api_endpoints),
+                ('JavaScript', js_files),
+                ('Static Files', static_files),
+                ('CSS', css_files),
+                ('Images', images),
+                ('Other', other)
+            ]
+
+            for cat_name, cat_list in categories:
+                if cat_list:
+                    summary += "=" * 80 + "\n"
+                    summary += "{} - {} URLs\n".format(cat_name.upper(), len(cat_list))
+                    summary += "=" * 80 + "\n"
+                    for url in cat_list[:10]:
+                        summary += "{}\n".format(url)
+                    if len(cat_list) > 10:
+                        summary += "... ({} more)\n".format(len(cat_list) - 10)
+                    summary += "\n"
+
+            summary += "=" * 80 + "\n"
+            summary += "SUMMARY\n"
+            summary += "=" * 80 + "\n"
+            for cat_name, cat_list in categories:
+                if cat_list and len(results) > 0:
+                    pct = int((len(cat_list) / float(len(results))) * 100)
+                    summary += "[+] {}: {} ({}%)\n".format(cat_name, len(cat_list), pct)
+
+            summary += "\n[*] Key Actions:\n"
+            if api_endpoints:
+                summary += "    - Review {} API endpoints for security testing\n".format(len(api_endpoints))
+            if js_files:
+                summary += "    - Check {} JS files for secrets/API keys\n".format(len(js_files))
+            if len(results) > 100:
+                summary += "    - Large attack surface: {} total URLs\n".format(len(results))
+            summary += "    - Click 'Import to Recon' to add endpoints\n"
+            # Batch both UI updates into single invocation
+            log_msg = "[+] Katana: {}s, {} URLs ({} API)".format(
+                elapsed, len(results), len(api_endpoints)
+            )
+            SwingUtilities.invokeLater(lambda: (
+                self.katana_area.append(summary),
+                self.log_to_ui(log_msg)
+            ))
+        except Exception as e:
+            err = "[!] Error: {}\n".format(str(e))
+            SwingUtilities.invokeLater(lambda: self.katana_area.append(err))
+            err_msg = str(e)
+            SwingUtilities.invokeLater(
+                lambda m=err_msg: self.log_to_ui("[!] Katana error: {}".format(m))
+            )
+        finally:
+            self._clear_active_tool_process("katana", process)
+            self._clear_tool_cancel("katana")
+            self._cleanup_temp_dir(temp_dir, "katana scan")
+
+    thread = threading.Thread(target=run_scan)
+    thread.daemon = True
+    thread.start()
+
+def _run_ffuf(self, event):
+    """Run FFUF directory fuzzer on endpoints from Recon tab"""
+    import os
+    import subprocess
+    import threading
+    import time as time_module
+
+    ffuf_path = self.ffuf_path_field.getText().strip()
+    wordlist = self.ffuf_wordlist_field.getText().strip()
+
+    if not ffuf_path:
+        self.ffuf_area.setText("[!] Configure FFUF path first\n")
+        return
+    if not self._validate_binary_signature(
+        "FFUF",
+        ffuf_path,
+        self.ffuf_area,
+        required_tokens=["fuzz faster u fool", "-json", "-noninteractive"],
+        forbidden_tokens=[],
+        fix_hint="Set FFUF Path to your local ffuf binary (for example: /home/teycir/go/bin/ffuf).",
+    ):
+        return
+
+    if not wordlist or not os.path.exists(wordlist):
+        self.ffuf_area.setText("[!] Wordlist not found: {}\n".format(wordlist))
+        self.ffuf_area.append("[*] Download with: wget -O ~/wordlists/api-endpoints.txt https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/api/api-endpoints.txt\n")
+        return
+    if not self.api_data:
+        self.ffuf_area.setText(
+            "[!] No endpoints in Recon tab. Capture or import first\n"
+        )
+        return
+
+    targets, target_meta = self._collect_ffuf_targets()
+    if not targets:
+        self.ffuf_area.setText(
+            "[!] No FFUF targets after filtering. Capture more first-party API traffic or adjust host filter.\n"
+        )
+        return
+
+    self.ffuf_area.setText("[*] Initializing FFUF...\n")
+    self.ffuf_area.append(
+        "[*] Targets: {} (from Recon tab; {} raw candidates)\n".format(
+            len(targets), target_meta.get("raw_candidates", len(targets))
+        )
+    )
+    if target_meta.get("manual_scope_enabled"):
+        self.ffuf_area.append(
+            "[*] Target base scope: {} lines | hosts={} | bases={}\n".format(
+                target_meta.get("manual_scope_line_count", 0),
+                target_meta.get("manual_scope_host_count", 0),
+                target_meta.get("manual_scope_base_count", 0),
+            )
+        )
+        preview = target_meta.get("manual_scope_preview", [])
+        if preview:
+            self.ffuf_area.append(
+                "[*] Scope preview: {}\n".format(", ".join(preview))
+            )
+    elif target_meta.get("force_host"):
+        self.ffuf_area.append(
+            "[*] Host scope: {}\n".format(target_meta.get("selected_host", "unknown"))
+        )
+    else:
+        allowed_bases = target_meta.get("allowed_bases", [])
+        if allowed_bases:
+            self.ffuf_area.append(
+                "[*] First-party base scope: {}\n".format(", ".join(allowed_bases[:3]))
+            )
+    self.ffuf_area.append(
+        "[*] Filtered out: noise-host={} scope-host={} path-noise={}\n".format(
+            target_meta.get("dropped_noise_host", 0),
+            target_meta.get("dropped_scope_host", 0),
+            target_meta.get("dropped_path", 0),
+        )
+    )
+    if target_meta.get("truncated", 0) > 0:
+        self.ffuf_area.append(
+            "[*] Target cap applied: {} skipped (max {})\n".format(
+                target_meta.get("truncated", 0), self.FFUF_MAX_TARGETS
+            )
+        )
+    # Count wordlist size
+    try:
+        with open(wordlist, 'r') as f:
+            word_count = sum(1 for line in f if line.strip())
+        self.ffuf_area.append("[*] Wordlist: {} ({} words)\n".format(wordlist, word_count))
+    except (IOError, OSError) as e:
+        self._callbacks.printError(
+            "FFUF wordlist count failed for {}: {}".format(wordlist, str(e))
+        )
+        self.ffuf_area.append("[*] Wordlist: {}\n".format(wordlist))
+    self.ffuf_area.append(
+        "[*] Threads: {}, Timeout: {}s, Rate: {}/s, Max: {}s/target\n".format(
+            self.FFUF_THREADS,
+            self.FFUF_REQUEST_TIMEOUT_SECONDS,
+            self.FFUF_RATE_LIMIT,
+            self.FFUF_TARGET_TIMEOUT_SECONDS
+        )
+    )
+    self.ffuf_area.append(
+        "[*] Filtering: static paths + tracker/ad paths + third-party hosts\n\n"
+    )
+    self.log_to_ui("[*] FFUF: {} targets from Recon".format(len(targets)))
+    self._clear_tool_cancel("ffuf")
+
+    def run_scan():
+        process = None
+        try:
+            all_matches = []
+            total_start = time_module.time()
+            cancelled_by_user = False
+
+            # Batch UI update - accumulate messages
+            progress_msg = "\n[*] Scanning {} targets...\n\n".format(len(targets))
+            SwingUtilities.invokeLater(
+                lambda: self.ffuf_area.append(progress_msg)
+            )
+
+            idx = 0
+            for target in targets:
+                if self._is_tool_cancelled("ffuf"):
+                    cancelled_by_user = True
+                    break
+                idx += 1
+                # Only update UI every 5 targets to reduce overhead
+                if idx % 5 == 0 or idx == len(targets):
+                    msg = "[*] Target {}/{}: {}\n".format(idx, len(targets), target)
+                    SwingUtilities.invokeLater(
+                        lambda m=msg: self.ffuf_area.append(m)
+                    )
+
+                start = time_module.time()
+                process = subprocess.Popen(
+                    [
+                        ffuf_path,
+                        "-u",
+                        target,
+                        "-w",
+                        wordlist,
+                        "-mc",
+                        "200,201,204,301,302,307,401,403,405",
+                        "-fc",
+                        "404,500,502,503",
+                        "-t",
+                        str(self.FFUF_THREADS),
+                        "-timeout",
+                        str(self.FFUF_REQUEST_TIMEOUT_SECONDS),
+                        "-rate",
+                        str(self.FFUF_RATE_LIMIT),
+                        "-json",
+                        "-noninteractive",
+                        "-H",
+                        "User-Agent: Mozilla/5.0",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    bufsize=1,
+                )
+                self._set_active_tool_process("ffuf", process)
+
+                # Thread-safe output gobbler
+                stdout_lines = []
+                output_lock = threading.Lock()
+
+                def stream_reader(pipe, output_list, lock=output_lock):
+                    try:
+                        while True:
+                            line = pipe.readline()
+                            if not line:
+                                break
+                            line_text = self._decode_process_data(
+                                line, "FFUF stdout line"
+                            )
+                            if line_text:
+                                with lock:
+                                    output_list.append(line_text)
+                    finally:
+                        pipe.close()
+
+                stdout_thread = threading.Thread(
+                    target=stream_reader, args=(process.stdout, stdout_lines)
+                )
+                stdout_thread.daemon = True
+                stdout_thread.start()
+
+                target_matches = []
+                timeout = self.FFUF_TARGET_TIMEOUT_SECONDS
+                timed_out = False
+
+                # Pure timeout loop
+                start_wait = time_module.time()
+                while process.poll() is None:
+                    if self._is_tool_cancelled("ffuf"):
+                        cancelled_by_user = True
+                        self._terminate_process_cross_platform(process, "FFUF")
+                        break
+                    if time_module.time() - start_wait > timeout:
+                        timed_out = True
+                        try:
+                            process.kill()
+                            process.wait()
+                        except Exception as e:
+                            self._callbacks.printError(
+                                "FFUF process kill failed: {}".format(str(e))
+                            )
+                        SwingUtilities.invokeLater(
+                            lambda t=target: self.ffuf_area.append(
+                                "[!] Timeout after {}s ({})\n".format(timeout, t)
+                            )
+                        )
+                        break
+                    time_module.sleep(0.5)
+
+                stdout_thread.join(timeout=2)
+                process.wait()
+                self._clear_active_tool_process("ffuf", process)
+
+                if cancelled_by_user:
+                    break
+
+                # Parse JSON output
+                if not timed_out:
+                    with output_lock:
+                        lines_snapshot = list(stdout_lines)
+
+                    invalid_json_lines = 0
+                    for line in lines_snapshot:
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        try:
+                            data = json.loads(line)
+                            url = data.get("url", "")
+                            status = data.get("status", 0)
+                            length = data.get("length", 0)
+
+                            if url and status:
+                                result = "[Status: {}] [Length: {}] {}".format(
+                                    status, length, url
+                                )
+                                target_matches.append(result)
+                                SwingUtilities.invokeLater(
+                                    lambda r=result: self.ffuf_area.append(
+                                        "  {}\n".format(r)
+                                    )
+                                )
+                        except (ValueError, TypeError):
+                            invalid_json_lines += 1
+
+                    if invalid_json_lines > 0:
+                        SwingUtilities.invokeLater(
+                            lambda c=invalid_json_lines: self.ffuf_area.append(
+                                "[!] FFUF parse warnings: {} invalid JSON lines\n".format(
+                                    c
+                                )
+                            )
+                        )
+                        self._callbacks.printError(
+                            "FFUF parse warnings: {} invalid JSON lines".format(
+                                invalid_json_lines
+                            )
+                        )
+
+                elapsed = time_module.time() - start
+                all_matches.extend(target_matches)
+
+                SwingUtilities.invokeLater(
+                    lambda e=elapsed, m=len(target_matches): self.ffuf_area.append(
+                        "[+] Complete: {:.1f}s | {} matches\n\n".format(e, m)
+                    )
+                )
+
+            if cancelled_by_user:
+                with self.ffuf_lock:
+                    self.ffuf_results = all_matches
+                SwingUtilities.invokeLater(
+                    lambda: self.ffuf_area.append(
+                        "\n[!] FFUF run cancelled by user\n"
+                    )
+                )
+                SwingUtilities.invokeLater(
+                    lambda: self.log_to_ui("[!] FFUF cancelled by user")
+                )
+                return
+
+            # Store results
+            with self.ffuf_lock:
+                self.ffuf_results = all_matches
+
+            total_elapsed = int(time_module.time() - total_start)
+
+            # Group by status code
+            by_status = {}
+            for match in all_matches:
+                try:
+                    status = match.split('[Status: ')[1].split(']')[0]
+                    by_status.setdefault(status, []).append(match)
+                except (IndexError, ValueError):
+                    by_status.setdefault('unknown', []).append(match)
+
+            summary = "\n" + "=" * 80 + "\n"
+            summary += "FFUF SCAN RESULTS\n"
+            summary += "=" * 80 + "\n"
+            avg_time = float(total_elapsed) / len(targets) if targets else 0
+            summary += "[*] Total Time: {}s ({:.1f}s per target)\n".format(total_elapsed, avg_time)
+            summary += "[*] Targets Scanned: {}\n".format(len(targets))
+            summary += "[*] Total Discoveries: {}\n".format(len(all_matches))
+            summary += "\n"
+
+            if all_matches:
+                for status in sorted(by_status.keys()):
+                    matches = by_status[status]
+                    summary += "=" * 80 + "\n"
+                    summary += "STATUS {} - {} paths\n".format(status, len(matches))
+                    summary += "=" * 80 + "\n"
+                    for match in matches[:10]:
+                        summary += "{}\n".format(match)
+                    if len(matches) > 10:
+                        summary += "... ({} more)\n".format(len(matches) - 10)
+                    summary += "\n"
+
+                summary += "=" * 80 + "\n"
+                summary += "SUMMARY\n"
+                summary += "=" * 80 + "\n"
+                for status in sorted(by_status.keys()):
+                    count = len(by_status[status])
+                    pct = int((count / float(len(all_matches))) * 100)
+                    summary += "[+] Status {}: {} ({}%)\n".format(status, count, pct)
+                summary += "\n[*] Use 'Export Results' to save all discoveries\n"
+            else:
+                summary += "[*] No paths discovered\n"
+
+            SwingUtilities.invokeLater(lambda: self.ffuf_area.append(summary))
+            SwingUtilities.invokeLater(
+                lambda: self.log_to_ui(
+                    "[+] FFUF: {}s, {} targets, {} discoveries".format(
+                        total_elapsed, len(targets), len(all_matches)
+                    )
+                )
+            )
+            SwingUtilities.invokeLater(
+                lambda: self.ffuf_area.setCaretPosition(
+                    self.ffuf_area.getDocument().getLength()
+                )
+            )
+        except Exception as e:
+            err = "[!] Error: {}\n".format(str(e))
+            SwingUtilities.invokeLater(lambda: self.ffuf_area.append(err))
+            err_msg = str(e)
+            SwingUtilities.invokeLater(
+                lambda m=err_msg: self.log_to_ui("[!] FFUF error: {}".format(m))
+            )
+        finally:
+            self._clear_active_tool_process("ffuf", process)
+            self._clear_tool_cancel("ffuf")
+
+    thread = threading.Thread(target=run_scan)
+    thread.daemon = True
+    thread.start()
+
+def _run_kiterunner(self, event):
+    """Run Kiterunner API route scan on scoped first-party hosts."""
+    import os
+    import subprocess
+    import tempfile
+    import threading
+    import time as time_module
+
+    kiterunner_path = self.kiterunner_path_field.getText().strip()
+    wordlist_value = self.kiterunner_wordlist_field.getText().strip()
+    profile_value = self._selected_profile_value(self.kiterunner_profile_combo)
+    profile_cfg = self._kiterunner_profile_settings(profile_value)
+    custom_override = self._get_kiterunner_custom_targets_override()
+
+    if not kiterunner_path:
+        self.kiterunner_area.setText("[!] Configure Kiterunner path first\n")
+        return
+    if not self._validate_binary_signature(
+        "Kiterunner",
+        kiterunner_path,
+        self.kiterunner_area,
+        required_tokens=["scan", "brute", "wordlist"],
+        forbidden_tokens=[],
+        fix_hint="Set Kiterunner Path to your local kr binary (for example: $HOME/.local/bin/kr).",
+    ):
+        return
+    if (not self.api_data) and (not custom_override.get("enabled")):
+        self.kiterunner_area.setText(
+            "[!] No endpoints in Recon tab. Capture or import first\n"
+        )
+        return
+
+    targets, target_meta = self._collect_kiterunner_targets()
+    if not targets:
+        error_text = self._ascii_safe(
+            target_meta.get("error") or target_meta.get("source_filter_error") or ""
+        ).strip()
+        if error_text:
+            self.kiterunner_area.setText("[!] {}\n".format(error_text))
+        else:
+            self.kiterunner_area.setText(
+                "[!] No Kiterunner targets after filtering. Capture more first-party API traffic or adjust host filter.\n"
+            )
+        return
+    profile_target_host_cap = int(profile_cfg.get("target_host_cap", 0) or 0)
+    profile_target_host_cap_skipped = 0
+    if profile_target_host_cap > 0 and len(targets) > profile_target_host_cap:
+        profile_target_host_cap_skipped = len(targets) - profile_target_host_cap
+        targets = list(targets[:profile_target_host_cap])
+
+    alias_value = ""
+    wordlist_args = []
+    wordlist_mode = ""
+    raw_wordlist = self._ascii_safe(wordlist_value).strip()
+    assetnote_entry_cap = int(profile_cfg.get("assetnote_entry_cap", 0) or 0)
+    assetnote_cap_applied = False
+    assetnote_cap_syntax_normalized = False
+
+    def _kiterunner_alias_has_explicit_cap(alias_text):
+        return bool(
+            re.search(r"(?:;|:)\d+$", self._ascii_safe(alias_text).strip())
+        )
+
+    def _normalize_kiterunner_assetnote_alias(alias_text, fallback_cap=0):
+        normalized_alias = self._ascii_safe(alias_text).strip()
+        if not normalized_alias:
+            return {
+                "value": "",
+                "cap_applied": False,
+                "syntax_normalized": False,
+            }
+        cap_match = re.search(r"^(.*?)(?:;|:)(\d+)$", normalized_alias)
+        if cap_match:
+            alias_name = self._ascii_safe(cap_match.group(1)).strip()
+            alias_cap = self._ascii_safe(cap_match.group(2)).strip()
+            if alias_name and alias_cap:
+                return {
+                    "value": "{}:{}".format(alias_name, alias_cap),
+                    "cap_applied": False,
+                    "syntax_normalized": ";" in normalized_alias,
+                }
+        if fallback_cap > 0:
+            return {
+                "value": "{}:{}".format(normalized_alias, fallback_cap),
+                "cap_applied": True,
+                "syntax_normalized": False,
+            }
+        return {
+            "value": normalized_alias,
+            "cap_applied": False,
+            "syntax_normalized": False,
+        }
+
+    if raw_wordlist and os.path.exists(raw_wordlist):
+        wordlist_args = ["-w", raw_wordlist]
+        wordlist_mode = "file"
+    else:
+        lower_wordlist = self._ascii_safe(raw_wordlist, lower=True)
+        if lower_wordlist.startswith("assetnote:"):
+            alias_value = raw_wordlist.split(":", 1)[1].strip()
+        elif raw_wordlist and (os.sep not in raw_wordlist) and ("\\" not in raw_wordlist):
+            alias_value = raw_wordlist
+        if alias_value:
+            alias_meta = _normalize_kiterunner_assetnote_alias(
+                alias_value,
+                fallback_cap=0
+                if _kiterunner_alias_has_explicit_cap(alias_value)
+                else assetnote_entry_cap,
+            )
+            effective_alias_value = alias_meta.get("value") or ""
+            assetnote_cap_applied = bool(alias_meta.get("cap_applied"))
+            assetnote_cap_syntax_normalized = bool(
+                alias_meta.get("syntax_normalized")
+            )
+            wordlist_args = ["-A", effective_alias_value]
+            wordlist_mode = "assetnote"
+    if not wordlist_args:
+        self.kiterunner_area.setText(
+            "[!] Kiterunner wordlist not found or alias invalid: {}\n".format(
+                raw_wordlist
+            )
+        )
+        self.kiterunner_area.append(
+            "[*] Use a local .kite file path or an Assetnote alias such as apiroutes-260227\n"
+        )
+        return
+
+    temp_dir = tempfile.mkdtemp(prefix="burp_kiterunner_")
+    targets_file = os.path.join(temp_dir, "targets.txt")
+    writer = None
+    try:
+        writer = FileWriter(targets_file)
+        for target in targets:
+            writer.write(target + "\n")
+    finally:
+        if writer:
+            writer.close()
+
+    self.kiterunner_area.setText("[*] Running Kiterunner...\n")
+    source_mode = self._ascii_safe(target_meta.get("source_mode") or "", lower=True)
+    self.kiterunner_area.append(
+        "[*] Mode: {}\n".format(
+            profile_cfg.get("profile", profile_value).title()
+        )
+    )
+    if source_mode == "custom_targets":
+        self.kiterunner_area.append("[*] Target Source: Custom Targets popup\n")
+    elif target_meta.get("manual_scope_enabled"):
+        self.kiterunner_area.append("[*] Target Source: Target Bases popup\n")
+    elif target_meta.get("force_host"):
+        self.kiterunner_area.append("[*] Target Source: Recon filtered scope (host filter)\n")
+    else:
+        self.kiterunner_area.append("[*] Target Source: Recon filtered scope\n")
+    if source_mode == "custom_targets":
+        self.kiterunner_area.append(
+            "[*] Targets: {} base URLs\n".format(len(targets))
+        )
+    else:
+        self.kiterunner_area.append(
+            "[*] Targets: {} hosts ({} raw candidates)\n".format(
+                len(targets), target_meta.get("raw_candidates", len(targets))
+            )
+        )
+    self.kiterunner_area.append("[*] Target URLs:\n")
+    for target_url in targets:
+        self.kiterunner_area.append(
+            "    {}\n".format(self._ascii_safe(target_url))
+        )
+    if source_mode == "custom_targets":
+        self.kiterunner_area.append(
+            "[*] Custom targets: {} popup-defined base URLs\n".format(
+                target_meta.get("custom_targets_count", len(targets))
+            )
+        )
+    elif target_meta.get("manual_scope_enabled"):
+        self.kiterunner_area.append(
+            "[*] Target base scope: {} lines | hosts={} | bases={}\n".format(
+                target_meta.get("manual_scope_line_count", 0),
+                target_meta.get("manual_scope_host_count", 0),
+                target_meta.get("manual_scope_base_count", 0),
+            )
+        )
+        preview = target_meta.get("manual_scope_preview", [])
+        if preview:
+            self.kiterunner_area.append(
+                "[*] Scope preview: {}\n".format(", ".join(preview))
+            )
+    elif target_meta.get("force_host"):
+        self.kiterunner_area.append(
+            "[*] Host scope: {}\n".format(target_meta.get("selected_host", "unknown"))
+        )
+    else:
+        allowed_bases = target_meta.get("allowed_bases", [])
+        if allowed_bases:
+            self.kiterunner_area.append(
+                "[*] First-party base scope: {}\n".format(", ".join(allowed_bases))
+            )
+    if source_mode != "custom_targets":
+        self.kiterunner_area.append(
+            "[*] Filtered out: noise-host={} scope-host={} low-signal={}\n".format(
+                target_meta.get("dropped_noise_host", 0),
+                target_meta.get("dropped_scope_host", 0),
+                target_meta.get("dropped_low_signal", 0),
+            )
+        )
+        if target_meta.get("signal_relaxed"):
+            self.kiterunner_area.append(
+                "[*] Low-signal fallback: +{} hosts (kept scoped first-party bases after strict API-only pass returned none)\n".format(
+                    target_meta.get("signal_relax_added", 0)
+                )
+            )
+    filter_error_text = self._ascii_safe(
+        target_meta.get("source_filter_error") or ""
+    ).strip()
+    if filter_error_text:
+        self.kiterunner_area.append(
+            "[!] Recon filtered scope snapshot error: {}\n".format(filter_error_text)
+        )
+    if target_meta.get("truncated", 0) > 0:
+        self.kiterunner_area.append(
+            "[*] Target cap applied: {} skipped (max {})\n".format(
+                target_meta.get("truncated", 0), self.KITERUNNER_MAX_TARGETS
+            )
+        )
+    if profile_target_host_cap_skipped > 0:
+        self.kiterunner_area.append(
+            "[*] Profile host cap: {} skipped (top {} ranked hosts kept for {} mode)\n".format(
+                profile_target_host_cap_skipped,
+                profile_target_host_cap,
+                profile_cfg.get("profile", profile_value).title(),
+            )
+        )
+    self.kiterunner_area.append(
+        "[*] Wordlist: {} ({})\n".format(
+            raw_wordlist, "Assetnote alias" if wordlist_mode == "assetnote" else "local file"
+        )
+    )
+    if assetnote_cap_applied:
+        self.kiterunner_area.append(
+            "[*] Route budget: Assetnote alias capped to first {} entries for {} mode\n".format(
+                assetnote_entry_cap,
+                profile_cfg.get("profile", profile_value).title(),
+            )
+        )
+    if assetnote_cap_syntax_normalized:
+        self.kiterunner_area.append(
+            "[*] Wordlist cap syntax normalized to alias:N for local kr compatibility\n"
+        )
+    max_elapsed_seconds = int(profile_cfg.get("max_elapsed_seconds", 0) or 0)
+    if max_elapsed_seconds > 0:
+        self.kiterunner_area.append(
+            "[*] Time boundary: {}s max elapsed for {} mode\n".format(
+                max_elapsed_seconds,
+                profile_cfg.get("profile", profile_value).title(),
+            )
+        )
+    self.kiterunner_area.append(
+        "[*] Tuning: Hosts={} | Per-host={} | Preflight={} | Timeout={} | Delay={}\n".format(
+            profile_cfg.get("max_parallel_hosts"),
+            profile_cfg.get("max_connection_per_host"),
+            profile_cfg.get("preflight_depth"),
+            profile_cfg.get("timeout"),
+            profile_cfg.get("delay"),
+        )
+    )
+    self.kiterunner_area.append(
+        "[*] WAF evasion: forwarded-IP headers + lower concurrency + redirect quarantine controls\n\n"
+    )
+    self.log_to_ui(
+        "[*] Kiterunner: Starting scan on {} hosts ({})".format(
+            len(targets), profile_cfg.get("profile", profile_value)
+        )
+    )
+    self._clear_tool_cancel("kiterunner")
+
+    def run_scan():
+        process = None
+        try:
+            cmd = [
+                kiterunner_path,
+                "scan",
+                targets_file,
+            ]
+            cmd.extend(wordlist_args)
+            cmd.extend(
+                [
+                    "-o",
+                    "text",
+                    "--progress",
+                    "-q",
+                    "-v",
+                    "error",
+                    "-j",
+                    str(profile_cfg.get("max_parallel_hosts", 8)),
+                    "-x",
+                    str(profile_cfg.get("max_connection_per_host", 2)),
+                    "-d",
+                    str(profile_cfg.get("preflight_depth", 1)),
+                    "-t",
+                    str(profile_cfg.get("timeout", "6s")),
+                    "--delay",
+                    str(profile_cfg.get("delay", "90ms")),
+                    "--quarantine-threshold",
+                    str(profile_cfg.get("quarantine_threshold", 10)),
+                    "--max-redirects",
+                    "1",
+                    "--fail-status-codes",
+                    "400,404,429,500,501,502,503,504",
+                    "--user-agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    "-H",
+                    "X-Forwarded-For: 127.0.0.1",
+                    "-H",
+                    "X-Originating-IP: 127.0.0.1",
+                    "-H",
+                    "X-Forwarded-Host: localhost",
+                    "-H",
+                    "Accept: application/json",
+                ]
+            )
+            if profile_cfg.get("full_scan"):
+                cmd.append("--kitebuilder-full-scan")
+
+            display_cmd = " ".join(cmd)
+            SwingUtilities.invokeLater(
+                lambda: self.kiterunner_area.append(
+                    "[*] Command: {}\n\n".format(display_cmd)
+                )
+            )
+
+            start_time = time_module.time()
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+                shell=False,
+            )
+            self._set_active_tool_process("kiterunner", process)
+
+            results = []
+            error_lines = []
+            last_update = start_time
+            cancelled_by_user = False
+            timed_out_by_boundary = False
+            output_lock = threading.Lock()
+            pending_kiterunner_output_lines = []
+            heartbeat_interval_seconds = 10.0
+            ui_poll_interval_seconds = 0.35
+            total_target_count = len(targets)
+            progress_state = {
+                "processed_targets": None,
+                "progress_is_estimate": False,
+                "progress_signal_seen": False,
+                "discovery_target_keys": set(),
+            }
+
+            def stream_reader(pipe, output_list, lock=output_lock):
+                buffered_text = ""
+                try:
+                    while True:
+                        chunk = pipe.read(1)
+                        if not chunk:
+                            break
+                        chunk_text = self._decode_process_data(
+                            chunk, "Kiterunner stdout raw line"
+                        )
+                        if not chunk_text:
+                            continue
+                        buffered_text += chunk_text
+                        emitted_segments = []
+                        segment_start = 0
+                        index = 0
+                        while index < len(buffered_text):
+                            if buffered_text[index] in ["\r", "\n"]:
+                                emitted_segments.append(
+                                    buffered_text[segment_start : index + 1]
+                                )
+                                segment_start = index + 1
+                            index += 1
+                        if emitted_segments:
+                            buffered_text = buffered_text[segment_start:]
+                            with lock:
+                                output_list.extend(emitted_segments)
+                    if buffered_text:
+                        with lock:
+                            output_list.append(buffered_text)
+                except Exception as read_err:
+                    self._callbacks.printError(
+                        "Kiterunner stdout reader error: {}".format(str(read_err))
+                    )
+                finally:
+                    try:
+                        pipe.close()
+                    except Exception as close_err:
+                        self._callbacks.printError(
+                            "Kiterunner stdout close error: {}".format(
+                                str(close_err)
+                            )
+                        )
+
+            def _sanitize_kiterunner_output_lines(raw_text):
+                cleaned_text = self.ANSI_ESCAPE_PATTERN.sub(
+                    "", self._ascii_safe(raw_text)
+                )
+                cleaned_text = cleaned_text.replace("\x08", "")
+                normalized_lines = []
+                for logical_line in cleaned_text.split("\n"):
+                    if "\r" in logical_line:
+                        carriage_segments = [
+                            segment
+                            for segment in logical_line.split("\r")
+                            if segment
+                        ]
+                        if carriage_segments:
+                            logical_line = carriage_segments[-1]
+                        else:
+                            logical_line = logical_line.replace("\r", "")
+                    logical_line = re.sub(
+                        r"[\x00-\x07\x0b\x0c\x0e-\x1f\x7f]",
+                        "",
+                        logical_line,
+                    ).strip()
+                    if logical_line:
+                        normalized_lines.append(logical_line)
+                return normalized_lines
+
+            def _extract_kiterunner_progress_update(raw_text):
+                cleaned_text = self.ANSI_ESCAPE_PATTERN.sub(
+                    "", self._ascii_safe(raw_text)
+                )
+                cleaned_text = cleaned_text.replace("\x08", "")
+                best_exact_count = None
+                best_estimated_count = None
+                for segment in cleaned_text.split("\r"):
+                    segment_text = self._ascii_safe(segment).strip()
+                    if not segment_text:
+                        continue
+                    matches = re.findall(r"(?<!\d)(\d+)\s*/\s*(\d+)(?!\d)", segment_text)
+                    for match in matches:
+                        try:
+                            current_count = int(match[0])
+                            total_count = int(match[1])
+                        except (TypeError, ValueError):
+                            continue
+                        if current_count < 0 or current_count > total_count:
+                            continue
+                        if total_count == total_target_count:
+                            if (best_exact_count is None) or (
+                                current_count > best_exact_count
+                            ):
+                                best_exact_count = current_count
+                            continue
+                        if (
+                            total_target_count > 0
+                            and total_count > total_target_count
+                            and current_count > 0
+                        ):
+                            estimated_count = int(
+                                (current_count * total_target_count + total_count - 1)
+                                / total_count
+                            )
+                            if estimated_count < 1:
+                                estimated_count = 1
+                            if estimated_count > total_target_count:
+                                estimated_count = total_target_count
+                            if (best_estimated_count is None) or (
+                                estimated_count > best_estimated_count
+                            ):
+                                best_estimated_count = estimated_count
+                if best_exact_count is not None:
+                    return {
+                        "processed_targets": best_exact_count,
+                        "is_estimate": False,
+                    }
+                if best_estimated_count is not None:
+                    return {
+                        "processed_targets": best_estimated_count,
+                        "is_estimate": True,
+                    }
+                return {
+                    "processed_targets": None,
+                    "is_estimate": False,
+                }
+
+            def _kiterunner_progress_line_candidate(clean_line):
+                if not clean_line:
+                    return False
+                return bool(
+                    re.search(r"(?<!\d)\d+\s*/\s*\d+(?!\d)", clean_line)
+                )
+
+            def _kiterunner_discovery_target_key(parsed_result):
+                url_text = self._ascii_safe(parsed_result.get("url") or "").strip()
+                if not url_text:
+                    return ""
+                try:
+                    parsed_url = URL(url_text)
+                except Exception:
+                    return ""
+                host = self._ascii_safe(parsed_url.getHost(), lower=True).strip()
+                if not host:
+                    return ""
+                protocol = self._ascii_safe(
+                    parsed_url.getProtocol() or "https", lower=True
+                ).strip() or "https"
+                port = parsed_url.getPort()
+                if port == -1:
+                    port = 443 if protocol == "https" else 80
+                if (protocol == "https" and port == 443) or (
+                    protocol == "http" and port == 80
+                ):
+                    base_url = "{}://{}/".format(protocol, host)
+                else:
+                    base_url = "{}://{}:{}/".format(protocol, host, port)
+                return self._ascii_safe(base_url).strip()
+
+            def _render_kiterunner_discovery_line(parsed_result):
+                method_text = (
+                    self._ascii_safe(parsed_result.get("method") or "GET").strip()
+                    or "GET"
+                )
+                status_text = (
+                    self._ascii_safe(parsed_result.get("status") or "").strip()
+                    or "?"
+                )
+                url_text = self._ascii_safe(parsed_result.get("url") or "").strip()
+                return "[+] Discovery: [{}] [{}] {}\n".format(
+                    method_text, status_text, url_text
+                )
+
+            def _render_kiterunner_progress_line(
+                processed_count,
+                discoveries_count,
+                elapsed_seconds,
+                is_estimate=False,
+            ):
+                if processed_count is None:
+                    return "[*] Progress: target-position unavailable | discoveries={} | elapsed={}s\n".format(
+                        int(discoveries_count),
+                        int(elapsed_seconds),
+                    )
+                safe_processed = max(
+                    0, min(int(processed_count), int(total_target_count))
+                )
+                progress_prefix = "~" if is_estimate else ""
+                return "[*] Progress: {}{}/{} targets processed | discoveries={} | elapsed={}s\n".format(
+                    progress_prefix,
+                    safe_processed,
+                    total_target_count,
+                    int(discoveries_count),
+                    int(elapsed_seconds),
+                )
+
+            def _flush_pending_kiterunner_lines():
+                processed_changed = False
+                drained = []
+                with output_lock:
+                    if pending_kiterunner_output_lines:
+                        drained = list(pending_kiterunner_output_lines)
+                        del pending_kiterunner_output_lines[:]
+                if not drained:
+                    return 0
+
+                ui_lines = []
+                for raw_line in drained:
+                    progress_update = _extract_kiterunner_progress_update(raw_line)
+                    inferred_processed_count = progress_update.get("processed_targets")
+                    inferred_is_estimate = bool(progress_update.get("is_estimate"))
+                    if inferred_processed_count is not None:
+                        current_processed = progress_state["processed_targets"]
+                        if (
+                            current_processed is None
+                            or inferred_processed_count > current_processed
+                            or (
+                                progress_state["progress_is_estimate"]
+                                and (not inferred_is_estimate)
+                            )
+                        ):
+                            progress_state["processed_targets"] = inferred_processed_count
+                            progress_state["progress_is_estimate"] = inferred_is_estimate
+                            progress_state["progress_signal_seen"] = True
+                            processed_changed = True
+                    for clean_line in _sanitize_kiterunner_output_lines(raw_line):
+                        parsed_result = self._parse_kiterunner_result_line(clean_line)
+                        if parsed_result:
+                            results.append(clean_line)
+                            discovery_target_key = _kiterunner_discovery_target_key(
+                                parsed_result
+                            )
+                            if discovery_target_key:
+                                discovery_target_keys = progress_state[
+                                    "discovery_target_keys"
+                                ]
+                                previous_count = len(discovery_target_keys)
+                                discovery_target_keys.add(discovery_target_key)
+                                if len(discovery_target_keys) > previous_count:
+                                    if (
+                                        progress_state["processed_targets"] is None
+                                        or len(discovery_target_keys)
+                                        > progress_state["processed_targets"]
+                                    ):
+                                        progress_state["processed_targets"] = len(
+                                            discovery_target_keys
+                                        )
+                                        if not progress_state["progress_signal_seen"]:
+                                            progress_state["progress_is_estimate"] = True
+                                        processed_changed = True
+                            ui_lines.append(
+                                _render_kiterunner_discovery_line(parsed_result)
+                            )
+                            continue
+
+                        lower_line = clean_line.lower()
+                        if "fatal" in lower_line or "error" in lower_line:
+                            error_lines.append(clean_line)
+                            if clean_line.startswith("[!]"):
+                                ui_lines.append(clean_line + "\n")
+                            else:
+                                ui_lines.append("[!] " + clean_line + "\n")
+                            continue
+
+                        if _kiterunner_progress_line_candidate(clean_line):
+                            continue
+                        ui_lines.append(clean_line + "\n")
+
+                if processed_changed:
+                    elapsed = int(time_module.time() - start_time)
+                    ui_lines.append(
+                        _render_kiterunner_progress_line(
+                            progress_state["processed_targets"],
+                            len(results),
+                            elapsed,
+                            progress_state["progress_is_estimate"],
+                        )
+                    )
+
+                if ui_lines:
+                    rendered_output = "".join(ui_lines)
+                    SwingUtilities.invokeLater(
+                        lambda t=rendered_output: (
+                            self.kiterunner_area.append(t),
+                            self.kiterunner_area.setCaretPosition(
+                                self.kiterunner_area.getDocument().getLength()
+                            ),
+                        )
+                    )
+                return len(ui_lines)
+
+            stdout_thread = threading.Thread(
+                target=stream_reader,
+                args=(process.stdout, pending_kiterunner_output_lines),
+            )
+            stdout_thread.daemon = True
+            stdout_thread.start()
+
+            while process.poll() is None:
+                if self._is_tool_cancelled("kiterunner"):
+                    cancelled_by_user = True
+                    self._terminate_process_cross_platform(process, "Kiterunner")
+                    break
+                _flush_pending_kiterunner_lines()
+                current_time = time_module.time()
+                if max_elapsed_seconds > 0 and (
+                    current_time - start_time
+                ) >= max_elapsed_seconds:
+                    timed_out_by_boundary = True
+                    self._terminate_process_cross_platform(process, "Kiterunner")
+                    break
+                if current_time - last_update >= heartbeat_interval_seconds:
+                    elapsed = int(current_time - start_time)
+                    discoveries = len(results)
+                    SwingUtilities.invokeLater(
+                        lambda e=elapsed, d=discoveries, p=progress_state["processed_targets"], est=progress_state["progress_is_estimate"]: (
+                            self.kiterunner_area.append(
+                                _render_kiterunner_progress_line(p, d, e, est)
+                            ),
+                            self.kiterunner_area.setCaretPosition(
+                                self.kiterunner_area.getDocument().getLength()
+                            ),
+                        )
+                    )
+                    last_update = current_time
+                time_module.sleep(ui_poll_interval_seconds)
+
+            process.wait()
+            stdout_thread.join(timeout=2)
+            _flush_pending_kiterunner_lines()
+            elapsed = int(time_module.time() - start_time)
+
+            with self.kiterunner_lock:
+                self.kiterunner_results = list(results)
+
+            if cancelled_by_user:
+                SwingUtilities.invokeLater(
+                    lambda: self.kiterunner_area.append(
+                        "\n[!] Kiterunner run cancelled by user\n"
+                    )
+                )
+                SwingUtilities.invokeLater(
+                    lambda: self.log_to_ui("[!] Kiterunner cancelled by user")
+                )
+                return
+
+            if timed_out_by_boundary and not results:
+                boundary_text = (
+                    "\n[!] Kiterunner {} time boundary reached after {}s; no discoveries were collected before the run was stopped\n".format(
+                        profile_cfg.get("profile", profile_value).title(),
+                        max_elapsed_seconds,
+                    )
+                )
+                SwingUtilities.invokeLater(
+                    lambda t=boundary_text: self.kiterunner_area.append(t)
+                )
+                SwingUtilities.invokeLater(
+                    lambda: self.log_to_ui(
+                        "[!] Kiterunner {} time boundary reached after {}s".format(
+                            profile_cfg.get("profile", profile_value).title(),
+                            max_elapsed_seconds,
+                        )
+                    )
+                )
+                return
+
+            if process.returncode != 0 and (not results) and (not timed_out_by_boundary):
+                fail_lines = [
+                    "",
+                    "[!] Kiterunner command failed",
+                    "[!] Exit code: {}".format(process.returncode),
+                    "[!] Command: {}".format(display_cmd),
+                ]
+
+                # Check for wordlist-related errors
+                wordlist_error_detected = False
+                remote_wordlist_error_detected = False
+                for err_line in error_lines:
+                    err_lower = self._ascii_safe(err_line, lower=True)
+                    if "failed to get remote wordlists" in err_lower or "failed to get url" in err_lower:
+                        remote_wordlist_error_detected = True
+                        wordlist_error_detected = True
+                        continue
+                    if "invalid names" in err_lower or "failed to get wordlists" in err_lower:
+                        wordlist_error_detected = True
+                        continue
+
+                if wordlist_error_detected:
+                    fail_lines.append("")
+                    fail_lines.append("[!] WORDLIST ERROR DETECTED")
+                    if remote_wordlist_error_detected:
+                        fail_lines.append("[*] The local kr binary could not fetch Assetnote wordlists for '{}'.".format(raw_wordlist))
+                        fail_lines.append("")
+                        fail_lines.append("[*] To fix this issue:")
+                        fail_lines.append("    1. Confirm this host can resolve/reach wordlists.assetnote.io")
+                        fail_lines.append("    2. Retry with a local .kite file if remote wordlists are blocked")
+                        fail_lines.append("    3. Or use a cached alias / alias:N value supported by your local kr build")
+                    else:
+                        fail_lines.append("[*] The wordlist alias '{}' is not available in your kiterunner installation.".format(raw_wordlist))
+                        fail_lines.append("")
+                        fail_lines.append("[*] To fix this issue:")
+                        fail_lines.append("    1. Check available wordlists: kr wordlist list")
+                        fail_lines.append("    2. Update the Wordlist/Alias field with a valid alias (e.g., apiroutes-260227)")
+                        fail_lines.append("    3. Or use a local .kite file path instead of an alias")
+                        fail_lines.append("")
+                        fail_lines.append("[*] Common valid aliases:")
+                        fail_lines.append("    - apiroutes-260227 (February 2026 API routes)")
+                        fail_lines.append("    - aspx-260227 (ASP/ASPX routes)")
+                        fail_lines.append("    - Run 'kr wordlist list' to see all available aliases")
+
+                fail_text = "\n".join(fail_lines) + "\n"
+                SwingUtilities.invokeLater(
+                    lambda t=fail_text: self.kiterunner_area.append(t)
+                )
+                SwingUtilities.invokeLater(
+                    lambda: self.log_to_ui(
+                        "[!] Kiterunner failed with exit code {}".format(
+                            process.returncode
+                        )
+                    )
+                )
+                return
+
+            by_status = {}
+            by_method = {}
+            for result_line in results:
+                parsed = self._parse_kiterunner_result_line(result_line)
+                if not parsed:
+                    continue
+                status = parsed.get("status") or "unknown"
+                method = parsed.get("method") or "GET"
+                by_status.setdefault(status, []).append(result_line)
+                by_method[method] = by_method.get(method, 0) + 1
+
+            summary = "\n" + "=" * 80 + "\n"
+            summary += "KITERUNNER SCAN RESULTS\n"
+            summary += "=" * 80 + "\n"
+            summary += "[*] Scan Time: {}s\n".format(elapsed)
+            summary += "[*] Targets Scanned: {}\n".format(len(targets))
+            summary += "[*] Total Discoveries: {}\n".format(len(results))
+            summary += "[*] Profile: {}\n".format(
+                profile_cfg.get("profile", profile_value).title()
+            )
+            if timed_out_by_boundary:
+                summary += "[*] Boundary: stopped early at {}s with partial results\n".format(
+                    max_elapsed_seconds
+                )
+            summary += "\n"
+
+            if results:
+                for status in sorted(by_status.keys()):
+                    matches = by_status[status]
+                    summary += "=" * 80 + "\n"
+                    summary += "STATUS {} - {} routes\n".format(status, len(matches))
+                    summary += "=" * 80 + "\n"
+                    for match in matches[:10]:
+                        summary += "{}\n".format(match)
+                    if len(matches) > 10:
+                        summary += "... ({} more)\n".format(len(matches) - 10)
+                    summary += "\n"
+
+                summary += "=" * 80 + "\n"
+                summary += "METHOD SUMMARY\n"
+                summary += "=" * 80 + "\n"
+                for method in sorted(by_method.keys()):
+                    summary += "[+] {}: {}\n".format(method, by_method[method])
+                summary += "\n[*] Use 'Export Results' to save all discoveries\n"
+            else:
+                summary += "[*] No API routes discovered\n"
+
+            SwingUtilities.invokeLater(lambda: self.kiterunner_area.append(summary))
+            SwingUtilities.invokeLater(
+                lambda: self.log_to_ui(
+                    "[+] Kiterunner: {}s, {} hosts, {} discoveries".format(
+                        elapsed, len(targets), len(results)
+                    )
+                )
+            )
+            SwingUtilities.invokeLater(
+                lambda: self.kiterunner_area.setCaretPosition(
+                    self.kiterunner_area.getDocument().getLength()
+                )
+            )
+        except Exception as e:
+            err = "[!] Error: {}\n".format(str(e))
+            SwingUtilities.invokeLater(lambda: self.kiterunner_area.append(err))
+            err_msg = str(e)
+            SwingUtilities.invokeLater(
+                lambda m=err_msg: self.log_to_ui("[!] Kiterunner error: {}".format(m))
+            )
+        finally:
+            self._clear_active_tool_process("kiterunner", process)
+            self._clear_tool_cancel("kiterunner")
+            self._cleanup_temp_dir(temp_dir, "kiterunner scan")
+
+    thread = threading.Thread(target=run_scan)
+    thread.daemon = True
+    thread.start()
+
+def _run_wayback(self):
+    """Discover historical endpoints using Wayback Machine API"""
+    import os
+    import subprocess
+    import threading
+    import tempfile
+    import time as time_module
+
+    if not self.api_data:
+        self.wayback_area.setText(
+            "[!] No endpoints in Recon tab. Capture or import first\n"
+        )
+        return
+
+    queries, query_meta = self._collect_wayback_queries()
+
+    # Get date range and limit from UI with validation
+    current_year = str(time.localtime().tm_year)
+    from_year = self.wayback_from_field.getText().strip() or "2020"
+    to_year = self.wayback_to_field.getText().strip() or current_year
+    limit = self.wayback_limit_field.getText().strip() or "100"
+
+    # Validate inputs
+    try:
+        from_year_int = int(from_year)
+        to_year_int = int(to_year)
+        limit_int = int(limit)
+        current_year_int = int(current_year)
+        if from_year_int < 1996 or from_year_int > current_year_int:
+            from_year = "2020"
+        if to_year_int < 1996 or to_year_int > current_year_int:
+            to_year = current_year
+        if limit_int < 1 or limit_int > 1000:
+            limit = "50"
+    except ValueError:
+        from_year = "2020"
+        to_year = current_year
+        limit = "50"
+
+    if not queries:
+        self.wayback_area.setText("[!] No hosts found in Recon tab\n")
+        return
+
+    wayback_temp_dir = None
+    wayback_targets_file = None
+    use_custom_wayback = False
+    custom_wayback_command = None
+
+    if self.wayback_custom_cmd_checkbox.isSelected():
+        wayback_temp_dir = tempfile.mkdtemp(prefix="burp_wayback_")
+        wayback_targets_file = os.path.join(wayback_temp_dir, "targets.txt")
+        writer = None
+        try:
+            writer = FileWriter(wayback_targets_file)
+            for host, path in queries:
+                target = host + path if path else host
+                writer.write(target + "\n")
+        finally:
+            if writer:
+                try:
+                    writer.close()
+                except Exception as e:
+                    self._callbacks.printError(
+                        "Wayback target file close error: {}".format(str(e))
+                    )
+
+        use_custom_wayback, custom_wayback_command = self._resolve_custom_command(
+            "Wayback",
+            self.wayback_custom_cmd_checkbox,
+            self.wayback_custom_cmd_field,
+            {
+                "targets_file": wayback_targets_file,
+                "from_year": from_year,
+                "to_year": to_year,
+                "limit": limit,
+            },
+            self.wayback_area,
+        )
+        if use_custom_wayback and not custom_wayback_command:
+            self._cleanup_temp_dir(
+                wayback_temp_dir, "wayback custom command validation"
+            )
+            return
+        if use_custom_wayback and custom_wayback_command:
+            if not self._validate_wayback_custom_command_tools(
+                custom_wayback_command, self.wayback_area
+            ):
+                self._cleanup_temp_dir(
+                    wayback_temp_dir, "wayback custom command tool validation"
+                )
+                return
+    uses_recon_query_list = (not use_custom_wayback) or (
+        wayback_targets_file and wayback_targets_file in custom_wayback_command
+    )
+
+    self.wayback_area.setText("[*] Querying Wayback Machine...\n")
+    self.wayback_area.append(
+        "[*] Targets: {} hosts + {} paths\n".format(
+            query_meta.get("host_count", 0), query_meta.get("path_count", 0)
+        )
+    )
+    if query_meta.get("manual_scope_enabled"):
+        self.wayback_area.append(
+            "[*] Target base scope: {} lines | hosts={} | bases={}\n".format(
+                query_meta.get("manual_scope_line_count", 0),
+                query_meta.get("manual_scope_host_count", 0),
+                query_meta.get("manual_scope_base_count", 0),
+            )
+        )
+        preview = query_meta.get("manual_scope_preview", [])
+        if preview:
+            self.wayback_area.append(
+                "[*] Scope preview: {}\n".format(", ".join(preview))
+            )
+    elif query_meta.get("force_host"):
+        self.wayback_area.append(
+            "[*] Host scope: {}\n".format(query_meta.get("selected_host", "unknown"))
+        )
+    else:
+        allowed_bases = query_meta.get("allowed_bases", [])
+        if allowed_bases:
+            self.wayback_area.append(
+                "[*] First-party base scope: {}\n".format(", ".join(allowed_bases))
+            )
+    self.wayback_area.append(
+        "[*] Filtered out: noise-host={} scope-host={} path-noise={}\n".format(
+            query_meta.get("dropped_noise_host", 0),
+            query_meta.get("dropped_scope_host", 0),
+            query_meta.get("dropped_path", 0),
+        )
+    )
+    if query_meta.get("truncated", 0) > 0:
+        self.wayback_area.append(
+            "[*] Query cap applied: {} skipped (max {})\n".format(
+                query_meta.get("truncated", 0), self.WAYBACK_MAX_QUERIES
+            )
+        )
+    self.wayback_area.append("[*] Date Range: {}-{}\n".format(from_year, to_year))
+    self.wayback_area.append("[*] Limit: {} per target\n\n".format(limit))
+    if use_custom_wayback and custom_wayback_command:
+        self.wayback_area.append("[*] Mode: Custom command override\n")
+        self.wayback_area.append("[*] Command: {}\n\n".format(custom_wayback_command))
+        if not uses_recon_query_list:
+            self.wayback_area.append(
+                "[*] Note: custom command defines query scope (generated target list not referenced)\n\n"
+            )
+    self.log_to_ui(
+        "[*] Wayback: {} queries ({}-{})".format(len(queries), from_year, to_year)
+    )
+    self._clear_tool_cancel("wayback")
+
+    def run_discovery():
+        process = None
+        try:
+            import json
+
+            import urllib2  # type: ignore
+
+            all_urls = []
+            seen_urls = set()
+            start_time = time_module.time()
+            error_count = 0
+            backoff_time = 3.0  # Start with 3s delay
+            custom_warning_lines = []
+            cancelled_by_user = False
+
+            if use_custom_wayback and custom_wayback_command:
+                cmd = self._build_shell_command(custom_wayback_command)
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    bufsize=1,
+                    shell=False,
+                )
+                self._set_active_tool_process("wayback", process)
+                SwingUtilities.invokeLater(
+                    lambda: self.log_to_ui(
+                        "[*] Wayback custom cmd: {}".format(custom_wayback_command)
+                    )
+                )
+
+                while True:
+                    line = process.stdout.readline()
+                    if not line:
+                        if process.poll() is not None:
+                            break
+                        if self._is_tool_cancelled("wayback"):
+                            cancelled_by_user = True
+                            self._terminate_process_cross_platform(
+                                process, "Wayback"
+                            )
+                            break
+                        time_module.sleep(0.1)
+                        continue
+
+                    line = self._decode_process_data(line, "Wayback stdout line")
+
+                    normalized = self._normalize_wayback_entry(line)
+                    if not normalized:
+                        continue
+
+                    original_url = normalized.split(" | ", 1)[0]
+                    if original_url in seen_urls:
+                        continue
+
+                    seen_urls.add(original_url)
+                    all_urls.append(normalized)
+                    SwingUtilities.invokeLater(
+                        lambda u=original_url: self.wayback_area.append(
+                            "  [+] {}\n".format(u)
+                        )
+                        )
+
+                stderr_data = process.stderr.read() if process.stderr else ""
+                process.wait()
+                if self._is_tool_cancelled("wayback"):
+                    cancelled_by_user = True
+                if not isinstance(stderr_data, str):
+                    try:
+                        stderr_data = stderr_data.decode("utf-8", errors="ignore")
+                    except Exception as e:
+                        self._callbacks.printError(
+                            "Wayback stderr decode error: {}".format(str(e))
+                        )
+                        stderr_data = str(stderr_data)
+
+                if process.returncode != 0:
+                    err_preview = (stderr_data or "").strip()
+                    if len(err_preview) > 300:
+                        err_preview = err_preview[:300] + "..."
+                    if all_urls:
+                        warning = (
+                            "[!] Custom command exited with code {} after producing {} snapshots".format(
+                                process.returncode, len(all_urls)
+                            )
+                        )
+                        custom_warning_lines.append(warning)
+                        if err_preview:
+                            custom_warning_lines.append(
+                                "[!] STDERR: {}".format(err_preview)
+                            )
+                        SwingUtilities.invokeLater(
+                            lambda w=warning: self.wayback_area.append(w + "\n")
+                        )
+                        SwingUtilities.invokeLater(
+                            lambda: self.log_to_ui(
+                                "[!] Wayback custom command partial failure (exit {})".format(
+                                    process.returncode
+                                )
+                            )
+                        )
+                    else:
+                        error_count = len(queries)
+                        raise Exception(
+                            "Custom command failed (exit {}): {}".format(
+                                process.returncode,
+                                err_preview or "no stderr output",
+                            )
+                        )
+            else:
+                idx = 0
+                request_spacing_s = 8.0
+                max_retries = 4
+                retry_delay_s = 5.0
+                rate_limit_cooldown_s = 0.0
+                SwingUtilities.invokeLater(
+                    lambda: self.wayback_area.append(
+                        "[*] Throttle: spacing={}s | retries={} | base-retry-delay={}s\n".format(
+                            int(request_spacing_s), max_retries, int(retry_delay_s)
+                        )
+                    )
+                )
+                for host, path in queries:
+                    if self._is_tool_cancelled("wayback"):
+                        cancelled_by_user = True
+                        break
+                    idx += 1
+                    target = host + path if path else host
+                    SwingUtilities.invokeLater(
+                        lambda t=target, i=idx, total=len(queries): self.wayback_area.append(
+                            "[*] {}/{}: {}\n".format(i, total, t)
+                        )
+                    )
+
+                    if rate_limit_cooldown_s > 0.0:
+                        cooldown = float(rate_limit_cooldown_s)
+                        SwingUtilities.invokeLater(
+                            lambda c=cooldown: self.wayback_area.append(
+                                "  [*] Cooling down {:.0f}s after recent rate-limit\n".format(
+                                    c
+                                )
+                            )
+                        )
+                        time_module.sleep(cooldown)
+                    success = False
+                    data = None
+
+                    try:
+                        for attempt in range(max_retries + 1):
+                            try:
+                                # Query Wayback CDX API with date range
+                                match_type = "prefix" if path else "domain"
+                                api_url = "https://web.archive.org/cdx/search/cdx?url={}&matchType={}&output=json&filter=statuscode:200&collapse=urlkey&from={}&to={}&limit={}".format(
+                                    target, match_type, from_year, to_year, limit
+                                )
+
+                                # Create request with proper headers to bypass robots.txt
+                                request = urllib2.Request(api_url)
+                                request.add_header('User-Agent', 'Mozilla/5.0 (compatible; archive.org_bot +http://archive.org/details/archive.org_bot)')
+                                request.add_header('Accept', 'application/json')
+
+                                response = None
+                                try:
+                                    response = urllib2.urlopen(request, timeout=20)
+                                    data = json.loads(response.read())
+                                    success = True
+                                except urllib2.HTTPError as http_err:
+                                    if http_err.code == 403:
+                                        raise Exception(  # noqa: B904
+                                            "HTTP Error 403: FORBIDDEN (blocked by robots.txt)"
+                                        )
+                                    elif http_err.code == 429:
+                                        if attempt < max_retries:
+                                            wait_s = float(retry_delay_s) * (2 ** attempt)
+                                            SwingUtilities.invokeLater(
+                                                lambda a=attempt + 1, m=max_retries, w=wait_s: self.wayback_area.append(
+                                                    "  [*] 429 received; retry {}/{} in {:.0f}s\n".format(
+                                                        a, m, w
+                                                    )
+                                                )
+                                            )
+                                            time_module.sleep(wait_s)
+                                            continue
+                                        raise Exception(  # noqa: B904
+                                            "HTTP Error 429: Too Many Requests"
+                                        )
+                                    else:
+                                        raise Exception(  # noqa: B904
+                                            "HTTP Error {}: {}".format(
+                                                http_err.code, http_err.reason
+                                            )
+                                        )
+                                except urllib2.URLError as url_err:
+                                    if "timed out" in str(url_err).lower():
+                                        if attempt < max_retries:
+                                            time_module.sleep(retry_delay_s)
+                                            continue
+                                        raise Exception(  # noqa: B904
+                                            "Timeout after {} retries".format(max_retries)
+                                        )
+                                    raise Exception("Network error: {}".format(str(url_err)))  # noqa: B904
+                                finally:
+                                    if response:
+                                        response.close()
+
+                                if success:
+                                    break
+                            except Exception as retry_err:
+                                if attempt == max_retries:
+                                    raise
+                                self._callbacks.printError(
+                                    "Wayback transient attempt {} failed: {}".format(
+                                        attempt, str(retry_err)
+                                    )
+                                )
+                                time_module.sleep(retry_delay_s)
+                    except Exception as e:
+                        err_msg = str(e)
+                        SwingUtilities.invokeLater(
+                            lambda err=err_msg: self.wayback_area.append(
+                                "  [!] Error: {}\n".format(err)
+                            )
+                        )
+                        error_count += 1
+                        if "429" in err_msg or "Too Many Requests" in err_msg:
+                            backoff_time = min(backoff_time * 2, 90.0)
+                            rate_limit_cooldown_s = max(
+                                float(rate_limit_cooldown_s), float(backoff_time)
+                            )
+                            SwingUtilities.invokeLater(
+                                lambda b=backoff_time: self.wayback_area.append(
+                                    "  [*] Rate-limit backoff increased to {:.0f}s\n".format(
+                                        b
+                                    )
+                                )
+                            )
+                            time_module.sleep(backoff_time)
+                        continue
+
+                    try:
+                        if success and data and len(data) > 1:  # First row is headers
+                            found_count = 0
+                            for row in data[1:]:  # Skip header row
+                                if len(row) >= 3:
+                                    original_url = row[2]  # Original URL
+                                    timestamp = row[1]  # Timestamp
+                                    snapshot_url = (
+                                        "http://web.archive.org/web/{}/{}".format(
+                                            timestamp, original_url
+                                        )
+                                    )
+
+                                    # Deduplicate by original URL
+                                    if original_url not in seen_urls:
+                                        seen_urls.add(original_url)
+                                        all_urls.append(
+                                            "{} | {} | {}".format(
+                                                original_url, snapshot_url, timestamp
+                                            )
+                                        )
+                                        found_count += 1
+
+                            if found_count > 0:
+                                SwingUtilities.invokeLater(
+                                    lambda c=found_count: self.wayback_area.append(
+                                        "  [+] Found: {} snapshots\n".format(c)
+                                    )
+                                )
+                            else:
+                                SwingUtilities.invokeLater(
+                                    lambda: self.wayback_area.append(
+                                        "  [-] No unique archives\n"
+                                    )
+                                )
+                        else:
+                            SwingUtilities.invokeLater(
+                                lambda: self.wayback_area.append(
+                                    "  [-] No archive found\n"
+                                )
+                            )
+                    except Exception as parse_err:
+                        err_msg = str(parse_err)
+                        SwingUtilities.invokeLater(
+                            lambda err=err_msg: self.wayback_area.append(
+                                "  [!] Parse error: {}\n".format(err)
+                            )
+                        )
+                        self._callbacks.printError("Wayback parse error: {}".format(err_msg))
+
+                    # Reset error tracking on success
+                    error_count = 0
+                    backoff_time = 3.0
+                    if rate_limit_cooldown_s > 0.0:
+                        rate_limit_cooldown_s = max(0.0, float(rate_limit_cooldown_s) - 2.0)
+                    if self._is_tool_cancelled("wayback"):
+                        cancelled_by_user = True
+                        break
+                    time_module.sleep(request_spacing_s)
+
+            if cancelled_by_user:
+                with self.wayback_lock:
+                    self.wayback_discovered = all_urls
+                SwingUtilities.invokeLater(
+                    lambda c=len(all_urls): self.wayback_area.append(
+                        "\n[!] Wayback run cancelled by user (partial snapshots: {})\n".format(
+                            c
+                        )
+                    )
+                )
+                SwingUtilities.invokeLater(
+                    lambda: self.log_to_ui("[!] Wayback cancelled by user")
+                )
+                return
+
+            elapsed = int(time_module.time() - start_time)
+
+            # Store results
+            with self.wayback_lock:
+                self.wayback_discovered = all_urls
+
+            summary = "\n" + "=" * 80 + "\n"
+            summary += "WAYBACK DISCOVERY RESULTS\n"
+            summary += "=" * 80 + "\n"
+            summary += "[*] Query Time: {}s (~{}min)\n".format(elapsed, elapsed // 60)
+            if uses_recon_query_list:
+                summary += "[*] Queries: {} (hosts + paths)\n".format(len(queries))
+            else:
+                summary += "[*] Queries: Custom command (scope defined by command)\n"
+            summary += "[*] Snapshots Found: {}\n".format(len(all_urls))
+            if uses_recon_query_list:
+                summary += "[*] Success Rate: {}%\n".format(
+                    int((len(queries) - error_count) * 100.0 / len(queries)) if len(queries) > 0 else 0
+                )
+            else:
+                summary += "[*] Success Rate: N/A (custom mode)\n"
+            if custom_warning_lines:
+                summary += "\n" + "\n".join(custom_warning_lines) + "\n"
+            summary += "\n"
+
+            if all_urls:
+                # Score and sort snapshots by relevance
+                scored_urls = []
+                for url in all_urls:
+                    score = 0
+                    url_lower = url.lower()
+                    # Prioritize API endpoints
+                    if '/api/' in url_lower: score += 10
+                    if any(v in url_lower for v in ['/v1/', '/v2/', '/v3/']): score += 5
+                    # Deprioritize static files
+                    if any(ext in url_lower for ext in ['.js', '.css', '.png', '.jpg']): score -= 5
+                    scored_urls.append((score, url))
+
+                scored_urls.sort(reverse=True, key=lambda x: x[0])
+
+                summary += "=" * 80 + "\n"
+                summary += "DISCOVERED API ENDPOINTS\n"
+                summary += "=" * 80 + "\n"
+                # Extract and filter API endpoints
+                api_endpoints_list = []
+                for _, url_entry in scored_urls:
+                    try:
+                        original_url = url_entry.split(" | ")[0]
+                        if not original_url.startswith("http"):
+                            original_url = "http://" + original_url
+                        parsed = URL(original_url)
+                        path = parsed.getPath() or "/"
+                        # Only include API endpoints
+                        if any(p in path.lower() for p in ['/api/', '/v1/', '/v2/', '/v3/', '/graphql', '/rest/']):
+                            endpoint = "{}://{}{}".format(parsed.getProtocol(), parsed.getHost(), path)
+                            if parsed.getQuery():
+                                query = parsed.getQuery()
+                                # Skip search/query noise
+                                if not any(n in query.lower() for n in ['?q=', 'rdt=', 'search=']):
+                                    endpoint += "?" + query
+                            # Skip noise patterns
+                            if not any(n in endpoint.lower() for n in ['/r/$', '?rdt=']):
+                                api_endpoints_list.append(endpoint)
+                    except Exception as e:
+                        self._callbacks.printError(
+                            "Wayback endpoint parse error: {}".format(str(e))
+                        )
+                        continue
+                
+                # Deduplicate and sort
+                api_endpoints_list = sorted(set(api_endpoints_list))
+                for endpoint in api_endpoints_list[:50]:
+                    summary += "{}\n".format(endpoint)
+                if len(api_endpoints_list) > 50:
+                    summary += "... ({} more)\n".format(len(api_endpoints_list) - 50)
+                summary += "\n"
+
+                summary += "=" * 80 + "\n"
+                summary += "SUMMARY\n"
+                summary += "=" * 80 + "\n"
+                summary += "[+] Total Snapshots: {}\n".format(len(all_urls))
+                summary += "[+] Filtered API Endpoints: {}\n\n".format(len(api_endpoints_list))
+
+                summary += "[*] Key Actions:\n"
+                summary += "    - Click 'Send to Recon' to add discovered endpoints\n"
+                summary += "    - Review snapshots for deprecated/forgotten endpoints\n"
+                summary += "    - Export results for manual analysis\n"
+            else:
+                summary += "[*] No snapshots found\n"
+                summary += "[*] Try expanding date range or checking different hosts\n"
+
+            SwingUtilities.invokeLater(lambda: self.wayback_area.append(summary))
+            SwingUtilities.invokeLater(
+                lambda: self.log_to_ui(
+                    "[+] Wayback: {}s, {} archives".format(elapsed, len(all_urls))
+                )
+            )
+        except Exception as e:
+            err = "[!] Error: {}\n".format(str(e))
+            SwingUtilities.invokeLater(lambda: self.wayback_area.append(err))
+            err_msg = str(e)
+            SwingUtilities.invokeLater(
+                lambda m=err_msg: self.log_to_ui("[!] Wayback error: {}".format(m))
+            )
+        finally:
+            self._clear_active_tool_process("wayback", process)
+            self._clear_tool_cancel("wayback")
+            if wayback_temp_dir:
+                self._cleanup_temp_dir(wayback_temp_dir, "wayback scan")
+
+    thread = threading.Thread(target=run_discovery)
+    thread.daemon = True
+    thread.start()
+
+def _run_apihunter(self, event):
+    """Run ApiHunter with calibration preset support."""
+    import os
+    import subprocess
+    import tempfile
+    import threading
+    import time as time_module
+
+    apihunter_path = self.apihunter_path_field.getText().strip()
+    if not apihunter_path:
+        self.apihunter_area.setText("[!] Configure ApiHunter path first\n")
+        return
+    if not self.api_data:
+        self.apihunter_area.setText("[!] No endpoints in Recon tab\n")
+        return
+
+    temp_dir = tempfile.mkdtemp(prefix="burp_apihunter_")
+    targets_file = os.path.join(temp_dir, "targets.txt")
+    results_file = os.path.join(temp_dir, "results.ndjson")
+
+    targets, target_meta = self._collect_apihunter_targets()
+    if not targets:
+        self._cleanup_temp_dir(temp_dir, "apihunter empty")
+        error_text = self._ascii_safe(target_meta.get("error") or "").strip()
+        if error_text:
+            self.apihunter_area.setText("[!] {}\n".format(error_text))
+        else:
+            self.apihunter_area.setText("[!] No targets\n")
+        return
+
+    def _write_targets_file(file_path, target_values):
+        writer = None
+        try:
+            writer = FileWriter(file_path)
+            for target_value in list(target_values or []):
+                writer.write(self._ascii_safe(target_value) + "\n")
+        finally:
+            if writer:
+                writer.close()
+
+    _write_targets_file(targets_file, targets)
+
+    # Get calibration preset
+    calibration = "Balanced (Desktop Preset)"
+    try:
+        calibration = str(self.apihunter_calibration_combo.getSelectedItem())
+    except Exception as e:
+        self._callbacks.printError("ApiHunter calibration read error: {}".format(str(e)))
+
+    auth_mode = "Auth + Unauth"
+    try:
+        auth_mode = str(self.apihunter_auth_mode_combo.getSelectedItem())
+    except Exception as e:
+        self._callbacks.printError("ApiHunter auth mode read error: {}".format(str(e)))
+
+    # Check for custom command override
+    use_custom, custom_apihunter_command = self._resolve_custom_command(
+        "ApiHunter",
+        self.apihunter_custom_cmd_checkbox,
+        self.apihunter_custom_cmd_field,
+        {
+            "apihunter_path": apihunter_path,
+            "targets_file": targets_file,
+            "results_file": results_file,
+        },
+        self.apihunter_area,
+    )
+    if use_custom and not custom_apihunter_command:
+        self._cleanup_temp_dir(temp_dir, "apihunter custom command validation")
+        return
+    if use_custom and self._ascii_safe(auth_mode, lower=True).strip() in [
+        "auth + unauth",
+        "auth+unauth",
+    ]:
+        self._cleanup_temp_dir(temp_dir, "apihunter custom command dual-pass validation")
+        self.apihunter_area.setText(
+            "[!] Auth + Unauth mode is not supported when 'Enable Custom' is active\n"
+        )
+        self.apihunter_area.append(
+            "[*] Disable custom mode to run dual-pass, or keep custom mode with Auth Only/Unauth Only.\n"
+        )
+        return
+
+    target_count = max(1, int(len(targets)))
+    if "Quick" in calibration:
+        timeout_secs_per_target = 12
+        watchdog_secs_per_target = 20
+        timeout_secs_cap = 1200
+    elif "Deep" in calibration:
+        timeout_secs_per_target = 20
+        watchdog_secs_per_target = 90
+        timeout_secs_cap = 3600
+    else:  # Balanced
+        timeout_secs_per_target = 15
+        watchdog_secs_per_target = 40
+        timeout_secs_cap = 2400
+    adaptive_timeout_secs = min(
+        timeout_secs_cap, max(timeout_secs_per_target, target_count * timeout_secs_per_target)
+    )
+    max_timeout = min(
+        7200,
+        max(target_count * watchdog_secs_per_target, adaptive_timeout_secs + 60),
+    )
+
+    self.apihunter_area.setText("[*] Running ApiHunter...\n")
+    if not use_custom:
+        self.apihunter_area.append("[*] Calibration: {}\n".format(calibration))
+    source_mode = self._ascii_safe(target_meta.get("source_mode") or "", lower=True)
+    if source_mode == "custom_targets":
+        self.apihunter_area.append("[*] Target Source: Custom Targets popup\n")
+    else:
+        self.apihunter_area.append("[*] Target Source: Recon filtered scope\n")
+    self.apihunter_area.append("[*] Auth Mode: {}\n".format(auth_mode))
+    self.apihunter_area.append("[*] Targets: {}\n".format(len(targets)))
+    self.apihunter_area.append("[*] Target URLs:\n")
+    for target_url in targets:
+        self.apihunter_area.append("    {}\n".format(self._ascii_safe(target_url)))
+    if use_custom:
+        self.apihunter_area.append(
+            "[*] Timeout Budget: watchdog={}s (~{}s/target)\n".format(
+                max_timeout, watchdog_secs_per_target
+            )
+        )
+    else:
+        self.apihunter_area.append(
+            "[*] Timeout Budget: --timeout-secs {} (scaled) | watchdog={}s (~{}s/target)\n".format(
+                adaptive_timeout_secs,
+                max_timeout,
+                watchdog_secs_per_target,
+            )
+        )
+    self.apihunter_area.append("\n")
+    self._clear_tool_cancel("apihunter")
+
+    def _pick_best_frequency_value(counter_map):
+        items = list((counter_map or {}).items())
+        if not items:
+            return ""
+        ordered = sorted(
+            items,
+            key=lambda item: (-int(item[1]), -len(self._ascii_safe(item[0])), self._ascii_safe(item[0])),
+        )
+        return self._ascii_safe(ordered[0][0]).strip()
+
+    def _entry_header_value(entry, header_name):
+        headers = entry.get("headers") if isinstance(entry, dict) else {}
+        if not isinstance(headers, dict):
+            return ""
+        target = self._ascii_safe(header_name or "", lower=True).strip()
+        for raw_name, raw_value in headers.items():
+            safe_name = self._ascii_safe(raw_name or "", lower=True).strip()
+            if safe_name != target:
+                continue
+            return self._ascii_safe(raw_value or "").strip()
+        return ""
+
+    def _cookie_header_to_pairs(raw_cookie):
+        text = self._ascii_safe(raw_cookie or "").strip()
+        if not text:
+            return []
+        ignored_cookie_attrs = set(
+            [
+                "path",
+                "domain",
+                "expires",
+                "max-age",
+                "secure",
+                "httponly",
+                "samesite",
+                "priority",
+            ]
+        )
+        pairs = []
+        seen = set()
+        for chunk in text.split(";"):
+            part = self._ascii_safe(chunk or "").strip()
+            if (not part) or ("=" not in part):
+                continue
+            name, value = part.split("=", 1)
+            name = self._ascii_safe(name).strip()
+            value = self._ascii_safe(value).strip()
+            lower_name = self._ascii_safe(name, lower=True)
+            if (not name) or (not value) or (lower_name in ignored_cookie_attrs):
+                continue
+            if lower_name in seen:
+                continue
+            seen.add(lower_name)
+            pairs.append("{}={}".format(name, value))
+            if len(pairs) >= 20:
+                break
+        return pairs
+
+    def _discover_auth_associated_targets(target_list):
+        return _discover_auth_associated_targets_shared(
+            self,
+            target_list,
+            "ApiHunter auth target discovery snapshot error",
+        )
+
+    def _collect_auth_context_for_targets(target_list):
+        target_keys = set()
+        for target_url in list(target_list or []):
+            key = self._apihunter_target_key(target_url)
+            if key:
+                target_keys.add(key)
+
+        context = {
+            "headers": [],
+            "cookies": [],
+            "matched_entries": 0,
+            "auth_candidates_found": 0,
+        }
+        if not target_keys:
+            return context
+
+        filtered_source = {}
+        try:
+            filtered_source = dict(self._filter_endpoints())
+        except Exception as e:
+            self._callbacks.printError(
+                "ApiHunter auth context source snapshot error: {}".format(str(e))
+            )
+            filtered_source = {}
+
+        authorization_counts = {}
+        cookie_counts = {}
+        extra_header_counts = {}
+        extra_header_candidates = [
+            ("x-api-key", "X-API-Key"),
+            ("api-key", "Api-Key"),
+            ("apikey", "ApiKey"),
+            ("x-auth-token", "X-Auth-Token"),
+            ("x-access-token", "X-Access-Token"),
+        ]
+        for entries in filtered_source.values():
+            entries_list = entries if isinstance(entries, list) else [entries]
+            for entry in entries_list:
+                if not isinstance(entry, dict):
+                    continue
+                host = self._ascii_safe(entry.get("host"), lower=True).strip()
+                if not host:
+                    continue
+                protocol = (
+                    self._ascii_safe(entry.get("protocol"), lower=True).strip()
+                    or "https"
+                )
+                port = entry.get("port", -1)
+                if port == -1:
+                    port = 443 if protocol == "https" else 80
+                if (protocol == "https" and port == 443) or (
+                    protocol == "http" and port == 80
+                ):
+                    scoped_url = "{}://{}/".format(protocol, host)
+                else:
+                    scoped_url = "{}://{}:{}/".format(protocol, host, port)
+                target_key = self._apihunter_target_key(scoped_url)
+                if target_key not in target_keys:
+                    continue
+
+                context["matched_entries"] += 1
+                authorization_value = _entry_header_value(entry, "authorization")
+                if authorization_value:
+                    authorization_counts[authorization_value] = (
+                        authorization_counts.get(authorization_value, 0) + 1
+                    )
+                cookie_value = _entry_header_value(entry, "cookie")
+                if cookie_value:
+                    cookie_counts[cookie_value] = cookie_counts.get(cookie_value, 0) + 1
+                for lower_header_name, display_header_name in extra_header_candidates:
+                    header_value = _entry_header_value(entry, lower_header_name)
+                    if not header_value:
+                        continue
+                    rendered = "{}: {}".format(display_header_name, header_value)
+                    extra_header_counts[rendered] = (
+                        extra_header_counts.get(rendered, 0) + 1
+                    )
+
+        selected_authorization = _pick_best_frequency_value(authorization_counts)
+        if selected_authorization:
+            context["headers"].append(
+                "Authorization: {}".format(selected_authorization)
+            )
+            context["auth_candidates_found"] += 1
+        for header_line, _count in sorted(
+            extra_header_counts.items(), key=lambda item: (-int(item[1]), item[0])
+        )[:3]:
+            context["headers"].append(header_line)
+            context["auth_candidates_found"] += 1
+
+        selected_cookie = _pick_best_frequency_value(cookie_counts)
+        cookie_pairs = _cookie_header_to_pairs(selected_cookie)
+        if cookie_pairs:
+            context["cookies"] = cookie_pairs
+            context["auth_candidates_found"] += len(cookie_pairs)
+        return context
+
+    def _build_default_apihunter_command(output_file_path, targets_file_path=None):
+        selected_targets_file = (
+            self._ascii_safe(targets_file_path).strip()
+            if targets_file_path
+            else targets_file
+        )
+        cmd_local = [
+            apihunter_path,
+            "--urls",
+            selected_targets_file,
+            "--format",
+            "ndjson",
+            "--output",
+            output_file_path,
+            "--no-discovery",
+        ]
+        if "Quick" in calibration:
+            cmd_local.extend(
+                [
+                    "--filter-timeout",
+                    "3",
+                    "--max-endpoints",
+                    "40",
+                    "--concurrency",
+                    "4",
+                    "--timeout-secs",
+                    str(adaptive_timeout_secs),
+                    "--retries",
+                    "1",
+                    "--delay-ms",
+                    "0",
+                ]
+            )
+        elif "Deep" in calibration:
+            cmd_local.extend(
+                [
+                    "--active-checks",
+                    "--response-diff-deep",
+                    "--filter-timeout",
+                    "3",
+                    "--max-endpoints",
+                    "0",
+                    "--concurrency",
+                    "6",
+                    "--timeout-secs",
+                    str(adaptive_timeout_secs),
+                    "--retries",
+                    "2",
+                    "--delay-ms",
+                    "100",
+                    "--waf-evasion",
+                    "--per-host-clients",
+                    "--adaptive-concurrency",
+                ]
+            )
+        else:
+            cmd_local.extend(
+                [
+                    "--filter-timeout",
+                    "3",
+                    "--max-endpoints",
+                    "80",
+                    "--concurrency",
+                    "5",
+                    "--timeout-secs",
+                    str(adaptive_timeout_secs),
+                    "--retries",
+                    "1",
+                    "--delay-ms",
+                    "50",
+                ]
+            )
+        return cmd_local
+
+    def _append_auth_context_to_command(base_cmd, auth_context):
+        cmd_local = list(base_cmd)
+        for header_line in list(auth_context.get("headers", []) or []):
+            clean_header = self._ascii_safe(header_line).strip()
+            if clean_header:
+                cmd_local.extend(["--headers", clean_header])
+        cookies = list(auth_context.get("cookies", []) or [])
+        if cookies:
+            cmd_local.extend(["--cookies", ",".join(cookies)])
+        return cmd_local
+
+    def _append_auth_context_to_custom_command(command_text, auth_context):
+        rendered = self._ascii_safe(command_text or "").strip()
+        if not rendered:
+            return rendered
+        for header_line in list(auth_context.get("headers", []) or []):
+            clean_header = self._ascii_safe(header_line).strip()
+            if clean_header:
+                rendered += " --headers {}".format(
+                    self._quote_custom_command_value(clean_header)
+                )
+        cookies = list(auth_context.get("cookies", []) or [])
+        if cookies:
+            rendered += " --cookies {}".format(
+                self._quote_custom_command_value(",".join(cookies))
+            )
+        return rendered
+
+    def run_scan():
+        process = None
+        null_sink_handle = None
+        aggregated_findings = []
+        try:
+            mode_key = self._ascii_safe(auth_mode, lower=True).strip()
+            run_plan = []
+            if mode_key == "auth only":
+                run_plan = [("Auth", True)]
+            elif mode_key in ["auth + unauth", "auth+unauth"]:
+                run_plan = [("Unauth", False), ("Auth", True)]
+            else:
+                run_plan = [("Unauth", False)]
+
+            auth_context = {
+                "headers": [],
+                "cookies": [],
+                "matched_entries": 0,
+                "auth_candidates_found": 0,
+            }
+            auth_targets = []
+            unauth_targets = list(targets)
+            auth_targets_file = os.path.join(temp_dir, "targets_auth.txt")
+            unauth_targets_file = os.path.join(temp_dir, "targets_unauth.txt")
+            auth_targets_file_ready = False
+            unauth_targets_file_ready = False
+            if any(use_auth for _label, use_auth in run_plan):
+                auth_discovery = _discover_auth_associated_targets(targets)
+                auth_targets = list(auth_discovery.get("auth_targets", []) or [])
+                unauth_targets = list(auth_discovery.get("unauth_targets", []) or [])
+                matched_entries = int(auth_discovery.get("matched_entries", 0) or 0)
+                auth_entries = int(auth_discovery.get("auth_entries", 0) or 0)
+                header_auth_entries = int(
+                    auth_discovery.get("header_auth_entries", 0) or 0
+                )
+                signal_only_entries = int(
+                    auth_discovery.get("signal_only_entries", 0) or 0
+                )
+                associated_count = len(auth_targets)
+                unauth_count = len(unauth_targets)
+                SwingUtilities.invokeLater(
+                    lambda m=matched_entries, a=auth_entries, c=associated_count: self.apihunter_area.append(
+                        "[*] Auth discovery: matched_entries={} auth_entries={} associated_targets={}\n".format(
+                            m, a, c
+                        )
+                    )
+                )
+                SwingUtilities.invokeLater(
+                    lambda c=associated_count, u=unauth_count: self.apihunter_area.append(
+                        "[*] Auth split: auth_targets={} unauth_targets={}\n".format(
+                            c, u
+                        )
+                    )
+                )
+                SwingUtilities.invokeLater(
+                    lambda h=header_auth_entries, s=signal_only_entries: self.apihunter_area.append(
+                        "[*] Auth discovery detail: header_auth_entries={} signal_only_entries={}\n".format(
+                            h, s
+                        )
+                    )
+                )
+
+                if auth_targets:
+                    auth_lines = ["[*] Auth-associated target URLs:"]
+                    for auth_target_url in auth_targets:
+                        auth_lines.append("    {}".format(self._ascii_safe(auth_target_url)))
+                    SwingUtilities.invokeLater(
+                        lambda t="\n".join(auth_lines) + "\n": self.apihunter_area.append(t)
+                    )
+                    auth_context = _collect_auth_context_for_targets(auth_targets)
+                    has_auth_material = bool(
+                        auth_context.get("headers") or auth_context.get("cookies")
+                    )
+                    if has_auth_material:
+                        SwingUtilities.invokeLater(
+                            lambda: self.apihunter_area.append(
+                                "[*] Auth context prepared: headers={} cookies={} matched_entries={}\n".format(
+                                    len(auth_context.get("headers", []) or []),
+                                    len(auth_context.get("cookies", []) or []),
+                                    int(auth_context.get("matched_entries", 0) or 0),
+                                )
+                            )
+                        )
+                    else:
+                        SwingUtilities.invokeLater(
+                            lambda c=associated_count: self.apihunter_area.append(
+                                "[*] Auth discovery note: {} auth-associated target(s) detected, but reusable Authorization/Cookie/API-key header context was not found. Auth pass will run with target split only.\n".format(
+                                    c
+                                )
+                            )
+                        )
+
+                if unauth_targets:
+                    unauth_lines = ["[*] Unauth target URLs:"]
+                    for unauth_target_url in unauth_targets:
+                        unauth_lines.append(
+                            "    {}".format(self._ascii_safe(unauth_target_url))
+                        )
+                    SwingUtilities.invokeLater(
+                        lambda t="\n".join(unauth_lines) + "\n": self.apihunter_area.append(t)
+                    )
+
+                if not auth_targets:
+                    SwingUtilities.invokeLater(
+                        lambda: self.apihunter_area.append(
+                            "[*] Auth discovery: found none in Recon filtered scope.\n"
+                        )
+                    )
+                    if matched_entries > 0 and header_auth_entries == 0:
+                        SwingUtilities.invokeLater(
+                            lambda m=matched_entries: self.apihunter_area.append(
+                                "[*] Auth discovery note: matched {} target-scoped entries, but none had Authorization/Cookie/API-key request headers or auth signals.\n".format(
+                                    m
+                                )
+                            )
+                        )
+                    if mode_key == "auth only":
+                        SwingUtilities.invokeLater(
+                            lambda: self.apihunter_area.append(
+                                "[!] Auth mode selected but no associated auth data was found.\n"
+                            )
+                        )
+                        return
+                if mode_key in ["auth + unauth", "auth+unauth"]:
+                    split_plan = []
+                    if unauth_targets:
+                        split_plan.append(("Unauth", False))
+                    else:
+                        SwingUtilities.invokeLater(
+                            lambda: self.apihunter_area.append(
+                                "[*] Unauth pass skipped: no unauth-associated targets found.\n"
+                            )
+                        )
+                    if auth_targets:
+                        split_plan.append(("Auth", True))
+                    else:
+                        SwingUtilities.invokeLater(
+                            lambda: self.apihunter_area.append(
+                                "[*] Auth pass skipped: no auth-associated targets found.\n"
+                            )
+                        )
+                    run_plan = split_plan
+            if not run_plan:
+                SwingUtilities.invokeLater(
+                    lambda: self.apihunter_area.append("[!] No ApiHunter passes selected\n")
+                )
+                return
+
+            total_passes = len(run_plan)
+            for pass_index, (pass_label, use_auth_pass) in enumerate(run_plan, 1):
+                null_sink_handle = None
+                if self._is_tool_cancelled("apihunter"):
+                    SwingUtilities.invokeLater(
+                        lambda: self.apihunter_area.append("\n[!] Cancelled\n")
+                    )
+                    return
+
+                pass_key = self._ascii_safe(pass_label, lower=True).replace(" ", "_")
+                pass_results_file = (
+                    results_file
+                    if total_passes == 1
+                    else os.path.join(temp_dir, "results_{}.ndjson".format(pass_key))
+                )
+                pass_targets = auth_targets if use_auth_pass else unauth_targets
+                if not pass_targets:
+                    continue
+                pass_targets_file = targets_file
+                if pass_targets != targets:
+                    if use_auth_pass:
+                        if not auth_targets_file_ready:
+                            _write_targets_file(auth_targets_file, pass_targets)
+                            auth_targets_file_ready = True
+                        pass_targets_file = auth_targets_file
+                    else:
+                        if not unauth_targets_file_ready:
+                            _write_targets_file(unauth_targets_file, pass_targets)
+                            unauth_targets_file_ready = True
+                        pass_targets_file = unauth_targets_file
+
+                if use_custom and custom_apihunter_command:
+                    command_for_pass = custom_apihunter_command
+                    if pass_targets_file != targets_file:
+                        command_for_pass = command_for_pass.replace(
+                            targets_file, pass_targets_file
+                        )
+                    if use_auth_pass:
+                        command_for_pass = _append_auth_context_to_custom_command(
+                            command_for_pass, auth_context
+                        )
+                    cmd = self._build_shell_command(command_for_pass)
+                    display_cmd = (
+                        "{} [--headers/--cookies redacted]".format(command_for_pass)
+                        if use_auth_pass
+                        else command_for_pass
+                    )
+                    SwingUtilities.invokeLater(
+                        lambda p=pass_label: self.apihunter_area.append(
+                            "[*] Pass {}: custom command override enabled\n".format(p)
+                        )
+                    )
+                else:
+                    cmd = _build_default_apihunter_command(
+                        pass_results_file, pass_targets_file
+                    )
+                    display_cmd = " ".join(cmd)
+                    if use_auth_pass:
+                        cmd = _append_auth_context_to_command(cmd, auth_context)
+                        display_cmd = "{} [--headers/--cookies redacted]".format(
+                            display_cmd
+                        )
+
+                SwingUtilities.invokeLater(
+                    lambda p=pass_label, i=pass_index, t=total_passes: self.apihunter_area.append(
+                        "\n[*] Pass {}/{}: {}\n".format(i, t, p)
+                    )
+                )
+                SwingUtilities.invokeLater(
+                    lambda c=len(pass_targets): self.apihunter_area.append(
+                        "[*] Pass Targets: {}\n".format(c)
+                    )
+                )
+                SwingUtilities.invokeLater(
+                    lambda d=display_cmd: self.apihunter_area.append(
+                        "[*] Command: {}\n\n".format(d)
+                    )
+                )
+
+                start_time = time_module.time()
+                timed_out = False
+                null_sink = getattr(subprocess, "DEVNULL", None)
+                if null_sink is None:
+                    null_sink_handle = open(os.devnull, "wb")
+                    null_sink = null_sink_handle
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=null_sink,
+                    stderr=null_sink,
+                    shell=False,
+                )
+                self._set_active_tool_process("apihunter", process)
+
+                SwingUtilities.invokeLater(
+                    lambda p=pass_label: self.apihunter_area.append(
+                        "[*] Computing {} pass...\n".format(p)
+                    )
+                )
+
+                while process.poll() is None:
+                    if self._is_tool_cancelled("apihunter"):
+                        self._terminate_process_cross_platform(process, "ApiHunter")
+                        SwingUtilities.invokeLater(
+                            lambda: self.apihunter_area.append("\n[!] Cancelled\n")
+                        )
+                        if null_sink_handle is not None:
+                            try:
+                                null_sink_handle.close()
+                            except Exception:
+                                pass
+                            null_sink_handle = None
+                        return
+                    elapsed = int(time_module.time() - start_time)
+                    if elapsed > max_timeout:
+                        try:
+                            process.kill()
+                            process.wait()
+                        except Exception as kill_err:
+                            self._callbacks.printError(
+                                "ApiHunter timeout kill error: {}".format(str(kill_err))
+                            )
+                        timed_out = True
+                        break
+                    time_module.sleep(0.1)
+
+                elapsed = int(time_module.time() - start_time)
+                if timed_out:
+                    SwingUtilities.invokeLater(
+                        lambda p=pass_label: self.apihunter_area.append(
+                            "\n[!] {} pass timeout after {}s\n".format(p, max_timeout)
+                        )
+                    )
+                else:
+                    process.wait()
+                    SwingUtilities.invokeLater(
+                        lambda p=pass_label, e=elapsed: self.apihunter_area.append(
+                            "\n[+] {} pass completed in {}s\n".format(p, e)
+                        )
+                    )
+
+                if os.path.exists(pass_results_file):
+                    parsed_holder = {"findings": []}
+
+                    def _render_pass_results(path=pass_results_file, label=pass_label):
+                        parsed_holder["findings"] = (
+                            self._process_apihunter_ndjson_results(
+                                path, self.apihunter_area, run_label=label
+                            )
+                            or []
+                        )
+
+                    SwingUtilities.invokeAndWait(_render_pass_results)
+                    aggregated_findings.extend(parsed_holder["findings"])
+                    if timed_out:
+                        SwingUtilities.invokeLater(
+                            lambda p=pass_label, c=len(parsed_holder["findings"]): self.apihunter_area.append(
+                                "[*] {} pass timeout: parsed {} partial finding(s) from NDJSON.\n".format(
+                                    p, c
+                                )
+                            )
+                        )
+                else:
+                    SwingUtilities.invokeLater(
+                        lambda p=pass_label: self.apihunter_area.append(
+                            "[*] {} pass produced no NDJSON results file.\n".format(p)
+                        )
+                    )
+                if null_sink_handle is not None:
+                    try:
+                        null_sink_handle.close()
+                    except Exception as close_err:
+                        self._callbacks.printError(
+                            "ApiHunter devnull close error: {}".format(str(close_err))
+                        )
+                    null_sink_handle = None
+        except Exception as e:
+            err = "[!] Error: {}\n".format(str(e))
+            SwingUtilities.invokeLater(lambda t=err: self.apihunter_area.append(t))
+        finally:
+            if null_sink_handle is not None:
+                try:
+                    null_sink_handle.close()
+                except Exception:
+                    pass
+            with getattr(self, "apihunter_lock", threading.Lock()):
+                self.apihunter_findings = list(aggregated_findings)
+            self._clear_active_tool_process("apihunter", process)
+            self._clear_tool_cancel("apihunter")
+            self._cleanup_temp_dir(temp_dir, "apihunter")
+
+    thread = threading.Thread(target=run_scan)
+    thread.daemon = True
+    thread.start()

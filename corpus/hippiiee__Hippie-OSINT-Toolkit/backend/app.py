@@ -1,0 +1,374 @@
+import asyncio
+import logging
+import os
+import threading
+from functools import wraps
+from typing import Callable, Dict, Optional, Tuple
+
+from flask import Flask, request
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_socketio import SocketIO
+from werkzeug.exceptions import HTTPException
+
+from core import socket_events as se
+from core.validators import (
+    is_valid_crypto_address,
+    is_valid_domain,
+    is_valid_email,
+    is_valid_ip,
+    is_valid_phone,
+    is_valid_url,
+    is_valid_username,
+)
+from domain.subdomains.crtsh_module import crtsh_module
+from domain.whois.whois_module import whois_module
+from domain.dns.dns_module import dns_module
+from network.ip.ip_module import ip_module
+from network.wayback.wayback_module import wayback_module
+from network.crypto.crypto_module import crypto_module
+from network.metadata.metadata_module import metadata_bp
+from social_networks.discord.discord_module import discord_module
+from social_networks.github.osgint_module import github_module
+from social_networks.google.ghunt_module import google_module
+from social_networks.mastodon.mastodon_module import mastodon_module
+from social_networks.reddit.reddit_module import run_reddit
+from social_networks.telegram.telegram_module import telegram_module
+from social_networks.tiktok.tiktok_module import tiktok_module
+from username.whatsmyname.whatsmyname_module import whatsmyname_module
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+io = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="threading",
+    logger=False,
+    engineio_logger=False,
+    ping_timeout=60,
+    ping_interval=25,
+)
+
+limiter = Limiter(get_remote_address, app=app, default_limits=["10 per minute"], storage_uri="memory://")
+
+app.register_blueprint(metadata_bp)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Per-client task tracking
+# ---------------------------------------------------------------------------
+# Keyed by (namespace, sid) so two clients on the same namespace don't cancel
+# each other. Modules cooperate via the threading.Event we pass in.
+_active_tasks: Dict[Tuple[str, str], threading.Event] = {}
+_tasks_lock = threading.RLock()
+
+
+def _cancel_task(namespace: str, sid: str) -> None:
+    with _tasks_lock:
+        event = _active_tasks.pop((namespace, sid), None)
+        if event is not None:
+            event.set()
+
+
+def _register_task(namespace: str, sid: str) -> threading.Event:
+    with _tasks_lock:
+        _cancel_task(namespace, sid)
+        event = threading.Event()
+        _active_tasks[(namespace, sid)] = event
+        return event
+
+
+def _clear_client(sid: str) -> None:
+    with _tasks_lock:
+        for key in [k for k in _active_tasks if k[1] == sid]:
+            _active_tasks.pop(key).set()
+
+
+def _finish_task(namespace, room, cancel_event):
+    with _tasks_lock:
+        key = (namespace, room)
+        # An older task must not remove its replacement.
+        if _active_tasks.get(key) is cancel_event:
+            _active_tasks.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# Background execution: native threads isolate each task's asyncio loop.
+# ---------------------------------------------------------------------------
+def _spawn_async(coro_fn: Callable, *args, namespace: str, **kwargs):
+    def run():
+        # asyncio.run also shuts down async generators and the default executor.
+        asyncio.run(coro_fn(*args, **kwargs))
+
+    return _spawn_sync(run, namespace=namespace, _task_room=kwargs.get("room"),
+                       _task_cancel=kwargs.get("cancel_event"))
+
+
+def _spawn_sync(fn: Callable, *args, namespace: str,
+                _task_room=None, _task_cancel=None, **kwargs):
+    """Run a callable in a native Socket.IO background thread."""
+    room = kwargs.get("room", _task_room)
+    cancel_event = kwargs.get("cancel_event", _task_cancel)
+
+    def runner() -> None:
+        try:
+            if cancel_event is None or not cancel_event.is_set():
+                fn(*args, **kwargs)
+        except asyncio.CancelledError:
+            logger.info("Async task cancelled for %s", namespace)
+        except Exception as exc:
+            logger.exception("Task failed for %s: %s", namespace, exc)
+            if cancel_event is None or not cancel_event.is_set():
+                _emit_error(namespace, str(exc), room=room)
+        finally:
+            _finish_task(namespace, room, cancel_event)
+
+    return io.start_background_task(runner)
+
+
+# ---------------------------------------------------------------------------
+# Handler glue
+# ---------------------------------------------------------------------------
+def _extract_input(data):
+    if isinstance(data, dict):
+        return data.get("query") or data.get("input") or data
+    return data
+
+
+def _emit_error(namespace: str, message: str, room: Optional[str] = None) -> None:
+    io.emit(se.SERVER_EVENTS["result"], {"error": message}, namespace=namespace, room=room)
+
+
+def _validated_handler(validator: Optional[Callable], namespace: str, runner: Callable):
+    """Wrap a runner with input extraction, validation, and per-client task tracking."""
+
+    @wraps(runner)
+    def handler(data=None):
+        sid = request.sid
+        room = sid
+        value = _extract_input(data)
+
+        if validator is not None:
+            if not value:
+                _emit_error(namespace, "No input provided", room=room)
+                return
+            ok, err = validator(value)
+            if not ok:
+                _emit_error(namespace, err, room=room)
+                return
+
+        cancel_event = _register_task(namespace, sid)
+        try:
+            runner(value, data, cancel_event, room)
+        except Exception as exc:
+            logger.exception(f"Handler error on {namespace}: {exc}")
+            _emit_error(namespace, str(exc), room=room)
+            _finish_task(namespace, room, cancel_event)
+
+    return handler
+
+
+def _disconnect_handler(namespace: str):
+    def handler(reason=None):
+        _cancel_task(namespace, request.sid)
+
+    return handler
+
+
+def _cancel_handler(namespace: str):
+    def handler():
+        sid = request.sid
+        _cancel_task(namespace, sid)
+        io.emit(
+            se.SERVER_EVENTS["result"],
+            {"status": "cancelled", "message": "Search cancelled by user"},
+            namespace=namespace,
+            room=sid,
+        )
+
+    return handler
+
+
+# ---------------------------------------------------------------------------
+# Per-namespace search runners
+# ---------------------------------------------------------------------------
+async def _run_domain(query, _data, cancel_event, room):
+    namespace = se.ns("domain")
+    await crtsh_module.search(query, io, namespace, cancel_event=cancel_event, room=room)
+    if not cancel_event.is_set():
+        await whois_module.search(query, io, namespace, cancel_event=cancel_event, room=room)
+
+
+async def _run_email(_query, _data, cancel_event, room):
+    io.emit(
+        se.SERVER_EVENTS["result"],
+        {"result": {"module": "email", "message": "Email search functionality will be implemented soon."}},
+        namespace=se.ns("email"),
+        room=room,
+    )
+
+
+async def _run_phone(_query, _data, cancel_event, room):
+    io.emit(
+        se.SERVER_EVENTS["result"],
+        {"result": {"module": "phone", "message": "Phone search functionality will be implemented soon."}},
+        namespace=se.ns("phone"),
+        room=room,
+    )
+
+
+def _async_runner(coro_fn, namespace: str, **extra_kwargs):
+    def runner(value, _data, cancel_event, room):
+        _spawn_async(
+            coro_fn,
+            value,
+            io,
+            namespace,
+            cancel_event=cancel_event,
+            room=room,
+            namespace=namespace,
+            **extra_kwargs,
+        )
+
+    return runner
+
+
+def _domain_runner(value, _data, cancel_event, room):
+    _spawn_async(_run_domain, value, None, cancel_event=cancel_event, room=room, namespace=se.ns("domain"))
+
+
+def _email_runner(value, data, cancel_event, room):
+    _spawn_async(_run_email, value, data, cancel_event=cancel_event, room=room, namespace=se.ns("email"))
+
+
+def _phone_runner(value, data, cancel_event, room):
+    _spawn_async(_run_phone, value, data, cancel_event=cancel_event, room=room, namespace=se.ns("phone"))
+
+
+def _whatsmyname_runner(value, _data, cancel_event, room):
+    _spawn_sync(
+        whatsmyname_module.search,
+        value,
+        io,
+        se.ns("username"),
+        cancel_event=cancel_event,
+        room=room,
+        namespace=se.ns("username"),
+    )
+
+
+def _wayback_runner(value, _data, cancel_event, room):
+    _spawn_sync(
+        wayback_module.search_sync,
+        value,
+        io,
+        se.ns("wayback"),
+        cancel_event=cancel_event,
+        room=room,
+        namespace=se.ns("wayback"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Handler table — single source of truth for what gets registered.
+# ---------------------------------------------------------------------------
+SEARCH_HANDLERS = [
+    # (namespace_key, event_key, validator, runner)
+    ("email",      "search",         is_valid_email,    _email_runner),
+    ("domain",     "search",         is_valid_domain,   _domain_runner),
+    ("whois",      "search",         is_valid_domain,
+        _async_runner(whois_module.search, se.ns("whois"))),
+    ("subdomains", "search",         is_valid_domain,
+        _async_runner(crtsh_module.search, se.ns("subdomains"))),
+    ("username",   "search",         is_valid_username, _whatsmyname_runner),
+    ("discord",    "search",         None,
+        _async_runner(discord_module.search, se.ns("discord"))),
+    ("github",     "search",         None,
+        _async_runner(github_module.search, se.ns("github"))),
+    ("google",     "search",         None,
+        _async_runner(google_module.search, se.ns("google"))),
+    ("reddit",     "search",         is_valid_username,
+        _async_runner(run_reddit, se.ns("reddit"))),
+    ("tiktok",     "searchVideo",    is_valid_url,
+        _async_runner(tiktok_module.search, se.ns("tiktok"), search_type="video")),
+    ("tiktok",     "searchProfile",  is_valid_username,
+        _async_runner(tiktok_module.search, se.ns("tiktok"), search_type="profile")),
+    ("mastodon",   "searchUsername", is_valid_username,
+        _async_runner(mastodon_module.search, se.ns("mastodon"), search_type="username")),
+    ("mastodon",   "searchInstance", None,
+        _async_runner(mastodon_module.search, se.ns("mastodon"), search_type="instance")),
+    ("phone",      "search",         is_valid_phone,    _phone_runner),
+    ("dns",        "search",         is_valid_domain,
+        _async_runner(dns_module.search, se.ns("dns"))),
+    ("ip",         "search",         is_valid_ip,
+        _async_runner(ip_module.search, se.ns("ip"))),
+    ("wayback",    "search",         is_valid_domain,   _wayback_runner),
+    ("crypto",     "search",         is_valid_crypto_address,
+        _async_runner(crypto_module.search, se.ns("crypto"))),
+    ("telegram",   "search",         is_valid_username,
+        _async_runner(telegram_module.search, se.ns("telegram"))),
+]
+
+
+def _register_handlers() -> None:
+    for ns_key, event_key, validator, runner in SEARCH_HANDLERS:
+        namespace = se.ns(ns_key)
+        event_name = se.event(ns_key, event_key)
+        handler = _validated_handler(validator, namespace, runner)
+        io.on(event_name, namespace=namespace)(handler)
+        logger.info(f"Registered handler {namespace}:{event_name}")
+
+    for ns_key, channels in se.NAMESPACES.items():
+        namespace = se.ns(ns_key)
+        io.on("disconnect", namespace=namespace)(_disconnect_handler(namespace))
+        cancel_event_name = channels.get("cancel")
+        if not cancel_event_name:
+            continue
+        namespace = se.ns(ns_key)
+        io.on(cancel_event_name, namespace=namespace)(_cancel_handler(namespace))
+        logger.info(f"Registered cancel handler {namespace}:{cancel_event_name}")
+
+
+_register_handlers()
+
+
+# ---------------------------------------------------------------------------
+# Connection lifecycle
+# ---------------------------------------------------------------------------
+@io.on("connect")
+def handle_connect():
+    logger.info(f"Client connected: {request.sid}")
+    io.emit("connection_success", {"status": "connected"}, room=request.sid)
+
+
+@io.on("disconnect")
+def handle_disconnect(reason=None):
+    sid = request.sid
+    logger.info(f"Client disconnected: {sid}")
+    _clear_client(sid)
+
+
+@app.errorhandler(Exception)
+def error_handler(e):
+    if isinstance(e, HTTPException):
+        return e
+    logger.exception(f"Server error: {e}")
+    return "Internal server error", 500
+
+
+if __name__ == "__main__":
+    logger.info("OSINT Toolkit server started")
+    io.run(app, debug=os.environ.get("DEBUG", "False").lower() == "true")

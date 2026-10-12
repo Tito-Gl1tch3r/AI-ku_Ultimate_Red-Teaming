@@ -1,0 +1,423 @@
+package api_storage
+
+import (
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/taymour/elysiandb/internal/globals"
+	"github.com/taymour/elysiandb/internal/log"
+	"github.com/taymour/elysiandb/internal/schema"
+	"github.com/taymour/elysiandb/internal/storage"
+)
+
+const CoreEntityTypePrefix = "_elysiandb_core_"
+
+func WriteEntity(entity string, data map[string]any) []schema.ValidationError {
+	if globals.GetConfig().Api.Schema.Enabled && entity != schema.SchemaEntity {
+		errors := schema.ValidateEntity(entity, data, nil)
+		if len(errors) > 0 {
+			return errors
+		}
+	}
+
+	if _, ok := data["id"].(string); !ok || data["id"] == "" {
+		data["id"] = uuid.New().String()
+	}
+
+	subs := ExtractSubEntities(entity, data)
+	for _, sub := range subs {
+		subEntity := sub["@entity"].(string)
+		delete(sub, "@entity")
+		WriteEntity(subEntity, sub)
+	}
+
+	persistEntity(entity, data)
+
+	if !schema.IsManualSchema(entity, nil) || !globals.GetConfig().Api.Schema.Strict {
+		updateSchemaIfNeeded(entity, data)
+	}
+
+	return []schema.ValidationError{}
+}
+
+func UpdateEntitySchema(entity string, fieldsRaw map[string]any) map[string]any {
+	fields := schema.MapToFields(fieldsRaw)
+
+	entitySchema := schema.Entity{
+		ID:     entity,
+		Fields: fields,
+	}
+
+	storable := schema.SchemaEntityToStorableStructure(entitySchema)
+	storable["_manual"] = true
+
+	WriteEntity(schema.SchemaEntity, storable)
+
+	return storable
+}
+
+func CreateEntityType(entity string) error {
+	if EntityTypeExists(entity) {
+		return fmt.Errorf("entity type '%s' already exists", entity)
+	}
+
+	AddEntityType(entity)
+
+	return nil
+}
+
+func DeleteEntityType(entity string) error {
+	if !EntityTypeExists(entity) {
+		return fmt.Errorf("entity type '%s' does not exist", entity)
+	}
+
+	DeleteAllEntities(entity)
+	RemoveEntityIndexes(entity)
+
+	key := globals.ApiAllEntityTypesListKey()
+	data, _ := storage.GetByKey(key)
+	types := decodeIDs(data)
+	newTypes := make([]string, 0, len(types))
+	for _, t := range types {
+		if t != entity {
+			newTypes = append(newTypes, t)
+		}
+	}
+
+	storage.PutKeyValue(key, encodeIDs(newTypes))
+
+	return nil
+}
+
+func persistEntity(entity string, data map[string]any) {
+	id, _ := data["id"].(string)
+	key := globals.ApiSingleEntityKey(entity, id)
+	old := ReadEntityById(entity, id)
+	storage.PutJsonValue(key, data)
+	AddIdToindexes(entity, id)
+	AddEntityType(entity)
+
+	if old != nil {
+		UpdateIndexesForEntity(entity, id, old, data)
+	} else {
+		for k := range data {
+			if k != "id" {
+				markFieldAndNestedDirty(entity, k, data[k])
+			}
+		}
+	}
+}
+
+func updateSchemaIfNeeded(entity string, data map[string]any) {
+	if globals.GetConfig().Api.Schema.Enabled && entity != schema.SchemaEntity {
+		analyzed := schema.AnalyzeEntitySchema(entity, data)
+		WriteEntity(schema.SchemaEntity, analyzed)
+	}
+}
+
+func WriteListOfEntities(entity string, list []map[string]any) [][]schema.ValidationError {
+	errors := [][]schema.ValidationError{}
+	for _, data := range list {
+		errors = append(errors, WriteEntity(entity, data))
+	}
+
+	return errors
+}
+
+func AddEntityType(entity string) {
+	key := globals.ApiAllEntityTypesListKey()
+	data, _ := storage.GetByKey(key)
+	types := decodeIDs(data)
+	found := slices.Contains(types, entity)
+
+	if !found {
+		types = append(types, entity)
+		storage.PutKeyValue(key, encodeIDs(types))
+	}
+}
+
+func GetEntitySchema(entity string) map[string]any {
+	schemaData := ReadEntityById(schema.SchemaEntity, entity)
+	if schemaData == nil {
+		return nil
+	}
+
+	return schemaData
+}
+
+func EntityTypeExists(entity string) bool {
+	for _, t := range ListEntityTypes() {
+		if t == entity {
+			return true
+		}
+	}
+
+	return false
+}
+
+func ListEntityTypes() []string {
+	data, _ := storage.GetByKey(globals.ApiAllEntityTypesListKey())
+	return decodeIDs(data)
+}
+
+func ListPublicEntityTypes() []string {
+	data, _ := storage.GetByKey(globals.ApiAllEntityTypesListKey())
+	allEntityTypes := decodeIDs(data)
+
+	publicEntityTypes := make([]string, 0, len(allEntityTypes))
+	for _, entityType := range allEntityTypes {
+		if !strings.HasPrefix(entityType, CoreEntityTypePrefix) {
+			publicEntityTypes = append(publicEntityTypes, entityType)
+		}
+	}
+
+	return publicEntityTypes
+}
+
+func ReadEntityById(entity, id string) map[string]any {
+	key := globals.ApiSingleEntityKey(entity, id)
+	data, _ := storage.GetJsonByKey(key)
+
+	return data
+}
+
+func ListEntities(
+	entity string,
+	limit int,
+	offset int,
+	sortField string,
+	sortAscending bool,
+	filters map[string]map[string]string,
+	search string,
+	includesParam string,
+) []map[string]any {
+	idList, err := GetListOfIds(entity, sortField, sortAscending)
+	if err != nil {
+		return []map[string]any{}
+	}
+
+	ids := decodeIDs(idList)
+	if len(ids) == 0 {
+		return []map[string]any{}
+	}
+
+	if len(filters) == 0 {
+		ids = applyOffsetLimit(ids, offset, limit)
+	}
+
+	all := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		entityData := ReadEntityById(entity, id)
+		if entityData != nil {
+			all = append(all, entityData)
+		}
+	}
+
+	autoInc := ExtractAutoIncludes(filters)
+	includesParam = MergeIncludes(includesParam, autoInc)
+
+	if includesParam != "" {
+		all = ApplyIncludes(all, includesParam)
+	}
+
+	filtered := make([]map[string]any, 0, len(all))
+	for _, e := range all {
+		if search == "" && FiltersMatchEntity(e, filters) {
+			filtered = append(filtered, e)
+		}
+
+		if search != "" && SearchMatchesEntity(e, search) {
+			filtered = append(filtered, e)
+		}
+	}
+
+	if len(filters) > 0 {
+		return applyOffsetLimit(filtered, offset, limit)
+	}
+
+	return filtered
+}
+
+func ApplyFiltersToList(
+	entities []map[string]any,
+	filters map[string]map[string]string,
+) []map[string]any {
+	if len(filters) == 0 {
+		return entities
+	}
+
+	filtered := make([]map[string]any, 0, len(entities))
+	for _, e := range entities {
+		if FiltersMatchEntity(e, filters) {
+			filtered = append(filtered, e)
+		}
+	}
+
+	return filtered
+}
+
+func applyOffsetLimit[T any](in []T, offset, limit int) []T {
+	start := offset
+	if start > len(in) {
+		start = len(in)
+	}
+
+	end := len(in)
+	if limit > 0 && start+limit < end {
+		end = start + limit
+	}
+
+	return in[start:end]
+}
+
+func GetListOfIds(entity, sortField string, sortAscending bool) ([]byte, error) {
+	if sortField == "" {
+		idIndexKey := globals.ApiEntityIndexIdKey(entity)
+		return storage.GetByKey(idIndexKey)
+	}
+
+	ensureFieldIndexFresh(entity, sortField)
+	if !IndexExistsForField(entity, sortField) {
+		return []byte{}, nil
+	}
+
+	if sortAscending {
+		return storage.GetByKey(
+			globals.ApiEntityIndexFieldSortAscKey(entity, sortField),
+		)
+	}
+
+	return storage.GetByKey(
+		globals.ApiEntityIndexFieldSortDescKey(entity, sortField),
+	)
+}
+
+func DeleteEntityById(entity, id string) {
+	key := globals.ApiSingleEntityKey(entity, id)
+	storage.DeleteJsonByKey(key)
+	RemoveIdFromIndexes(entity, id)
+}
+
+func DeleteAllEntities(entity string) {
+	prefix := globals.ApiEntitiesAllKey(entity)
+	storage.DeleteJsonByPrefix(prefix)
+	RemoveEntityIndexes(entity)
+	key := globals.ApiAllEntityTypesListKey()
+	data, _ := storage.GetByKey(key)
+	types := decodeIDs(data)
+	newTypes := make([]string, 0, len(types))
+	for _, t := range types {
+		if t != entity {
+			newTypes = append(newTypes, t)
+		}
+	}
+
+	storage.PutKeyValue(key, encodeIDs(newTypes))
+}
+
+func DeleteAll() {
+	entities := ListEntityTypes()
+
+	for _, entity := range entities {
+		DeleteAllEntities(entity)
+	}
+}
+
+func UpdateEntityById(entity, id string, updated map[string]any) map[string]any {
+	existing := ReadEntityById(entity, id)
+	if existing == nil {
+		return nil
+	}
+
+	old := make(map[string]any, len(existing))
+	maps.Copy(old, existing)
+
+	maps.Copy(existing, updated)
+
+	if _, ok := existing["id"].(string); !ok || existing["id"] == "" {
+		existing["id"] = id
+	}
+
+	subs := ExtractSubEntities(entity, existing)
+	for _, sub := range subs {
+		subEntity := sub["@entity"].(string)
+		delete(sub, "@entity")
+		WriteEntity(subEntity, sub)
+	}
+
+	persistEntity(entity, existing)
+	UpdateIndexesForEntity(entity, id, old, existing)
+	updateSchemaIfNeeded(entity, existing)
+
+	return existing
+}
+
+func UpdateListOfEntities(entity string, updates []map[string]any) []map[string]any {
+	results := make([]map[string]any, 0, len(updates))
+	for _, upd := range updates {
+		id, ok := upd["id"].(string)
+		if !ok || id == "" {
+			continue
+		}
+
+		res := UpdateEntityById(entity, id, upd)
+		if res != nil {
+			results = append(results, res)
+		}
+	}
+
+	return results
+}
+
+func DumpAll() map[string]any {
+	entities := ListEntityTypes()
+
+	result := make(map[string]any)
+	for _, entity := range entities {
+		if entity == schema.SchemaEntity {
+			continue
+		}
+
+		result[entity] = ListEntities(entity, 0, 0, "", true, nil, "", "")
+	}
+
+	return result
+}
+
+func EntityExists(entity, id string) bool {
+	return ReadEntityById(entity, id) != nil
+}
+
+func CountAllEntities() int {
+	counter := 0
+	entities := ListEntityTypes()
+
+	for _, entity := range entities {
+		if entity == schema.SchemaEntity {
+			continue
+		}
+
+		counter += len(ListEntities(entity, 0, 0, "", true, nil, "", ""))
+	}
+
+	return counter
+}
+
+func ImportAll(data map[string][]map[string]any) {
+	for entity, items := range data {
+		storage.DeleteByWildcardKey(globals.ApiEntityIndexPatternKey(entity))
+
+		for _, item := range items {
+			if errs := WriteEntity(entity, item); len(errs) > 0 {
+				log.Error(fmt.Sprintf("Error importing entity %s: %+v", entity, errs))
+			}
+		}
+
+		log.Info(fmt.Sprintf("The entity '%s' has been imported", entity))
+	}
+
+	log.Info("All entities have been imported")
+}

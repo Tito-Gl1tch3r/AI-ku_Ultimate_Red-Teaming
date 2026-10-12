@@ -1,0 +1,4486 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    process::Stdio,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::STANDARD};
+use rustls::{
+    DigitallySignedStruct, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature},
+    pki_types::{CertificateDer, ServerName, UnixTime},
+};
+use serde::Deserialize;
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use tokio::{io::AsyncReadExt, net::lookup_host};
+use tokio::{net::TcpStream, time::timeout};
+use tokio_rustls::TlsConnector;
+use uuid::Uuid;
+use x509_parser::{extensions::GeneralName, parse_x509_certificate};
+
+use crate::{
+    intelligence::{CveProbe, PublicCodeProbe, RegistrationProbe},
+    nuclei::NucleiProbe,
+    proto::{
+        Asset, Certificate, Evidence, Finding, FindingSeverity, FindingState, Observation,
+        ScopeTarget, Service, TargetKind, TechnologyFingerprint, Website,
+    },
+    repository::{DiscoveryRecord, FindingEvaluation, Repository, RepositoryError},
+};
+
+#[async_trait]
+pub trait DnsResolver: Send + Sync {
+    async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>, String>;
+}
+
+pub struct SystemDnsResolver;
+
+#[async_trait]
+impl DnsResolver for SystemDnsResolver {
+    async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>, String> {
+        let addresses = lookup_host((domain, 0))
+            .await
+            .map_err(|error| error.to_string())?
+            .map(|socket| socket.ip())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Ok(addresses)
+    }
+}
+
+#[async_trait]
+pub trait PortConnector: Send + Sync {
+    async fn connect(&self, address: IpAddr, port: u16) -> Result<bool, String>;
+}
+
+pub struct SystemPortConnector;
+
+#[async_trait]
+impl PortConnector for SystemPortConnector {
+    async fn connect(&self, address: IpAddr, port: u16) -> Result<bool, String> {
+        match timeout(
+            std::time::Duration::from_millis(750),
+            TcpStream::connect((address, port)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::HostUnreachable
+                        | std::io::ErrorKind::NetworkUnreachable
+                ) =>
+            {
+                Ok(false)
+            }
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_) => Ok(false),
+        }
+    }
+}
+
+#[async_trait]
+pub trait ServiceProbe: Send + Sync {
+    async fn banner(&self, address: IpAddr, port: u16) -> Result<Vec<u8>, String>;
+}
+
+pub struct SystemServiceProbe;
+
+#[async_trait]
+impl ServiceProbe for SystemServiceProbe {
+    async fn banner(&self, address: IpAddr, port: u16) -> Result<Vec<u8>, String> {
+        let mut stream = timeout(
+            std::time::Duration::from_secs(2),
+            TcpStream::connect((address, port)),
+        )
+        .await
+        .map_err(|_| "banner connect timed out".to_owned())?
+        .map_err(|error| error.to_string())?;
+        let mut banner = vec![0; MAX_SERVICE_BANNER_BYTES];
+        let length = timeout(
+            std::time::Duration::from_millis(1200),
+            stream.read(&mut banner),
+        )
+        .await
+        .map_err(|_| "banner read timed out".to_owned())?
+        .map_err(|error| error.to_string())?;
+        banner.truncate(length);
+        Ok(banner)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanVantage {
+    External,
+    Internal,
+    Mixed,
+}
+
+impl ScanVantage {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "external" => Some(Self::External),
+            "internal" => Some(Self::Internal),
+            "mixed" => Some(Self::Mixed),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::External => "external",
+            Self::Internal => "internal",
+            Self::Mixed => "mixed",
+        }
+    }
+
+    fn permits(self, address: IpAddr) -> bool {
+        match self {
+            Self::External => is_public_address(address),
+            Self::Internal => !is_public_address(address),
+            Self::Mixed => true,
+        }
+    }
+}
+
+pub struct WebSnapshot {
+    pub url: String,
+    pub status_code: u16,
+    pub title: String,
+    pub server: String,
+    pub content_type: String,
+    pub body: Vec<u8>,
+}
+
+#[async_trait]
+pub trait WebsiteProbe: Send + Sync {
+    fn supports_path_probes(&self) -> bool {
+        false
+    }
+
+    fn supports_crawl(&self) -> bool {
+        false
+    }
+
+    async fn fetch(
+        &self,
+        address: IpAddr,
+        port: u16,
+        server_name: &str,
+        path: &str,
+    ) -> Result<WebSnapshot, String>;
+}
+
+pub struct SystemWebsiteProbe;
+
+#[async_trait]
+impl WebsiteProbe for SystemWebsiteProbe {
+    fn supports_path_probes(&self) -> bool {
+        true
+    }
+
+    fn supports_crawl(&self) -> bool {
+        true
+    }
+
+    async fn fetch(
+        &self,
+        address: IpAddr,
+        port: u16,
+        server_name: &str,
+        path: &str,
+    ) -> Result<WebSnapshot, String> {
+        if !HTTP_PROBE_PATHS.contains(&path) && !safe_crawl_path(path) {
+            return Err("HTTP probe path is not allowed".to_owned());
+        }
+        install_crypto_provider();
+        let scheme = if matches!(port, 443 | 8443) {
+            "https"
+        } else {
+            "http"
+        };
+        let host = if server_name.contains(':') {
+            format!("[{server_name}]")
+        } else {
+            server_name.to_owned()
+        };
+        let url = format!("{scheme}://{host}:{port}{path}");
+        let mut builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .danger_accept_invalid_certs(true)
+            .user_agent("CyberEdge/0.1 authorized-observer");
+        if server_name.parse::<IpAddr>().is_err() {
+            builder = builder.resolve(server_name, SocketAddr::new(address, port));
+        }
+        let mut response = builder
+            .build()
+            .map_err(|error| error.to_string())?
+            .get(&url)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status_code = response.status().as_u16();
+        let server = response
+            .headers()
+            .get(reqwest::header::SERVER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .chars()
+            .take(256)
+            .collect::<String>();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .chars()
+            .take(256)
+            .collect::<String>();
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+            if body.len() + chunk.len() > MAX_WEB_BODY_BYTES {
+                return Err(format!("response body exceeds {MAX_WEB_BODY_BYTES} bytes"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(WebSnapshot {
+            url,
+            status_code,
+            title: html_title(&body),
+            server,
+            content_type,
+            body,
+        })
+    }
+}
+
+#[async_trait]
+pub trait ScreenshotProbe: Send + Sync {
+    async fn capture(&self, html: &[u8]) -> Result<Vec<u8>, String>;
+}
+
+pub struct SystemScreenshotProbe {
+    binary: PathBuf,
+    chromium_sandbox: bool,
+}
+
+impl SystemScreenshotProbe {
+    pub fn new(binary: impl Into<PathBuf>) -> Self {
+        Self {
+            binary: binary.into(),
+            chromium_sandbox: true,
+        }
+    }
+
+    pub fn isolated_container(binary: impl Into<PathBuf>) -> Self {
+        Self {
+            binary: binary.into(),
+            chromium_sandbox: false,
+        }
+    }
+}
+
+#[async_trait]
+impl ScreenshotProbe for SystemScreenshotProbe {
+    async fn capture(&self, html: &[u8]) -> Result<Vec<u8>, String> {
+        if html.len() > MAX_WEB_BODY_BYTES {
+            return Err("HTML evidence exceeds screenshot input limit".to_owned());
+        }
+        let token = Uuid::now_v7();
+        let html_path = std::env::temp_dir().join(format!("cyberedge-{token}.html"));
+        let png_path = std::env::temp_dir().join(format!("cyberedge-{token}.png"));
+        let profile_path = std::env::temp_dir().join(format!("cyberedge-chromium-{token}"));
+        let mut offline_html = br#"<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'">"#.to_vec();
+        offline_html.extend_from_slice(html);
+        tokio::fs::write(&html_path, offline_html)
+            .await
+            .map_err(|error| error.to_string())?;
+        let file_url = format!("file://{}", html_path.display());
+        let mut command = tokio::process::Command::new(&self.binary);
+        command
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env("HOME", std::env::temp_dir())
+            .args([
+                "--headless=new",
+                "--disable-gpu",
+                "--disable-javascript",
+                "--disable-extensions",
+                "--disable-crash-reporter",
+                "--disable-crashpad",
+                "--disable-breakpad",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--host-resolver-rules=MAP * ~NOTFOUND",
+                "--window-size=1440,900",
+            ])
+            .arg(format!("--user-data-dir={}", profile_path.display()))
+            .arg(format!("--screenshot={}", png_path.display()));
+        if !self.chromium_sandbox {
+            command.arg("--no-sandbox");
+        }
+        command.arg(file_url);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), command.status())
+            .await
+            .map_err(|_| "screenshot renderer timed out".to_owned())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+        let screenshot = match result {
+            Ok(status) if status.success() => tokio::fs::read(&png_path)
+                .await
+                .map_err(|error| error.to_string()),
+            Ok(status) => Err(format!("screenshot renderer exited with {status}")),
+            Err(error) => Err(error),
+        };
+        let _ = tokio::fs::remove_file(&html_path).await;
+        let _ = tokio::fs::remove_file(&png_path).await;
+        let _ = tokio::fs::remove_dir_all(&profile_path).await;
+        let screenshot = screenshot?;
+        if !screenshot.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Err("screenshot renderer did not produce PNG".to_owned());
+        }
+        if screenshot.len() > MAX_SCREENSHOT_BYTES {
+            return Err("screenshot exceeds evidence limit".to_owned());
+        }
+        Ok(screenshot)
+    }
+}
+
+pub struct SocketScreenshotProbe {
+    socket_path: PathBuf,
+}
+
+impl SocketScreenshotProbe {
+    pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl ScreenshotProbe for SocketScreenshotProbe {
+    async fn capture(&self, html: &[u8]) -> Result<Vec<u8>, String> {
+        if html.len() > MAX_WEB_BODY_BYTES {
+            return Err("HTML evidence exceeds screenshot input limit".to_owned());
+        }
+        let exchange = async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = tokio::net::UnixStream::connect(&self.socket_path)
+                .await
+                .map_err(|error| error.to_string())?;
+            stream
+                .write_u32(html.len() as u32)
+                .await
+                .map_err(|error| error.to_string())?;
+            stream
+                .write_all(html)
+                .await
+                .map_err(|error| error.to_string())?;
+            stream.flush().await.map_err(|error| error.to_string())?;
+            let status = stream.read_u8().await.map_err(|error| error.to_string())?;
+            let length = stream.read_u32().await.map_err(|error| error.to_string())? as usize;
+            if length > MAX_SCREENSHOT_BYTES {
+                return Err("renderer response exceeds limit".to_owned());
+            }
+            let mut payload = vec![0; length];
+            stream
+                .read_exact(&mut payload)
+                .await
+                .map_err(|error| error.to_string())?;
+            if status == 0 {
+                if !payload.starts_with(b"\x89PNG\r\n\x1a\n") {
+                    return Err("renderer did not return PNG".to_owned());
+                }
+                Ok(payload)
+            } else {
+                Err(String::from_utf8_lossy(&payload).into_owned())
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(20), exchange)
+            .await
+            .map_err(|_| "screenshot renderer IPC timed out".to_owned())?
+    }
+}
+
+#[async_trait]
+pub trait CertificateProbe: Send + Sync {
+    async fn leaf_certificate(
+        &self,
+        address: IpAddr,
+        port: u16,
+        server_name: &str,
+    ) -> Result<Vec<u8>, String>;
+}
+
+pub struct SystemCertificateProbe {
+    connector: TlsConnector,
+}
+
+impl SystemCertificateProbe {
+    pub fn new() -> Self {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = Arc::new(CollectCertificateVerifier {
+            provider: provider.clone(),
+        });
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("ring provider supports default TLS versions")
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        Self {
+            connector: TlsConnector::from(Arc::new(config)),
+        }
+    }
+}
+
+impl Default for SystemCertificateProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug)]
+struct CollectCertificateVerifier {
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for CollectCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+#[async_trait]
+impl CertificateProbe for SystemCertificateProbe {
+    async fn leaf_certificate(
+        &self,
+        address: IpAddr,
+        port: u16,
+        server_name: &str,
+    ) -> Result<Vec<u8>, String> {
+        let stream = timeout(
+            std::time::Duration::from_secs(2),
+            TcpStream::connect((address, port)),
+        )
+        .await
+        .map_err(|_| "TLS connect timed out".to_owned())?
+        .map_err(|error| error.to_string())?;
+        let server_name =
+            ServerName::try_from(server_name.to_owned()).map_err(|error| error.to_string())?;
+        let stream = timeout(
+            std::time::Duration::from_secs(3),
+            self.connector.connect(server_name, stream),
+        )
+        .await
+        .map_err(|_| "TLS handshake timed out".to_owned())?
+        .map_err(|error| error.to_string())?;
+        stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certificates| certificates.first())
+            .map(|certificate| certificate.as_ref().to_vec())
+            .ok_or_else(|| "TLS peer did not provide a certificate".to_owned())
+    }
+}
+
+#[async_trait]
+pub trait CertificateSource: Send + Sync {
+    async fn discover(&self, domain: &str) -> Result<Vec<String>, String>;
+}
+
+pub struct CrtShSource {
+    client: reqwest::Client,
+}
+
+impl CrtShSource {
+    pub fn new() -> Result<Self, reqwest::Error> {
+        Self::with_proxy(None)
+    }
+
+    pub fn with_proxy(proxy: Option<&str>) -> Result<Self, reqwest::Error> {
+        install_crypto_provider();
+        let mut builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .user_agent("CyberEdge/0.1 passive-inventory");
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(reqwest::Proxy::all(proxy)?);
+        }
+        Ok(Self {
+            client: builder.build()?,
+        })
+    }
+}
+
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+#[derive(Deserialize)]
+struct CrtShEntry {
+    name_value: String,
+}
+
+#[derive(Deserialize)]
+struct CertSpotterIssuance {
+    #[serde(default)]
+    dns_names: Vec<String>,
+}
+
+#[async_trait]
+impl CertificateSource for CrtShSource {
+    async fn discover(&self, domain: &str) -> Result<Vec<String>, String> {
+        match self.discover_crt_sh(domain).await {
+            Ok(names) => Ok(names),
+            Err(crt_sh_error) => {
+                self.discover_certspotter(domain)
+                    .await
+                    .map_err(|fallback_error| {
+                        format!("crt.sh: {crt_sh_error}; certspotter: {fallback_error}")
+                    })
+            }
+        }
+    }
+}
+
+impl CrtShSource {
+    async fn discover_crt_sh(&self, domain: &str) -> Result<Vec<String>, String> {
+        let response = self
+            .client
+            .get("https://crt.sh/")
+            .query(&[("q", format!("%.{domain}")), ("output", "json".to_owned())])
+            .send()
+            .await
+            .map_err(|error| error.to_string())?
+            .error_for_status()
+            .map_err(|error| error.to_string())?;
+        let entries = response
+            .json::<Vec<CrtShEntry>>()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(entries
+            .into_iter()
+            .flat_map(|entry| {
+                entry
+                    .name_value
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect())
+    }
+
+    async fn discover_certspotter(&self, domain: &str) -> Result<Vec<String>, String> {
+        let response = self
+            .client
+            .get("https://api.certspotter.com/v1/issuances")
+            .query(&[
+                ("domain", domain),
+                ("include_subdomains", "true"),
+                ("expand", "dns_names"),
+            ])
+            .send()
+            .await
+            .map_err(|error| error.to_string())?
+            .error_for_status()
+            .map_err(|error| error.to_string())?;
+        Ok(response
+            .json::<Vec<CertSpotterIssuance>>()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .flat_map(|issuance| issuance.dns_names)
+            .collect())
+    }
+}
+
+pub struct DiscoveryWorker {
+    repository: Arc<dyn Repository>,
+    resolver: Arc<dyn DnsResolver>,
+    certificate_source: Option<Arc<dyn CertificateSource>>,
+    port_connector: Option<Arc<dyn PortConnector>>,
+    certificate_probe: Option<Arc<dyn CertificateProbe>>,
+    website_probe: Option<Arc<dyn WebsiteProbe>>,
+    screenshot_probe: Option<Arc<dyn ScreenshotProbe>>,
+    nuclei_probe: Option<Arc<dyn NucleiProbe>>,
+    public_code_probe: Option<Arc<dyn PublicCodeProbe>>,
+    cve_probe: Option<Arc<dyn CveProbe>>,
+    registration_probe: Option<Arc<dyn RegistrationProbe>>,
+    service_probe: Option<Arc<dyn ServiceProbe>>,
+    scan_vantage: ScanVantage,
+    service_ports: Vec<u16>,
+}
+
+impl DiscoveryWorker {
+    pub fn new(repository: Arc<dyn Repository>, resolver: Arc<dyn DnsResolver>) -> Self {
+        Self {
+            repository,
+            resolver,
+            certificate_source: None,
+            port_connector: None,
+            certificate_probe: None,
+            website_probe: None,
+            screenshot_probe: None,
+            nuclei_probe: None,
+            public_code_probe: None,
+            cve_probe: None,
+            registration_probe: None,
+            service_probe: None,
+            scan_vantage: ScanVantage::Mixed,
+            service_ports: Vec::new(),
+        }
+    }
+
+    pub fn with_certificate_probe(mut self, probe: Arc<dyn CertificateProbe>) -> Self {
+        self.certificate_probe = Some(probe);
+        self
+    }
+
+    pub fn with_website_probe(mut self, probe: Arc<dyn WebsiteProbe>) -> Self {
+        self.website_probe = Some(probe);
+        self
+    }
+
+    pub fn with_screenshot_probe(mut self, probe: Arc<dyn ScreenshotProbe>) -> Self {
+        self.screenshot_probe = Some(probe);
+        self
+    }
+
+    pub fn with_nuclei_probe(mut self, probe: Arc<dyn NucleiProbe>) -> Self {
+        self.nuclei_probe = Some(probe);
+        self
+    }
+
+    pub fn with_public_code_probe(mut self, probe: Arc<dyn PublicCodeProbe>) -> Self {
+        self.public_code_probe = Some(probe);
+        self
+    }
+
+    pub fn with_cve_probe(mut self, probe: Arc<dyn CveProbe>) -> Self {
+        self.cve_probe = Some(probe);
+        self
+    }
+
+    pub fn with_registration_probe(mut self, probe: Arc<dyn RegistrationProbe>) -> Self {
+        self.registration_probe = Some(probe);
+        self
+    }
+
+    pub fn with_service_probe(mut self, probe: Arc<dyn ServiceProbe>) -> Self {
+        self.service_probe = Some(probe);
+        self
+    }
+
+    pub fn with_scan_vantage(mut self, vantage: ScanVantage) -> Self {
+        self.scan_vantage = vantage;
+        self
+    }
+
+    pub fn with_port_connector(
+        mut self,
+        connector: Arc<dyn PortConnector>,
+        ports: Vec<u16>,
+    ) -> Self {
+        self.port_connector = Some(connector);
+        self.service_ports = ports;
+        self
+    }
+
+    pub fn with_certificate_source(mut self, source: Arc<dyn CertificateSource>) -> Self {
+        self.certificate_source = Some(source);
+        self
+    }
+
+    pub async fn run_once(&self) -> Result<bool, RepositoryError> {
+        let Some(claimed) = self.repository.claim_task(now()).await? else {
+            return Ok(false);
+        };
+        if !matches!(
+            claimed.task.policy_id.as_str(),
+            "policy_passive_dns"
+                | "policy_passive_inventory"
+                | "policy_service_baseline"
+                | "policy_vulnerability_baseline"
+                | "policy_public_code_intelligence"
+                | "policy_cve_intelligence"
+                | "policy_registration_intelligence"
+                | "policy_assessment_standard"
+                | "policy_assessment_thorough"
+        ) {
+            self.repository.fail_task(&claimed.task.id, now()).await?;
+            return Ok(true);
+        }
+
+        if matches!(
+            claimed.task.policy_id.as_str(),
+            "policy_assessment_standard" | "policy_assessment_thorough"
+        ) {
+            let records = self
+                .run_assessment(
+                    &claimed.task.id,
+                    &claimed.scope.id,
+                    &claimed.scope.targets,
+                    claimed.task.policy_id == "policy_assessment_thorough",
+                )
+                .await?;
+            if self.repository.get_task(&claimed.task.id).await?.state
+                == i32::from(crate::proto::TaskState::Canceled)
+            {
+                return Ok(true);
+            }
+            self.repository
+                .complete_task(&claimed.task.id, records, now())
+                .await?;
+            return Ok(true);
+        }
+
+        if claimed.task.policy_id == "policy_public_code_intelligence" {
+            let records = self
+                .discover_public_code_references(
+                    &claimed.task.id,
+                    &claimed.scope.id,
+                    &claimed.scope.targets,
+                )
+                .await?;
+            self.repository
+                .complete_task(&claimed.task.id, records, now())
+                .await?;
+            return Ok(true);
+        }
+        if claimed.task.policy_id == "policy_cve_intelligence" {
+            let records = self
+                .discover_cve_findings(&claimed.task.id, &claimed.scope.id, &[])
+                .await?;
+            self.repository
+                .complete_task(&claimed.task.id, records, now())
+                .await?;
+            return Ok(true);
+        }
+        if claimed.task.policy_id == "policy_registration_intelligence" {
+            let records = self
+                .discover_registrations(&claimed.task.id, &claimed.scope.id, &claimed.scope.targets)
+                .await;
+            self.repository
+                .complete_task(&claimed.task.id, records, now())
+                .await?;
+            return Ok(true);
+        }
+
+        let mut records = Vec::new();
+        for target in &claimed.scope.targets {
+            if matches!(
+                claimed.task.policy_id.as_str(),
+                "policy_service_baseline" | "policy_vulnerability_baseline"
+            ) {
+                records.extend(
+                    self.discover_active_target(&claimed.task.id, &claimed.scope.id, target)
+                        .await,
+                );
+                continue;
+            }
+            records.extend(
+                self.discover_target(&claimed.task.id, &claimed.scope.id, target)
+                    .await,
+            );
+            if claimed.task.policy_id == "policy_passive_inventory" {
+                records.extend(
+                    self.discover_certificates(&claimed.task.id, &claimed.scope.id, target)
+                        .await,
+                );
+            }
+        }
+        if matches!(
+            claimed.task.policy_id.as_str(),
+            "policy_service_baseline" | "policy_vulnerability_baseline"
+        ) {
+            records.extend(
+                self.discover_host_collisions(
+                    &claimed.task.id,
+                    &claimed.scope.id,
+                    &claimed.scope.targets,
+                    &records,
+                )
+                .await,
+            );
+        }
+        if claimed.task.policy_id == "policy_vulnerability_baseline" {
+            records.extend(
+                self.discover_nuclei_findings(
+                    &claimed.task.id,
+                    &claimed.scope.id,
+                    &claimed.scope.targets,
+                    &records,
+                )
+                .await?,
+            );
+        }
+        self.repository
+            .complete_task(&claimed.task.id, records, now())
+            .await?;
+        Ok(true)
+    }
+
+    async fn run_assessment(
+        &self,
+        task_id: &str,
+        scope_id: &str,
+        scope_targets: &[ScopeTarget],
+        thorough: bool,
+    ) -> Result<Vec<DiscoveryRecord>, RepositoryError> {
+        let fallback = scope_targets.first().cloned().unwrap_or(ScopeTarget {
+            kind: TargetKind::Unspecified.into(),
+            value: "scope".to_owned(),
+        });
+        let mut records = Vec::new();
+        let mut active_targets = scope_targets.to_vec();
+
+        for target in scope_targets {
+            records.extend(self.discover_target(task_id, scope_id, target).await);
+            let certificate_records = self.discover_certificates(task_id, scope_id, target).await;
+            for record in &certificate_records {
+                if record.observation.observation_type == "ct.discovered_domain" {
+                    active_targets.push(ScopeTarget {
+                        kind: TargetKind::Domain.into(),
+                        value: record.asset.value.clone(),
+                    });
+                }
+            }
+            records.extend(certificate_records);
+        }
+        let passive_state = if records
+            .iter()
+            .any(|record| record.observation.observation_type == "ct.error")
+        {
+            "partial"
+        } else {
+            "complete"
+        };
+        records.push(coverage_record(
+            task_id,
+            scope_id,
+            &fallback,
+            "passive_discovery",
+            passive_state,
+            "DNS seeds and certificate transparency",
+            records.len(),
+        ));
+
+        for target in scope_targets
+            .iter()
+            .filter(|target| TargetKind::try_from(target.kind) == Ok(TargetKind::Domain))
+        {
+            let wildcard = self.wildcard_addresses(&target.value).await;
+            if !wildcard.is_empty() {
+                records.push(record(
+                    task_id,
+                    scope_id,
+                    TargetKind::Domain,
+                    &target.value,
+                    "dns.wildcard",
+                    json!({"domain": target.value, "addresses": wildcard.iter().map(ToString::to_string).collect::<Vec<_>>() }),
+                ));
+            }
+            for label in ASSESSMENT_DNS_LABELS {
+                let domain = format!("{label}.{}", target.value);
+                if self.resolver.resolve(&domain).await.is_ok_and(|addresses| {
+                    let addresses = addresses.into_iter().collect::<BTreeSet<_>>();
+                    !addresses.is_empty() && addresses != wildcard
+                }) {
+                    active_targets.push(ScopeTarget {
+                        kind: TargetKind::Domain.into(),
+                        value: domain,
+                    });
+                }
+            }
+        }
+        active_targets.sort_by(|left, right| left.value.cmp(&right.value));
+        active_targets.dedup_by(|left, right| left.kind == right.kind && left.value == right.value);
+        let discovered_total = active_targets.len().saturating_sub(scope_targets.len());
+        let active_batches = active_targets
+            .len()
+            .div_ceil(ASSESSMENT_ACTIVE_TARGET_BATCH_SIZE);
+        records.push(coverage_record(
+            task_id,
+            scope_id,
+            &fallback,
+            "subdomain_expansion",
+            "complete",
+            &format!(
+                "bounded DNS labels plus CT names with wildcard filtering; {} active targets in {} bounded batches",
+                active_targets.len(),
+                active_batches
+            ),
+            discovered_total,
+        ));
+        records.push(coverage_record(
+            task_id,
+            scope_id,
+            &fallback,
+            "scan_vantage",
+            "complete",
+            &format!(
+                "{} vantage; addresses outside this network class are retained but not actively probed",
+                self.scan_vantage.name()
+            ),
+            active_targets.len(),
+        ));
+
+        let ports = if thorough {
+            thorough_service_ports()
+        } else {
+            self.service_ports.clone()
+        };
+        let active_start = records.len();
+        for batch in active_targets.chunks(ASSESSMENT_ACTIVE_TARGET_BATCH_SIZE) {
+            for target in batch {
+                if self.repository.get_task(task_id).await?.state
+                    == i32::from(crate::proto::TaskState::Canceled)
+                {
+                    return Ok(records);
+                }
+                records.extend(
+                    self.discover_active_target_on_ports(task_id, scope_id, target, &ports)
+                        .await,
+                );
+            }
+        }
+        records.extend(
+            self.discover_host_collisions(task_id, scope_id, &active_targets, &records)
+                .await,
+        );
+        let active_records = records.len() - active_start;
+        let active_errors = records[active_start..]
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.observation.observation_type.as_str(),
+                    "tcp.error" | "dns.error"
+                )
+            })
+            .count();
+        let active_state = if self.port_connector.is_none() {
+            "unavailable"
+        } else if active_errors > 0 {
+            "partial"
+        } else {
+            "complete"
+        };
+        records.push(coverage_record(
+            task_id,
+            scope_id,
+            &fallback,
+            "active_inventory",
+            active_state,
+            if thorough {
+                "TCP 1-1024 plus selected high-value ports"
+            } else {
+                "baseline service ports"
+            },
+            active_records,
+        ));
+        let collection_errors = records[active_start..]
+            .iter()
+            .filter(|record| {
+                record.observation.observation_type.ends_with("_error")
+                    || record.observation.observation_type.ends_with(".error")
+            })
+            .count();
+        records.push(coverage_record(
+            task_id,
+            scope_id,
+            &fallback,
+            "collection_quality",
+            if collection_errors == 0 {
+                "complete"
+            } else {
+                "partial"
+            },
+            &format!(
+                "{collection_errors} typed collection errors retained separately from security findings"
+            ),
+            active_records,
+        ));
+
+        let vulnerability = self
+            .discover_nuclei_findings(task_id, scope_id, &active_targets, &records)
+            .await?;
+        let vulnerability_state = if self.nuclei_probe.is_none() {
+            "unavailable"
+        } else {
+            adapter_state(&vulnerability, "nuclei.error", "nuclei.no_targets")
+        };
+        let vulnerability_count = vulnerability.len();
+        records.extend(vulnerability);
+        records.push(coverage_record(
+            task_id,
+            scope_id,
+            &fallback,
+            "vulnerability",
+            vulnerability_state,
+            "reviewed Nuclei baseline",
+            vulnerability_count,
+        ));
+
+        let public_code = self
+            .discover_public_code_references(task_id, scope_id, scope_targets)
+            .await?;
+        let public_code_state = if self.public_code_probe.is_none() {
+            "unavailable"
+        } else {
+            adapter_state(&public_code, "github.code.error", "github.code.no_targets")
+        };
+        let public_code_count = public_code.len();
+        records.extend(public_code);
+        records.push(coverage_record(
+            task_id,
+            scope_id,
+            &fallback,
+            "public_code",
+            public_code_state,
+            "exact-domain public metadata",
+            public_code_count,
+        ));
+
+        let cve = self
+            .discover_cve_findings(task_id, scope_id, &records)
+            .await?;
+        let cve_state = if self.cve_probe.is_none() {
+            "unavailable"
+        } else {
+            adapter_state(&cve, "nvd.cve.error", "nvd.cve.no_targets")
+        };
+        let cve_count = cve.len();
+        records.extend(cve);
+        records.push(coverage_record(
+            task_id,
+            scope_id,
+            &fallback,
+            "cve",
+            cve_state,
+            "exact observed CPE correlation",
+            cve_count,
+        ));
+
+        let registration = self
+            .discover_registrations(task_id, scope_id, scope_targets)
+            .await;
+        let registration_state = if self.registration_probe.is_none() {
+            "unavailable"
+        } else {
+            adapter_state(
+                &registration,
+                "registration.error",
+                "registration.no_targets",
+            )
+        };
+        let registration_count = registration.len();
+        records.extend(registration);
+        records.push(coverage_record(
+            task_id,
+            scope_id,
+            &fallback,
+            "registration",
+            registration_state,
+            "licensed registration intelligence",
+            registration_count,
+        ));
+        Ok(records)
+    }
+
+    async fn wildcard_addresses(&self, root: &str) -> BTreeSet<IpAddr> {
+        let suffix = &hex_hash(root.as_bytes())[..12];
+        let first = self
+            .resolver
+            .resolve(&format!("cyberedge-nx-a-{suffix}.{root}"))
+            .await
+            .ok();
+        let second = self
+            .resolver
+            .resolve(&format!("cyberedge-nx-b-{suffix}.{root}"))
+            .await
+            .ok();
+        match (first, second) {
+            (Some(first), Some(second)) => {
+                let first = first.into_iter().collect::<BTreeSet<_>>();
+                let second = second.into_iter().collect::<BTreeSet<_>>();
+                if !first.is_empty() && first == second {
+                    first
+                } else {
+                    BTreeSet::new()
+                }
+            }
+            _ => BTreeSet::new(),
+        }
+    }
+
+    async fn discover_registrations(
+        &self,
+        task_id: &str,
+        scope_id: &str,
+        scope_targets: &[ScopeTarget],
+    ) -> Vec<DiscoveryRecord> {
+        let domains = scope_targets
+            .iter()
+            .filter(|target| TargetKind::try_from(target.kind) == Ok(TargetKind::Domain))
+            .map(|target| target.value.clone())
+            .take(MAX_REGISTRATION_DOMAINS)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if domains.is_empty() {
+            return vec![record(
+                task_id,
+                scope_id,
+                TargetKind::Unspecified,
+                "scope",
+                "registration.no_targets",
+                json!({"reason": "scope has no domain targets"}),
+            )];
+        }
+        let Some(probe) = &self.registration_probe else {
+            return vec![record(
+                task_id,
+                scope_id,
+                TargetKind::Domain,
+                &domains[0],
+                "registration.error",
+                json!({"error": "registration adapter unavailable"}),
+            )];
+        };
+        let output = match probe.lookup(&domains).await {
+            Ok(output) => output,
+            Err(error) => {
+                return vec![record(
+                    task_id,
+                    scope_id,
+                    TargetKind::Domain,
+                    &domains[0],
+                    "registration.error",
+                    json!({"error": error, "target_count": domains.len()}),
+                )];
+            }
+        };
+        let response = match parse_registration_output(&output, &domains) {
+            Ok(response) => response,
+            Err(error) => {
+                return vec![record(
+                    task_id,
+                    scope_id,
+                    TargetKind::Domain,
+                    &domains[0],
+                    "registration.error",
+                    json!({"error": error, "target_count": domains.len()}),
+                )];
+            }
+        };
+        let mut records = Vec::new();
+        for registration in response.records {
+            let payload = serde_json::to_value(&registration)
+                .expect("validated registration is serializable");
+            records.push(record(
+                task_id,
+                scope_id,
+                TargetKind::Domain,
+                &registration.domain,
+                "registration.icp",
+                payload.clone(),
+            ));
+            if registration.entity_type != "individual" && !registration.entity_name.is_empty() {
+                let organization_value = if registration.unified_social_credit_code.is_empty() {
+                    registration.entity_name.as_str()
+                } else {
+                    registration.unified_social_credit_code.as_str()
+                };
+                records.push(record(
+                    task_id,
+                    scope_id,
+                    TargetKind::Organization,
+                    organization_value,
+                    "organization.registration",
+                    payload,
+                ));
+            }
+        }
+        for coverage in response.coverage {
+            records.push(record(
+                task_id,
+                scope_id,
+                TargetKind::Domain,
+                &coverage.domain,
+                "registration.coverage",
+                json!({"domain": coverage.domain, "completed": true}),
+            ));
+        }
+        records
+    }
+
+    async fn discover_cve_findings(
+        &self,
+        task_id: &str,
+        scope_id: &str,
+        task_records: &[DiscoveryRecord],
+    ) -> Result<Vec<DiscoveryRecord>, RepositoryError> {
+        let mut assets = self
+            .repository
+            .search_assets(scope_id)
+            .await?
+            .into_iter()
+            .map(|asset| (asset.id.clone(), asset))
+            .collect::<BTreeMap<_, _>>();
+        let mut services = self
+            .repository
+            .search_services(scope_id)
+            .await?
+            .into_iter()
+            .map(|service| (service.id.clone(), service))
+            .collect::<BTreeMap<_, _>>();
+        for record in task_records {
+            assets.insert(record.asset.id.clone(), record.asset.clone());
+            if let Some(service) = &record.service {
+                services.insert(service.id.clone(), service.clone());
+            }
+        }
+        let mut targets = BTreeMap::<String, Vec<Asset>>::new();
+        let mut websites = self
+            .repository
+            .search_websites(scope_id)
+            .await?
+            .into_iter()
+            .map(|website| (website.id.clone(), website))
+            .collect::<BTreeMap<_, _>>();
+        for record in task_records {
+            if let Some(website) = &record.website {
+                websites.insert(website.id.clone(), website.clone());
+            }
+        }
+        for website in websites.into_values() {
+            let Some(service) = services.get(&website.service_id) else {
+                continue;
+            };
+            let Some(asset) = assets.get(&service.asset_id) else {
+                continue;
+            };
+            for fingerprint in website.fingerprints {
+                if exact_cpe_name(&fingerprint.cpe_name)
+                    && fingerprint.cpe_source.starts_with("cyberedge-cpe-map:")
+                {
+                    targets
+                        .entry(fingerprint.cpe_name)
+                        .or_default()
+                        .push(asset.clone());
+                }
+            }
+        }
+        for values in targets.values_mut() {
+            values.sort_by(|left, right| left.id.cmp(&right.id));
+            values.dedup_by(|left, right| left.id == right.id);
+        }
+        if targets.is_empty() {
+            return Ok(vec![record(
+                task_id,
+                scope_id,
+                TargetKind::Unspecified,
+                "scope",
+                "nvd.cve.no_targets",
+                json!({"reason": "no exact evidence-backed CPE identities"}),
+            )]);
+        }
+        let Some(probe) = &self.cve_probe else {
+            return Ok(vec![record(
+                task_id,
+                scope_id,
+                TargetKind::Unspecified,
+                "scope",
+                "nvd.cve.error",
+                json!({"error": "CVE adapter unavailable"}),
+            )]);
+        };
+        let cpe_names = targets
+            .keys()
+            .take(MAX_CVE_CPE_NAMES)
+            .cloned()
+            .collect::<Vec<_>>();
+        let output = match probe.query(&cpe_names).await {
+            Ok(output) => output,
+            Err(error) => {
+                return Ok(vec![record(
+                    task_id,
+                    scope_id,
+                    TargetKind::Unspecified,
+                    "scope",
+                    "nvd.cve.error",
+                    json!({"error": error, "cpe_count": cpe_names.len()}),
+                )]);
+            }
+        };
+        let results = match parse_cve_output(&output, &cpe_names) {
+            Ok(results) => results,
+            Err(error) => {
+                return Ok(vec![record(
+                    task_id,
+                    scope_id,
+                    TargetKind::Unspecified,
+                    "scope",
+                    "nvd.cve.error",
+                    json!({"error": error, "cpe_count": cpe_names.len()}),
+                )]);
+            }
+        };
+        let previous = self.repository.search_findings(scope_id).await?;
+        let mut present = BTreeSet::new();
+        let mut records = Vec::new();
+        for result in results
+            .into_iter()
+            .filter(|result| !result.vuln_status.eq_ignore_ascii_case("rejected"))
+        {
+            for asset in targets.get(&result.cpe_name).into_iter().flatten() {
+                let fingerprint = cve_fingerprint(&result.cpe_name, &result.cve_id);
+                if present.insert((asset.id.clone(), result.cve_id.clone(), fingerprint.clone())) {
+                    records.push(cve_result_record(
+                        task_id,
+                        scope_id,
+                        asset.clone(),
+                        result.clone(),
+                        fingerprint,
+                    ));
+                }
+            }
+        }
+        for cpe_name in &cpe_names {
+            for asset in targets.get(cpe_name).into_iter().flatten() {
+                let evaluations = previous
+                    .iter()
+                    .filter(|finding| finding.detector == "nvd-cve" && finding.asset_id == asset.id)
+                    .filter(|finding| {
+                        cve_fingerprint(cpe_name, &finding.rule_id) == finding.fingerprint
+                    })
+                    .filter(|finding| {
+                        !present.contains(&(
+                            asset.id.clone(),
+                            finding.rule_id.clone(),
+                            finding.fingerprint.clone(),
+                        ))
+                    })
+                    .map(|finding| FindingEvaluation {
+                        asset_id: finding.asset_id.clone(),
+                        detector: finding.detector.clone(),
+                        rule_id: finding.rule_id.clone(),
+                        fingerprint: finding.fingerprint.clone(),
+                    })
+                    .collect();
+                let mut coverage = record(
+                    task_id,
+                    scope_id,
+                    TargetKind::try_from(asset.kind).unwrap_or(TargetKind::Unspecified),
+                    &asset.value,
+                    "nvd.cve.coverage",
+                    json!({"cpe_name": cpe_name, "completed": true}),
+                );
+                coverage.finding_evaluations = evaluations;
+                records.push(coverage);
+            }
+        }
+        Ok(records)
+    }
+
+    async fn discover_public_code_references(
+        &self,
+        task_id: &str,
+        scope_id: &str,
+        scope_targets: &[ScopeTarget],
+    ) -> Result<Vec<DiscoveryRecord>, RepositoryError> {
+        let domains = scope_targets
+            .iter()
+            .filter(|target| TargetKind::try_from(target.kind) == Ok(TargetKind::Domain))
+            .map(|target| target.value.clone())
+            .take(MAX_PUBLIC_CODE_DOMAINS)
+            .collect::<BTreeSet<_>>();
+        let fallback = domains
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "scope".to_owned());
+        let Some(probe) = &self.public_code_probe else {
+            return Ok(vec![record(
+                task_id,
+                scope_id,
+                TargetKind::Domain,
+                &fallback,
+                "github.code.error",
+                json!({"error": "public code adapter unavailable"}),
+            )]);
+        };
+        if domains.is_empty() {
+            return Ok(vec![record(
+                task_id,
+                scope_id,
+                TargetKind::Unspecified,
+                &fallback,
+                "github.code.no_targets",
+                json!({"reason": "scope has no domain targets"}),
+            )]);
+        }
+        let domains = domains.into_iter().collect::<Vec<_>>();
+        let output = match probe.search(&domains).await {
+            Ok(output) => output,
+            Err(error) => {
+                return Ok(vec![record(
+                    task_id,
+                    scope_id,
+                    TargetKind::Domain,
+                    &fallback,
+                    "github.code.error",
+                    json!({"error": error, "target_count": domains.len()}),
+                )]);
+            }
+        };
+        let references = match parse_public_code_output(&output, &domains) {
+            Ok(references) => references,
+            Err(error) => {
+                return Ok(vec![record(
+                    task_id,
+                    scope_id,
+                    TargetKind::Domain,
+                    &fallback,
+                    "github.code.error",
+                    json!({"error": error, "target_count": domains.len()}),
+                )]);
+            }
+        };
+        let previous = self.repository.search_findings(scope_id).await?;
+        let mut present = BTreeSet::new();
+        let mut records = Vec::new();
+        for reference in references {
+            let fingerprint = public_code_fingerprint(&reference);
+            if present.insert((reference.query_domain.clone(), fingerprint.clone())) {
+                records.push(public_code_result_record(
+                    task_id,
+                    scope_id,
+                    reference,
+                    fingerprint,
+                ));
+            }
+        }
+        for domain in &domains {
+            let asset_id = stable_id(
+                "asset",
+                format!("{scope_id}:{}:{domain}", i32::from(TargetKind::Domain)).as_bytes(),
+            );
+            let evaluations = previous
+                .iter()
+                .filter(|finding| {
+                    finding.detector == "github-public-code" && finding.asset_id == asset_id
+                })
+                .filter(|finding| !present.contains(&(domain.clone(), finding.fingerprint.clone())))
+                .map(|finding| FindingEvaluation {
+                    asset_id: finding.asset_id.clone(),
+                    detector: finding.detector.clone(),
+                    rule_id: finding.rule_id.clone(),
+                    fingerprint: finding.fingerprint.clone(),
+                })
+                .collect();
+            let mut coverage = record(
+                task_id,
+                scope_id,
+                TargetKind::Domain,
+                domain,
+                "github.code.coverage",
+                json!({"domain": domain, "completed": true}),
+            );
+            coverage.finding_evaluations = evaluations;
+            records.push(coverage);
+        }
+        Ok(records)
+    }
+
+    async fn discover_nuclei_findings(
+        &self,
+        task_id: &str,
+        scope_id: &str,
+        scope_targets: &[ScopeTarget],
+        task_records: &[DiscoveryRecord],
+    ) -> Result<Vec<DiscoveryRecord>, RepositoryError> {
+        let fallback = scope_targets
+            .first()
+            .map(|target| {
+                (
+                    TargetKind::try_from(target.kind).unwrap_or(TargetKind::Unspecified),
+                    target.value.as_str(),
+                )
+            })
+            .unwrap_or((TargetKind::Unspecified, "scope"));
+        let Some(probe) = &self.nuclei_probe else {
+            return Ok(vec![record(
+                task_id,
+                scope_id,
+                fallback.0,
+                fallback.1,
+                "nuclei.error",
+                json!({"error": "nuclei adapter unavailable"}),
+            )]);
+        };
+        let targets = nuclei_targets(task_records);
+        if targets.is_empty() {
+            return Ok(vec![record(
+                task_id,
+                scope_id,
+                fallback.0,
+                fallback.1,
+                "nuclei.no_targets",
+                json!({"reason": "no successfully observed website targets"}),
+            )]);
+        }
+        let urls = targets
+            .values()
+            .map(|target| target.url.clone())
+            .collect::<Vec<_>>();
+        let previous = self.repository.search_findings(scope_id).await?;
+        let mut present = BTreeSet::new();
+        let mut completed = BTreeSet::new();
+        let mut records = Vec::new();
+        for batch in urls.chunks(MAX_NUCLEI_TARGETS) {
+            let batch_targets = batch
+                .iter()
+                .filter_map(|url| targets.get(url).map(|target| (url.clone(), target.clone())))
+                .collect::<BTreeMap<_, _>>();
+            let output = match probe.scan(batch).await {
+                Ok(output) => output,
+                Err(error) => {
+                    records.push(record(
+                        task_id,
+                        scope_id,
+                        fallback.0,
+                        fallback.1,
+                        "nuclei.error",
+                        json!({"error": error, "target_count": batch.len(), "batch_size": MAX_NUCLEI_TARGETS}),
+                    ));
+                    continue;
+                }
+            };
+            let parsed = match parse_nuclei_output(&output, &batch_targets) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    records.push(record(
+                        task_id,
+                        scope_id,
+                        fallback.0,
+                        fallback.1,
+                        "nuclei.error",
+                        json!({"error": error, "target_count": batch.len(), "batch_size": MAX_NUCLEI_TARGETS}),
+                    ));
+                    continue;
+                }
+            };
+            completed.extend(batch.iter().cloned());
+            for result in parsed {
+                let key = (
+                    result.target.asset.id.clone(),
+                    result.event.template_id.clone(),
+                    nuclei_fingerprint(&result.event),
+                );
+                if present.insert(key) {
+                    records.push(nuclei_result_record(
+                        task_id,
+                        scope_id,
+                        result.target,
+                        result.event,
+                        result.raw,
+                    ));
+                }
+            }
+        }
+        if completed.is_empty() {
+            if records.is_empty() {
+                records.push(record(
+                    task_id,
+                    scope_id,
+                    fallback.0,
+                    fallback.1,
+                    "nuclei.error",
+                    json!({"error": "all Nuclei batches failed", "target_count": urls.len()}),
+                ));
+            }
+            return Ok(records);
+        }
+        for target in targets.values() {
+            if !completed.contains(&target.url) {
+                continue;
+            }
+            let evaluations = previous
+                .iter()
+                .filter(|finding| {
+                    finding.detector == "nuclei" && finding.asset_id == target.asset.id
+                })
+                .filter(|finding| {
+                    !present.contains(&(
+                        finding.asset_id.clone(),
+                        finding.rule_id.clone(),
+                        finding.fingerprint.clone(),
+                    ))
+                })
+                .map(|finding| FindingEvaluation {
+                    asset_id: finding.asset_id.clone(),
+                    detector: finding.detector.clone(),
+                    rule_id: finding.rule_id.clone(),
+                    fingerprint: finding.fingerprint.clone(),
+                })
+                .collect();
+            records.push(nuclei_coverage_record(
+                task_id,
+                scope_id,
+                target,
+                evaluations,
+            ));
+        }
+        Ok(records)
+    }
+
+    async fn discover_host_collisions(
+        &self,
+        task_id: &str,
+        scope_id: &str,
+        targets: &[ScopeTarget],
+        task_records: &[DiscoveryRecord],
+    ) -> Vec<DiscoveryRecord> {
+        let Some(probe) = &self.website_probe else {
+            return Vec::new();
+        };
+        let domains = targets
+            .iter()
+            .filter(|target| TargetKind::try_from(target.kind) == Ok(TargetKind::Domain))
+            .map(|target| target.value.clone())
+            .take(MAX_HOST_COLLISION_DOMAINS)
+            .collect::<BTreeSet<_>>();
+        if domains.is_empty() {
+            return Vec::new();
+        }
+
+        let mut addresses = targets
+            .iter()
+            .filter(|target| TargetKind::try_from(target.kind) == Ok(TargetKind::Ip))
+            .filter_map(|target| target.value.parse::<IpAddr>().ok())
+            .collect::<BTreeSet<_>>();
+        let mut resolved = BTreeMap::new();
+        for record in task_records
+            .iter()
+            .filter(|record| record.observation.observation_type == "dns.addresses")
+        {
+            let Ok(payload) =
+                serde_json::from_str::<serde_json::Value>(&record.observation.value_json)
+            else {
+                continue;
+            };
+            let Some(domain) = payload.get("domain").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if !domains.contains(domain) {
+                continue;
+            }
+            let domain_addresses = payload
+                .get("addresses")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|address| address.parse::<IpAddr>().ok())
+                .collect::<BTreeSet<_>>();
+            addresses.extend(domain_addresses.iter().copied());
+            resolved.insert(domain.to_owned(), domain_addresses);
+        }
+
+        let open_web_endpoints = task_records
+            .iter()
+            .filter_map(|record| {
+                let service = record.service.as_ref()?;
+                let address = record.asset.value.parse::<IpAddr>().ok()?;
+                let port = u16::try_from(service.port).ok()?;
+                (addresses.contains(&address) && matches!(port, 80 | 443 | 8080 | 8443))
+                    .then_some((address, port))
+            })
+            .collect::<BTreeSet<_>>();
+        let mut candidates = BTreeSet::new();
+        for domain in domains {
+            for (address, port) in &open_web_endpoints {
+                if resolved
+                    .get(&domain)
+                    .is_some_and(|domain_addresses| domain_addresses.contains(address))
+                {
+                    continue;
+                }
+                candidates.insert((*address, *port, domain.clone()));
+                if candidates.len() == MAX_HOST_COLLISION_CANDIDATES {
+                    break;
+                }
+            }
+            if candidates.len() == MAX_HOST_COLLISION_CANDIDATES {
+                break;
+            }
+        }
+
+        let concurrency = Arc::new(tokio::sync::Semaphore::new(HOST_COLLISION_CONCURRENCY));
+        let mut probes = tokio::task::JoinSet::new();
+        for (address, port, domain) in candidates {
+            let probe = probe.clone();
+            let concurrency = concurrency.clone();
+            probes.spawn(async move {
+                let permit = concurrency.acquire_owned().await;
+                let (baseline, candidate) = match permit {
+                    Ok(_permit) => {
+                        let baseline = probe.fetch(address, port, &address.to_string(), "/").await;
+                        let candidate = probe.fetch(address, port, &domain, "/").await;
+                        (baseline, candidate)
+                    }
+                    Err(error) => (Err(error.to_string()), Err(error.to_string())),
+                };
+                (address, port, domain, baseline, candidate)
+            });
+        }
+
+        let mut records = Vec::new();
+        while let Some(result) = probes.join_next().await {
+            if let Ok((address, port, domain, baseline, candidate)) = result {
+                match (baseline, candidate) {
+                    (Ok(baseline), Ok(candidate)) => records.push(host_collision_record(
+                        task_id, scope_id, address, port, &domain, baseline, candidate,
+                    )),
+                    (baseline, candidate) => records.push(record(
+                        task_id,
+                        scope_id,
+                        TargetKind::Ip,
+                        &address.to_string(),
+                        "http.host_collision_error",
+                        json!({
+                            "address": address,
+                            "port": port,
+                            "host": domain,
+                            "baseline_error": baseline.err(),
+                            "candidate_error": candidate.err(),
+                        }),
+                    )),
+                }
+            }
+        }
+        records.sort_by(|left, right| {
+            left.observation
+                .value_json
+                .cmp(&right.observation.value_json)
+        });
+        records
+    }
+
+    async fn discover_active_target(
+        &self,
+        task_id: &str,
+        scope_id: &str,
+        target: &ScopeTarget,
+    ) -> Vec<DiscoveryRecord> {
+        self.discover_active_target_on_ports(task_id, scope_id, target, &self.service_ports)
+            .await
+    }
+
+    async fn discover_active_target_on_ports(
+        &self,
+        task_id: &str,
+        scope_id: &str,
+        target: &ScopeTarget,
+        ports: &[u16],
+    ) -> Vec<DiscoveryRecord> {
+        match TargetKind::try_from(target.kind).unwrap_or(TargetKind::Unspecified) {
+            TargetKind::Ip => match target.value.parse::<IpAddr>() {
+                Ok(address) => {
+                    let mut records = vec![record(
+                        task_id,
+                        scope_id,
+                        TargetKind::Ip,
+                        &target.value,
+                        "scope.seed",
+                        json!({"source": "authorized_scope", "value": target.value}),
+                    )];
+                    if !self.scan_vantage.permits(address) {
+                        records.push(vantage_skip_record(
+                            task_id,
+                            scope_id,
+                            address,
+                            self.scan_vantage,
+                            &target.value,
+                        ));
+                        return records;
+                    }
+                    records.extend(
+                        self.discover_services(task_id, scope_id, address, &target.value, ports)
+                            .await,
+                    );
+                    records
+                }
+                Err(error) => vec![record(
+                    task_id,
+                    scope_id,
+                    TargetKind::Ip,
+                    &target.value,
+                    "tcp.error",
+                    json!({"address": target.value, "error": error.to_string()}),
+                )],
+            },
+            TargetKind::Domain => match self.resolver.resolve(&target.value).await {
+                Ok(addresses) => {
+                    let values = addresses
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    let mut records = vec![record(
+                        task_id,
+                        scope_id,
+                        TargetKind::Domain,
+                        &target.value,
+                        "dns.addresses",
+                        json!({"domain": target.value, "addresses": values}),
+                    )];
+                    for address in addresses {
+                        if !self.scan_vantage.permits(address) {
+                            records.push(vantage_skip_record(
+                                task_id,
+                                scope_id,
+                                address,
+                                self.scan_vantage,
+                                &target.value,
+                            ));
+                            continue;
+                        }
+                        records.extend(
+                            self.discover_services(
+                                task_id,
+                                scope_id,
+                                address,
+                                &target.value,
+                                ports,
+                            )
+                            .await,
+                        );
+                    }
+                    records
+                }
+                Err(error) => vec![record(
+                    task_id,
+                    scope_id,
+                    TargetKind::Domain,
+                    &target.value,
+                    "dns.error",
+                    json!({"domain": target.value, "error": error}),
+                )],
+            },
+            kind => vec![unsupported_target_record(
+                task_id,
+                scope_id,
+                kind,
+                &target.value,
+            )],
+        }
+    }
+
+    async fn discover_services(
+        &self,
+        task_id: &str,
+        scope_id: &str,
+        address: IpAddr,
+        server_name: &str,
+        ports: &[u16],
+    ) -> Vec<DiscoveryRecord> {
+        let Some(connector) = &self.port_connector else {
+            return vec![record(
+                task_id,
+                scope_id,
+                TargetKind::Ip,
+                &address.to_string(),
+                "tcp.error",
+                json!({"address": address, "error": "port connector unavailable"}),
+            )];
+        };
+        let mut results = Vec::with_capacity(ports.len());
+        for ports in ports.chunks(SERVICE_SCAN_CONCURRENCY) {
+            let mut probes = tokio::task::JoinSet::new();
+            for port in ports.iter().copied() {
+                let connector = connector.clone();
+                probes.spawn(async move { (port, connector.connect(address, port).await) });
+            }
+            while let Some(result) = probes.join_next().await {
+                match result {
+                    Ok(result) => results.push(result),
+                    Err(error) => results.push((0, Err(error.to_string()))),
+                }
+            }
+        }
+        results.sort_by_key(|(port, _)| *port);
+
+        let mut records = Vec::new();
+        for (port, result) in results {
+            match result {
+                Ok(true) => {
+                    let mut open = service_record(task_id, scope_id, address, port);
+                    if let Some(probe) = &self.service_probe
+                        && supports_read_first_banner(port)
+                    {
+                        match probe.banner(address, port).await {
+                            Ok(banner) if !banner.is_empty() => {
+                                let hint = identify_banner_service(&banner, port);
+                                if let Some(service) = open.service.as_mut() {
+                                    service.service_hint = hint.to_owned();
+                                }
+                                records.push(service_banner_record(
+                                    task_id, scope_id, address, port, hint, banner,
+                                ));
+                            }
+                            Ok(_) => {}
+                            Err(error) if error != "banner read timed out" => {
+                                records.push(record(
+                                    task_id,
+                                    scope_id,
+                                    TargetKind::Ip,
+                                    &address.to_string(),
+                                    "service.banner_error",
+                                    json!({"address": address, "port": port, "error": error}),
+                                ));
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    records.push(open);
+                    if matches!(port, 443 | 8443) {
+                        records.push(
+                            self.discover_certificate(
+                                task_id,
+                                scope_id,
+                                address,
+                                port,
+                                server_name,
+                            )
+                            .await,
+                        );
+                    }
+                    if matches!(port, 80 | 443 | 8080 | 8443) {
+                        records.extend(
+                            self.discover_websites(task_id, scope_id, address, port, server_name)
+                                .await,
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => records.push(record(
+                    task_id,
+                    scope_id,
+                    TargetKind::Ip,
+                    &address.to_string(),
+                    "tcp.error",
+                    json!({"address": address, "port": port, "error": error}),
+                )),
+            }
+        }
+        if records.is_empty() {
+            records.push(record(
+                task_id,
+                scope_id,
+                TargetKind::Ip,
+                &address.to_string(),
+                "tcp.no_open_ports",
+                json!({"address": address, "ports": ports}),
+            ));
+        }
+        records
+    }
+
+    async fn discover_websites(
+        &self,
+        task_id: &str,
+        scope_id: &str,
+        address: IpAddr,
+        port: u16,
+        server_name: &str,
+    ) -> Vec<DiscoveryRecord> {
+        let Some(probe) = &self.website_probe else {
+            return vec![record(
+                task_id,
+                scope_id,
+                TargetKind::Ip,
+                &address.to_string(),
+                "http.error",
+                json!({"address": address, "port": port, "error": "website probe unavailable"}),
+            )];
+        };
+        let root = match probe.fetch(address, port, server_name, "/").await {
+            Ok(snapshot) => website_record(task_id, scope_id, address, port, snapshot),
+            Err(error) => {
+                return vec![record(
+                    task_id,
+                    scope_id,
+                    TargetKind::Ip,
+                    &address.to_string(),
+                    "http.error",
+                    json!({"address": address, "port": port, "error": error}),
+                )];
+            }
+        };
+        let crawl_paths = root
+            .website
+            .as_ref()
+            .map(|website| website.discovered_paths.clone())
+            .unwrap_or_default();
+        let screenshot_input = root.website.as_ref().and_then(|website| {
+            (website.status_code < 300 && website.content_type.contains("html"))
+                .then(|| root.evidence.content.clone())
+        });
+        let mut records = vec![root];
+        if let (Some(renderer), Some(html)) = (&self.screenshot_probe, screenshot_input) {
+            match renderer.capture(&html).await {
+                Ok(png) => {
+                    let screenshot = screenshot_record(task_id, scope_id, address, port, png);
+                    if let Some(website) = records[0].website.as_mut() {
+                        website.screenshot_evidence_id = screenshot.evidence.id.clone();
+                    }
+                    records.push(screenshot);
+                }
+                Err(error) => records.push(record(
+                    task_id,
+                    scope_id,
+                    TargetKind::Ip,
+                    &address.to_string(),
+                    "http.screenshot_error",
+                    json!({"address": address, "port": port, "error": error}),
+                )),
+            }
+        }
+        if probe.supports_path_probes() {
+            for path in &HTTP_PROBE_PATHS[1..] {
+                let record = match probe.fetch(address, port, server_name, path).await {
+                    Ok(snapshot) => {
+                        http_exposure_record(task_id, scope_id, address, port, path, snapshot)
+                    }
+                    Err(error) => record(
+                        task_id,
+                        scope_id,
+                        TargetKind::Ip,
+                        &address.to_string(),
+                        "http.exposure_probe_error",
+                        json!({"address": address, "port": port, "path": path, "error": error}),
+                    ),
+                };
+                records.push(record);
+            }
+        }
+        if probe.supports_crawl() {
+            for path in crawl_paths {
+                let record = match probe.fetch(address, port, server_name, &path).await {
+                    Ok(snapshot) => {
+                        http_crawl_record(task_id, scope_id, address, port, &path, snapshot)
+                    }
+                    Err(error) => record(
+                        task_id,
+                        scope_id,
+                        TargetKind::Ip,
+                        &address.to_string(),
+                        "http.crawl_error",
+                        json!({"address": address, "port": port, "path": path, "error": error}),
+                    ),
+                };
+                records.push(record);
+            }
+        }
+        records
+    }
+
+    async fn discover_certificate(
+        &self,
+        task_id: &str,
+        scope_id: &str,
+        address: IpAddr,
+        port: u16,
+        server_name: &str,
+    ) -> DiscoveryRecord {
+        let Some(probe) = &self.certificate_probe else {
+            return record(
+                task_id,
+                scope_id,
+                TargetKind::Ip,
+                &address.to_string(),
+                "tls.error",
+                json!({"address": address, "port": port, "error": "certificate probe unavailable"}),
+            );
+        };
+        match probe.leaf_certificate(address, port, server_name).await {
+            Ok(der) => {
+                certificate_record(task_id, scope_id, address, port, der).unwrap_or_else(|error| {
+                    record(
+                        task_id,
+                        scope_id,
+                        TargetKind::Ip,
+                        &address.to_string(),
+                        "tls.error",
+                        json!({"address": address, "port": port, "error": error}),
+                    )
+                })
+            }
+            Err(error) => record(
+                task_id,
+                scope_id,
+                TargetKind::Ip,
+                &address.to_string(),
+                "tls.error",
+                json!({"address": address, "port": port, "error": error}),
+            ),
+        }
+    }
+
+    async fn discover_certificates(
+        &self,
+        task_id: &str,
+        scope_id: &str,
+        target: &ScopeTarget,
+    ) -> Vec<DiscoveryRecord> {
+        if TargetKind::try_from(target.kind) != Ok(TargetKind::Domain) {
+            return Vec::new();
+        }
+        let Some(source) = &self.certificate_source else {
+            return vec![record(
+                task_id,
+                scope_id,
+                TargetKind::Domain,
+                &target.value,
+                "ct.error",
+                json!({"domain": target.value, "error": "certificate source unavailable"}),
+            )];
+        };
+        match source.discover(&target.value).await {
+            Ok(names) => normalize_certificate_names(&target.value, names)
+                .into_iter()
+                .map(|domain| {
+                    record(
+                        task_id,
+                        scope_id,
+                        TargetKind::Domain,
+                        &domain,
+                        "ct.discovered_domain",
+                        json!({"source": "certificate_transparency", "root_domain": target.value, "domain": domain}),
+                    )
+                })
+                .collect(),
+            Err(error) => vec![record(
+                task_id,
+                scope_id,
+                TargetKind::Domain,
+                &target.value,
+                "ct.error",
+                json!({"domain": target.value, "error": error}),
+            )],
+        }
+    }
+
+    async fn discover_target(
+        &self,
+        task_id: &str,
+        scope_id: &str,
+        target: &ScopeTarget,
+    ) -> Vec<DiscoveryRecord> {
+        match TargetKind::try_from(target.kind).unwrap_or(TargetKind::Unspecified) {
+            TargetKind::Domain => self.discover_domain(task_id, scope_id, &target.value).await,
+            TargetKind::Ip => vec![record(
+                task_id,
+                scope_id,
+                TargetKind::Ip,
+                &target.value,
+                "scope.seed",
+                json!({"source": "authorized_scope", "value": target.value}),
+            )],
+            kind => vec![unsupported_target_record(
+                task_id,
+                scope_id,
+                kind,
+                &target.value,
+            )],
+        }
+    }
+
+    async fn discover_domain(
+        &self,
+        task_id: &str,
+        scope_id: &str,
+        domain: &str,
+    ) -> Vec<DiscoveryRecord> {
+        match self.resolver.resolve(domain).await {
+            Ok(addresses) if addresses.is_empty() => vec![record(
+                task_id,
+                scope_id,
+                TargetKind::Domain,
+                domain,
+                "dns.no_data",
+                json!({"domain": domain, "addresses": []}),
+            )],
+            Ok(addresses) => {
+                let values = addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                let mut records = vec![record(
+                    task_id,
+                    scope_id,
+                    TargetKind::Domain,
+                    domain,
+                    "dns.addresses",
+                    json!({"domain": domain, "addresses": values}),
+                )];
+                records.extend(addresses.into_iter().map(|address| {
+                    record(
+                        task_id,
+                        scope_id,
+                        TargetKind::Ip,
+                        &address.to_string(),
+                        "dns.discovered_ip",
+                        json!({"domain": domain, "address": address}),
+                    )
+                }));
+                records
+            }
+            Err(error) => vec![record(
+                task_id,
+                scope_id,
+                TargetKind::Domain,
+                domain,
+                "dns.error",
+                json!({"domain": domain, "error": error}),
+            )],
+        }
+    }
+}
+
+const MAX_CERTIFICATE_NAMES: usize = 1_000;
+
+fn normalize_certificate_names(root: &str, names: Vec<String>) -> Vec<String> {
+    let root = root.trim().trim_end_matches('.').to_ascii_lowercase();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let name = name
+                .trim()
+                .trim_start_matches("*.")
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            ((!name.is_empty())
+                && (name == root || name.ends_with(&format!(".{root}")))
+                && name.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                }))
+            .then_some(name)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(MAX_CERTIFICATE_NAMES)
+        .collect()
+}
+
+fn record(
+    task_id: &str,
+    scope_id: &str,
+    kind: TargetKind,
+    value: &str,
+    observation_type: &str,
+    payload: serde_json::Value,
+) -> DiscoveryRecord {
+    let timestamp = now();
+    let content = serde_json::to_vec(&payload).expect("JSON evidence is serializable");
+    let evidence_hash = hex_hash(&content);
+    let asset_id = stable_id(
+        "asset",
+        format!("{scope_id}:{}:{value}", i32::from(kind)).as_bytes(),
+    );
+    let evidence_id = format!("evidence_{evidence_hash}");
+    DiscoveryRecord {
+        asset: Asset {
+            id: asset_id.clone(),
+            scope_id: scope_id.to_owned(),
+            kind: kind.into(),
+            value: value.to_owned(),
+            first_seen_at: Some(timestamp),
+            last_seen_at: Some(timestamp),
+        },
+        service: None,
+        certificate: None,
+        website: None,
+        observation: Observation {
+            id: format!("observation_{}", Uuid::now_v7()),
+            task_id: task_id.to_owned(),
+            asset_id,
+            observation_type: observation_type.to_owned(),
+            value_json: String::from_utf8(content.clone()).expect("JSON is UTF-8"),
+            evidence_id: evidence_id.clone(),
+            observed_at: Some(timestamp),
+        },
+        evidence: Evidence {
+            id: evidence_id,
+            media_type: "application/json".to_owned(),
+            sha256: evidence_hash,
+            content,
+            created_at: Some(timestamp),
+        },
+        finding_evaluations: Vec::new(),
+        findings: Vec::new(),
+    }
+}
+
+fn service_record(task_id: &str, scope_id: &str, address: IpAddr, port: u16) -> DiscoveryRecord {
+    let value = address.to_string();
+    let mut record = record(
+        task_id,
+        scope_id,
+        TargetKind::Ip,
+        &value,
+        "tcp.open",
+        json!({"address": address, "transport": "tcp", "port": port}),
+    );
+    let timestamp = record
+        .observation
+        .observed_at
+        .expect("observation timestamp exists");
+    record.service = Some(Service {
+        id: stable_id(
+            "service",
+            format!("{}:tcp:{port}", record.asset.id).as_bytes(),
+        ),
+        asset_id: record.asset.id.clone(),
+        transport: "tcp".to_owned(),
+        port: u32::from(port),
+        service_hint: service_hint(port).to_owned(),
+        first_seen_at: Some(timestamp),
+        last_seen_at: Some(timestamp),
+    });
+    record
+}
+
+fn service_banner_record(
+    task_id: &str,
+    scope_id: &str,
+    address: IpAddr,
+    port: u16,
+    service_hint: &str,
+    banner: Vec<u8>,
+) -> DiscoveryRecord {
+    let sanitized = banner
+        .into_iter()
+        .filter(|byte| byte.is_ascii_graphic() || byte.is_ascii_whitespace())
+        .take(MAX_SERVICE_BANNER_BYTES)
+        .collect::<Vec<_>>();
+    let text = String::from_utf8_lossy(&sanitized).trim().to_owned();
+    record(
+        task_id,
+        scope_id,
+        TargetKind::Ip,
+        &address.to_string(),
+        "service.banner",
+        json!({
+            "address": address,
+            "port": port,
+            "service_hint": service_hint,
+            "banner": text,
+        }),
+    )
+}
+
+fn identify_banner_service(banner: &[u8], port: u16) -> &'static str {
+    let value = String::from_utf8_lossy(banner).to_ascii_lowercase();
+    if value.starts_with("ssh-") {
+        "ssh"
+    } else if value.contains("smtp") {
+        "smtp"
+    } else if value.starts_with("+ok") && value.contains("pop") {
+        "pop3"
+    } else if value.starts_with("* ok") && value.contains("imap") {
+        "imap"
+    } else if value.contains("redis") {
+        "redis"
+    } else {
+        service_hint(port)
+    }
+}
+
+fn supports_read_first_banner(port: u16) -> bool {
+    !matches!(
+        port,
+        53 | 80
+            | 443
+            | 445
+            | 1433
+            | 1521
+            | 2375
+            | 3000
+            | 3306
+            | 5432
+            | 5601
+            | 5672
+            | 6379
+            | 8080
+            | 8443
+            | 9090
+            | 9200
+            | 11211
+            | 27017
+    )
+}
+
+fn vantage_skip_record(
+    task_id: &str,
+    scope_id: &str,
+    address: IpAddr,
+    vantage: ScanVantage,
+    source: &str,
+) -> DiscoveryRecord {
+    record(
+        task_id,
+        scope_id,
+        TargetKind::Ip,
+        &address.to_string(),
+        "scan.vantage_excluded",
+        json!({
+            "address": address,
+            "source": source,
+            "vantage": vantage.name(),
+            "reason": "address class is outside the configured scan vantage",
+        }),
+    )
+}
+
+fn is_public_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            !address.is_private()
+                && !address.is_loopback()
+                && !address.is_link_local()
+                && !address.is_broadcast()
+                && !address.is_documentation()
+                && !address.is_unspecified()
+                && !address.is_multicast()
+        }
+        IpAddr::V6(address) => {
+            !address.is_loopback()
+                && !address.is_unique_local()
+                && !address.is_unicast_link_local()
+                && !address.is_unspecified()
+                && !address.is_multicast()
+        }
+    }
+}
+
+fn certificate_record(
+    task_id: &str,
+    scope_id: &str,
+    address: IpAddr,
+    port: u16,
+    der: Vec<u8>,
+) -> Result<DiscoveryRecord, String> {
+    let (_, parsed) = parse_x509_certificate(&der).map_err(|error| error.to_string())?;
+    let dns_names = parsed
+        .subject_alternative_name()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .flat_map(|extension| extension.value.general_names.iter())
+        .filter_map(|name| match name {
+            GeneralName::DNSName(value) => Some((*value).to_owned()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let timestamp = now();
+    let value = address.to_string();
+    let asset_id = stable_id(
+        "asset",
+        format!("{scope_id}:{}:{value}", i32::from(TargetKind::Ip)).as_bytes(),
+    );
+    let service_id = stable_id("service", format!("{asset_id}:tcp:{port}").as_bytes());
+    let sha256 = hex_hash(&der);
+    let observation_id = format!("observation_{}", Uuid::now_v7());
+    let evidence_id = format!("evidence_{sha256}");
+    let certificate = Certificate {
+        id: stable_id("certificate", format!("{service_id}:{sha256}").as_bytes()),
+        service_id: service_id.clone(),
+        sha256: sha256.clone(),
+        subject: parsed.subject().to_string(),
+        issuer: parsed.issuer().to_string(),
+        dns_names: dns_names.clone(),
+        not_before: Some(prost_types::Timestamp {
+            seconds: parsed.validity().not_before.timestamp(),
+            nanos: 0,
+        }),
+        not_after: Some(prost_types::Timestamp {
+            seconds: parsed.validity().not_after.timestamp(),
+            nanos: 0,
+        }),
+        first_seen_at: Some(timestamp),
+        last_seen_at: Some(timestamp),
+    };
+    let (finding_evaluations, findings) = certificate_validity_detections(
+        task_id,
+        scope_id,
+        &asset_id,
+        &service_id,
+        &observation_id,
+        &evidence_id,
+        &certificate,
+        timestamp,
+    );
+    let payload = json!({
+        "address": address,
+        "port": port,
+        "sha256": sha256,
+        "subject": certificate.subject,
+        "issuer": certificate.issuer,
+        "dns_names": dns_names,
+        "not_before_unix": certificate.not_before.as_ref().map(|value| value.seconds),
+        "not_after_unix": certificate.not_after.as_ref().map(|value| value.seconds),
+    });
+    Ok(DiscoveryRecord {
+        asset: Asset {
+            id: asset_id.clone(),
+            scope_id: scope_id.to_owned(),
+            kind: TargetKind::Ip.into(),
+            value,
+            first_seen_at: Some(timestamp),
+            last_seen_at: Some(timestamp),
+        },
+        service: Some(Service {
+            id: service_id,
+            asset_id: asset_id.clone(),
+            transport: "tcp".to_owned(),
+            port: u32::from(port),
+            service_hint: "https".to_owned(),
+            first_seen_at: Some(timestamp),
+            last_seen_at: Some(timestamp),
+        }),
+        certificate: Some(certificate),
+        website: None,
+        observation: Observation {
+            id: observation_id,
+            task_id: task_id.to_owned(),
+            asset_id,
+            observation_type: "tls.certificate".to_owned(),
+            value_json: payload.to_string(),
+            evidence_id: evidence_id.clone(),
+            observed_at: Some(timestamp),
+        },
+        evidence: Evidence {
+            id: evidence_id,
+            media_type: "application/pkix-cert".to_owned(),
+            sha256,
+            content: der,
+            created_at: Some(timestamp),
+        },
+        finding_evaluations,
+        findings,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn certificate_validity_detections(
+    task_id: &str,
+    scope_id: &str,
+    asset_id: &str,
+    service_id: &str,
+    observation_id: &str,
+    evidence_id: &str,
+    certificate: &Certificate,
+    timestamp: prost_types::Timestamp,
+) -> (Vec<FindingEvaluation>, Vec<Finding>) {
+    const EXPIRING_WINDOW_SECONDS: i64 = 30 * 24 * 60 * 60;
+    const DETECTOR: &str = "cyberedge-tls";
+    const EXPIRED_RULE: &str = "tls-certificate-expired-v1";
+    const EXPIRING_RULE: &str = "tls-certificate-expiring-v1";
+
+    let fingerprint = |rule_id: &'static str| {
+        let fingerprint = hex_hash(format!("{rule_id}:{service_id}").as_bytes());
+        FindingEvaluation {
+            asset_id: asset_id.to_owned(),
+            detector: DETECTOR.to_owned(),
+            rule_id: rule_id.to_owned(),
+            fingerprint,
+        }
+    };
+    let expired = fingerprint(EXPIRED_RULE);
+    let expiring = fingerprint(EXPIRING_RULE);
+    let evaluations = vec![expired, expiring];
+    let Some(not_after) = certificate.not_after else {
+        return (evaluations, Vec::new());
+    };
+
+    let selected = if not_after.seconds <= timestamp.seconds {
+        Some((
+            &evaluations[0],
+            "TLS certificate expired",
+            FindingSeverity::High,
+        ))
+    } else if not_after.seconds <= timestamp.seconds + EXPIRING_WINDOW_SECONDS {
+        Some((
+            &evaluations[1],
+            "TLS certificate expires within 30 days",
+            FindingSeverity::Medium,
+        ))
+    } else {
+        None
+    };
+    let Some((evaluation, title, severity)) = selected else {
+        return (evaluations, Vec::new());
+    };
+    let finding = Finding {
+        id: stable_id(
+            "finding",
+            format!(
+                "{scope_id}:{}:{}:{asset_id}:{}",
+                evaluation.detector, evaluation.rule_id, evaluation.fingerprint
+            )
+            .as_bytes(),
+        ),
+        scope_id: scope_id.to_owned(),
+        task_id: task_id.to_owned(),
+        asset_id: asset_id.to_owned(),
+        observation_id: observation_id.to_owned(),
+        evidence_id: evidence_id.to_owned(),
+        detector: evaluation.detector.to_owned(),
+        rule_id: evaluation.rule_id.to_owned(),
+        title: title.to_owned(),
+        description: format!(
+            "The retained DER certificate for service {service_id} expires at Unix timestamp {}.",
+            not_after.seconds
+        ),
+        severity: severity.into(),
+        state: FindingState::Open.into(),
+        fingerprint: evaluation.fingerprint.clone(),
+        first_seen_at: Some(timestamp),
+        last_seen_at: Some(timestamp),
+    };
+    (evaluations, vec![finding])
+}
+
+fn website_record(
+    task_id: &str,
+    scope_id: &str,
+    address: IpAddr,
+    port: u16,
+    snapshot: WebSnapshot,
+) -> DiscoveryRecord {
+    let timestamp = now();
+    let value = address.to_string();
+    let asset_id = stable_id(
+        "asset",
+        format!("{scope_id}:{}:{value}", i32::from(TargetKind::Ip)).as_bytes(),
+    );
+    let service_id = stable_id("service", format!("{asset_id}:tcp:{port}").as_bytes());
+    let content_sha256 = hex_hash(&snapshot.body);
+    let evidence_id = format!("evidence_{content_sha256}");
+    let observation_id = format!("observation_{}", Uuid::now_v7());
+    let website = Website {
+        id: stable_id(
+            "website",
+            format!("{service_id}:{}", snapshot.url).as_bytes(),
+        ),
+        service_id: service_id.clone(),
+        url: snapshot.url.clone(),
+        status_code: u32::from(snapshot.status_code),
+        title: snapshot.title.clone(),
+        server: snapshot.server.clone(),
+        content_type: snapshot.content_type.clone(),
+        content_sha256: content_sha256.clone(),
+        first_seen_at: Some(timestamp),
+        last_seen_at: Some(timestamp),
+        fingerprints: technology_fingerprints(
+            &snapshot.body,
+            &snapshot.server,
+            &evidence_id,
+            &content_sha256,
+        ),
+        discovered_paths: discovered_paths(&snapshot.body),
+        screenshot_evidence_id: String::new(),
+    };
+    let evidence_media_type = website.content_type.clone();
+    let (finding_evaluation, finding) = directory_listing_detection(
+        task_id,
+        scope_id,
+        &asset_id,
+        &observation_id,
+        &evidence_id,
+        &snapshot,
+        timestamp,
+    );
+    let payload = json!({
+        "address": address, "port": port, "url": snapshot.url,
+        "status_code": snapshot.status_code, "title": snapshot.title,
+        "server": snapshot.server, "content_type": snapshot.content_type,
+        "content_sha256": content_sha256,
+    });
+    DiscoveryRecord {
+        asset: Asset {
+            id: asset_id.clone(),
+            scope_id: scope_id.to_owned(),
+            kind: TargetKind::Ip.into(),
+            value,
+            first_seen_at: Some(timestamp),
+            last_seen_at: Some(timestamp),
+        },
+        service: Some(Service {
+            id: service_id,
+            asset_id: asset_id.clone(),
+            transport: "tcp".to_owned(),
+            port: u32::from(port),
+            service_hint: service_hint(port).to_owned(),
+            first_seen_at: Some(timestamp),
+            last_seen_at: Some(timestamp),
+        }),
+        certificate: None,
+        website: Some(website),
+        observation: Observation {
+            id: observation_id,
+            task_id: task_id.to_owned(),
+            asset_id,
+            observation_type: "http.response".to_owned(),
+            value_json: payload.to_string(),
+            evidence_id: evidence_id.clone(),
+            observed_at: Some(timestamp),
+        },
+        evidence: Evidence {
+            id: evidence_id,
+            media_type: evidence_media_type,
+            sha256: content_sha256,
+            content: snapshot.body,
+            created_at: Some(timestamp),
+        },
+        finding_evaluations: vec![finding_evaluation],
+        findings: finding.into_iter().collect(),
+    }
+}
+
+#[derive(Clone)]
+struct NucleiTarget {
+    url: String,
+    asset: Asset,
+    service: Service,
+}
+
+#[derive(Deserialize)]
+struct NucleiEvent {
+    #[serde(rename = "template-id")]
+    template_id: String,
+    #[serde(default, rename = "matcher-name")]
+    matcher_name: String,
+    #[serde(default)]
+    r#type: String,
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default, rename = "matched-at")]
+    matched_at: String,
+    #[serde(default, rename = "is_fuzzing_result")]
+    is_fuzzing_result: bool,
+    info: NucleiInfo,
+}
+
+#[derive(Deserialize)]
+struct NucleiInfo {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    severity: serde_json::Value,
+}
+
+struct ParsedNucleiResult {
+    target: NucleiTarget,
+    event: NucleiEvent,
+    raw: Vec<u8>,
+}
+
+fn nuclei_targets(records: &[DiscoveryRecord]) -> BTreeMap<String, NucleiTarget> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let website = record.website.as_ref()?;
+            let service = record.service.as_ref()?;
+            let url = normalized_http_target(&website.url)?;
+            Some((
+                url.clone(),
+                NucleiTarget {
+                    url,
+                    asset: record.asset.clone(),
+                    service: service.clone(),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn normalized_http_target(value: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host().is_none()
+    {
+        return None;
+    }
+    url.set_path("/");
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.to_string())
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicCodeReference {
+    query_domain: String,
+    repository: String,
+    path: String,
+    name: String,
+    blob_sha: String,
+    html_url: String,
+}
+
+#[derive(Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CveResult {
+    cpe_name: String,
+    cve_id: String,
+    source_identifier: String,
+    published: String,
+    last_modified: String,
+    vuln_status: String,
+    description: String,
+    cvss_version: String,
+    cvss_vector: String,
+    base_score: Option<f64>,
+    base_severity: String,
+    references: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistrationResponse {
+    coverage: Vec<RegistrationCoverage>,
+    records: Vec<RegistrationRecord>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistrationCoverage {
+    domain: String,
+    status: String,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct RegistrationRecord {
+    domain: String,
+    icp_number: String,
+    site_name: String,
+    entity_name: String,
+    entity_type: String,
+    unified_social_credit_code: String,
+    status: String,
+    approved_at: String,
+    source: String,
+    source_url: String,
+    relationships: Vec<RegistrationRelationship>,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct RegistrationRelationship {
+    relationship_type: String,
+    related_entity: String,
+    related_domain: String,
+    confidence: String,
+    source: String,
+}
+
+fn parse_registration_output(
+    output: &[u8],
+    domains: &[String],
+) -> Result<RegistrationResponse, String> {
+    if output.len() > MAX_REGISTRATION_OUTPUT_BYTES {
+        return Err("registration output exceeds evidence limit".to_owned());
+    }
+    let response: RegistrationResponse = serde_json::from_slice(output)
+        .map_err(|error| format!("invalid registration JSON: {error}"))?;
+    if response.records.len() > MAX_REGISTRATION_RESULTS || response.coverage.len() != domains.len()
+    {
+        return Err("registration result count is invalid".to_owned());
+    }
+    let requested = domains.iter().collect::<BTreeSet<_>>();
+    let covered = response
+        .coverage
+        .iter()
+        .filter(|coverage| coverage.status == "complete")
+        .map(|coverage| &coverage.domain)
+        .collect::<BTreeSet<_>>();
+    if requested != covered {
+        return Err("registration coverage is incomplete".to_owned());
+    }
+    for registration in &response.records {
+        if !requested.contains(&registration.domain)
+            || registration.icp_number.is_empty()
+            || registration.icp_number.len() > 128
+            || registration.site_name.len() > 512
+            || registration.entity_name.len() > 512
+            || !matches!(
+                registration.entity_type.as_str(),
+                "enterprise" | "government" | "institution" | "individual" | "other"
+            )
+            || registration.entity_type == "individual"
+                && (!registration.entity_name.is_empty()
+                    || !registration.unified_social_credit_code.is_empty())
+            || !matches!(
+                registration.status.as_str(),
+                "active" | "cancelled" | "unknown"
+            )
+            || registration.approved_at.len() > 64
+            || registration.source.is_empty()
+            || registration.source.len() > 256
+            || !strict_https_url(&registration.source_url)
+            || !registration.unified_social_credit_code.is_empty()
+                && (registration.unified_social_credit_code.len() != 18
+                    || !registration
+                        .unified_social_credit_code
+                        .bytes()
+                        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()))
+            || registration.relationships.len() > 20
+            || registration.relationships.iter().any(|relationship| {
+                !matches!(
+                    relationship.relationship_type.as_str(),
+                    "same_entity" | "parent" | "subsidiary" | "affiliate"
+                ) || relationship.related_entity.len() > 512
+                    || !relationship.related_domain.is_empty()
+                        && !valid_domain_name(&relationship.related_domain)
+                    || !matches!(relationship.confidence.as_str(), "confirmed" | "reported")
+                    || relationship.source.is_empty()
+                    || relationship.source.len() > 256
+            })
+        {
+            return Err("registration record violates the adapter profile".to_owned());
+        }
+    }
+    Ok(response)
+}
+
+fn valid_domain_name(value: &str) -> bool {
+    value.len() <= 253
+        && value.contains('.')
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+fn strict_https_url(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
+}
+
+fn parse_cve_output(output: &[u8], cpe_names: &[String]) -> Result<Vec<CveResult>, String> {
+    if output.len() > MAX_CVE_OUTPUT_BYTES {
+        return Err("CVE output exceeds evidence limit".to_owned());
+    }
+    let results: Vec<CveResult> =
+        serde_json::from_slice(output).map_err(|error| format!("invalid CVE JSON: {error}"))?;
+    if results.len() > MAX_CVE_RESULTS {
+        return Err("CVE result count exceeds limit".to_owned());
+    }
+    let cpe_names = cpe_names.iter().collect::<BTreeSet<_>>();
+    for result in &results {
+        if !cpe_names.contains(&result.cpe_name)
+            || !exact_cpe_name(&result.cpe_name)
+            || !valid_cve_identifier(&result.cve_id)
+            || result.description.len() > 4096
+            || result.source_identifier.len() > 256
+            || result.published.len() > 64
+            || result.last_modified.len() > 64
+            || result.vuln_status.len() > 64
+            || result.cvss_version.len() > 16
+            || result.cvss_vector.len() > 256
+            || result
+                .base_score
+                .is_some_and(|score| !(0.0..=10.0).contains(&score))
+            || !matches!(
+                result.base_severity.to_ascii_uppercase().as_str(),
+                "UNKNOWN" | "NONE" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"
+            )
+            || result.references.len() > 10
+            || result.references.iter().any(|reference| {
+                reference.len() > 2048
+                    || reqwest::Url::parse(reference).is_err()
+                    || !reference.starts_with("https://") && !reference.starts_with("http://")
+            })
+        {
+            return Err("CVE result violates the adapter profile".to_owned());
+        }
+    }
+    Ok(results)
+}
+
+fn exact_cpe_name(value: &str) -> bool {
+    let components = value.split(':').collect::<Vec<_>>();
+    components.len() == 13
+        && components[0] == "cpe"
+        && components[1] == "2.3"
+        && matches!(components[2], "a" | "o" | "h")
+        && components[3..=5]
+            .iter()
+            .all(|component| !component.is_empty() && !matches!(*component, "*" | "-"))
+        && value.len() <= 1024
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_cve_identifier(value: &str) -> bool {
+    let mut parts = value.split('-');
+    parts.next() == Some("CVE")
+        && parts
+            .next()
+            .is_some_and(|year| year.len() == 4 && year.bytes().all(|byte| byte.is_ascii_digit()))
+        && parts.next().is_some_and(|number| {
+            number.len() >= 4 && number.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && parts.next().is_none()
+}
+
+fn cve_fingerprint(cpe_name: &str, cve_id: &str) -> String {
+    hex_hash(format!("{cpe_name}:{cve_id}").as_bytes())
+}
+
+fn cve_severity(result: &CveResult) -> FindingSeverity {
+    match result.base_severity.to_ascii_uppercase().as_str() {
+        "LOW" => FindingSeverity::Low,
+        "MEDIUM" => FindingSeverity::Medium,
+        "HIGH" => FindingSeverity::High,
+        "CRITICAL" => FindingSeverity::Critical,
+        _ => FindingSeverity::Info,
+    }
+}
+
+fn cve_result_record(
+    task_id: &str,
+    scope_id: &str,
+    asset: Asset,
+    result: CveResult,
+    fingerprint: String,
+) -> DiscoveryRecord {
+    let timestamp = now();
+    let content = serde_json::to_vec(&result).expect("validated CVE result is serializable");
+    let evidence_sha256 = hex_hash(&content);
+    let evidence_id = format!("evidence_{evidence_sha256}");
+    let observation_id = format!("observation_{}", Uuid::now_v7());
+    let evaluation = FindingEvaluation {
+        asset_id: asset.id.clone(),
+        detector: "nvd-cve".to_owned(),
+        rule_id: result.cve_id.clone(),
+        fingerprint: fingerprint.clone(),
+    };
+    let description = format!(
+        "NVD associates {} with the exact evidence-backed CPE {}. {}",
+        result.cve_id,
+        result.cpe_name,
+        result.description.trim()
+    )
+    .chars()
+    .take(4096)
+    .collect::<String>();
+    let finding = Finding {
+        id: stable_id(
+            "finding",
+            format!(
+                "{scope_id}:nvd-cve:{}:{}:{fingerprint}",
+                result.cve_id, asset.id
+            )
+            .as_bytes(),
+        ),
+        scope_id: scope_id.to_owned(),
+        task_id: task_id.to_owned(),
+        asset_id: asset.id.clone(),
+        observation_id: observation_id.clone(),
+        evidence_id: evidence_id.clone(),
+        detector: "nvd-cve".to_owned(),
+        rule_id: result.cve_id.clone(),
+        title: format!("{} applies to observed product identity", result.cve_id),
+        description,
+        severity: cve_severity(&result).into(),
+        state: FindingState::Open.into(),
+        fingerprint,
+        first_seen_at: Some(timestamp),
+        last_seen_at: Some(timestamp),
+    };
+    DiscoveryRecord {
+        asset,
+        service: None,
+        certificate: None,
+        website: None,
+        observation: Observation {
+            id: observation_id,
+            task_id: task_id.to_owned(),
+            asset_id: finding.asset_id.clone(),
+            observation_type: "nvd.cve.result".to_owned(),
+            value_json: json!({
+                "cpe_name": result.cpe_name,
+                "cve_id": result.cve_id,
+                "base_score": result.base_score,
+                "base_severity": result.base_severity,
+                "vuln_status": result.vuln_status,
+            })
+            .to_string(),
+            evidence_id: evidence_id.clone(),
+            observed_at: Some(timestamp),
+        },
+        evidence: Evidence {
+            id: evidence_id,
+            media_type: "application/json".to_owned(),
+            sha256: evidence_sha256,
+            content,
+            created_at: Some(timestamp),
+        },
+        finding_evaluations: vec![evaluation],
+        findings: vec![finding],
+    }
+}
+
+fn parse_public_code_output(
+    output: &[u8],
+    domains: &[String],
+) -> Result<Vec<PublicCodeReference>, String> {
+    if output.len() > MAX_PUBLIC_CODE_OUTPUT_BYTES {
+        return Err("public code output exceeds evidence limit".to_owned());
+    }
+    let values: Vec<PublicCodeReference> = serde_json::from_slice(output)
+        .map_err(|error| format!("invalid public code JSON: {error}"))?;
+    if values.len() > MAX_PUBLIC_CODE_RESULTS {
+        return Err("public code result count exceeds limit".to_owned());
+    }
+    let domains = domains.iter().collect::<BTreeSet<_>>();
+    for value in &values {
+        let url = reqwest::Url::parse(&value.html_url)
+            .map_err(|_| "public code result URL is invalid".to_owned())?;
+        if !domains.contains(&value.query_domain)
+            || value.repository.len() > 256
+            || value.repository.split('/').count() != 2
+            || value.path.is_empty()
+            || value.path.len() > 1024
+            || value.name.is_empty()
+            || value.name.len() > 256
+            || !matches!(value.blob_sha.len(), 40 | 64)
+            || !value.blob_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || url.scheme() != "https"
+            || url.host_str() != Some("github.com")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || [&value.repository, &value.path, &value.name]
+                .into_iter()
+                .any(|field| field.chars().any(char::is_control))
+        {
+            return Err("public code result violates the adapter profile".to_owned());
+        }
+    }
+    Ok(values)
+}
+
+fn public_code_fingerprint(value: &PublicCodeReference) -> String {
+    hex_hash(format!("{}:{}", value.repository, value.path).as_bytes())
+}
+
+fn public_code_result_record(
+    task_id: &str,
+    scope_id: &str,
+    reference: PublicCodeReference,
+    fingerprint: String,
+) -> DiscoveryRecord {
+    let domain = reference.query_domain.clone();
+    let payload = json!({
+        "query_domain": reference.query_domain,
+        "repository": reference.repository,
+        "path": reference.path,
+        "name": reference.name,
+        "blob_sha": reference.blob_sha,
+        "html_url": reference.html_url,
+        "classification": "public_code_reference_candidate",
+    });
+    let mut result = record(
+        task_id,
+        scope_id,
+        TargetKind::Domain,
+        &domain,
+        "github.code.reference",
+        payload,
+    );
+    let rule_id = "public-code-reference".to_owned();
+    let evaluation = FindingEvaluation {
+        asset_id: result.asset.id.clone(),
+        detector: "github-public-code".to_owned(),
+        rule_id: rule_id.clone(),
+        fingerprint: fingerprint.clone(),
+    };
+    result.findings.push(Finding {
+        id: stable_id(
+            "finding",
+            format!(
+                "{scope_id}:github-public-code:{rule_id}:{}:{fingerprint}",
+                result.asset.id
+            )
+            .as_bytes(),
+        ),
+        scope_id: scope_id.to_owned(),
+        task_id: task_id.to_owned(),
+        asset_id: result.asset.id.clone(),
+        observation_id: result.observation.id.clone(),
+        evidence_id: result.evidence.id.clone(),
+        detector: "github-public-code".to_owned(),
+        rule_id,
+        title: "Public code references an authorized domain".to_owned(),
+        description: "GitHub code search returned a public repository path referencing the authorized domain. This is a review candidate, not proof of a credential leak.".to_owned(),
+        severity: FindingSeverity::Info.into(),
+        state: FindingState::Open.into(),
+        fingerprint,
+        first_seen_at: result.observation.observed_at,
+        last_seen_at: result.observation.observed_at,
+    });
+    result.finding_evaluations.push(evaluation);
+    result
+}
+
+fn parse_nuclei_output(
+    output: &[u8],
+    targets: &BTreeMap<String, NucleiTarget>,
+) -> Result<Vec<ParsedNucleiResult>, String> {
+    if output.len() > MAX_NUCLEI_OUTPUT_BYTES {
+        return Err("nuclei output exceeds evidence limit".to_owned());
+    }
+    let mut parsed = Vec::new();
+    for line in output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        if parsed.len() == MAX_NUCLEI_RESULTS || line.len() > MAX_NUCLEI_RESULT_BYTES {
+            return Err("nuclei result count or line size exceeds limit".to_owned());
+        }
+        let mut value: serde_json::Value = serde_json::from_slice(line)
+            .map_err(|error| format!("invalid nuclei JSONL: {error}"))?;
+        if ["request", "response", "template-encoded", "interaction"]
+            .iter()
+            .any(|field| value.get(field).is_some())
+        {
+            return Err("nuclei result contains forbidden raw execution fields".to_owned());
+        }
+        let source_sha256 = hex_hash(line);
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| "nuclei result must be a JSON object".to_owned())?;
+        object.remove("curl-command");
+        object.insert(
+            "cyberedge-source-sha256".to_owned(),
+            serde_json::Value::String(source_sha256),
+        );
+        let event: NucleiEvent = serde_json::from_value(value.clone())
+            .map_err(|error| format!("invalid nuclei result schema: {error}"))?;
+        if event.template_id.is_empty()
+            || event.template_id.len() > 256
+            || !event
+                .template_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            || !matches!(event.r#type.as_str(), "http" | "ssl")
+            || event.is_fuzzing_result
+        {
+            return Err("nuclei result violates the adapter profile".to_owned());
+        }
+        let target = [&event.host, &event.url, &event.matched_at]
+            .into_iter()
+            .flat_map(|value| nuclei_result_target_candidates(value))
+            .find_map(|url| targets.get(&url).cloned())
+            .ok_or_else(|| "nuclei result is outside derived targets".to_owned())?;
+        nuclei_severity(&event.info.severity)?;
+        parsed.push(ParsedNucleiResult {
+            target,
+            event,
+            raw: serde_json::to_vec(&value).expect("validated nuclei result is serializable"),
+        });
+    }
+    Ok(parsed)
+}
+
+fn nuclei_result_target_candidates(value: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(url) = normalized_http_target(value) {
+        candidates.push(url);
+    }
+    if !value.contains("://") && !value.is_empty() {
+        for scheme in ["https", "http"] {
+            if let Some(url) = normalized_http_target(&format!("{scheme}://{value}/"))
+                && !candidates.contains(&url)
+            {
+                candidates.push(url);
+            }
+        }
+    }
+    candidates
+}
+
+fn nuclei_severity(value: &serde_json::Value) -> Result<FindingSeverity, String> {
+    match value
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "info" => Ok(FindingSeverity::Info),
+        "low" => Ok(FindingSeverity::Low),
+        "medium" => Ok(FindingSeverity::Medium),
+        "high" => Ok(FindingSeverity::High),
+        "critical" => Ok(FindingSeverity::Critical),
+        _ => Err("nuclei result has invalid severity".to_owned()),
+    }
+}
+
+fn nuclei_fingerprint(event: &NucleiEvent) -> String {
+    hex_hash(
+        format!(
+            "{}:{}:{}",
+            event.template_id, event.matcher_name, event.matched_at
+        )
+        .as_bytes(),
+    )
+}
+
+fn nuclei_result_record(
+    task_id: &str,
+    scope_id: &str,
+    target: NucleiTarget,
+    event: NucleiEvent,
+    raw: Vec<u8>,
+) -> DiscoveryRecord {
+    let timestamp = now();
+    let evidence_sha256 = hex_hash(&raw);
+    let evidence_id = format!("evidence_{evidence_sha256}");
+    let observation_id = format!("observation_{}", Uuid::now_v7());
+    let fingerprint = nuclei_fingerprint(&event);
+    let severity = nuclei_severity(&event.info.severity).expect("validated nuclei severity");
+    let title = if event.info.name.trim().is_empty() {
+        event.template_id.clone()
+    } else {
+        event.info.name.trim().chars().take(512).collect()
+    };
+    let description = format!(
+        "{} Matched at {}.",
+        event
+            .info
+            .description
+            .trim()
+            .chars()
+            .take(4096)
+            .collect::<String>(),
+        event.matched_at
+    )
+    .trim()
+    .to_owned();
+    let evaluation = FindingEvaluation {
+        asset_id: target.asset.id.clone(),
+        detector: "nuclei".to_owned(),
+        rule_id: event.template_id.clone(),
+        fingerprint: fingerprint.clone(),
+    };
+    let finding = Finding {
+        id: stable_id(
+            "finding",
+            format!(
+                "{scope_id}:nuclei:{}:{}:{fingerprint}",
+                event.template_id, target.asset.id
+            )
+            .as_bytes(),
+        ),
+        scope_id: scope_id.to_owned(),
+        task_id: task_id.to_owned(),
+        asset_id: target.asset.id.clone(),
+        observation_id: observation_id.clone(),
+        evidence_id: evidence_id.clone(),
+        detector: "nuclei".to_owned(),
+        rule_id: event.template_id.clone(),
+        title,
+        description,
+        severity: severity.into(),
+        state: FindingState::Open.into(),
+        fingerprint,
+        first_seen_at: Some(timestamp),
+        last_seen_at: Some(timestamp),
+    };
+    let payload = json!({
+        "target": target.url,
+        "template_id": event.template_id,
+        "matcher_name": event.matcher_name,
+        "matched_at": event.matched_at,
+        "severity": event.info.severity,
+        "content_sha256": evidence_sha256,
+    });
+    DiscoveryRecord {
+        asset: target.asset,
+        service: Some(target.service),
+        certificate: None,
+        website: None,
+        observation: Observation {
+            id: observation_id,
+            task_id: task_id.to_owned(),
+            asset_id: finding.asset_id.clone(),
+            observation_type: "nuclei.result".to_owned(),
+            value_json: payload.to_string(),
+            evidence_id: evidence_id.clone(),
+            observed_at: Some(timestamp),
+        },
+        evidence: Evidence {
+            id: evidence_id,
+            media_type: "application/x-ndjson".to_owned(),
+            sha256: evidence_sha256,
+            content: raw,
+            created_at: Some(timestamp),
+        },
+        finding_evaluations: vec![evaluation],
+        findings: vec![finding],
+    }
+}
+
+fn nuclei_coverage_record(
+    task_id: &str,
+    scope_id: &str,
+    target: &NucleiTarget,
+    evaluations: Vec<FindingEvaluation>,
+) -> DiscoveryRecord {
+    let mut record = record(
+        task_id,
+        scope_id,
+        TargetKind::try_from(target.asset.kind).unwrap_or(TargetKind::Unspecified),
+        &target.asset.value,
+        "nuclei.coverage",
+        json!({"target": target.url, "completed": true}),
+    );
+    record.service = Some(target.service.clone());
+    record.finding_evaluations = evaluations;
+    record
+}
+
+fn host_collision_record(
+    task_id: &str,
+    scope_id: &str,
+    address: IpAddr,
+    port: u16,
+    domain: &str,
+    baseline: WebSnapshot,
+    candidate: WebSnapshot,
+) -> DiscoveryRecord {
+    let timestamp = now();
+    let value = address.to_string();
+    let asset_id = stable_id(
+        "asset",
+        format!("{scope_id}:{}:{value}", i32::from(TargetKind::Ip)).as_bytes(),
+    );
+    let service_id = stable_id("service", format!("{asset_id}:tcp:{port}").as_bytes());
+    let baseline_sha256 = hex_hash(&baseline.body);
+    let candidate_sha256 = hex_hash(&candidate.body);
+    let matched = host_collision_matches(&baseline, &candidate);
+    let evidence_content = serde_json::to_vec(&json!({
+        "address": address,
+        "port": port,
+        "host": domain,
+        "baseline": {
+            "url": baseline.url,
+            "status_code": baseline.status_code,
+            "title": baseline.title,
+            "content_type": baseline.content_type,
+            "content_sha256": baseline_sha256,
+            "body_base64": STANDARD.encode(&baseline.body),
+        },
+        "candidate": {
+            "url": candidate.url,
+            "status_code": candidate.status_code,
+            "title": candidate.title,
+            "content_type": candidate.content_type,
+            "content_sha256": candidate_sha256,
+            "body_base64": STANDARD.encode(&candidate.body),
+        },
+        "matched": matched,
+    }))
+    .expect("host collision evidence is serializable");
+    let evidence_sha256 = hex_hash(&evidence_content);
+    let evidence_id = format!("evidence_{evidence_sha256}");
+    let observation_id = format!("observation_{}", Uuid::now_v7());
+    let detector = "cyberedge-http";
+    let rule_id = "http-host-collision-v1";
+    let fingerprint = hex_hash(format!("{rule_id}:{service_id}:{domain}").as_bytes());
+    let evaluation = FindingEvaluation {
+        asset_id: asset_id.clone(),
+        detector: detector.to_owned(),
+        rule_id: rule_id.to_owned(),
+        fingerprint: fingerprint.clone(),
+    };
+    let finding = matched.then(|| Finding {
+        id: stable_id(
+            "finding",
+            format!("{scope_id}:{detector}:{rule_id}:{asset_id}:{fingerprint}").as_bytes(),
+        ),
+        scope_id: scope_id.to_owned(),
+        task_id: task_id.to_owned(),
+        asset_id: asset_id.clone(),
+        observation_id: observation_id.clone(),
+        evidence_id: evidence_id.clone(),
+        detector: detector.to_owned(),
+        rule_id: rule_id.to_owned(),
+        title: "Host-routed website exposed on alternate scoped IP".to_owned(),
+        description: format!(
+            "Sending the authorized Host {domain} to {address}:{port} returned a materially different successful response than the address baseline."
+        ),
+        severity: FindingSeverity::Medium.into(),
+        state: FindingState::Open.into(),
+        fingerprint,
+        first_seen_at: Some(timestamp),
+        last_seen_at: Some(timestamp),
+    });
+    let observation_payload = json!({
+        "address": address,
+        "port": port,
+        "host": domain,
+        "baseline_status_code": baseline.status_code,
+        "baseline_content_sha256": baseline_sha256,
+        "candidate_status_code": candidate.status_code,
+        "candidate_content_sha256": candidate_sha256,
+        "matched": matched,
+    });
+    DiscoveryRecord {
+        asset: Asset {
+            id: asset_id.clone(),
+            scope_id: scope_id.to_owned(),
+            kind: TargetKind::Ip.into(),
+            value,
+            first_seen_at: Some(timestamp),
+            last_seen_at: Some(timestamp),
+        },
+        service: Some(Service {
+            id: service_id,
+            asset_id: asset_id.clone(),
+            transport: "tcp".to_owned(),
+            port: u32::from(port),
+            service_hint: service_hint(port).to_owned(),
+            first_seen_at: Some(timestamp),
+            last_seen_at: Some(timestamp),
+        }),
+        certificate: None,
+        website: None,
+        observation: Observation {
+            id: observation_id,
+            task_id: task_id.to_owned(),
+            asset_id,
+            observation_type: "http.host_collision_check".to_owned(),
+            value_json: observation_payload.to_string(),
+            evidence_id: evidence_id.clone(),
+            observed_at: Some(timestamp),
+        },
+        evidence: Evidence {
+            id: evidence_id,
+            media_type: "application/vnd.cyberedge.host-collision+json".to_owned(),
+            sha256: evidence_sha256,
+            content: evidence_content,
+            created_at: Some(timestamp),
+        },
+        finding_evaluations: vec![evaluation],
+        findings: finding.into_iter().collect(),
+    }
+}
+
+fn host_collision_matches(baseline: &WebSnapshot, candidate: &WebSnapshot) -> bool {
+    let content_type = candidate.content_type.to_ascii_lowercase();
+    let json_content = content_type.contains("json");
+    let useful_content = content_type.contains("text") || json_content;
+    let successful = matches!(candidate.status_code, 200 | 301 | 302);
+    let plausible_body = if json_content {
+        candidate.body.len() >= 32
+    } else {
+        candidate.body.len() >= 150 && candidate.body.contains(&b'<')
+    };
+    let materially_different = baseline.status_code != candidate.status_code
+        || baseline.content_type != candidate.content_type
+        || baseline.body.len().abs_diff(candidate.body.len()) > 20
+        || (!baseline.title.is_empty()
+            && !candidate.title.is_empty()
+            && baseline.title != candidate.title);
+    successful
+        && useful_content
+        && plausible_body
+        && baseline.body != candidate.body
+        && materially_different
+}
+
+fn technology_fingerprints(
+    body: &[u8],
+    server: &str,
+    evidence_id: &str,
+    content_sha256: &str,
+) -> Vec<TechnologyFingerprint> {
+    let body = String::from_utf8_lossy(body).to_ascii_lowercase();
+    let mut matches = Vec::new();
+    let wordpress_generator = generator_tag(&body, "wordpress");
+    let wordpress = wordpress_generator.is_some()
+        || body.contains("/wp-content/") && body.contains("/wp-includes/");
+    if wordpress {
+        let version = wordpress_generator
+            .and_then(|tag| product_version(tag, "wordpress"))
+            .unwrap_or_default();
+        let cpe_name = (!version.is_empty())
+            .then(|| format!("cpe:2.3:a:wordpress:wordpress:{version}:*:*:*:*:*:*:*"));
+        matches.push(("WordPress", version, "http-wordpress-v1", cpe_name));
+    }
+    let grafana = body.contains("window.grafanabootdata")
+        && (body.contains("public/build/") || body.contains("<title>grafana"));
+    if grafana {
+        matches.push(("Grafana", String::new(), "http-grafana-v1", None));
+    }
+    if let Some(version) = exact_server_version(server, "nginx") {
+        matches.push((
+            "nginx",
+            version.clone(),
+            "http-server-nginx-v1",
+            Some(format!("cpe:2.3:a:f5:nginx:{version}:*:*:*:*:*:*:*")),
+        ));
+    }
+    matches
+        .into_iter()
+        .map(|(name, version, rule_id, cpe_name)| TechnologyFingerprint {
+            id: stable_id(
+                "fingerprint",
+                format!("{rule_id}:{content_sha256}").as_bytes(),
+            ),
+            name: name.to_owned(),
+            version,
+            detector: "cyberedge-http".to_owned(),
+            rule_id: rule_id.to_owned(),
+            evidence_id: evidence_id.to_owned(),
+            cpe_source: cpe_name
+                .as_ref()
+                .map(|_| format!("cyberedge-cpe-map:{rule_id}"))
+                .unwrap_or_default(),
+            cpe_name: cpe_name.unwrap_or_default(),
+        })
+        .collect()
+}
+
+fn exact_server_version(server: &str, product: &str) -> Option<String> {
+    let value = server.trim();
+    let (name, version) = value.split_once('/')?;
+    if !name.eq_ignore_ascii_case(product)
+        || version.is_empty()
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+    Some(version.chars().take(32).collect())
+}
+
+fn generator_tag<'a>(body: &'a str, product: &str) -> Option<&'a str> {
+    body.split("<meta").skip(1).find_map(|suffix| {
+        let tag = suffix.split_once('>')?.0;
+        let generator = tag.contains("name=\"generator\"") || tag.contains("name='generator'");
+        (generator && tag.contains(product)).then_some(tag)
+    })
+}
+
+fn product_version(body: &str, product: &str) -> Option<String> {
+    let suffix = body
+        .get(body.find(product)? + product.len()..)?
+        .trim_start();
+    let version = suffix
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || *character == '.')
+        .take(32)
+        .collect::<String>();
+    (!version.is_empty()).then_some(version)
+}
+
+fn discovered_paths(body: &[u8]) -> Vec<String> {
+    const MAX_CRAWL_PATHS: usize = 64;
+    let html = String::from_utf8_lossy(body);
+    let lowered = html.to_ascii_lowercase();
+    let mut paths = BTreeSet::new();
+    for attribute in ["href", "src"] {
+        let mut offset = 0;
+        while let Some(relative) = lowered[offset..].find(attribute) {
+            let start = offset + relative + attribute.len();
+            let suffix = &html[start..];
+            let Some(equals) = suffix.find('=') else {
+                break;
+            };
+            if !suffix[..equals].chars().all(char::is_whitespace) {
+                offset = start;
+                continue;
+            }
+            let value = suffix[equals + 1..].trim_start();
+            let Some(quote) = value
+                .chars()
+                .next()
+                .filter(|value| matches!(value, '\'' | '"'))
+            else {
+                offset = start + equals + 1;
+                continue;
+            };
+            let value = &value[quote.len_utf8()..];
+            let Some(end) = value.find(quote) else {
+                break;
+            };
+            insert_crawl_path(&mut paths, &value[..end], MAX_CRAWL_PATHS);
+            if paths.len() == MAX_CRAWL_PATHS {
+                return paths.into_iter().collect();
+            }
+            offset = html.len() - value.len() + end + quote.len_utf8();
+        }
+    }
+
+    for value in html
+        .split(['\'', '"'])
+        .filter(|value| value.starts_with('/'))
+    {
+        insert_crawl_path(&mut paths, value, MAX_CRAWL_PATHS);
+        if paths.len() == MAX_CRAWL_PATHS {
+            break;
+        }
+    }
+    paths.into_iter().collect()
+}
+
+fn insert_crawl_path(paths: &mut BTreeSet<String>, value: &str, limit: usize) {
+    if paths.len() == limit {
+        return;
+    }
+    let path = value.split('#').next().unwrap_or_default();
+    if safe_crawl_path(path) && path != "/" && !HTTP_PROBE_PATHS.contains(&path) {
+        paths.insert(path.to_owned());
+    }
+}
+
+fn safe_crawl_path(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    path.len() > 1
+        && path.len() <= 256
+        && path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.contains(['?', '#', '\\'])
+        && !path.split('/').any(|segment| matches!(segment, "." | ".."))
+        && !lowered.contains("%2e")
+        && !lowered.contains("%2f")
+        && !lowered.contains("%5c")
+        && !path.chars().any(char::is_control)
+}
+
+fn http_crawl_record(
+    task_id: &str,
+    scope_id: &str,
+    address: IpAddr,
+    port: u16,
+    path: &str,
+    snapshot: WebSnapshot,
+) -> DiscoveryRecord {
+    let timestamp = now();
+    let value = address.to_string();
+    let asset_id = stable_id(
+        "asset",
+        format!("{scope_id}:{}:{value}", i32::from(TargetKind::Ip)).as_bytes(),
+    );
+    let service_id = stable_id("service", format!("{asset_id}:tcp:{port}").as_bytes());
+    let sha256 = hex_hash(&snapshot.body);
+    let evidence_id = format!("evidence_{sha256}");
+    let payload = json!({
+        "address": address, "port": port, "url": snapshot.url, "path": path,
+        "status_code": snapshot.status_code, "title": snapshot.title,
+        "content_type": snapshot.content_type, "content_sha256": sha256,
+    });
+    DiscoveryRecord {
+        asset: Asset {
+            id: asset_id.clone(),
+            scope_id: scope_id.to_owned(),
+            kind: TargetKind::Ip.into(),
+            value,
+            first_seen_at: Some(timestamp),
+            last_seen_at: Some(timestamp),
+        },
+        service: Some(Service {
+            id: service_id,
+            asset_id: asset_id.clone(),
+            transport: "tcp".to_owned(),
+            port: u32::from(port),
+            service_hint: service_hint(port).to_owned(),
+            first_seen_at: Some(timestamp),
+            last_seen_at: Some(timestamp),
+        }),
+        certificate: None,
+        website: None,
+        observation: Observation {
+            id: format!("observation_{}", Uuid::now_v7()),
+            task_id: task_id.to_owned(),
+            asset_id,
+            observation_type: "http.crawl".to_owned(),
+            value_json: payload.to_string(),
+            evidence_id: evidence_id.clone(),
+            observed_at: Some(timestamp),
+        },
+        evidence: Evidence {
+            id: evidence_id,
+            media_type: snapshot.content_type,
+            sha256,
+            content: snapshot.body,
+            created_at: Some(timestamp),
+        },
+        finding_evaluations: Vec::new(),
+        findings: Vec::new(),
+    }
+}
+
+fn screenshot_record(
+    task_id: &str,
+    scope_id: &str,
+    address: IpAddr,
+    port: u16,
+    png: Vec<u8>,
+) -> DiscoveryRecord {
+    let timestamp = now();
+    let value = address.to_string();
+    let asset_id = stable_id(
+        "asset",
+        format!("{scope_id}:{}:{value}", i32::from(TargetKind::Ip)).as_bytes(),
+    );
+    let service_id = stable_id("service", format!("{asset_id}:tcp:{port}").as_bytes());
+    let sha256 = hex_hash(&png);
+    let evidence_id = format!("evidence_{sha256}");
+    let payload = json!({
+        "address": address, "port": port, "media_type": "image/png",
+        "content_sha256": sha256, "rendering": "offline-html-evidence",
+    });
+    DiscoveryRecord {
+        asset: Asset {
+            id: asset_id.clone(),
+            scope_id: scope_id.to_owned(),
+            kind: TargetKind::Ip.into(),
+            value,
+            first_seen_at: Some(timestamp),
+            last_seen_at: Some(timestamp),
+        },
+        service: Some(Service {
+            id: service_id,
+            asset_id: asset_id.clone(),
+            transport: "tcp".to_owned(),
+            port: u32::from(port),
+            service_hint: service_hint(port).to_owned(),
+            first_seen_at: Some(timestamp),
+            last_seen_at: Some(timestamp),
+        }),
+        certificate: None,
+        website: None,
+        observation: Observation {
+            id: format!("observation_{}", Uuid::now_v7()),
+            task_id: task_id.to_owned(),
+            asset_id,
+            observation_type: "http.screenshot".to_owned(),
+            value_json: payload.to_string(),
+            evidence_id: evidence_id.clone(),
+            observed_at: Some(timestamp),
+        },
+        evidence: Evidence {
+            id: evidence_id,
+            media_type: "image/png".to_owned(),
+            sha256,
+            content: png,
+            created_at: Some(timestamp),
+        },
+        finding_evaluations: Vec::new(),
+        findings: Vec::new(),
+    }
+}
+
+fn http_exposure_record(
+    task_id: &str,
+    scope_id: &str,
+    address: IpAddr,
+    port: u16,
+    path: &str,
+    snapshot: WebSnapshot,
+) -> DiscoveryRecord {
+    let timestamp = now();
+    let value = address.to_string();
+    let asset_id = stable_id(
+        "asset",
+        format!("{scope_id}:{}:{value}", i32::from(TargetKind::Ip)).as_bytes(),
+    );
+    let service_id = stable_id("service", format!("{asset_id}:tcp:{port}").as_bytes());
+    let content_sha256 = hex_hash(&snapshot.body);
+    let evidence_id = format!("evidence_{content_sha256}");
+    let observation_id = format!("observation_{}", Uuid::now_v7());
+    let (evaluation, finding) = http_exposure_detection(
+        task_id,
+        scope_id,
+        &asset_id,
+        &service_id,
+        &observation_id,
+        &evidence_id,
+        path,
+        &snapshot,
+        timestamp,
+    );
+    let payload = json!({
+        "address": address, "port": port, "url": snapshot.url, "path": path,
+        "status_code": snapshot.status_code, "content_type": snapshot.content_type,
+        "content_sha256": content_sha256,
+    });
+    DiscoveryRecord {
+        asset: Asset {
+            id: asset_id.clone(),
+            scope_id: scope_id.to_owned(),
+            kind: TargetKind::Ip.into(),
+            value,
+            first_seen_at: Some(timestamp),
+            last_seen_at: Some(timestamp),
+        },
+        service: Some(Service {
+            id: service_id,
+            asset_id: asset_id.clone(),
+            transport: "tcp".to_owned(),
+            port: u32::from(port),
+            service_hint: service_hint(port).to_owned(),
+            first_seen_at: Some(timestamp),
+            last_seen_at: Some(timestamp),
+        }),
+        certificate: None,
+        website: None,
+        observation: Observation {
+            id: observation_id,
+            task_id: task_id.to_owned(),
+            asset_id,
+            observation_type: "http.exposure_probe".to_owned(),
+            value_json: payload.to_string(),
+            evidence_id: evidence_id.clone(),
+            observed_at: Some(timestamp),
+        },
+        evidence: Evidence {
+            id: evidence_id,
+            media_type: snapshot.content_type,
+            sha256: content_sha256,
+            content: snapshot.body,
+            created_at: Some(timestamp),
+        },
+        finding_evaluations: vec![evaluation],
+        findings: finding.into_iter().collect(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn http_exposure_detection(
+    task_id: &str,
+    scope_id: &str,
+    asset_id: &str,
+    service_id: &str,
+    observation_id: &str,
+    evidence_id: &str,
+    path: &str,
+    snapshot: &WebSnapshot,
+    timestamp: prost_types::Timestamp,
+) -> (FindingEvaluation, Option<Finding>) {
+    let (rule_id, title, severity, matched) = match path {
+        "/.git/HEAD" => {
+            let value = String::from_utf8_lossy(&snapshot.body);
+            let value = value.trim();
+            let detached_head = matches!(value.len(), 40 | 64)
+                && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+            (
+                "http-exposed-git-head-v1",
+                "Git repository metadata exposed",
+                FindingSeverity::Medium,
+                snapshot.status_code == 200 && (value.starts_with("ref: refs/") || detached_head),
+            )
+        }
+        "/.DS_Store" => (
+            "http-exposed-ds-store-v1",
+            "DS_Store metadata exposed",
+            FindingSeverity::Low,
+            snapshot.status_code == 200 && snapshot.body.starts_with(b"\0\0\0\x01Bud1"),
+        ),
+        _ => unreachable!("only fixed exposure probe paths reach the detector"),
+    };
+    let detector = "cyberedge-http";
+    let fingerprint = hex_hash(format!("{rule_id}:{service_id}").as_bytes());
+    let evaluation = FindingEvaluation {
+        asset_id: asset_id.to_owned(),
+        detector: detector.to_owned(),
+        rule_id: rule_id.to_owned(),
+        fingerprint: fingerprint.clone(),
+    };
+    if !matched {
+        return (evaluation, None);
+    }
+    let finding = Finding {
+        id: stable_id(
+            "finding",
+            format!("{scope_id}:{detector}:{rule_id}:{asset_id}:{fingerprint}").as_bytes(),
+        ),
+        scope_id: scope_id.to_owned(),
+        task_id: task_id.to_owned(),
+        asset_id: asset_id.to_owned(),
+        observation_id: observation_id.to_owned(),
+        evidence_id: evidence_id.to_owned(),
+        detector: detector.to_owned(),
+        rule_id: rule_id.to_owned(),
+        title: title.to_owned(),
+        description: format!(
+            "The fixed HTTP probe at {} returned content matching {}.",
+            snapshot.url, rule_id
+        ),
+        severity: severity.into(),
+        state: FindingState::Open.into(),
+        fingerprint,
+        first_seen_at: Some(timestamp),
+        last_seen_at: Some(timestamp),
+    };
+    (evaluation, Some(finding))
+}
+
+fn directory_listing_detection(
+    task_id: &str,
+    scope_id: &str,
+    asset_id: &str,
+    observation_id: &str,
+    evidence_id: &str,
+    snapshot: &WebSnapshot,
+    timestamp: prost_types::Timestamp,
+) -> (FindingEvaluation, Option<Finding>) {
+    let detector = "cyberedge-http";
+    let rule_id = "http-directory-listing-v1";
+    let fingerprint = hex_hash(format!("{rule_id}:{}", snapshot.url).as_bytes());
+    let evaluation = FindingEvaluation {
+        asset_id: asset_id.to_owned(),
+        detector: detector.to_owned(),
+        rule_id: rule_id.to_owned(),
+        fingerprint: fingerprint.clone(),
+    };
+    let title = snapshot.title.trim().to_ascii_lowercase();
+    let body = String::from_utf8_lossy(&snapshot.body).to_ascii_lowercase();
+    let listing_title = title.starts_with("index of /")
+        || body.contains("<title>index of /")
+        || body.contains("<h1>index of /");
+    let listing_marker = body.contains("parent directory") || body.contains("?c=n;o=");
+    if snapshot.status_code != 200 || !listing_title || !listing_marker {
+        return (evaluation, None);
+    }
+
+    let finding = Finding {
+        id: stable_id(
+            "finding",
+            format!("{scope_id}:{detector}:{rule_id}:{asset_id}:{fingerprint}").as_bytes(),
+        ),
+        scope_id: scope_id.to_owned(),
+        task_id: task_id.to_owned(),
+        asset_id: asset_id.to_owned(),
+        observation_id: observation_id.to_owned(),
+        evidence_id: evidence_id.to_owned(),
+        detector: detector.to_owned(),
+        rule_id: rule_id.to_owned(),
+        title: "HTTP directory listing exposed".to_owned(),
+        description: format!(
+            "The HTTP response at {} exposes a directory index backed by the retained response body.",
+            snapshot.url
+        ),
+        severity: FindingSeverity::Medium.into(),
+        state: FindingState::Open.into(),
+        fingerprint,
+        first_seen_at: Some(timestamp),
+        last_seen_at: Some(timestamp),
+    };
+    (evaluation, Some(finding))
+}
+
+const MAX_WEB_BODY_BYTES: usize = 1_048_576;
+const MAX_SERVICE_BANNER_BYTES: usize = 512;
+const SERVICE_SCAN_CONCURRENCY: usize = 128;
+const MAX_SCREENSHOT_BYTES: usize = 10 * 1_048_576;
+const MAX_HOST_COLLISION_DOMAINS: usize = 16;
+const MAX_HOST_COLLISION_CANDIDATES: usize = 64;
+const HOST_COLLISION_CONCURRENCY: usize = 8;
+const MAX_NUCLEI_TARGETS: usize = 64;
+const MAX_PUBLIC_CODE_DOMAINS: usize = 8;
+const MAX_PUBLIC_CODE_RESULTS: usize = 160;
+const MAX_PUBLIC_CODE_OUTPUT_BYTES: usize = 1_048_576;
+const MAX_CVE_CPE_NAMES: usize = 16;
+const MAX_CVE_RESULTS: usize = 5_000;
+const MAX_CVE_OUTPUT_BYTES: usize = 10 * 1_048_576;
+const MAX_REGISTRATION_DOMAINS: usize = 8;
+const MAX_REGISTRATION_RESULTS: usize = 160;
+const MAX_REGISTRATION_OUTPUT_BYTES: usize = 2 * 1_048_576;
+const MAX_NUCLEI_RESULTS: usize = 1_000;
+const MAX_NUCLEI_RESULT_BYTES: usize = 1_048_576;
+const MAX_NUCLEI_OUTPUT_BYTES: usize = 10 * 1_048_576;
+const HTTP_PROBE_PATHS: &[&str] = &["/", "/.git/HEAD", "/.DS_Store"];
+
+fn html_title(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let lower = text.to_ascii_lowercase();
+    let Some(start) = lower.find("<title") else {
+        return String::new();
+    };
+    let Some(open) = lower[start..].find('>').map(|offset| start + offset + 1) else {
+        return String::new();
+    };
+    let Some(close) = lower[open..].find("</title>").map(|offset| open + offset) else {
+        return String::new();
+    };
+    text[open..close]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(512)
+        .collect()
+}
+
+fn unsupported_target_record(
+    task_id: &str,
+    scope_id: &str,
+    kind: TargetKind,
+    value: &str,
+) -> DiscoveryRecord {
+    record(
+        task_id,
+        scope_id,
+        kind,
+        value,
+        "policy.error",
+        json!({"target": value, "kind": i32::from(kind), "error": "target kind unsupported by policy"}),
+    )
+}
+
+fn service_hint(port: u16) -> &'static str {
+    match port {
+        22 => "ssh",
+        25 => "smtp",
+        53 => "dns",
+        80 | 8080 => "http",
+        110 => "pop3",
+        143 => "imap",
+        443 | 8443 => "https",
+        445 => "smb",
+        3306 => "mysql",
+        5432 => "postgresql",
+        6379 => "redis",
+        _ => "unknown",
+    }
+}
+
+pub const BASELINE_SERVICE_PORTS: &[u16] = &[
+    22, 25, 53, 80, 110, 143, 443, 445, 3306, 5432, 6379, 8080, 8443,
+];
+
+const ASSESSMENT_DNS_LABELS: &[&str] = &[
+    "www", "api", "auth", "admin", "app", "dev", "test", "stage", "staging", "mail", "smtp", "vpn",
+    "sso", "portal", "docs", "git", "cdn", "static", "m", "monitor",
+];
+const ASSESSMENT_ACTIVE_TARGET_BATCH_SIZE: usize = 64;
+
+fn thorough_service_ports() -> Vec<u16> {
+    let mut ports = (1..=1024).collect::<Vec<_>>();
+    ports.extend([
+        1433, 1521, 2375, 3000, 3306, 3389, 5432, 5601, 5672, 5900, 6379, 8080, 8443, 9000, 9090,
+        9200, 11211, 27017,
+    ]);
+    ports
+}
+
+fn adapter_state(records: &[DiscoveryRecord], error_type: &str, empty_type: &str) -> &'static str {
+    if records
+        .iter()
+        .any(|record| record.observation.observation_type == error_type)
+    {
+        "unavailable"
+    } else if records
+        .iter()
+        .any(|record| record.observation.observation_type == empty_type)
+    {
+        "partial"
+    } else {
+        "complete"
+    }
+}
+
+fn coverage_record(
+    task_id: &str,
+    scope_id: &str,
+    target: &ScopeTarget,
+    stage: &str,
+    state: &str,
+    detail: &str,
+    observations: usize,
+) -> DiscoveryRecord {
+    record(
+        task_id,
+        scope_id,
+        TargetKind::try_from(target.kind).unwrap_or(TargetKind::Unspecified),
+        &target.value,
+        "assessment.coverage",
+        json!({"stage": stage, "state": state, "detail": detail, "observations": observations}),
+    )
+}
+
+fn stable_id(prefix: &str, value: &[u8]) -> String {
+    format!("{prefix}_{}", &hex_hash(value)[..32])
+}
+
+fn hex_hash(value: &[u8]) -> String {
+    Sha256::digest(value)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn now() -> prost_types::Timestamp {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time must be after Unix epoch");
+    prost_types::Timestamp {
+        seconds: duration.as_secs() as i64,
+        nanos: duration.subsec_nanos() as i32,
+    }
+}
+
+#[cfg(test)]
+mod detector_tests {
+    use super::*;
+
+    fn certificate(not_after: i64) -> Certificate {
+        Certificate {
+            not_after: Some(prost_types::Timestamp {
+                seconds: not_after,
+                nanos: 0,
+            }),
+            ..Certificate::default()
+        }
+    }
+
+    #[test]
+    fn classifies_certificate_validity_windows() {
+        let timestamp = prost_types::Timestamp {
+            seconds: 1_000_000_000,
+            nanos: 0,
+        };
+        let detect = |not_after| {
+            certificate_validity_detections(
+                "task",
+                "scope",
+                "asset",
+                "service",
+                "observation",
+                "evidence",
+                &certificate(not_after),
+                timestamp,
+            )
+            .1
+        };
+        assert_eq!(
+            detect(timestamp.seconds - 1)[0].rule_id,
+            "tls-certificate-expired-v1"
+        );
+        assert_eq!(
+            detect(timestamp.seconds + 29 * 24 * 60 * 60)[0].rule_id,
+            "tls-certificate-expiring-v1"
+        );
+        assert!(detect(timestamp.seconds + 31 * 24 * 60 * 60).is_empty());
+    }
+
+    #[test]
+    fn requires_strong_technology_signatures() {
+        let detect = |body: &[u8]| technology_fingerprints(body, "", "evidence", "hash");
+        assert!(detect(b"WordPress consulting and Grafana dashboards").is_empty());
+        assert!(detect(b"/wp-content/theme.css").is_empty());
+        assert!(
+            detect(b"<meta name=\"generator\" content=\"Joomla\">WordPress services").is_empty()
+        );
+
+        let wordpress = detect(b"<meta name=\"generator\" content=\"WordPress 6.8.1\">");
+        assert_eq!(wordpress[0].name, "WordPress");
+        assert_eq!(wordpress[0].version, "6.8.1");
+        assert_eq!(
+            wordpress[0].cpe_name,
+            "cpe:2.3:a:wordpress:wordpress:6.8.1:*:*:*:*:*:*:*"
+        );
+        assert_eq!(wordpress[0].evidence_id, "evidence");
+
+        let grafana = detect(b"<title>Grafana</title><script>window.grafanaBootData={}</script>");
+        assert_eq!(grafana[0].name, "Grafana");
+        assert!(grafana[0].cpe_name.is_empty());
+
+        let nginx = technology_fingerprints(b"", "nginx/1.27.5", "evidence", "hash");
+        assert_eq!(nginx[0].version, "1.27.5");
+        assert_eq!(nginx[0].cpe_name, "cpe:2.3:a:f5:nginx:1.27.5:*:*:*:*:*:*:*");
+        assert!(technology_fingerprints(b"", "nginx", "evidence", "hash").is_empty());
+    }
+
+    #[test]
+    fn separates_scan_vantages_and_identifies_read_only_banners() {
+        let private = IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 1, 100));
+        let public = IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8));
+        assert!(!ScanVantage::External.permits(private));
+        assert!(ScanVantage::Internal.permits(private));
+        assert!(!ScanVantage::Internal.permits(public));
+        assert_eq!(identify_banner_service(b"SSH-2.0-OpenSSH_9.9", 602), "ssh");
+    }
+
+    #[test]
+    fn retains_more_than_one_nuclei_target_batch() {
+        let records = (0..65)
+            .map(|index| {
+                website_record(
+                    "task",
+                    "scope",
+                    IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+                    10_000 + index,
+                    WebSnapshot {
+                        url: format!("http://host-{index}.example:{}", 10_000 + index),
+                        status_code: 200,
+                        title: String::new(),
+                        server: String::new(),
+                        content_type: "text/html".to_owned(),
+                        body: Vec::new(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(nuclei_targets(&records).len(), 65);
+    }
+
+    #[test]
+    fn bounds_crawl_paths_to_safe_same_origin_links() {
+        let mut html = String::from(
+            r#"<a href="/login">login</a><a HREF='/docs/start'>docs</a>
+               <a href="https://outside.example/">outside</a><a href="//outside.example/">outside</a>
+               <a href="/search?q=secret">query</a><a href="/../admin">traversal</a>
+               <a href="/%2e%2e/admin">encoded</a><a href="/.git/HEAD">fixed probe</a>"#,
+        );
+        for index in 0..20 {
+            html.push_str(&format!(r#"<a href="/page/{index}">page</a>"#));
+        }
+        html.push_str(
+            r#"<script src="/assets/app.js"></script><script>fetch("/api/v1/me")</script>"#,
+        );
+        let paths = discovered_paths(html.as_bytes());
+        assert_eq!(paths.len(), 24);
+        assert!(paths.contains(&"/login".to_owned()));
+        assert!(paths.contains(&"/docs/start".to_owned()));
+        assert!(paths.contains(&"/assets/app.js".to_owned()));
+        assert!(paths.contains(&"/api/v1/me".to_owned()));
+        assert!(!paths.iter().any(|path| path.contains("outside")));
+        assert!(!paths.iter().any(|path| path.contains("admin")));
+        assert!(!paths.contains(&"/.git/HEAD".to_owned()));
+    }
+
+    #[test]
+    fn host_collision_requires_material_response_difference() {
+        let snapshot = |title: &str, content_type: &str, body: Vec<u8>| WebSnapshot {
+            url: "http://192.0.2.1/".to_owned(),
+            status_code: 200,
+            title: title.to_owned(),
+            server: String::new(),
+            content_type: content_type.to_owned(),
+            body,
+        };
+        let baseline_body = format!("<title>Default</title>{}", "same-size ".repeat(20));
+        let dynamic_body = baseline_body.replace("same-size ", "time-vary ");
+        assert!(!host_collision_matches(
+            &snapshot("Default", "text/html", baseline_body.into_bytes()),
+            &snapshot("Default", "text/html", dynamic_body.into_bytes()),
+        ));
+
+        let json = br#"{"application":"private-api","route":"authorized-host"}"#.to_vec();
+        assert!(host_collision_matches(
+            &snapshot("Default", "text/html", b"default".to_vec()),
+            &snapshot("API", "application/json", json),
+        ));
+    }
+
+    #[test]
+    fn maps_bare_nuclei_ssl_hosts_to_derived_https_targets() {
+        let url = "https://example.com/".to_owned();
+        let targets = BTreeMap::from([(
+            url.clone(),
+            NucleiTarget {
+                url,
+                asset: Asset::default(),
+                service: Service::default(),
+            },
+        )]);
+        let output = br#"{"template-id":"deprecated-tls","type":"ssl","host":"example.com:443","matched-at":"example.com:443","info":{"name":"Deprecated TLS","severity":"low"}}"#;
+
+        assert_eq!(parse_nuclei_output(output, &targets).unwrap().len(), 1);
+    }
+}

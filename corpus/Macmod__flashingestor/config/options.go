@@ -1,0 +1,305 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"sync"
+
+	"gopkg.in/yaml.v3"
+)
+
+// QueryDefinition represents a single LDAP query configuration
+type QueryDefinition struct {
+	Name       string   `yaml:"name"`
+	Filter     string   `yaml:"filter"`
+	Attributes []string `yaml:"attributes"`
+	PageSize   int      `yaml:"page_size"`
+}
+
+// RuntimeOptions holds configurable runtime options that can be changed while running
+type RuntimeOptions struct {
+	mu sync.RWMutex
+
+	Ingestion struct {
+		RecurseTrusts          bool              `yaml:"recurse_trusts"`
+		RecurseFeasibleOnly    bool              `yaml:"recurse_feasible_only"`
+		IncludeACLs            bool              `yaml:"include_acls"`
+		SearchForest           bool              `yaml:"search_forest"`
+		LdapsToLdapFallback    bool              `yaml:"ldaps_to_ldap_fallback"`
+		PromptMsgpackOverwrite bool              `yaml:"prompt_msgpack_overwrite"`
+		AppendForestDomains    bool              `yaml:"append_forest_domains"`
+		Queries                []QueryDefinition `yaml:"queries"`
+	} `yaml:"ingestion"`
+
+	RemoteCollection struct {
+		Methods            []string `yaml:"methods"`
+		AvailabilityChecks []string `yaml:"availability_checks"`
+	} `yaml:"remote_collection"`
+
+	Conversion struct {
+		MergeRemote             bool `yaml:"merge_remote"`
+		WriterBufsize           int  `yaml:"writer_bufsize"`
+		CompressOutput          bool `yaml:"compress_output"`
+		CleanupAfterCompression bool `yaml:"cleanup_after_compression"`
+	} `yaml:"conversion"`
+}
+
+// LoadOptions loads options from a YAML file, or returns defaults if file doesn't exist
+func LoadOptions(configPath string) (*RuntimeOptions, error) {
+	// If no config path provided, return defaults
+	if configPath == "" {
+		return FallbackOptions(), nil
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// File doesn't exist, return defaults
+			return FallbackOptions(), nil
+		}
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	opts := FallbackOptions()
+	if err := yaml.Unmarshal(data, opts); err != nil {
+		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	return opts, nil
+}
+
+// SaveOptions saves current options to a YAML file
+func (opts *RuntimeOptions) SaveOptions(configPath string) error {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+
+	data, err := yaml.Marshal(opts)
+	if err != nil {
+		return fmt.Errorf("failed to marshal options: %w", err)
+	}
+
+	if err := os.WriteFile(configPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write config file: %w", err)
+	}
+
+	return nil
+}
+
+func (opts *RuntimeOptions) GetRecurseTrusts() bool {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+	return opts.Ingestion.RecurseTrusts
+}
+
+func (opts *RuntimeOptions) GetRecurseFeasibleOnly() bool {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+	return opts.Ingestion.RecurseFeasibleOnly
+}
+
+func (opts *RuntimeOptions) GetIncludeACLs() bool {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+	return opts.Ingestion.IncludeACLs
+}
+
+func (opts *RuntimeOptions) GetSearchForest() bool {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+	return opts.Ingestion.SearchForest
+}
+
+func (opts *RuntimeOptions) GetLdapsToLdapFallback() bool {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+	return opts.Ingestion.LdapsToLdapFallback
+}
+
+func (opts *RuntimeOptions) GetPromptMsgpackOverwrite() bool {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+	return opts.Ingestion.PromptMsgpackOverwrite
+}
+
+func (opts *RuntimeOptions) GetAppendForestDomains() bool {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+	return opts.Ingestion.AppendForestDomains
+}
+
+func (opts *RuntimeOptions) GetMergeRemote() bool {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+	return opts.Conversion.MergeRemote
+}
+
+func (opts *RuntimeOptions) GetWriterBufsize() int {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+	return opts.Conversion.WriterBufsize
+}
+
+func (opts *RuntimeOptions) GetCompressOutput() bool {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+	return opts.Conversion.CompressOutput
+}
+
+func (opts *RuntimeOptions) GetCleanupAfterCompression() bool {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+	return opts.Conversion.CleanupAfterCompression
+}
+
+// IsMethodEnabled checks if a specific collection method is enabled
+func (opts *RuntimeOptions) IsMethodEnabled(method string) bool {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+	for _, m := range opts.RemoteCollection.Methods {
+		if m == method {
+			return true
+		}
+	}
+	return false
+}
+
+// DisableMethod removes a specific collection method from the enabled list
+func (opts *RuntimeOptions) DisableMethod(method string) {
+	opts.mu.Lock()
+	defer opts.mu.Unlock()
+	for i, m := range opts.RemoteCollection.Methods {
+		if m == method {
+			opts.RemoteCollection.Methods = append(opts.RemoteCollection.Methods[:i], opts.RemoteCollection.Methods[i+1:]...)
+			return
+		}
+	}
+}
+
+// GetQueries returns a copy of the query definitions
+func (opts *RuntimeOptions) GetQueries() []QueryDefinition {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+	queries := make([]QueryDefinition, len(opts.Ingestion.Queries))
+	copy(queries, opts.Ingestion.Queries)
+	return queries
+}
+
+// GetEnabledMethods returns a copy of the enabled methods list
+func (opts *RuntimeOptions) GetEnabledMethods() []string {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+	methods := make([]string, len(opts.RemoteCollection.Methods))
+	copy(methods, opts.RemoteCollection.Methods)
+	return methods
+}
+
+// GetAvailabilityChecks returns a map of availability checks to run
+// Returns empty map if not configured (meaning no checks run)
+func (opts *RuntimeOptions) GetAvailabilityChecks() map[string]bool {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+	// If omitted from YAML, return empty map (no checks)
+	if opts.RemoteCollection.AvailabilityChecks == nil {
+		return make(map[string]bool)
+	}
+	// Convert slice to map for efficient lookup
+	checks := make(map[string]bool, len(opts.RemoteCollection.AvailabilityChecks))
+	for _, check := range opts.RemoteCollection.AvailabilityChecks {
+		checks[check] = true
+	}
+	return checks
+}
+
+// IsAnyCAMethodEnabled checks if any Enterprise CA collection methods are enabled
+func (opts *RuntimeOptions) IsAnyCAMethodEnabled() bool {
+	return opts.IsMethodEnabled("caregistry") ||
+		opts.IsMethodEnabled("certservices")
+}
+
+// IsAnyComputerMethodEnabled checks if any computer collection methods are enabled
+func (opts *RuntimeOptions) IsAnyComputerMethodEnabled() bool {
+	return opts.IsMethodEnabled("sessions") ||
+		opts.IsMethodEnabled("regsessions") ||
+		opts.IsMethodEnabled("loggedon") ||
+		opts.IsMethodEnabled("ntlmregistry") ||
+		opts.IsMethodEnabled("webclient") ||
+		opts.IsMethodEnabled("localgroups") ||
+		opts.IsMethodEnabled("userrights") ||
+		opts.IsMethodEnabled("smbinfo") ||
+		opts.IsMethodEnabled("dcregistry") ||
+		opts.IsMethodEnabled("ldapservices")
+}
+
+// HasAnyMethodsEnabled checks if any remote collection methods are enabled
+func (opts *RuntimeOptions) HasAnyMethodsEnabled() bool {
+	opts.mu.RLock()
+	defer opts.mu.RUnlock()
+	return len(opts.RemoteCollection.Methods) > 0
+}
+
+// Thread-safe setters
+func (opts *RuntimeOptions) SetRecurseTrusts(enabled bool) {
+	opts.mu.Lock()
+	defer opts.mu.Unlock()
+	opts.Ingestion.RecurseTrusts = enabled
+}
+
+func (opts *RuntimeOptions) SetIncludeACLs(enabled bool) {
+	opts.mu.Lock()
+	defer opts.mu.Unlock()
+	opts.Ingestion.IncludeACLs = enabled
+}
+
+func (opts *RuntimeOptions) SetSearchForest(enabled bool) {
+	opts.mu.Lock()
+	defer opts.mu.Unlock()
+	opts.Ingestion.SearchForest = enabled
+}
+
+func (opts *RuntimeOptions) SetLdapsToLdapFallback(enabled bool) {
+	opts.mu.Lock()
+	defer opts.mu.Unlock()
+	opts.Ingestion.LdapsToLdapFallback = enabled
+}
+
+func (opts *RuntimeOptions) SetPromptMsgpackOverwrite(enabled bool) {
+	opts.mu.Lock()
+	defer opts.mu.Unlock()
+	opts.Ingestion.PromptMsgpackOverwrite = enabled
+}
+
+func (opts *RuntimeOptions) SetAppendForestDomains(enabled bool) {
+	opts.mu.Lock()
+	defer opts.mu.Unlock()
+	opts.Ingestion.AppendForestDomains = enabled
+}
+
+func (opts *RuntimeOptions) SetMergeRemote(enabled bool) {
+	opts.mu.Lock()
+	defer opts.mu.Unlock()
+	opts.Conversion.MergeRemote = enabled
+}
+
+func (opts *RuntimeOptions) SetWriterBufsize(size int) {
+	opts.mu.Lock()
+	defer opts.mu.Unlock()
+	opts.Conversion.WriterBufsize = size
+}
+
+func (opts *RuntimeOptions) SetCompressOutput(enabled bool) {
+	opts.mu.Lock()
+	defer opts.mu.Unlock()
+	opts.Conversion.CompressOutput = enabled
+}
+
+func (opts *RuntimeOptions) SetCleanupAfterCompression(enabled bool) {
+	opts.mu.Lock()
+	defer opts.mu.Unlock()
+	opts.Conversion.CleanupAfterCompression = enabled
+}
+
+func (opts *RuntimeOptions) SetAvailabilityChecks(checks []string) {
+	opts.mu.Lock()
+	defer opts.mu.Unlock()
+	opts.RemoteCollection.AvailabilityChecks = checks
+}

@@ -1,0 +1,111 @@
+from contextlib import contextmanager
+import logging
+import io
+import json
+import os
+from pathlib import Path as _Path
+import xxhash
+from osir_lib.logger import AppLogger
+
+logger = AppLogger().get_logger()
+
+
+@contextmanager
+def capture_log_output(target_logger):
+    """
+        Temporarily captures log emissions from a specific logger into an in-memory buffer.
+
+        In the OSIR orchestration flow, this context manager is used to intercept 
+        module-specific logs (DEBUG, INFO, ERROR) so they can be saved into 
+        the task trace database. This provides a granular view of what happened 
+        during a specific forensic execution without cluttering the main system log.
+
+        Args:
+            target_logger (logging.Logger): The logger instance to intercept.
+
+        Yields:
+            io.StringIO: A string buffer containing the captured log data.
+    """
+    log_capture_string = io.StringIO()
+    temp_handler = logging.StreamHandler(log_capture_string)
+    db_fmt = logging.Formatter('[%(levelname)s][%(asctime)s] - %(filename)s:%(lineno)d - %(funcName)s - %(message)s')
+    temp_handler.setFormatter(db_fmt)
+    target_logger.addHandler(temp_handler)
+    try:
+        yield log_capture_string
+    finally:
+        target_logger.removeHandler(temp_handler)
+
+
+def normalize_osir_path(input_path: str) -> str:
+    """
+        Standardizes paths to be relative to the framework's internal share mount point.
+
+        Args:
+            input_path (str): The absolute or prefixed path to normalize.
+
+        Returns:
+            str: The normalized path starting from /OSIR/share.
+    """
+    anchor = "/OSIR/share"
+
+    if anchor in str(input_path):
+        s_path = str(input_path)
+        return s_path[s_path.find(anchor):]
+
+    return input_path
+
+def remove_placeholders(text: str) -> str:
+    """
+    Replaces all placeholders {key} with an empty string.
+    
+    Args:
+        text: The text containing placeholders
+        
+    Returns:
+        The text without placeholders
+    """
+    import re
+    return re.sub(r'\{[^}]+\}', '', text)
+
+
+def compute_file_xxh3_128_prefix(path, prefix_size: int = 8192) -> str:
+    """
+    Computes xxh3_128 on only the first bytes of a file (default: first 8KB).
+
+    Args:
+        path (str | Path): Path to the file.
+        prefix_size (int): Number of bytes to read from the beginning.
+
+    Returns:
+        str: Hex digest of xxh3_128 over the prefix.
+    """
+    p = _Path(path)
+    h = xxhash.xxh3_128()
+    with p.open("rb") as f:
+        h.update(f.read(prefix_size))
+    return h.hexdigest()
+
+
+def compute_file_xxh3_128_full(path, chunk_size: int = 1024 * 1024) -> str:
+    """
+    Computes xxh3_128 on the whole file.
+
+    Args:
+        path (str | Path): Path to the file.
+        chunk_size (int): Read size per chunk.
+
+    Returns:
+        str: Hex digest of xxh3_128 over the full file.
+    """
+    p = _Path(path)
+    h = xxhash.xxh3_128()
+
+    with p.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+
+    return h.hexdigest()

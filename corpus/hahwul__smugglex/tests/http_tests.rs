@@ -1,0 +1,317 @@
+//! Tests for HTTP request module
+//!
+//! This module contains tests for:
+//! - send_request function with mocked network calls
+//! - TLS and non-TLS request handling
+//! - Timeout behavior
+//! - Error handling for connection failures
+
+use smugglex::http::{ExpectContinueParams, expect_continue_sequence, send_request};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::time::{Duration, timeout};
+
+// Mock HTTP server for testing
+async fn mock_server(port: u16, response: &str) {
+    let response = response.to_string();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = [0; 1024];
+            let _ = socket.read(&mut buf).await.unwrap();
+
+            let http_response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                response.len(),
+                response
+            );
+            socket.write_all(http_response.as_bytes()).await.unwrap();
+        }
+    });
+}
+
+#[tokio::test]
+async fn test_send_request_http_success() {
+    let port = 8080;
+    let response_body = "Hello, World!";
+    mock_server(port, response_body).await;
+
+    // Give server time to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let result = send_request(
+        "127.0.0.1",
+        port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        5,
+        false,
+        false,
+    )
+    .await;
+
+    assert!(result.is_ok());
+    let (response, _duration) = result.unwrap();
+    assert!(response.contains("HTTP/1.1 200 OK"));
+    assert!(response.contains(response_body));
+}
+
+#[tokio::test]
+async fn test_send_request_with_timeout() {
+    let port = 8081;
+
+    // Start a server that doesn't respond immediately
+    tokio::spawn(async move {
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        if let Ok((mut socket, _)) = listener.accept().await {
+            // Delay response to trigger timeout
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let http_response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            socket.write_all(http_response.as_bytes()).await.unwrap();
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Use very short timeout
+    let result = timeout(
+        Duration::from_millis(500),
+        send_request(
+            "127.0.0.1",
+            port,
+            "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            1,
+            false,
+            false,
+        ),
+    )
+    .await;
+
+    // Should timeout
+    assert!(result.is_err() || result.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn test_send_request_connection_refused() {
+    // Try to connect to a port that should be closed
+    let result = send_request(
+        "127.0.0.1",
+        9999,
+        "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        5,
+        false,
+        false,
+    )
+    .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    // Should be an Io error due to connection refused
+    match err {
+        smugglex::error::SmugglexError::Io(_) => {}
+        _ => panic!("Expected Io error"),
+    }
+}
+
+#[tokio::test]
+async fn test_send_request_invalid_host() {
+    // Invalid hostname should fail
+    let result = send_request(
+        "invalid.host.name.that.does.not.exist",
+        80,
+        "GET / HTTP/1.1\r\nHost: invalid\r\n\r\n",
+        5,
+        false,
+        false,
+    )
+    .await;
+
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_send_request_verbose_output() {
+    let port = 8082;
+    let response_body = "Verbose test";
+    mock_server(port, response_body).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Capture stdout to verify verbose output
+    // Note: In real implementation, you might use a testing framework that captures output
+    let result = send_request(
+        "127.0.0.1",
+        port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        5,
+        true,
+        false,
+    )
+    .await;
+
+    assert!(result.is_ok());
+    // Verbose output would be printed to stdout, but we can't easily test that in unit tests
+    // In integration tests, we could capture stdout
+}
+
+#[tokio::test]
+async fn test_send_request_with_custom_headers() {
+    let port = 8083;
+    let response_body = "Custom headers test";
+    mock_server(port, response_body).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let request = "GET / HTTP/1.1\r\nHost: localhost\r\nX-Custom: test\r\n\r\n";
+    let result = send_request("127.0.0.1", port, request, 5, false, false).await;
+
+    assert!(result.is_ok());
+    let (response, _) = result.unwrap();
+    assert!(response.contains("HTTP/1.1 200 OK"));
+}
+
+// Note: HTTPS tests would require proper TLS certificate setup
+// For now, we skip full HTTPS testing in unit tests
+// Integration tests should cover HTTPS scenarios
+
+#[tokio::test]
+async fn test_send_request_large_response() {
+    let port = 8084;
+    let large_body = "x".repeat(10000); // 10KB response
+    mock_server(port, &large_body).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let result = send_request(
+        "127.0.0.1",
+        port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        10,
+        false,
+        false,
+    )
+    .await;
+
+    assert!(result.is_ok());
+    let (response, _) = result.unwrap();
+    assert!(response.contains("HTTP/1.1 200 OK"));
+    assert!(response.contains(&large_body));
+}
+
+#[tokio::test]
+async fn test_pipeline_requests_preserves_responses_on_timeout() {
+    use smugglex::http::pipeline_requests;
+
+    let port = 8085;
+    // Server: answer the first request fully, then accept the second and never
+    // reply, forcing the pipelined exchange to stall until its own timeout.
+    tokio::spawn(async move {
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nAB")
+                .await
+                .unwrap();
+            // Second request: consumed but never answered.
+            let _ = socket.read(&mut buf).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let requests = vec![
+        "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+        "GET /b HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+    ];
+    let responses = pipeline_requests("127.0.0.1", port, &requests, 1, false, false)
+        .await
+        .unwrap();
+
+    // The first response must survive even though the second request stalls past
+    // the timeout (previously the whole batch was discarded to an empty Vec).
+    assert_eq!(
+        responses.len(),
+        1,
+        "first response should survive the timeout"
+    );
+    assert!(responses[0].contains("HTTP/1.1 200 OK"));
+    assert!(responses[0].contains("AB"));
+}
+
+#[tokio::test]
+async fn test_expect_continue_sequence_handles_interim_and_queued_responses() {
+    let port = 8086;
+    tokio::spawn(async move {
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        if let Ok((mut socket, _)) = listener.accept().await {
+            // The client must stop after the header block and wait for 100
+            // Continue before writing the body.
+            let mut received = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !received.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                received.extend_from_slice(&chunk[..n]);
+            }
+            assert!(String::from_utf8_lossy(&received).contains("Expect: 100-continue"));
+            socket
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .await
+                .unwrap();
+
+            // Body and follow-up are written back-to-back by the client. Wait
+            // until the follow-up request line arrives before returning two
+            // framed responses in one socket write.
+            received.clear();
+            while !received.windows(14).any(|w| w == b"GET /followup ") {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                received.extend_from_slice(&chunk[..n]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nHTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let result = expect_continue_sequence(ExpectContinueParams {
+        host: "127.0.0.1",
+        port,
+        headers: "POST /submit HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n",
+        body: "ABC",
+        followup: "GET /followup HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        early_wait: Duration::from_millis(250),
+        timeout: 2,
+        verbose: false,
+        use_tls: false,
+    })
+    .await
+    .unwrap();
+
+    assert!(result.body_sent);
+    assert!(!result.timed_out);
+    assert_eq!(result.interim_responses.len(), 1);
+    assert_eq!(result.post_body_responses.len(), 2);
+    assert!(result.post_body_responses[0].contains("200 OK"));
+    assert!(result.post_body_responses[1].contains("404 Not Found"));
+}

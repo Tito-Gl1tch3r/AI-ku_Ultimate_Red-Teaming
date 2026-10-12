@@ -1,0 +1,508 @@
+"""SQLite database layer for Ghost investigations."""
+
+import json
+import os
+import sqlite3
+from pathlib import Path
+from contextlib import contextmanager
+
+from ghost.core.config import config, DATA_DIR
+from ghost.core.paths import DIR_MODE, resolve_database_path as _resolve_database_path, restrict_db_file
+
+SCHEMA_VERSION = 2
+
+
+def resolve_database_path(database_url: str) -> Path:
+    """Resolve Ghost's configured SQLite database URL to a filesystem path.
+
+    Ghost v2 uses SQLite as the durable default because it is robust enough for
+    local investigations, easy to back up, and avoids the old JSON-file storage
+    limitation raised in early feedback. Other database engines are explicit
+    roadmap items instead of silently falling back to an unexpected path.
+    """
+    return _resolve_database_path(database_url, data_dir=DATA_DIR)
+
+
+DB_PATH = resolve_database_path(config.database_url)
+
+
+def get_connection(database_path: Path | None = None) -> sqlite3.Connection:
+    path = database_path or DB_PATH
+    if str(path) != ":memory:":
+        parent_existed = path.parent.exists()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not parent_existed:
+            os.chmod(path.parent, DIR_MODE)
+        restrict_db_file(path)
+    conn = sqlite3.connect(str(path), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    if str(path) != ":memory:":
+        restrict_db_file(path)
+    return conn
+
+
+@contextmanager
+def get_db(database_path: Path | None = None):
+    conn = get_connection(database_path)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db(database_path: Path | None = None):
+    """Create all tables if they don't exist."""
+    with get_db(database_path) as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS investigations (
+                id TEXT PRIMARY KEY,
+                target TEXT NOT NULL,
+                input_type TEXT NOT NULL,
+                scope TEXT DEFAULT '',
+                authorized_use INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                summary TEXT DEFAULT '',
+                risk_score REAL DEFAULT 0.0,
+                errors TEXT DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS entities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                investigation_id TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                value TEXT NOT NULL,
+                platform TEXT DEFAULT '',
+                confidence REAL DEFAULT 0.0,
+                metadata TEXT DEFAULT '{}',
+                FOREIGN KEY (investigation_id) REFERENCES investigations(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS findings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                investigation_id TEXT NOT NULL,
+                module_name TEXT NOT NULL,
+                data TEXT NOT NULL DEFAULT '{}',
+                collected_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (investigation_id) REFERENCES investigations(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS relationships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                investigation_id TEXT NOT NULL,
+                source_entity_id INTEGER NOT NULL,
+                target_entity_id INTEGER NOT NULL,
+                relationship_type TEXT NOT NULL,
+                evidence TEXT DEFAULT '',
+                confidence REAL DEFAULT 0.0,
+                FOREIGN KEY (investigation_id) REFERENCES investigations(id) ON DELETE CASCADE,
+                FOREIGN KEY (source_entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+                FOREIGN KEY (target_entity_id) REFERENCES entities(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_investigations_target ON investigations(target);
+            CREATE INDEX IF NOT EXISTS idx_investigations_status ON investigations(status);
+            CREATE INDEX IF NOT EXISTS idx_investigations_created_at ON investigations(created_at);
+            CREATE INDEX IF NOT EXISTS idx_entities_investigation ON entities(investigation_id);
+            CREATE INDEX IF NOT EXISTS idx_entities_type_value ON entities(entity_type, value);
+            CREATE INDEX IF NOT EXISTS idx_findings_investigation ON findings(investigation_id);
+            CREATE INDEX IF NOT EXISTS idx_relationships_investigation ON relationships(investigation_id);
+        """)
+        existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(investigations)").fetchall()}
+        if "scope" not in existing_columns:
+            conn.execute("ALTER TABLE investigations ADD COLUMN scope TEXT DEFAULT ''")
+        if "authorized_use" not in existing_columns:
+            conn.execute("ALTER TABLE investigations ADD COLUMN authorized_use INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)",
+            (SCHEMA_VERSION,),
+        )
+
+
+# ── Investigation CRUD ──────────────────────────────────────────────
+
+
+def save_investigation(inv_dict: dict):
+    """Save or update a full investigation from Investigation.to_dict()."""
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO investigations
+                (id, target, input_type, scope, authorized_use, status, started_at, completed_at, summary, risk_score, errors)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+            (
+                inv_dict["id"],
+                inv_dict["target"],
+                inv_dict["input_type"],
+                inv_dict.get("scope", ""),
+                1 if inv_dict.get("authorized_use", False) else 0,
+                inv_dict["status"],
+                inv_dict["started_at"],
+                inv_dict["completed_at"],
+                inv_dict.get("summary", ""),
+                inv_dict.get("risk_score", 0.0),
+                json.dumps(inv_dict.get("errors", [])),
+            ),
+        )
+
+        # Store each module's findings
+        conn.execute("DELETE FROM findings WHERE investigation_id = ?", (inv_dict["id"],))
+        for module_name, data in inv_dict.get("findings", {}).items():
+            conn.execute(
+                "INSERT INTO findings (investigation_id, module_name, data) VALUES (?, ?, ?)",
+                (inv_dict["id"], module_name, json.dumps(data, default=str)),
+            )
+
+        # Extract and store entities + relationships from correlations
+        _store_entities_and_relationships(conn, inv_dict)
+
+
+def _store_entities_and_relationships(conn, inv_dict):
+    """Extract entities from findings/correlations and store them."""
+    investigation_id = inv_dict["id"]
+    conn.execute("DELETE FROM entities WHERE investigation_id = ?", (investigation_id,))
+    conn.execute("DELETE FROM relationships WHERE investigation_id = ?", (investigation_id,))
+
+    entity_map = {}  # (type, value) -> entity_id
+
+    def _ensure_entity(etype, value, platform="", confidence=0.5, metadata=None):
+        key = (etype, value)
+        if key in entity_map:
+            return entity_map[key]
+        cur = conn.execute(
+            "INSERT INTO entities (investigation_id, entity_type, value, platform, confidence, metadata) VALUES (?, ?, ?, ?, ?, ?)",
+            (investigation_id, etype, value, platform, confidence, json.dumps(metadata or {})),
+        )
+        eid = cur.lastrowid
+        entity_map[key] = eid
+        return eid
+
+    # Central target entity
+    target_eid = _ensure_entity("target", inv_dict["target"], confidence=1.0)
+
+    # Entities from findings
+    findings = inv_dict.get("findings", {})
+
+    # Username profiles
+    for profile in findings.get("username", {}).get("profiles", []):
+        if profile.get("status") == "found":
+            eid = _ensure_entity("profile", profile.get("url", ""), platform=profile.get("platform", ""))
+            conn.execute(
+                "INSERT INTO relationships (investigation_id, source_entity_id, target_entity_id, relationship_type, confidence) VALUES (?, ?, ?, ?, ?)",
+                (investigation_id, target_eid, eid, "has_profile", 0.8),
+            )
+
+    # Social profiles
+    for profile in findings.get("social", {}).get("profiles", []):
+        platform = profile.get("platform", "")
+        eid = _ensure_entity("profile", profile.get("url", profile.get("username", "")), platform=platform)
+        conn.execute(
+            "INSERT INTO relationships (investigation_id, source_entity_id, target_entity_id, relationship_type, confidence) VALUES (?, ?, ?, ?, ?)",
+            (investigation_id, target_eid, eid, "has_profile", 0.9),
+        )
+
+    _insert_ingest_entities(conn, investigation_id, target_eid, findings.get("ingest"))
+
+    # Email entities
+    email_data = findings.get("email", {})
+    if email_data.get("email"):
+        eid = _ensure_entity("email", email_data["email"])
+        conn.execute(
+            "INSERT INTO relationships (investigation_id, source_entity_id, target_entity_id, relationship_type, confidence) VALUES (?, ?, ?, ?, ?)",
+            (investigation_id, target_eid, eid, "has_email", 0.9),
+        )
+
+    # Breaches
+    for breach in email_data.get("breaches", {}).get("breaches", []):
+        eid = _ensure_entity("breach", breach.get("name", ""), metadata=breach)
+        email_key = ("email", email_data.get("email", inv_dict["target"]))
+        src = entity_map.get(email_key, target_eid)
+        conn.execute(
+            "INSERT INTO relationships (investigation_id, source_entity_id, target_entity_id, relationship_type, evidence, confidence) VALUES (?, ?, ?, ?, ?, ?)",
+            (investigation_id, src, eid, "breached_in", breach.get("date", ""), 0.95),
+        )
+
+    # Identities from correlations
+    for identity in inv_dict.get("correlations", {}).get("identities", []):
+        _ensure_entity(
+            identity.get("type", "identity"),
+            identity.get("value", ""),
+            confidence=identity.get("confidence", 0.5),
+        )
+
+    # Locations
+    for loc in inv_dict.get("correlations", {}).get("locations", []):
+        _ensure_entity(
+            "location", loc.get("value", ""), metadata={k: loc[k] for k in ("lat", "lon", "source") if k in loc}
+        )
+
+
+def _ingest_metadata(record: dict) -> dict:
+    provenance = record.get("provenance") if isinstance(record.get("provenance"), dict) else {}
+    return {"ingest_tool": record.get("tool") or "", "provenance": provenance}
+
+
+def _insert_ingest_entities(conn, investigation_id: str, target_eid: int, ingest_findings) -> None:
+    """Add graph nodes for claimed ingested records. URLs are stored unchanged."""
+    if not isinstance(ingest_findings, dict):
+        return
+
+    seen = set()
+    for record in ingest_findings.get("records") or []:
+        if not isinstance(record, dict) or record.get("status") != "Claimed":
+            continue
+        platform = record.get("platform") or ""
+        if not isinstance(platform, str):
+            platform = str(platform)
+        metadata = _ingest_metadata(record)
+        url = record.get("url")
+        if isinstance(url, str) and url:
+            key = ("profile", url)
+            if key in seen:
+                continue
+            seen.add(key)
+            eid = conn.execute(
+                "INSERT INTO entities (investigation_id, entity_type, value, platform, confidence, metadata) VALUES (?, ?, ?, ?, ?, ?)",
+                (investigation_id, "profile", url, platform, 0.6, json.dumps(metadata)),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO relationships (investigation_id, source_entity_id, target_entity_id, relationship_type, confidence) VALUES (?, ?, ?, ?, ?)",
+                (investigation_id, target_eid, eid, "has_profile", 0.6),
+            )
+            continue
+
+        fields = record.get("fields") if isinstance(record.get("fields"), dict) else {}
+        domain = fields.get("domain") or ""
+        if isinstance(domain, str) and domain:
+            key = ("account", domain)
+            if key in seen:
+                continue
+            seen.add(key)
+            eid = conn.execute(
+                "INSERT INTO entities (investigation_id, entity_type, value, platform, confidence, metadata) VALUES (?, ?, ?, ?, ?, ?)",
+                (investigation_id, "account", domain, platform, 0.6, json.dumps(metadata)),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO relationships (investigation_id, source_entity_id, target_entity_id, relationship_type, confidence) VALUES (?, ?, ?, ?, ?)",
+                (investigation_id, target_eid, eid, "has_account", 0.6),
+            )
+
+
+def _delete_ingest_entities(conn, investigation_id: str) -> None:
+    """Remove entities previously written by ingest so a re-save does not duplicate them.
+
+    Relationships that point at those entities are deleted first. With
+    foreign_keys=ON, deleting the entity while a relationship still references
+    it fails unless the schema cascade runs; removing the rows explicitly
+    keeps the second ingest working either way.
+    """
+    rows = conn.execute(
+        "SELECT id, metadata FROM entities WHERE investigation_id = ?",
+        (investigation_id,),
+    ).fetchall()
+    ingest_ids = []
+    for row in rows:
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        if isinstance(metadata, dict) and "ingest_tool" in metadata:
+            ingest_ids.append(row["id"])
+    if not ingest_ids:
+        return
+    placeholders = ",".join("?" * len(ingest_ids))
+    conn.execute(
+        f"DELETE FROM relationships WHERE source_entity_id IN ({placeholders}) OR target_entity_id IN ({placeholders})",
+        (*ingest_ids, *ingest_ids),
+    )
+    conn.execute(
+        f"DELETE FROM entities WHERE id IN ({placeholders})",
+        tuple(ingest_ids),
+    )
+
+
+def save_ingest_into_investigation(
+    investigation_id: str,
+    ingest_findings: dict,
+    *,
+    completed_at: str,
+    mark_authorized: bool = False,
+) -> None:
+    """Attach ingested records to an existing case in one transaction.
+
+    Only the ingest finding and ingest-tagged entities are replaced. Other
+    modules, the case target, and the existing summary stay as they were.
+    """
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, target FROM investigations WHERE id = ?",
+            (investigation_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(investigation_id)
+
+        if mark_authorized:
+            conn.execute(
+                "UPDATE investigations SET completed_at = ?, authorized_use = 1 WHERE id = ?",
+                (completed_at, investigation_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE investigations SET completed_at = ? WHERE id = ?",
+                (completed_at, investigation_id),
+            )
+
+        conn.execute(
+            "DELETE FROM findings WHERE investigation_id = ? AND module_name = ?",
+            (investigation_id, "ingest"),
+        )
+        conn.execute(
+            "INSERT INTO findings (investigation_id, module_name, data) VALUES (?, ?, ?)",
+            (investigation_id, "ingest", json.dumps(ingest_findings, default=str)),
+        )
+
+        _delete_ingest_entities(conn, investigation_id)
+        target_row = conn.execute(
+            "SELECT id FROM entities WHERE investigation_id = ? AND entity_type = ? AND value = ?",
+            (investigation_id, "target", row["target"]),
+        ).fetchone()
+        if target_row is None:
+            target_eid = conn.execute(
+                "INSERT INTO entities (investigation_id, entity_type, value, platform, confidence, metadata) VALUES (?, ?, ?, ?, ?, ?)",
+                (investigation_id, "target", row["target"], "", 1.0, "{}"),
+            ).lastrowid
+        else:
+            target_eid = target_row["id"]
+        _insert_ingest_entities(conn, investigation_id, target_eid, ingest_findings)
+
+
+def get_investigation(investigation_id: str) -> dict | None:
+    """Retrieve a full investigation by ID."""
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM investigations WHERE id = ?", (investigation_id,)).fetchone()
+        if not row:
+            return None
+
+        inv = dict(row)
+        inv["authorized_use"] = bool(inv.get("authorized_use", 0))
+        inv["errors"] = json.loads(inv.get("errors", "[]"))
+
+        # Load findings
+        findings_rows = conn.execute(
+            "SELECT module_name, data FROM findings WHERE investigation_id = ?",
+            (investigation_id,),
+        ).fetchall()
+        inv["findings"] = {r["module_name"]: json.loads(r["data"]) for r in findings_rows}
+
+        # Load entities
+        entities = conn.execute(
+            "SELECT * FROM entities WHERE investigation_id = ?",
+            (investigation_id,),
+        ).fetchall()
+        inv["entities"] = [dict(e) for e in entities]
+        for e in inv["entities"]:
+            e["metadata"] = json.loads(e.get("metadata", "{}"))
+
+        # Load relationships
+        rels = conn.execute(
+            "SELECT * FROM relationships WHERE investigation_id = ?",
+            (investigation_id,),
+        ).fetchall()
+        inv["relationships"] = [dict(r) for r in rels]
+
+        return inv
+
+
+def list_investigations(limit: int = 50, offset: int = 0) -> list[dict]:
+    """List all investigations, newest first."""
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                target,
+                input_type,
+                scope,
+                authorized_use,
+                status,
+                started_at,
+                completed_at,
+                risk_score,
+                summary
+            FROM investigations
+            ORDER BY started_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        ).fetchall()
+        investigations = [dict(r) for r in rows]
+        for investigation in investigations:
+            investigation["authorized_use"] = bool(investigation.get("authorized_use", 0))
+        return investigations
+
+
+def get_graph_data(investigation_id: str) -> dict | None:
+    """Return D3.js-compatible force-directed graph data."""
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM investigations WHERE id = ?", (investigation_id,)).fetchone()
+        if not row:
+            return None
+
+        entities = conn.execute(
+            "SELECT id, entity_type, value, platform, confidence FROM entities WHERE investigation_id = ?",
+            (investigation_id,),
+        ).fetchall()
+
+        relationships = conn.execute(
+            "SELECT source_entity_id, target_entity_id, relationship_type, confidence FROM relationships WHERE investigation_id = ?",
+            (investigation_id,),
+        ).fetchall()
+
+        nodes = []
+        for e in entities:
+            nodes.append(
+                {
+                    "id": e["id"],
+                    "label": e["value"][:60],
+                    "type": e["entity_type"],
+                    "platform": e["platform"],
+                    "confidence": e["confidence"],
+                }
+            )
+
+        links = []
+        entity_ids = {e["id"] for e in entities}
+        for r in relationships:
+            if r["source_entity_id"] in entity_ids and r["target_entity_id"] in entity_ids:
+                links.append(
+                    {
+                        "source": r["source_entity_id"],
+                        "target": r["target_entity_id"],
+                        "type": r["relationship_type"],
+                        "confidence": r["confidence"],
+                    }
+                )
+
+        return {"nodes": nodes, "links": links}
+
+
+def delete_investigation(investigation_id: str) -> bool:
+    """Delete an investigation and all related data."""
+    with get_db() as conn:
+        cur = conn.execute("DELETE FROM investigations WHERE id = ?", (investigation_id,))
+        return cur.rowcount > 0

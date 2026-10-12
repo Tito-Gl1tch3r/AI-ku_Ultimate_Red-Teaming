@@ -1,0 +1,593 @@
+"""
+AutoPiff Semantic Rule Engine
+
+Evaluates YAML-defined semantic rules against function diffs.
+Produces high-precision, explainable delta detections.
+"""
+
+import re
+import yaml
+import logging
+from typing import Dict, List, Set, Optional, Tuple, Any
+from dataclasses import dataclass, field
+
+logger = logging.getLogger("autopiff.rule_engine")
+
+
+@dataclass
+class SinkMatch:
+    """A detected sink in the code."""
+    group: str
+    symbol: str
+    line_num: int
+    in_added: bool  # True if in added lines, False if context
+
+
+@dataclass
+class RuleHit:
+    """A semantic rule that matched."""
+    rule_id: str
+    category: str
+    confidence: float
+    sinks: List[str]
+    indicators: List[str]
+    why_matters: str
+    diff_snippet: str
+
+
+class SemanticRuleEngine:
+    """
+    Evaluates AutoPiff semantic rules against function diffs.
+
+    Design principles:
+    - Conservative: prefer precision over recall
+    - Explainable: every hit includes rationale
+    - Sink-aware: rules consider proximity to dangerous APIs
+    """
+
+    def __init__(self, rules_path: str, sinks_path: str):
+        with open(rules_path, 'r') as f:
+            self.rules_config = yaml.safe_load(f)
+        with open(sinks_path, 'r') as f:
+            self.sinks_config = yaml.safe_load(f)
+
+        self.rules = self.rules_config.get('rules', [])
+        self.categories = {c['id']: c for c in self.rules_config.get('categories', [])}
+        self.global_exclusions = self.rules_config.get('global_exclusions', [])
+
+        # Build sink lookup: symbol -> group
+        self.sink_lookup: Dict[str, str] = {}
+        for group, data in self.sinks_config.get('sinks', {}).items():
+            for sym in data.get('symbols', []):
+                self.sink_lookup[sym] = group
+
+        # Compile exclusion patterns
+        self.exclusion_patterns = self._compile_exclusions()
+
+        # Detection patterns for each guard/validation type
+        self.guard_patterns = self._compile_guard_patterns()
+
+    def _compile_exclusions(self) -> Dict[str, List[re.Pattern]]:
+        """Compile regex patterns for global exclusions."""
+        patterns = {}
+        for excl in self.global_exclusions:
+            pid = excl['pattern_id']
+            hints = excl.get('hints', [])
+            patterns[pid] = [re.compile(re.escape(h), re.IGNORECASE) for h in hints]
+        return patterns
+
+    def _compile_guard_patterns(self) -> Dict[str, List[re.Pattern]]:
+        """Compile patterns for detecting guards/validations."""
+        return {
+            # --- Original guard patterns (v1) ---
+            'length_check': [
+                re.compile(r'\b(InputBufferLength|OutputBufferLength|InformationBufferLength|BufferLength|Length)\s*(<|>|<=|>=|==|!=)', re.IGNORECASE),
+                re.compile(r'\bsizeof\s*\(.*\)\s*(<|>|<=|>=)', re.IGNORECASE),
+                re.compile(r'\bif\s*\(.*[Ll]en(gth)?\s*(<|>|<=|>=)', re.IGNORECASE),
+                # Size-based comparisons (e.g., DecompressedSize > 0x1000)
+                re.compile(r'\bif\s*\(.*\b\w*[Ss]ize\w*\s*(<|>|<=|>=)', re.IGNORECASE),
+                # Hex-constant size comparisons (e.g., 0x1000 < uVar3, also in compound conditions)
+                re.compile(r'\b0x[0-9a-fA-F]+\s*(<|>|<=|>=)\s*\w+'),
+                # Numeric-named variable comparisons common in decompilers
+                re.compile(r'\bif\s*\(.*\b\w*[Cc](ount|b|ch)\w*\s*(<|>|<=|>=)', re.IGNORECASE),
+            ],
+            'sizeof_check': [
+                re.compile(r'\bsizeof\s*\([^)]+\)', re.IGNORECASE),
+                re.compile(r'\bRtlSizeT', re.IGNORECASE),
+            ],
+            'index_bounds': [
+                re.compile(r'\bif\s*\([^)]*\b(index|idx|i|j)\s*(<|>|<=|>=)\s*\d+', re.IGNORECASE),
+                re.compile(r'\b(index|idx)\s*(<|>=)\s*\w+', re.IGNORECASE),
+            ],
+            'null_check': [
+                re.compile(r'\bif\s*\(\s*\w+\s*(!=|==)\s*NULL', re.IGNORECASE),
+                re.compile(r'\bif\s*\(\s*!\s*\w+\s*\)', re.IGNORECASE),
+                re.compile(r'\bif\s*\(\s*\w+\s*\)', re.IGNORECASE),  # if (ptr)
+            ],
+            'null_assignment': [
+                re.compile(r'\w+\s*=\s*NULL\s*;', re.IGNORECASE),
+                re.compile(r'\w+\s*=\s*0\s*;'),  # ptr = 0
+            ],
+            'probe': [
+                re.compile(r'\bProbeForRead\b', re.IGNORECASE),
+                re.compile(r'\bProbeForWrite\b', re.IGNORECASE),
+            ],
+            'previous_mode_gate': [
+                re.compile(r'\bExGetPreviousMode\b', re.IGNORECASE),
+                re.compile(r'\bPreviousMode\b', re.IGNORECASE),
+                re.compile(r'\bKernelMode\b.*\bUserMode\b', re.IGNORECASE),
+            ],
+            'seh_guard': [
+                re.compile(r'\b__try\b', re.IGNORECASE),
+                re.compile(r'\b__except\b', re.IGNORECASE),
+                re.compile(r'\bExRaiseAccessViolation\b', re.IGNORECASE),
+            ],
+            'safe_math_helper': [
+                re.compile(r'\bRtl(ULong|SizeT|UIntPtr)(Add|Sub|Mult)\b', re.IGNORECASE),
+                re.compile(r'\bNT_SUCCESS\s*\(\s*Rtl', re.IGNORECASE),
+            ],
+            'overflow_check': [
+                re.compile(r'\b(overflow|Overflow)\b', re.IGNORECASE),
+                re.compile(r'\bULONG_MAX\b', re.IGNORECASE),
+                re.compile(r'\bSIZE_T_MAX\b', re.IGNORECASE),
+                re.compile(r'\bRtl.*Mult\b', re.IGNORECASE),
+            ],
+            'refcount': [
+                re.compile(r'\bInterlocked(Increment|Decrement|Exchange|CompareExchange)\b', re.IGNORECASE),
+            ],
+
+            # --- New guard patterns (v2) ---
+
+            # Race condition guards
+            'spinlock': [
+                re.compile(r'\bKeAcquireSpinLock\b'),
+                re.compile(r'\bKeReleaseSpinLock\b'),
+                re.compile(r'\bKeAcquireInStackQueuedSpinLock\b'),
+            ],
+            'mutex_resource': [
+                re.compile(r'\bExAcquireFastMutex\b'),
+                re.compile(r'\bExAcquireResourceExclusiveLite\b'),
+                re.compile(r'\bExAcquireResourceSharedLite\b'),
+                re.compile(r'\bKeEnterCriticalRegion\b'),
+                re.compile(r'\bKeWaitForSingleObject\b'),
+            ],
+            'buffer_capture': [
+                re.compile(r'\b\w+\s*=\s*\w+->\w+\s*;.*//.*capture', re.IGNORECASE),
+                re.compile(r'\bCaptured\w+\s*=', re.IGNORECASE),
+                re.compile(r'\bLocal\w+\s*=\s*\w+->', re.IGNORECASE),
+            ],
+            'cancel_safe': [
+                re.compile(r'\bIoCsqInsertIrp\b'),
+                re.compile(r'\bIoCsqRemoveIrp\b'),
+            ],
+
+            # Type confusion guards
+            'object_type_check': [
+                re.compile(r'\b(ObjectType|TypeTag|Type|Signature)\s*(==|!=)\s*\w+'),
+                re.compile(r'\bif\s*\([^)]*\b(Type|ObjectType)\b'),
+            ],
+            'handle_type_validation': [
+                re.compile(r'\bObReferenceObjectByHandle\b[^;]*(Io|Ps|Ex|Ob)\w+Type'),
+                re.compile(r'\bOBJ_FORCE_ACCESS_CHECK\b'),
+            ],
+            'wow64_check': [
+                re.compile(r'\bIoIs32bitProcess\b'),
+                re.compile(r'\bPsGetProcessWow64Process\b'),
+            ],
+
+            # Authorization guards
+            'privilege_check': [
+                re.compile(r'\bSeSinglePrivilegeCheck\b'),
+                re.compile(r'\bSeAccessCheck\b'),
+                re.compile(r'\bSePrivilegeCheck\b'),
+            ],
+            'access_mode_fix': [
+                re.compile(r'\bIrp->RequestorMode\b'),
+                re.compile(r'\bOBJ_FORCE_ACCESS_CHECK\b'),
+                re.compile(r'\bUserMode\b'),
+            ],
+            'device_acl': [
+                re.compile(r'\bIoCreateDeviceSecure\b'),
+                re.compile(r'\bFILE_DEVICE_SECURE_OPEN\b'),
+                re.compile(r'\bSDDL_DEVOBJ\b'),
+            ],
+            'access_mask_reduction': [
+                re.compile(r'\bKEY_READ\b'),
+                re.compile(r'\bKEY_QUERY_VALUE\b'),
+                re.compile(r'\bGENERIC_READ\b'),
+            ],
+
+            # Information disclosure guards
+            'buffer_zeroing': [
+                re.compile(r'\bRtlZeroMemory\b'),
+                re.compile(r'\bRtlSecureZeroMemory\b'),
+                re.compile(r'\bmemset\s*\([^,]+,\s*0\s*,'),
+                re.compile(r'=\s*\{?\s*0\s*\}?\s*;'),
+            ],
+            'pointer_scrub': [
+                re.compile(r'\w+->?\w*(Pointer|Ptr|Address)\w*\s*=\s*(NULL|0|\(PVOID\)\s*0)\s*;', re.IGNORECASE),
+                re.compile(r'\bMmHighestUserAddress\b'),
+            ],
+
+            # IOCTL hardening guards
+            'default_case': [
+                re.compile(r'\bdefault\s*:'),
+                re.compile(r'\bSTATUS_INVALID_DEVICE_REQUEST\b'),
+            ],
+
+            # MDL handling guards
+            'mdl_safe': [
+                re.compile(r'\bMmGetSystemAddressForMdlSafe\b'),
+                re.compile(r'\bMmProbeAndLockPages\b[^;]*UserMode'),
+            ],
+
+            # Object management guards
+            'reference_balance': [
+                re.compile(r'\bObDereferenceObject\b'),
+                re.compile(r'\bObfDereferenceObject\b'),
+            ],
+            'force_access_check': [
+                re.compile(r'\bOBJ_FORCE_ACCESS_CHECK\b'),
+                re.compile(r'\bOBJ_KERNEL_HANDLE\b'),
+            ],
+
+            # String handling guards
+            'safe_string_replacement': [
+                re.compile(r'\bRtlStringCb(Copy|Cat|Printf)[AW]\b'),
+                re.compile(r'\bRtlStringCch(Copy|Cat|Printf)[AW]\b'),
+            ],
+
+            # Pool hardening guards
+            'pool_type_hardening': [
+                re.compile(r'\bNonPagedPoolNx\b'),
+                re.compile(r'\bExAllocatePool2\b'),
+                re.compile(r'\bPOOL_FLAG_NON_PAGED\b'),
+            ],
+
+            # Crypto hardening guards
+            'secure_zero': [
+                re.compile(r'\bRtlSecureZeroMemory\b'),
+                re.compile(r'\bSecureZeroMemory\b'),
+            ],
+            'constant_time_compare': [
+                re.compile(r'\|=\s*\w+\s*\^\s*\w+'),  # XOR-accumulate pattern
+                re.compile(r'\bRtlCompareMemory\b.*replaced', re.IGNORECASE),
+            ],
+
+            # Error path hardening guards
+            'error_cleanup': [
+                re.compile(r'\bif\s*\(\s*!NT_SUCCESS\b[^)]*\)\s*\{[^}]*(ExFreePool|ObDereferenceObject|IoFreeMdl|MmUnlockPages)', re.DOTALL),
+                re.compile(r'\bif\s*\(\s*!NT_SUCCESS\b'),
+            ],
+            'goto_cleanup': [
+                re.compile(r'\bgoto\s+(Cleanup|cleanup|Exit|exit|Done|done|Error|error)\b'),
+                re.compile(r'\b(Cleanup|Exit|Done|Error)\s*:\s*$'),
+            ],
+            'completion_status_fix': [
+                re.compile(r'\bIrp->IoStatus\.Status\s*=\s*Status\b'),
+                re.compile(r'\bIrp->IoStatus\.Status\s*=\s*\w+Status\b'),
+            ],
+
+            # DoS hardening guards
+            'depth_limit': [
+                re.compile(r'\bIoGetRemainingStackSize\b'),
+                re.compile(r'\bMAX_RECURSION\b', re.IGNORECASE),
+                re.compile(r'\b(depth|Depth)\s*(<|>|<=|>=)\s*\w+'),
+            ],
+
+            # NDIS guards
+            'oid_validation': [
+                re.compile(r'\bInformationBufferLength\b\s*(<|>|<=|>=)'),
+                re.compile(r'\bNDIS_STATUS_INVALID_LENGTH\b'),
+            ],
+
+            # PnP/Power guards
+            'removal_check': [
+                re.compile(r'\b(DeviceRemoved|Removed|SurpriseRemoval)\b'),
+                re.compile(r'\bSTATUS_DELETE_PENDING\b'),
+            ],
+            'power_state_check': [
+                re.compile(r'\bPowerDeviceD0\b'),
+                re.compile(r'\bDevicePowerState\b'),
+            ],
+            'remove_lock': [
+                re.compile(r'\bIoAcquireRemoveLock\b'),
+                re.compile(r'\bIoReleaseRemoveLock\b'),
+            ],
+
+            # Filesystem filter guards
+            'flt_context_release': [
+                re.compile(r'\bFltReleaseContext\b'),
+            ],
+        }
+
+    def _is_excluded(self, diff_lines: List[str]) -> Tuple[bool, Optional[str]]:
+        """Check if diff matches global exclusion patterns (logging-only, etc.)."""
+        added_lines = [l[1:] for l in diff_lines if l.startswith('+') and not l.startswith('+++')]
+        added_text = '\n'.join(added_lines)
+
+        for pattern_id, regexes in self.exclusion_patterns.items():
+            matches = sum(1 for r in regexes if r.search(added_text))
+            # If most added content is exclusion patterns, skip
+            if matches > 0 and len(added_lines) < 5:
+                # Check if there's substantial non-exclusion content
+                non_match_lines = 0
+                for line in added_lines:
+                    if not any(r.search(line) for r in regexes):
+                        non_match_lines += 1
+                if non_match_lines == 0:
+                    return True, pattern_id
+
+        return False, None
+
+    def _find_sinks(self, diff_lines: List[str]) -> List[SinkMatch]:
+        """Find all sink symbols in the diff."""
+        sinks = []
+        for i, line in enumerate(diff_lines):
+            is_added = line.startswith('+') and not line.startswith('+++')
+            for symbol, group in self.sink_lookup.items():
+                if symbol in line:
+                    sinks.append(SinkMatch(
+                        group=group,
+                        symbol=symbol,
+                        line_num=i,
+                        in_added=is_added
+                    ))
+        return sinks
+
+    def _detect_guard_type(self, added_lines: List[str]) -> Dict[str, List[str]]:
+        """Detect which guard types are present in added lines."""
+        detected = {}
+        text = '\n'.join(added_lines)
+
+        for guard_type, patterns in self.guard_patterns.items():
+            matches = []
+            for p in patterns:
+                for m in p.finditer(text):
+                    matches.append(m.group())
+            if matches:
+                detected[guard_type] = list(set(matches))
+
+        return detected
+
+    def _find_guard_lines(self, diff_lines: List[str], guard_type: str) -> List[int]:
+        """Find line numbers where a specific guard type appears in added lines."""
+        guard_lines = []
+        patterns = self.guard_patterns.get(guard_type, [])
+        for i, line in enumerate(diff_lines):
+            if line.startswith('+') and not line.startswith('+++'):
+                for p in patterns:
+                    if p.search(line):
+                        guard_lines.append(i)
+                        break
+        return guard_lines
+
+    def _check_proximity(self, guard_line: int, sink_line: int, proximity: str) -> bool:
+        """Check if guard is in required proximity to sink."""
+        distance = abs(guard_line - sink_line)
+        if proximity == 'near_sink':
+            return distance <= 10
+        elif proximity == 'immediately_after_sink':
+            return 0 <= (guard_line - sink_line) <= 3
+        elif proximity == 'before_sink':
+            return -10 <= (guard_line - sink_line) < 0
+        return True
+
+    def classify_surface_area(self, code: str) -> List[str]:
+        """Classify the attack surface area of the code."""
+        surfaces = []
+        code_lower = code.lower()
+
+        if any(s in code_lower for s in ['irp_mj_device_control', 'iocontrolcode', 'systembuffer', 'type3inputbuffer']):
+            surfaces.append('ioctl')
+        if any(s in code_lower for s in ['ndis', 'miniportoidrequest', 'filteroidrequest']):
+            surfaces.append('ndis')
+        if any(s in code_lower for s in ['storport', 'scsi', 'srb']):
+            surfaces.append('storage')
+        if any(s in code_lower for s in ['flt', 'fsctl', 'irp_mj_create', 'irp_mj_read', 'irp_mj_write']):
+            surfaces.append('filesystem')
+
+        return surfaces if surfaces else ['unknown']
+
+    def evaluate(self, func_name: str, old_code: str, new_code: str,
+                 diff_lines: List[str]) -> List[RuleHit]:
+        """
+        Evaluate all semantic rules against a function diff.
+
+        Returns list of RuleHit for each matching rule.
+        """
+        hits = []
+
+        # Check global exclusions first
+        is_excluded, excl_reason = self._is_excluded(diff_lines)
+        if is_excluded:
+            logger.debug(f"Function {func_name} excluded: {excl_reason}")
+            return []
+
+        # Parse added lines
+        added_lines = [l[1:] for l in diff_lines if l.startswith('+') and not l.startswith('+++')]
+        if not added_lines:
+            return []
+
+        # Find sinks and guards
+        sinks = self._find_sinks(diff_lines)
+        guards = self._detect_guard_type(added_lines)
+
+        # Evaluate each rule
+        for rule in self.rules:
+            hit = self._evaluate_rule(rule, func_name, diff_lines, added_lines,
+                                       new_code, sinks, guards)
+            if hit:
+                hits.append(hit)
+
+        return hits
+
+    def _evaluate_rule(self, rule: Dict, func_name: str, diff_lines: List[str],
+                       added_lines: List[str], new_code: str,
+                       sinks: List[SinkMatch], guards: Dict[str, List[str]]) -> Optional[RuleHit]:
+        """Evaluate a single rule against the diff."""
+        rule_id = rule['rule_id']
+        required = rule.get('required_signals', [])
+
+        matched_sinks = set()
+        matched_indicators = []
+
+        for signal in required:
+            if isinstance(signal, dict):
+                key = list(signal.keys())[0]
+                value = signal[key]
+            else:
+                # String signal format: "key: value"
+                if ':' in str(signal):
+                    key, value = str(signal).split(':', 1)
+                    key = key.strip()
+                    value = value.strip()
+                else:
+                    continue
+
+            if key == 'sink_group':
+                # Check if any sink matches
+                matching = [s for s in sinks if s.group == value]
+                if not matching:
+                    return None
+                matched_sinks.update(s.group for s in matching)
+                matched_indicators.extend(s.symbol for s in matching)
+
+            elif key == 'change_type':
+                # Check for guard_added, validation_added, etc.
+                if value in ['guard_added', 'validation_added', 'hardening_added', 'post_free_hardening']:
+                    if not guards:
+                        return None
+
+            elif key == 'guard_kind' or key == 'validation_kind' or key == 'hardening_kind':
+                # Check specific guard type
+                if value not in guards:
+                    return None
+                matched_indicators.extend(guards[value])
+
+            elif key == 'proximity':
+                # Check that at least one guard is near at least one sink
+                if not sinks or not guards:
+                    return None
+                # Find line numbers for detected guard types
+                all_guard_lines = []
+                for gtype in guards:
+                    all_guard_lines.extend(self._find_guard_lines(diff_lines, gtype))
+                if not all_guard_lines:
+                    return None
+                # Check if any guard-sink pair satisfies the proximity constraint
+                proximity_met = False
+                for guard_line in all_guard_lines:
+                    for sink in sinks:
+                        if self._check_proximity(guard_line, sink.line_num, value):
+                            proximity_met = True
+                            break
+                    if proximity_met:
+                        break
+                if not proximity_met:
+                    return None
+
+        # If we get here, rule matched
+        diff_snippet = '\n'.join(diff_lines[:30])  # First 30 lines
+        if len(diff_lines) > 30:
+            diff_snippet += '\n... (truncated)'
+
+        return RuleHit(
+            rule_id=rule_id,
+            category=rule['category'],
+            confidence=rule.get('confidence', 0.8),
+            sinks=list(matched_sinks),
+            indicators=list(set(matched_indicators))[:10],
+            why_matters=rule.get('plain_english_summary', ''),
+            diff_snippet=diff_snippet
+        )
+
+    def evaluate_new_function(self, func_name: str, new_code: str) -> List[RuleHit]:
+        """
+        Evaluate attack surface rules against a newly added function.
+
+        Unlike evaluate(), there is no old code or diff — the entire function
+        is new.  We synthesize diff_lines by prefixing every line with '+',
+        then check for sinks WITHOUT adequate mitigating guards.
+
+        Returns list of RuleHit for each matching attack_surface rule.
+        """
+        if not new_code or not new_code.strip():
+            return []
+
+        # Synthesize diff lines: entire function is "added"
+        code_lines = new_code.splitlines()
+        diff_lines = [f"+{line}" for line in code_lines]
+
+        # Reuse existing helpers
+        sinks = self._find_sinks(diff_lines)
+        if not sinks:
+            return []
+
+        added_lines = code_lines  # all lines are "added"
+        guards = self._detect_guard_type(added_lines)
+
+        # Build set of sink groups present
+        sink_groups_present: Set[str] = {s.group for s in sinks}
+
+        hits = []
+        for rule in self.rules:
+            if rule.get('rule_type') != 'attack_surface':
+                continue
+
+            required_sink_groups = rule.get('sink_groups', [])
+            mitigating_guards = rule.get('mitigating_guards', [])
+
+            # Check if at least one required sink group is present
+            matched_groups = [g for g in required_sink_groups if g in sink_groups_present]
+            if not matched_groups:
+                continue
+
+            # Count how many mitigating guards are present
+            guards_present = [g for g in mitigating_guards if g in guards]
+
+            # If two or more mitigating guards are present, the code is
+            # adequately protected — don't flag it
+            if len(guards_present) >= 2:
+                continue
+
+            # Fewer guards → higher confidence (base confidence adjusted)
+            base_conf = rule.get('confidence', 0.70)
+            if len(guards_present) == 1:
+                # One guard present — reduce confidence
+                confidence = max(0.45, base_conf - 0.10)
+            else:
+                # No guards at all — full confidence
+                confidence = base_conf
+
+            # Collect matched sink symbols for indicators
+            matched_sinks = [s for s in sinks if s.group in matched_groups]
+            indicators = list(set(s.symbol for s in matched_sinks))[:10]
+
+            diff_snippet = '\n'.join(diff_lines[:30])
+            if len(diff_lines) > 30:
+                diff_snippet += '\n... (truncated)'
+
+            hits.append(RuleHit(
+                rule_id=rule['rule_id'],
+                category=rule['category'],
+                confidence=confidence,
+                sinks=matched_groups,
+                indicators=indicators,
+                why_matters=rule.get('plain_english_summary', ''),
+                diff_snippet=diff_snippet,
+            ))
+
+        return hits
+
+    def get_rule_by_id(self, rule_id: str) -> Optional[Dict]:
+        """Get rule definition by ID."""
+        for rule in self.rules:
+            if rule['rule_id'] == rule_id:
+                return rule
+        return None
+
+    def get_category_description(self, category_id: str) -> str:
+        """Get category description."""
+        cat = self.categories.get(category_id, {})
+        return cat.get('description', category_id)

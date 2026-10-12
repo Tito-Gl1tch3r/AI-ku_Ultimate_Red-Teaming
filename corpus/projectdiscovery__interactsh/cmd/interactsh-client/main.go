@@ -1,0 +1,476 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	asnmap "github.com/projectdiscovery/asnmap/libs"
+	"github.com/projectdiscovery/goflags"
+	"github.com/projectdiscovery/gologger"
+	"github.com/projectdiscovery/gologger/levels"
+	"github.com/projectdiscovery/interactsh/internal/runner"
+	"github.com/projectdiscovery/interactsh/pkg/client"
+	"github.com/projectdiscovery/interactsh/pkg/options"
+	"github.com/projectdiscovery/interactsh/pkg/server"
+	"github.com/projectdiscovery/interactsh/pkg/settings"
+	"github.com/projectdiscovery/utils/auth/pdcp"
+	"github.com/projectdiscovery/utils/env"
+	fileutil "github.com/projectdiscovery/utils/file"
+	folderutil "github.com/projectdiscovery/utils/folder"
+	updateutils "github.com/projectdiscovery/utils/update"
+)
+
+var (
+	healthcheck           bool
+	defaultConfigLocation = filepath.Join(folderutil.HomeDirOrDefault("."), ".config/interactsh-client/config.yaml")
+)
+
+func main() {
+	gologger.DefaultLogger.SetMaxLevel(levels.LevelVerbose)
+
+	defaultOpts := client.DefaultOptions
+	cliOptions := &options.CLIClientOptions{}
+
+	flagSet := goflags.NewFlagSet()
+	flagSet.SetDescription(`Interactsh client - Go client to generate interactsh payloads and display interaction data.`)
+
+	flagSet.CreateGroup("input", "Input",
+		flagSet.StringVarP(&cliOptions.ServerURL, "server", "s", defaultOpts.ServerURL, "interactsh server(s) to use"),
+		// StringSliceOptions, not the FileCommaSeparated variant used by
+		// -match/-filter: that one reads the file and splits its contents,
+		// which for -file would turn a DTD into a list of names.
+		flagSet.StringSliceVarP(&cliOptions.Files, "file", "fl", nil,
+			"local file(s) to upload and host on the interactsh server", goflags.StringSliceOptions),
+	)
+
+	flagSet.CreateGroup("config", "config",
+		flagSet.StringVar(&cliOptions.Config, "config", defaultConfigLocation, "flag configuration file"),
+		flagSet.DynamicVar(&cliOptions.PdcpAuth, "auth", "true", "configure projectdiscovery cloud (pdcp) api key"),
+		flagSet.IntVarP(&cliOptions.NumberOfPayloads, "number", "n", 1, "number of interactsh payload to generate"),
+		flagSet.StringVarP(&cliOptions.Token, "token", "t", "", "authentication token to connect protected interactsh server"),
+		flagSet.IntVarP(&cliOptions.PollInterval, "poll-interval", "pi", 5, "poll interval in seconds to pull interaction data"),
+		flagSet.BoolVarP(&cliOptions.DisableHTTPFallback, "no-http-fallback", "nf", false, "disable http fallback registration"),
+		flagSet.IntVarP(&cliOptions.CorrelationIdLength, "correlation-id-length", "cidl", settings.CorrelationIdLengthDefault, fmt.Sprintf("length of the correlation id preamble (min %d, default %d)", settings.CorrelationIdLengthMinimum, settings.CorrelationIdLengthDefault)),
+		flagSet.IntVarP(&cliOptions.CorrelationIdNonceLength, "correlation-id-nonce-length", "cidn", settings.CorrelationIdNonceLengthDefault, fmt.Sprintf("length of the correlation id nonce (min %d, default %d)", settings.CorrelationIdNonceLengthMinimum, settings.CorrelationIdNonceLengthDefault)),
+		flagSet.StringVarP(&cliOptions.SessionFile, "session-file", "sf", "", "store/read from session file"),
+		flagSet.DurationVarP(&cliOptions.KeepAliveInterval, "keep-alive-interval", "kai", time.Minute, "keep alive interval"),
+	)
+
+	flagSet.CreateGroup("filter", "Filter",
+		flagSet.StringSliceVarP(&cliOptions.Match, "match", "m", nil, "match interaction based on the specified pattern", goflags.FileCommaSeparatedStringSliceOptions),
+		flagSet.StringSliceVarP(&cliOptions.Filter, "filter", "f", nil, "filter interaction based on the specified pattern", goflags.FileCommaSeparatedStringSliceOptions),
+		flagSet.BoolVar(&cliOptions.DNSOnly, "dns-only", false, "display only dns interaction in CLI output"),
+		flagSet.BoolVar(&cliOptions.HTTPOnly, "http-only", false, "display only http interaction in CLI output"),
+		flagSet.BoolVar(&cliOptions.SmtpOnly, "smtp-only", false, "display only smtp interactions in CLI output"),
+		flagSet.BoolVar(&cliOptions.Asn, "asn", false, " include asn information of remote ip in json output"),
+	)
+
+	flagSet.CreateGroup("update", "Update",
+		flagSet.CallbackVarP(options.GetUpdateCallback("interactsh-client"), "update", "up", "update interactsh-client to latest version"),
+		flagSet.BoolVarP(&cliOptions.DisableUpdateCheck, "disable-update-check", "duc", false, "disable automatic interactsh-client update check"),
+	)
+
+	flagSet.CreateGroup("output", "Output",
+		flagSet.StringVar(&cliOptions.Output, "o", "", "output file to write interaction data"),
+		flagSet.BoolVar(&cliOptions.JSON, "json", false, "write output in JSON Lines format"),
+		flagSet.BoolVarP(&cliOptions.StorePayload, "payload-store", "ps", false, "write generated interactsh payload to file"),
+		flagSet.StringVarP(&cliOptions.StorePayloadFile, "payload-store-file", "psf", settings.StorePayloadFileDefault, "store generated interactsh payloads to given file"),
+		flagSet.StringVarP(&cliOptions.FileStoreFile, "file-store-file", "fsf", "", "store hosted file URLs to given file (requires -file)"),
+
+		flagSet.BoolVar(&cliOptions.Verbose, "v", false, "display verbose interaction"),
+	)
+
+	flagSet.CreateGroup("debug", "Debug",
+		flagSet.BoolVar(&cliOptions.Version, "version", false, "show version of the project"),
+		flagSet.BoolVarP(&healthcheck, "hc", "health-check", false, "run diagnostic check up"),
+	)
+
+	if err := flagSet.Parse(); err != nil {
+		gologger.Fatal().Msgf("Could not parse options: %s\n", err)
+	}
+
+	// If user have passed auth flag without key (ex: interactsh-client -auth)
+	// then we will prompt user to enter the api key, if already set shows user identity and exit
+	// If user have passed auth flag with key (ex: interactsh-client -auth=<api-key>)
+	// then we will validate the key and save it to file
+	if cliOptions.PdcpAuth == "true" {
+		options.AuthWithPDCP()
+	} else if len(cliOptions.PdcpAuth) == 36 {
+		ph := pdcp.PDCPCredHandler{}
+		if _, err := ph.GetCreds(); err == pdcp.ErrNoCreds {
+			apiServer := env.GetEnvOrDefault("PDCP_API_SERVER", pdcp.DefaultApiServer)
+			if validatedCreds, err := ph.ValidateAPIKey(cliOptions.PdcpAuth, apiServer, "interactsh"); err == nil {
+				options.ShowBanner()
+				asnmap.PDCPApiKey = validatedCreds.APIKey
+				if err = ph.SaveCreds(validatedCreds); err != nil {
+					gologger.Warning().Msgf("Could not save credentials to file: %s\n", err)
+				}
+			}
+		}
+	} else {
+		options.ShowBanner()
+	}
+
+	if healthcheck {
+		cfgFilePath, _ := flagSet.GetConfigFilePath()
+		gologger.Print().Msgf("%s\n", runner.DoHealthCheck(cfgFilePath))
+		os.Exit(0)
+	}
+	if cliOptions.Version {
+		gologger.Info().Msgf("Current Version: %s\n", options.Version)
+		os.Exit(0)
+	}
+
+	if !cliOptions.DisableUpdateCheck {
+		latestVersion, err := updateutils.GetToolVersionCallback("interactsh-client", options.Version)()
+		if err != nil {
+			if cliOptions.Verbose {
+				gologger.Error().Msgf("interactsh version check failed: %v", err.Error())
+			}
+		} else {
+			gologger.Info().Msgf("Current interactsh version %v %v", options.Version, updateutils.GetVersionDescription(options.Version, latestVersion))
+		}
+	}
+
+	if fileutil.FileExists(cliOptions.Config) {
+		if err := flagSet.MergeConfigFile(cliOptions.Config); err != nil {
+			gologger.Fatal().Msgf("Could not read config: %s\n", err)
+		}
+	}
+
+	var outputFile *os.File
+	var err error
+	if cliOptions.Output != "" {
+		if outputFile, err = os.Create(cliOptions.Output); err != nil {
+			gologger.Fatal().Msgf("Could not create output file: %s\n", err)
+		}
+		defer func() {
+			if err := outputFile.Close(); err != nil {
+				gologger.Error().Msgf("Error closing output file: %v\n", err)
+			}
+		}()
+	}
+
+	var sessionInfo *options.SessionInfo
+	if fileutil.FileExists(cliOptions.SessionFile) {
+		// attempt to load session info - silently ignore on failure
+		_ = fileutil.Unmarshal(fileutil.YAML, []byte(cliOptions.SessionFile), &sessionInfo)
+	}
+
+	client, err := client.New(&client.Options{
+		ServerURL:                cliOptions.ServerURL,
+		Token:                    cliOptions.Token,
+		DisableHTTPFallback:      cliOptions.DisableHTTPFallback,
+		CorrelationIdLength:      cliOptions.CorrelationIdLength,
+		CorrelationIdNonceLength: cliOptions.CorrelationIdNonceLength,
+		SessionInfo:              sessionInfo,
+	})
+	if err != nil {
+		gologger.Fatal().Msgf("Could not create client: %s\n", err)
+	}
+
+	// Uploads must follow registration, since the server verifies the session,
+	// and precede the payload listing so every URL is shown together.
+	fileURLs := uploadFiles(client, cliOptions)
+
+	interactshURLs := generatePayloadURL(cliOptions.NumberOfPayloads, client)
+
+	gologger.Info().Msgf("Listing %d payload for OOB Testing\n", cliOptions.NumberOfPayloads)
+	for _, interactshURL := range interactshURLs {
+		gologger.Info().Msgf("%s\n", interactshURL)
+	}
+
+	warnIfServerLacksIPv6(client)
+
+	if len(fileURLs) > 0 {
+		gologger.Info().Msgf("Hosting %d file(s) for OOB Testing\n", len(cliOptions.Files))
+		for _, fileURL := range fileURLs {
+			gologger.Info().Msgf("%s\n", fileURL)
+		}
+	}
+
+	// One record type per file. -psf is a machine-readable list of payload
+	// hostnames, one per line and exactly -n of them, which is what a wrapper
+	// script substituting into a payload template relies on; mixing hosted-file
+	// URLs into it turns "$line" into "https://host/f/x" and silently produces
+	// nonsense like http://https://host/f/x/. Hosted-file URLs get their own file.
+	if cliOptions.StorePayload && cliOptions.StorePayloadFile != "" {
+		if err := writeLines(cliOptions.StorePayloadFile, interactshURLs); err != nil {
+			gologger.Fatal().Msgf("Could not write to payload output file: %s\n", err)
+		}
+	}
+	if cliOptions.FileStoreFile != "" {
+		if len(fileURLs) == 0 {
+			gologger.Warning().Msgf("-file-store-file was given without -file, so no hosted file URLs were written\n")
+		}
+		if err := writeLines(cliOptions.FileStoreFile, fileURLs); err != nil {
+			gologger.Fatal().Msgf("Could not write to file URL output file: %s\n", err)
+		}
+	}
+
+	// show all interactions
+	noFilter := !cliOptions.DNSOnly && !cliOptions.HTTPOnly && !cliOptions.SmtpOnly
+
+	var matcher *regexMatcher
+	var filter *regexMatcher
+	if len(cliOptions.Match) > 0 {
+		if matcher, err = newRegexMatcher(cliOptions.Match); err != nil {
+			gologger.Fatal().Msgf("Could not compile matchers: %s\n", err)
+		}
+	}
+	if len(cliOptions.Filter) > 0 {
+		if filter, err = newRegexMatcher(cliOptions.Filter); err != nil {
+			gologger.Fatal().Msgf("Could not compile filter: %s\n", err)
+		}
+	}
+
+	err = client.StartPolling(time.Duration(cliOptions.PollInterval)*time.Second, func(interaction *server.Interaction) {
+		if matcher != nil && !matcher.match(interaction.FullId) {
+			return
+		}
+		if filter != nil && filter.match(interaction.FullId) {
+			return
+		}
+
+		if cliOptions.Asn {
+			_ = client.TryGetAsnInfo(interaction)
+		}
+
+		if !cliOptions.JSON {
+			builder := &bytes.Buffer{}
+
+			switch interaction.Protocol {
+			case "dns":
+				if noFilter || cliOptions.DNSOnly {
+					fmt.Fprintf(builder, "[%s] Received DNS interaction (%s) from %s at %s", interaction.FullId, interaction.QType, interaction.RemoteAddress, interaction.Timestamp.Format("2006-01-02 15:04:05"))
+					if cliOptions.Verbose {
+						fmt.Fprintf(builder, "\n-----------\nDNS Request\n-----------\n\n%s\n\n------------\nDNS Response\n------------\n\n%s\n\n", interaction.RawRequest, interaction.RawResponse)
+					}
+					writeOutput(outputFile, builder)
+				}
+			case "http", "https":
+				if noFilter || cliOptions.HTTPOnly {
+					proto := strings.ToUpper(interaction.Protocol)
+					fmt.Fprintf(builder, "[%s] Received %s interaction from %s at %s", interaction.FullId, proto, interaction.RemoteAddress, interaction.Timestamp.Format("2006-01-02 15:04:05"))
+					if cliOptions.Verbose {
+						fmt.Fprintf(builder, "\n------------\n%s Request\n------------\n\n%s\n\n-------------\n%s Response\n-------------\n\n%s\n\n", proto, interaction.RawRequest, proto, interaction.RawResponse)
+					}
+					writeOutput(outputFile, builder)
+				}
+			case "smtp":
+				if noFilter || cliOptions.SmtpOnly {
+					fmt.Fprintf(builder, "[%s] Received SMTP interaction from %s at %s", interaction.FullId, interaction.RemoteAddress, interaction.Timestamp.Format("2006-01-02 15:04:05"))
+					if cliOptions.Verbose {
+						fmt.Fprintf(builder, "\n------------\nSMTP Interaction\n------------\n\n%s\n\n", interaction.RawRequest)
+					}
+					writeOutput(outputFile, builder)
+				}
+			case "ftp":
+				if noFilter {
+					fmt.Fprintf(builder, "Received FTP interaction from %s at %s", interaction.RemoteAddress, interaction.Timestamp.Format("2006-01-02 15:04:05"))
+					if cliOptions.Verbose {
+						fmt.Fprintf(builder, "\n------------\nFTP Interaction\n------------\n\n%s\n\n", interaction.RawRequest)
+					}
+					writeOutput(outputFile, builder)
+				}
+			case "responder", "smb":
+				if noFilter {
+					fmt.Fprintf(builder, "Received Responder/Smb interaction at %s", interaction.Timestamp.Format("2006-01-02 15:04:05"))
+					if cliOptions.Verbose {
+						fmt.Fprintf(builder, "\n------------\nResponder/SMB Interaction\n------------\n\n%s\n\n", interaction.RawRequest)
+					}
+					writeOutput(outputFile, builder)
+				}
+			case "ldap":
+				if noFilter {
+					fmt.Fprintf(builder, "[%s] Received LDAP interaction from %s at %s", interaction.FullId, interaction.RemoteAddress, interaction.Timestamp.Format("2006-01-02 15:04:05"))
+					if cliOptions.Verbose {
+						fmt.Fprintf(builder, "\n------------\nLDAP Interaction\n------------\n\n%s\n\n", interaction.RawRequest)
+					}
+					writeOutput(outputFile, builder)
+				}
+			}
+		} else {
+			b, err := json.Marshal(interaction)
+			if err != nil {
+				gologger.Error().Msgf("Could not marshal json output: %s\n", err)
+			} else {
+				_, _ = os.Stdout.Write(b)
+				_, _ = os.Stdout.Write([]byte("\n"))
+			}
+			if outputFile != nil {
+				_, _ = outputFile.Write(b)
+				_, _ = outputFile.Write([]byte("\n"))
+			}
+		}
+	})
+	if err != nil {
+		gologger.Error().Msg(err.Error())
+	}
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	for range c {
+		if cliOptions.SessionFile != "" {
+			_ = client.SaveSessionTo(cliOptions.SessionFile)
+		}
+		_ = client.StopPolling()
+		// whether the session is saved/loaded it shouldn't be destroyed {
+		if cliOptions.SessionFile == "" {
+			_ = client.Close()
+		}
+		os.Exit(1)
+	}
+}
+
+// warnIfServerLacksIPv6 alerts the user when the chosen server publishes no
+// AAAA records, since interactions reaching the target over IPv6 would
+// otherwise be dropped silently and read as "no interaction" (issue #1391).
+func warnIfServerLacksIPv6(c *client.Client) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if ok, err := c.ServerSupportsIPv6(ctx); err == nil && !ok {
+		gologger.Warning().Msgf("Server %s publishes no IPv6 (AAAA) records; interactions from IPv6-only sources will be missed\n", c.ServerURL())
+	}
+}
+
+func generatePayloadURL(numberOfPayloads int, client *client.Client) []string {
+	interactshURLs := make([]string, numberOfPayloads)
+	for i := 0; i < numberOfPayloads; i++ {
+		interactshURLs[i] = client.URL()
+	}
+	return interactshURLs
+}
+
+// electionHint explains which server the complaint is about when -s named more
+// than one. The client registers with a single server chosen at random, and
+// upload support cannot influence that choice because it is only advertised in
+// the registration response. Without this, a mixed list reads as "none of my
+// servers support uploads" on the runs that happen to elect one that does not.
+func electionHint(serverList string) string {
+	var listed int
+	for _, s := range strings.Split(serverList, ",") {
+		if strings.TrimSpace(s) != "" {
+			listed++
+		}
+	}
+	if listed < 2 {
+		return ""
+	}
+	return fmt.Sprintf(" (chosen at random from the %d servers in -s, so this may differ between runs;"+
+		" pass a single server with -file)", listed)
+}
+
+// uploadFiles hosts local files on the interactsh server and returns the URLs a
+// target should fetch. It returns nil when no files were requested.
+func uploadFiles(c *client.Client, cliOptions *options.CLIClientOptions) []string {
+	if len(cliOptions.Files) == 0 {
+		return nil
+	}
+
+	uploaded, err := c.UploadFiles(cliOptions.Files)
+	if err != nil {
+		// Registration already happened -- it has to, since upload support is
+		// only advertised in the register response -- so a session exists on the
+		// server. Wind it down the same way the signal handler does, rather than
+		// leaving it to sit until the eviction TTL: persist it if the user asked
+		// for a resumable session, otherwise deregister it. Doing neither would
+		// overstate the server's live session count for every client that trips
+		// this path, and would strand a session the user cannot resume.
+		if cliOptions.SessionFile != "" {
+			_ = c.SaveSessionTo(cliOptions.SessionFile)
+		} else {
+			_ = c.Close()
+		}
+		// Name the server in both failures. The client registers with one server
+		// out of -s, so without it the reader cannot tell which of their servers
+		// the complaint is about.
+		if errors.Is(err, client.ErrUploadNotAdvertised) {
+			gologger.Fatal().Msgf("Server %s did not advertise file hosting, so it predates -file; upgrade the server%s\n",
+				c.ServerURL(), electionHint(cliOptions.ServerURL))
+		}
+		if errors.Is(err, client.ErrUploadUnsupported) {
+			gologger.Fatal().Msgf("Server %s does not accept file uploads; it must be started with -upload%s\n",
+				c.ServerURL(), electionHint(cliOptions.ServerURL))
+		}
+		// Fatal rather than a warning: the user asked to host a payload, and
+		// carrying on without it produces a confusing "no interaction" result.
+		gologger.Fatal().Msgf("Could not upload files to %s: %s\n", c.ServerURL(), err)
+	}
+
+	// One payload host for every file, so the target performs a single DNS
+	// lookup and the output is consistent. Any nonce works, since the server
+	// only reads the correlation id prefix.
+	host := c.URL()
+	withFTP := false
+	if caps := c.Capabilities(); caps != nil {
+		withFTP = caps.FTP
+	}
+
+	var urls []string
+	for _, file := range uploaded {
+		urls = append(urls, c.FileURL(host, file))
+		// Only when the server actually runs an FTP listener, otherwise the
+		// URL would never connect.
+		if withFTP {
+			urls = append(urls, c.FTPFileURL(host, file))
+		}
+	}
+	return urls
+}
+
+func writeOutput(outputFile *os.File, builder *bytes.Buffer) {
+	if outputFile != nil {
+		_, _ = outputFile.Write(builder.Bytes())
+		_, _ = outputFile.Write([]byte("\n"))
+	}
+	gologger.Silent().Msgf("%s", builder.String())
+}
+
+type regexMatcher struct {
+	items []*regexp.Regexp
+}
+
+func newRegexMatcher(items []string) (*regexMatcher, error) {
+	matcher := &regexMatcher{}
+	for _, item := range items {
+		if compiled, err := regexp.Compile(item); err != nil {
+			return nil, err
+		} else {
+			matcher.items = append(matcher.items, compiled)
+		}
+	}
+	return matcher, nil
+}
+
+func (m *regexMatcher) match(item string) bool {
+	for _, regex := range m.items {
+		if regex.MatchString(item) {
+			return true
+		}
+	}
+	return false
+}
+
+// writeLines writes one record per line, newline-terminated.
+//
+// The terminator matters: without it the last record has no newline, so a plain
+// "while read line" loop -- the most likely consumer of these files -- drops it,
+// and wc -l reports one fewer record than the file holds.
+func writeLines(path string, lines []string) error {
+	var b strings.Builder
+	for _, line := range lines {
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return os.WriteFile(path, []byte(b.String()), 0644)
+}

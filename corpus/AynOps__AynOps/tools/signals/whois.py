@@ -1,0 +1,28 @@
+from datetime import UTC, datetime
+
+from utils import safe_parse_datetime
+
+
+def whois_extractor(result, signals):
+    if result.get("success"):
+        expiry = result.get("expiration_date")
+        exp_dt = safe_parse_datetime(expiry)
+        if exp_dt:
+            if exp_dt.tzinfo is None:
+                exp_dt = exp_dt.replace(tzinfo=UTC)
+            days = (exp_dt - datetime.now(UTC)).days
+            signals["domain_expiry_days"] = days
+            if days < 0:
+                signals["auto_warnings"].append(
+                    f"Domain EXPIRED {abs(days)} days ago — domain may be hijackable"
+                )
+            elif days < 14:
+                signals["auto_warnings"].append(
+                    f"Domain expires in {days} days — CRITICAL renewal required"
+                )
+            elif days < 30:
+                signals["auto_warnings"].append(
+                    f"Domain expires in {days} days — HIGH priority renewal"
+                )
+    else:
+        return

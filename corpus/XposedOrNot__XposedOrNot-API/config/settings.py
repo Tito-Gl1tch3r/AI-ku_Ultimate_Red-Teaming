@@ -1,0 +1,110 @@
+"""Configuration settings for the application."""
+
+import os
+from typing import Optional
+
+# Environment Variables
+ENVIRONMENT: str = os.environ.get("ENVIRONMENT", "production")
+AUTH_EMAIL: str = os.environ["AUTH_EMAIL"]
+DEBUG_EMAIL: Optional[str] = os.environ.get("DEBUG_EMAIL")
+AUTHKEY: str = os.environ["AUTHKEY"]
+CF_MAGIC: str = os.environ["CF_MAGIC"]
+CF_UNBLOCK_MAGIC: str = os.environ["CF_UNBLOCK_MAGIC"]
+FERNET_KEY: Optional[str] = os.environ.get("ENCRYPTION_KEY")
+PROJECT_ID: Optional[str] = os.environ.get("PROJECT_ID")
+SECRET_APIKEY: str = os.environ["SECRET_APIKEY"]
+SECURITY_SALT: str = os.environ["SECURITY_SALT"]
+MONITOR_TOKEN_SALT: str = os.environ.get("MONITOR_TOKEN_SALT", "xon-monitor-consent")
+TOPIC_ID: Optional[str] = os.environ.get("TOPIC_ID")
+WTF_CSRF_SECRET_KEY: str = os.environ["WTF_CSRF_SECRET_KEY"]
+BASE_URL: str = os.environ.get("BASE_URL", "https://api.xposedornot.com")
+WEBSITE_BASE_URL: str = "https://xposedornot.com"
+
+BOT_ENFORCEMENT_ENABLED: bool = (
+    os.environ.get("BOT_ENFORCEMENT_ENABLED", "false").lower() == "true"
+)
+CF_BLOCK_ENFORCEMENT_ENABLED: bool = (
+    os.environ.get("CF_BLOCK_ENFORCEMENT_ENABLED", "false").lower() == "true"
+)
+CF_BLOCK_DAY_THRESHOLD: int = int(os.environ.get("CF_BLOCK_DAY_THRESHOLD", "25"))
+LIMITER_DEGRADED_ENABLED: bool = (
+    os.environ.get("LIMITER_DEGRADED_ENABLED", "true").lower() == "true"
+)
+SENIORITY_ENRICH_URL: Optional[str] = os.environ.get("SENIORITY_ENRICH_URL")
+SENIORITY_ENRICH_SECRET: Optional[str] = os.environ.get("SENIORITY_ENRICH_SECRET")
+
+# Domain email verification anti-abuse limits
+DOMAIN_EMAIL_LIMITS_ENABLED: bool = (
+    os.environ.get("DOMAIN_EMAIL_LIMITS_ENABLED", "true").lower() == "true"
+)
+DOMAIN_EMAIL_RECIPIENT_COOLDOWN_SECONDS: int = int(
+    os.environ.get("DOMAIN_EMAIL_RECIPIENT_COOLDOWN_SECONDS", "900")
+)
+DOMAIN_EMAIL_DOMAIN_MAX_PER_HOUR: int = int(
+    os.environ.get("DOMAIN_EMAIL_DOMAIN_MAX_PER_HOUR", "5")
+)
+DOMAIN_EMAIL_IP_MAX_PER_HOUR: int = int(
+    os.environ.get("DOMAIN_EMAIL_IP_MAX_PER_HOUR", "10")
+)
+DOMAIN_EMAIL_GLOBAL_DAILY_BUDGET: int = int(
+    os.environ.get("DOMAIN_EMAIL_GLOBAL_DAILY_BUDGET", "2000")
+)
+
+# Redis Configuration
+REDIS_HOST: str = os.environ.get("REDIS_HOST", "localhost")
+REDIS_PORT: int = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_DB: int = int(os.environ.get("REDIS_DB", "0"))
+REDIS_PASSWORD: Optional[str] = os.environ.get("REDIS_PASSWORD")
+
+# Redis URL for rate limiter
+REDIS_URL: str = f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
+if REDIS_PASSWORD:
+    REDIS_URL = f"redis://:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
+
+# Constants
+MAX_EMAIL_LENGTH: int = 254
+DEFAULT_TIMEOUT: int = 20
+
+"""API configuration settings."""
+
+# API Configuration
+API_TITLE = "XposedOrNot API"
+API_VERSION = "2.0.0"
+API_DESCRIPTION = """
+The XON API provides comprehensive data breach detection and monitoring services. Use our API to:
+* Check if email addresses have been exposed in data breaches
+* Monitor domain-level breaches
+* Access detailed breach analytics
+* Get real-time breach metrics
+
+## Documentation Access
+
+| Interface | Features | Rate Limits |
+|-----------|----------|-------------|
+| **Swagger UI** - Interactive documentation at `/docs` | • Try out API endpoints directly<br>• View request/response examples<br>• Interactive testing | • 2 requests/second<br>• 50-100/hour<br>• 100-1000/day |
+| **OpenAPI JSON** - Raw spec at `/openapi.json` | • Import into other tools<br>• Use for automated testing<br>• Generate client code |  |
+
+> Most endpoints are publicly accessible. Domain-specific endpoints may require authentication.
+"""
+
+# Rate Limiting
+RATE_LIMIT_DEFAULT = "2 per second;50 per hour;100 per day"
+RATE_LIMIT_ANALYTICS = "5 per minute;100 per hour;500 per day"
+RATE_LIMIT_DOMAIN = "2 per second;25 per hour;50 per day"
+
+# Security
+MAX_EMAIL_LENGTH = 254
+MAX_DOMAIN_LENGTH = 253
+MAX_TOKEN_LENGTH = 100
+
+# Cache Settings
+CACHE_TTL = 3600  # 1 hour
+CACHE_MAX_SIZE = 1000
+
+# API Endpoints
+API_PREFIX = "/v1"
+API_DOCS_URL = "/docs"
+API_OPENAPI_URL = "/openapi.json"
+
+# OpenAPI Server Configurations
+OPENAPI_SERVERS = [{"url": BASE_URL, "description": "Production server"}]

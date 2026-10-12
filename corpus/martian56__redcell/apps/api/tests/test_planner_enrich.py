@@ -1,0 +1,76 @@
+"""The planner fallback fills draft fields from the operator's text."""
+
+from app.routers.ai import enrich_proposal
+from redcell_core.schemas import SessionProposal
+
+
+def test_fills_from_bare_domain_when_model_returns_nothing():
+    p = enrich_proposal(None, "do a full pentest on Ufazien, its domain is ufazien.com")
+    assert p is not None
+    assert p.kind == "network"
+    assert p.scope == ["ufazien.com"]
+    assert p.targets == ["https://ufazien.com"]
+    assert p.name == "Ufazien assessment"
+
+
+def test_fills_gaps_but_keeps_model_values():
+    model = SessionProposal(name="Custom name", scope=["keep.example.com"], brief="focus on auth")
+    p = enrich_proposal(model, "target is app.acme.com")
+    assert p.name == "Custom name"          # not overwritten
+    assert p.scope == ["keep.example.com"]  # not overwritten
+    assert p.brief == "focus on auth"       # preserved
+    assert p.targets == ["https://app.acme.com"]  # gap filled
+
+
+def test_git_url_is_a_code_review():
+    p = enrich_proposal(None, "review the code at https://github.com/org/repo")
+    assert p is not None
+    assert p.kind == "code"
+    assert p.source == "https://github.com/org/repo"
+    assert p.scope == [] and p.targets == []
+
+
+def test_cidr_goes_to_scope():
+    p = enrich_proposal(None, "assess the 10.0.0.0/24 range")
+    assert p is not None
+    assert "10.0.0.0/24" in p.scope
+
+
+def test_no_target_no_proposal():
+    assert enrich_proposal(None, "hi, can you help me plan something later?") is None
+
+
+def test_general_kind_is_preserved_and_filled():
+    model = SessionProposal(name="Footprint", kind="general", brief="map public footprint")
+    p = enrich_proposal(model, "subject is Globex, globex.com")
+    assert p.kind == "general"
+    assert "globex.com" in p.scope
+    assert p.targets == ["https://globex.com"]
+
+
+def test_general_task_without_host_still_drafts():
+    model = SessionProposal(name="Threat model", kind="general", brief="threat model our product")
+    p = enrich_proposal(model, "help me threat model our product")
+    assert p is not None
+    assert p.kind == "general"
+
+
+def test_osint_kind_is_preserved_and_filled():
+    model = SessionProposal(name="Footprint Globex", kind="osint", brief="public footprint")
+    p = enrich_proposal(model, "profile Globex, their domain is globex.com")
+    assert p.kind == "osint"
+    assert "globex.com" in p.scope
+
+
+def test_osint_person_without_host_still_drafts():
+    model = SessionProposal(name="Profile", kind="osint", brief="profile a person")
+    p = enrich_proposal(model, "profile the username jdoe across platforms")
+    assert p is not None
+    assert p.kind == "osint"
+
+
+def test_mobile_kind_is_preserved():
+    model = SessionProposal(name="App review", kind="mobile", brief="static review of the apk")
+    p = enrich_proposal(model, "pentest my android app, I'll upload the APK")
+    assert p is not None
+    assert p.kind == "mobile"

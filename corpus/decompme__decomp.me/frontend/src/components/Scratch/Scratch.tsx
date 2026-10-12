@@ -1,0 +1,724 @@
+import { StreamLanguage } from "@codemirror/language";
+import type { EditorView } from "@codemirror/view";
+import { DotFillIcon } from "@primer/octicons-react";
+import { vim } from "@replit/codemirror-vim";
+import {
+    type ComponentProps,
+    useCallback,
+    useEffect,
+    useMemo,
+    useReducer,
+    useRef,
+    useState,
+} from "react";
+import * as api from "@/lib/api";
+import basicSetup from "@/lib/codemirror/basic-setup";
+import { cpp } from "@/lib/codemirror/cpp";
+import { pascal } from "@/lib/codemirror/pascal";
+import useCompareExtension from "@/lib/codemirror/useCompareExtension";
+import { useSize } from "@/lib/hooks";
+import {
+    DefaultDiffTab,
+    useAutoRecompileDelaySetting,
+    useAutoRecompileSetting,
+    useDefaultDiffTab,
+    useLanguageServerEnabled,
+    useMatchProgressBarEnabled,
+    useSwapVerticalLayout,
+    useVimModeEnabled,
+} from "@/lib/settings";
+import CustomLayout, {
+    activateTabInLayout,
+    type Layout,
+    visitLayout,
+} from "../CustomLayout";
+import CompilerOpts from "../compiler/CompilerOpts";
+import CompilationPanel from "../Diff/CompilationPanel";
+import ObjdiffPanel from "../Diff/ObjdiffPanel";
+import CodeMirror from "../Editor/CodeMirror";
+import ErrorBoundary from "../ErrorBoundary";
+import ScoreBadge, { calculateScorePercent } from "../ScoreBadge";
+import { ScrollContext } from "../ScrollContext";
+import ScrollRestorer from "../ScrollRestorer";
+import {
+    SelectedSourceLineProvider,
+    useSelectedSourceLine,
+} from "../SelectedSourceLineContext";
+import { Tab, TabCloseButton } from "../Tabs";
+import useLanguageServer from "./hooks/useLanguageServer";
+import AboutPanel from "./panels/AboutPanel";
+import DecompilationPanel from "./panels/DecompilePanel";
+import FamilyPanel from "./panels/FamilyPanel";
+import ProblemPanel from "./panels/ProblemPanel";
+import styles from "./Scratch.module.scss";
+import ScratchMatchBanner from "./ScratchMatchBanner";
+import ScratchProgressBar from "./ScratchProgressBar";
+import ScratchToolbar from "./ScratchToolbar";
+import ScratchTour from "./ScratchTour";
+
+enum TabId {
+    ABOUT = "scratch_about",
+    SOURCE_CODE = "scratch_source_code",
+    CONTEXT = "scratch_context",
+    OPTIONS = "scratch_options",
+    DIFF = "scratch_diff",
+    DECOMPILATION = "scratch_decompilation",
+    FAMILY = "scratch_family",
+    OBJDIFF = "scratch_objdiff",
+    PROBLEMS = "scratch_problems",
+}
+
+const DEFAULT_LAYOUTS: Record<"desktop_2col" | "mobile_2row", Layout> = {
+    desktop_2col: {
+        key: 0,
+        kind: "horizontal",
+        size: 100,
+        children: [
+            {
+                key: 1,
+                kind: "pane",
+                size: 50,
+                activeTab: TabId.SOURCE_CODE,
+                tabs: [
+                    TabId.ABOUT,
+                    TabId.FAMILY,
+                    TabId.SOURCE_CODE,
+                    TabId.CONTEXT,
+                    TabId.OPTIONS,
+                ],
+            },
+            {
+                key: 2,
+                kind: "pane",
+                size: 50,
+                activeTab: TabId.DIFF,
+                tabs: [TabId.DIFF, TabId.OBJDIFF, TabId.DECOMPILATION],
+            },
+        ],
+    },
+    mobile_2row: {
+        key: 0,
+        kind: "vertical",
+        size: 100,
+        children: [
+            {
+                key: 1,
+                kind: "pane",
+                size: 40,
+                activeTab: TabId.SOURCE_CODE,
+                tabs: [
+                    TabId.ABOUT,
+                    TabId.FAMILY,
+                    TabId.SOURCE_CODE,
+                    TabId.CONTEXT,
+                    TabId.OPTIONS,
+                ],
+            },
+            {
+                key: 2,
+                kind: "pane",
+                size: 60,
+                activeTab: TabId.DIFF,
+                tabs: [
+                    TabId.DIFF,
+                    TabId.OBJDIFF,
+                    TabId.PROBLEMS,
+                    TabId.DECOMPILATION,
+                ],
+            },
+        ],
+    },
+};
+
+function maybeSwapVerticalLayout(
+    layout: Layout,
+    layoutName: string,
+    swap: boolean,
+): Layout {
+    if (layoutName !== "mobile_2row" || !swap) {
+        return layout;
+    }
+    if (layout.kind !== "vertical" || layout.children.length !== 2) {
+        return layout;
+    }
+
+    const clone = cloneValue(layout);
+    clone.children = [...clone.children].reverse();
+    return clone;
+}
+
+function getDefaultLayout(
+    width: number,
+    _height: number,
+): keyof typeof DEFAULT_LAYOUTS {
+    if (width > 700) {
+        return "desktop_2col";
+    }
+
+    return "mobile_2row";
+}
+
+function cloneValue<T>(layout: T): T {
+    return JSON.parse(JSON.stringify(layout)) as T;
+}
+
+function sameTextIgnoringLineEndings(a: string, b: string): boolean {
+    return a.replace(/\r\n?/g, "\n") === b.replace(/\r\n?/g, "\n");
+}
+
+function areJsonStringifiedValuesEqual(a: unknown, b: unknown): boolean {
+    return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function doScratchOptionsDiffer(
+    scratch: Readonly<api.Scratch>,
+    parentScratch: Readonly<api.Scratch>,
+): boolean {
+    return (
+        scratch.platform !== parentScratch.platform ||
+        scratch.compiler !== parentScratch.compiler ||
+        scratch.compiler_flags !== parentScratch.compiler_flags ||
+        !areJsonStringifiedValuesEqual(
+            scratch.diff_flags,
+            parentScratch.diff_flags,
+        ) ||
+        scratch.diff_label !== parentScratch.diff_label ||
+        !areJsonStringifiedValuesEqual(
+            scratch.libraries,
+            parentScratch.libraries,
+        ) ||
+        scratch.match_override !== parentScratch.match_override ||
+        scratch.preset !== parentScratch.preset
+    );
+}
+
+function isTabActiveInLayout(layout: Layout, tab: TabId): boolean {
+    let active = false;
+    visitLayout(layout, (node) => {
+        if (node.kind === "pane" && node.activeTab === tab) {
+            active = true;
+        }
+    });
+    return active;
+}
+
+function ChangedTabMarker({ label }: { label: string }) {
+    return (
+        <span
+            className={styles.changedTabMarker}
+            title={label}
+            aria-label={label}
+        >
+            <DotFillIcon size={16} />
+        </span>
+    );
+}
+
+function applyDefaultDiffTab(
+    layout: Layout,
+    defaultDiffTab: DefaultDiffTab,
+): Layout {
+    const preferredTab =
+        defaultDiffTab === DefaultDiffTab.OBJDIFF ? TabId.OBJDIFF : TabId.DIFF;
+    visitLayout(layout, (node) => {
+        if (node.kind === "pane" && node.tabs.includes(preferredTab)) {
+            node.activeTab = preferredTab;
+        }
+    });
+    return layout;
+}
+
+function SourceCodeMirror(props: ComponentProps<typeof CodeMirror>) {
+    const { setSelectedSourceLine } = useSelectedSourceLine();
+
+    return (
+        <CodeMirror {...props} onSelectedLineChange={setSelectedSourceLine} />
+    );
+}
+
+export type Props = {
+    scratch: Readonly<api.Scratch>;
+    onChange: (scratch: Partial<api.Scratch>) => void;
+    deleteScratch: () => Promise<void>;
+    parentScratch?: api.Scratch;
+    initialCompilation?: Readonly<api.Compilation>;
+    offline: boolean;
+};
+
+function ScratchInner({
+    scratch,
+    onChange,
+    deleteScratch,
+    parentScratch,
+    initialCompilation,
+    offline,
+}: Props) {
+    const availableCompilers = api.useCompilers(scratch.platform);
+    const language = api.resolveCompilerLanguage(
+        availableCompilers[scratch.compiler],
+        scratch.compiler_flags,
+    );
+    const CODEMIRROR_EXTENSIONS = useMemo(
+        () => [
+            basicSetup,
+            language?.id === "pascal" ? StreamLanguage.define(pascal) : cpp(),
+        ],
+        [language?.id],
+    );
+
+    const container = useSize<HTMLDivElement>();
+    const [layout, setLayout] = useState<Layout>(undefined);
+    const [layoutName, setLayoutName] =
+        useState<keyof typeof DEFAULT_LAYOUTS>(undefined);
+    const [viewedChangedTabs, setViewedChangedTabs] = useState<Set<TabId>>(
+        () => new Set(),
+    );
+
+    const [autoRecompileSetting] = useAutoRecompileSetting();
+    const [autoRecompileDelaySetting] = useAutoRecompileDelaySetting();
+    const [languageServerEnabledSetting] = useLanguageServerEnabled();
+    const [matchProgressBarEnabledSetting] = useMatchProgressBarEnabled();
+    const [defaultDiffTab] = useDefaultDiffTab();
+    const { compilation, isCompiling, isCompilationOld, compile } =
+        api.useCompilation(
+            scratch,
+            autoRecompileSetting,
+            autoRecompileDelaySetting,
+            initialCompilation,
+        );
+    const userIsYou = api.useUserIsYou();
+    const sourceEditor = useRef<EditorView>(null);
+    const contextEditor = useRef<EditorView>(null);
+    const [valueVersion, incrementValueVersion] = useReducer((x) => x + 1, 0);
+
+    const compilerOptsScrollPosition = useRef(0);
+
+    const [isModified, setIsModified] = useState(false);
+    const setScratch = useCallback(
+        (partial: Partial<api.Scratch>) => {
+            const hasChanges = Object.entries(partial).some(
+                ([key, value]) =>
+                    !Object.is(scratch[key as keyof api.Scratch], value),
+            );
+
+            if (!hasChanges) return;
+
+            onChange(partial);
+            setIsModified(true);
+        },
+        [onChange, scratch],
+    );
+
+    const [perSaveObj, setPerSaveObj] = useState({});
+    const saveCallback = () => {
+        setPerSaveObj({});
+    };
+
+    const shouldCompare = !isModified;
+    const contextDiffersFromParent =
+        shouldCompare &&
+        parentScratch &&
+        !sameTextIgnoringLineEndings(scratch.context, parentScratch.context);
+    const optionsDifferFromParent =
+        shouldCompare &&
+        parentScratch &&
+        doScratchOptionsDiffer(scratch, parentScratch);
+    const sourceCompareExtension = useCompareExtension(
+        sourceEditor,
+        shouldCompare ? parentScratch?.source_code : undefined,
+    );
+    const contextCompareExtension = useCompareExtension(
+        contextEditor,
+        shouldCompare ? parentScratch?.context : undefined,
+    );
+
+    const [swapVerticalLayout] = useSwapVerticalLayout();
+
+    const [saveSource, saveContext] = useLanguageServer(
+        languageServerEnabledSetting,
+        scratch,
+        language,
+        sourceEditor,
+        contextEditor,
+    );
+
+    const lastGoodScore = useRef<number>(scratch.score);
+    const lastGoodMaxScore = useRef<number>(scratch.max_score);
+    if (compilation?.success) {
+        lastGoodScore.current = compilation?.diff_output?.current_score;
+        lastGoodMaxScore.current = compilation?.diff_output?.max_score;
+    }
+
+    // TODO: CustomLayout should handle adding/removing tabs
+    const [decompilationTabEnabled, setDecompilationTabEnabled] =
+        useState(false);
+    useEffect(() => {
+        if (decompilationTabEnabled) {
+            setLayout((layout) => {
+                const clone = cloneValue(layout);
+                activateTabInLayout(clone, TabId.DECOMPILATION);
+                return clone;
+            });
+        }
+    }, [decompilationTabEnabled]);
+
+    // If the version of the scratch changes, refresh code editors
+    useEffect(() => {
+        incrementValueVersion();
+        setViewedChangedTabs(new Set());
+    }, [scratch.slug, scratch.last_updated]);
+
+    useEffect(() => {
+        if (!layout) return;
+
+        setViewedChangedTabs((current) => {
+            const next = new Set(current);
+
+            if (isTabActiveInLayout(layout, TabId.CONTEXT)) {
+                next.add(TabId.CONTEXT);
+            }
+
+            if (isTabActiveInLayout(layout, TabId.OPTIONS)) {
+                next.add(TabId.OPTIONS);
+            }
+
+            return next.size === current.size ? current : next;
+        });
+    }, [layout]);
+
+    const [useVim] = useVimModeEnabled();
+    const cmExtensionsSource = useMemo(
+        () => [
+            ...CODEMIRROR_EXTENSIONS,
+            sourceCompareExtension,
+            ...(useVim ? [vim()] : []),
+        ],
+        [CODEMIRROR_EXTENSIONS, sourceCompareExtension, useVim],
+    );
+    const cmExtensionsContext = useMemo(
+        () => [
+            ...CODEMIRROR_EXTENSIONS,
+            contextCompareExtension,
+            ...(useVim ? [vim()] : []),
+        ],
+        [CODEMIRROR_EXTENSIONS, contextCompareExtension, useVim],
+    );
+
+    const renderTab = (id: string) => {
+        switch (id as TabId) {
+            case TabId.ABOUT:
+                return (
+                    <Tab
+                        key={id}
+                        tabKey={id}
+                        label="About"
+                        className={styles.about}
+                        dataTour="scratch-tab-about"
+                    >
+                        {() => (
+                            <AboutPanel
+                                scratch={scratch}
+                                setScratch={
+                                    userIsYou(scratch.owner) ? setScratch : null
+                                }
+                            />
+                        )}
+                    </Tab>
+                );
+            case TabId.SOURCE_CODE:
+                return (
+                    <Tab
+                        key={id}
+                        tabKey={id}
+                        label="Source code"
+                        dataTour="scratch-tab-source"
+                        onSelect={() => {
+                            sourceEditor.current?.focus?.();
+                            saveContext();
+                        }}
+                    >
+                        <SourceCodeMirror
+                            viewRef={sourceEditor}
+                            className={styles.editor}
+                            value={scratch.source_code}
+                            valueVersion={valueVersion}
+                            onChange={(value) => {
+                                setScratch({ source_code: value });
+                            }}
+                            extensions={cmExtensionsSource}
+                            placeholder="Write the code for the function you are matching here."
+                            dataTour="scratch-source-editor"
+                        />
+                    </Tab>
+                );
+            case TabId.CONTEXT:
+                return (
+                    <Tab
+                        key={id}
+                        tabKey={id}
+                        label={
+                            <>
+                                Context
+                                {contextDiffersFromParent &&
+                                    !viewedChangedTabs.has(TabId.CONTEXT) && (
+                                        <ChangedTabMarker label="Context has changes vs parent scratch." />
+                                    )}
+                            </>
+                        }
+                        className={styles.context}
+                        dataTour="scratch-tab-context"
+                        onSelect={() => {
+                            contextEditor.current?.focus?.();
+                            saveSource();
+                        }}
+                    >
+                        <CodeMirror
+                            viewRef={contextEditor}
+                            className={styles.editor}
+                            value={scratch.context}
+                            valueVersion={valueVersion}
+                            onChange={(value) => {
+                                setScratch({ context: value });
+                            }}
+                            extensions={cmExtensionsContext}
+                            placeholder="Add your typedefs, structs, and declarations here."
+                            dataTour="scratch-context-editor"
+                        />
+                    </Tab>
+                );
+            case TabId.OPTIONS:
+                return (
+                    <Tab
+                        key={id}
+                        tabKey={id}
+                        label={
+                            <>
+                                Options
+                                {optionsDifferFromParent &&
+                                    !viewedChangedTabs.has(TabId.OPTIONS) && (
+                                        <ChangedTabMarker label="Options have changes vs parent scratch." />
+                                    )}
+                            </>
+                        }
+                        className={styles.compilerOptsTab}
+                        dataTour="scratch-tab-options"
+                    >
+                        {() => (
+                            <ScrollRestorer
+                                className={styles.compilerOptsContainer}
+                                scrollPositionRef={compilerOptsScrollPosition}
+                            >
+                                <CompilerOpts
+                                    platform={scratch.platform}
+                                    value={scratch}
+                                    onChange={setScratch}
+                                    diffLabel={scratch.diff_label}
+                                    onDiffLabelChange={(d) =>
+                                        setScratch({ diff_label: d })
+                                    }
+                                    matchOverride={scratch.match_override}
+                                    onMatchOverrideChange={(m) =>
+                                        setScratch({ match_override: m })
+                                    }
+                                />
+                            </ScrollRestorer>
+                        )}
+                    </Tab>
+                );
+            case TabId.DIFF:
+                return (
+                    <Tab
+                        key={id}
+                        tabKey={id}
+                        dataTour="scratch-tab-compilation"
+                        label={
+                            <>
+                                Compilation
+                                {compilation && (
+                                    <ScoreBadge
+                                        score={
+                                            compilation?.diff_output
+                                                ?.current_score ?? -1
+                                        }
+                                        maxScore={
+                                            compilation?.diff_output
+                                                ?.max_score ?? -1
+                                        }
+                                        matchOverride={scratch.match_override}
+                                        compiledSuccessfully={
+                                            compilation?.success ?? false
+                                        }
+                                    />
+                                )}
+                            </>
+                        }
+                        className={styles.diffTab}
+                    >
+                        {compilation && (
+                            <CompilationPanel
+                                scratch={scratch}
+                                compilation={compilation}
+                                isCompiling={isCompiling}
+                                isCompilationOld={isCompilationOld}
+                                perSaveObj={perSaveObj}
+                                showProblems={layoutName !== "mobile_2row"}
+                            />
+                        )}
+                    </Tab>
+                );
+            case TabId.OBJDIFF:
+                return (
+                    <Tab
+                        key={id}
+                        tabKey={id}
+                        label="objdiff"
+                        className={styles.diffTab}
+                        dataTour="scratch-tab-objdiff"
+                    >
+                        {compilation && (
+                            <ObjdiffPanel
+                                scratch={scratch}
+                                compilation={compilation}
+                                buildRunning={isCompiling}
+                            />
+                        )}
+                    </Tab>
+                );
+            case TabId.DECOMPILATION:
+                return (
+                    decompilationTabEnabled && (
+                        <Tab
+                            key={id}
+                            tabKey={id}
+                            dataTour="scratch-tab-decompilation"
+                            label={
+                                <>
+                                    Decompilation
+                                    <TabCloseButton
+                                        onClick={() =>
+                                            setDecompilationTabEnabled(false)
+                                        }
+                                    />
+                                </>
+                            }
+                        >
+                            <DecompilationPanel scratch={scratch} />
+                        </Tab>
+                    )
+                );
+            case TabId.FAMILY:
+                return (
+                    <Tab
+                        key={id}
+                        tabKey={id}
+                        label="Family"
+                        dataTour="scratch-tab-family"
+                    >
+                        {() => <FamilyPanel scratch={scratch} />}
+                    </Tab>
+                );
+            case TabId.PROBLEMS:
+                return (
+                    compilation?.compiler_output && (
+                        <Tab
+                            key={id}
+                            tabKey={id}
+                            label="Problems"
+                            dataTour="scratch-tab-problems"
+                        >
+                            {() => (
+                                <ProblemPanel
+                                    text={compilation.compiler_output}
+                                />
+                            )}
+                        </Tab>
+                    )
+                );
+            default:
+                return <Tab key={id} tabKey={id} label={id} disabled />;
+        }
+    };
+
+    useEffect(() => {
+        if (!container.width) return;
+        const preferredLayout = getDefaultLayout(
+            container.width,
+            container.height,
+        );
+        if (layoutName !== preferredLayout) {
+            setLayoutName(preferredLayout);
+            setLayout(
+                maybeSwapVerticalLayout(
+                    applyDefaultDiffTab(
+                        cloneValue(DEFAULT_LAYOUTS[preferredLayout]),
+                        defaultDiffTab,
+                    ),
+                    preferredLayout,
+                    swapVerticalLayout,
+                ),
+            );
+        }
+    }, [container.width, container.height, layoutName, defaultDiffTab]);
+
+    const offlineOverlay = offline ? (
+        <div className="fixed top-10 self-center rounded bg-red-8 px-3 py-2">
+            <p className="text-sm">
+                The scratch editor is in offline mode. We're attempting to
+                reconnect to the backend – as long as this tab is open, your
+                work is safe.
+            </p>
+        </div>
+    ) : null;
+
+    const matchPercent = calculateScorePercent(
+        lastGoodScore.current,
+        lastGoodMaxScore.current,
+    );
+
+    return (
+        <div
+            ref={container.ref}
+            className={styles.container}
+            data-tour="scratch-view"
+        >
+            <ScratchTour />
+            <ErrorBoundary>
+                <ScratchMatchBanner scratch={scratch} />
+            </ErrorBoundary>
+            <ErrorBoundary>
+                <ScratchToolbar
+                    compile={compile}
+                    isCompiling={isCompiling}
+                    scratch={scratch}
+                    setScratch={setScratch}
+                    saveCallback={saveCallback}
+                    deleteScratch={deleteScratch}
+                    setDecompilationTabEnabled={setDecompilationTabEnabled}
+                />
+                {matchProgressBarEnabledSetting && (
+                    <ScratchProgressBar matchPercent={matchPercent} />
+                )}
+            </ErrorBoundary>
+            <ErrorBoundary>
+                {layout && (
+                    <ScrollContext.Provider value={sourceEditor}>
+                        <CustomLayout
+                            layout={layout}
+                            onChange={setLayout}
+                            renderTab={renderTab}
+                        />
+                    </ScrollContext.Provider>
+                )}
+            </ErrorBoundary>
+            {offlineOverlay}
+        </div>
+    );
+}
+
+export default function Scratch(props: Props) {
+    return (
+        <SelectedSourceLineProvider>
+            <ScratchInner {...props} />
+        </SelectedSourceLineProvider>
+    );
+}

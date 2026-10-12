@@ -1,0 +1,520 @@
+"""Response models for the application."""
+
+# Standard library imports
+from datetime import datetime
+from typing import Optional, List, Dict, Any, Union
+
+# Third-party imports
+from pydantic import BaseModel, Field
+
+# Local imports
+from .base import BaseResponse, BaseBreachInfo, BaseMetrics
+
+
+class AlertMeResponse(BaseResponse):
+    """Response model for alert-me endpoint."""
+
+    pass
+
+
+class VerificationResponse(BaseModel):
+    """Response model for verification endpoints."""
+
+    html_content: str
+
+
+class EmailCheckResponse(BaseModel):
+    """Response model for email check endpoint."""
+
+    breaches: List[List[str]] = []
+    email: str
+
+
+class MetricsResponse(BaseMetrics):
+    """Response model for metrics endpoint."""
+
+    pass
+
+
+class DomainVerificationResponse(BaseModel):
+    """Response model for domain verification."""
+
+    domainVerification: Optional[str | List[str]]
+
+
+class DomainExposureResponse(BaseModel):
+    """Response model for domain exposure."""
+
+    sendDomains: Dict
+    SearchStatus: str
+
+
+class MonthlyDigestResponse(BaseResponse):
+    """Response model for monthly digest endpoint."""
+
+    task_id: str
+    trigger_type: str = Field(description="manual or automatic")
+    target_email: Optional[str] = Field(
+        default=None, description="Target email for manual triggers"
+    )
+    testing_mode: bool = Field(description="Whether emails are sent to test address")
+
+
+class MonthlyDigestErrorResponse(BaseModel):
+    """Error response model for monthly digest endpoint."""
+
+    Error: str
+
+
+class BreachSummary(BaseModel):
+    """Model for breach summary."""
+
+    site: str = ""
+
+
+class PasteSummary(BaseModel):
+    """Model for paste summary."""
+
+    cnt: int = 0
+    domain: str = ""
+    tmpstmp: str = ""
+
+
+class BreachEntity(BaseModel):
+    """Model for breach entity details."""
+
+    breachID: str
+    breachedDate: str
+    domain: str
+    industry: str
+    logo: str
+    passwordRisk: str
+    searchable: Optional[bool]
+    sensitive: Optional[bool]
+    verified: Optional[bool]
+    exposedData: List[str]
+    exposedRecords: int
+    exposureDescription: str
+    referenceURL: str = ""
+
+
+class BreachesResponse(BaseResponse):
+    """Response model for breaches endpoint."""
+
+    exposedBreaches: Optional[List[BreachEntity]] = None
+
+
+class BreachAnalyticsResponse(BaseModel):
+    """Response model for breach analytics endpoint."""
+
+    BreachMetrics: Optional[Dict] = None
+    BreachesSummary: BreachSummary
+    ExposedBreaches: Optional[Dict] = None
+    ExposedPastes: Optional[Dict] = None
+    PasteMetrics: Optional[Dict] = None
+    PastesSummary: PasteSummary
+
+    class Config:
+        """Pydantic model configuration."""
+
+        validate_by_name = True
+        validate_assignment = True
+
+
+class BreachAnalyticsAuthResponse(BreachAnalyticsResponse):
+    """Response model for breach analytics with a validated session token."""
+
+    ShieldOn: bool = False
+
+
+class EmptyBreachResponse(BaseModel):
+    """Response model for empty breach results."""
+
+    BreachesSummary: BreachSummary
+    PastesSummary: PasteSummary
+
+
+class DomainBreachDetail(BaseModel):
+    """Model for individual domain breach details."""
+
+    domain: str = Field(..., description="Domain that was breached")
+    breach_pastes: int = Field(..., description="Number of paste records found")
+    breach_emails: int = Field(..., description="Number of unique emails found")
+    breach_total: int = Field(..., description="Total number of breach records")
+    breach_count: int = Field(..., description="Number of unique breaches")
+    breach_last_seen: Optional[str] = Field(
+        None, description="Date when the breach was last seen"
+    )
+
+
+class DomainBreachSummaryResponse(BaseModel):
+    """Response model for domain breach summary endpoint."""
+
+    sendDomains: Dict[str, List[DomainBreachDetail]] = Field(
+        ..., description="Dictionary containing list of breach details"
+    )
+    SearchStatus: str = Field(..., description="Status of the search (Success/Error)")
+
+
+class DomainBreachDetails(BaseModel):
+    """Model for domain breach details."""
+
+    domain: str
+    breach_pastes: int
+    breach_emails: int
+    breach_total: int
+    breach_count: int
+    breach_last_seen: Optional[str] = None
+
+
+class DetailedMetricsResponse(BaseMetrics):
+    """Response model for detailed metrics."""
+
+    Yearly_Breaches_Count: Dict[int, int]
+    Industry_Breaches_Count: Dict[str, int]
+    Top_Breaches: List[BaseBreachInfo]
+    Recent_Breaches: List[BaseBreachInfo]
+
+
+class PulseNewsItem(BaseModel):
+    """Model for individual news item."""
+
+    title: str
+    date: str
+    summary: str
+    url: str
+
+
+class PulseNewsResponse(BaseResponse):
+    """Response model for news feed."""
+
+    data: List[PulseNewsItem]
+
+
+class ApiKeyResponse(BaseResponse):
+    """Response model for API key operations."""
+
+    api_key: Optional[str] = None
+
+
+class BreachDetailResponse(BaseModel):
+    """Model for detailed breach information."""
+
+    breachID: str
+    breachedDate: str
+    addedDate: Optional[str] = None
+    domain: str
+    industry: str
+    logo: str
+    passwordRisk: str
+    searchable: bool
+    sensitive: bool
+    verified: bool
+    breachType: str = ""
+    exposedData: List[str]
+    exposedRecords: int
+    exposureDescription: str
+    referenceURL: str = ""
+
+
+class BreachListResponse(BaseModel):
+    """Response model for /v1/breaches endpoint."""
+
+    status: str
+    message: Optional[str] = None
+    exposedBreaches: Optional[List[BreachDetailResponse]] = None
+
+
+class EmailBreachResponse(BaseModel):
+    """Response model for email breach check endpoint."""
+
+    breaches: List[List[str]] = []
+    email: str
+
+
+class EmailBreachErrorResponse(BaseModel):
+    """Response model for email breach check error."""
+
+    Error: str
+    email: Optional[str] = None
+
+
+class DomainAlertResponse(BaseModel):
+    """Response model for domain alert endpoint."""
+
+    Success: str = "Domain Alert Successful"
+
+
+class DomainAlertErrorResponse(BaseModel):
+    """Error response model for domain alert endpoint."""
+
+    Error: str
+    email: Optional[str] = None
+
+
+class DomainVerifyResponse(BaseModel):
+    """Response model for domain verification."""
+
+    status: str = "success"
+    dashboard_link: str
+
+
+class DomainVerifyErrorResponse(BaseModel):
+    """Error response model for domain verification."""
+
+    status: str = "error"
+    message: str = "Invalid or expired verification token"
+
+
+class BreachDetails(BaseModel):
+    """Model for breach details."""
+
+    email: str
+    domain: str
+    breach: str
+
+
+class DetailedBreachInfo(BaseModel):
+    """Model for detailed breach information."""
+
+    breached_date: Optional[str] = None
+    logo: str = ""
+    password_risk: str = ""
+    searchable: str = "No"
+    xposed_data: str = ""
+    xposed_records: Union[int, str] = 0
+    xposure_desc: str = ""
+    added: Optional[str] = None
+
+    class Config:
+        """Pydantic model configuration."""
+
+        json_encoders = {
+            datetime: lambda v: v.strftime("%a, %d %b %Y %H:%M:%S GMT") if v else None
+        }
+
+
+class AlertDetail(BaseModel):
+    """Model for individual alert details."""
+
+    alert_id: str
+    breach_id: str
+    breach_name: str
+    alert_time: str
+    severity: str
+    status: str
+    description: str
+    affected_domain: str
+    affected_email_count: int
+    exposed_fields: List[str]
+    password_type: str
+    acknowledged_at: Optional[str] = None
+    acknowledged_by: Optional[str] = None
+    last_updated_by: Optional[str] = None
+
+
+class AlertManagement(BaseModel):
+    """Model for alert management data."""
+
+    summary: Dict[str, Any]
+    alerts: List[AlertDetail] = []
+
+
+class DomainBreachesResponse(BaseModel):
+    """Response model for domain breaches endpoint."""
+
+    Yearly_Metrics: Dict[str, int]
+    Domain_Summary: Dict[str, int]
+    Breach_Summary: Dict[str, int]
+    Breaches_Details: List[BreachDetails]
+    Top10_Breaches: Dict[str, int]
+    Detailed_Breach_Info: Dict[str, DetailedBreachInfo]
+    Verified_Domains: List[str]
+    Seniority_Summary: Dict[str, int]
+    Yearly_Breach_Hierarchy: Dict[str, Any]
+    Alert_Management: Optional[AlertManagement] = None
+
+
+class DomainBreachesErrorResponse(BaseModel):
+    """Error response model for domain breaches endpoint."""
+
+    Error: str
+
+
+class ShieldActivationResponse(BaseModel):
+    """Response model for shield activation endpoint."""
+
+    Success: str
+
+
+class ShieldActivationErrorResponse(BaseModel):
+    """Error response model for shield activation endpoint."""
+
+    Error: str
+
+
+class ShieldVerificationResponse(BaseModel):
+    """Response model for shield verification endpoint."""
+
+    html_content: str = ""
+    status: str = "success"
+
+
+class ShieldVerificationErrorResponse(BaseModel):
+    """Error response model for shield verification endpoint."""
+
+    html_content: str = ""
+    status: str = "error"
+
+
+class AlertResponse(BaseModel):
+    """Response model for alert operations."""
+
+    status: str
+    message: str
+
+
+class VerificationResponse(BaseModel):
+    """Response model for verification operations."""
+
+    status: str
+    sensitive_breach_details: Optional[Dict] = None
+    BreachMetrics: Optional[Dict] = None
+
+
+class BreachHierarchyChild(BaseModel):
+    """Model for breach hierarchy child items."""
+
+    description: str
+    children: List["BreachHierarchyChild"] = []
+    tooltip: Optional[str] = None
+
+    def dict(self, *args, **kwargs):
+        """Convert the model to a dictionary with custom handling for recursive structures."""
+        d = super().dict(*args, **kwargs)
+        # Only include non-null values and properly handle tooltip
+        return {
+            k: v
+            for k, v in d.items()
+            if v is not None and k != "tooltip" or k == "tooltip" and v is not None
+        }
+
+
+class BreachHierarchyResponse(BaseModel):
+    """Model for breach hierarchy response."""
+
+    description: str
+    children: List[BreachHierarchyChild] = []
+
+    def dict(self, *args, **kwargs):
+        """Convert the model to a dictionary with custom handling for recursive structures."""
+        d = super().dict(*args, **kwargs)
+        return {k: v for k, v in d.items() if v is not None}
+
+
+# Update forward references for nested models
+BreachHierarchyChild.update_forward_refs()
+
+
+class UnsubscribeResponse(BaseModel):
+    """Response model for unsubscribe endpoint."""
+
+    status: str
+    message: str
+
+
+class UnsubscribeVerifyResponse(BaseModel):
+    """Response model for unsubscribe verification endpoint."""
+
+    html_content: str
+    status: str = "success"
+
+
+class UnsubscribeVerifyErrorResponse(BaseModel):
+    """Error response model for unsubscribe verification endpoint."""
+
+    html_content: str
+    status: str = "error"
+
+
+class AlertStatusUpdateRequest(BaseModel):
+    """Request model for alert status update."""
+
+    alert_id: str
+    status: str
+
+
+class AlertStatusUpdateResponse(BaseModel):
+    """Response model for alert status update."""
+
+    status: str
+    message: str
+    alert_id: str
+    previous_status: str
+    current_status: str
+    acknowledged_at: Optional[str] = None
+    acknowledged_by: Optional[str] = None
+    last_updated_by: str
+
+
+class AlertStatusUpdateErrorResponse(BaseModel):
+    """Error response model for alert status update."""
+
+    Error: str
+
+
+class MonitorResponse(BaseModel):
+    """Response model for monitor onboarding/revocation operations."""
+
+    status: str
+    message: str
+
+
+class MonitorErrorResponse(BaseModel):
+    """Error response model for monitor operations."""
+
+    Error: str
+
+
+class MonitorItem(BaseModel):
+    """Model for a single monitored contact in the requester's circle."""
+
+    target_email: str
+    status: str
+    requested_at: Optional[str] = None
+    responded_at: Optional[str] = None
+    shield_override: bool = False
+    breaches: Optional[Dict[str, Any]] = None
+
+
+class MonitorManagement(BaseModel):
+    """Model for the requester's monitor list grouped by status."""
+
+    summary: Dict[str, Any]
+    monitors: List[MonitorItem] = []
+
+
+class MonitorListResponse(BaseModel):
+    """Response model for the my-monitors listing endpoint."""
+
+    status: str
+    Monitor_Management: MonitorManagement
+
+
+class MonitorListErrorResponse(BaseModel):
+    """Error response model for the my-monitors listing endpoint."""
+
+    Error: str
+
+
+class DashboardSignOutResponse(BaseModel):
+    """Response model for dashboard sign-out."""
+
+    status: str = "success"
+    message: str = "Signed out"
+
+
+class DashboardSignOutErrorResponse(BaseModel):
+    """Error response model for dashboard sign-out."""
+
+    Error: str

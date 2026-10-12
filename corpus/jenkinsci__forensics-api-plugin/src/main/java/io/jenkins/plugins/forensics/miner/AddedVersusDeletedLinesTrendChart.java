@@ -1,0 +1,61 @@
+package io.jenkins.plugins.forensics.miner;
+
+import edu.hm.hafner.echarts.BuildResult;
+import edu.hm.hafner.echarts.ChartModelConfiguration;
+import edu.hm.hafner.echarts.LineSeries;
+import edu.hm.hafner.echarts.LineSeries.FilledMode;
+import edu.hm.hafner.echarts.LineSeries.StackedMode;
+import edu.hm.hafner.echarts.LinesChartModel;
+import edu.hm.hafner.echarts.LinesDataSet;
+import edu.hm.hafner.echarts.SeriesBuilder;
+import io.jenkins.plugins.echarts.JenkinsPalette;
+
+/**
+ * Builds the Java side model for a trend chart showing the number of deleted and added lines of code in a build.
+ * The trend chart contains one series that shows the deleted lines and one series that shows the added lines
+ * per build. The number of builds to consider is controlled by a {@link ChartModelConfiguration} instance.
+ * The created model object can be serialized to JSON and can be used 1:1 as
+ * an ECharts configuration object in the corresponding JS file.
+ *
+ * @author Ullrich Hafner
+ */
+class AddedVersusDeletedLinesTrendChart {
+    /**
+     * Creates the chart for the specified results.
+     *
+     * @param results
+     *         the results to render - these results must be provided in descending order, i.e. the current
+     *         build is the head of the list, then the previous builds, and so on
+     * @param configuration
+     *         the chart configuration to be used
+     * @param seriesBuilder
+     *         the builder to plot the data points
+     * @param <T>
+     *         the type of the action that stores the results
+     *
+     * @return the chart model, ready to be serialized to JSON
+     */
+    <T> LinesChartModel create(
+            final Iterable<? extends BuildResult<T>> results,
+            final ChartModelConfiguration configuration,
+            final SeriesBuilder<T> seriesBuilder) {
+        var dataSet = seriesBuilder.createDataSet(configuration, results);
+
+        var model = new LinesChartModel(dataSet);
+        var newSeries = getSeries(
+                dataSet, "Added Lines", JenkinsPalette.GREEN, AddedVersusDeletedLinesForensicsSeriesBuilder.ADDED);
+        var fixedSeries = getSeries(
+                dataSet, "Deleted Lines", JenkinsPalette.RED, AddedVersusDeletedLinesForensicsSeriesBuilder.DELETED);
+
+        model.addSeries(newSeries, fixedSeries);
+
+        return model;
+    }
+
+    private LineSeries getSeries(
+            final LinesDataSet dataSet, final String name, final JenkinsPalette color, final String dataSetId) {
+        var newSeries = new LineSeries(name, color.normal(), StackedMode.SEPARATE_LINES, FilledMode.FILLED);
+        newSeries.addAll(dataSet.getSeries(dataSetId));
+        return newSeries;
+    }
+}

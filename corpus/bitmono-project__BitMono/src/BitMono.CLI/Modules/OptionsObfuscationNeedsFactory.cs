@@ -1,0 +1,216 @@
+﻿namespace BitMono.CLI.Modules;
+
+internal class OptionsObfuscationNeedsFactory
+{
+    private readonly string[] _args;
+
+    public OptionsObfuscationNeedsFactory(string[] args)
+    {
+        _args = args;
+    }
+
+    [SuppressMessage("ReSharper", "AssignNullToNotNullAttribute")]
+    public ObfuscationNeeds? Create(CancellationToken cancellationToken)
+    {
+        var parser = new Parser(with =>
+        {
+            with.EnableDashDash = true;
+            with.HelpWriter = Console.Error;
+        });
+        var parserResult = parser.ParseArguments<Options>(_args);
+        if (!parserResult.Errors.IsEmpty())
+        {
+            return null;
+        }
+        var options = parserResult.Value;
+
+        // --inspect-metadata is a standalone diagnostic, not an obfuscation run; hand it straight to Main.
+        if (!string.IsNullOrEmpty(options.InspectMetadata))
+        {
+            return new ObfuscationNeeds
+            {
+                Way = ObfuscationNeedsWay.Options,
+                InspectMetadataPath = options.InspectMetadata
+            };
+        }
+
+        // --encrypt-metadata is likewise a standalone step (the offline half), not an obfuscation run.
+        if (!string.IsNullOrEmpty(options.EncryptMetadata))
+        {
+            return new ObfuscationNeeds
+            {
+                Way = ObfuscationNeedsWay.Options,
+                EncryptMetadataPath = options.EncryptMetadata,
+                EncryptMetadataKey = options.MetadataKey
+            };
+        }
+
+        // --rename-il2cpp-exports is likewise a standalone post-build step (#276 export renaming).
+        if (!string.IsNullOrEmpty(options.RenameIl2cppExports))
+        {
+            return new ObfuscationNeeds
+            {
+                Way = ObfuscationNeedsWay.Options,
+                RenameExportsPath = options.RenameIl2cppExports,
+                EncryptMetadataKey = options.MetadataKey
+            };
+        }
+
+        ObfuscationSettings? obfuscationSettings = null;
+        try
+        {
+            if (options.ObfuscationFile != null && File.Exists(options.ObfuscationFile))
+            {
+                obfuscationSettings = Json.LoadFile<ObfuscationSettings>(options.ObfuscationFile);
+            }
+            else if (File.Exists(KnownConfigNames.Obfuscation))
+            {
+                obfuscationSettings = Json.LoadFile<ObfuscationSettings>(KnownConfigNames.Obfuscation);
+            }
+            else
+            {
+                // Fallback to application base directory
+                var baseObfuscationFile = Path.Combine(AppContext.BaseDirectory, KnownConfigNames.Obfuscation);
+                if (File.Exists(baseObfuscationFile))
+                {
+                    obfuscationSettings = Json.LoadFile<ObfuscationSettings>(baseObfuscationFile);
+                }
+            }
+
+            if (obfuscationSettings != null && options.NoWatermark)
+            {
+                obfuscationSettings.Watermark = false;
+            }
+
+            if (obfuscationSettings != null && options.IL2CPP)
+            {
+                obfuscationSettings.IL2CPP = true;
+            }
+
+            if (obfuscationSettings != null)
+            {
+                obfuscationSettings.StrongNameKeyFile = options.StrongNameKey;
+            }
+
+            if (obfuscationSettings != null && !string.IsNullOrEmpty(options.OutputName))
+            {
+                obfuscationSettings.OutputFileName = options.OutputName;
+            }
+
+            if (obfuscationSettings != null && !string.IsNullOrWhiteSpace(options.Plugins))
+            {
+                obfuscationSettings.PluginsDirectoryName = options.Plugins;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Warning: Could not load obfuscation configuration: {ex}");
+        }
+
+        var filePath = PathFormatterUtility.Format(options.File!);
+        if (!File.Exists(filePath))
+        {
+            Console.WriteLine($"File {filePath} cannot be found, please, try again!");
+            return null;
+        }
+        var fileBaseDirectory = Path.GetDirectoryName(filePath);
+
+        ProtectionSettings? protectionSettings = null;
+        string? protectionsFile = options.ProtectionsFile;
+        if (options.Protections.Any())
+        {
+            protectionSettings = new ProtectionSettings
+            {
+                Protections = options.Protections.Select(x => new ProtectionSetting
+                {
+                    Name = x,
+                    Enabled = true
+                }).ToList()
+            };
+        }
+        else if (ProtectionPresets.Expand(options.Preset ?? obfuscationSettings?.Preset) is { } presetProtectionSettings)
+        {
+            protectionSettings = presetProtectionSettings;
+            Console.WriteLine($"Using protection preset: {ProtectionPresets.Parse(options.Preset ?? obfuscationSettings?.Preset)} ({presetProtectionSettings.Protections.Count} protection(s)).");
+        }
+        else
+        {
+            // Try to find protections.json for fallback
+            if (protectionsFile != null && File.Exists(protectionsFile))
+            {
+                // Use specified file
+            }
+            else if (File.Exists(KnownConfigNames.Protections))
+            {
+                protectionsFile = KnownConfigNames.Protections;
+            }
+            else
+            {
+                // Fallback to application base directory
+                var baseProtectionsFile = Path.Combine(AppContext.BaseDirectory, KnownConfigNames.Protections);
+                if (File.Exists(baseProtectionsFile))
+                {
+                    protectionsFile = baseProtectionsFile;
+                }
+            }
+        }
+
+        // Multiple dependency directories may be passed via -l/--libraries; fall back to the
+        // configured (or default "libs") directory when none are given.
+        var librariesPaths = options.Libraries
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(PathFormatterUtility.Format)
+            .ToList();
+        var referencesDirectories = librariesPaths.Count > 0
+            ? librariesPaths
+            : new List<string> { Path.Combine(fileBaseDirectory, obfuscationSettings?.ReferencesDirectoryName ?? "libs") };
+
+        ObfuscationNeeds needs;
+        if (obfuscationSettings?.ForceObfuscation == true)
+        {
+            needs = new ObfuscationNeeds
+            {
+                FileName = filePath,
+                FileBaseDirectory = fileBaseDirectory,
+                ReferencesDirectoryName = fileBaseDirectory,
+                ReferencesDirectoryNames = new List<string> { fileBaseDirectory },
+                OutputPath = fileBaseDirectory,
+                Protections = options.Protections.ToList(),
+                ProtectionSettings = protectionSettings,
+                Way = ObfuscationNeedsWay.Options,
+                CriticalsFile = options.CriticalsFile,
+                LoggingFile = options.LoggingFile,
+                ObfuscationFile = options.ObfuscationFile,
+                ProtectionsFile = protectionsFile,
+                ObfuscationSettings = obfuscationSettings
+            };
+        }
+        else
+        {
+            needs = new ObfuscationNeeds
+            {
+                FileName = filePath,
+                FileBaseDirectory = fileBaseDirectory,
+                ReferencesDirectoryName = referencesDirectories[0],
+                ReferencesDirectoryNames = referencesDirectories,
+                OutputPath = options.Output?.IsNullOrEmpty() == false
+                    ? options.Output
+                    : Path.Combine(fileBaseDirectory, obfuscationSettings?.OutputDirectoryName ?? "output"),
+                Protections = options.Protections.ToList(),
+                ProtectionSettings = protectionSettings,
+                Way = ObfuscationNeedsWay.Options,
+                CriticalsFile = options.CriticalsFile,
+                LoggingFile = options.LoggingFile,
+                ObfuscationFile = options.ObfuscationFile,
+                ProtectionsFile = protectionsFile,
+                ObfuscationSettings = obfuscationSettings
+            };
+        }
+
+        needs.NoLogo = options.NoLogo;
+
+        Directory.CreateDirectory(needs.OutputPath);
+        Directory.CreateDirectory(needs.ReferencesDirectoryName);
+        return needs;
+    }
+}

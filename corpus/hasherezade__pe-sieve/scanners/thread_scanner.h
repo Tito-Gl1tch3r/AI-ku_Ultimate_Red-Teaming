@@ -1,0 +1,450 @@
+#pragma once
+
+#include <windows.h>
+
+#include "module_scanner.h"
+#include "../utils/threads_util.h"
+#include "../utils/process_symbols.h"
+#include "../stats/stats.h"
+#include "../stats/entropy_stats.h"
+#include <vector>
+
+namespace pesieve {
+
+	typedef enum ThSusIndicator {
+		THI_NONE,
+		THI_SUS_START,
+		THI_SUS_IP,
+		THI_SUS_RET,
+		THI_SUS_CALLSTACK_SHC,
+		THI_SUS_CALLS_INTEGRITY,
+		THI_SUS_CALLSTACK_CORRUPT,
+		THI_MAX
+	} _ThSusIndicator;
+
+	inline std::string indicator_to_str(const ThSusIndicator& indicator)
+	{
+		switch (indicator) {
+			case THI_NONE: return "NONE";
+			case THI_SUS_START: return "SUS_START";
+			case THI_SUS_IP: return "SUS_IP";
+			case THI_SUS_RET: return "SUS_RET";
+			case THI_SUS_CALLSTACK_SHC: return "SUS_CALLSTACK_SHC";
+			case THI_SUS_CALLS_INTEGRITY: return "SUS_CALLS_INTEGRITY";
+			case THI_SUS_CALLSTACK_CORRUPT: return "SUS_CALLSTACK_CORRUPT";
+		}
+		return "";
+	}
+
+	//!  A custom structure keeping a fragment of a thread context
+	typedef struct _ctx_details {
+		bool is64b;
+		ULONGLONG rip;
+		ULONGLONG rsp;
+		ULONGLONG rbp;
+		ULONGLONG last_ret; // the last return address on the stack
+		ULONGLONG ret_on_stack; // the last return address stored on the stack
+		bool is_ret_as_syscall;
+		bool is_ret_in_frame;
+		bool is_managed; // does it contain .NET modules
+		std::vector<ULONGLONG> callStack;
+
+		_ctx_details(bool _is64b = false, ULONGLONG _rip = 0, ULONGLONG _rsp = 0, ULONGLONG _rbp = 0, ULONGLONG _ret_addr = 0)
+		{
+			init(_is64b, _rip, _rsp, _rbp, _ret_addr);
+		}
+
+		void init(bool _is64b = false, ULONGLONG _rip = 0, ULONGLONG _rsp = 0, ULONGLONG _rbp = 0, ULONGLONG _ret_addr = 0)
+		{
+			this->is64b = _is64b;
+			this->rip = _rip;
+			this->rsp = _rsp;
+			this->rbp = _rbp;
+			this->last_ret = _ret_addr;
+			this->ret_on_stack = 0;
+			this->is_ret_as_syscall = true;
+			this->is_ret_in_frame = true;
+			this->is_managed = false;
+			this->callStack.clear();
+		}
+
+	} ctx_details;
+
+	class SuspAddrReport {
+	public:
+		SuspAddrReport(ULONGLONG _module = 0 , size_t _moduleSize = 0, DWORD _allocProtection = 0)
+			: module(_module), moduleSize(_moduleSize),
+			alloc_protection(_allocProtection), curr_protection(0),
+			is_code(false)
+		{
+		}
+
+		void print()
+		{
+			std::cout << __FUNCTION__ << " : " << std::hex << module << " : " << moduleSize
+				<< " alloc_protect: " << alloc_protection
+				<< " curr_protect: " << curr_protection
+				<< " is_code: " << is_code
+				<< " entropy: " << stats.entropy
+				<< " susp_addr [";
+			for (auto itr = suspAddresses.begin(); itr != suspAddresses.end(); ++itr) {
+				ULONGLONG susp_addr = *itr;
+				std::cout << " " << susp_addr;
+			}
+			std::cout << " ]" << std::endl;
+		}
+
+		const bool toJSON(std::stringstream& outs, size_t level, const pesieve::t_json_level& jdetails) const
+		{
+			if (addressesToJSON(outs, level, jdetails)) {
+				outs << ",\n";
+			}
+			moduleInfoToJSON(outs, level, jdetails);
+			return true;
+		}
+
+		void addSuspAddr(ULONGLONG addr)
+		{
+			this->suspAddresses.insert(addr);
+		}
+
+		bool addressesToJSON(std::stringstream& outs,size_t level,const pesieve::t_json_level& jdetails) const
+		{
+			if (!suspAddresses.size()) {
+				return false;
+			}
+
+			std::string addrTypeStr = "susp_return_addr";
+			if (this->module && this->moduleSize) {
+				addrTypeStr = "susp_addr";
+			}
+
+			OUT_PADDED(outs, level, "\"" << addrTypeStr << "\" : [");
+
+			bool isFirst = true;
+			for (auto itr = suspAddresses.begin(); itr != suspAddresses.end(); ++itr) {
+				const ULONGLONG susp_addr = *itr;
+				if (!susp_addr) {
+					continue;
+				}
+				if (!isFirst) {
+					outs << ", ";
+				}
+				outs << "\"" << std::hex << susp_addr << "\"";
+				isFirst = false;
+			}
+			outs << "]";
+			return true;
+		}
+
+		bool moduleInfoToJSON(std::stringstream& outs, size_t level, const pesieve::t_json_level& jdetails) const
+		{
+			if (!this->module) {
+				return false;
+			}
+			OUT_PADDED(outs, level, "\"module\" : ");
+			outs << "\"" << std::hex << (ULONGLONG)module << "\"";
+			if (moduleSize) {
+				outs << ",\n";
+				OUT_PADDED(outs, level, "\"module_size\" : ");
+				outs << "\"" << std::hex << (ULONGLONG)moduleSize << "\"";
+			}
+			outs << ",\n";
+			if (alloc_protection != curr_protection) {
+				OUT_PADDED(outs, level, "\"alloc_protection\" : ");
+				outs << "\"" << std::hex << alloc_protection << "\"";
+				outs << ",\n";
+				OUT_PADDED(outs, level, "\"curr_protection\" : ");
+				outs << "\"" << std::hex << curr_protection << "\"";
+			}
+			else {
+				OUT_PADDED(outs, level, "\"protection\" : ");
+				outs << "\"" << std::hex << curr_protection << "\"";
+			}
+			outs << ",\n";
+			OUT_PADDED(outs, level, "\"is_code\" : ");
+			outs << "\"" << std::dec << is_code << "\"";
+			if (stats.isFilled()) {
+				outs << ",\n";
+				stats.toJSON(outs, level);
+			}
+			outs << "\n";
+			return true;
+		}
+
+		ULONG_PTR module;
+		size_t moduleSize;
+		std::set<ULONGLONG> suspAddresses;
+		DWORD alloc_protection;
+		DWORD curr_protection;
+		AreaEntropyStats stats;
+		bool is_code;
+	};
+
+	//!  A report from the thread scan, generated by ThreadScanner
+	class ThreadScanReport : public ModuleScanReport
+	{
+	public:
+		static const DWORD THREAD_STATE_UNKNOWN = (-1);
+		static const DWORD THREAD_STATE_WAITING = 5;
+
+		static std::string translate_thread_state(DWORD thread_state);
+		static std::string translate_wait_reason(DWORD thread_wait_reason);
+		
+		//---
+
+		ThreadScanReport(DWORD _tid)
+			: ModuleScanReport(0, 0), 
+			tid(_tid), stack_ptr(0),
+			thread_state(THREAD_STATE_UNKNOWN), 
+			thread_wait_reason(0), thread_wait_time(0),
+			has_native_wow64_context(false)
+		{
+		}
+
+		~ThreadScanReport()
+		{
+			for (auto itr = this->suspAreaReports.begin(); itr != this->suspAreaReports.end(); ++itr) {
+				SuspAddrReport* rep = itr->second;
+				delete rep;
+			}
+			suspAreaReports.clear();
+		}
+		
+		SuspAddrReport* findAreaForAddress(const ULONGLONG &susp_addr)
+		{
+			auto found = this->suspAreaReports.find(susp_addr);
+			if (found != this->suspAreaReports.end()) {
+				return found->second;
+			}
+			for (auto itr = this->suspAreaReports.begin(); itr != this->suspAreaReports.end(); ++itr) {
+				SuspAddrReport* rep = itr->second;
+				if (!rep) continue;
+				if (susp_addr >= rep->module && susp_addr < (rep->module + rep->moduleSize)) {
+					return rep;
+				}
+			}
+			return nullptr;
+		}
+
+		const virtual void callstackToJSON(std::stringstream& outs, size_t level, const pesieve::t_json_level& jdetails, const ctx_details& details)
+		{
+			bool printCallstack = (jdetails >= JSON_DETAILS) ? true : false;
+			if (this->indicators.find(THI_SUS_CALLSTACK_CORRUPT) != this->indicators.end()) {
+				printCallstack = true;
+			}
+			if (this->indicators.find(THI_SUS_CALLSTACK_SHC) != this->indicators.end()) {
+				printCallstack = true;
+			}
+			OUT_PADDED(outs, level, "\"stack_ptr\" : ");
+			outs << "\"" << std::hex << details.rsp << "\"";
+			if (details.callStack.size()) {
+				outs << ",\n";
+				OUT_PADDED(outs, level, "\"frames_count\" : ");
+				outs << std::dec << details.callStack.size();
+				if (printCallstack) {
+					outs << ",\n";
+					OUT_PADDED(outs, level, "\"frames\" : [");
+					for (auto itr = details.callStack.rbegin(); itr != details.callStack.rend(); ++itr) {
+						if (itr != details.callStack.rbegin()) {
+							outs << ", ";
+						}
+						const ULONGLONG addr = *itr;
+						outs << "\"" << std::hex << addr;
+						auto sItr = this->addrToSymbol.find(addr);
+						if (sItr != this->addrToSymbol.end()) {
+							const std::string &sym = sItr->second;
+							if (!sym.empty()) {
+								outs << ";" << sym;
+							}
+						}
+						outs << "\"";
+					}
+					outs << "]";
+				}
+			}
+		}
+
+		const bool threadInfoToJSON(std::stringstream& outs, size_t level, const pesieve::t_json_level& jdetails)
+		{
+			OUT_PADDED(outs, level, "\"state\" : ");
+			if (thread_state == THREAD_STATE_UNKNOWN) {
+				outs << "\"" << "UNKNOWN" << "\"";
+			}
+			else {
+				outs << "\"" << translate_thread_state(thread_state) << "\"";
+			}
+			if (thread_state == THREAD_STATE_WAITING) {
+				outs << ",\n";
+				OUT_PADDED(outs, level, "\"wait_reason\" : ");
+				outs << "\"" << translate_wait_reason(thread_wait_reason) << "\"";
+			}
+			if (stack_ptr) {
+				outs << ",\n";
+				OUT_PADDED(outs, level, "\"callstack\" : {\n");
+				callstackToJSON(outs, level + 1, jdetails, cDetails);
+				outs << "\n";
+				OUT_PADDED(outs, level, "}");
+			}
+			if (has_native_wow64_context && nativeWow64Details.rsp) {
+				outs << ",\n";
+				OUT_PADDED(outs, level, "\"native_callstack\" : {\n");
+				callstackToJSON(outs, level + 1, jdetails, nativeWow64Details);
+				outs << "\n";
+				OUT_PADDED(outs, level, "}");
+			}
+			bool showLastCall = (jdetails >= JSON_DETAILS) ? true : false;
+			if ((this->indicators.find(THI_SUS_CALLS_INTEGRITY) != this->indicators.end()) || 
+				(this->indicators.find(THI_SUS_CALLSTACK_CORRUPT) != this->indicators.end()) )
+			{
+				showLastCall = true;
+			}
+			if (showLastCall) {
+				if (!this->lastSyscall.empty()) {
+					outs << ",\n";
+					OUT_PADDED(outs, level, "\"last_sysc\" : ");
+					outs << "\"" << this->lastSyscall << "\"";
+				}
+				if (!this->lastFunction.empty() && (this->lastFunction != this->lastSyscall)) {
+					outs << ",\n";
+					OUT_PADDED(outs, level, "\"last_func\" : ");
+					outs << "\"" << this->lastFunction << "\"";
+				}
+			}
+			outs << "\n";
+			return true;
+		}
+
+		const bool indicatorsToJSON(std::stringstream& outs, size_t level, const pesieve::t_json_level& jdetails)
+		{
+			OUT_PADDED(outs, level, "\"indicators\" : [");
+			for (auto itr = indicators.begin(); itr != indicators.end(); ++itr) {
+				if (itr != indicators.begin()) {
+					outs << ", ";
+				}
+				outs << "\"" << indicator_to_str(*itr) << "\"";
+			}
+			outs << "]";
+			return true;
+		}
+
+		const virtual void fieldsToJSON(std::stringstream &outs, size_t level, const pesieve::t_json_level &jdetails)
+		{
+			ElementScanReport::_toJSON(outs, level);
+			outs << ",\n";
+			OUT_PADDED(outs, level, "\"thread_id\" : ");
+			outs << std::dec << tid;
+			outs << ",\n";
+			OUT_PADDED(outs, level, "\"thread_info\" : {\n");
+			threadInfoToJSON(outs, level + 1, jdetails);
+			OUT_PADDED(outs, level, "}");
+			outs << ",\n";
+			indicatorsToJSON(outs, level, jdetails);
+
+			if (!suspAreaReports.empty()) {
+				outs << ",\n";
+				OUT_PADDED(outs, level, "\"susp_areas\" : [\n");
+
+				bool isFirst = true;
+				for (const auto& entry : suspAreaReports) {
+					const SuspAddrReport* suspr = entry.second;
+					if (!suspr) {
+						continue;
+					}
+					if (!isFirst) {
+						outs << ",\n";
+					}
+					OUT_PADDED(outs, level + 1, "{\n");
+					suspr->toJSON(outs, level + 2, jdetails);
+					OUT_PADDED(outs, level + 1, "}");
+					isFirst = false;
+				}
+				outs << "\n";
+				OUT_PADDED(outs, level, "]");
+			}
+		}
+
+		const virtual bool toJSON(std::stringstream& outs, size_t level, const pesieve::t_json_level &jdetails)
+		{
+			OUT_PADDED(outs, level, "\"thread_scan\" : {\n");
+			fieldsToJSON(outs, level + 1, jdetails);
+			outs << "\n";
+			OUT_PADDED(outs, level, "}");
+			return true;
+		}
+
+		DWORD tid;
+		ULONGLONG stack_ptr;
+		DWORD thread_state;
+		DWORD thread_wait_reason;
+		DWORD thread_wait_time;
+
+		std::string lastSyscall;
+		std::string lastFunction;
+
+		// Primary context used by the existing analysis logic. For a WOW64 target
+		// scanned by a 64-bit build, this remains the 32-bit guest context.
+		ctx_details cDetails;
+
+		// Additional native AMD64 context exposed for WOW64 targets. It is report-only
+		// in this narrow refactor; indicator semantics remain unchanged.
+		bool has_native_wow64_context;
+		ctx_details nativeWow64Details;
+
+		std::map<ULONGLONG, std::string> addrToSymbol;
+		std::set<ULONGLONG> shcCandidates;
+		std::set<ThSusIndicator> indicators;
+		std::map<ULONGLONG, SuspAddrReport*> suspAreaReports;
+	};
+
+	//!  A scanner for threads
+	//!  Stack-scan inspired by the idea presented here: https://github.com/thefLink/Hunt-Sleeping-Beacons
+	class ThreadScanner : public ProcessFeatureScanner {
+	public:
+		ThreadScanner(HANDLE hProc, bool _isReflection, bool _isManaged, const util::thread_info& _info, ModulesInfo& _modulesInfo, peconv::ExportsMapper* _exportsMap, ProcessSymbolsManager* _symbols)
+			: ProcessFeatureScanner(hProc), isReflection(_isReflection), isManaged(_isManaged),
+			info(_info), modulesInfo(_modulesInfo), exportsMap(_exportsMap), symbols(_symbols)
+		{
+		}
+
+		virtual ThreadScanReport* scanRemote();
+
+	protected:
+		void initReport(ThreadScanReport& my_report);
+		void reportResolvedCallstack(ThreadScanReport& my_report);
+		static std::string choosePreferredFunctionName(const std::string& dbgSymbol, const std::string& manualSymbol);
+
+		bool scanRemoteThreadCtx(HANDLE hThread, ThreadScanReport& my_report);
+		bool fetchThreadCtxDetails(IN HANDLE hProcess, IN HANDLE hThread, OUT ThreadScanReport& my_report);
+
+		bool isAddrInNamedModule(ULONGLONG addr);
+		void printThreadInfo(const util::thread_info& threadi);
+		std::string resolveLowLevelFuncName(IN const ULONGLONG addr, OUT OPTIONAL size_t* disp = nullptr);
+		std::string resolveAddrToString(IN ULONGLONG addr);
+		bool printResolvedAddr(const ULONGLONG addr);
+		size_t fillCallStackInfo(IN HANDLE hThread, const IN LPVOID ctx, IN OUT ctx_details& cDetails);
+		bool fetchNativeThreadCtxDetails(IN HANDLE hProcess, IN HANDLE hThread, IN OUT ctx_details& cDetails);
+#ifdef _WIN64
+		bool fetchWow64ThreadCtxDetails(IN HANDLE hProcess, IN HANDLE hThread, IN OUT ctx_details& cDetails);
+#endif
+		size_t analyzeCallStackInfo(IN OUT ThreadScanReport& my_report);
+		size_t _analyzeCallStack(IN OUT ctx_details& cDetails, OUT IN std::set<ULONGLONG>& shcCandidates);
+
+		bool checkReturnAddrIntegrity(IN const std::vector<ULONGLONG>& callStack, IN OUT ThreadScanReport& my_report);
+
+		bool fillAreaStats(SuspAddrReport* my_report);
+		bool reportSuspiciousAddr(ThreadScanReport* my_report, ULONGLONG susp_addr);
+		bool filterDotNet(ThreadScanReport& my_report);
+
+		// Assigns the final verdict basing on collected indicators. Returns true if the report was modified.
+		bool assessIndicators(ThreadScanReport& my_report);
+
+		bool isReflection;
+		bool isManaged;
+		const util::thread_info& info;
+		ModulesInfo& modulesInfo;
+		peconv::ExportsMapper* exportsMap;
+		ProcessSymbolsManager* symbols;
+	};
+
+}; //namespace pesieve

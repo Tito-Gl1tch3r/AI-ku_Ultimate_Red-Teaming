@@ -1,0 +1,164 @@
+import { useEffect, useState, useCallback } from 'react'
+import { Button, Progress, Tag } from '../../ui'
+import {
+  IconSync,
+  IconLoading,
+  IconCheckCircle,
+  IconCloseCircle,
+  IconCloudDownload,
+  IconEdit,
+  IconApi,
+  IconGitHub,
+  IconFileText,
+  IconExport,
+} from '../../ui/Icons'
+import type { UpdateStatus } from '@shared/types'
+import PromptTemplateModal from '../PromptTemplateModal'
+import MCPServerModal from '../MCPServerModal'
+
+export default function GeneralSection() {
+  const [appVersion, setAppVersion] = useState('')
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({ state: 'idle' })
+  const [templateModalOpen, setTemplateModalOpen] = useState(false)
+  const [mcpModalOpen, setMcpModalOpen] = useState(false)
+
+  useEffect(() => {
+    window.electronAPI.getAppVersion().then(setAppVersion)
+  }, [])
+
+  // Subscribe to update status events
+  useEffect(() => {
+    window.electronAPI.onUpdateStatus((status: UpdateStatus) => {
+      setUpdateStatus(status)
+    })
+    return () => {
+      window.electronAPI.removeAllListeners('update:status')
+    }
+  }, [])
+
+  const handleCheckUpdate = useCallback(() => {
+    setUpdateStatus({ state: 'checking' })
+    window.electronAPI.checkForUpdate()
+  }, [])
+
+  const handleInstallUpdate = useCallback(() => {
+    window.electronAPI.installUpdate()
+  }, [])
+
+  return (
+    <>
+      {/* About & Version */}
+      <div style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={{ fontSize: 'var(--font-size-xl)', fontWeight: 600, color: 'var(--text-primary)' }}>
+          Anything Analyzer
+        </span>
+        <span style={{ color: 'var(--text-secondary)' }}>v{appVersion}</span>
+        <a
+          href="https://github.com/Mouseww/anything-analyzer"
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            color: 'var(--text-muted)',
+            transition: 'color 0.15s',
+          }}
+          title="GitHub"
+          onMouseEnter={e => (e.currentTarget.style.color = 'var(--text-primary)')}
+          onMouseLeave={e => (e.currentTarget.style.color = 'var(--text-muted)')}
+          onClick={e => {
+            e.preventDefault()
+            window.electronAPI.openExternal('https://github.com/Mouseww/anything-analyzer')
+          }}
+        >
+          <IconGitHub size={18} />
+        </a>
+      </div>
+
+      {/* Update */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, flexWrap: 'wrap' }}>
+        {updateStatus.state === 'idle' && (
+          <Button size="sm" icon={<IconSync size={14} />} onClick={handleCheckUpdate}>
+            检查更新
+          </Button>
+        )}
+        {updateStatus.state === 'checking' && (
+          <Button size="sm" icon={<IconLoading size={14} />} disabled>
+            正在检查...
+          </Button>
+        )}
+        {updateStatus.state === 'not-available' && (
+          <>
+            <IconCheckCircle size={14} style={{ color: 'var(--color-success)' }} />
+            <span style={{ fontSize: 'var(--font-size-base)' }}>已是最新版本</span>
+            <Button size="sm" onClick={handleCheckUpdate}>重新检查</Button>
+          </>
+        )}
+        {updateStatus.state === 'available' && (
+          <>
+            <Tag color="info">v{updateStatus.info?.version} 可用</Tag>
+            <span style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-base)' }}>正在下载...</span>
+          </>
+        )}
+        {updateStatus.state === 'downloaded' && (
+          <>
+            <IconCloudDownload size={14} style={{ color: 'var(--color-accent)' }} />
+            <span style={{ fontSize: 'var(--font-size-base)' }}>v{updateStatus.info?.version} 已就绪</span>
+            <Button variant="primary" size="sm" onClick={handleInstallUpdate}>
+              立即重启更新
+            </Button>
+          </>
+        )}
+        {updateStatus.state === 'error' && (
+          <>
+            <IconCloseCircle size={14} style={{ color: 'var(--color-error)' }} />
+            <span style={{ color: 'var(--color-error)', fontSize: 'var(--font-size-sm)' }}>{updateStatus.error}</span>
+            <Button size="sm" onClick={handleCheckUpdate}>重试</Button>
+          </>
+        )}
+      </div>
+
+      {updateStatus.state === 'downloading' && (
+        <Progress
+          percent={Math.round(updateStatus.progress?.percent ?? 0)}
+          status="normal"
+        />
+      )}
+
+      <div style={{ marginTop: 24 }}>
+        <div style={{ fontSize: 'var(--font-size-base)', fontWeight: 600, marginBottom: 12, color: 'var(--text-primary)' }}>
+          管理工具
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%' }}>
+          <Button icon={<IconEdit size={14} />} block onClick={() => setTemplateModalOpen(true)}>
+            管理提示词模板
+          </Button>
+          <Button icon={<IconApi size={14} />} block onClick={() => setMcpModalOpen(true)}>
+            管理 MCP 服务器
+          </Button>
+        </div>
+      </div>
+
+      {/* Error Logs */}
+      <div style={{ marginTop: 24 }}>
+        <div style={{ fontSize: 'var(--font-size-base)', fontWeight: 600, marginBottom: 12, color: 'var(--text-primary)' }}>
+          错误日志
+        </div>
+        <div style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)', marginBottom: 8 }}>
+          遇到问题时可导出日志文件发送给开发者以便排查
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Button icon={<IconFileText size={14} />} onClick={() => window.electronAPI.openLogFolder()}>
+            打开日志目录
+          </Button>
+          <Button icon={<IconExport size={14} />} onClick={() => window.electronAPI.exportLogs()}>
+            导出日志
+          </Button>
+        </div>
+      </div>
+
+      <PromptTemplateModal open={templateModalOpen} onClose={() => setTemplateModalOpen(false)} />
+      <MCPServerModal open={mcpModalOpen} onClose={() => setMcpModalOpen(false)} />
+    </>
+  )
+}

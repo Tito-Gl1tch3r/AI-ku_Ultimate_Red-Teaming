@@ -1,0 +1,103 @@
+import { Component, OnInit, Inject, ViewChild, ChangeDetectionStrategy } from '@angular/core';
+import { MatDialogRef, MAT_DIALOG_DATA } from '@angular/material/dialog';
+import { IndexeddbService } from '../indexeddb.service';
+import { MatSort, Sort, MatSortModule } from '@angular/material/sort';
+import { MatTableDataSource, MatTableModule } from '@angular/material/table';
+import { MatPaginator, MatPaginatorModule } from '@angular/material/paginator';
+import { Router } from '@angular/router';
+
+@Component({
+  selector: 'app-dialog-report-history',
+  standalone: false,
+  //imports: [],
+  templateUrl: './dialog-report-history.component.html',
+  changeDetection: ChangeDetectionStrategy.Eager,
+  styleUrl: './dialog-report-history.component.scss'
+})
+export class DialogReportHistoryComponent implements OnInit {
+
+  displayedColumns: string[] = ['report_name', 'report_lastupdate', 'settings'];
+  dataSource = new MatTableDataSource([]);
+  anyreports = false;
+  loading = false;
+
+  @ViewChild(MatSort) set sort(sort: MatSort) {
+    if (sort) this.dataSource.sort = sort;
+  }
+
+  @ViewChild('paginator') set paginator(paginator: MatPaginator) {
+    if (paginator) this.dataSource.paginator = paginator;
+  }
+
+
+  // @ts-ignore
+  constructor(public router: Router, public dialogRef: MatDialogRef<DialogReportcssComponent>, private indexeddbService: IndexeddbService, @Inject(MAT_DIALOG_DATA) public data: any) { }
+
+  ngOnInit(): void {
+
+    this.getreports();
+
+  }
+
+
+  getreports(): void {
+    this.loading = true;
+    this.indexeddbService.getReportsHistory(this.data).then(retdata => {
+      if (retdata.length > 0) {
+        this.anyreports = true;
+        this.dataSource.data = retdata;
+      } else {
+        this.dataSource.data = [];
+        this.anyreports = false;
+      }
+      this.loading = false;
+    });
+  }
+
+  downloadhistoryreport(report: any): void {
+
+    const enc = btoa(JSON.stringify(report));
+    const blob = new Blob([encodeURIComponent(enc)], { type: 'text/plain' });
+    const link = document.createElement('a');
+    const url = window.URL.createObjectURL(blob);
+    link.setAttribute('href', url);
+    link.setAttribute('download', report.report_name + ' ' + report.report_id + ' (vulnrepo.com).vulnr');
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+
+  }
+
+  replacereport(report: any): void {
+
+    const importreport = report;
+
+    this.indexeddbService.deleteReport(importreport, false).then(data => {
+
+
+      if (data) {
+        this.indexeddbService.importReport(JSON.stringify(importreport)).then(data => {
+
+          this.router.navigate(['report/', importreport.report_id]).then(() => {
+            window.location.reload();
+          });
+
+        });
+      }
+
+    });
+
+  }
+
+  removereporthistory(report:any): void {
+
+    this.indexeddbService.deletesingleReporthistory(report).then(data => {
+      if (data) {
+        this.getreports();
+      }
+    });
+
+  }
+
+}

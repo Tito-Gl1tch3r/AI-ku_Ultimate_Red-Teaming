@@ -1,0 +1,169 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Yammi\AuditLog\Tests\Unit\Presentation\ViewModel;
+
+use PHPUnit\Framework\TestCase;
+use Yammi\AuditLog\Application\DTO\Audit\TimelineEntryData;
+use Yammi\AuditLog\Presentation\ViewModel\TimelineEntryViewModel;
+
+final class TimelineEntryViewModelTest extends TestCase
+{
+    public function test_it_presents_the_entry_fields(): void
+    {
+        $entry = $this->viewModel(chainSize: 3);
+
+        $this->assertSame('Order', $entry->model());
+        $this->assertSame('7', $entry->id());
+        $this->assertSame('updated', $entry->event());
+        $this->assertSame('user', $entry->actorType());
+        $this->assertSame('Jane', $entry->actorLabel());
+        $this->assertSame('app:sync', $entry->originLabel());
+        $this->assertSame('corr-1', $entry->correlationId());
+        $this->assertTrue($entry->isNoise());
+        $this->assertSame(3, $entry->chainSize());
+        $this->assertTrue($entry->hasChain());
+        $this->assertSame(2, $entry->changeCount());
+    }
+
+    public function test_it_exposes_the_change_reason(): void
+    {
+        $this->assertNull($this->viewModel(chainSize: 1)->reason());
+
+        $entry = new TimelineEntryViewModel(new TimelineEntryData(
+            id: 1,
+            auditableType: 'App\\Models\\Order',
+            auditableId: '7',
+            event: 'updated',
+            actorType: 'user',
+            actorLabel: 'Jane',
+            originLabel: null,
+            changes: ['status' => ['old' => 'a', 'new' => 'b']],
+            labels: [],
+            occurredAt: '2026-01-01T10:00:00+00:00',
+            correlationId: null,
+            reason: 'ticket #4521',
+        ), 1);
+
+        $this->assertSame('ticket #4521', $entry->reason());
+    }
+
+    public function test_a_single_change_has_no_chain(): void
+    {
+        $this->assertFalse($this->viewModel(chainSize: 1)->hasChain());
+    }
+
+    public function test_occurred_at_is_formatted(): void
+    {
+        $entry = $this->viewModel(chainSize: 1);
+
+        $this->assertSame('2026-01-01 10:00', $entry->occurredAt());
+        $this->assertSame('01.01.2026', $entry->occurredAt('d.m.Y'));
+    }
+
+    public function test_occurred_at_converts_to_the_display_timezone(): void
+    {
+        $entry = new TimelineEntryData(
+            id: 1,
+            auditableType: 'App\\Models\\Order',
+            auditableId: '1',
+            event: 'updated',
+            actorType: 'user',
+            actorLabel: 'Jane',
+            originLabel: null,
+            changes: [],
+            labels: [],
+            occurredAt: '2026-01-01T10:00:00+00:00',
+            correlationId: null,
+        );
+
+        $viewModel = new TimelineEntryViewModel($entry, 1, null, 'Asia/Tokyo');
+
+        $this->assertSame('2026-01-01 19:00', $viewModel->occurredAt());
+    }
+
+    public function test_change_rows_present_nulls_and_arrays_as_strings(): void
+    {
+        $rows = $this->viewModel(chainSize: 1)->changes();
+
+        $this->assertSame(
+            [
+                ['field' => 'status', 'old' => 'a', 'new' => 'b', 'oldLabel' => null, 'newLabel' => null],
+                ['field' => 'meta', 'old' => '—', 'new' => '{"x":1}', 'oldLabel' => null, 'newLabel' => null],
+            ],
+            $rows,
+        );
+    }
+
+    public function test_a_job_actor_links_to_the_configured_jobs_monitor(): void
+    {
+        $entry = new TimelineEntryData(
+            id: 1,
+            auditableType: 'App\\Models\\Order',
+            auditableId: '1',
+            event: 'updated',
+            actorType: 'job',
+            actorLabel: 'App\\Jobs\\ProcessOrder',
+            originLabel: null,
+            changes: [],
+            labels: [],
+            occurredAt: '2026-01-01T10:00:00+00:00',
+            correlationId: null,
+        );
+
+        $viewModel = new TimelineEntryViewModel($entry, 1, '/jobs-monitor/');
+
+        $this->assertSame('/jobs-monitor?search=App%5CJobs%5CProcessOrder', $viewModel->jobsMonitorLink());
+    }
+
+    public function test_non_job_actors_and_missing_config_have_no_monitor_link(): void
+    {
+        $userEntry = $this->viewModel(chainSize: 1);
+
+        $this->assertNull($userEntry->jobsMonitorLink());
+    }
+
+    public function test_change_rows_carry_snapshotted_labels(): void
+    {
+        $entry = new TimelineEntryData(
+            id: 1,
+            auditableType: 'App\\Models\\Order',
+            auditableId: '1',
+            event: 'updated',
+            actorType: 'user',
+            actorLabel: 'Jane',
+            originLabel: null,
+            changes: ['user_id' => ['old' => 5, 'new' => 7]],
+            labels: ['user_id.old' => 'John Doe', 'user_id.new' => 'Jane Smith'],
+            occurredAt: '2026-01-01T10:00:00+00:00',
+            correlationId: null,
+        );
+
+        $rows = (new TimelineEntryViewModel($entry, 1))->changes();
+
+        $this->assertSame('John Doe', $rows[0]['oldLabel']);
+        $this->assertSame('Jane Smith', $rows[0]['newLabel']);
+    }
+
+    private function viewModel(int $chainSize): TimelineEntryViewModel
+    {
+        return new TimelineEntryViewModel(new TimelineEntryData(
+            id: 12,
+            auditableType: 'App\\Models\\Order',
+            auditableId: '7',
+            event: 'updated',
+            actorType: 'user',
+            actorLabel: 'Jane',
+            originLabel: 'app:sync',
+            changes: [
+                'status' => ['old' => 'a', 'new' => 'b'],
+                'meta' => ['old' => null, 'new' => ['x' => 1]],
+            ],
+            labels: [],
+            occurredAt: '2026-01-01T10:00:00+00:00',
+            correlationId: 'corr-1',
+            isNoise: true,
+        ), $chainSize);
+    }
+}

@@ -1,0 +1,818 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pycryptodome>=3.20,<4"]
+# ///
+"""Guided remote onboarding CLI for pairing vacuums through the main server.
+
+This is a standalone script. Copy it to any machine and run:
+
+    uv run start_onboarding.py --server api-roborock.example.com
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from getpass import getpass
+import io
+import json
+import secrets
+import socket
+import ssl
+import sys
+import time
+from typing import Any, Callable, TextIO
+from urllib import error, parse, request
+import zlib
+
+from Crypto.Cipher import AES, PKCS1_v1_5
+from Crypto.PublicKey import RSA
+from Crypto.Util.Padding import pad
+
+from onboarding_shared import build_ssl_context, perform_onboarding_preflight
+
+
+CFGWIFI_HOST = "192.168.8.1"
+CFGWIFI_PORT = 55559
+CFGWIFI_TIMEOUT_SECONDS = 2.0
+CFGWIFI_PRE_KEY = "6433df70f5a3a42e"
+CFGWIFI_UID = "1234567890"
+DEFAULT_COUNTRY_DOMAIN = "us"
+DEFAULT_TIMEZONE = "America/New_York"
+DEFAULT_STACK_HTTPS_PORT = 555
+MAX_STACK_SERVER_LENGTH = 32
+POLL_INTERVAL_SECONDS = 5.0
+POLL_TIMEOUT_SECONDS = 300.0
+# Public-key recovery runs on the server and can outlast the normal traffic timeout.
+KEY_RECOVERY_TIMEOUT_SECONDS = 1200.0
+
+# Mapping from IANA timezone to POSIX TZ string for the vacuum firmware.
+_IANA_TO_POSIX: dict[str, str] = {
+    "America/New_York": "EST5EDT,M3.2.0,M11.1.0",
+    "America/Chicago": "CST6CDT,M3.2.0,M11.1.0",
+    "America/Denver": "MST7MDT,M3.2.0,M11.1.0",
+    "America/Los_Angeles": "PST8PDT,M3.2.0,M11.1.0",
+    "America/Phoenix": "MST7",
+    "America/Anchorage": "AKST9AKDT,M3.2.0,M11.1.0",
+    "Pacific/Honolulu": "HST10",
+    "America/Toronto": "EST5EDT,M3.2.0,M11.1.0",
+    "America/Vancouver": "PST8PDT,M3.2.0,M11.1.0",
+    "America/Winnipeg": "CST6CDT,M3.2.0,M11.1.0",
+    "America/Edmonton": "MST7MDT,M3.2.0,M11.1.0",
+    "Europe/London": "GMT0BST,M3.5.0/1,M10.5.0",
+    "Europe/Berlin": "CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Paris": "CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Amsterdam": "CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Vienna": "CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Rome": "CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Madrid": "CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Warsaw": "CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Stockholm": "CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Zurich": "CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Brussels": "CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Moscow": "MSK-3",
+    "Asia/Shanghai": "CST-8",
+    "Asia/Tokyo": "JST-9",
+    "Asia/Kolkata": "IST-5:30",
+    "Australia/Sydney": "AEST-10AEDT,M10.1.0,M4.1.0/3",
+    "Australia/Melbourne": "AEST-10AEDT,M10.1.0,M4.1.0/3",
+    "Australia/Perth": "AWST-8",
+}
+DEFAULT_CST = _IANA_TO_POSIX[DEFAULT_TIMEZONE]
+
+
+def posix_tz_from_iana(iana: str) -> str:
+    """Return a POSIX TZ string for the given IANA timezone, or empty string if unknown."""
+    return _IANA_TO_POSIX.get(iana.strip(), "")
+
+
+# Mapping from IANA timezone to country domain for the vacuum firmware.
+_IANA_TO_COUNTRY: dict[str, str] = {
+    "America/New_York": "us",
+    "America/Chicago": "us",
+    "America/Denver": "us",
+    "America/Los_Angeles": "us",
+    "America/Phoenix": "us",
+    "America/Anchorage": "us",
+    "Pacific/Honolulu": "us",
+    "America/Toronto": "us",
+    "America/Vancouver": "us",
+    "America/Winnipeg": "us",
+    "America/Edmonton": "us",
+    "Europe/London": "eu",
+    "Europe/Berlin": "eu",
+    "Europe/Paris": "eu",
+    "Europe/Amsterdam": "eu",
+    "Europe/Vienna": "eu",
+    "Europe/Rome": "eu",
+    "Europe/Madrid": "eu",
+    "Europe/Warsaw": "eu",
+    "Europe/Stockholm": "eu",
+    "Europe/Zurich": "eu",
+    "Europe/Brussels": "eu",
+    "Europe/Moscow": "ru",
+    "Europe/Kaliningrad": "ru",
+    "Europe/Samara": "ru",
+    "Europe/Volgograd": "ru",
+    "Europe/Kirov": "ru",
+    "Europe/Astrakhan": "ru",
+    "Europe/Saratov": "ru",
+    "Europe/Ulyanovsk": "ru",
+    "Asia/Shanghai": "cn",
+    "Asia/Tokyo": "jp",
+    "Asia/Kolkata": "in",
+    "Australia/Sydney": "au",
+    "Australia/Melbourne": "au",
+    "Australia/Perth": "au",
+}
+
+
+def country_from_iana(iana: str) -> str:
+    """Return a country domain for the given IANA timezone, or empty string if unknown."""
+    cleaned = (iana or "").strip()
+    if not cleaned:
+        return ""
+    if cleaned in _IANA_TO_COUNTRY:
+        return _IANA_TO_COUNTRY[cleaned]
+    if cleaned.startswith("Europe/"):
+        return "eu"
+    return ""
+
+
+def crc32(data: bytes) -> int:
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def build_frame(payload: bytes, cmd_id: int) -> bytes:
+    buf = io.BytesIO()
+    buf.write(b"1.0")
+    buf.write(b"\x00\x00\x00\x01")
+    buf.write(bytes([0, cmd_id]))
+    buf.write(bytes([(len(payload) >> 8) & 0xFF, len(payload) & 0xFF]))
+    buf.write(payload)
+    csum = crc32(buf.getvalue())
+    buf.write(bytes([(csum >> 24) & 0xFF, (csum >> 16) & 0xFF, (csum >> 8) & 0xFF, csum & 0xFF]))
+    return buf.getvalue()
+
+
+def parse_cmd(pkt: bytes) -> int:
+    return (pkt[7] << 8) | pkt[8]
+
+
+def parse_payload(pkt: bytes) -> bytes:
+    ln = (pkt[9] << 8) | pkt[10]
+    return pkt[11 : 11 + ln]
+
+
+def rsa_decrypt_blocks(payload: bytes, private_key: bytes) -> bytes:
+    key = RSA.import_key(private_key)
+    cipher = PKCS1_v1_5.new(key)
+    block_size = key.size_in_bytes()
+    out = bytearray()
+    for index in range(0, len(payload), block_size):
+        out.extend(cipher.decrypt(payload[index : index + block_size], sentinel=None))
+    return bytes(out)
+
+
+def aes_encrypt_json(data: dict[str, Any], key16: str) -> bytes:
+    cipher = AES.new(key16.encode(), AES.MODE_ECB)
+    plaintext = json.dumps(data, separators=(",", ":")).encode()
+    return cipher.encrypt(pad(plaintext, AES.block_size))
+
+
+def build_hello_packet(pre_key: str, pubkey_pem: bytes) -> bytes:
+    body = {"id": 1, "method": "hello", "params": {"app_ver": 1, "key": pubkey_pem.decode()}}
+    return build_frame(aes_encrypt_json(body, pre_key), 16)
+
+
+def build_wifi_packet(session_key: str, body: dict[str, Any]) -> bytes:
+    return build_frame(aes_encrypt_json(body, session_key), 1)
+
+
+def recv_with_timeout(sock: socket.socket, timeout: float) -> bytes | None:
+    sock.settimeout(timeout)
+    try:
+        data, _addr = sock.recvfrom(4096)
+        return data
+    except TimeoutError:
+        return None
+    except socket.timeout:
+        return None
+
+
+def sanitize_stack_server(url: str) -> str:
+    host, port = _parse_server_target(url, default_port=DEFAULT_STACK_HTTPS_PORT)
+    if host.lower().startswith("api-"):
+        host = host[4:]
+    authority = _format_authority(host, port=port, default_port=443)
+    if not authority:
+        raise ValueError("A server host is required.")
+    stack_server = f"{authority}/"
+    if len(stack_server) > MAX_STACK_SERVER_LENGTH:
+        raise ValueError(
+            f"Server host is too long for onboarding: token.r must be at most "
+            f"{MAX_STACK_SERVER_LENGTH} characters, got {len(stack_server)} ({stack_server})."
+        )
+    return stack_server
+
+
+def normalize_api_base_url(url: str) -> str:
+    host, port = _parse_server_target(url, default_port=DEFAULT_STACK_HTTPS_PORT)
+    if not host.lower().startswith("api-"):
+        host = f"api-{host}"
+    authority = _format_authority(host, port=port, default_port=443)
+    return f"https://{authority}"
+
+
+def _parse_server_target(url: str, *, default_port: int | None = None) -> tuple[str, int | None]:
+    value = str(url or "").strip()
+    if not value:
+        raise ValueError("A server host is required.")
+    parsed = parse.urlsplit(value if "://" in value else f"//{value}")
+    host = str(parsed.hostname or "").strip().strip("/")
+    if not host:
+        raise ValueError("A server host is required.")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Server port must be numeric.") from exc
+    if port is None:
+        port = default_port
+    return host, port
+
+
+def _format_authority(host: str, *, port: int | None = None, default_port: int | None = None) -> str:
+    normalized_host = str(host or "").strip().strip("/")
+    if not normalized_host:
+        return ""
+    if port is None:
+        return normalized_host
+    if default_port is not None and port == default_port:
+        return normalized_host
+    return f"{normalized_host}:{port}"
+
+
+def _format_bool_label(value: bool, true_label: str, false_label: str) -> str:
+    return true_label if value else false_label
+
+
+def format_device_label(device: dict[str, Any], *, disambiguator: str = "") -> str:
+    onboarding = dict(device.get("onboarding") or {})
+    key_state = dict(onboarding.get("key_state") or {})
+    name = str(device.get("name") or device.get("duid") or "Unknown vacuum")
+    if disambiguator:
+        name = f"{name} [{disambiguator}]"
+    samples = int(key_state.get("query_samples") or 0)
+    labels = [
+        _format_bool_label(bool(onboarding.get("has_public_key")), "Public Key Determined", "No Public Key"),
+        _format_bool_label(bool(device.get("connected")), "Connected", "Disconnected"),
+        f"{samples} Query Samples",
+    ]
+    if bool(onboarding.get("unsupported")):
+        labels.insert(0, "Unsupported")
+    return f"{name} [{' ] ['.join(labels)}]"
+
+
+def _print_status_summary(status: dict[str, Any], output: TextIO) -> None:
+    target = dict(status.get("target") or {})
+    name = str(target.get("name") or target.get("duid") or target.get("did") or "Unknown vacuum")
+    output.write(
+        f"Status for {name}: samples={int(status.get('query_samples') or 0)}, "
+        f"public_key={bool(status.get('has_public_key'))}, "
+        f"connected={bool(status.get('connected'))}, "
+        f"state={status.get('public_key_state') or 'missing'}\n"
+    )
+    guidance = str(status.get("guidance") or "").strip()
+    if guidance:
+        output.write(f"{guidance}\n")
+
+
+@dataclass(slots=True)
+class GuidedOnboardingConfig:
+    api_base_url: str
+    stack_server: str
+    admin_password: str
+    ssid: str
+    password: str
+    timezone: str
+    cst: str
+    country_domain: str
+    allow_insecure_tls: bool = False
+
+
+class ApiReachabilityError(RuntimeError):
+    """Raised when the admin API is temporarily unreachable."""
+
+
+class RemoteOnboardingApi:
+    """Thin authenticated JSON client for the admin onboarding endpoints."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        admin_password: str,
+        timeout_seconds: float = 15.0,
+        opener: request.OpenerDirector | None = None,
+        ssl_context: ssl.SSLContext | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.admin_password = admin_password
+        self.timeout_seconds = timeout_seconds
+        self._ssl_context = ssl_context
+        self._opener = opener or request.build_opener(request.HTTPCookieProcessor())
+        self._logged_in = False
+
+    def _open(self, req: request.Request):
+        if self._ssl_context is not None:
+            try:
+                return self._opener.open(req, timeout=self.timeout_seconds, context=self._ssl_context)
+            except TypeError:
+                pass
+        return self._opener.open(req, timeout=self.timeout_seconds)
+
+    def login(self) -> None:
+        if self._logged_in:
+            return
+        self._request_json(
+            "POST",
+            "/admin/api/login",
+            payload={"password": self.admin_password},
+            allow_401=True,
+        )
+        self._logged_in = True
+
+    def list_devices(self) -> list[dict[str, Any]]:
+        payload = self._request_json("GET", "/admin/api/onboarding/devices")
+        devices = payload.get("devices")
+        return list(devices) if isinstance(devices, list) else []
+
+    def start_session(
+        self,
+        *,
+        duid: str = "",
+        new_vacuum: bool = False,
+        name: str = "",
+        model: str = "",
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"duid": duid, "new_vacuum": new_vacuum}
+        if name:
+            payload["name"] = name
+        if model:
+            payload["model"] = model
+        return self._request_json(
+            "POST",
+            "/admin/api/onboarding/sessions",
+            payload=payload,
+        )
+
+    def get_session(self, *, session_id: str) -> dict[str, Any]:
+        return self._request_json("GET", f"/admin/api/onboarding/sessions/{parse.quote(session_id, safe='')}")
+
+    def delete_session(self, *, session_id: str) -> dict[str, Any]:
+        return self._request_json("DELETE", f"/admin/api/onboarding/sessions/{parse.quote(session_id, safe='')}")
+
+    def get_status(self) -> dict[str, Any]:
+        return self._request_json("GET", "/admin/api/status")
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        allow_401: bool = False,
+    ) -> dict[str, Any]:
+        data = None
+        headers = {"Accept": "application/json"}
+        if payload is not None:
+            data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = request.Request(f"{self.base_url}{path}", data=data, headers=headers, method=method)
+        try:
+            with self._open(req) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except error.HTTPError as exc:
+            if exc.code == 401 and allow_401:
+                raise RuntimeError("Invalid admin password.") from exc
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(_format_http_error(exc.code, detail)) from exc
+        except error.URLError as exc:
+            raise ApiReachabilityError(f"Unable to reach {self.base_url}: {exc.reason}") from exc
+        except OSError as exc:
+            raise ApiReachabilityError(f"Unable to reach {self.base_url}: {exc}") from exc
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Invalid JSON response from {path}: {raw[:200]}") from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"Unexpected response from {path}: {parsed!r}")
+        return parsed
+
+
+def _format_http_error(status_code: int, raw_body: str) -> str:
+    try:
+        parsed = json.loads(raw_body)
+    except json.JSONDecodeError:
+        parsed = {}
+    if isinstance(parsed, dict):
+        message = str(parsed.get("error") or parsed.get("detail") or "").strip()
+        if message:
+            return f"HTTP {status_code}: {message}"
+    body = raw_body.strip()
+    if body:
+        return f"HTTP {status_code}: {body[:200]}"
+    return f"HTTP {status_code}"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Guided Roborock remote onboarding")
+    parser.add_argument("--server", required=True, help="Main server hostname or HTTPS URL, usually starting with api-")
+    parser.add_argument("--admin-password", default="")
+    parser.add_argument("--ssid", default="")
+    parser.add_argument("--password", default="")
+    parser.add_argument("--timezone", default="")
+    parser.add_argument("--cst", default="")
+    parser.add_argument("--country-domain", default="")
+    parser.add_argument(
+        "--allow-insecure-tls",
+        action="store_true",
+        help="Skip TLS certificate verification for the admin API and MQTT preflight checks.",
+    )
+    return parser
+
+
+def _prompt_text(value: str, prompt: str, *, default: str = "", secret: bool = False) -> str:
+    if str(value or "").strip():
+        return str(value).strip()
+    display_prompt = prompt if not default else f"{prompt} [{default}]"
+    while True:
+        entered = getpass(f"{display_prompt}: ") if secret else input(f"{display_prompt}: ")
+        candidate = str(entered or "").strip() or default
+        if candidate:
+            return candidate
+        print("A value is required.")
+
+
+def prompt_for_config(args: argparse.Namespace) -> GuidedOnboardingConfig:
+    api_base_url = normalize_api_base_url(args.server)
+    stack_server = sanitize_stack_server(args.server)
+    admin_password = _prompt_text(args.admin_password, "Admin password", secret=True)
+    ssid = _prompt_text(args.ssid, "Home Wi-Fi SSID")
+    password = _prompt_text(args.password, "Home Wi-Fi password", secret=True)
+    timezone = _prompt_text(args.timezone, "Timezone", default=DEFAULT_TIMEZONE)
+    cst = str(args.cst or "").strip()
+    if not cst:
+        cst = posix_tz_from_iana(timezone)
+    if not cst:
+        cst = _prompt_text("", "POSIX TZ string (could not auto-detect from timezone)", default=DEFAULT_CST)
+    country_domain = str(args.country_domain or "").strip()
+    if not country_domain:
+        country_domain = country_from_iana(timezone)
+    if not country_domain:
+        country_domain = _prompt_text("", "Country domain (could not auto-detect from timezone)", default=DEFAULT_COUNTRY_DOMAIN)
+    return GuidedOnboardingConfig(
+        api_base_url=api_base_url,
+        stack_server=stack_server,
+        admin_password=admin_password,
+        ssid=ssid,
+        password=password,
+        timezone=timezone,
+        cst=cst,
+        country_domain=country_domain,
+        allow_insecure_tls=bool(args.allow_insecure_tls),
+    )
+
+
+def onboard_once(config: GuidedOnboardingConfig, output: TextIO = sys.stdout) -> bool:
+    token_s = f"S_TOKEN_{secrets.token_hex(16)}"
+    token_t = f"T_TOKEN_{secrets.token_hex(16)}"
+
+    key = RSA.generate(1024)
+    priv = key.export_key()
+    pub = key.publickey().export_key()
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    target = (CFGWIFI_HOST, CFGWIFI_PORT)
+    try:
+        hello = build_hello_packet(CFGWIFI_PRE_KEY, pub)
+        sock.sendto(hello, target)
+        hello_resp = recv_with_timeout(sock, CFGWIFI_TIMEOUT_SECONDS)
+        if not hello_resp:
+            output.write("HELLO: no response\n")
+            return False
+
+        cmd = parse_cmd(hello_resp)
+        dec = rsa_decrypt_blocks(parse_payload(hello_resp), priv).decode(errors="replace")
+        output.write(f"HELLO_RESP_CMD={cmd}\n")
+        output.write(f"HELLO_RESP_JSON={dec}\n")
+        parsed = json.loads(dec)
+        session_key = parsed["params"]["key"]
+        if not isinstance(session_key, str) or len(session_key) != 16:
+            output.write("HELLO: session key invalid\n")
+            return False
+
+        body = {
+            "u": CFGWIFI_UID,
+            "ssid": config.ssid,
+            "token": {
+                "r": config.stack_server,
+                "tz": config.timezone,
+                "s": token_s,
+                "cst": config.cst,
+                "t": token_t,
+            },
+            "passwd": config.password,
+            "country_domain": config.country_domain,
+        }
+        wifi_pkt = build_wifi_packet(session_key, body)
+        sock.sendto(wifi_pkt, target)
+        output.write(f"TOKEN_S={token_s}\n")
+        output.write(f"TOKEN_T={token_t}\n")
+        output.write(f"WIFI_BODY_SENT={json.dumps(body, separators=(',', ':'))}\n")
+
+        wifi_resp = recv_with_timeout(sock, CFGWIFI_TIMEOUT_SECONDS)
+        if wifi_resp is None:
+            output.write("WIFI_RESP: none\n")
+        else:
+            output.write(f"WIFI_RESP_CMD={parse_cmd(wifi_resp)}\n")
+            output.write(f"WIFI_RESP_HEX={wifi_resp.hex()[:800]}\n")
+        return True
+    finally:
+        sock.close()
+
+
+def _new_vacuum_choice() -> dict[str, Any]:
+    return {"new_vacuum": True, "duid": "", "name": "New vacuum"}
+
+
+def choose_device(devices: list[dict[str, Any]], *, output: TextIO) -> dict[str, Any] | None:
+    if not devices:
+        output.write(
+            "No vacuums are in the inventory yet (none imported from the cloud).\n"
+            "If this vacuum has never been on the cloud, choose 'New vacuum' below.\n"
+        )
+
+    name_counts: dict[str, int] = {}
+    for device in devices:
+        key = str(device.get("name") or device.get("duid") or "").strip().lower()
+        name_counts[key] = name_counts.get(key, 0) + 1
+
+    while True:
+        output.write("Available vacuums:\n")
+        for index, device in enumerate(devices, start=1):
+            key = str(device.get("name") or device.get("duid") or "").strip().lower()
+            disambiguator = str(device.get("duid") or "") if name_counts.get(key, 0) > 1 else ""
+            output.write(f"  {index}. {format_device_label(device, disambiguator=disambiguator)}\n")
+        new_vacuum_index = len(devices) + 1
+        output.write(
+            f"  {new_vacuum_index}. New vacuum (never on the cloud / not yet in inventory)\n"
+        )
+        raw = input("Select a vacuum by number, type 'new', or 'quit': ").strip().lower()
+        if raw == "quit":
+            return None
+        if raw in ("new", "n"):
+            return _new_vacuum_choice()
+        if raw.isdigit():
+            index = int(raw)
+            if 1 <= index <= len(devices):
+                return devices[index - 1]
+            if index == new_vacuum_index:
+                return _new_vacuum_choice()
+        output.write("Please enter a valid number.\n")
+
+
+def _format_elapsed(seconds: float) -> str:
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes}m {secs:02d}s" if minutes else f"{secs}s"
+
+
+def poll_session_until_progress(
+    api: Any,
+    *,
+    session_id: str,
+    baseline_samples: int,
+    baseline_status: dict[str, Any] | None = None,
+    output: TextIO,
+    poll_interval_seconds: float = POLL_INTERVAL_SECONDS,
+    timeout_seconds: float = POLL_TIMEOUT_SECONDS,
+    recovery_timeout_seconds: float = KEY_RECOVERY_TIMEOUT_SECONDS,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> tuple[str, dict[str, Any]]:
+    deadline = time.monotonic() + timeout_seconds
+    latest = dict(baseline_status or {"session_id": session_id, "query_samples": baseline_samples})
+    baseline_has_public_key = bool((baseline_status or {}).get("has_public_key"))
+    waiting_for_reconnect = False
+    recovery_started_at: float | None = None
+    while True:
+        try:
+            latest = api.get_session(session_id=session_id)
+            waiting_for_reconnect = False
+        except ApiReachabilityError as exc:
+            if time.monotonic() >= deadline:
+                return "timeout", latest
+            if not waiting_for_reconnect:
+                output.write(
+                    "The main server is not reachable yet from this machine. "
+                    "Finish reconnecting to your normal Wi-Fi and the script will keep retrying.\n"
+                )
+                output.write(f"{exc}\n")
+                waiting_for_reconnect = True
+            else:
+                output.write("Still waiting for this machine to reach the main server again...\n")
+            sleep_fn(poll_interval_seconds)
+            continue
+        if str(latest.get("identity_conflict") or "").strip():
+            return "conflict", latest
+        if bool(latest.get("unsupported")):
+            return "unsupported", latest
+        if bool(latest.get("connected")):
+            return "connected", latest
+        if bool(latest.get("has_public_key")) and not baseline_has_public_key:
+            return "public_key_ready", latest
+        if str(latest.get("public_key_state") or "") == "recovering" and not baseline_has_public_key:
+            # Keep the user waiting here: another pairing cycle is pointless until the key is ready.
+            now = time.monotonic()
+            if recovery_started_at is None:
+                recovery_started_at = now
+            elapsed = now - recovery_started_at
+            if elapsed >= recovery_timeout_seconds:
+                return "timeout", latest
+            output.write(
+                f"Calculating public key... please wait ({_format_elapsed(elapsed)} elapsed). "
+                "Do not start the next pairing cycle yet.\n"
+            )
+            sleep_fn(poll_interval_seconds)
+            continue
+        if int(latest.get("query_samples") or 0) > baseline_samples and not baseline_has_public_key:
+            return "sample_increased", latest
+        if time.monotonic() >= deadline:
+            return "timeout", latest
+        output.write("Waiting for the server to observe new onboarding traffic...\n")
+        sleep_fn(poll_interval_seconds)
+
+
+def prompt_post_attempt_action(status: dict[str, Any], *, output: TextIO) -> str:
+    while True:
+        _print_status_summary(status, output)
+        raw = input("Choose: [retry] [refresh] [reselect] [quit]: ").strip().lower()
+        if raw in {"retry", "refresh", "reselect", "quit"}:
+            return raw
+        output.write("Please type retry, refresh, reselect, or quit.\n")
+
+
+def run_guided_onboarding(
+    *,
+    config: GuidedOnboardingConfig,
+    api: Any,
+    send_onboarding: Callable[[GuidedOnboardingConfig, TextIO], bool] = onboard_once,
+    output: TextIO = sys.stdout,
+    poll_interval_seconds: float = POLL_INTERVAL_SECONDS,
+    timeout_seconds: float = POLL_TIMEOUT_SECONDS,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> int:
+    api.login()
+
+    while True:
+        devices = api.list_devices()
+        selected = choose_device(devices, output=output)
+        if selected is None:
+            return 0
+
+        if selected.get("new_vacuum"):
+            output.write(
+                "Starting a session for a new vacuum. The server will adopt it from its own "
+                "onboarding traffic and add it to the inventory once it registers.\n"
+            )
+            session = api.start_session(new_vacuum=True)
+        else:
+            session = api.start_session(
+                duid=str(selected.get("duid") or ""),
+                name=str(selected.get("name") or ""),
+                model=str(selected.get("model") or ""),
+            )
+        session_id = str(session.get("session_id") or "").strip()
+        if not session_id:
+            raise RuntimeError("Server did not return an onboarding session id.")
+
+        try:
+            while True:
+                status = api.get_session(session_id=session_id)
+                baseline_samples = int(status.get("query_samples") or 0)
+                baseline_has_public_key = bool(status.get("has_public_key"))
+                output.write(
+                    "\nReset the vacuum Wi-Fi, connect this machine to the vacuum Wi-Fi, "
+                    "then press Enter to send onboarding.\n"
+                )
+                output.write("Type 'reselect' to choose another vacuum or 'quit' to exit.\n")
+                if baseline_has_public_key:
+                    output.write(
+                        "The public key is already ready. This should be the final pairing cycle, "
+                        "but some vacuums still take a few minutes to finish reconnecting.\n"
+                    )
+                raw = input("> ").strip().lower()
+                if raw == "quit":
+                    return 0
+                if raw == "reselect":
+                    break
+
+                output.write("Sending cfgwifi onboarding packet...\n")
+                if not send_onboarding(config, output):
+                    output.write("Onboarding send failed.\n")
+                    action = prompt_post_attempt_action(status, output=output)
+                    if action == "reselect":
+                        break
+                    if action == "quit":
+                        return 0
+                    if action == "refresh":
+                        refreshed = api.get_session(session_id=session_id)
+                        _print_status_summary(refreshed, output)
+                    continue
+
+                output.write(
+                    "Reconnect this machine to your normal Wi-Fi. "
+                    "Once the main server is reachable again, the script will poll every 5 seconds "
+                    "for up to 5 minutes. Some vacuums take most of that window, especially on the "
+                    "final cycle.\n"
+                )
+                result, status = poll_session_until_progress(
+                    api,
+                    session_id=session_id,
+                    baseline_samples=baseline_samples,
+                    baseline_status=status,
+                    output=output,
+                    poll_interval_seconds=poll_interval_seconds,
+                    timeout_seconds=timeout_seconds,
+                    sleep_fn=sleep_fn,
+                )
+                _print_status_summary(status, output)
+                if result == "connected":
+                    output.write("The vacuum is connected to the local server.\n")
+                    return 0
+                if result == "public_key_ready":
+                    output.write(
+                        "The public key is ready. Send the final pairing cycle now to finish the connection.\n"
+                    )
+                    continue
+                if result == "sample_increased":
+                    output.write(
+                        "The sample count increased. Send the next pairing cycle now to collect more onboarding data.\n"
+                    )
+                    continue
+                if result == "unsupported":
+                    output.write("This vacuum is not supported by the current onboarding flow.\n")
+                if result == "timeout" and baseline_has_public_key and bool(status.get("has_public_key")):
+                    output.write(
+                        "The public key was already ready, but the vacuum did not finish connecting within the timeout. "
+                        "Some models are slow on the final cycle; wait a bit longer if the vacuum is still working, "
+                        "or retry if it never announces Wi-Fi connected.\n"
+                    )
+
+                action = prompt_post_attempt_action(status, output=output)
+                if action == "retry":
+                    continue
+                if action == "refresh":
+                    _print_status_summary(api.get_session(session_id=session_id), output)
+                    continue
+                if action == "quit":
+                    return 0
+                break
+        finally:
+            try:
+                api.delete_session(session_id=session_id)
+            except Exception:
+                pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    config = prompt_for_config(args)
+    ssl_context = build_ssl_context(allow_insecure_tls=config.allow_insecure_tls)
+    api = RemoteOnboardingApi(
+        base_url=config.api_base_url,
+        admin_password=config.admin_password,
+        ssl_context=ssl_context,
+    )
+    try:
+        if config.allow_insecure_tls:
+            print("TLS certificate verification is DISABLED. Preflight will only test reachability.")
+        perform_onboarding_preflight(
+            api=api,
+            api_base_url=config.api_base_url,
+            allow_insecure_tls=config.allow_insecure_tls,
+            output=sys.stdout,
+        )
+        return run_guided_onboarding(config=config, api=api)
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        return 130
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

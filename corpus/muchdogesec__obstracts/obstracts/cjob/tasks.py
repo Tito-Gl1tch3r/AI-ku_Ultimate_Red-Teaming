@@ -1,0 +1,625 @@
+import io
+import logging
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from celery import shared_task, chain, current_task, Task as CeleryTask
+from celery.worker.request import Request
+from django.db import transaction
+import typing
+from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
+from django.utils import timezone
+
+from dogesec_commons.stixifier.stixifier import StixifyProcessor, ReportProperties
+from txt2stix.txt2stix import Txt2StixData
+import requests
+
+from obstracts.cjob import helpers
+from obstracts.classifier.models import DocumentEmbedding
+import obstracts.classifier.tasks as classifier_tasks
+from obstracts.server.statistics import build_data_and_add_to_cache
+from ..server.models import Job
+from ..server import models
+from django.core.cache import cache
+from history4feed.app import models as h4f_models
+
+from django.core.files.base import File
+from django.conf import settings
+
+if typing.TYPE_CHECKING:
+    from .. import settings
+
+POLL_INTERVAL = 30
+LOCK_EXPIRE = 60 * 10
+
+
+def get_lock_id(job: Job):
+    lock_id = f"feed-lock-{job.feed.id}"
+    logging.debug("using lock id %s", lock_id)
+    return lock_id
+
+
+def queue_lock(job: Job):
+    logging.debug("lock_value = {v}".format(v=cache.get(get_lock_id(job))))
+    lock_value = dict(feed_id=str(job.feed.id))
+    if job:
+        lock_value["job_id"] = str(job.id)
+
+    status = cache.add(get_lock_id(job), lock_value, timeout=LOCK_EXPIRE)
+    return status
+
+
+class ShouldRetry(Exception):
+    pass
+
+
+class CancelledJob(Exception):
+    pass
+
+
+@shared_task
+def job_completed_with_error(job_id):
+    job = Job.objects.get(pk=job_id)
+    if job.state in [models.JobState.CANCELLING, models.JobState.CANCELLED]:
+        job.update_state(models.JobState.CANCELLED)
+    elif job.processed_items == 0 and job.failed_processes > 0:
+        job.update_state(models.JobState.PROCESS_FAILED)
+    else:
+        job.update_state(models.JobState.PROCESSED)
+
+    if job.feed:
+        logging.info("removing queue lock for feed `%s`", str(job.feed.id))
+        if cache.delete(get_lock_id(job)):
+            logging.info("lock deleted")
+        else:
+            logging.error("Failed to remove lock")
+
+    job.save()
+
+
+def create_job_entry(h4f_job: h4f_models.Job, profile_id, **extra):
+    job = Job.objects.create(
+        id=h4f_job.id,
+        history4feed_job=h4f_job,
+        feed_id=h4f_job.feed_id,
+        profile_id=profile_id,
+        type=models.JobType.FEED_INDEX,
+    )
+    feed_fields = [
+        "pdfshift_cookie_settings",
+        "admiralty_source_reliability",
+    ]
+    update_fields = [f for f in feed_fields if extra.get(f)]
+    if update_fields:
+        for field in update_fields:
+            setattr(job.feed, field, extra[field])
+        job.feed.save()
+    return job
+
+
+def create_pdf_reindex_job(feed, files):
+    job = models.Job.objects.create(
+        id=uuid.uuid4(),
+        type=models.JobType.PDF_INDEX,
+        feed_id=feed.id,
+        state=models.JobState.QUEUED,
+    )
+
+    pdf_tasks = [reindex_pdf_for_post.si(job.id, f.post_id) for f in files]
+    pdf_tasks.append(job_completed_with_error.si(job.id))
+    chain(pdf_tasks).apply_async()
+
+    return job
+
+def create_reprocessing_job(feed, posts: list[models.h4f_models.Post], options: dict = None):
+    job  = models.Job.objects.create(
+        id=uuid.uuid4(),
+        type=models.JobType.REPROCESS_POSTS,
+        feed_id=feed.id,
+        profile_id=options.pop('profile_id', None),
+        state=models.JobState.QUEUED,
+        extra=options,
+    )
+    post_ids = []
+    profile_ids = []
+    profile_id = job.profile_id
+    for post in posts:
+        if options['skip_extraction'] and getattr(post, 'obstracts_post', None):
+            profile_id = post.obstracts_post.profile_id
+        post_ids.append(str(post.id))
+        profile_ids.append(str(profile_id))
+
+    t = chain(
+        wait_in_queue.si(job_id=job.id),
+        process_posts_from_index(
+            job.id,
+            post_ids,
+            0,
+            profile_ids=profile_ids,
+        ),
+    )
+    t.stamp(obstracts_id=str(job.id))
+    t.apply_async()
+    return job
+
+
+def process_posts_from_index(job_id, post_ids, index, profile_ids=None):
+    """Build the remaining post-processing chain, including job finalization."""
+    post_ids = [str(post_id) for post_id in post_ids]
+    profile_ids = profile_ids or [None] * len(post_ids)
+    tasks = [
+        process_post.si(
+            job_id=job_id,
+            post_id=post_id,
+            profile_id=profile_ids[post_index],
+            post_ids=post_ids,
+            post_index=post_index,
+            profile_ids=profile_ids,
+        )
+        for post_index, post_id in enumerate(post_ids[index:], start=index)
+    ]
+    tasks.append(job_completed_with_error.si(job_id=job_id))
+    processing_chain = chain(tasks)
+    processing_chain.stamp(obstracts_id=str(job_id))
+    return processing_chain
+
+
+@shared_task(bind=True)
+def start_processing(self, job_id):
+    job = Job.objects.get(pk=job_id)
+    logging.info(
+        f"processing {job_id=}, {job.feed_id=}, {current_task.request.root_id=}"
+    )
+    posts = [
+        f.post.id
+        for f in h4f_models.FulltextJob.objects.filter(
+            job=job.history4feed_job, status=h4f_models.FullTextState.RETRIEVED
+        ).all()
+    ]
+
+    logging.info("processing %d posts for job %s", len(posts), job_id)
+    t = chain(
+        wait_in_queue.si(job_id=job_id),
+        process_posts_from_index(job_id, posts, 0),
+    )
+    t.stamp(obstracts_id=str(job.id))
+    return self.replace(t)
+
+@shared_task(bind=True, default_retry_delay=10)
+def wait_in_queue(self: CeleryTask, job_id):
+    logging.info("job with id %s waiting in queue", job_id)
+    job = Job.objects.get(pk=job_id)
+    if job.is_cancelled():
+        job.errors.append("job cancelled while in queue")
+        job.save(update_fields=["errors"])
+        return False
+    if not queue_lock(job):
+        return self.retry(max_retries=300)
+    job.update_state(models.JobState.PROCESSING)
+    return True
+
+
+def download_pdf(url, is_demo=False, cookie_consent_mode=None):
+    params = {
+        "source": url,
+        "timeout": 30,
+        "delay": 1000,
+        "css": "div.cookie-banner, .cookie-consent, #cookie-consent, .cc-window { display: none !important; }",
+    }
+    if cookie_consent_mode == models.PDFCookieConsentMode.disable_all_js:
+        params.update(disable_javascript=True)
+    else:
+        params.update(
+            javascript='document.querySelectorAll(".cookie-banner, .cookie-consent, #cookie-consent").forEach(e => e.remove());'
+        )
+    if is_demo:
+        params.update(sandbox=True)
+    response = requests.post(
+        f"https://api.pdfshift.io/v3/convert/pdf",
+        headers={"X-API-Key": settings.PDFSHIFT_API_KEY},
+        json=params,
+    )
+    if not response.ok:
+        print(response.content)
+    response.raise_for_status()
+    return response.content
+
+@shared_task
+def update_knowledgebase(job_id):
+    job = models.Job.objects.get(pk=job_id)
+    state = models.JobState.PROCESSED
+    try:
+        helpers.run_on_collections(job, job.extra['knowledgebase'])
+    except Exception as e:
+        job.errors.append(str(e))
+        job.save(update_fields=["errors"])
+        state = models.JobState.PROCESS_FAILED
+    job.update_state(state)
+
+
+def _build_topic_embedding_for_post(post_file, force=False, include_non_incident=False):
+    try:
+        post_file.create_embedding(
+            force=force,
+            include_non_incident=include_non_incident,
+        )
+        if post_file.embedding_id:
+            return "processed", None
+        return "failed", f"embedding not created for post {post_file.post_id}"
+    except Exception:
+        logging.exception("embedding build failed for post %s", post_file.post_id)
+        return "failed", f"embedding build failed for post {post_file.post_id}"
+
+
+def run_topic_embeddings_job(
+    job_id,
+    force=False,
+    workers=settings.CLASSIFIER_CONCURRENCY,
+    include_non_incident=False,
+):
+    job = models.Job.objects.get(pk=job_id)
+    try:
+        qs = models.File.objects.filter(processed=True)
+        if not include_non_incident:
+            qs = qs.filter(ai_describes_incident=True)
+
+        if not force:
+            qs = qs.filter(embedding__isnull=True)
+
+        if not qs.count():
+            job.update_state(models.JobState.PROCESSED)
+            return
+
+        cancelled = False
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _build_topic_embedding_for_post,
+                    post_file,
+                    force,
+                    include_non_incident,
+                ): post_file.pk
+                for post_file in qs
+            }
+            for future in as_completed(futures):
+                status, msg = future.result()
+                if job.is_cancelled():
+                    cancelled = True
+                    pool.shutdown(wait=False, cancel_futures=True)
+                if status == "processed":
+                    job.processed_items += 1
+                elif status == "failed":
+                    job.failed_processes += 1
+                    if msg:
+                        job.errors.append(msg)
+                else:
+                    logging.error("unexpected status %s for post %s", status, futures[future])
+                job.save(update_fields=["errors", "processed_items", "failed_processes"])
+        if cancelled:
+            job.update_state(models.JobState.CANCELLED)
+        elif job.failed_processes and job.processed_items == 0:
+            job.update_state(models.JobState.PROCESS_FAILED)
+        else:
+            job.update_state(models.JobState.PROCESSED)
+    except Exception as e:
+        logging.exception("topic embedding task failed")
+        job.errors.append(str(e))
+        job.save(update_fields=["errors"])
+        job.update_state(models.JobState.PROCESS_FAILED)
+    finally:
+        job.save(update_fields=["errors", "processed_items", "failed_processes"])
+
+
+def run_topic_clusters_job(job_id, force=False):
+    job = models.Job.objects.get(pk=job_id)
+    try:
+        if job.is_cancelled():
+            job.update_state(models.JobState.CANCELLED)
+            return
+
+        classifier_tasks.run_clustering(
+            force=force,
+            workers=settings.CLASSIFIER_CONCURRENCY,
+            should_cancel=lambda: models.Job.objects.get(pk=job_id).is_cancelled(),
+        )
+        if job.is_cancelled():
+            job.update_state(models.JobState.CANCELLED)
+            return
+        job.processed_items += 1
+        job.update_state(models.JobState.PROCESSED)
+    except classifier_tasks.ClusteringCancelled:
+        job.update_state(models.JobState.CANCELLED)
+    except Exception as e:
+        logging.exception("topic cluster task failed")
+        job.failed_processes += 1
+        job.errors.append(str(e))
+        job.update_state(models.JobState.PROCESS_FAILED)
+    finally:
+        job.save(update_fields=["errors", "processed_items", "failed_processes"])
+
+
+@shared_task
+def build_topic_clusters(job_id, force=False):
+    run_topic_clusters_job(job_id, force=force)
+
+@shared_task
+def add_pdf_to_post(job_id, post_id):
+    job = models.Job.objects.get(pk=job_id)
+    post_file = models.File.objects.get(pk=post_id)
+    feedp = models.FeedProfile.objects.get(feed_id=post_file.feed_id)
+    try:
+        pdf_bytes = download_pdf(
+            post_file.post.link, cookie_consent_mode=feedp.pdfshift_cookie_settings
+        )
+        post_file.pdf_file.save(
+            f"{post_file.post.title}.pdf", io.BytesIO(pdf_bytes), save=False
+        )
+        post_file.save(update_fields=["pdf_file"])
+    except Exception as e:
+        logging.exception(f"process file to pdf failed for {post_file.pk}")
+        job.errors.append(f"process file to pdf failed for {post_file.pk}: {str(e)}")
+        job.save()
+
+
+@shared_task
+def process_post_hard_timeout(
+    job_id,
+    post_id,
+    timeout,
+    failed_task_id,
+    post_ids=None,
+    post_index=None,
+    profile_ids=None,
+):
+    """Record a hard timeout and resume after the post whose process was killed."""
+    msg = f"task hard timed out for post {post_id} after {timeout} seconds"
+    logging.error(msg)
+
+    with transaction.atomic():
+        job = Job.objects.select_for_update().get(pk=job_id)
+        errors = list(job.errors or [])
+        if msg not in errors:
+            errors.append(msg)
+            job.errors = errors
+            job.failed_processes += 1
+            job.save(update_fields=["errors", "failed_processes"])
+        can_continue = job.failed_processes <= settings.MAX_FAILED_PROCESSES
+
+    if can_continue and post_ids is not None and post_index is not None:
+        continuation = process_posts_from_index(
+            job_id,
+            post_ids,
+            post_index + 1,
+            profile_ids=profile_ids,
+        )
+        continuation.apply_async(task_id=failed_task_id)
+    else:
+        job_completed_with_error.delay(job_id=job_id)
+
+
+class ProcessPostRequest(Request):
+    """Handle hard limits in the main worker, which survives the SIGKILL."""
+
+    def on_timeout(self, soft, timeout):
+        super().on_timeout(soft, timeout)
+        if soft:
+            return
+
+        try:
+            job_id = self.kwargs["job_id"]
+            post_id = self.kwargs["post_id"]
+            post_ids = self.kwargs.get("post_ids")
+            post_index = self.kwargs.get("post_index")
+            profile_ids = self.kwargs.get("profile_ids")
+            process_post_hard_timeout.delay(
+                job_id=job_id,
+                post_id=post_id,
+                timeout=timeout,
+                failed_task_id=self.id,
+                post_ids=post_ids,
+                post_index=post_index,
+                profile_ids=profile_ids,
+            )
+        except Exception:
+            logging.exception(
+                "failed to schedule hard-timeout handling for task %s", self.id
+            )
+
+
+class ProcessPostTask(CeleryTask):
+    Request = ProcessPostRequest
+
+
+@shared_task(
+    bind=True,
+    base=ProcessPostTask,
+    soft_time_limit=settings.PROCESSING_TIMEOUT_SECONDS,
+    time_limit=settings.PROCESSING_TIMEOUT_SECONDS + 20,
+)
+def process_post(
+    self,
+    job_id,
+    post_id,
+    profile_id=None,
+    post_ids=None,
+    post_index=None,
+    profile_ids=None,
+    *args,
+):
+    from obstracts.server.views import PostOnlyView
+
+    job = Job.objects.get(pk=job_id)
+    post = h4f_models.Post.objects.get(pk=post_id)
+    profile = job.profile
+    if profile_id:
+        profile = models.Profile.objects.get(pk=profile_id)
+    try:
+        if job.is_cancelled():
+            raise CancelledJob()
+        file, _ = models.File.objects.update_or_create(
+            post_id=post_id,
+            defaults=dict(
+                processed=False,
+            ),
+            create_defaults=dict(
+                feed_id=job.feed.id,
+                profile_id=profile.id,
+            )
+        )
+
+        if profile.generate_pdf and (job.type != models.JobType.REPROCESS_POSTS or not file.pdf_file):
+            add_pdf_to_post.delay(job_id, post_id)
+        
+        PostOnlyView.remove_report_objects(file)
+
+        mode = "html_article"
+        stream = io.BytesIO(post.description.encode())
+        stream.name = f"post-{post_id}.html"
+
+        processor = StixifyProcessor(
+            stream,
+            profile,
+            job_id=f"{post.id}+{job.id}",
+            file2txt_mode=mode,
+            report_id=post_id,
+            base_url=post.link,
+        )
+        processor.collection_name = job.feed.collection_name
+        properties = ReportProperties(
+            name=post.title,
+            identity=file.feed.identity,
+            tlp_level="clear",
+            confidence=None,
+            labels=[f"tag.{cat.name}" for cat in post.categories.all()],
+            created=file.post.pubdate,
+            kwargs=dict(
+                external_references=[
+                    dict(source_name="post_link", url=post.link),
+                    dict(source_name="obstracts_feed_id", external_id=str(job.feed.id)),
+                    dict(
+                        source_name="obstracts_profile_id",
+                        external_id=str(profile.id),
+                    ),
+                ],
+                admiralty_source_reliability=job.feed.admiralty_source_reliability,
+            ),
+        )
+        processor.setup(
+            properties,
+            dict(_obstracts_feed_id=str(job.feed.id), _obstracts_post_id=post_id),
+        )
+        if job.type == models.JobType.REPROCESS_POSTS and job.extra['skip_extraction']:
+            processor.output_md = file.markdown_file.open().read().decode()
+            txt2stix_data = None
+            if job.extra['skip_extraction']:
+                if not file.txt2stix_data:
+                    raise Exception("no existing extraction data to use for reprocess with skip_extraction=true")
+                txt2stix_data = Txt2StixData.model_validate(file.txt2stix_data)
+            processor.txt2stix(txt2stix_data)
+            processor.write_bundle(processor.bundler)
+            processor.upload_to_arango()
+        else:
+            processor.process()
+
+        if getattr(processor, "md_file", None):
+            file.markdown_file.save("markdown.md", processor.md_file.open(), save=False)
+            models.FileImage.objects.filter(report=file).delete()  # remove old references
+
+            for image in processor.md_images:
+                models.FileImage.objects.create(
+                    report=file, file=File(image, image.name), name=image.name
+                )
+
+        file.set_txt2stix_data(processor.txt2stix_data)
+        file.create_embedding(include_non_incident=settings.CREATE_EMBEDDING_INCLUDE_NON_INCIDENT)
+
+        file.processed = True
+        file.save(
+            update_fields=[
+                "processed",
+                "markdown_file",
+            ]
+        )
+        job.processed_items += 1
+    except CancelledJob:
+        msg = f"job cancelled by user for post {post_id}"
+        logging.error(msg, exc_info=True)
+        job.errors.append(msg)
+    except (SoftTimeLimitExceeded, TimeLimitExceeded) as e:
+        msg= f"task timed out for post {post_id}: {str(e)}"
+        job.errors.append(msg)
+        logging.error(msg, exc_info=True)
+        job.failed_processes += 1
+    except Exception as e:
+        msg = f"processing failed for post {post_id}"
+        logging.error(msg, exc_info=True)
+        job.failed_processes += 1
+        job.errors.append(msg)
+    job.save(update_fields=["errors", "processed_items", "failed_processes"])
+    return job_id
+
+
+@shared_task
+def reindex_pdf_for_post(job_id, post_id):
+    post_file = models.File.objects.get(pk=post_id)
+    error_msg = None
+    success = False
+    job = Job.objects.get(pk=job_id)
+    if job.is_cancelled():
+        return
+    job.update_state(models.JobState.PROCESSING)
+    feedp = models.FeedProfile.objects.get(feed_id=post_file.feed_id)
+    try:
+        if not (post_file.profile and post_file.profile.generate_pdf):
+            error_msg = f"cannot generate pdf for file {post_id}"
+        else:
+            pdf_bytes = download_pdf(
+                post_file.post.link, cookie_consent_mode=feedp.pdfshift_cookie_settings
+            )
+            post_file.pdf_file.save(
+                f"{post_file.post.title}.pdf", io.BytesIO(pdf_bytes), save=False
+            )
+            post_file.save(update_fields=["pdf_file"])
+            success = True
+    except Exception:
+        logging.exception(f"process file to pdf failed for {post_file.pk}")
+        error_msg = f"process file to pdf failed for {post_file.pk}"
+
+    with transaction.atomic():
+        job = Job.objects.select_for_update().get(pk=job_id)
+        if success:
+            job.processed_items += 1
+        else:
+            job.failed_processes += 1
+            if error_msg:
+                job.errors.append(error_msg)
+        job.save(
+            update_fields=[
+                "errors",
+                "processed_items",
+                "failed_processes",
+            ]
+        )
+
+
+@shared_task
+def auto_refresh_statistics_data():
+    build_data_and_add_to_cache(timezone.now())
+
+from celery import signals
+
+
+@signals.worker_ready.connect
+def mark_old_jobs_as_failed(**kwargs):
+    models.Job.objects.filter(state=models.JobState.RETRIEVING).update(
+        state=models.JobState.RETRIEVE_FAILED
+    )
+    models.Job.objects.exclude(
+        state__in=[
+            models.JobState.RETRIEVE_FAILED,
+            models.JobState.CANCELLED,
+            models.JobState.PROCESS_FAILED,
+            models.JobState.PROCESSED,
+        ]
+    ).update(state=models.JobState.CANCELLED)
+    auto_refresh_statistics_data.delay()

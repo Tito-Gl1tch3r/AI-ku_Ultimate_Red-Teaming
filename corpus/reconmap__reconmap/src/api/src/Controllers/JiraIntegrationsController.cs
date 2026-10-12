@@ -1,0 +1,62 @@
+using api_v2.Domain.Entities;
+using api_v2.Infrastructure.Persistence;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+
+namespace api_v2.Controllers;
+
+[Route("api/integrations/jira")]
+[ApiController]
+public class JiraIntegrationsController(AppDbContext dbContext) : ControllerBase
+{
+    public sealed record JiraIntegrationResponse(int Id, string Name, string Url, string Email, bool IsEnabled, string ProjectKey);
+
+    private static JiraIntegrationResponse ToResponse(JiraIntegration integration) => new(
+        integration.Id, integration.Name, integration.Url, integration.Email, integration.IsEnabled, integration.ProjectKey);
+
+    [HttpGet]
+    public async Task<IActionResult> GetMany()
+    {
+        var integrations = await dbContext.JiraIntegrations.AsNoTracking().ToListAsync();
+        return Ok(integrations.Select(ToResponse));
+    }
+
+    [HttpGet("{id:int}")]
+    public async Task<IActionResult> GetOne(int id)
+    {
+        var integration = await dbContext.JiraIntegrations.FindAsync(id);
+        if (integration == null) return NotFound();
+        return Ok(ToResponse(integration));
+    }
+
+    [HttpPost]
+    public async Task<IActionResult> CreateOne([FromBody] JiraIntegration integration)
+    {
+        dbContext.JiraIntegrations.Add(integration);
+        await dbContext.SaveChangesAsync();
+        return CreatedAtAction(nameof(GetOne), new { id = integration.Id }, ToResponse(integration));
+    }
+
+    [HttpPut("{id:int}")]
+    public async Task<IActionResult> UpdateOne(int id, [FromBody] JiraIntegration integration)
+    {
+        var dbModel = await dbContext.JiraIntegrations.FindAsync(id);
+        if (dbModel == null) return NotFound();
+
+        dbContext.Entry(dbModel).CurrentValues.SetValues(integration);
+        dbContext.Entry(dbModel).Property(x => x.Id).IsModified = false;
+        await dbContext.SaveChangesAsync();
+        return Ok(ToResponse(dbModel));
+    }
+
+    [HttpDelete("{id:int}")]
+    public async Task<IActionResult> DeleteOne(int id)
+    {
+        var deleteCount = await dbContext.JiraIntegrations
+            .Where(n => n.Id == id)
+            .ExecuteDeleteAsync();
+
+        if (deleteCount == 0) return NotFound();
+        return NoContent();
+    }
+}

@@ -1,0 +1,454 @@
+from enum import StrEnum, auto
+import uuid
+from rest_framework import serializers
+
+
+from history4feed.app import serializers as h4fserializers
+
+from .models import (
+    AdmiraltyInformationCredibility,
+    AdmiraltySourceReliability,
+    File,
+    PDFCookieConsentMode,
+    Profile,
+    Job,
+    FileImage,
+)
+from obstracts.classifier.models import Cluster
+
+from drf_spectacular.utils import extend_schema_field
+from django.utils.translation import gettext_lazy as _
+
+
+
+
+class TopicBaseSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = Cluster
+        exclude = ["members", "created_at"]
+
+class ObstractsJobSerializer(serializers.ModelSerializer):
+    id = serializers.UUIDField()
+    feed_id = serializers.PrimaryKeyRelatedField(
+        read_only=True, source="feed", required=False, allow_null=True
+    )
+    profile_id = serializers.PrimaryKeyRelatedField(
+        read_only=True, source="profile", required=False, allow_null=True
+    )
+
+    class Meta:
+        model = Job
+        # fields = "__all__"
+        exclude = ["feed", "profile", "history4feed_job"]
+
+
+class ProfileIDField(serializers.PrimaryKeyRelatedField):
+    def __init__(self, **kwargs):
+        super().__init__(
+            queryset=Profile.objects,
+            error_messages={
+                "required": _("This field is required."),
+                "does_not_exist": _(
+                    'Invalid profile with id "{pk_value}" - object does not exist.'
+                ),
+                "incorrect_type": _(
+                    "Incorrect type. Expected profile id (uuid), received {data_type}."
+                ),
+            },
+            **kwargs,
+        )
+
+    def to_internal_value(self, data):
+        return super().to_internal_value(data).pk
+
+    def to_representation(self, value):
+        if isinstance(value, uuid.UUID):
+            return value
+        return super().to_representation(value)
+
+
+class FileIDField(serializers.PrimaryKeyRelatedField):
+    def __init__(self, **kwargs):
+        kwargs['pk_field'] = serializers.UUIDField()
+        super().__init__(
+            error_messages={
+                "required": _("This field is required."),
+                "does_not_exist": _(
+                    'Invalid post with id "{pk_value}" - object does not exist.'
+                ),
+                "incorrect_type": _(
+                    "Incorrect type. Expected post id (uuid), received {data_type}."
+                ),
+            },
+            **kwargs,
+        )
+
+    def get_queryset(self):
+        return File.objects.filter(feed_id=self.context['feed'].pk)
+
+
+class CreateTaskSerializer(serializers.Serializer):
+    profile_id = ProfileIDField(
+        help_text="profile id to use", write_only=True, required=True
+    )
+
+
+class ReindexFeedSerializer(CreateTaskSerializer):
+    only_hidden_posts = serializers.BooleanField(
+        write_only=True,
+        default=True,
+        help_text="default true; if true, only reindex posts that are have not been processed",
+    )
+
+
+class FeedCreateSerializer(CreateTaskSerializer, h4fserializers.FeedSerializer):
+    count_of_posts = serializers.IntegerField(
+        read_only=True,
+        help_text="Number of posts in feed",
+    )
+    pdfshift_cookie_settings = serializers.ChoiceField(
+        choices=PDFCookieConsentMode.choices,
+        default=PDFCookieConsentMode.disable_all_js,
+        source="obstracts_feed.pdfshift_cookie_settings",
+    )
+    admiralty_source_reliability = serializers.ChoiceField(
+        choices=AdmiraltySourceReliability.choices,
+        default=None,
+        allow_null=True,
+        required=False,
+        source="obstracts_feed.admiralty_source_reliability",
+    )
+
+
+class SkeletonFeedSerializer(h4fserializers.SkeletonFeedSerializer):
+    pdfshift_cookie_settings = serializers.ChoiceField(
+        choices=PDFCookieConsentMode.choices,
+        default=PDFCookieConsentMode.disable_all_js,
+        source="obstracts_feed.pdfshift_cookie_settings",
+    )
+
+
+class PatchFeedSerializer(h4fserializers.FeedPatchSerializer):
+    title = serializers.CharField(required=True, help_text="title of feed")
+    description = serializers.CharField(required=True, help_text="description of feed")
+    pdfshift_cookie_settings = serializers.ChoiceField(
+        choices=PDFCookieConsentMode.choices,
+        default=PDFCookieConsentMode.disable_all_js,
+    )
+    admiralty_source_reliability = serializers.ChoiceField(
+        choices=AdmiraltySourceReliability.choices,
+        default=None,
+        allow_null=True,
+        required=False,
+    )
+
+    class Meta(h4fserializers.FeedPatchSerializer.Meta):
+        fields = h4fserializers.FeedPatchSerializer.Meta.fields + [
+            "pdfshift_cookie_settings",
+            "admiralty_source_reliability",
+        ]
+
+
+class FetchFeedSerializer(CreateTaskSerializer, h4fserializers.FeedFetchSerializer):
+    include_remote_blogs = serializers.BooleanField(write_only=True, default=False)
+
+
+class FetchPostSerializer(CreateTaskSerializer):
+    pass
+
+
+class ReprocessSinglePostSerializer(serializers.Serializer):
+
+    profile_id = ProfileIDField(
+        help_text="profile id to use", write_only=True, required=False, allow_null=True
+    )
+    skip_extraction = serializers.BooleanField(
+        write_only=True,
+        default=True,
+        help_text="Default true. If false, the extraction process will be run again on the post.",
+    )
+
+    def validate(self, attrs):
+        profile_id = attrs.get("profile_id", None)
+        if profile_id and attrs["skip_extraction"]:
+            raise serializers.ValidationError(
+                {
+                    "non_field_errors": [
+                        "Cannot specify profile_id when skip_extraction is true (or not set)"
+                    ]
+                }
+            )
+        if not profile_id and not attrs["skip_extraction"]:
+            raise serializers.ValidationError(
+                {
+                    "non_field_errors": [
+                        "Must specify profile_id when skip_extraction is false"
+                    ]
+                }
+            )
+        return super().validate(attrs)
+
+
+class ReprocessFeedPostsSerializer(ReprocessSinglePostSerializer):
+    only_hidden_posts = serializers.BooleanField(
+        write_only=True,
+        default=True,
+        help_text="default true; if true, only reprocess posts that are not visible",
+    )
+    pubdate_after = serializers.DateTimeField(
+        write_only=True,
+        required=False,
+        help_text="only process posts that have `pubdate` greater than passed value",
+    )
+
+    def validate(self, attrs):
+        if attrs["only_hidden_posts"] and not attrs.get("profile_id", None):
+            raise serializers.ValidationError(
+                {
+                    "non_field_errors": [
+                        "Must specify profile_id when only_hidden_posts is true"
+                    ]
+                }
+            )
+        return super().validate(attrs)
+
+
+class ReindexPDFsSerializer(serializers.Serializer):
+    posts = serializers.ListField(
+        child=FileIDField(
+            help_text="post id", write_only=True, required=False, allow_null=False
+        ),
+        required=False,
+        allow_empty=False,
+        help_text="List of post IDs to reindex PDFs for. If not provided, all eligible posts will be reindexed.",
+    )
+    missing_pdfs_only = serializers.BooleanField(
+        default=False,
+        help_text="If true, only reindex posts that are missing PDF files. If false, reindex all eligible posts.",
+    )
+
+
+class H4fPostCreateSerializer(serializers.Serializer):
+    title = serializers.CharField()
+    link = serializers.URLField()
+    pubdate = serializers.DateTimeField()
+    author = serializers.CharField(required=False)
+    categories = serializers.ListField(child=serializers.CharField(), required=False)
+
+
+class PatchPostSerializer(H4fPostCreateSerializer):
+    link = None
+
+
+class PostCreateSerializer(CreateTaskSerializer):
+    posts = serializers.ListSerializer(
+        child=H4fPostCreateSerializer(), allow_empty=False
+    )
+
+
+class ObstractsPostSerializer(h4fserializers.PostSerializer):
+    profile_id = serializers.UUIDField(
+        source="obstracts_post.profile_id", required=False, allow_null=True
+    )
+    ai_describes_incident = serializers.BooleanField(
+        source="obstracts_post.ai_describes_incident",
+        required=False,
+        read_only=True,
+        allow_null=True,
+    )
+    ai_incident_summary = serializers.CharField(
+        source="obstracts_post.ai_incident_summary",
+        required=False,
+        read_only=True,
+        allow_null=True,
+    )
+    ai_incident_classification = serializers.ListField(
+        source="obstracts_post.ai_incident_classification",
+        required=False,
+        read_only=True,
+        allow_null=True,
+    )
+    summary = serializers.CharField(
+        source="obstracts_post.summary", read_only=True, required=False, allow_null=True
+    )
+    visible = serializers.BooleanField(
+        source="obstracts_post.processed",
+        read_only=True,
+        required=False,
+        allow_null=True,
+    )
+    archived_pdf = serializers.FileField(
+        source="obstracts_post.pdf_file",
+        read_only=True,
+        required=False,
+        allow_null=True,
+    )
+    ai_threat_score = serializers.IntegerField(
+        source="threat_score",
+        read_only=True,
+        required=False,
+        allow_null=True,
+    )
+
+
+class SimilarPostsSerializer(serializers.Serializer):
+    """
+    serialize similar posts with their similarity score to the query post
+    """
+    post_id = serializers.UUIDField(help_text="id of the similar post")
+    post_title = serializers.CharField(help_text="title of the similar post")
+    pubdate = serializers.DateTimeField(help_text="publication date of the similar post")
+    similarity_score = serializers.FloatField(help_text="similarity score to the query post")
+    shared_topics = serializers.ListField(
+        child=serializers.CharField(), help_text="list of shared topic ids with the query post"
+    )
+    feed_id = serializers.UUIDField(help_text="id of the feed containing the similar post")
+
+class PostWithFeedIDSerializer(ObstractsPostSerializer):
+    feed_id = serializers.UUIDField(help_text="containing feed's id", required=False)
+
+class PostWithSimilaritiesSerializer(serializers.Serializer):
+    similar_posts = SimilarPostsSerializer(many=True, source="obstracts_post.similar_posts", read_only=True)
+    topics = TopicBaseSerializer(
+        source="obstracts_post.embedding.clusters",
+        many=True,
+        read_only=True,
+        required=False,
+        allow_null=True,
+    )
+
+
+    
+class ImageSerializer(serializers.ModelSerializer):
+    url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = FileImage
+        fields = ["name", "url"]
+
+    @extend_schema_field(serializers.CharField())
+    def get_url(self, instance):
+        request = self.context.get("request")
+        if instance.file and hasattr(instance.file, "url"):
+            photo_url = instance.file.url
+            return request.build_absolute_uri(photo_url)
+        return None
+
+
+class AttackNavigatorSerializer(serializers.Serializer):
+    mobile = serializers.BooleanField(default=False)
+    ics = serializers.BooleanField(default=False)
+    enterprise = serializers.BooleanField(default=False)
+
+
+from dogesec_commons.utils.serializers import JSONSchemaSerializer
+
+
+class AttackNavigatorDomainSerializer(JSONSchemaSerializer):
+    json_schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "MITRE ATT&CK Navigator Layer v4.5",
+        "type": "object",
+        "required": ["version", "name", "domain", "techniques"],
+        "properties": {
+            "version": {"type": "string", "enum": ["4.5"]},
+            "name": {"type": "string"},
+            "domain": {
+                "type": "string",
+                "enum": ["enterprise-attack", "mobile-attack", "ics-attack"],
+            },
+            "description": {"type": "string"},
+            "gradient": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["color", "minValue", "maxValue"],
+                    "properties": {
+                        "color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+                        "minValue": {"type": "number"},
+                        "maxValue": {"type": "number"},
+                    },
+                },
+            },
+            "legendItems": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string"},
+                        "color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+                        "value": {"type": "number"},
+                    },
+                },
+            },
+            "showTacticsRowBackground": {"type": "boolean"},
+            "techniques": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["techniqueID"],
+                    "properties": {
+                        "techniqueID": {"type": "string"},
+                        "score": {"type": ["number", "null"]},
+                        "color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+                        "comment": {"type": "string"},
+                        "enabled": {"type": "boolean"},
+                        "links": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "href": {"type": "string", "format": "uri"},
+                                    "text": {"type": "string"},
+                                },
+                                "required": ["href", "text"],
+                            },
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "tacticUseIds": {"type": "array", "items": {"type": "string"}},
+            "filters": {
+                "type": "object",
+                "properties": {
+                    "includeSubtechniques": {"type": "boolean"},
+                    "showOnlyVisibleTechniques": {"type": "boolean"},
+                },
+            },
+        },
+        "additionalProperties": True,
+    }
+
+
+class HealthCheckChoices(StrEnum):
+    AUTHORIZED = auto()
+    UNAUTHORIZED = auto()
+    UNSUPPORTED = auto()
+    NOT_CONFIGURED = "not-configured"
+    UNKNOWN = auto()
+    OFFLINE = auto()
+
+
+class HealthCheckChoiceField(serializers.ChoiceField):
+    def __init__(self, **kwargs):
+        choices = [m.value for m in HealthCheckChoices]
+        super().__init__(choices, **kwargs)
+
+
+class HealthCheckLLMs(serializers.Serializer):
+    openai = HealthCheckChoiceField()
+    deepseek = HealthCheckChoiceField()
+    anthropic = HealthCheckChoiceField()
+    gemini = HealthCheckChoiceField()
+    openrouter = HealthCheckChoiceField()
+
+
+class HealthCheckSerializer(serializers.Serializer):
+    ctibutler = HealthCheckChoiceField()
+    vulmatch = HealthCheckChoiceField()
+    btcscan = HealthCheckChoiceField()
+    binlist = HealthCheckChoiceField()
+    pdfshift = HealthCheckChoiceField()
+    llms = HealthCheckLLMs()

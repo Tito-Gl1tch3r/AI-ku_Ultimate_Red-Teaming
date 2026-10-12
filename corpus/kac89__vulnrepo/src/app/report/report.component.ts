@@ -1,0 +1,4197 @@
+import { Component, OnInit, OnDestroy, ViewChild, KeyValueChanges, KeyValueDiffer, KeyValueDiffers, ElementRef, AfterViewInit, HostListener, ChangeDetectionStrategy } from '@angular/core';
+import { ActivatedRoute } from '@angular/router';
+import { MatDialog, MatDialogRef } from '@angular/material/dialog';
+import { IndexeddbService } from '../indexeddb.service';
+import { DialogPassComponent } from '../dialog-pass/dialog-pass.component';
+import { DialogAddissueComponent } from '../dialog-addissue/dialog-addissue.component';
+import { Router } from '@angular/router';
+import { Subscription, of, concatMap, Observable } from 'rxjs';
+import { MessageService } from '../message.service';
+import { CdkDragDrop, moveItemInArray } from '@angular/cdk/drag-drop';
+import { DialogImportAdvancedComponent } from '../dialog-import-advanced/dialog-import-advanced.component';
+import { MatPaginator } from '@angular/material/paginator';
+import { MatSort } from '@angular/material/sort';
+import { MatTableDataSource } from '@angular/material/table';
+import { DialogEditComponent } from '../dialog-edit/dialog-edit.component';
+import { DialogExportissuesComponent } from '../dialog-exportissues/dialog-exportissues.component';
+import { DialogChangelogComponent } from '../dialog-changelog/dialog-changelog.component';
+import { DialogChangekeyComponent } from '../dialog-changekey/dialog-changekey.component';
+import { DialogRemoveitemsComponent } from '../dialog-removeitems/dialog-removeitems.component';
+import { DialogIssuesEditComponent } from '../dialog-issues-edit/dialog-issues-edit.component';
+import { DialogCvssComponent } from '../dialog-cvss/dialog-cvss.component';
+import { DialogCveComponent } from '../dialog-cve/dialog-cve.component';
+import { DialogCustomcontentComponent } from '../dialog-customcontent/dialog-customcontent.component';
+import { DialogReportcssComponent } from '../dialog-reportcss/dialog-reportcss.component';
+import { DialogApierrorComponent } from '../dialog-apierror/dialog-apierror.component';
+import { sha256 } from 'js-sha256';
+import { MatSnackBar } from '@angular/material/snack-bar';
+import { MatChipInputEvent } from '@angular/material/chips';
+import { COMMA, ENTER } from '@angular/cdk/keycodes';
+import { HttpClient, HttpEventType } from '@angular/common/http';
+import { v4 as uuid } from 'uuid';
+import DOMPurify from 'dompurify';
+import { ApiService } from '../api.service';
+import { MatCalendar, MatCalendarCellCssClasses, DateRange } from '@angular/material/datepicker';
+import { SessionstorageserviceService } from "../sessionstorageservice.service"
+import { DatePipe } from '@angular/common';
+import { DateAdapter } from '@angular/material/core';
+import { DialogAddCustomTemplateComponent } from '../dialog-add-custom-template/dialog-add-custom-template.component';
+import { DialogEncryptReportComponent } from '../dialog-encrypt-report/dialog-encrypt-report.component';
+import { PageEvent } from '@angular/material/paginator';
+import { DialogEditorFullscreenComponent } from '../dialog-editor-fullscreen/dialog-editor-fullscreen.component';
+import { DialogAttachPreviewComponent } from '../dialog-attach-preview/dialog-attach-preview.component';
+// NOTE: `docx` is intentionally NOT imported statically — it is ~1 MB of the
+// bundle and is only needed by DownloadDOCX(), which loads it on demand via
+// `await import('docx')`. Do not re-add a top-level value import here.
+// Type-only imports are erased at compile time and cost nothing; they are
+// aliased so they don't collide with the destructured locals in DownloadDOCX().
+import type { TextRun as DocxTextRun } from "docx";
+import { UtilsService } from '../utils.service';
+import { OllamaServiceService } from '../ollama-service.service';
+import { DialogOllamaSettingsComponent } from '../dialog-ollama-settings/dialog-ollama-settings.component';
+import { DialogOllamaComponent } from '../dialog-ollama/dialog-ollama.component';
+import { CurrentdateService } from '../currentdate.service';
+import { DialogMergeIssuesComponent } from '../dialog-merge-issues/dialog-merge-issues.component';
+import { DialogReportHistoryComponent } from '../dialog-report-history/dialog-report-history.component';
+import { DialogSpinnerComponent } from '../dialog-spinner/dialog-spinner.component';
+import { IssueFilterService, FilterPill } from '../issue-filter.service';
+import { DialogFilterHelpComponent } from '../dialog-filter-help/dialog-filter-help.component';
+import { CryptoUtilsService } from '../crypto-utils.service';
+import { KeyVaultService } from '../key-vault.service';
+
+export interface Tags {
+  name: string;
+}
+
+@Component({
+  standalone: false,
+  //imports: [],
+  selector: 'app-report',
+  templateUrl: './report.component.html',
+  changeDetection: ChangeDetectionStrategy.Eager,
+  styleUrls: ['./report.component.scss']
+})
+
+export class ReportComponent implements OnInit, OnDestroy, AfterViewInit {
+
+  // Pie
+  public pieChartLabels: string[] = ['Critical', 'High', 'Medium', 'Low', 'Info'];
+  public chartcolors: any[] = [{
+    backgroundColor: ['#FF0039', '#FF7518', '#F9EE06', '#3FB618', '#2780E3']
+  }];
+
+  private reportDiffer: KeyValueDiffer<string, any>;
+  private reportDifferlogo: KeyValueDiffer<string, any>;
+  private reportDiffersettings: KeyValueDiffer<string, any>;
+  private reportTitleDiffer: KeyValueDiffer<any, any>;
+  private objDiffers: Array<KeyValueDiffer<string, any>>;
+  private objDiffersFiles: Array<KeyValueDiffer<string, any>>;
+  private objDiffersResearcher: Array<KeyValueDiffer<string, any>>;
+  private requireKeyPromise: Promise<string | null> | null = null;
+  private vaultSub!: Subscription;
+  public pieChartData: number[] = [0, 0, 0, 0, 0];
+  public pieChartType = 'pie';
+  public pieChartPlugins = [];
+
+  dialogRef: MatDialogRef<DialogPassComponent>;
+  displayedColumns: string[] = ['date', 'desc', 'settings'];
+  dataSource = new MatTableDataSource();
+  listchangelog: any[];
+  changelogLimit = 5;
+
+  @ViewChild("textareaheight") textareaheight: ElementRef;
+  @ViewChild('paginatorIssues') paginator: MatPaginator;
+  @ViewChild('paginatorchangelog') paginator2: MatPaginator;
+
+  @ViewChild('table2', { read: MatSort }) sort: MatSort;
+
+  issesTable = new MatTableDataSource();
+  selectedResult: any;
+  length: number;
+  pageSize = 20;
+  pageIndex = 0;
+  pageEvent: PageEvent;
+
+  @ViewChild(MatCalendar) calendar: MatCalendar<Date>;
+  advhtml = '';
+  report_css: any;
+  bugbountylist = [];
+  reportProfileList_int: string[] = [];
+  report_id: string;
+  report_info: any;
+  lastsavereportdata = '';
+  reportdesc: any;
+  selecteditem = false;
+  BBmsg = '';
+
+  textarea_selected = ""
+  textarea_selected_start: any;
+  textarea_selected_end: any;
+  textarea_click: any;
+  selectedIssues: any[] = [];
+  ReportProfilesList: any[] = [];
+  scopePreviewHTML = [];
+  RaportsTags: any[] = [];
+  pok = 0;
+  prev_height = 190;
+  timerCounter = 0;
+  spinner: any;
+  savemsg = '';
+  report_decryption_in_progress: boolean;
+  report_encryption_in_progress: boolean;
+  api_connection_status: boolean;
+  report_source_api = false;
+  upload_in_progress = false;
+  youhaveunsavedchanges = false;
+  stickyBarVisible = false;
+  decryptedReportData: any;
+  decryptedReportDataChanged: any;
+  lastSavedSnapshot: any = null;
+  setLocal = 'en-GB';  //dd/MM/yyyy
+  subscription: Subscription;
+  displayedSeverityColumns: string[] = ['severity', 'count'];
+  dataSourceforseverity = [
+    { severity: 'Critical', count: 0 },
+    { severity: 'High', count: 0 },
+    { severity: 'Medium', count: 0 },
+    { severity: 'Low', count: 0 },
+    { severity: 'Info', count: 0 }
+  ];
+  issueStatus = [
+    { status: 'Open (Waiting for review)', value: 1 },
+    { status: 'Fix In Progress', value: 2 },
+    { status: 'Fixed', value: 3 },
+    { status: 'Won\'t Fix', value: 4 }
+  ];
+  statusStatsTable = [
+    { status: 'Open', value: 0, color: '#FF0039' },
+    { status: 'In Progress', value: 0, color: '#FF9800' },
+    { status: 'Fixed', value: 0, color: '#69f0ae' },
+    { status: "Won't Fix", value: 0, color: '#616161' },
+  ];
+  heatmapWeeks: { date: string, total: number, top: 'c'|'h'|'m'|'l'|'i'|null, q: 0|1|2|3|4, inRange: boolean, inWindow: boolean }[][] = [];
+  heatmapMonthLabels: { label: string, col: number }[] = [];
+  heatmapRangeMode: 'window' | '12w' | 'all' = 'window';
+  readonly heatmapRangeOptions: { mode: 'window' | '12w' | 'all', label: string }[] = [
+    { mode: 'window', label: 'Test window' },
+    { mode: '12w',    label: '12 weeks' },
+    { mode: 'all',    label: 'All-time' },
+  ];
+  heatmapStats: { total: number, activeDays: number, peakLabel: string, peakCount: number, longestStreak: number, avgPerActive: number } = {
+    total: 0, activeDays: 0, peakLabel: '', peakCount: 0, longestStreak: 0, avgPerActive: 0,
+  };
+
+  // Per-day activity cache (key: YYYY-MM-DD) used by mat-calendar dateClass and the selected-day card.
+  dayActivityMap: Map<string, { c: number, h: number, m: number, l: number, i: number, total: number }> = new Map();
+  selectedActivityDay: { key: string, label: string, c: number, h: number, m: number, l: number, i: number, total: number } | null = null;
+  readonly calendarSeverityOrder: { key: 'c' | 'h' | 'm' | 'l' | 'i', label: string, cssVar: string }[] = [
+    { key: 'c', label: 'Critical', cssVar: '--sev-critical' },
+    { key: 'h', label: 'High',     cssVar: '--sev-high' },
+    { key: 'm', label: 'Medium',   cssVar: '--sev-medium' },
+    { key: 'l', label: 'Low',      cssVar: '--sev-low' },
+    { key: 'i', label: 'Info',     cssVar: '--sev-info' },
+  ];
+  selectedtheme = 'white';
+  uploadlogoprev = '';
+  adv_html: any;
+  advlogo: any;
+  advlogo_saved: any;
+
+  severitytable = [
+    { name: 'Critical', value: 0 },
+    { name: 'High', value: 0 },
+    { name: 'Medium', value: 0 },
+    { name: 'Low', value: 0 },
+    { name: 'Info', value: 0 }
+  ];
+
+  // options stats
+  gradient: boolean = true;
+  showLegend: boolean = true;
+  showLabels: boolean = true;
+  isDoughnut: boolean = false;
+
+  colorScheme = {
+    domain: ['#FF0039', '#FF7518', '#F9EE06', '#3FB618', '#2780E3']
+  };
+
+  // options stats activity
+  selectedRangeValue: DateRange<Date> | null;
+  startDate: any;
+  visible = true;
+  selectable = true;
+  removable = true;
+  addOnBlur = true;
+  readonly separatorKeysCodes = [ENTER, COMMA] as const;
+
+  aiprogress = false;
+  aiconnected = false;
+  models: any;
+
+  issueFilterQuery = '';
+  issueFilterError: string | null = null;
+  issueFilterPills: FilterPill[] = [];
+  readonly issueFilterSeverities = ['Critical', 'High', 'Medium', 'Low', 'Info'];
+
+  kanbanView = false;
+  kanbanSwimlanes = false;
+  tagFilterInput = '';
+  readonly kanbanColumns = [
+    { status: 1, label: 'Open',         cssClass: 'open' },
+    { status: 2, label: 'In Progress',  cssClass: 'inprogress' },
+    { status: 3, label: 'Fixed',        cssClass: 'fixed' },
+    { status: 4, label: "Won't Fix",    cssClass: 'wontfix' },
+  ];
+  readonly swimlaneSeverities = ['Critical', 'High', 'Medium', 'Low', 'Info'];
+
+  getFilteredVulns(): any[] {
+    const vulns: any[] = this.decryptedReportDataChanged?.report_vulns ?? [];
+    const { result, error } = this.issueFilterService.filter(vulns, this.issueFilterQuery);
+    this.issueFilterError = error;
+    return result;
+  }
+
+  applyIssueFilter() {
+    this.pageIndex = 0;
+    const parsed = this.issueFilterService.parse(this.issueFilterQuery);
+    this.issueFilterError = parsed.error;
+    this.issueFilterPills = this.issueFilterService.describe(parsed.ast);
+    const filtered = this.getFilteredVulns();
+    this.issesTable = new MatTableDataSource(filtered);
+    this.issesTable.paginator = this.paginator;
+    this.selectedResult = filtered.slice(0, this.pageSize);
+  }
+
+  toggleIssueSeverityToken(severity: string) {
+    this.issueFilterQuery = this.issueFilterService.toggleFieldToken(
+      this.issueFilterQuery, 'severity', severity,
+    );
+    this.applyIssueFilter();
+  }
+
+  isIssueSeverityActive(severity: string): boolean {
+    return this.issueFilterService.hasFieldToken(this.issueFilterQuery, 'severity', severity);
+  }
+
+  get hasAnySeverityFilter(): boolean {
+    return this.issueFilterSeverities.some(sev => this.isIssueSeverityActive(sev));
+  }
+
+  clearIssueFilter() {
+    this.issueFilterQuery = '';
+    this.applyIssueFilter();
+  }
+
+  removeIssueFilterPill(pill: FilterPill) {
+    this.issueFilterQuery = this.issueFilterService.removeRange(
+      this.issueFilterQuery, pill.start, pill.end,
+    );
+    this.applyIssueFilter();
+  }
+
+  openIssueFilterHelp() {
+    const ref = this.dialog.open(DialogFilterHelpComponent, {
+      width: '520px',
+      maxWidth: '95vw',
+      autoFocus: false,
+      panelClass: 'dialog-filter-help-panel',
+    });
+    ref.afterClosed().subscribe((snippet: string | undefined) => {
+      if (!snippet) return;
+      const current = this.issueFilterQuery.trim();
+      this.issueFilterQuery = current ? `${current} ${snippet}` : snippet;
+      this.applyIssueFilter();
+    });
+  }
+
+  get issueProgress(): number {
+    const vulns: any[] = this.decryptedReportDataChanged?.report_vulns ?? [];
+    if (vulns.length === 0) return 0;
+    const closed = vulns.filter(v => v.status === 3 || v.status === 4).length;
+    return Math.round((closed / vulns.length) * 100);
+  }
+
+  // ─── Asset inventory ────────────────────────────────────────────────
+  scopeTabIndex = 0;
+
+  assetsPageIndex = 0;
+  assetsPageSize = 10;
+  readonly assetsPageSizeOptions = [10, 25, 50, 100];
+  assetsSortField: 'type' | 'name' | 'target' | 'scope' | 'findings' | null = null;
+  assetsSortDir: 'asc' | 'desc' = 'desc';
+
+  readonly assetTypes = [
+    { value: 'web',    label: 'Web',    icon: 'language' },
+    { value: 'api',    label: 'API',    icon: 'api' },
+    { value: 'host',   label: 'Host',   icon: 'dns' },
+    { value: 'mobile', label: 'Mobile', icon: 'smartphone' },
+    { value: 'cloud',  label: 'Cloud',  icon: 'cloud' },
+    { value: 'iot',    label: 'IoT',    icon: 'router' },
+    { value: 'code',   label: 'Code',   icon: 'code' },
+    { value: 'other',  label: 'Other',  icon: 'category' },
+  ];
+
+  assetIcon(type: string): string {
+    return this.assetTypes.find(t => t.value === type)?.icon || 'category';
+  }
+
+  addAsset() {
+    if (!this.decryptedReportDataChanged) return;
+    if (!Array.isArray(this.decryptedReportDataChanged.report_assets)) {
+      this.decryptedReportDataChanged.report_assets = [];
+    }
+    this.decryptedReportDataChanged.report_assets.push({
+      id: uuid(),
+      name: '',
+      type: 'web',
+      target: '',
+      notes: '',
+      in_scope: true
+    });
+  }
+
+  removeAsset(asset: any) {
+    if (!this.decryptedReportDataChanged?.report_assets) return;
+    const idx = this.decryptedReportDataChanged.report_assets.indexOf(asset);
+    if (idx >= 0) this.decryptedReportDataChanged.report_assets.splice(idx, 1);
+  }
+
+  toggleAssetScope(asset: any) {
+    asset.in_scope = !asset.in_scope;
+  }
+
+  // Heuristic: a finding belongs to an asset if its title/desc/poc/refs contain
+  // the asset's name or target (case-insensitive substring). Each vuln counted once.
+  countFindingsForAsset(asset: any): number {
+    const vulns: any[] = this.decryptedReportDataChanged?.report_vulns ?? [];
+    const needles: string[] = [];
+    if (asset?.name)   needles.push(String(asset.name).toLowerCase().trim());
+    if (asset?.target) needles.push(String(asset.target).toLowerCase().trim());
+    const filtered = needles.filter(n => n.length >= 2);
+    if (filtered.length === 0) return 0;
+    let n = 0;
+    for (const v of vulns) {
+      const haystack = (
+        (v.title || '') + ' ' +
+        (v.desc  || '') + ' ' +
+        (v.poc   || '') + ' ' +
+        (Array.isArray(v.ref) ? v.ref.map((r: any) => r?.refs ?? r ?? '').join(' ') : '')
+      ).toLowerCase();
+      if (filtered.some(needle => haystack.includes(needle))) n++;
+    }
+    return n;
+  }
+
+  filterIssuesByAsset(asset: any) {
+    const term = (asset?.target || asset?.name || '').trim();
+    if (!term) return;
+    // Quote so the parser treats it as a free-text search across all fields.
+    this.issueFilterQuery = `"${term.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+    this.applyIssueFilter();
+    // Smooth scroll to the issues list
+    setTimeout(() => {
+      const el = document.querySelector('.report-issue-filter-bar');
+      el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 50);
+  }
+
+  trackAsset = (_: number, a: any) => a?.id ?? _;
+
+  get assetTotals() {
+    const list: any[] = this.decryptedReportDataChanged?.report_assets ?? [];
+    const total = list.length;
+    const inScope = list.filter(a => a.in_scope !== false).length;
+    return { total, inScope, outOfScope: total - inScope };
+  }
+
+  get sortedAssets(): any[] {
+    const list: any[] = this.decryptedReportDataChanged?.report_assets ?? [];
+    if (!this.assetsSortField) return list;
+    const dir = this.assetsSortDir === 'asc' ? 1 : -1;
+    const field = this.assetsSortField;
+    return [...list].sort((a, b) => {
+      let av: any;
+      let bv: any;
+      if (field === 'findings') {
+        av = this.countFindingsForAsset(a);
+        bv = this.countFindingsForAsset(b);
+      } else if (field === 'scope') {
+        av = a.in_scope === false ? 0 : 1;
+        bv = b.in_scope === false ? 0 : 1;
+      } else {
+        av = String(a?.[field] ?? '').toLowerCase();
+        bv = String(b?.[field] ?? '').toLowerCase();
+      }
+      if (av < bv) return -1 * dir;
+      if (av > bv) return  1 * dir;
+      return 0;
+    });
+  }
+
+  get displayedAssets(): any[] {
+    const sorted = this.sortedAssets;
+    const totalPages = Math.max(1, Math.ceil(sorted.length / this.assetsPageSize));
+    if (this.assetsPageIndex >= totalPages) {
+      // Clamp when assets are removed below the current page; runs during the
+      // same change-detection cycle so the next read returns the right slice.
+      this.assetsPageIndex = totalPages - 1;
+    }
+    if (sorted.length <= this.assetsPageSize) return sorted;
+    const start = this.assetsPageIndex * this.assetsPageSize;
+    return sorted.slice(start, start + this.assetsPageSize);
+  }
+
+  setAssetsSort(field: 'type' | 'name' | 'target' | 'scope' | 'findings') {
+    if (this.assetsSortField === field) {
+      this.assetsSortDir = this.assetsSortDir === 'asc' ? 'desc' : 'asc';
+    } else {
+      this.assetsSortField = field;
+      // Findings is most useful in descending order (worst-first); others ascending.
+      this.assetsSortDir = field === 'findings' ? 'desc' : 'asc';
+    }
+    this.assetsPageIndex = 0;
+  }
+
+  onAssetsPage(e: PageEvent) {
+    this.assetsPageIndex = e.pageIndex;
+    this.assetsPageSize = e.pageSize;
+  }
+
+  // Switch to Inventory tab and immediately run the extractor.
+  goToInventoryAndExtract() {
+    this.scopeTabIndex = 1;
+    setTimeout(() => this.extractAssetsFromText(), 60);
+  }
+
+  get hasExtractableContent(): boolean {
+    if (this.decryptedReportDataChanged?.report_scope?.trim()) return true;
+    return (this.decryptedReportDataChanged?.report_vulns ?? []).some((v: any) => v.poc?.trim());
+  }
+
+  // Parse the free-text Description and issue PoC fields for URLs, IPv4 (with
+  // optional CIDR), and bare hostnames; add each as a structured asset, skipping duplicates.
+  extractAssetsFromText() {
+    const scopeText = this.decryptedReportDataChanged?.report_scope || '';
+    const vulns: any[] = this.decryptedReportDataChanged?.report_vulns ?? [];
+    const pocText = vulns.map((v: any) => v.poc || '').join('\n');
+    const text = [scopeText, pocText].filter(t => t.trim()).join('\n');
+    if (!text.trim()) {
+      this.snackBar.open('Nothing to extract — add a description or PoC content to issues', 'OK', {
+        duration: 2500,
+        panelClass: ['notify-snackbar-fail']
+      });
+      return;
+    }
+    if (!Array.isArray(this.decryptedReportDataChanged.report_assets)) {
+      this.decryptedReportDataChanged.report_assets = [];
+    }
+
+    const norm = (s: any) => String(s ?? '').toLowerCase().trim();
+    const existing = new Set<string>(
+      this.decryptedReportDataChanged.report_assets
+        .map((a: any) => norm(a.target) || norm(a.name))
+        .filter((s: string) => s.length > 0)
+    );
+
+    const found = new Map<string, { target: string; type: string }>();
+
+    // 1) Full URLs (highest priority)
+    const urlRe = /\bhttps?:\/\/[^\s<>'"`)]+/gi;
+    let m: RegExpExecArray | null;
+    while ((m = urlRe.exec(text)) !== null) {
+      const v = m[0].replace(/[.,;:!?)\]\}]+$/, '').toLowerCase();
+      if (!existing.has(v) && !found.has(v)) {
+        found.set(v, { target: v, type: 'web' });
+      }
+    }
+
+    // 2) IPv4 addresses with optional CIDR
+    const ipRe = /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)(?:\/\d{1,2})?\b/g;
+    while ((m = ipRe.exec(text)) !== null) {
+      const v = m[0].toLowerCase();
+      if (!existing.has(v) && !found.has(v)) {
+        found.set(v, { target: v, type: 'host' });
+      }
+    }
+
+    // 3) Bare hostnames — must contain a dot, end with letters TLD (≥2 chars).
+    //    Skip those already inside a captured URL, and skip common file extensions.
+    const fileExtRe = /\.(md|txt|json|html?|css|jpe?g|png|svg|gif|pdf|docx?|xlsx?|csv|xml|zip|tar|gz|bz2|js|ts|py|rb|sh|yml|yaml|toml|ini|log|bak)$/i;
+    const hostRe = /\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b/gi;
+    while ((m = hostRe.exec(text)) !== null) {
+      const v = m[0].toLowerCase();
+      if (existing.has(v)) continue;
+      if (found.has(v)) continue;
+      if (fileExtRe.test(v)) continue;
+      // Skip if this hostname appears inside an already-captured URL
+      let inUrl = false;
+      for (const k of found.keys()) {
+        if (k.startsWith('http') && k.includes(v)) { inUrl = true; break; }
+      }
+      if (inUrl) continue;
+      found.set(v, { target: v, type: 'web' });
+    }
+
+    let added = 0;
+    for (const [, info] of found) {
+      this.decryptedReportDataChanged.report_assets.push({
+        id: uuid(),
+        name: '',
+        type: info.type,
+        target: info.target,
+        notes: 'Extracted from report content',
+        in_scope: true
+      });
+      added++;
+    }
+
+    if (added === 0) {
+      this.snackBar.open('No new URLs, hosts or IPs found', 'OK', {
+        duration: 2500
+      });
+    } else {
+      this.snackBar.open(
+        `Extracted ${added} asset${added === 1 ? '' : 's'} from report content`,
+        'OK',
+        { duration: 3000, panelClass: ['notify-snackbar-success'] }
+      );
+    }
+  }
+  insertInventoryAsTable() {
+    const assets: any[] = this.decryptedReportDataChanged?.report_assets ?? [];
+    if (assets.length === 0) {
+      this.snackBar.open('Inventory is empty — add assets first', 'OK', { duration: 2500 });
+      return;
+    }
+    const typeLabels: Record<string, string> = {
+      web: 'Web', api: 'API', host: 'Host', mobile: 'Mobile',
+      cloud: 'Cloud', iot: 'IoT', code: 'Code', other: 'Other'
+    };
+    const rows = assets.map((a: any) => {
+      const type = typeLabels[a.type] ?? a.type ?? '';
+      const name = (a.name || '').replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
+      const target = (a.target || '').replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
+      const scope = a.in_scope ? 'Yes' : 'No';
+      return `| ${type} | ${name} | ${target} | ${scope} |`;
+    });
+    const table = [
+      '| Type | Name | Target | In Scope |',
+      '|------|------|--------|----------|',
+      ...rows
+    ].join('\n');
+    const current = this.decryptedReportDataChanged.report_scope || '';
+    this.decryptedReportDataChanged.report_scope = current
+      ? current.trimEnd() + '\n\n' + table
+      : table;
+    this.scopeTabIndex = 0;
+    this.snackBar.open('Inventory table inserted into Description', 'OK', {
+      duration: 2500, panelClass: ['notify-snackbar-success']
+    });
+  }
+  // ─────────────────────────────────────────────────────────────────────
+
+  getKanbanIssues(status: number): any[] {
+    return (this.decryptedReportDataChanged?.report_vulns ?? []).filter((v: any) => v.status === status);
+  }
+
+  getSwimlaneIssues(status: number, severity: string): any[] {
+    return (this.decryptedReportDataChanged?.report_vulns ?? [])
+      .filter((v: any) => v.status === status && v.severity === severity);
+  }
+
+  getWipLimit(status: number): number | null {
+    const meta = this.decryptedReportDataChanged?.report_metadata;
+    const v = meta?.kanban_wip?.[status];
+    return (typeof v === 'number' && v > 0) ? v : null;
+  }
+
+  setWipLimit(status: number, value: any): void {
+    const meta = this.decryptedReportDataChanged?.report_metadata;
+    if (!meta) return;
+    if (!meta.kanban_wip) meta.kanban_wip = {};
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) {
+      delete meta.kanban_wip[status];
+    } else {
+      meta.kanban_wip[status] = Math.floor(n);
+    }
+  }
+
+  isOverWIP(status: number): boolean {
+    const limit = this.getWipLimit(status);
+    return !!limit && this.getKanbanIssues(status).length > limit;
+  }
+
+  clearAllWipLimits(): void {
+    const meta = this.decryptedReportDataChanged?.report_metadata;
+    if (meta?.kanban_wip) meta.kanban_wip = {};
+  }
+
+  getTagSuggestions(input: string, issue: any): string[] {
+    const all = this.getAllTAgs();
+    const existing = new Set((issue.tags || []).map((t: any) => t.name as string));
+    const q = input.toLowerCase();
+    return all.filter(t => !existing.has(t) && t.toLowerCase().includes(q));
+  }
+
+  onTagAutoSelect(event: any, dec_data: any, input: HTMLInputElement): void {
+    const value: string = (event.option.value || '').trim();
+    if (value) {
+      const index = this.decryptedReportDataChanged.report_vulns.indexOf(dec_data);
+      if (!this.decryptedReportDataChanged.report_vulns[index].tags.some((t: any) => t.name === value)) {
+        this.decryptedReportDataChanged.report_vulns[index].tags.push({ name: value });
+      }
+    }
+    input.value = '';
+    this.tagFilterInput = '';
+  }
+
+  onPasteAttach(event: ClipboardEvent, dec_data: any): void {
+    const items = event.clipboardData?.items;
+    if (!items) return;
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.startsWith('image/')) {
+        event.preventDefault();
+        const file = items[i].getAsFile();
+        if (!file) continue;
+        this.upload_in_progress = true;
+        const fileReader = new FileReader();
+        fileReader.onload = () => { this.checksumfile(fileReader.result, file, dec_data); };
+        fileReader.readAsDataURL(file);
+        this.snackBar.open('Screenshot pasted as attachment', 'OK', { duration: 2000, panelClass: ['notify-snackbar-success'] });
+        break;
+      }
+    }
+  }
+
+  @HostListener('window:keydown.control.shift.l', ['$event'])
+  GoToNewReport(event: KeyboardEvent) {
+    event.preventDefault();
+    this.addissue();
+  }
+
+  constructor(private route: ActivatedRoute,
+    public dialog: MatDialog,
+    private ollamaService: OllamaServiceService,
+    private http: HttpClient,
+    private indexeddbService: IndexeddbService,
+    private differs: KeyValueDiffers,
+    public router: Router,
+    private apiService: ApiService,
+    private messageService: MessageService,
+    private snackBar: MatSnackBar,
+    public sessionsub: SessionstorageserviceService,
+    private datePipe: DatePipe,
+    private dateAdapter: DateAdapter<Date>,
+    private utilsService: UtilsService,
+    private currentdateService: CurrentdateService,
+    private issueFilterService: IssueFilterService,
+    private cryptoUtils: CryptoUtilsService,
+    private keyVault: KeyVaultService) {
+    //console.log(route);
+    this.subscription = this.messageService.getDecrypted().subscribe(message => {
+      this.decryptedReportData = message;
+      this.decryptedReportDataChanged = this.decryptedReportData;
+      // Backward-compat: older reports do not have report_assets.
+      if (!Array.isArray(this.decryptedReportDataChanged.report_assets)) {
+        this.decryptedReportDataChanged.report_assets = [];
+      }
+      this.snapshotForSave();
+      this.adv_html = this.decryptedReportDataChanged.report_settings.report_html;
+      this.advlogo_saved = this.decryptedReportDataChanged.report_settings.report_logo.logo;
+
+      this.reportDiffer = this.differs.find(this.decryptedReportData).create();
+      this.reportDifferlogo = this.differs.find({ report_logo: this.decryptedReportDataChanged.report_settings.report_logo.logo }).create();
+      this.reportDiffersettings = this.differs.find(this.decryptedReportDataChanged.report_settings).create();
+
+      this.objDiffers = new Array<KeyValueDiffer<string, any>>();
+      this.decryptedReportDataChanged.report_vulns.forEach((itemGroup, index) => {
+        this.objDiffers[index] = this.differs.find(itemGroup).create();
+      });
+
+      this.objDiffersFiles = new Array<KeyValueDiffer<string, any>>();
+      this.decryptedReportDataChanged.report_vulns.forEach((itemGroup, index) => {
+        this.objDiffersFiles[index] = this.differs.find(itemGroup.files).create();
+      });
+
+      this.objDiffersResearcher = new Array<KeyValueDiffer<string, any>>();
+      this.decryptedReportDataChanged.researcher.forEach((itemGroup, index) => {
+        this.objDiffersResearcher[index] = this.differs.find(itemGroup).create();
+      });
+
+      if (this.report_info) {
+        this.reportTitleDiffer = this.differs.find({ report_name: this.report_info.report_name }).create();
+      }
+
+      this.doStats();
+
+      this.calendarDateChanged();
+      this.startDate = new Date(this.decryptedReportDataChanged.report_metadata.starttest);
+
+      // get css style
+      this.http.get('/assets/bootstrap.min.css', { responseType: 'text' }).subscribe(res => {
+        this.report_css = res;
+      });
+
+      // get bug bountys programs list, full credits: https://github.com/projectdiscovery/public-bugbounty-programs
+      this.http.get<any>('/assets/chaos-bugbounty-list.json?v=' + + new Date()).subscribe(res => {
+        this.bugbountylist = res.programs;
+      });
+
+      this.getReportProfiles();
+
+
+      this.issesTable = new MatTableDataSource(this.decryptedReportDataChanged.report_vulns);
+      this.issesTable.paginator = this.paginator;
+      this.selectedResult = this.decryptedReportDataChanged.report_vulns.slice(0, this.pageSize);
+
+      setTimeout(() => this.issesTable.paginator = this.paginator);
+      setTimeout(() => this.dataSource.sort = this.sort);
+      setTimeout(() => this.dataSource.paginator = this.paginator2);
+
+    });
+
+    // When the vault is cleared (auto-lock or tab hidden) and the report has no
+    // unsaved changes, immediately flip back to the encrypted/locked state.
+    this.vaultSub = this.keyVault.change$.subscribe(changedId => {
+      const affectsThisReport = changedId === null || changedId === this.report_id;
+      if (!affectsThisReport) return;
+      if (!this.decryptedReportDataChanged) return;
+      if (this.youhaveunsavedchanges) return;
+      if (this.report_id && this.keyVault.has(this.report_id)) return;
+
+      this.decryptedReportData = null;
+      this.decryptedReportDataChanged = null;
+      this.report_decryption_in_progress = false;
+      this.removeSureYouWanttoLeave();
+      this.indexeddbService.updateEncStatus(false);
+      // Re-show the password dialog so the user can re-enter their key,
+      // same as on first page load (setTimeout avoids ExpressionChangedAfterItHasBeenCheckedError).
+      setTimeout(_ => this.openDialog(this.report_info));
+    });
+
+  }
+
+  ngOnInit() {
+    // this.report_id = this.route.snapshot.params['report_id'];
+    //set local
+    if (navigator.language) {
+      this.dateAdapter.setLocale(navigator.language); //detect browser local
+      this.setLocal = navigator.language;
+    } else {
+      this.dateAdapter.setLocale(this.setLocal);
+    }
+
+
+    this.route.params.subscribe(routeParams => {
+      if (routeParams.report_id != '') {
+        if (routeParams.report_id) {
+          this.report_decryption_in_progress = true;
+          this.report_id = routeParams.report_id;
+          this.youhaveunsavedchanges = false;
+          this.lastsavereportdata = '';
+          this.savemsg = '';
+          // check if report exist
+          this.indexeddbService.checkifreportexist(this.report_id).then(data => {
+            if (data) {
+
+              console.log('Report exist: OK');
+              this.report_info = data;
+              this.reportdesc = data;
+              // check if pass in keyVault
+              const pass = this.keyVault.get(data.report_id);
+              if (pass !== null) {
+                this.report_decryption_in_progress = true;
+                this.indexeddbService.decrypt(pass, data.report_id).then(returned => {
+
+                  if (returned) {
+                    this.report_decryption_in_progress = false;
+                    this.report_source_api = false;
+                  }
+
+                });
+              } else {
+                this.report_decryption_in_progress = false;
+                setTimeout(_ => this.openDialog(data)); // BUGFIX: https://github.com/angular/angular/issues/6005#issuecomment-165911194
+              }
+
+            } else {
+              console.log('Report not exist locally: YES');
+              this.api_connection_status = true;
+              this.report_decryption_in_progress = false;
+              this.indexeddbService.checkAPIreport(this.report_id).then(re => {
+                if (re) {
+                  this.report_info = re;
+                  this.reportdesc = re;
+                  this.api_connection_status = false;
+                  // check if pass in keyVault
+                  const pass = this.keyVault.get(re.report_id);
+                  if (pass !== null) {
+                    this.report_decryption_in_progress = true;
+                    this.indexeddbService.decodeAES(re, pass).then(result => {
+                      if (result) {
+                        this.report_decryption_in_progress = false;
+                        this.report_source_api = true;
+                      }
+                    }).catch(() => { this.report_decryption_in_progress = false; });
+                  } else {
+                    this.report_source_api = true;
+                    setTimeout(_ => this.openDialog(re)); // BUGFIX: https://github.com/angular/angular/issues/6005#issuecomment-165911194
+                  }
+                } else {
+                  this.api_connection_status = false;
+                  this.router.navigate(['/my-reports']);
+                }
+              });
+            }
+          });
+
+        }
+      }
+    });
+
+
+    this.indexeddbService.getkeybyAiintegration().then(ret => {
+
+      if (ret[0]) {
+        this.aiconnected = true;
+        this.models = ret[0];
+      }
+    });
+  }
+
+
+  ngAfterViewInit() { }
+
+  calendarDateChanged() {
+    this.selectedRangeValue = new DateRange<Date>(new Date(this.decryptedReportDataChanged.report_metadata.starttest), new Date(this.decryptedReportDataChanged.report_metadata.endtest));
+
+    //jump to specific date
+    if (this.decryptedReportDataChanged.report_metadata.starttest && this.calendar) {
+      this.calendar.activeDate = new Date(this.decryptedReportDataChanged.report_metadata.starttest);
+      this.calendar.updateTodaysDate(); // update calendar state
+    }
+
+    this.rebuildDayActivityMap();
+    this.refreshSelectedActivityDay();
+    this.buildHeatmap();
+  }
+
+  private rebuildDayActivityMap() {
+    const map = new Map<string, { c: number, h: number, m: number, l: number, i: number, total: number }>();
+    const vulns: any[] = this.decryptedReportDataChanged?.report_vulns ?? [];
+    for (const v of vulns) {
+      if (!v?.date) continue;
+      const d = new Date(v.date);
+      if (isNaN(d.getTime())) continue;
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      let entry = map.get(key);
+      if (!entry) {
+        entry = { c: 0, h: 0, m: 0, l: 0, i: 0, total: 0 };
+        map.set(key, entry);
+      }
+      switch (v.severity) {
+        case 'Critical': entry.c++; break;
+        case 'High':     entry.h++; break;
+        case 'Medium':   entry.m++; break;
+        case 'Low':      entry.l++; break;
+        case 'Info':     entry.i++; break;
+      }
+      entry.total++;
+    }
+    this.dayActivityMap = map;
+  }
+
+  private dateKey(date: Date): string {
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  }
+
+  private inTestWindow(date: Date): boolean {
+    const meta = this.decryptedReportDataChanged?.report_metadata;
+    if (!meta) return false;
+    const start = meta.starttest ? new Date(meta.starttest) : null;
+    const end   = meta.endtest   ? new Date(meta.endtest)   : null;
+    if (!start || !end || isNaN(start.getTime()) || isNaN(end.getTime())) return false;
+    const dKey = this.dateKey(date);
+    const sKey = this.dateKey(start);
+    const eKey = this.dateKey(end);
+    const lo = sKey <= eKey ? sKey : eKey;
+    const hi = sKey <= eKey ? eKey : sKey;
+    return dKey >= lo && dKey <= hi;
+  }
+
+  refreshSelectedActivityDay() {
+    if (!this.selectedActivityDay) return;
+    const e = this.dayActivityMap.get(this.selectedActivityDay.key);
+    if (!e) {
+      this.selectedActivityDay = { ...this.selectedActivityDay, c: 0, h: 0, m: 0, l: 0, i: 0, total: 0 };
+      return;
+    }
+    this.selectedActivityDay = { ...this.selectedActivityDay, ...e };
+  }
+
+  onCalendarDayClick(date: Date | null) {
+    if (!date) return;
+    const key = this.dateKey(date);
+    const entry = this.dayActivityMap.get(key) ?? { c: 0, h: 0, m: 0, l: 0, i: 0, total: 0 };
+    let label = key;
+    try {
+      label = date.toLocaleDateString(this.setLocal, { year: 'numeric', month: 'short', day: 'numeric' });
+    } catch {
+      label = date.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+    }
+    const already = this.selectedActivityDay?.key === key;
+    if (already) {
+      this.clearCalendarDayFilter();
+      return;
+    }
+    this.selectedActivityDay = { key, label, ...entry };
+    this.issueFilterQuery = this.issueFilterService.toggleFieldToken(
+      this.stripDateTokens(this.issueFilterQuery), 'date', key,
+    );
+    this.applyIssueFilter();
+    // Force mat-calendar to re-evaluate dateClass on every cell so the
+    // act-picked highlight moves to the newly clicked day. Material does not
+    // rebuild cells just because the dateClass function reference changes.
+    this.calendar?.updateTodaysDate();
+    setTimeout(() => {
+      const el = document.querySelector('.report-issue-filter-bar');
+      el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 50);
+  }
+
+  clearCalendarDayFilter() {
+    this.selectedActivityDay = null;
+    this.issueFilterQuery = this.stripDateTokens(this.issueFilterQuery);
+    this.applyIssueFilter();
+    this.calendar?.updateTodaysDate();
+  }
+
+  private stripDateTokens(query: string): string {
+    return (query ?? '')
+      .split(' ')
+      .filter(t => !/^-?date:/i.test(t))
+      .join(' ')
+      .trim();
+  }
+
+  onDateChangeReportstart(event) {
+    const newdate = new Date(event.value).getTime();
+    this.decryptedReportDataChanged.report_metadata.starttest = newdate;
+    this.calendarDateChanged();
+    this.sureYouWanttoLeave();
+  }
+
+  onDateChangeReportend(event) {
+    const newdate = new Date(event.value).getTime();
+    this.decryptedReportDataChanged.report_metadata.endtest = newdate;
+    this.calendarDateChanged();
+    this.sureYouWanttoLeave();
+  }
+
+  canDeactivate() {
+    if (this.youhaveunsavedchanges == true) {
+      const confirmed = confirm("You have unsaved changes, Do you really want to leave?");
+      if (confirmed) {
+        this.youhaveunsavedchanges = false;
+        this.indexeddbService.updatechangesStatus(false);
+      }
+      return confirmed;
+    }
+    return true;
+  }
+
+  dateClass() {
+    return (date: Date): MatCalendarCellCssClasses => {
+      const key = this.dateKey(date);
+      const entry = this.dayActivityMap.get(key);
+      const classes: string[] = [];
+
+      if (this.inTestWindow(date)) classes.push('act-window');
+      if (this.selectedActivityDay?.key === key) classes.push('act-picked');
+
+      if (!entry || entry.total === 0) return classes.length ? classes : '';
+
+      classes.push('act');
+      if (entry.c > 0) classes.push('has-c');
+      if (entry.h > 0) classes.push('has-h');
+      if (entry.m > 0) classes.push('has-m');
+      if (entry.l > 0) classes.push('has-l');
+      if (entry.i > 0) classes.push('has-i');
+
+      if (entry.total === 1)      classes.push('act-q1');
+      else if (entry.total <= 3)  classes.push('act-q2');
+      else if (entry.total <= 6)  classes.push('act-q3');
+      else                        classes.push('act-q4');
+
+      return classes;
+    };
+  }
+
+  getReportProfiles() {
+    // get report profiles
+    this.indexeddbService.retrieveReportProfile().then(ret => {
+      if (ret) {
+        this.ReportProfilesList = ret;
+      }
+      this.getAPIReportProfiles();
+    });
+
+  }
+
+  getAPIReportProfiles() {
+    const localkey = this.keyVault.getApiVault();
+    if (localkey) {
+      //this.msg = 'API connection please wait...';
+
+      const vaultobj = JSON.parse(localkey);
+
+      vaultobj.forEach((element) => {
+
+        this.apiService.APISend(element.value, element.apikey, 'getreportprofiles', '').then(resp => {
+          this.reportProfileList_int = [];
+          if (resp.length > 0) {
+            resp.forEach((ele) => {
+              ele.api = 'remote';
+              ele.apiurl = element.value;
+              ele.apikey = element.apikey;
+              ele.apiname = element.viewValue;
+            });
+            this.reportProfileList_int.push(...resp);
+          }
+
+        }).then(() => {
+
+          this.ReportProfilesList = [...this.ReportProfilesList, ...this.reportProfileList_int];
+          //this.dataSource.sort = this.sort;
+          //this.dataSource.paginator = this.paginator;
+          //this.msg = '';
+        }).catch(() => { });
+
+
+        setTimeout(() => {
+          // console.log('hide progress timeout');
+          //this.msg = '';
+        }, 10000);
+
+      });
+
+    }
+  }
+
+  dataChanged(changes: KeyValueChanges<any, any[]>) {
+    /* If you want to see details then use
+      changes.forEachRemovedItem((record) => ...);
+      changes.forEachAddedItem((record) => ...);
+      changes.forEachChangedItem((record) => ...);
+    */
+
+    changes.forEachAddedItem((record) => {
+      if (record.previousValue !== null) {
+        this.afterDetection();
+        //console.log('ADDED: ',record);
+      }
+    });
+
+    changes.forEachChangedItem((record) => {
+      // fix for rising detection change after report read only
+      if (record.key !== 'report_version' && record.key !== 'report_name') {
+        // console.log('Detection start');
+        //console.log('CHANGED: ',record);
+        this.afterDetection();
+      }
+    });
+
+  }
+
+  callListener(e) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+  timeout(e) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+
+
+  sureYouWanttoLeave() {
+    window.addEventListener('beforeunload', this.callListener, true);
+    this.youhaveunsavedchanges = true;
+    this.stickyBarVisible = true;
+
+    this.indexeddbService.updatechangesStatus(true);
+
+  }
+
+  removeSureYouWanttoLeave() {
+    window.removeEventListener('beforeunload', this.callListener, true);
+    this.youhaveunsavedchanges = false;
+    this.stickyBarVisible = false;
+    let id = window.setTimeout(function () { }, 0);
+    while (id--) {
+      window.clearTimeout(id); // will do nothing if no timeout with id is present
+    }
+    this.indexeddbService.updatechangesStatus(false);
+  }
+
+  dismissStickyBar() {
+    this.stickyBarVisible = false;
+  }
+
+  async discardChanges() {
+    const pass = await this.requireKey(this.report_info.report_id);
+    if (pass === null) return;
+    this.report_decryption_in_progress = true;
+    if (this.report_source_api) {
+      this.indexeddbService.decodeAES(this.report_info, pass).then(result => {
+        if (result) {
+          this.report_decryption_in_progress = false;
+          this.removeSureYouWanttoLeave();
+        }
+      }).catch(() => { this.report_decryption_in_progress = false; });
+    } else {
+      this.indexeddbService.decrypt(pass, this.report_info.report_id).then(returned => {
+        if (returned) {
+          this.report_decryption_in_progress = false;
+          this.removeSureYouWanttoLeave();
+        }
+      });
+    }
+  }
+
+  afterDetectionNow() {
+    this.reportDiffer = this.differs.find(this.decryptedReportData).create();
+    this.reportDifferlogo = this.differs.find({ report_logo: this.decryptedReportDataChanged.report_settings.report_logo.logo }).create();
+    this.reportDiffersettings = this.differs.find({ ...this.decryptedReportDataChanged.report_settings }).create();
+
+    this.objDiffers = new Array<KeyValueDiffer<string, any>>();
+    this.decryptedReportDataChanged.report_vulns.forEach((itemGroup, index) => {
+      this.objDiffers[index] = this.differs.find(itemGroup).create();
+    });
+
+    this.objDiffersFiles = new Array<KeyValueDiffer<string, any>>();
+    this.decryptedReportDataChanged.report_vulns.forEach((itemGroup, index) => {
+      this.objDiffersFiles[index] = this.differs.find(itemGroup.files).create();
+    });
+
+    this.objDiffersResearcher = new Array<KeyValueDiffer<string, any>>();
+    this.decryptedReportDataChanged.researcher.forEach((itemGroup, index) => {
+      this.objDiffersResearcher[index] = this.differs.find(itemGroup).create();
+    });
+
+    if (this.report_info) {
+      this.reportTitleDiffer = this.differs.find({ report_name: this.report_info.report_name }).create();
+    }
+
+    this.sureYouWanttoLeave();
+  }
+
+  afterDetection() {
+    if (this.timerCounter >= 60) {
+      setTimeout(() => { this.afterDetectionNow() }, 10000);
+      this.timerCounter = 0;
+    }
+    this.timerCounter++;
+    this.sureYouWanttoLeave();
+  }
+
+  ngDoCheck(): void {
+
+    if (this.decryptedReportDataChanged) {
+
+      const changes = this.reportDiffer.diff(this.decryptedReportDataChanged);
+      if (changes) {
+        this.dataChanged(changes);
+      }
+
+      if (this.reportDifferlogo) {
+        const changeslogo = this.reportDifferlogo.diff({ report_logo: this.decryptedReportDataChanged.report_settings.report_logo.logo });
+        if (changeslogo) {
+          this.dataChanged(changeslogo);
+        }
+      }
+
+      if (this.reportDiffersettings) {
+        const changessettings = this.reportDiffersettings.diff(this.decryptedReportDataChanged.report_settings);
+        if (changessettings) {
+          this.dataChanged(changessettings);
+        }
+      }
+
+      if (this.objDiffers) {
+        this.decryptedReportDataChanged.report_vulns.forEach((itemGroup, index) => {
+          if (this.objDiffers[index]) {
+            const objDiffer = this.objDiffers[index];
+            const objChanges = objDiffer.diff(itemGroup);
+            if (objChanges) {
+              this.dataChanged(objChanges);
+            }
+          }
+        });
+      }
+
+      if (this.objDiffersFiles) {
+        this.decryptedReportDataChanged.report_vulns.forEach((itemGroup, index) => {
+          if (this.objDiffersFiles[index]) {
+            const objDiffer2 = this.objDiffersFiles[index];
+            const objChanges2 = objDiffer2.diff(itemGroup.files);
+            if (objChanges2) {
+              this.dataChanged(objChanges2);
+            }
+          }
+        });
+      }
+
+      if (this.objDiffersResearcher) {
+        this.decryptedReportDataChanged.researcher.forEach((itemGroup, index) => {
+          if (this.objDiffersResearcher[index]) {
+            const objDiffer3 = this.objDiffersResearcher[index];
+            const objChanges3 = objDiffer3.diff(itemGroup);
+            if (objChanges3) {
+              this.dataChanged(objChanges3);
+            }
+          }
+        });
+      }
+
+    }
+
+    if (this.reportTitleDiffer && this.report_info) {
+      const changesName = this.reportTitleDiffer.diff({ report_name: this.report_info.report_name });
+      if (changesName) {
+        this.dataChanged(changesName);
+      }
+    }
+
+  }
+
+  toggle(event, checked) {
+
+    const ret = this.selectedResult[event];
+    const index: number = this.decryptedReportDataChanged.report_vulns.indexOf(ret);
+    if (index !== -1) {
+      if (checked === true) {
+        this.selectedIssues.push({ "index": index, "data": ret });
+
+      } else if (checked === false) {
+        const index2: number = this.selectedIssues.findIndex(i => i.data === ret)
+        if (index2 !== -1) {
+          this.selectedIssues.splice(index2, 1);
+        }
+      }
+
+    }
+
+
+    if (this.selectedIssues.length > 0) {
+
+      this.pok = 1;
+    } else {
+      this.pok = 0;
+    }
+
+  }
+
+  checkcheckbox(i) {
+
+    let returnVal = false;
+    const ret = this.selectedResult[i];
+
+    const index2: number = this.selectedIssues.findIndex(i => i.data === ret)
+    if (index2 !== -1) {
+      returnVal = true;
+    }
+
+    return returnVal
+  }
+
+  openissuesedit(array) {
+
+    const dialogRef = this.dialog.open(DialogIssuesEditComponent, {
+      width: '450px',
+      data: { sel: array, orig: this.decryptedReportDataChanged.report_vulns }
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+
+      if (result) {
+        console.log('Dialog edit issue closed');
+        this.doStats();
+      }
+    });
+
+  }
+
+  openissuesmerge(array) {
+
+    const dialogRef = this.dialog.open(DialogMergeIssuesComponent, {
+      width: '450px',
+      data: array
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+
+      if (result) {
+        result.forEach(eachObj => {
+          const index: number = this.decryptedReportDataChanged.report_vulns.indexOf(eachObj);
+          if (index !== -1) {
+            this.decryptedReportDataChanged.report_vulns.splice(index, 1);
+            this.addtochangelog('Remove issue: ' + eachObj.title);
+            this.afterDetectionNow();
+          }
+        });
+        this.deselectall();
+        this.doStats();
+      }
+    });
+
+  }
+
+  selectall() {
+
+    this.pok = 1;
+    this.selectedIssues = [];
+
+
+
+    this.decryptedReportDataChanged.report_vulns.forEach((element, ind) => {
+
+      this.selectedIssues.push({ "index": ind, "data": element });
+
+    });
+
+
+  }
+
+  selectBySeverity(severity: string) {
+
+    this.pok = 1;
+    this.selectedIssues = [];
+
+    this.decryptedReportDataChanged.report_vulns.forEach((element, ind) => {
+      if (element.severity === severity) {
+        this.selectedIssues.push({ "index": ind, "data": element });
+      }
+    });
+
+  }
+
+  hasSeverityInReport(severity: string): boolean {
+    return this.decryptedReportDataChanged?.report_vulns?.some(
+      (el: any) => el.severity === severity
+    );
+  }
+
+  deselectall() {
+
+
+    this.pok = 0;
+    this.selectedIssues = [];
+
+  }
+
+  removeSelecteditems(array) {
+
+    const dialogRef = this.dialog.open(DialogRemoveitemsComponent, {
+      width: '400px',
+      panelClass: 'remove-dialog-panel',
+      data: { sel: array, orig: this.decryptedReportDataChanged.report_vulns }
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+
+      if (result) {
+        result.forEach(eachObj => {
+          const index: number = this.decryptedReportDataChanged.report_vulns.indexOf(eachObj);
+          if (index !== -1) {
+            this.decryptedReportDataChanged.report_vulns.splice(index, 1);
+            this.addtochangelog('Remove issue: ' + eachObj.title);
+            this.afterDetectionNow();
+          }
+        });
+        this.deselectall();
+        this.doStats();
+      }
+    });
+
+  }
+
+
+  openDialogCVSS(data: any): void {
+
+    const dialogRef = this.dialog.open(DialogCvssComponent, {
+      width: '1100px',
+      maxWidth: '95vw',
+      panelClass: 'cvss-dialog-panel',
+      backdropClass: 'vr-blur-backdrop',
+      disableClose: false,
+      data: data
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The CVSS dialog was closed');
+      this.doStats();
+    });
+
+  }
+
+
+  openDialogCVE(data: any): void {
+
+    const dialogRef = this.dialog.open(DialogCveComponent, {
+      width: '960px',
+      maxWidth: '95vw',
+      disableClose: false,
+      panelClass: 'dark-dialog-panel',
+      backdropClass: 'vr-blur-backdrop',
+      data: data
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The CVE dialog was closed');
+    });
+
+  }
+
+
+  openDialog(data: any): void {
+
+    const dialogRef = this.dialog.open(DialogPassComponent, {
+      width: '90vw',
+      maxWidth: '480px',
+      disableClose: true,
+      data: data,
+      panelClass: 'dark-dialog-panel'
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The security key dialog was closed');
+    });
+
+  }
+
+  private requireKey(reportId: string): Promise<string | null> {
+    const existing = this.keyVault.get(reportId);
+    if (existing !== null) return Promise.resolve(existing);
+
+    // Deduplicate: if a re-auth dialog is already open (e.g. user clicked save
+    // multiple times before the dialog appeared), share the same promise so only
+    // one DialogPassComponent is ever shown at a time.
+    if (this.requireKeyPromise) return this.requireKeyPromise;
+
+    // Snapshot unsaved changes before the dialog triggers decodeAES → messageService,
+    // which would overwrite decryptedReportDataChanged with the old stored version.
+    const snapshot = this.decryptedReportDataChanged
+      ? JSON.parse(JSON.stringify(this.decryptedReportDataChanged))
+      : null;
+
+    this.requireKeyPromise = new Promise<string | null>(resolve => {
+      const dialogRef = this.dialog.open(DialogPassComponent, {
+        width: '90vw',
+        maxWidth: '480px',
+        disableClose: true,
+        data: this.report_info,
+        panelClass: 'dark-dialog-panel'
+      });
+
+      dialogRef.afterClosed().subscribe(result => {
+        this.requireKeyPromise = null;
+        if (result?.data) {
+          if (snapshot) {
+            this.decryptedReportDataChanged = snapshot;
+          }
+          resolve(result.data);
+        } else {
+          resolve(null);
+        }
+      });
+    });
+
+    return this.requireKeyPromise;
+  }
+
+  addtablescope(): void {
+
+    this.decryptedReportDataChanged.report_scope = this.decryptedReportDataChanged.report_scope + ' \
+\n\
+IP   | hostname | role | comments\n\
+------|--------------|-------|---------------\n\
+127.0.0.1 | localhost.localdomain | PROD | client asked to test this one with care\n\
+255.255.255.255 | N/A | DMZ | test you can go do whatever you want on it\n\
+';
+
+  }
+
+  addcodescope(): void {
+
+    this.decryptedReportDataChanged.report_scope = this.decryptedReportDataChanged.report_scope + ' \
+\n\
+```\n\
+Sample code here\n\
+```\n\
+';
+
+  }
+
+  doStats() {
+
+    const critical = this.decryptedReportDataChanged.report_vulns.filter(function (el) {
+      return (el.severity === 'Critical');
+    });
+
+    const high = this.decryptedReportDataChanged.report_vulns.filter(function (el) {
+      return (el.severity === 'High');
+    });
+
+    const medium = this.decryptedReportDataChanged.report_vulns.filter(function (el) {
+      return (el.severity === 'Medium');
+    });
+
+    const low = this.decryptedReportDataChanged.report_vulns.filter(function (el) {
+      return (el.severity === 'Low');
+    });
+
+    const info = this.decryptedReportDataChanged.report_vulns.filter(function (el) {
+      return (el.severity === 'Info');
+    });
+
+    this.dataSourceforseverity = [
+      { severity: 'Critical', count: critical.length },
+      { severity: 'High', count: high.length },
+      { severity: 'Medium', count: medium.length },
+      { severity: 'Low', count: low.length },
+      { severity: 'Info', count: info.length }
+    ];
+
+    this.severitytable = [
+      { name: 'Critical', value: critical.length },
+      { name: 'High', value: high.length },
+      { name: 'Medium', value: medium.length },
+      { name: 'Low', value: low.length },
+      { name: 'Info', value: info.length }
+    ];
+
+    const vulns = this.decryptedReportDataChanged.report_vulns;
+    this.statusStatsTable = [
+      { status: 'Open', value: vulns.filter(v => v.status === 1).length, color: '#FF0039' },
+      { status: 'In Progress', value: vulns.filter(v => v.status === 2).length, color: '#FF9800' },
+      { status: 'Fixed', value: vulns.filter(v => v.status === 3).length, color: '#69f0ae' },
+      { status: "Won't Fix", value: vulns.filter(v => v.status === 4).length, color: '#616161' },
+    ];
+
+    this.buildHeatmap();
+
+    this.listchangelog = [...this.decryptedReportData.report_changelog].sort((a, b) => b.date - a.date);
+    this.changelogLimit = 5;
+    this.dataSource = new MatTableDataSource(this.decryptedReportData.report_changelog);
+    this.dataSource.sort = this.sort;
+    this.dataSource.paginator = this.paginator2;
+
+    if (this.decryptedReportDataChanged.report_vulns.length > 0) {
+      setTimeout(() => {
+        if (this.calendar) {
+          this.calendar.updateTodaysDate();
+        }
+      });
+    }
+
+    // this.reportdesc.report_lastupdate = this.decryptedReportDataChanged.report_lastupdate;
+    const filtered = this.getFilteredVulns();
+    this.issesTable = new MatTableDataSource(filtered);
+    this.issesTable.paginator = this.paginator;
+    this.selectedResult = filtered.slice(this.pageIndex * this.pageSize, this.pageIndex * this.pageSize + this.pageSize);
+
+  }
+
+  setHeatmapRange(mode: 'window' | '12w' | 'all') {
+    if (this.heatmapRangeMode === mode) return;
+    this.heatmapRangeMode = mode;
+    this.buildHeatmap();
+  }
+
+  onHeatmapCellClick(cell: { date: string, inRange: boolean }) {
+    if (!cell?.inRange) return;
+    this.onCalendarDayClick(new Date(cell.date));
+  }
+
+  isHeatmapCellPicked(cell: { date: string }): boolean {
+    return this.selectedActivityDay?.key === cell.date;
+  }
+
+  heatmapCellTitle(cell: { date: string, total: number, inRange: boolean }): string {
+    if (!cell.inRange) return '';
+    if (cell.total === 0) return `No findings on ${cell.date}`;
+    const e = this.dayActivityMap.get(cell.date);
+    const parts: string[] = [];
+    if (e) {
+      for (const sev of this.calendarSeverityOrder) {
+        const v = e[sev.key];
+        if (v > 0) parts.push(`${v} ${sev.label}`);
+      }
+    }
+    const breakdown = parts.length ? ` (${parts.join(', ')})` : '';
+    return `${cell.date} — ${cell.total} finding${cell.total !== 1 ? 's' : ''}${breakdown}`;
+  }
+
+  get heatmapWindowLabel(): string {
+    const meta = this.decryptedReportDataChanged?.report_metadata;
+    if (!meta?.starttest || !meta?.endtest) return '';
+    const s = new Date(meta.starttest);
+    const e = new Date(meta.endtest);
+    if (isNaN(s.getTime()) || isNaN(e.getTime())) return '';
+    return `${this.formatShortDate(this.dateKey(s))} – ${this.formatShortDate(this.dateKey(e))}`;
+  }
+
+  private formatShortDate(key: string): string {
+    const d = new Date(key);
+    if (isNaN(d.getTime())) return key;
+    try {
+      return d.toLocaleDateString(this.setLocal, { month: 'short', day: 'numeric' });
+    } catch {
+      return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    }
+  }
+
+  private getHeatmapRange(): { startNorm: Date, endNorm: Date, winStart: Date | null, winEnd: Date | null } {
+    const meta = this.decryptedReportDataChanged?.report_metadata ?? {};
+    const today = new Date();
+    const todayNorm = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+
+    const winStart = meta.starttest ? this.normDate(new Date(meta.starttest)) : null;
+    const winEnd   = meta.endtest   ? this.normDate(new Date(meta.endtest))   : null;
+
+    let startNorm: Date;
+    let endNorm: Date;
+
+    if (this.heatmapRangeMode === '12w') {
+      endNorm = winEnd && winEnd > todayNorm ? winEnd : todayNorm;
+      startNorm = new Date(endNorm.getFullYear(), endNorm.getMonth(), endNorm.getDate() - (12 * 7 - 1));
+    } else if (this.heatmapRangeMode === 'all') {
+      const stamps: number[] = [];
+      for (const k of this.dayActivityMap.keys()) {
+        const d = new Date(k);
+        if (!isNaN(d.getTime())) stamps.push(d.getTime());
+      }
+      if (winStart) stamps.push(winStart.getTime());
+      if (winEnd)   stamps.push(winEnd.getTime());
+      stamps.push(todayNorm.getTime());
+      const minS = Math.min(...stamps);
+      const maxS = Math.max(...stamps);
+      startNorm = new Date(minS);
+      endNorm   = new Date(maxS);
+    } else {
+      endNorm   = winEnd ?? todayNorm;
+      startNorm = winStart ?? new Date(endNorm.getFullYear(), endNorm.getMonth(), endNorm.getDate() - 29);
+    }
+
+    return { startNorm, endNorm, winStart, winEnd };
+  }
+
+  private normDate(d: Date): Date {
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  }
+
+  buildHeatmap() {
+    if (!this.dayActivityMap || this.dayActivityMap.size === 0 && !this.decryptedReportDataChanged?.report_metadata) {
+      this.heatmapWeeks = [];
+      this.heatmapMonthLabels = [];
+      this.heatmapStats = { total: 0, activeDays: 0, peakLabel: '', peakCount: 0, longestStreak: 0, avgPerActive: 0 };
+      return;
+    }
+
+    const { startNorm, endNorm, winStart, winEnd } = this.getHeatmapRange();
+    const sevOrder: ('c'|'h'|'m'|'l'|'i')[] = ['c', 'h', 'm', 'l', 'i'];
+
+    // Compute saturation reference: max daily total inside the visible range.
+    let rangeMax = 0;
+    for (const [key, entry] of this.dayActivityMap.entries()) {
+      const d = new Date(key);
+      if (d >= startNorm && d <= endNorm) rangeMax = Math.max(rangeMax, entry.total);
+    }
+    if (rangeMax === 0) rangeMax = 1;
+
+    // Stat accumulators
+    let total = 0;
+    let activeDays = 0;
+    let peakKey = '';
+    let peakCount = 0;
+    let currentStreak = 0;
+    let longestStreak = 0;
+
+    // Build week columns starting from the Sunday of the week containing startNorm.
+    const gridStart = new Date(startNorm);
+    gridStart.setDate(gridStart.getDate() - gridStart.getDay());
+
+    const weeks: typeof this.heatmapWeeks = [];
+    const monthLabels: { label: string, col: number }[] = [];
+    let lastMonth = -1;
+    const cur = new Date(gridStart);
+
+    while (cur <= endNorm) {
+      const week: typeof this.heatmapWeeks[0] = [];
+      for (let d = 0; d < 7; d++) {
+        const inRange = cur >= startNorm && cur <= endNorm;
+        const key = this.dateKey(cur);
+        const entry = inRange ? this.dayActivityMap.get(key) : undefined;
+        const count = entry?.total ?? 0;
+        const inWindow = !!winStart && !!winEnd && cur >= winStart && cur <= winEnd;
+
+        let top: 'c'|'h'|'m'|'l'|'i' | null = null;
+        if (entry) {
+          for (const s of sevOrder) {
+            if (entry[s] > 0) { top = s; break; }
+          }
+        }
+
+        let q: 0|1|2|3|4 = 0;
+        if (count > 0) {
+          const ratio = count / rangeMax;
+          q = ratio >= 0.75 ? 4 : ratio >= 0.5 ? 3 : ratio >= 0.25 ? 2 : 1;
+        }
+
+        week.push({ date: key, total: count, top, q, inRange, inWindow });
+
+        if (inRange) {
+          total += count;
+          if (count > 0) {
+            activeDays++;
+            currentStreak++;
+            if (currentStreak > longestStreak) longestStreak = currentStreak;
+            if (count > peakCount) { peakCount = count; peakKey = key; }
+          } else {
+            currentStreak = 0;
+          }
+        }
+
+        cur.setDate(cur.getDate() + 1);
+      }
+
+      const firstInRange = week.find(d => d.inRange);
+      if (firstInRange) {
+        const m = new Date(firstInRange.date).getMonth();
+        if (m !== lastMonth) {
+          monthLabels.push({ label: new Date(firstInRange.date).toLocaleString('default', { month: 'short' }), col: weeks.length });
+          lastMonth = m;
+        }
+      }
+
+      weeks.push(week);
+    }
+
+    this.heatmapWeeks = weeks;
+    this.heatmapMonthLabels = monthLabels;
+    this.heatmapStats = {
+      total,
+      activeDays,
+      peakLabel: peakKey ? this.formatShortDate(peakKey) : '',
+      peakCount,
+      longestStreak,
+      avgPerActive: activeDays > 0 ? Math.round((total / activeDays) * 10) / 10 : 0,
+    };
+  }
+
+  getData(event?: PageEvent) {
+
+    if (event) {
+      this.pageSize = event.pageSize;
+      this.pageIndex = event.pageIndex;
+    }
+
+    this.selectedResult = this.getFilteredVulns().slice(this.pageIndex * this.pageSize, this.pageIndex * this.pageSize + this.pageSize);
+    return event;
+
+  }
+
+  renderdateformat(inputdate) {
+    const date = new Date(inputdate).getTime();
+    const rdate = this.datePipe.transform(date, 'yyyy-MM-dd');
+    return rdate
+  }
+
+  onDateChange(data, event) {
+    const newdate = new Date(event.value).getTime();
+    const index: number = this.decryptedReportDataChanged.report_vulns.indexOf(data);
+    if (index !== -1) {
+      this.decryptedReportDataChanged.report_vulns[index].date = newdate;
+      this.doStats();
+    }
+
+  }
+
+  mergeissue(issue) {
+    this.decryptedReportDataChanged.report_vulns.push(issue);
+    this.addtochangelog('Create issue: ' + issue.title);
+    this.afterDetectionNow();
+    this.doStats();
+  }
+
+  addissue() {
+
+    function isIterable(x: unknown): boolean {
+      return !!x?.[Symbol.iterator];
+    }
+
+    console.log('Add issue');
+    const dialogRef = this.dialog.open(DialogAddissueComponent, {
+      width: '1180px',
+      maxWidth: '96vw',
+      panelClass: 'addissue-dialog-panel',
+      backdropClass: 'vr-blur-backdrop',
+      // Titles already in the report, so the dialog can flag a staged duplicate.
+      data: {
+        existing: (this.decryptedReportDataChanged?.report_vulns || []).map(v => v.title)
+      }
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The dialog was closed');
+      if (result !== undefined) {
+        if (isIterable(result)) {
+          for (var elem of result) {
+            if (elem.title !== '') {
+              this.mergeissue(elem);
+            }
+          }
+        } else {
+          this.mergeissue(result);
+        }
+
+      } else {
+
+        if (result) {
+          if (result.title !== '') {
+            this.mergeissue(result);
+          }
+        }
+      }
+
+    });
+
+  }
+
+  import_issues() {
+    const advRef = this.dialog.open(DialogImportAdvancedComponent, {
+      width: '800px',
+      maxWidth: '95vw',
+      panelClass: 'import-advanced-dialog-panel',
+      backdropClass: 'vr-blur-backdrop'
+    });
+
+    advRef.afterClosed().subscribe(result => {
+      if (result === undefined) return;
+      this.applyImportResult(result);
+    });
+  }
+
+  private applyImportResult(result: any[]) {
+    let importedCount = 0;
+    result.forEach(eachObj => {
+      if (eachObj.title !== '' && eachObj.title !== undefined && eachObj.cvss !== 'Active') {
+        this.decryptedReportDataChanged.report_vulns.push(eachObj);
+        importedCount++;
+        this.afterDetectionNow();
+      }
+    });
+    if (importedCount > 0) {
+      this.addtochangelog('Imported x' + importedCount + ' issue' + (importedCount > 1 ? 's' : ''));
+    }
+    this.doStats();
+  }
+
+
+  export_by_tag(tag) {
+    const filteredTags = this.decryptedReportDataChanged.report_vulns.filter((element) => element.tags.some((subElement) => subElement.name === tag));
+
+    console.log('Export issues');
+    const dialogRef = this.dialog.open(DialogExportissuesComponent, {
+      width: '560px',
+      panelClass: 'export-dialog-panel',
+      backdropClass: 'vr-blur-backdrop',
+      data: filteredTags
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The dialog was closed');
+    });
+
+
+  }
+
+  export_by_severity(exportitem, severity) {
+
+    const bySeverity = exportitem.filter(item => item.severity === severity);
+
+    if (bySeverity.length > 0) {
+      console.log('Export issues');
+      const dialogRef = this.dialog.open(DialogExportissuesComponent, {
+        width: '560px',
+        panelClass: 'export-dialog-panel',
+        backdropClass: 'vr-blur-backdrop',
+        data: bySeverity
+      });
+
+      dialogRef.afterClosed().subscribe(result => {
+        console.log('The dialog was closed');
+      });
+    }
+  }
+
+  export_issues(original, type) {
+    console.log('Export issues');
+
+    if (type === 'selected') {
+
+      const dialogRef = this.dialog.open(DialogExportissuesComponent, {
+        width: '560px',
+        panelClass: 'export-dialog-panel',
+        backdropClass: 'vr-blur-backdrop',
+        data: { sel: this.selectedIssues, orig: original }
+      });
+
+      dialogRef.afterClosed().subscribe(result => {
+        console.log('The dialog was closed');
+      });
+
+    } else if (type === 'all') {
+
+      const dialogRef = this.dialog.open(DialogExportissuesComponent, {
+        width: '560px',
+        panelClass: 'export-dialog-panel',
+        backdropClass: 'vr-blur-backdrop',
+        data: original
+      });
+
+      dialogRef.afterClosed().subscribe(result => {
+        console.log('The dialog was closed');
+      });
+
+    }
+  }
+
+  drop(event: CdkDragDrop<string[]>) {
+    moveItemInArray(this.decryptedReportDataChanged.report_vulns, event.previousIndex, event.currentIndex);
+    moveItemInArray(this.selectedResult, event.previousIndex, event.currentIndex);
+    moveItemInArray(this.scopePreviewHTML, event.previousIndex, event.currentIndex);
+  }
+
+  copyIssueMarkdown(issue: any): void {
+    const statusMap: Record<number, string> = { 1: 'Open', 2: 'In Progress', 3: 'Fixed', 4: "Won't Fix" };
+    const date = issue.date ? new Date(issue.date).toISOString().slice(0, 10) : '';
+    const tags = (issue.tags || []).map((t: any) => `\`${t.name}\``).join(', ');
+
+    const rows: [string, string][] = [['Severity', issue.severity ?? ''], ['Status', statusMap[issue.status] ?? '']];
+    if (issue.cvss) rows.push(['CVSS', String(issue.cvss)]);
+    if (issue.cve)  rows.push(['CVE', issue.cve]);
+    if (date)       rows.push(['Date', date]);
+    if (tags)       rows.push(['Tags', tags]);
+
+    const table = ['| Property | Value |', '|---|---|', ...rows.map(([k, v]) => `| ${k} | ${v} |`)].join('\n');
+    const sections: string[] = [`## [${issue.severity}] ${issue.title}`, '', table];
+
+    if (issue.desc?.trim())  sections.push('', '### Description', '',  issue.desc.trim());
+    if (issue.poc?.trim())   sections.push('', '### Proof of Concept', '', '```', issue.poc.trim(), '```');
+    if (issue.ref?.trim()) {
+      const refs = issue.ref.trim().split('\n').filter(Boolean).map((r: string) => `- ${r.trim()}`).join('\n');
+      sections.push('', '### References', '', refs);
+    }
+
+    navigator.clipboard.writeText(sections.join('\n')).then(() => {
+      this.snackBar.open('Issue copied as Markdown', 'OK', { duration: 2000, panelClass: ['notify-snackbar-success'] });
+    }).catch(() => {
+      this.snackBar.open('Copy failed — clipboard access denied', '', { duration: 3000 });
+    });
+  }
+
+  dropKanban(event: CdkDragDrop<number>): void {
+    if (event.previousContainer === event.container) return;
+    const issue = event.item.data;
+    if (issue.status === event.container.data) return;
+    issue.status = event.container.data;
+    this.doStats();
+    this.sureYouWanttoLeave();
+  }
+
+  async saveReportChanges(report_id: any) {
+    this.report_encryption_in_progress = true;
+    this.savemsg = 'Please wait, report is encrypted...';
+    const pass = await this.requireKey(report_id);
+    if (!pass) {
+      this.report_encryption_in_progress = false;
+      this.savemsg = '';
+      return;
+    }
+    let useAPI = false;
+
+    this.indexeddbService.getkeybyReportID(report_id).then(data => {
+      if (data) {
+
+        if (data.NotFound === 'NOOK') {
+          console.log('no locally report');
+          useAPI = true;
+        } else {
+
+          // update report
+          this.decryptedReportDataChanged.report_version = this.decryptedReportDataChanged.report_version + 1;
+          this.addSaveChangelog();
+          // tslint:disable-next-line:max-line-length
+          this.indexeddbService.prepareupdatereport(this.decryptedReportDataChanged, pass, this.report_info.report_id, this.report_info.report_name, this.report_info.report_createdate, data.key).then(retu => {
+            if (retu) {
+              this.reportdesc.report_lastupdate = retu;
+              this.report_encryption_in_progress = false;
+              this.savemsg = 'All changes saved successfully!';
+              this.lastsavereportdata = retu;
+              this.snapshotForSave();
+              this.doStats();
+
+              this.removeSureYouWanttoLeave();
+
+              this.snackBar.open('All changes saved successfully!', 'OK', {
+                duration: 3000,
+                panelClass: ['notify-snackbar-success']
+              });
+            }
+          });
+
+        }
+
+      }
+    }).then(() => {
+
+      if (useAPI === true) {
+
+
+        this.indexeddbService.checkAPIreportchanges(this.report_id).then(re => {
+          if (re) {
+            //console.log(re);
+            //console.log(re.report_lastupdate);
+            //console.log(this.reportdesc.report_lastupdate);
+
+            if (this.reportdesc.report_lastupdate === re.report_lastupdate) {
+              console.log('no changes');
+
+              this.indexeddbService.searchAPIreport(this.report_info.report_id).then(ret => {
+
+                if (ret === 'API_ERROR') {
+                  console.log('api problems');
+
+                  const dialogRef = this.dialog.open(DialogApierrorComponent, {
+                    width: '400px',
+                    disableClose: true
+                  });
+
+                  dialogRef.afterClosed().subscribe(async result => {
+
+                    if (result === 'tryagain') {
+                      console.log('User select: try again');
+                      this.saveReportChanges(this.report_info.report_id);
+                    }
+
+                    if (result === 'savelocally') {
+                      console.log('User select: save locally');
+                      try {
+                        this.decryptedReportDataChanged.report_version = this.decryptedReportDataChanged.report_version + 1;
+                        this.addSaveChangelog();
+                        // Encrypt
+                        const ciphertext = await this.cryptoUtils.encrypt(JSON.stringify(this.decryptedReportDataChanged), pass);
+                        const now: number = Date.now();
+                        const to_update = {
+                          report_id: uuid(),
+                          report_name: this.report_info.report_name,
+                          report_createdate: this.report_info.report_createdate,
+                          report_lastupdate: now,
+                          encrypted_data: ciphertext
+                        };
+
+                        this.indexeddbService.cloneReportadd(to_update).then(data => {
+                          if (data) {
+                            this.removeSureYouWanttoLeave();
+                            this.router.navigate(['/my-reports']);
+                          }
+                        });
+
+                      } catch (except) {
+                        console.log(except);
+                      }
+
+                    }
+                  });
+
+                } else {
+                  this.decryptedReportDataChanged.report_version = this.decryptedReportDataChanged.report_version + 1;
+                  this.addSaveChangelog();
+                  // tslint:disable-next-line:max-line-length
+                  this.indexeddbService.prepareupdateAPIreport(ret.api, ret.apikey, this.decryptedReportDataChanged, pass, this.report_info.report_id, this.report_info.report_name, this.report_info.report_createdate).then(retu => {
+                    if (retu === 'NOSPACE') {
+                      this.savemsg = '';
+                      this.report_encryption_in_progress = false;
+                    } else {
+                      this.report_encryption_in_progress = false;
+                      this.reportdesc.report_lastupdate = retu;
+                      this.savemsg = 'All changes saved on remote API successfully!';
+                      this.lastsavereportdata = retu;
+                      this.snapshotForSave();
+                      this.doStats();
+                      this.removeSureYouWanttoLeave();
+
+                      this.snackBar.open('All changes saved on remote API successfully!', 'OK', {
+                        duration: 3000,
+                        panelClass: ['notify-snackbar-success']
+                      });
+                    }
+
+                  });
+
+                }
+
+              });
+
+
+            } else {
+              console.log('report changes detected!!!');
+
+
+              const dialogRef = this.dialog.open(DialogApierrorComponent, {
+                width: '400px',
+                disableClose: true
+              });
+
+              dialogRef.afterClosed().subscribe(async result => {
+
+                if (result === 'tryagain') {
+                  console.log('User select: try again');
+                  this.saveReportChanges(this.report_info.report_id);
+                }
+
+                if (result === 'savelocally') {
+                  console.log('User select: save locally');
+                  try {
+                    this.decryptedReportDataChanged.report_version = this.decryptedReportDataChanged.report_version + 1;
+                    this.addSaveChangelog();
+                    // Encrypt
+                    const ciphertext = await this.cryptoUtils.encrypt(JSON.stringify(this.decryptedReportDataChanged), pass);
+                    const now: number = Date.now();
+                    const to_update = {
+                      report_id: uuid(),
+                      report_name: this.report_info.report_name,
+                      report_createdate: this.report_info.report_createdate,
+                      report_lastupdate: now,
+                      encrypted_data: ciphertext
+                    };
+
+                    this.indexeddbService.cloneReportadd(to_update).then(data => {
+                      if (data) {
+                        this.removeSureYouWanttoLeave();
+                        this.router.navigate(['/my-reports']);
+                      }
+                    });
+
+                  } catch (except) {
+                    console.log(except);
+                  }
+
+                }
+              });
+
+            }
+
+          }
+        });
+
+      }
+
+    });
+
+  }
+
+
+  getTags(items) {
+    const ret = items.filter(function (el) {
+      return (el.tags.length !== 0);
+    });
+
+    return ret.length;
+  }
+
+  getAllTAgs() {
+
+    const rettag = this.decryptedReportDataChanged.report_vulns.filter(function (el) {
+      return (el.tags.length > 0);
+    });
+
+    if (rettag.length > 0) {
+      const xxx: any[] = [];
+      this.RaportsTags = [];
+      rettag.forEach(function (value) {
+        value.tags.forEach(function (tagval) {
+
+          if (!xxx.includes(tagval.name)) {
+            xxx.push(tagval.name);
+          }
+
+        });
+      });
+      this.RaportsTags = xxx;
+
+    }
+
+    return this.RaportsTags
+  }
+
+  sortbycvss() {
+    this.deselectall();
+    //this.decryptedReportDataChanged.report_vulns = this.decryptedReportDataChanged.report_vulns.sort((a, b) => b.cvss - a.cvss);
+    this.selectedResult = this.selectedResult.sort((a, b) => b.cvss - a.cvss);
+  }
+
+  sortbyseverity() {
+
+    this.deselectall();
+
+    const critical: any[] = [];
+
+    const high: any[] = [];
+
+    const medium: any[] = [];
+
+    const low: any[] = [];
+
+    const info: any[] = [];
+
+    for (const [key, value] of Object.entries(this.decryptedReportDataChanged.report_vulns)) {
+
+      if (value) {
+        if (value["severity"] === "Critical") {
+          critical.push(value);
+        } else if (value["severity"] === "High") {
+          high.push(value);
+        } else if (value["severity"] === "Medium") {
+          medium.push(value);
+        } else if (value["severity"] === "Low") {
+          low.push(value);
+        } else if (value["severity"] === "Info") {
+          info.push(value);
+        }
+      }
+
+    }
+
+    const merge = [...critical, ...high, ...medium, ...low, ...info];
+
+    this.decryptedReportDataChanged.report_vulns = merge;
+
+    this.selectedResult = merge.slice(0, this.pageSize);
+
+  }
+
+  addCustomcontent(item) {
+
+    const dialogRef = this.dialog.open(DialogCustomcontentComponent, {
+      width: '550px',
+      height: '450px',
+      data: item
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The dialog was closed');
+
+      if (result) {
+        if (result !== '') {
+          this.decryptedReportDataChanged.report_settings.report_html = result;
+        }
+      }
+    });
+
+  }
+
+  addCustomcss(item) {
+
+    const dialogRef = this.dialog.open(DialogReportcssComponent, {
+      width: '550px',
+      height: '450px',
+      data: item
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The dialog was closed');
+      if (result || result === "") {
+        this.decryptedReportDataChanged.report_settings.report_css = result;
+      }
+    });
+
+  }
+
+
+  editreporttitle(item) {
+
+    const dialogRef = this.dialog.open(DialogEditComponent, {
+      width: '450px',
+      maxWidth: '95vw',
+      panelClass: 'edit-dialog-panel',
+      data: item
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The dialog was closed');
+      if (result) {
+        if (result !== 'nochanges') {
+          this.report_info.report_name = result;
+          this.sureYouWanttoLeave();
+        }
+      }
+    });
+
+  }
+
+  changesecuritykey(report_id: string) {
+
+    const dialogRef = this.dialog.open(DialogChangekeyComponent, {
+      width: '450px'
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The dialog was closed');
+
+      if (result) {
+        this.updateSecKey(report_id, result);
+      }
+
+    });
+
+  }
+
+  updateSecKey(report_id, pass) {
+
+    this.savemsg = 'Please wait, report is encrypted...';
+    this.keyVault.set(report_id, pass);
+
+    // update report
+    this.addtochangelog('Change report security key');
+    this.decryptedReportDataChanged.report_version = this.decryptedReportDataChanged.report_version + 1;
+    this.addSaveChangelog();
+
+    this.indexeddbService.getkeybyReportID(report_id).then(data => {
+      if (data) {
+
+        if (data.NotFound === 'NOOK') {
+          console.log('no locally report');
+        } else {
+          // tslint:disable-next-line:max-line-length
+          this.indexeddbService.prepareupdatereport(this.decryptedReportDataChanged, pass, this.report_info.report_id, this.report_info.report_name, this.report_info.report_createdate, data.key).then(retu => {
+            if (retu) {
+              this.savemsg = 'All changes saved successfully!';
+              this.lastsavereportdata = retu;
+              this.snapshotForSave();
+              this.doStats();
+            }
+          });
+        }
+
+      }
+    });
+
+  }
+
+  editissuetitle(item) {
+    const dialogRef = this.dialog.open(DialogEditComponent, {
+      width: '450px',
+      maxWidth: '95vw',
+      panelClass: 'edit-dialog-panel',
+      data: item
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The dialog was closed');
+      if (result) {
+        if (result !== 'nochanges') {
+          const index: number = this.decryptedReportDataChanged.report_vulns.indexOf(result);
+          if (index !== -1) {
+            this.decryptedReportDataChanged.report_vulns[index].title = result.title;
+            this.afterDetectionNow();
+          }
+        }
+      }
+    });
+  }
+  ngOnDestroy() {
+    // unsubscribe to ensure no memory leaks
+    this.subscription.unsubscribe();
+    if (this.vaultSub) this.vaultSub.unsubscribe();
+  }
+
+  addresearcher() {
+
+    const add = {
+      reportername: '',
+      reportersocial: '',
+      reporterwww: '',
+      reporteremail: ''
+    };
+
+    this.decryptedReportDataChanged.researcher.push(add);
+    this.afterDetectionNow();
+
+  }
+
+  removeresearcher(item) {
+
+    const index: number = this.decryptedReportDataChanged.researcher.indexOf(item);
+
+    if (index !== -1) {
+      this.decryptedReportDataChanged.researcher.splice(index, 1);
+      this.afterDetectionNow();
+    }
+
+  }
+
+
+  addchangelog() {
+    const dialogRef = this.dialog.open(DialogChangelogComponent, {
+      width: '500px'
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The dialog was closed');
+
+      if (result !== undefined) {
+        this.decryptedReportDataChanged.report_changelog.push(result);
+        this.doStats();
+      }
+
+    });
+  }
+
+
+  editchangelog(item) {
+    const dialogRef = this.dialog.open(DialogChangelogComponent, {
+      width: '500px',
+      data: item
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The dialog was closed');
+
+      if (result) {
+        const index: number = this.decryptedReportDataChanged.report_changelog.indexOf(result.origi);
+
+        if (index !== -1) {
+          const updated: any = { date: result.date, desc: result.desc };
+          if (result.version) { updated.version = result.version; }
+          this.decryptedReportDataChanged.report_changelog[index] = updated;
+          this.doStats();
+        }
+      }
+
+    });
+  }
+
+
+  addtochangelog(item) {
+    const today: number = Date.now();
+    const add_changelog = {
+      date: today,
+      desc: item,
+      version: this.decryptedReportDataChanged.report_version
+    };
+
+    this.decryptedReportDataChanged.report_changelog.push(add_changelog);
+    this.doStats();
+  }
+
+  private snapshotForSave(): void {
+    if (this.decryptedReportDataChanged) {
+      try {
+        this.lastSavedSnapshot = JSON.parse(JSON.stringify(this.decryptedReportDataChanged));
+      } catch {
+        this.lastSavedSnapshot = null;
+      }
+    }
+  }
+
+  private buildSaveDiff(): string {
+    const before = this.lastSavedSnapshot;
+    const after = this.decryptedReportDataChanged;
+    if (!before || !after) return '';
+
+    const lines: string[] = [];
+    const trim = (s: string, n = 60) => (s && s.length > n ? s.slice(0, n - 1) + '…' : s);
+
+    // Issues — match by title (best-effort)
+    const beforeVulns: any[] = Array.isArray(before.report_vulns) ? before.report_vulns : [];
+    const afterVulns: any[] = Array.isArray(after.report_vulns) ? after.report_vulns : [];
+    const beforeTitles = new Set(beforeVulns.map((v: any) => v.title));
+    const afterTitles = new Set(afterVulns.map((v: any) => v.title));
+
+    const added = afterVulns.filter((v: any) => !beforeTitles.has(v.title));
+    const removed = beforeVulns.filter((v: any) => !afterTitles.has(v.title));
+    const modified: any[] = [];
+    afterVulns.forEach((av: any) => {
+      if (!beforeTitles.has(av.title)) return;
+      const bv = beforeVulns.find((b: any) => b.title === av.title);
+      if (bv && JSON.stringify(bv) !== JSON.stringify(av)) modified.push(av);
+    });
+
+    if (added.length) {
+      lines.push(`+ Added ${added.length} issue${added.length > 1 ? 's' : ''}: ${added.map((v: any) => trim(v.title || '(untitled)')).join(', ')}`);
+    }
+    if (removed.length) {
+      lines.push(`- Removed ${removed.length} issue${removed.length > 1 ? 's' : ''}: ${removed.map((v: any) => trim(v.title || '(untitled)')).join(', ')}`);
+    }
+    if (modified.length) {
+      lines.push(`~ Modified ${modified.length} issue${modified.length > 1 ? 's' : ''}: ${modified.map((v: any) => trim(v.title || '(untitled)')).join(', ')}`);
+    }
+
+    // Assets
+    const beforeAssets: any[] = Array.isArray(before.report_assets) ? before.report_assets : [];
+    const afterAssets: any[] = Array.isArray(after.report_assets) ? after.report_assets : [];
+    const aDelta = afterAssets.length - beforeAssets.length;
+    if (aDelta > 0) lines.push(`+ Added ${aDelta} asset${aDelta > 1 ? 's' : ''}`);
+    else if (aDelta < 0) lines.push(`- Removed ${-aDelta} asset${-aDelta > 1 ? 's' : ''}`);
+    else if (JSON.stringify(beforeAssets) !== JSON.stringify(afterAssets)) lines.push(`~ Assets updated`);
+
+    // Researchers
+    const beforeR: any[] = Array.isArray(before.researcher) ? before.researcher : [];
+    const afterR: any[] = Array.isArray(after.researcher) ? after.researcher : [];
+    const rDelta = afterR.length - beforeR.length;
+    if (rDelta > 0) lines.push(`+ Added ${rDelta} researcher${rDelta > 1 ? 's' : ''}`);
+    else if (rDelta < 0) lines.push(`- Removed ${-rDelta} researcher${-rDelta > 1 ? 's' : ''}`);
+    else if (JSON.stringify(beforeR) !== JSON.stringify(afterR)) lines.push(`~ Researchers updated`);
+
+    // Scope / summary
+    if ((before.report_scope || '') !== (after.report_scope || '')) lines.push(`~ Scope updated`);
+    if ((before.report_summary || '') !== (after.report_summary || '')) lines.push(`~ Summary updated`);
+
+    // Test dates
+    const bMeta = before.report_metadata || {};
+    const aMeta = after.report_metadata || {};
+    if ((bMeta.starttest || '') !== (aMeta.starttest || '')) lines.push(`~ Test start date updated`);
+    if ((bMeta.endtest || '') !== (aMeta.endtest || '')) lines.push(`~ Test end date updated`);
+
+    // Settings (logo + flags)
+    if (JSON.stringify(before.report_settings || {}) !== JSON.stringify(after.report_settings || {})) {
+      lines.push(`~ Report settings updated`);
+    }
+
+    return lines.length ? '\n' + lines.join('\n') : '';
+  }
+
+  private addSaveChangelog(): void {
+    const version = this.decryptedReportDataChanged.report_version;
+    const diff = this.buildSaveDiff();
+    this.addtochangelog('Save report v.' + version + diff);
+  }
+  removefromchangelog(item) {
+    const remo = 'changelog';
+    const dialogRef = this.dialog.open(DialogEditComponent, {
+      width: '420px',
+      maxWidth: '95vw',
+      maxHeight: '90vh',
+      panelClass: 'edit-dialog-panel',
+      data: [{ remo }, { item }],
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The dialog was closed');
+
+      const index: number = this.decryptedReportDataChanged.report_changelog.indexOf(result);
+
+      if (index !== -1) {
+        this.decryptedReportDataChanged.report_changelog.splice(index, 1);
+        this.doStats();
+      }
+    });
+  }
+
+  removeallfromchangelog() {
+
+
+    const remo = 'changelog_wipe';
+    const dialogRef = this.dialog.open(DialogEditComponent, {
+      width: '420px',
+      maxWidth: '95vw',
+      panelClass: 'edit-dialog-panel',
+      data: [{ remo }],
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The dialog was closed');
+      if (result) {
+        this.decryptedReportDataChanged.report_changelog = [];
+        this.doStats();
+      }
+    });
+
+
+
+
+
+  }
+  removeIssiue(item) {
+    const remo = 'remove';
+    const dialogRef = this.dialog.open(DialogEditComponent, {
+      width: '420px',
+      maxWidth: '95vw',
+      panelClass: 'edit-dialog-panel',
+      data: [{ remo }, { item }],
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The dialog was closed');
+
+      const index: number = this.decryptedReportDataChanged.report_vulns.indexOf(result);
+
+      if (index !== -1) {
+        this.decryptedReportDataChanged.report_vulns.splice(index, 1);
+        this.addtochangelog('Remove issue: ' + result.title);
+        this.afterDetectionNow();
+        this.doStats();
+      }
+
+    });
+  }
+
+
+
+  shareReport(report_id) {
+    this.indexeddbService.downloadEncryptedReport(report_id);
+  }
+
+  downloadASCII(report_details, metadata) {
+
+    function addNewlines(str) {
+      return stringDivider(str, 100, '\n');
+    }
+
+    function stringDivider(str, width, spaceReplacer) {
+      if (str.length > width) {
+        let p = width;
+        for (; p > 0 && str[p] !== ' '; p--) { }
+        if (p > 0) {
+          const left = str.substring(0, p);
+          const right = str.substring(p + 1);
+          return left + spaceReplacer + stringDivider(right, width, spaceReplacer);
+        }
+      }
+      return str;
+    }
+
+    let report_ascii_head = '######################################################\n\
+# Report Title: ' + metadata.report_name + '\n\
+# Report ID: ' + metadata.report_id + '\n\
+# Create Date: ' + new Date(metadata.report_createdate).toLocaleDateString(this.setLocal) + '\n\
+# Last Update: ' + new Date(metadata.report_lastupdate).toLocaleDateString(this.setLocal) + '\n';
+
+    if (report_details.researcher.length > 0) {
+
+      report_ascii_head = report_ascii_head + '#####\n# Author: \n';
+
+      report_details.researcher.forEach(function (value, key) {
+
+        if (value.reportername !== '') {
+          report_ascii_head = report_ascii_head + '# ' + value.reportername + '';
+        }
+
+        if (value.reporteremail !== '') {
+          report_ascii_head = report_ascii_head + ' - E-mail: ' + value.reporteremail + '';
+        }
+
+        if (value.reportersocial !== '') {
+          report_ascii_head = report_ascii_head + ' - Social: ' + value.reportersocial + '';
+        }
+
+        if (value.reporterwww !== '') {
+          report_ascii_head = report_ascii_head + ' - WWW: ' + value.reporterwww + '';
+        }
+
+        report_ascii_head = report_ascii_head + '\n';
+      }, this);
+
+    }
+
+    if (report_details.report_scope !== '') {
+      report_ascii_head = report_ascii_head + '# Report scope: \n' + addNewlines(report_details.report_scope);
+    }
+
+    report_ascii_head = report_ascii_head + '######################################################\n\
+# Vulnerabilities:\n\n';
+
+    let report_ascii_vulns = '';
+    report_details.report_vulns.forEach(function (value, key) {
+
+      report_ascii_vulns += report_ascii_vulns = '\n-> ' + Number(key + 1) + '. ' + value.title;
+
+      if (value.severity !== '') {
+        report_ascii_vulns = report_ascii_vulns + '\n# Severity: ' + value.severity + '\n';
+      }
+
+      if (value.date !== '') {
+        report_ascii_vulns = report_ascii_vulns + '# Find Date: ' + new Date(value.date).toLocaleDateString(this.setLocal) + '\n';
+      }
+
+      if (value.cvss !== '') {
+        report_ascii_vulns = report_ascii_vulns + '# CVSS: ' + value.cvss + '\n';
+      }
+
+      if (value.cve !== '') {
+        report_ascii_vulns = report_ascii_vulns + '# CVE: ' + addNewlines(value.cve) + '\n';
+      }
+
+      report_ascii_vulns = report_ascii_vulns + '# Description: \n' + addNewlines(value.desc) + '\n';
+
+      if (value.poc !== '') {
+        report_ascii_vulns = report_ascii_vulns + '# PoC: \n' + addNewlines(value.poc) + '\n';
+      }
+
+      if (value.ref !== '') {
+        report_ascii_vulns = report_ascii_vulns + '# References: \n' + value.ref + '\n\n';
+      }
+
+
+    }, this);
+
+    const report_ascii_end = '\n# Report generated by vulnrepo.com \n######################################################\n';
+    const report_ascii = report_ascii_head + report_ascii_vulns + report_ascii_end;
+
+    // download ascii report
+    const blob = new Blob([report_ascii], { type: 'text/plain;charset=utf-8' });
+    this.utilsService.downloadWithIntegrity(
+      blob,
+      metadata.report_name + ' ' + metadata.report_id + ' ASCII (vulnrepo.com).txt'
+    );
+
+  }
+
+  embedVideo(event) {
+    if (event.checked === false) {
+      this.decryptedReportDataChanged.report_settings.report_video_embed = false;
+    }
+    if (event.checked === true) {
+      this.decryptedReportDataChanged.report_settings.report_video_embed = true;
+    }
+  }
+
+  removeGeninfo(event) {
+    if (event.checked === false) {
+      this.decryptedReportDataChanged.report_settings.report_remove_lastpage = false;
+    }
+    if (event.checked === true) {
+      this.decryptedReportDataChanged.report_settings.report_remove_lastpage = true;
+    }
+  }
+
+  removechangelogpage(event) {
+    if (event.checked === false) {
+      this.decryptedReportDataChanged.report_settings.report_changelog_page = false;
+    }
+    if (event.checked === true) {
+      this.decryptedReportDataChanged.report_settings.report_changelog_page = true;
+    }
+  }
+
+  parsingdescnewline(event) {
+    if (event.checked === false) {
+      this.decryptedReportDataChanged.report_settings.report_parsing_desc = false;
+    }
+    if (event.checked === true) {
+      this.decryptedReportDataChanged.report_settings.report_parsing_desc = true;
+    }
+  }
+
+  parsingpocmarkdown(event) {
+    if (event.checked === false) {
+      this.decryptedReportDataChanged.report_settings.report_parsing_poc_markdown = false;
+    }
+    if (event.checked === true) {
+      this.decryptedReportDataChanged.report_settings.report_parsing_poc_markdown = true;
+    }
+  }
+
+  removeattachname(event) {
+    if (event.checked === false) {
+      this.decryptedReportDataChanged.report_settings.report_remove_attach_name = false;
+    }
+    if (event.checked === true) {
+      this.decryptedReportDataChanged.report_settings.report_remove_attach_name = true;
+    }
+  }
+
+  removeResearchers(event) {
+    if (event.checked === false) {
+      this.decryptedReportDataChanged.report_settings.report_remove_researchers = false;
+    }
+    if (event.checked === true) {
+      this.decryptedReportDataChanged.report_settings.report_remove_researchers = true;
+    }
+  }
+
+  removeIssuestatus(event) {
+    if (event.checked === false) {
+      this.decryptedReportDataChanged.report_settings.report_remove_issuestatus = false;
+    }
+    if (event.checked === true) {
+      this.decryptedReportDataChanged.report_settings.report_remove_issuestatus = true;
+    }
+  }
+
+  removeIssuecvss(event) {
+    if (event.checked === false) {
+      this.decryptedReportDataChanged.report_settings.report_remove_issuecvss = false;
+    }
+    if (event.checked === true) {
+      this.decryptedReportDataChanged.report_settings.report_remove_issuecvss = true;
+    }
+  }
+
+  removeIssuecve(event) {
+    if (event.checked === false) {
+      this.decryptedReportDataChanged.report_settings.report_remove_issuecve = false;
+    }
+    if (event.checked === true) {
+      this.decryptedReportDataChanged.report_settings.report_remove_issuecve = true;
+    }
+  }
+
+  removetagsfromreport(event) {
+    if (event.checked === false) {
+      this.decryptedReportDataChanged.report_settings.report_remove_issuetags = false;
+    }
+    if (event.checked === true) {
+      this.decryptedReportDataChanged.report_settings.report_remove_issuetags = true;
+    }
+  }
+
+  parserefmd(str): string {
+    if (!str?.trim()) return '';
+    return str.split("\n")
+      .filter((item: string) => item.trim().length > 0)
+      .map((item: string) => {
+        const ref = item.replace(/ /g, "_");
+        return `[${ref}](${ref})`;
+      })
+      .join("\n\n") + "\n\n";
+  }
+
+  DownloadMarkdown(report_info): void {
+    const data = this.decryptedReportDataChanged;
+    const settings = data.report_settings;
+
+    const str = `# Security Report
+## ${report_info.report_name}
+#### Report Version: ${data.report_version}
+#### Report ID: ${report_info.report_id}`;
+
+    let str_dates = "";
+    if (data.report_metadata.starttest !== '' && data.report_metadata.endtest !== '') {
+      const startdatestr = new Date(data.report_metadata.starttest).toLocaleDateString(this.setLocal);
+      const enddatestr = new Date(data.report_metadata.endtest).toLocaleDateString(this.setLocal);
+      str_dates = `\n#### Start date: ${startdatestr}\n#### End date: ${enddatestr}\n\n`;
+    }
+
+    const sevCounts: Record<string, number> = { Critical: 0, High: 0, Medium: 0, Low: 0, Info: 0 };
+    data.report_vulns.forEach((v: any) => { if (sevCounts[v.severity] !== undefined) sevCounts[v.severity]++; });
+
+    const vulnstats = `## Statistics\n
+Severity   | Number
+-----------|-------
+Critical   | ${sevCounts.Critical}
+High       | ${sevCounts.High}
+Medium     | ${sevCounts.Medium}
+Low        | ${sevCounts.Low}
+Info       | ${sevCounts.Info}\n\n`;
+
+    let str_summary = '';
+    if (data.report_summary?.trim()) {
+      str_summary = `## Summary\n\n${data.report_summary}\n\n`;
+    }
+
+    const str_scope = `## Scope\n\n${data.report_scope}\n\n`;
+
+    let str_issues = '## Results\n\n';
+    data.report_vulns.forEach((item: any, index: number) => {
+      const num = index + 1;
+      let issue = `### ${num}. ${item.title}\n`;
+      issue += `#### Severity:\n${item.severity}\n\n`;
+      if (!settings.report_remove_issuestatus && item.status) {
+        const statusEntry = this.utilsService.issueStatustable.find((s: any) => s.value === item.status);
+        if (statusEntry?.status) issue += `#### Status:\n${statusEntry.status}\n\n`;
+      }
+      if (!settings.report_remove_issuecvss && item.cvss?.length) {
+        issue += `#### CVSS Score:\n${item.cvss}\n\n`;
+      }
+      if (item.date) {
+        issue += `#### Date Found:\n${new Date(item.date).toLocaleDateString(this.setLocal)}\n\n`;
+      }
+      issue += `#### Description:\n${item.desc}\n\n`;
+      issue += `#### PoC:\n${item.poc}\n\n`;
+      if (!settings.report_remove_issuetags && item.tags?.length) {
+        issue += `#### Tags:\n${item.tags.map((t: any) => t.name).join(', ')}\n\n`;
+      }
+      issue += `#### References:\n${this.parserefmd(item.ref)}\n---\n\n`;
+      str_issues += issue;
+    });
+
+    let str_researcher = '';
+    if (settings.report_remove_researchers === false) {
+      str_researcher = '## Researchers\n\n';
+      data.researcher.forEach((item: any) => {
+        str_researcher += `> ${item.reportername} ${item.reportersocial}\n\n`;
+      });
+    }
+
+    let str_changelog = '';
+    if (settings.report_changelog_page === false) {
+      str_changelog = `## Changelog\n\nDate       | Description\n-----------|------------\n`;
+      data.report_changelog.forEach((item: any) => {
+        const rdate = new Date(item.date).toLocaleDateString(this.setLocal);
+        const cellDesc = String(item.desc || '').replace(/\\/g, '\\\\').replace(/\|/g, '\\|').replace(/\r?\n/g, '<br>');
+        str_changelog += `${rdate} | ${cellDesc}\n`;
+      });
+      str_changelog += '\n\n';
+    }
+
+    let str_footer = '';
+    if (settings.report_remove_lastpage === false) {
+      str_footer = `_Generated by [VULNRΞPO](https://vulnrepo.com/)_`;
+    }
+
+    // download MARKDOWN report
+    const content = str + str_dates + str_summary + str_scope + vulnstats + str_issues + str_researcher + str_changelog + str_footer;
+    const blob = new Blob([content], { type: 'text/markdown' });
+    this.utilsService.downloadWithIntegrity(
+      blob,
+      `${report_info.report_name} ${report_info.report_id} (vulnrepo.com).md`
+    );
+  }
+
+  DownloadJSON(report_info): void {
+
+    const json = {
+      "report_name": report_info.report_name,
+      "report_id": report_info.report_id,
+      "report_createdate": report_info.report_createdate,
+      "report_lastupdate": report_info.report_lastupdate,
+      "report_changelog": this.decryptedReportDataChanged.report_changelog,
+      "researcher": this.decryptedReportDataChanged.researcher,
+      "report_vulns": this.decryptedReportDataChanged.report_vulns,
+      "report_version": this.decryptedReportDataChanged.report_version,
+      "report_summary": this.decryptedReportDataChanged.report_summary,
+      "report_metadata": this.decryptedReportDataChanged.report_metadata,
+      "report_scope": this.decryptedReportDataChanged.report_scope,
+      "report_settings": this.decryptedReportDataChanged.report_settings
+    };
+
+    // download JSON report
+    const blob = new Blob([JSON.stringify(json)], { type: 'application/json' });
+    this.utilsService.downloadWithIntegrity(
+      blob,
+      report_info.report_name + ' ' + report_info.report_id + ' (vulnrepo.com).json'
+    );
+  }
+
+  async DownloadDOCX(report_info): Promise<void> {
+    this.showspinner();
+
+    // The document build below is synchronous and blocks the thread, so give the
+    // dialog a frame to actually paint first — two rAFs guarantee we are past a
+    // paint, not just queued before one.
+    await new Promise<void>(resolve =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    );
+
+    try {
+      await this.buildDOCX(report_info);
+    } finally {
+      this.hidespinner();
+    }
+  }
+
+  private async buildDOCX(report_info): Promise<void> {
+    // Lazy-load the DOCX writer; keeps ~1 MB out of the initial bundle.
+    const {
+      AlignmentType, Document, ExternalHyperlink, Footer, Header, Packer,
+      PageBreak, HeadingLevel, ImageRun, PageNumber, NumberFormat, Paragraph,
+      TextRun, TableOfContents, Table, TableCell, TableRow, WidthType,
+    } = await import('docx');
+
+    const data = this.decryptedReportDataChanged;
+
+    // ── SEVERITY COLOUR MAP ───────────────────────────────────────────────────
+    const SEV_COLORS: Record<string, string> = {
+      Critical: 'FF0039',
+      High:     'FF7518',
+      Medium:   'F9EE06',
+      Low:      '3FB618',
+      Info:     '2780E3',
+    };
+
+    const severityCounts = ['Critical', 'High', 'Medium', 'Low', 'Info'].map(s => ({
+      label: s,
+      count: data.report_vulns.filter((v: any) => v.severity === s).length,
+      color: SEV_COLORS[s],
+    }));
+    const totalIssues: number = data.report_vulns.length;
+
+    // ── CELL HELPERS ─────────────────────────────────────────────────────────
+    const sevCell = (text: string, fill: string, width = 3505) =>
+      new TableCell({
+        width: { size: width, type: WidthType.DXA },
+        shading: { fill },
+        children: [new Paragraph({ children: [new TextRun({ text, color: 'FFFFFF', bold: true })] })],
+      });
+
+    const plainCell = (text: string, width = 5505) =>
+      new TableCell({
+        width: { size: width, type: WidthType.DXA },
+        children: [new Paragraph(text)],
+      });
+
+    const headerCell = (text: string, width = 3505) =>
+      new TableCell({
+        width: { size: width, type: WidthType.DXA },
+        shading: { fill: 'CCCCCC' },
+        children: [new Paragraph({ children: [new TextRun({ text, bold: true })] })],
+      });
+
+    const generatedby = data.report_settings.report_remove_lastpage
+      ? new TextRun('')
+      : new TextRun('© Generated by vulnrepo.com | ');
+
+    const buildchangelog = (): any[] => data.report_changelog.map((entry: any) => {
+      const descLines = String(entry.desc || '').split(/\r?\n/);
+      const descRuns: DocxTextRun[] = descLines.map((line, i) =>
+        i === 0 ? new TextRun({ text: line }) : new TextRun({ text: line, break: 1 })
+      );
+      return new TableRow({
+        children: [
+          new TableCell({
+            width: { size: 1500, type: WidthType.DXA },
+            children: [new Paragraph(new Date(entry.date).toLocaleString(this.setLocal))],
+          }),
+          new TableCell({
+            width: { size: 7510, type: WidthType.DXA },
+            children: [new Paragraph({ children: descRuns })],
+          }),
+        ],
+      });
+    });
+
+    // ── REPORT SUMMARY ───────────────────────────────────────────────────────
+    const buildreportsummary = (): any[] => {
+      if (!data.report_summary?.length) return [];
+      return [
+        new Paragraph({
+          text: 'Report Summary',
+          heading: HeadingLevel.HEADING_1,
+          pageBreakBefore: true,
+          spacing: { after: 200, before: 200 },
+        }),
+        new Paragraph({ text: data.report_summary, spacing: { after: 200 } }),
+      ];
+    };
+
+    // ── RESEARCHERS ──────────────────────────────────────────────────────────
+    const buildauthors = (): any[] => data.researcher.map((r: any) => {
+      const runs: DocxTextRun[] = [new TextRun({ text: r.reportername, bold: true })];
+      if (r.reporteremail) runs.push(new TextRun({ text: '  ' + r.reporteremail }));
+      if (r.reportersocial) runs.push(new TextRun({ text: r.reportersocial, break: 1 }));
+      if (r.reporterwww) runs.push(new TextRun({ text: r.reporterwww, break: 1 }));
+      return new Paragraph({ children: runs, spacing: { after: 100 } });
+    });
+
+    const buildmainauthors = (): any[] => {
+      if (data.report_settings.report_remove_researchers) return [];
+      return [
+        new Paragraph({
+          text: 'Researchers',
+          heading: HeadingLevel.HEADING_1,
+          pageBreakBefore: true,
+          spacing: { after: 200, before: 200 },
+        }),
+        ...buildauthors(),
+      ];
+    };
+
+    // ── CHANGELOG SECTION ────────────────────────────────────────────────────
+    const buildmainchangelog = (): any[] => {
+      if (data.report_settings.report_changelog_page || !data.report_changelog.length) return [];
+      return [
+        new Paragraph({
+          text: 'Changelog',
+          heading: HeadingLevel.HEADING_1,
+          spacing: { after: 200, before: 200 },
+        }),
+        new Table({
+          columnWidths: [1500, 7510],
+          rows: [
+            new TableRow({ children: [headerCell('Date', 1500), headerCell('Description', 7510)] }),
+            ...buildchangelog(),
+          ],
+        }),
+      ];
+    };
+
+    // ── LOGO ─────────────────────────────────────────────────────────────────
+    const buildlogo = (): any[] => {
+      if (!data.report_settings.report_logo.logo) return [];
+      return [new ImageRun({
+        data: data.report_settings.report_logo.logo,
+        transformation: {
+          width: data.report_settings.report_logo.width,
+          height: data.report_settings.report_logo.height,
+        },
+      })];
+    };
+
+    // ── ATTACHMENTS ──────────────────────────────────────────────────────────
+    const buildfiles = (x: number): any[] => {
+      const result: any[] = [];
+      for (const file of data.report_vulns[x].files) {
+        if (!file.type.includes('image')) continue;
+        const filename = data.report_settings.report_remove_attach_name ? '' : file.title;
+        result.push(
+          new ImageRun({ data: file.data, transformation: { width: 500, height: 400 } }),
+          new TextRun({ text: 'SHA-256: ' + file.sha256checksum, break: 1 }),
+          new TextRun({ text: filename, break: 1 }),
+          new TextRun({ text: '', break: 1 }),
+        );
+      }
+      return result;
+    };
+
+    // ── TAGS ─────────────────────────────────────────────────────────────────
+    const buildtags = (x: number): any[] => {
+      const tags = data.report_vulns[x].tags.map((t: any) => t.name).join(', ');
+      return [new TextRun({ text: tags }), new TextRun({ text: '', break: 1 })];
+    };
+
+    // ── REFERENCES ───────────────────────────────────────────────────────────
+    const isUrl = (s: string) => /^https?:\/\//i.test(s.trim());
+
+    const buildrefs = (x: number): any[] => {
+      const vuln = data.report_vulns[x];
+      if (!vuln.ref?.length) return [];
+      return vuln.ref.toString().split('\n').flatMap((line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed) return [];
+        if (isUrl(trimmed)) {
+          return [new ExternalHyperlink({
+            link: trimmed,
+            children: [new TextRun({ text: trimmed, style: 'Hyperlink', break: 1 })],
+          })];
+        }
+        return [new TextRun({ text: trimmed, break: 1 })];
+      });
+    };
+
+    // ── FINDINGS SUMMARY TABLE ───────────────────────────────────────────────
+    const buildIssuesSummaryTable = (): any[] => {
+      if (!data.report_vulns.length) return [];
+      const hideStatus = data.report_settings.report_remove_issuestatus;
+      const colWidths = hideStatus ? [500, 1500, 7010] : [500, 1500, 5000, 2010];
+      const headerRow = new TableRow({
+        children: [
+          headerCell('#', 500),
+          headerCell('Severity', 1500),
+          headerCell('Title', hideStatus ? 7010 : 5000),
+          ...(hideStatus ? [] : [headerCell('Status', 2010)]),
+        ],
+      });
+      const rows = data.report_vulns.map((vuln: any, idx: number) => {
+        const statusEntry = this.utilsService.issueStatustable.find((s: any) => s.value === vuln.status);
+        const fill = SEV_COLORS[vuln.severity] ?? 'CCCCCC';
+        return new TableRow({
+          children: [
+            plainCell((idx + 1).toString(), 500),
+            sevCell(vuln.severity, fill, 1500),
+            plainCell(vuln.title, hideStatus ? 7010 : 5000),
+            ...(hideStatus ? [] : [plainCell(statusEntry?.status ?? '', 2010)]),
+          ],
+        });
+      });
+      return [
+        new Paragraph({
+          text: 'Findings Summary',
+          heading: HeadingLevel.HEADING_1,
+          pageBreakBefore: true,
+          spacing: { after: 200, before: 200 },
+        }),
+        new Table({ columnWidths: colWidths, rows: [headerRow, ...rows] }),
+      ];
+    };
+
+    // ── ISSUE METADATA TABLE ─────────────────────────────────────────────────
+    const buildIssueMetaTable = (vuln: any): any | null => {
+      const rows: any[] = [];
+      const fill = SEV_COLORS[vuln.severity] ?? 'CCCCCC';
+
+      if (vuln.severity) rows.push(new TableRow({
+        children: [headerCell('Severity', 2000), sevCell(vuln.severity, fill, 7010)],
+      }));
+
+      if (!data.report_settings.report_remove_issuestatus && vuln.status) {
+        const entry = this.utilsService.issueStatustable.find((s: any) => s.value === vuln.status);
+        if (entry?.status) rows.push(new TableRow({
+          children: [headerCell('Status', 2000), plainCell(entry.status, 7010)],
+        }));
+      }
+
+      if (!data.report_settings.report_remove_issuecvss && vuln.cvss?.length) rows.push(new TableRow({
+        children: [headerCell('CVSS Score', 2000), plainCell(vuln.cvss, 7010)],
+      }));
+
+      if (!data.report_settings.report_remove_issuecve && vuln.cve?.length) rows.push(new TableRow({
+        children: [headerCell('CVE', 2000), plainCell(vuln.cve, 7010)],
+      }));
+
+      if (vuln.date) rows.push(new TableRow({
+        children: [
+          headerCell('Date Found', 2000),
+          plainCell(new Date(vuln.date).toLocaleDateString(this.setLocal), 7010),
+        ],
+      }));
+
+      if (!rows.length) return null;
+      return new Table({ columnWidths: [2000, 7010], rows });
+    };
+
+    // ── ISSUE DETAIL PARAGRAPHS ──────────────────────────────────────────────
+    const buildParagraphissues = (): any[] => {
+      const result: any[] = [];
+      for (let i = 0; i < data.report_vulns.length; i++) {
+        const vuln = data.report_vulns[i];
+
+        result.push(new Paragraph({
+          text: `${i + 1}. [${vuln.severity}] ${vuln.title}`,
+          heading: HeadingLevel.HEADING_2,
+          pageBreakBefore: true,
+          spacing: { after: 200, before: 200 },
+        }));
+
+        const metaTable = buildIssueMetaTable(vuln);
+        if (metaTable) {
+          result.push(metaTable, new Paragraph({ text: '', spacing: { after: 100 } }));
+        }
+
+        if (vuln.desc?.length) {
+          result.push(
+            new Paragraph({ children: [new TextRun({ text: 'Description', bold: true })], spacing: { after: 100 } }),
+            new Paragraph({ text: vuln.desc, spacing: { after: 200 } }),
+          );
+        }
+
+        if (vuln.poc?.length) {
+          result.push(
+            new Paragraph({ children: [new TextRun({ text: 'Proof of Concept', bold: true })], spacing: { after: 100 } }),
+            new Paragraph({ text: vuln.poc, spacing: { after: 200 } }),
+          );
+        }
+
+        if (!data.report_settings.report_remove_issuetags && vuln.tags?.length) {
+          result.push(
+            new Paragraph({ children: [new TextRun({ text: 'Tags', bold: true })] }),
+            new Paragraph({ children: buildtags(i) }),
+          );
+        }
+
+        const refs = buildrefs(i);
+        if (refs.length) {
+          result.push(
+            new Paragraph({ children: [new TextRun({ text: 'References', bold: true })], spacing: { after: 100 } }),
+            new Paragraph({ children: refs }),
+          );
+        }
+
+        if (vuln.files?.length) {
+          result.push(
+            new Paragraph({ children: [new TextRun({ text: 'Attachments', bold: true })], spacing: { before: 200 } }),
+            new Paragraph({ children: buildfiles(i) }),
+          );
+        }
+      }
+      return result;
+    };
+
+    // ── DOCUMENT ─────────────────────────────────────────────────────────────
+    const doc = new Document({
+      creator: data.researcher?.[0]?.reportername ?? 'vulnrepo.com',
+      title: report_info.report_name,
+      description: `Security assessment report – ID: ${report_info.report_id}`,
+      sections: [{
+        properties: {
+          page: { pageNumbers: { start: 1, formatType: NumberFormat.DECIMAL } },
+        },
+        footers: {
+          default: new Footer({
+            children: [new Paragraph({
+              alignment: AlignmentType.CENTER,
+              children: [
+                generatedby,
+                new TextRun({ children: ['Page: ', PageNumber.CURRENT] }),
+                new TextRun({ children: ['/', PageNumber.TOTAL_PAGES] }),
+              ],
+            })],
+          }),
+        },
+        children: [
+          // Cover page
+          new Paragraph({ children: [...buildlogo()] }),
+          new Paragraph({
+            text: report_info.report_name,
+            heading: HeadingLevel.HEADING_1,
+            spacing: { before: 2000, after: 200 },
+          }),
+          new Paragraph('Report ID: ' + report_info.report_id),
+          new Paragraph('Report Version: ' + data.report_version),
+          new Paragraph('Created: ' + new Date(report_info.report_createdate).toLocaleDateString(this.setLocal)),
+          new Paragraph('Last Updated: ' + new Date(report_info.report_lastupdate).toLocaleDateString(this.setLocal)),
+          ...(data.report_metadata?.starttest ? [new Paragraph(
+            'Test Period: '
+            + new Date(data.report_metadata.starttest).toLocaleDateString(this.setLocal)
+            + ' \u2013 '
+            + new Date(data.report_metadata.endtest).toLocaleDateString(this.setLocal)
+          )] : []),
+          new Paragraph({
+            spacing: { before: 400, after: 200 },
+            alignment: AlignmentType.CENTER,
+            shading: { fill: 'FF0039' },
+            children: [new TextRun({ text: 'CONFIDENTIAL', color: 'FFFFFF', bold: true, size: 28 })],
+          }),
+
+          // Table of Contents
+          new Paragraph({
+            text: 'Table of Contents',
+            heading: HeadingLevel.HEADING_1,
+            pageBreakBefore: true,
+            spacing: { after: 200, before: 200 },
+          }),
+          new TableOfContents('Summary', { hyperlink: true, headingStyleRange: '1-5', stylesWithLevels: [] }),
+
+          // Scope
+          new Paragraph({
+            text: 'Scope',
+            heading: HeadingLevel.HEADING_1,
+            pageBreakBefore: true,
+            spacing: { after: 200, before: 200 },
+          }),
+          new Paragraph({ text: data.report_scope ?? '', spacing: { after: 200 } }),
+
+          // Statistics
+          new Paragraph({
+            text: 'Statistics and Risk',
+            heading: HeadingLevel.HEADING_1,
+            spacing: { after: 200, before: 200 },
+          }),
+          new Table({
+            columnWidths: [3505, 5505],
+            rows: [
+              new TableRow({ children: [headerCell('Severity', 3505), headerCell('Count', 5505)] }),
+              ...severityCounts.map(({ label, count, color }) => new TableRow({
+                children: [
+                  sevCell(label, color, 3505),
+                  plainCell(count.toString(), 5505),
+                ],
+              })),
+              new TableRow({
+                children: [
+                  headerCell('Total', 3505),
+                  new TableCell({
+                    width: { size: 5505, type: WidthType.DXA },
+                    children: [new Paragraph({ children: [new TextRun({ text: totalIssues.toString(), bold: true })] })],
+                  }),
+                ],
+              }),
+            ],
+          }),
+          new Paragraph({
+            text: 'The risk of application security vulnerabilities discovered during an assessment will be rated according to a custom-tailored version of the OWASP Risk Rating Methodology. Risk severity is determined based on the estimated technical and business impact of the vulnerability, and on the estimated likelihood of the vulnerability being exploited:',
+            spacing: { after: 200, before: 200 },
+          }),
+          new Table({
+            columnWidths: [1802, 1802, 1802, 1802, 1802],
+            rows: [
+              new TableRow({ children: [new TableCell({ width: { size: 1802, type: WidthType.DXA }, columnSpan: 5, shading: { fill: 'CCCCCC' }, children: [new Paragraph({ children: [new TextRun({ text: 'Overall Risk Severity', bold: true })], alignment: AlignmentType.CENTER })] })] }),
+              new TableRow({ children: [
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, rowSpan: 4, children: [new Paragraph('Impact')] }),
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, children: [new Paragraph('HIGH')] }),
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, shading: { fill: 'F9EE06' }, children: [new Paragraph('Medium')] }),
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, shading: { fill: 'FF7518' }, children: [new Paragraph({ children: [new TextRun({ text: 'High', color: 'FFFFFF' })] })] }),
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, shading: { fill: 'FF0039' }, children: [new Paragraph({ children: [new TextRun({ text: 'Critical', color: 'FFFFFF' })] })] }),
+              ] }),
+              new TableRow({ children: [
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, children: [new Paragraph('MEDIUM')] }),
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, shading: { fill: '3FB618' }, children: [new Paragraph('Low')] }),
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, shading: { fill: 'F9EE06' }, children: [new Paragraph('Medium')] }),
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, shading: { fill: 'FF7518' }, children: [new Paragraph({ children: [new TextRun({ text: 'High', color: 'FFFFFF' })] })] }),
+              ] }),
+              new TableRow({ children: [
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, children: [new Paragraph('LOW')] }),
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, shading: { fill: '2780E3' }, children: [new Paragraph({ children: [new TextRun({ text: 'Info', color: 'FFFFFF' })] })] }),
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, shading: { fill: '3FB618' }, children: [new Paragraph('Low')] }),
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, shading: { fill: 'F9EE06' }, children: [new Paragraph('Medium')] }),
+              ] }),
+              new TableRow({ children: [
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, children: [new Paragraph('')] }),
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, children: [new Paragraph('LOW')] }),
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, children: [new Paragraph('MEDIUM')] }),
+                new TableCell({ width: { size: 1802, type: WidthType.DXA }, children: [new Paragraph('HIGH')] }),
+              ] }),
+              new TableRow({ children: [new TableCell({ width: { size: 1802, type: WidthType.DXA }, columnSpan: 5, shading: { fill: 'CCCCCC' }, children: [new Paragraph({ children: [new TextRun({ text: 'Likelihood', bold: true })], alignment: AlignmentType.CENTER })] })] }),
+            ],
+          }),
+          new Paragraph({
+            text: 'Our Risk rating is based on this calculation: Risk = Likelihood \u00d7 Impact.',
+            spacing: { after: 200, before: 200 },
+          }),
+
+          // Findings summary
+          ...buildIssuesSummaryTable(),
+
+          // Detailed findings
+          new Paragraph({
+            text: `Issues (${data.report_vulns.length})`,
+            heading: HeadingLevel.HEADING_1,
+            pageBreakBefore: true,
+            spacing: { after: 200, before: 200 },
+          }),
+          ...buildParagraphissues(),
+
+          ...buildreportsummary(),
+          ...buildmainauthors(),
+          ...buildmainchangelog(),
+        ],
+      }],
+    });
+
+    const blob = await Packer.toBlob(doc);
+    this.utilsService.downloadWithIntegrity(
+      blob,
+      `${report_info.report_name} ${report_info.report_id} (vulnrepo.com).docx`
+    );
+  }
+
+  getDataSynchronous(file) {
+    return this.http.get('/assets/res/' + file, { responseType: 'text' }).toPromise()
+  }
+
+
+  DownloadHTMLreportv2(res, encrypted, ciphertext, json, report_info) {
+    // download HTML report
+    let blob = new Blob();
+    if (encrypted) {
+      blob = new Blob([res.replace("{'HERE':'REPLACE'};", "'" + ciphertext + "';")], { type: 'text/html' });
+    } else {
+      var jsondata = JSON.stringify(json);
+      blob = new Blob([res.replace("{'HERE':'REPLACE'};", "'" + btoa(encodeURIComponent(jsondata)) + "';")], { type: 'text/html' });
+    }
+
+    const encryptedtext = encrypted ? ' encrypted' : '';
+    this.hidespinner();
+    this.utilsService.downloadWithIntegrity(
+      blob,
+      report_info.report_name + ' ' + report_info.report_id + encryptedtext + ' (vulnrepo.com).html'
+    );
+  }
+
+  encrypt_reportv2(report_info, encrypted, type_dep): void {
+    const dialogRef = this.dialog.open(DialogEncryptReportComponent, {
+      width: '600px',
+      //height: '985px',
+      panelClass: 'encrypt-dialog-panel',
+      backdropClass: 'vr-blur-backdrop',
+      disableClose: true,
+      data: []
+    });
+
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('Encrypt report dialog was closed');
+      if (result) {
+        this.DownloadHTMLv2(report_info, encrypted, type_dep, result);
+      }
+    });
+
+  }
+
+
+  async DownloadHTMLv2(report_info, encrypted, type_dep, encpass): Promise<void> {
+    this.showspinner();
+    const json = {
+      "report_name": report_info.report_name,
+      "report_id": report_info.report_id,
+      "report_createdate": report_info.report_createdate,
+      "report_lastupdate": report_info.report_lastupdate,
+      "report_changelog": this.decryptedReportDataChanged.report_changelog,
+      "researcher": this.decryptedReportDataChanged.researcher,
+      "report_vulns": this.decryptedReportDataChanged.report_vulns,
+      "report_version": this.decryptedReportDataChanged.report_version,
+      "report_summary": this.decryptedReportDataChanged.report_summary,
+      "report_metadata": this.decryptedReportDataChanged.report_metadata,
+      "report_scope": this.decryptedReportDataChanged.report_scope,
+      "report_settings": this.decryptedReportDataChanged.report_settings,
+      "report_encrypted_t": true
+    };
+
+    const report_dep_css_obj = [
+      { "filename": "bootstrap/5.2.3/css/bootstrap.rtl.min.css", "integrity": "sha512-tC3gnye8BsHmrW3eRP3Nrj/bs+CSVUfzkjOlfLNrfvcbKXFxk5+b8dQCZi9rgVFjDudwipXfqEhsKMMgRZGCDw==" },
+      { "filename": "bootstrap-icons/1.10.3/font/bootstrap-icons.min.css", "integrity": "sha512-YFENbnqHbCRmJt5d+9lHimyEMt8LKSNTMLSaHjvsclnZGICeY/0KYEeiHwD1Ux4Tcao0h60tdcMv+0GljvWyHg==" }
+    ];
+
+    const report_dep_js_obj = [
+      { "filename": "jquery/3.6.3/jquery.min.js", "integrity": "sha512-STof4xm1wgkfm7heWqFJVn58Hm3EtS31XFaagaa8VMReCXAkQnJZ+jEy8PCC/iT18dFy95WcExNHFTqLyp72eQ==" },
+      { "filename": "crypto-js/4.1.1/crypto-js.min.js", "integrity": "sha512-E8QSvWZ0eCLGk4km3hxSsNmGWbLtSCSUcewDQPQWZF6pEU8GlT8a5fF32wOl1i8ftdMhssTrF/OhyGWwonTcXA==" },
+      { "filename": "bootstrap/5.2.3/js/bootstrap.bundle.min.js", "integrity": "sha512-i9cEfJwUwViEPFKdC1enz4ZRGBj8YQo6QByFTF92YXHi7waCqyexvRD75S5NVTsSiTv7rKWqG9Y5eFxmRsOn0A==" },
+      { "filename": "marked/15.0.0/marked.min.js", "integrity": "sha512-/tpw1ej/DTEJDoX8qZM1YY8H9bz2+2T9nhojBmizu9JDVNvjXvgA3zfRjVF96V3bwK6Uf3eIqrYKIKRZx203iA==" },
+      { "filename": "dompurify/3.4.7/purify.min.js", "integrity": "sha512-ARJaoWDaMaVH3/ChkgWAZPzN/V74aBQ9O0NYMsRmoYYqNLJ+uaq013+OnaQaYNvmlHGxrNbq/KL8U04A97A0cQ==" },
+      { "filename": "Chart.js/4.4.0/chart.umd.js", "integrity": "sha512-6HrPqAvK+lZElIZ4mZ64fyxIBTsaX5zAFZg2V/2WT+iKPrFzTzvx6QAsLW2OaLwobhMYBog/+bvmIEEGXi0p1w==" },
+      { "filename": "highlight.js/11.10.0/highlight.min.js", "integrity": "sha512-6yoqbrcLAHDWAdQmiRlHG4+m0g/CT/V9AGyxabG8j7Jk8j3r3K6due7oqpiRMZqcYe9WM2gPcaNNxnl2ux+3tA==" },
+      { "filename": "marked-highlight/2.2.1/index.umd.min.js", "integrity": "sha512-T5TNAGHd65imlc6xoRDq9hARHowETqOlOGMJ443E+PohphJHbzPpwQNBtcpmcjmHmQKLctZ/W3H2cY/T8EGDPA==" }
+
+    ];
+    let ciphertext = "";
+    const plaintext = JSON.stringify(json);
+    if (encpass === 'userepokey') {
+      const repoKey = await this.requireKey(report_info.report_id);
+      if (!repoKey) {
+        this.snackBar.open('Security key required to export encrypted report.', 'OK', {
+          duration: 4000,
+          panelClass: ['notify-snackbar-fail']
+        });
+        return;
+      }
+      ciphertext = await this.cryptoUtils.encrypt(plaintext, repoKey);
+    } else {
+      ciphertext = await this.cryptoUtils.encrypt(plaintext, encpass);
+    }
+
+
+    this.http.get('/assets/html_report_v3_template.html?v=' + new Date(), { responseType: 'text' }).subscribe(res => {
+
+      if (this.decryptedReportDataChanged.report_settings.report_css !== '') {
+        res = res.replace("/*[CSS_Injection_here]*/", DOMPurify.sanitize(this.decryptedReportDataChanged.report_settings.report_css))
+      }
+
+
+      // FULL REPORT DEP included
+      let css_String = "";
+      let js_String = "";
+
+      of("bootstrap/5.2.3/css/bootstrap.rtl.min.css", "bootstrap-icons/1.10.3/font/bootstrap-icons.min.css")
+        .pipe(
+          concatMap(ind => {
+            let obs1 = this.http.get('/assets/res/' + ind, { responseType: 'text' })
+            return obs1
+          })
+        ).subscribe(data => {
+          css_String = css_String + `<style>
+`+ data + `
+</style>`;
+
+        }).add(() => {
+          //console.log('Finally callback');
+
+            this.http.get('/assets/res/fonts/fonts-inline.css', { responseType: 'text' }).subscribe(fontsCSS => {
+              css_String = `<style>\n` + fontsCSS + `\n</style>\n` + css_String;
+              res = res.replace("<depstyle></depstyle>", css_String);
+              css_String = "";
+
+              of("jquery/3.6.3/jquery.min.js", "crypto-js/4.1.1/crypto-js.min.js", "bootstrap/5.2.3/js/bootstrap.bundle.min.js", "marked/15.0.0/marked.min.js", "dompurify/3.4.7/purify.min.js", "chart-js/4.4.0/chart.js", "highlight.js/11.10.0/highlight.min.js", "marked-highlight/2.2.1/index.umd.min.js")
+                .pipe(
+                  concatMap(ind => {
+                    let obs1 = this.http.get('/assets/res/' + ind, { responseType: 'text' })
+                    return obs1
+                  })
+                ).subscribe(data2 => {
+                  js_String = js_String + `<script>
+            ` + data2 + `
+            </script>`;
+
+                }).add(() => {
+                  res = res.replace("<depscripts></depscripts>", js_String);
+                  js_String = "";
+                  this.DownloadHTMLreportv2(res, encrypted, ciphertext, json, report_info);
+                });
+
+            }); // end fontsCSS subscrib
+
+
+        });
+
+
+
+    });
+  }
+
+  checksumfile(dataurl, file, dec_data) {
+    let file_sha2 = '';
+    // sha256 file checksum
+    const reader = new FileReader();
+    reader.onloadend = (e) => {
+      file_sha2 = sha256(reader.result || '');
+
+      this.proccessUpload(dataurl, file.name, file.type, file.size, file_sha2, dec_data);
+    };
+    reader.readAsArrayBuffer(file);
+
+  }
+
+  proccessUpload(data, name, type, size, sha256check, dec_data) {
+
+    const index: number = this.decryptedReportDataChanged.report_vulns.indexOf(dec_data);
+    const today: number = Date.now();
+
+    this.upload_in_progress = false;
+    const linkprev = data;
+    // tslint:disable-next-line:max-line-length
+    this.decryptedReportDataChanged.report_vulns[index].files.push({ 'data': linkprev, 'title': DOMPurify.sanitize(name), 'type': DOMPurify.sanitize(type), 'size': size, 'sha256checksum': sha256check, 'date': today });
+    this.afterDetectionNow();
+
+  }
+
+  uploadAttach(input: HTMLInputElement, dec_data) {
+
+    const files = input.files;
+    if (files && files.length) {
+      this.upload_in_progress = true;
+      for (let i = 0; i < files.length; i++) {
+        const fileReader = new FileReader();
+        fileReader.onload = (e) => {
+          this.checksumfile(fileReader.result, files[i], dec_data);
+        };
+        fileReader.readAsDataURL(files[i]);
+      }
+    }
+
+  }
+
+  downloadAttach(data, name) {
+
+    // convert base64 to raw binary data held in a string
+    // doesn't handle URLEncoded DataURIs - see SO answer #6850276 for code that does this
+    const byteString = atob(data.split(',')[1]);
+
+    // separate out the mime component
+    const mimeString = data.split(',')[0].split(':')[1].split(';')[0];
+
+    // write the bytes of the string to an ArrayBuffer
+    const ab = new ArrayBuffer(byteString.length);
+
+    // create a view into the buffer
+    const ia = new Uint8Array(ab);
+
+    // set the bytes of the buffer to the correct values
+    for (let i = 0; i < byteString.length; i++) {
+      ia[i] = byteString.charCodeAt(i);
+    }
+
+    // write the ArrayBuffer to a blob, and you're done
+    const blob = new Blob([ab], { type: mimeString });
+
+    const fileName = name;
+    const link = document.createElement('a');
+    const url = window.URL.createObjectURL(blob);
+    link.setAttribute('href', url);
+    link.setAttribute('download', fileName);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+
+  }
+
+
+  removeAttach(data, dec_data) {
+    const index: number = this.decryptedReportDataChanged.report_vulns.indexOf(dec_data);
+    const ind: number = this.decryptedReportDataChanged.report_vulns[index].files.indexOf(data);
+    if (ind !== -1) {
+      this.decryptedReportDataChanged.report_vulns[index].files.splice(ind, 1);
+      this.afterDetectionNow();
+    }
+  }
+
+
+  parselogo(data, name, type) {
+    const linkprev = 'data:image/png;base64,' + btoa(data);
+    this.uploadlogoprev = linkprev;
+    this.advlogo = linkprev;
+    this.decryptedReportDataChanged.report_settings.report_logo.logo = this.advlogo;
+    this.decryptedReportDataChanged.report_settings.report_logo.logo_name = DOMPurify.sanitize(name);
+    this.decryptedReportDataChanged.report_settings.report_logo.logo_type = DOMPurify.sanitize(type);
+  }
+
+  clearlogo() {
+    this.decryptedReportDataChanged.report_settings.report_logo.logo = '';
+    this.decryptedReportDataChanged.report_settings.report_logo.logo_name = '';
+    this.decryptedReportDataChanged.report_settings.report_logo.logo_type = '';
+    this.uploadlogoprev = '';
+    this.advlogo = '';
+    this.advlogo_saved = '';
+    console.log('Logo cleared!');
+  }
+
+  importlogo(input: HTMLInputElement) {
+
+    const files = input.files;
+    if (files && files.length) {
+      /*
+       console.log("Filename: " + files[0].name);
+       console.log("Type: " + files[0].type);
+       console.log("Size: " + files[0].size + " bytes");
+       */
+      const fileToRead = files[0];
+      const fileReader = new FileReader();
+      fileReader.onload = (e) => {
+        this.parselogo(fileReader.result, files[0].name, files[0].type);
+
+      };
+      fileReader.readAsBinaryString(fileToRead);
+    }
+
+  }
+
+
+  tagColor(name: string): number {
+    let h = 0;
+    for (let i = 0; i < name.length; i++) {
+      h = (h * 31 + name.charCodeAt(i)) >>> 0;
+    }
+    return h % 8;
+  }
+
+  toggleIssueTagToken(tag: string) {
+    this.issueFilterQuery = this.issueFilterService.toggleFieldToken(
+      this.issueFilterQuery, 'tag', tag,
+    );
+    this.applyIssueFilter();
+  }
+
+  isIssueTagActive(tag: string): boolean {
+    return this.issueFilterService.hasFieldToken(this.issueFilterQuery, 'tag', tag);
+  }
+
+  TAGadd(event: MatChipInputEvent, dec_data): void {
+
+    const value = (event.value || '').trim();
+
+    if (value) {
+      const index: number = this.decryptedReportDataChanged.report_vulns.indexOf(dec_data);
+      this.decryptedReportDataChanged.report_vulns[index].tags.push({ name: value });
+    }
+
+    // Reset the input value
+    if (event.input) {
+      event.input.value = '';
+    }
+
+  }
+
+  TAGremove(tag: Tags, dec_data): void {
+
+    const index: number = this.decryptedReportDataChanged.report_vulns.indexOf(dec_data);
+    const ind: number = this.decryptedReportDataChanged.report_vulns[index].tags.indexOf(tag);
+    if (ind !== -1) {
+      this.decryptedReportDataChanged.report_vulns[index].tags.splice(ind, 1);
+    }
+
+  }
+
+  setReportProfile(profile: any) {
+
+    this.uploadlogoprev = profile.logo;
+    this.advlogo = profile.logo;
+    this.advlogo_saved = '';
+
+    this.selectedtheme = profile.theme;
+
+    // make changes
+    this.decryptedReportDataChanged.researcher = [{ reportername: profile.ResName, reportersocial: profile.ResSocial, reporterwww: profile.ResWeb, reporteremail: profile.ResEmail }];
+    this.decryptedReportDataChanged.report_settings.report_logo.logo = profile.logo;
+    this.decryptedReportDataChanged.report_settings.report_logo.width = profile.logow;
+    this.decryptedReportDataChanged.report_settings.report_logo.height = profile.logoh;
+
+    this.decryptedReportDataChanged.report_settings.report_theme = profile.theme;
+
+    this.decryptedReportDataChanged.report_settings.report_css = profile.report_css;
+    this.decryptedReportDataChanged.report_settings.report_html = profile.report_custom_content;
+    this.decryptedReportDataChanged.report_settings.report_video_embed = profile.video_embed;
+    this.decryptedReportDataChanged.report_settings.report_remove_lastpage = profile.remove_lastpage;
+    this.decryptedReportDataChanged.report_settings.report_remove_issuestatus = profile.remove_issueStatus;
+    this.decryptedReportDataChanged.report_settings.report_remove_issuecvss = profile.remove_issuecvss;
+    this.decryptedReportDataChanged.report_settings.report_remove_issuecve = profile.remove_issuecve;
+    this.decryptedReportDataChanged.report_settings.report_remove_researchers = profile.remove_researcher;
+    this.decryptedReportDataChanged.report_settings.report_changelog_page = profile.remove_changelog;
+    this.decryptedReportDataChanged.report_settings.report_remove_issuetags = profile.remove_tags;
+    this.decryptedReportDataChanged.report_settings.report_parsing_desc = profile.report_parsing_desc;
+    this.decryptedReportDataChanged.report_settings.report_parsing_poc_markdown = profile.report_parsing_poc_markdown;
+    this.decryptedReportDataChanged.report_settings.report_remove_attach_name = profile.report_remove_attach_name;
+  }
+
+  savenewReportProfile() {
+
+    const time = new Date().toLocaleDateString(this.setLocal);
+    const profile = {
+      profile_name: time,
+      logo: this.decryptedReportDataChanged.report_settings.report_logo.logo,
+      logow: this.decryptedReportDataChanged.report_settings.report_logo.width,
+      logoh: this.decryptedReportDataChanged.report_settings.report_logo.height,
+      report_parsing_desc: this.decryptedReportDataChanged.report_settings.report_parsing_desc,
+      report_parsing_poc_markdown: this.decryptedReportDataChanged.report_settings.report_parsing_poc_markdown,
+      report_remove_attach_name: this.decryptedReportDataChanged.report_settings.report_remove_attach_name,
+      video_embed: this.decryptedReportDataChanged.report_settings.report_video_embed,
+      remove_lastpage: this.decryptedReportDataChanged.report_settings.report_remove_lastpage,
+      remove_issueStatus: this.decryptedReportDataChanged.report_settings.report_remove_issuestatus,
+      remove_issuecvss: this.decryptedReportDataChanged.report_settings.report_remove_issuecvss,
+      remove_issuecve: this.decryptedReportDataChanged.report_settings.report_remove_issuecve,
+      remove_researcher: this.decryptedReportDataChanged.report_settings.report_remove_researchers,
+      remove_changelog: this.decryptedReportDataChanged.report_settings.report_changelog_page,
+      remove_tags: this.decryptedReportDataChanged.report_settings.report_remove_issuetags,
+      ResName: this.decryptedReportDataChanged.researcher[0].reportername,
+      ResEmail: this.decryptedReportDataChanged.researcher[0].reporteremail,
+      ResSocial: this.decryptedReportDataChanged.researcher[0].reportersocial,
+      ResWeb: this.decryptedReportDataChanged.researcher[0].reporterwww
+    };
+    this.ReportProfilesList = this.ReportProfilesList.concat(profile);
+    this.indexeddbService.saveReportProfileinDB(profile).then(ret => { });
+    this.getReportProfiles();
+  }
+
+  searchBounty(poc) {
+    this.fastsearchBB(poc, true);
+  }
+
+  fastsearchBB(poc, showsnack) {
+    this.BBmsg = 'Please wait, searching...';
+    let scope = [];
+    this.bugbountylist.forEach(function (item: any) {
+      scope = scope.concat(item.domains);
+    });
+
+    const regex = /(?:[\w-]+\.)+[\w-]+/g;
+    let m;
+    const arr: any[] = [];
+    while ((m = regex.exec(poc.poc)) !== null) {
+      // This is necessary to avoid infinite loops with zero-width matches
+      if (m.index === regex.lastIndex) {
+        regex.lastIndex++;
+      }
+
+      m.forEach((match) => {
+        // get only scope & search
+        const findedbounty = scope.find(x => x == match);
+        if (findedbounty) {
+          this.bugbountylist.forEach(function (item: any) {
+            const findedbounty2 = item.domains.find(x => x == findedbounty);
+            if (findedbounty2) {
+              arr.push(item);
+            }
+          });
+
+        }
+      });
+    }
+
+    if (showsnack !== false) {
+      if (arr.length == 0) {
+        this.snackBar.open('No bug-bounty program found :-( !', 'OK', {
+          duration: 2000,
+          panelClass: ['notify-snackbar-fail']
+        });
+      } else {
+        this.snackBar.open('Found bug-bounty program !!! :-)', 'OK', {
+          duration: 2000,
+          panelClass: ['notify-snackbar-success']
+        });
+      }
+    }
+
+    const uniqueArray = arr.filter(function (item, pos) {
+      return arr.indexOf(item) == pos;
+    });
+
+    const index: number = this.decryptedReportDataChanged.report_vulns.indexOf(poc);
+    this.decryptedReportDataChanged.report_vulns[index].bounty = [];
+    this.decryptedReportDataChanged.report_vulns[index].bounty = this.decryptedReportDataChanged.report_vulns[index].bounty.concat(uniqueArray);
+
+    this.decryptedReportDataChanged.report_vulns[index].bounty = arr.filter(function (item, pos) {
+      return arr.indexOf(item) == pos;
+    });
+
+    this.BBmsg = '';
+
+
+  }
+
+  redirectBounty(url) {
+    window.open(url, "_blank");
+  }
+
+  changePoC(poc) {
+    this.fastsearchBB(poc, false);
+  }
+
+  editorFullscreenPoC(dec_data): void {
+
+    const index: number = this.decryptedReportDataChanged.report_vulns.indexOf(dec_data);
+
+    const dialogRef = this.dialog.open(DialogEditorFullscreenComponent, {
+      maxWidth: '100vw',
+      maxHeight: '100vh',
+      height: '100%',
+      width: '100%',
+      disableClose: false,
+      data: this.decryptedReportDataChanged.report_vulns[index].poc
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The Editor-fullscreen dialog was closed');
+      if (result || result == '') {
+        this.decryptedReportDataChanged.report_vulns[index].poc = result;
+      }
+    });
+
+  }
+
+  editorFullscreenScope(): void {
+
+    const dialogRef = this.dialog.open(DialogEditorFullscreenComponent, {
+      maxWidth: '100vw',
+      maxHeight: '100vh',
+      height: '100%',
+      width: '100%',
+      disableClose: false,
+      data: this.decryptedReportDataChanged.report_scope
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The Editor-fullscreen dialog was closed');
+      if (result) {
+        this.decryptedReportDataChanged.report_scope = result;
+      }
+    });
+
+  }
+
+  saveTemplate(dec_data): void {
+
+    const dialogRef = this.dialog.open(DialogAddCustomTemplateComponent, {
+      width: '600px',
+      disableClose: false,
+      data: [{
+        "title": dec_data.title,
+        "poc": "",
+        "desc": dec_data.desc,
+        "severity": dec_data.severity,
+        "ref": dec_data.ref,
+        "cvss": dec_data.cvss,
+        "cvss_vector": dec_data.cvss_vector,
+        "cve": dec_data.cve,
+        "tags": dec_data.tags,
+      }]
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The add custom template dialog was closed');
+
+      if (result) {
+        this.indexeddbService.saveReportTemplateinDB({ "title": result[0].title, "poc": "", "desc": result[0].desc, "severity": result[0].severity, "ref": result[0].ref, "cvss": result[0].cvss, "cvss_vector": result[0].cvss_vector, "cve": result[0].cve, "tags": result[0].tags });
+      }
+
+    });
+
+  }
+
+
+  openattachfullscreen(file, dec_data) {
+
+    const arr: any[] = [];
+    for (let item of dec_data.files) {
+      if (item.type.includes('image') || item.type.includes('video') && item.data.length <= 30000000) {
+        arr.push(item);
+      }
+    }
+
+
+    const dialogRef = this.dialog.open(DialogAttachPreviewComponent, {
+      maxWidth: '100vw',
+      maxHeight: '100vh',
+      height: '100%',
+      width: '100%',
+      disableClose: false,
+      data: [file, arr, dec_data]
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The Attach-Preview dialog was closed');
+      if (result) {
+
+        const index: number = this.decryptedReportDataChanged.report_vulns.indexOf(result[2]);
+        for (let file of result[1]) {
+          const ind: number = this.decryptedReportDataChanged.report_vulns[index].files.indexOf(file);
+          if (ind !== -1) {
+            this.decryptedReportDataChanged.report_vulns[index].files.splice(ind, 1);
+            this.afterDetectionNow();
+          }
+        }
+
+      }
+    });
+
+
+  }
+
+
+  aiasist() {
+    console.log('AI start chat');
+    this.aiprogress = true;
+
+    const json = {
+      "report_name": this.report_info.report_name,
+      "report_id": this.report_info.report_id,
+      "report_createdate": this.report_info.report_createdate,
+      "report_lastupdate": this.report_info.report_lastupdate,
+      //"report_changelog": this.decryptedReportDataChanged.report_changelog,
+      "researcher": this.decryptedReportDataChanged.researcher,
+      "report_vulns": this.decryptedReportDataChanged.report_vulns,
+      "report_version": this.decryptedReportDataChanged.report_version,
+      "report_summary": this.decryptedReportDataChanged.report_summary,
+      "report_metadata": this.decryptedReportDataChanged.report_metadata,
+      "report_scope": this.decryptedReportDataChanged.report_scope
+      //"report_settings": this.decryptedReportDataChanged.report_settings
+    };
+
+    const msgin = `I have attached a JSON report file, don't mention that file, which contains a list of vulnerabilities, can you prepare a report summary for a company as a document, with issue is most important and fix recommendation for board of company ?, mention scope if provided on JSON key "report_scope", mention researcher if provided on JSON key "researcher".
+    
+    <ATTACHMENT_FILE>
+    <FILE_INDEX>File 1</FILE_INDEX>
+    <FILE_NAME>`+ this.report_info.report_name + `</FILE_NAME>
+    <FILE_CONTENT>
+    `+ JSON.stringify(json) + `
+    </FILE_CONTENT>
+    </ATTACHMENT_FILE>
+    `;
+
+    this.decryptedReportDataChanged.report_summary = "";
+
+    let tempx = "";
+    this.ollamaService.chatStream(this.models.ollama_url, msgin, this.models.model, [], [], this.models.defaultprompt).subscribe({
+      next: (text) => {
+        this.decryptedReportDataChanged.report_summary += text;
+        tempx += text;
+      },
+      complete: () => {
+        console.log('AI end chat');
+
+        if (tempx.includes("<think>")) {
+          const words = tempx.split("</think>");
+          this.decryptedReportDataChanged.report_summary = words[1];
+        } else {
+          this.decryptedReportDataChanged.report_summary = tempx;
+        }
+
+        this.aiprogress = false;
+      },
+      error: () => {
+
+      }
+    });
+
+
+  }
+
+  goaisettings() {
+
+    const dialogRef = this.dialog.open(DialogOllamaSettingsComponent, {
+      width: '600px',
+      panelClass: 'ollama-settings-dialog-panel',
+      backdropClass: 'vr-blur-backdrop',
+      disableClose: false,
+      data: []
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The AI-Settings dialog was closed');
+      if (result) {
+
+        this.indexeddbService.getkeybyAiintegration().then(ret => {
+
+          if (ret[0]) {
+            this.models = ret[0];
+          }
+        });
+
+      }
+    });
+
+  }
+
+  goAIsummary(): void {
+
+    const res: any = {
+      "report_name": this.report_info.report_name,
+      "report_id": this.report_info.report_id,
+      "report_createdate": this.report_info.report_createdate,
+      "report_lastupdate": this.report_info.report_lastupdate,
+      //"report_changelog": this.decryptedReportDataChanged.report_changelog,
+      "researcher": this.decryptedReportDataChanged.researcher,
+      "report_vulns": this.decryptedReportDataChanged.report_vulns,
+      "report_version": this.decryptedReportDataChanged.report_version,
+      "report_summary": this.decryptedReportDataChanged.report_summary,
+      "report_metadata": this.decryptedReportDataChanged.report_metadata,
+      "report_scope": this.decryptedReportDataChanged.report_scope
+      //"report_settings": this.decryptedReportDataChanged.report_settings
+    };
+
+    const xxx = JSON.stringify(res);
+
+    const dialogRef = this.dialog.open(DialogOllamaComponent, {
+      width: '1040px',
+      maxWidth: '90vw',
+      panelClass: 'ollama-dialog-panel',
+      backdropClass: 'vr-blur-backdrop',
+      disableClose: true,
+      data: [{ "prompt": ``, "files": [{ "filename": this.report_info.report_name + ".json", "date": String(this.currentdateService.getcurrentDate()), "filetype": "json", "file": btoa(unescape(encodeURIComponent(xxx))) }], "images": [] }]
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The AI dialog was closed');
+    });
+
+  }
+
+  hidespinner(): void {
+    this.spinner?.close();
+    this.spinner = undefined;
+  }
+  showspinner(): void {
+
+    this.spinner = this.dialog.open(DialogSpinnerComponent, {
+      maxWidth: '250px',
+      maxHeight: '250px',
+      height: '250px',
+      width: '250px',
+      disableClose: false,
+      panelClass: 'my-css-class-spinner',
+      backdropClass: 'vr-spinner-backdrop',
+      data: ''
+    });
+
+  }
+
+
+  showHistory(report_id): void {
+
+    const dialogRef = this.dialog.open(DialogReportHistoryComponent, {
+      width: '600px',
+      maxHeight: '80vh',
+      panelClass: 'history-dialog-panel',
+      backdropClass: 'vr-blur-backdrop',
+      disableClose: false,
+      data: report_id
+    });
+
+    dialogRef.afterClosed().subscribe(result => {
+      console.log('The report history dialog was closed');
+    });
+
+  }
+
+
+}

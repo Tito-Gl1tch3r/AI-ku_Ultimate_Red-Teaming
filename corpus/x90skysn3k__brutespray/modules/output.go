@@ -1,0 +1,1085 @@
+package modules
+
+import (
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"sync/atomic"
+
+	"github.com/pterm/pterm"
+)
+
+// NoColorMode controls whether colored output is disabled
+var NoColorMode bool
+
+// Silent controls whether to suppress per-attempt logs (successes still printed)
+var Silent bool
+
+// TUIMode suppresses all console output when the interactive TUI is active.
+// File writes (success logs, reports) still happen.
+var TUIMode bool
+
+var debugAuditMu sync.Mutex
+var debugAuditFile *os.File
+var debugAuditEncoder *json.Encoder
+
+// ConfigureDebugAudit enables or disables the redacted per-attempt debug audit log.
+func ConfigureDebugAudit(enabled bool, path string) error {
+	debugAuditMu.Lock()
+	defer debugAuditMu.Unlock()
+	if debugAuditFile != nil {
+		_ = debugAuditFile.Close()
+		debugAuditFile = nil
+		debugAuditEncoder = nil
+	}
+	if !enabled {
+		return nil
+	}
+	if path == "" {
+		path = "brutespray-debug.jsonl"
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("opening debug audit log: %w", err)
+	}
+	debugAuditFile = file
+	debugAuditEncoder = json.NewEncoder(file)
+	debugAuditEncoder.SetEscapeHTML(false)
+	return nil
+}
+
+// CloseDebugAudit flushes and closes the redacted debug audit log.
+func CloseDebugAudit() error {
+	debugAuditMu.Lock()
+	defer debugAuditMu.Unlock()
+	if debugAuditFile == nil {
+		return nil
+	}
+	err := debugAuditFile.Close()
+	debugAuditFile = nil
+	debugAuditEncoder = nil
+	return err
+}
+
+// WriteDebugAttempt writes one redacted attempt diagnostic record when audit logging is enabled.
+func redactDebugAuditText(s string, sensitive ...string) string {
+	for _, value := range sensitive {
+		if value == "" {
+			continue
+		}
+		s = strings.ReplaceAll(s, value, "<redacted>")
+	}
+	return s
+}
+
+func WriteDebugAttempt(service string, host string, port int, user string, password string, status string, connected bool, retrying bool, duration time.Duration, err error) {
+	debugAuditMu.Lock()
+	defer debugAuditMu.Unlock()
+	if debugAuditEncoder == nil {
+		return
+	}
+	entry := struct {
+		Timestamp  string `json:"timestamp"`
+		Service    string `json:"service"`
+		Host       string `json:"host"`
+		Port       int    `json:"port"`
+		User       string `json:"user,omitempty"`
+		Password   string `json:"password"`
+		Status     string `json:"status"`
+		Connected  bool   `json:"connected"`
+		Retrying   bool   `json:"retrying,omitempty"`
+		DurationMs int64  `json:"duration_ms"`
+		Error      string `json:"error,omitempty"`
+	}{
+		Timestamp:  time.Now().Format(time.RFC3339),
+		Service:    service,
+		Host:       host,
+		Port:       port,
+		User:       user,
+		Password:   "<redacted>",
+		Status:     status,
+		Connected:  connected,
+		Retrying:   retrying,
+		DurationMs: duration.Milliseconds(),
+	}
+	if err != nil {
+		entry.Error = redactDebugAuditText(err.Error(), user, password)
+	}
+	_ = debugAuditEncoder.Encode(entry)
+}
+
+// ErrorSink routes error messages to the TUI when in TUI mode.
+// Set by brutespray.executeTUI() to eventBus.SendError.
+var ErrorSink func(string)
+
+// TUIError formats and routes an error message. In TUI mode it sends
+// through ErrorSink; otherwise it prints to stderr.
+func TUIError(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if TUIMode && ErrorSink != nil {
+		ErrorSink(msg)
+		return
+	}
+	_, _ = fmt.Fprint(os.Stderr, msg)
+}
+
+// OutputFormatMode controls the per-attempt output format ("text" or "json")
+var OutputFormatMode = "text"
+
+// LogEvery controls attempt logging frequency; 1 = log every attempt
+var LogEvery int64 = 1
+var attemptCounter int64
+
+// SuccessResult represents a successful credential attempt
+type SuccessResult struct {
+	Service  string    `json:"service"`
+	Host     string    `json:"host"`
+	Port     int       `json:"port"`
+	User     string    `json:"user"`
+	Password string    `json:"password"`
+	Time     time.Time `json:"time"`
+	Duration string    `json:"duration"`
+	Banner   string    `json:"banner,omitempty"`
+}
+
+// OutputStats tracks comprehensive statistics for the bruteforce session
+type OutputStats struct {
+	StartTime            time.Time       `json:"start_time"`
+	EndTime              time.Time       `json:"end_time"`
+	TotalAttempts        int64           `json:"total_attempts"`
+	SuccessfulAttempts   int64           `json:"successful_attempts"`
+	FailedAttempts       int64           `json:"failed_attempts"`
+	ConnectionErrors     int64           `json:"connection_errors"`
+	AuthenticationErrors int64           `json:"authentication_errors"`
+	SuccessRate          float64         `json:"success_rate"`
+	AttemptsPerSecond    float64         `json:"attempts_per_second"`
+	AverageResponseTime  time.Duration   `json:"average_response_time"`
+	PeakConcurrency      int             `json:"peak_concurrency"`
+	TotalHosts           int             `json:"total_hosts"`
+	TotalServices        int             `json:"total_services"`
+	SuccessfulResults    []SuccessResult `json:"successful_results"`
+	ServiceBreakdown     map[string]int  `json:"service_breakdown"`
+	HostBreakdown        map[string]int  `json:"host_breakdown"`
+	ConnectionErrorHosts map[string]int  `json:"connection_error_hosts"`
+	mutex                sync.RWMutex
+}
+
+// OutputStatsCopy is a copy of OutputStats without the mutex for safe copying
+type OutputStatsCopy struct {
+	StartTime            time.Time       `json:"start_time"`
+	EndTime              time.Time       `json:"end_time"`
+	TotalAttempts        int64           `json:"total_attempts"`
+	SuccessfulAttempts   int64           `json:"successful_attempts"`
+	FailedAttempts       int64           `json:"failed_attempts"`
+	ConnectionErrors     int64           `json:"connection_errors"`
+	AuthenticationErrors int64           `json:"authentication_errors"`
+	SuccessRate          float64         `json:"success_rate"`
+	AttemptsPerSecond    float64         `json:"attempts_per_second"`
+	AverageResponseTime  time.Duration   `json:"average_response_time"`
+	PeakConcurrency      int             `json:"peak_concurrency"`
+	TotalHosts           int             `json:"total_hosts"`
+	TotalServices        int             `json:"total_services"`
+	SuccessfulResults    []SuccessResult `json:"successful_results"`
+	ServiceBreakdown     map[string]int  `json:"service_breakdown"`
+	HostBreakdown        map[string]int  `json:"host_breakdown"`
+	ConnectionErrorHosts map[string]int  `json:"connection_error_hosts"`
+}
+
+var globalStats = &OutputStats{
+	StartTime:            time.Now(),
+	SuccessfulResults:    make([]SuccessResult, 0),
+	ServiceBreakdown:     make(map[string]int),
+	HostBreakdown:        make(map[string]int),
+	ConnectionErrorHosts: make(map[string]int),
+}
+
+// OutputMu serializes all terminal writes so the progress bar and result
+// messages don't interleave and produce visual artifacts.
+var OutputMu sync.Mutex
+
+// PrintlnColored prints a colored message with newline
+func PrintlnColored(color pterm.Color, msg string) {
+	if TUIMode {
+		return
+	}
+	OutputMu.Lock()
+	defer OutputMu.Unlock()
+	if NoColorMode {
+		fmt.Println(msg)
+	} else {
+		pterm.Println(pterm.NewStyle(color).Sprint(msg))
+	}
+}
+
+// PrintfColored prints a formatted colored message
+func PrintfColored(color pterm.Color, format string, args ...interface{}) {
+	if TUIMode {
+		return
+	}
+	msg := fmt.Sprintf(format, args...)
+	OutputMu.Lock()
+	defer OutputMu.Unlock()
+	if NoColorMode {
+		fmt.Print(msg)
+	} else {
+		pterm.Print(pterm.NewStyle(color).Sprint(msg))
+	}
+}
+
+func getConResultString(con_result bool, retrying bool, delayTime time.Duration) string {
+	var delaying bool
+	if delayTime > 2*time.Second {
+		delaying = true
+	}
+	if !retrying {
+		return "connection failed, giving up..."
+	} else if retrying && delaying {
+		return fmt.Sprintf("connection failed, retrying... delayed %s", delayTime)
+	} else {
+		return "connection failed, retrying..."
+	}
+}
+
+// WriteToFile writes success results to individual service files (legacy format)
+func WriteToFile(service string, content string, port int, output string) error {
+	dir := output
+
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+	}
+
+	filename := filepath.Join(dir, fmt.Sprintf("%d-%s-success.txt", port, service))
+	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	_, err = file.WriteString(content)
+	if err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+// RecordSuccess records a successful credential attempt
+func RecordSuccess(service string, host string, port int, user string, password string, duration time.Duration, banner ...string) {
+	globalStats.mutex.Lock()
+	defer globalStats.mutex.Unlock()
+
+	result := SuccessResult{
+		Service:  service,
+		Host:     host,
+		Port:     port,
+		User:     user,
+		Password: password,
+		Time:     time.Now(),
+		Duration: duration.String(),
+	}
+	if len(banner) > 0 && banner[0] != "" {
+		result.Banner = banner[0]
+	}
+
+	globalStats.SuccessfulResults = append(globalStats.SuccessfulResults, result)
+	globalStats.SuccessfulAttempts++
+	globalStats.ServiceBreakdown[service]++
+	globalStats.HostBreakdown[host]++
+}
+
+// RecordAttempt records any attempt (success or failure)
+func RecordAttempt(success bool) {
+	globalStats.mutex.Lock()
+	defer globalStats.mutex.Unlock()
+
+	globalStats.TotalAttempts++
+	if !success {
+		globalStats.FailedAttempts++
+	}
+}
+
+// RecordError records connection or authentication errors
+func RecordError(isConnectionError bool) {
+	globalStats.mutex.Lock()
+	defer globalStats.mutex.Unlock()
+
+	if isConnectionError {
+		globalStats.ConnectionErrors++
+	} else {
+		globalStats.AuthenticationErrors++
+	}
+}
+
+// RecordConnectionError records a connection error for a specific host
+func RecordConnectionError(host string) {
+	globalStats.mutex.Lock()
+	defer globalStats.mutex.Unlock()
+
+	globalStats.ConnectionErrors++
+	globalStats.ConnectionErrorHosts[host]++
+}
+
+// UpdateConcurrency updates concurrency metrics
+func UpdateConcurrency(current int) {
+	globalStats.mutex.Lock()
+	defer globalStats.mutex.Unlock()
+
+	if current > globalStats.PeakConcurrency {
+		globalStats.PeakConcurrency = current
+	}
+}
+
+// SetTotalHostsAndServices sets the total counts for hosts and services
+func SetTotalHostsAndServices(hosts int, services int) {
+	globalStats.mutex.Lock()
+	defer globalStats.mutex.Unlock()
+
+	globalStats.TotalHosts = hosts
+	globalStats.TotalServices = services
+}
+
+// GetStats returns a copy of current statistics
+func GetStats() OutputStatsCopy {
+	globalStats.mutex.RLock()
+	defer globalStats.mutex.RUnlock()
+
+	// Create a new struct without the mutex to avoid copy locks
+	stats := OutputStatsCopy{
+		StartTime:            globalStats.StartTime,
+		EndTime:              globalStats.EndTime,
+		TotalAttempts:        globalStats.TotalAttempts,
+		SuccessfulAttempts:   globalStats.SuccessfulAttempts,
+		FailedAttempts:       globalStats.FailedAttempts,
+		ConnectionErrors:     globalStats.ConnectionErrors,
+		AuthenticationErrors: globalStats.AuthenticationErrors,
+		SuccessRate:          globalStats.SuccessRate,
+		AttemptsPerSecond:    globalStats.AttemptsPerSecond,
+		AverageResponseTime:  globalStats.AverageResponseTime,
+		PeakConcurrency:      globalStats.PeakConcurrency,
+		TotalHosts:           globalStats.TotalHosts,
+		TotalServices:        globalStats.TotalServices,
+	}
+
+	// Copy slices and maps
+	stats.SuccessfulResults = make([]SuccessResult, len(globalStats.SuccessfulResults))
+	copy(stats.SuccessfulResults, globalStats.SuccessfulResults)
+
+	stats.ServiceBreakdown = make(map[string]int)
+	for k, v := range globalStats.ServiceBreakdown {
+		stats.ServiceBreakdown[k] = v
+	}
+
+	stats.HostBreakdown = make(map[string]int)
+	for k, v := range globalStats.HostBreakdown {
+		stats.HostBreakdown[k] = v
+	}
+
+	stats.ConnectionErrorHosts = make(map[string]int)
+	for k, v := range globalStats.ConnectionErrorHosts {
+		stats.ConnectionErrorHosts[k] = v
+	}
+
+	return stats
+}
+
+// CalculateFinalStats calculates final statistics
+func CalculateFinalStats() OutputStatsCopy {
+	stats := GetStats()
+	stats.EndTime = time.Now()
+
+	if stats.TotalAttempts > 0 {
+		stats.SuccessRate = float64(stats.SuccessfulAttempts) / float64(stats.TotalAttempts) * 100
+	}
+
+	duration := stats.EndTime.Sub(stats.StartTime).Seconds()
+	if duration > 0 {
+		stats.AttemptsPerSecond = float64(stats.TotalAttempts) / duration
+	}
+
+	return stats
+}
+
+// formatCredentialMsg formats a credential attempt message for display/logging.
+func formatCredentialMsg(service, host string, port int, user, pass, status, banner string) string {
+	var msg string
+	if IsPasswordOnlyService(service) {
+		msg = fmt.Sprintf("[%s] %s:%d - Password '%s' - %s", service, host, port, pass, status)
+	} else {
+		msg = fmt.Sprintf("[%s] %s:%d - User '%s' - Pass '%s' - %s", service, host, port, user, pass, status)
+	}
+	if banner != "" {
+		msg += fmt.Sprintf(" [Banner: %s]", banner)
+	}
+	return msg
+}
+
+// AttemptResult represents a single brute-force attempt for JSON output.
+type AttemptResult struct {
+	Timestamp        string `json:"timestamp"`
+	Service          string `json:"service"`
+	Host             string `json:"host"`
+	Port             int    `json:"port"`
+	User             string `json:"user,omitempty"`
+	Password         string `json:"password,omitempty"`
+	SecretRedacted   bool   `json:"secret_redacted,omitempty"`
+	SecretHMACSHA256 string `json:"secret_hmac_sha256,omitempty"`
+	Success          bool   `json:"success"`
+	Connected        bool   `json:"connected"`
+	Banner           string `json:"banner,omitempty"`
+	Status           string `json:"status"`
+	StatusCode       string `json:"status_code,omitempty"`
+	Confidence       string `json:"confidence,omitempty"`
+	ProofType        string `json:"proof_type,omitempty"`
+	ProofDetail      string `json:"proof_detail,omitempty"`
+}
+
+// PrintResult prints individual results (legacy format for compatibility).
+func PrintResult(service string, host string, port int, user string, pass string, result bool, con_result bool, retrying bool, output string, delayTime time.Duration, banner ...string) {
+	printResult(service, host, port, user, pass, result, con_result, retrying, output, delayTime, "", banner...)
+}
+
+// PrintResultWithStatus prints individual results with a stable machine-readable status code.
+func PrintResultWithStatus(service string, host string, port int, user string, pass string, result bool, con_result bool, retrying bool, output string, delayTime time.Duration, statusCode string, banner ...string) {
+	printResult(service, host, port, user, pass, result, con_result, retrying, output, delayTime, statusCode, banner...)
+}
+
+// PrintResultWithStatusAndProof prints results with status and proof metadata.
+func PrintResultWithStatusAndProof(service string, host string, port int, user string, pass string, result bool, conResult bool, retrying bool, output string, delayTime time.Duration, statusCode string, confidence string, proofType string, proofDetail string, banner ...string) {
+	printResultWithProof(service, host, port, user, pass, result, conResult, retrying, output, delayTime, statusCode, confidence, proofType, proofDetail, banner...)
+}
+
+func printResult(service string, host string, port int, user string, pass string, result bool, con_result bool, retrying bool, output string, delayTime time.Duration, statusCode string, banner ...string) {
+	printResultWithProof(service, host, port, user, pass, result, con_result, retrying, output, delayTime, statusCode, "", "", "", banner...)
+}
+
+func printResultWithProof(service string, host string, port int, user string, pass string, result bool, con_result bool, retrying bool, output string, delayTime time.Duration, statusCode string, confidence string, proofType string, proofDetail string, banner ...string) {
+	var msg string
+	var color pterm.Color
+	bannerStr := ""
+	if len(banner) > 0 {
+		bannerStr = banner[0]
+	}
+
+	var status string
+	switch {
+	case result && con_result:
+		status = "SUCCESS"
+		msg = formatCredentialMsg(service, host, port, user, pass, status, bannerStr)
+		color = pterm.BgGreen
+		content := msg + "\n"
+		if err := WriteToFile(service, content, port, output); err != nil {
+			PrintfColored(pterm.FgRed, "\n[!] WRITE ERROR: could not save credential to file: %v\n", err)
+		}
+	case !result && con_result:
+		status = "FAILED"
+		msg = formatCredentialMsg(service, host, port, user, pass, status, "")
+		color = pterm.FgLightRed
+	case !result && !con_result:
+		status = getConResultString(con_result, retrying, delayTime)
+		msg = formatCredentialMsg(service, host, port, user, pass, status, "")
+		color = pterm.FgRed
+	}
+
+	// Determine if we should print this attempt
+	shouldPrint := !TUIMode
+	if shouldPrint && Silent && (!result || !con_result) {
+		shouldPrint = false
+	}
+	if shouldPrint && !Silent && (!result || !con_result) && LogEvery > 1 {
+		n := atomic.AddInt64(&attemptCounter, 1)
+		if n%LogEvery != 0 {
+			shouldPrint = false
+		}
+	}
+	if shouldPrint {
+		OutputMu.Lock()
+		if OutputFormatMode == "json" {
+			displayPass, secretDigest, secretRedacted := GetEvidenceConfig().RenderSecret(pass)
+			attempt := AttemptResult{
+				Timestamp:        time.Now().Format(time.RFC3339),
+				Service:          service,
+				Host:             host,
+				Port:             port,
+				User:             user,
+				Password:         displayPass,
+				SecretRedacted:   secretRedacted,
+				SecretHMACSHA256: secretDigest,
+				Success:          result,
+				Connected:        con_result,
+				Banner:           bannerStr,
+				Status:           status,
+				StatusCode:       statusCode,
+				Confidence:       confidence,
+				ProofType:        proofType,
+				ProofDetail:      proofDetail,
+			}
+			jsonBytes, err := json.Marshal(attempt)
+			if err == nil {
+				fmt.Println(string(jsonBytes))
+			}
+		} else if NoColorMode {
+			fmt.Println(msg)
+		} else {
+			pterm.Println(pterm.NewStyle(color).Sprint(msg))
+		}
+		OutputMu.Unlock()
+	}
+}
+
+// FindingSink routes a finding line to the TUI when in TUI mode. Set by
+// brutespray.executeTUI() — mirrors ErrorSink.
+// NOTE: FindingSink is declared here but not yet wired to a TUI sink tab —
+// that wiring happens in Task A9 when the TUI Findings tab lands. Until then
+// it remains nil and TUI mode falls back to the standard text path.
+var FindingSink func(severity, code, service, target, message, cve string)
+
+// WriteFinding renders a pre-auth recon finding. The output channel is
+// chosen by OutputFormatMode + TUIMode: JSONL when format=="json", a TUI
+// event when TUIMode is on with FindingSink wired, otherwise a colored
+// stdout line. Primitive args to avoid a modules→brute import cycle.
+func WriteFinding(severity, code, service, host string, port int, message, cve string) {
+	WriteFindingWithProof(severity, code, service, host, port, message, cve, "", "", "")
+}
+
+// WriteFindingWithProof renders a pre-auth recon finding with proof metadata.
+func WriteFindingWithProof(severity, code, service, host string, port int, message, cve string, confidence string, proofType string, proofDetail string) {
+	target := fmt.Sprintf("%s:%d", host, port)
+	if OutputFormatMode == "json" {
+		rec := map[string]any{
+			"type":     "finding",
+			"severity": severity,
+			"code":     code,
+			"service":  service,
+			"target":   target,
+			"message":  message,
+		}
+		if confidence != "" {
+			rec["confidence"] = confidence
+		}
+		if proofType != "" {
+			rec["proof_type"] = proofType
+		}
+		if cve != "" {
+			rec["cve"] = cve
+		}
+		if proofDetail != "" {
+			rec["proof_detail"] = proofDetail
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(rec)
+		return
+	}
+	if TUIMode && FindingSink != nil {
+		FindingSink(severity, code, service, target, message, cve)
+		return
+	}
+	if Silent {
+		return
+	}
+	cveTrailer := ""
+	if cve != "" {
+		cveTrailer = " (" + cve + ")"
+	}
+	if NoColorMode {
+		fmt.Printf("[%s] %s %s %s%s\n", severity, service, target, message, cveTrailer)
+		return
+	}
+	color := pterm.FgYellow
+	switch severity {
+	case "CRITICAL":
+		color = pterm.FgRed
+	case "HIGH":
+		color = pterm.FgLightRed
+	case "WARN":
+		color = pterm.FgYellow
+	case "INFO":
+		color = pterm.FgCyan
+	}
+	PrintfColored(color, "[%s] %s %s %s%s\n", severity, service, target, message, cveTrailer)
+}
+
+// PrintBadKeyResult renders a successful SSH bad-key match. Distinct from
+// PrintResult so the message clearly signals embedded-bundle authentication.
+// In JSON mode produces a JSONL "badkey" record.
+func PrintBadKeyResult(service, host string, port int, user, vendor, cve, description string) {
+	target := fmt.Sprintf("%s:%d", host, port)
+	if OutputFormatMode == "json" {
+		rec := map[string]any{
+			"type":        "badkey",
+			"service":     service,
+			"target":      target,
+			"username":    user,
+			"vendor":      vendor,
+			"description": description,
+		}
+		if cve != "" {
+			rec["cve"] = cve
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(rec)
+		return
+	}
+	if Silent {
+		return
+	}
+	cveTrailer := ""
+	if cve != "" {
+		cveTrailer = " (" + cve + ")"
+	}
+	msg := fmt.Sprintf("[+] BADKEY %s %s@%s %s%s\n", service, user, target, vendor, cveTrailer)
+	if NoColorMode {
+		fmt.Print(msg)
+		return
+	}
+	PrintfColored(pterm.FgLightGreen, "%s", msg)
+}
+
+// PrintWarningBeta prints beta service warnings
+func PrintWarningBeta(service string) {
+	if TUIMode {
+		return
+	}
+	msg := fmt.Sprintf("[!] Warning: %s module is in Beta - results may be inaccurate", service)
+	if NoColorMode {
+		fmt.Println(msg)
+	} else {
+		pterm.Println(pterm.NewStyle(pterm.BgYellow).Sprint(msg))
+	}
+}
+
+// PrintProxyWarning prints a warning when SOCKS5 proxy is not supported by a module's underlying library.
+func PrintProxyWarning(service string) {
+	if TUIMode {
+		return
+	}
+	msg := fmt.Sprintf("[!] Warning: SOCKS5 proxy not supported for %s — connection will be direct", service)
+	if NoColorMode {
+		fmt.Println(msg)
+	} else {
+		pterm.Println(pterm.NewStyle(pterm.BgYellow).Sprint(msg))
+	}
+}
+
+// PrintSocksError prints SOCKS proxy errors
+func PrintSocksError(service string, err string) {
+	if TUIMode {
+		return
+	}
+	msg := fmt.Sprintf("[!] %s: SOCKS5 connection failed - %s", service, err)
+	if NoColorMode {
+		fmt.Println(msg)
+	} else {
+		pterm.Println(pterm.NewStyle(pterm.FgRed).Sprint(msg))
+	}
+}
+
+// PrintSkipping prints host skipping messages
+func PrintSkipping(host string, service string, retries int, maxRetries int) {
+	if TUIMode {
+		return
+	}
+	msg := fmt.Sprintf("[!] Warning: Skipping %s on %s - max retries (%d/%d) reached", service, host, retries, maxRetries)
+	if NoColorMode {
+		fmt.Println(msg)
+	} else {
+		pterm.Println(pterm.NewStyle(pterm.FgRed).Sprint(msg))
+	}
+}
+
+// PrintComprehensiveSummary prints a comprehensive summary report
+func PrintComprehensiveSummary(outputDir string) {
+	stats := CalculateFinalStats()
+
+	// Create output directory if it doesn't exist
+	if _, err := os.Stat(outputDir); os.IsNotExist(err) {
+		if err := os.Mkdir(outputDir, 0755); err != nil {
+			fmt.Printf("Error creating output directory: %v\n", err)
+			return
+		}
+	}
+
+	// Print to console
+	printSummaryToConsole(&stats)
+
+	// Write JSON report
+	writeJSONReport(&stats, outputDir)
+
+	// Write CSV report
+	writeCSVReport(&stats, outputDir)
+
+	// Write human-readable summary
+	writeHumanReadableSummary(&stats, outputDir)
+
+	// Write tool integration files (only if there are successful results)
+	writeMSFResourceScript(&stats, outputDir)
+	writeNetExecCommands(&stats, outputDir)
+}
+
+// printSummaryToConsole prints the summary to console
+func printSummaryToConsole(stats *OutputStatsCopy) {
+	fmt.Println("\n" + strings.Repeat("=", 60))
+	fmt.Println("                    BRUTESPRAY SUMMARY REPORT")
+	fmt.Println(strings.Repeat("=", 60))
+
+	fmt.Printf("Session Duration: %v\n", stats.EndTime.Sub(stats.StartTime).Round(time.Second))
+	fmt.Printf("Start Time: %s\n", stats.StartTime.Format("2006-01-02 15:04:05"))
+	fmt.Printf("End Time: %s\n", stats.EndTime.Format("2006-01-02 15:04:05"))
+
+	fmt.Println("\n--- ATTEMPT STATISTICS ---")
+	fmt.Printf("Total Attempts: %d\n", stats.TotalAttempts)
+	fmt.Printf("Successful Attempts: %d\n", stats.SuccessfulAttempts)
+	fmt.Printf("Failed Attempts: %d\n", stats.FailedAttempts)
+	fmt.Printf("Success Rate: %.2f%%\n", stats.SuccessRate)
+	fmt.Printf("Attempts per Second: %.2f\n", stats.AttemptsPerSecond)
+
+	fmt.Println("\n--- ERROR STATISTICS ---")
+	fmt.Printf("Connection Errors: %d\n", stats.ConnectionErrors)
+	fmt.Printf("Authentication Errors: %d\n", stats.AuthenticationErrors)
+
+	if len(stats.ConnectionErrorHosts) > 0 {
+		fmt.Println("\n--- CONNECTION ERROR HOSTS ---")
+		for host, count := range stats.ConnectionErrorHosts {
+			fmt.Printf("%s: %d connection errors\n", host, count)
+		}
+	}
+
+	fmt.Println("\n--- PERFORMANCE STATISTICS ---")
+	fmt.Printf("Average Response Time: %v\n", stats.AverageResponseTime)
+	fmt.Printf("Peak Concurrency: %d\n", stats.PeakConcurrency)
+
+	fmt.Println("\n--- SCOPE STATISTICS ---")
+	fmt.Printf("Total Hosts: %d\n", stats.TotalHosts)
+	fmt.Printf("Total Services: %d\n", stats.TotalServices)
+
+	if len(stats.SuccessfulResults) > 0 {
+		fmt.Println("\n--- SUCCESSFUL CREDENTIALS ---")
+		for i, result := range stats.SuccessfulResults {
+			if i >= 10 { // Limit to first 10 for console
+				fmt.Printf("... and %d more successful attempts\n", len(stats.SuccessfulResults)-10)
+				break
+			}
+			if IsPasswordOnlyService(result.Service) {
+				fmt.Printf("[%s] %s:%d - Password: %s\n", result.Service, result.Host, result.Port, result.Password)
+			} else {
+				fmt.Printf("[%s] %s:%d - User: %s - Password: %s\n", result.Service, result.Host, result.Port, result.User, result.Password)
+			}
+		}
+	}
+
+	fmt.Println(strings.Repeat("=", 60))
+}
+
+// writeJSONReport writes a JSON report
+func writeJSONReport(stats *OutputStatsCopy, outputDir string) {
+	jsonData, err := json.MarshalIndent(stats, "", "  ")
+	if err != nil {
+		fmt.Printf("Error creating JSON report: %v\n", err)
+		return
+	}
+
+	filename := filepath.Join(outputDir, "brutespray-summary.json")
+	err = os.WriteFile(filename, jsonData, 0644)
+	if err != nil {
+		fmt.Printf("Error writing JSON report: %v\n", err)
+		return
+	}
+
+	fmt.Printf("JSON report written to: %s\n", filename)
+}
+
+// writeCSVReport writes a CSV report
+func writeCSVReport(stats *OutputStatsCopy, outputDir string) {
+	filename := filepath.Join(outputDir, "brutespray-summary.csv")
+	file, err := os.Create(filename)
+	if err != nil {
+		fmt.Printf("Error creating CSV report: %v\n", err)
+		return
+	}
+	defer func() { _ = file.Close() }()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// Write summary statistics
+	summaryData := [][]string{
+		{"Metric", "Value"},
+		{"Start Time", stats.StartTime.Format("2006-01-02 15:04:05")},
+		{"End Time", stats.EndTime.Format("2006-01-02 15:04:05")},
+		{"Duration", stats.EndTime.Sub(stats.StartTime).String()},
+		{"Total Attempts", fmt.Sprintf("%d", stats.TotalAttempts)},
+		{"Successful Attempts", fmt.Sprintf("%d", stats.SuccessfulAttempts)},
+		{"Failed Attempts", fmt.Sprintf("%d", stats.FailedAttempts)},
+		{"Success Rate", fmt.Sprintf("%.2f%%", stats.SuccessRate)},
+		{"Attempts per Second", fmt.Sprintf("%.2f", stats.AttemptsPerSecond)},
+		{"Connection Errors", fmt.Sprintf("%d", stats.ConnectionErrors)},
+		{"Authentication Errors", fmt.Sprintf("%d", stats.AuthenticationErrors)},
+		{"Peak Concurrency", fmt.Sprintf("%d", stats.PeakConcurrency)},
+		{"Total Hosts", fmt.Sprintf("%d", stats.TotalHosts)},
+		{"Total Services", fmt.Sprintf("%d", stats.TotalServices)},
+	}
+
+	if err := writer.WriteAll(summaryData); err != nil {
+		fmt.Printf("Error writing CSV data: %v\n", err)
+		return
+	}
+
+	// Write connection error hosts if any
+	if len(stats.ConnectionErrorHosts) > 0 {
+		if err := writer.Write([]string{}); err != nil { // Empty line
+			fmt.Printf("Error writing CSV data: %v\n", err)
+			return
+		}
+		if err := writer.Write([]string{"Connection Error Hosts"}); err != nil {
+			fmt.Printf("Error writing CSV data: %v\n", err)
+			return
+		}
+		if err := writer.Write([]string{"Host", "Error Count"}); err != nil {
+			fmt.Printf("Error writing CSV data: %v\n", err)
+			return
+		}
+
+		for host, count := range stats.ConnectionErrorHosts {
+			if err := writer.Write([]string{host, fmt.Sprintf("%d", count)}); err != nil {
+				fmt.Printf("Error writing CSV data: %v\n", err)
+				return
+			}
+		}
+	}
+
+	// Write successful results
+	if len(stats.SuccessfulResults) > 0 {
+		if err := writer.Write([]string{}); err != nil { // Empty line
+			fmt.Printf("Error writing CSV data: %v\n", err)
+			return
+		}
+		if err := writer.Write([]string{"Service", "Host", "Port", "User", "Password", "Time", "Duration"}); err != nil {
+			fmt.Printf("Error writing CSV data: %v\n", err)
+			return
+		}
+
+		for _, result := range stats.SuccessfulResults {
+			if err := writer.Write([]string{
+				result.Service,
+				result.Host,
+				fmt.Sprintf("%d", result.Port),
+				result.User,
+				result.Password,
+				result.Time.Format("2006-01-02 15:04:05"),
+				result.Duration,
+			}); err != nil {
+				fmt.Printf("Error writing CSV data: %v\n", err)
+				return
+			}
+		}
+	}
+
+	fmt.Printf("CSV report written to: %s\n", filename)
+}
+
+// writeHumanReadableSummary writes a human-readable summary
+func writeHumanReadableSummary(stats *OutputStatsCopy, outputDir string) {
+	filename := filepath.Join(outputDir, "brutespray-summary.txt")
+	file, err := os.Create(filename)
+	if err != nil {
+		fmt.Printf("Error creating summary file: %v\n", err)
+		return
+	}
+	defer func() { _ = file.Close() }()
+
+	writef := func(format string, args ...any) {
+		if err != nil {
+			return
+		}
+		_, err = fmt.Fprintf(file, format, args...)
+	}
+
+	// Write the same content as console but to file
+	writef("%s\n", strings.Repeat("=", 60))
+	writef("                    BRUTESPRAY SUMMARY REPORT\n")
+	writef("%s\n", strings.Repeat("=", 60))
+
+	writef("Session Duration: %v\n", stats.EndTime.Sub(stats.StartTime).Round(time.Second))
+	writef("Start Time: %s\n", stats.StartTime.Format("2006-01-02 15:04:05"))
+	writef("End Time: %s\n", stats.EndTime.Format("2006-01-02 15:04:05"))
+
+	writef("\n--- ATTEMPT STATISTICS ---\n")
+	writef("Total Attempts: %d\n", stats.TotalAttempts)
+	writef("Successful Attempts: %d\n", stats.SuccessfulAttempts)
+	writef("Failed Attempts: %d\n", stats.FailedAttempts)
+	writef("Success Rate: %.2f%%\n", stats.SuccessRate)
+	writef("Attempts per Second: %.2f\n", stats.AttemptsPerSecond)
+
+	writef("\n--- ERROR STATISTICS ---\n")
+	writef("Connection Errors: %d\n", stats.ConnectionErrors)
+	writef("Authentication Errors: %d\n", stats.AuthenticationErrors)
+
+	if len(stats.ConnectionErrorHosts) > 0 {
+		writef("\n--- CONNECTION ERROR HOSTS ---\n")
+		for host, count := range stats.ConnectionErrorHosts {
+			writef("%s: %d connection errors\n", host, count)
+		}
+	}
+
+	writef("\n--- PERFORMANCE STATISTICS ---\n")
+	writef("Average Response Time: %v\n", stats.AverageResponseTime)
+	writef("Peak Concurrency: %d\n", stats.PeakConcurrency)
+
+	writef("\n--- SCOPE STATISTICS ---\n")
+	writef("Total Hosts: %d\n", stats.TotalHosts)
+	writef("Total Services: %d\n", stats.TotalServices)
+
+	if len(stats.SuccessfulResults) > 0 {
+		writef("\n--- SUCCESSFUL CREDENTIALS ---\n")
+		for _, result := range stats.SuccessfulResults {
+			if IsPasswordOnlyService(result.Service) {
+				writef("[%s] %s:%d - Password: %s\n", result.Service, result.Host, result.Port, result.Password)
+			} else {
+				writef("[%s] %s:%d - User: %s - Password: %s\n", result.Service, result.Host, result.Port, result.User, result.Password)
+			}
+		}
+	}
+
+	writef("%s\n", strings.Repeat("=", 60))
+
+	if err != nil {
+		fmt.Printf("Error writing summary file: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Human-readable summary written to: %s\n", filename)
+}
+
+// writeMSFResourceScript generates a Metasploit resource script (.rc) from found credentials.
+func writeMSFResourceScript(stats *OutputStatsCopy, outputDir string) {
+	if len(stats.SuccessfulResults) == 0 {
+		return
+	}
+
+	filename := filepath.Join(outputDir, "brutespray-msf.rc")
+	file, err := os.Create(filename)
+	if err != nil {
+		fmt.Printf("Error creating MSF resource script: %v\n", err)
+		return
+	}
+	defer func() { _ = file.Close() }()
+
+	writef := func(format string, args ...any) {
+		if err != nil {
+			return
+		}
+		_, err = fmt.Fprintf(file, format, args...)
+	}
+
+	// Map service names to MSF auxiliary modules
+	msfModules := map[string]string{
+		"ssh":      "auxiliary/scanner/ssh/ssh_login",
+		"ftp":      "auxiliary/scanner/ftp/ftp_login",
+		"telnet":   "auxiliary/scanner/telnet/telnet_login",
+		"mysql":    "auxiliary/scanner/mysql/mysql_login",
+		"postgres": "auxiliary/scanner/postgres/postgres_login",
+		"mssql":    "auxiliary/scanner/mssql/mssql_login",
+		"smb":      "auxiliary/scanner/smb/smb_login",
+		"smbnt":    "auxiliary/scanner/smb/smb_login",
+		"smtp":     "auxiliary/scanner/smtp/smtp_enum",
+		"vnc":      "auxiliary/scanner/vnc/vnc_login",
+		"rdp":      "auxiliary/scanner/rdp/rdp_scanner",
+		"redis":    "auxiliary/scanner/redis/redis_login",
+		"mongodb":  "auxiliary/scanner/mongodb/mongodb_login",
+		"pop3":     "auxiliary/scanner/pop3/pop3_login",
+		"imap":     "auxiliary/scanner/imap/imap_login",
+		"http":     "auxiliary/scanner/http/http_login",
+		"https":    "auxiliary/scanner/http/http_login",
+	}
+
+	writef("# Brutespray Metasploit Resource Script\n")
+	writef("# Generated: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+	writef("# Found credentials: %d\n\n", len(stats.SuccessfulResults))
+
+	for _, result := range stats.SuccessfulResults {
+		module, ok := msfModules[result.Service]
+		if !ok {
+			writef("# No MSF module mapping for service: %s (%s:%d)\n", result.Service, result.Host, result.Port)
+			continue
+		}
+		writef("use %s\n", module)
+		writef("set RHOSTS %s\n", result.Host)
+		writef("set RPORT %d\n", result.Port)
+		if result.User != "" {
+			writef("set USERNAME %s\n", result.User)
+		}
+		writef("set PASSWORD %s\n", result.Password)
+		if result.Service == "https" {
+			writef("set SSL true\n")
+		}
+		writef("run\n\n")
+	}
+
+	if err != nil {
+		fmt.Printf("Error writing MSF resource script: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Metasploit resource script written to: %s\n", filename)
+}
+
+// writeNetExecCommands generates NetExec (formerly CrackMapExec) commands from found credentials.
+func writeNetExecCommands(stats *OutputStatsCopy, outputDir string) {
+	if len(stats.SuccessfulResults) == 0 {
+		return
+	}
+
+	filename := filepath.Join(outputDir, "brutespray-nxc.sh")
+	file, err := os.Create(filename)
+	if err != nil {
+		fmt.Printf("Error creating NetExec commands file: %v\n", err)
+		return
+	}
+	defer func() { _ = file.Close() }()
+
+	writef := func(format string, args ...any) {
+		if err != nil {
+			return
+		}
+		_, err = fmt.Fprintf(file, format, args...)
+	}
+
+	// Map service names to nxc protocol names
+	nxcProtocols := map[string]string{
+		"ssh":   "ssh",
+		"smbnt": "smb",
+		"rdp":   "rdp",
+		"mssql": "mssql",
+		"ftp":   "ftp",
+		"winrm": "winrm",
+		"ldap":  "ldap",
+	}
+
+	writef("#!/bin/bash\n")
+	writef("# Brutespray NetExec Commands\n")
+	writef("# Generated: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+	writef("# Found credentials: %d\n\n", len(stats.SuccessfulResults))
+
+	for _, result := range stats.SuccessfulResults {
+		proto, ok := nxcProtocols[result.Service]
+		if !ok {
+			writef("# No nxc protocol for service: %s (%s:%d user:%s)\n", result.Service, result.Host, result.Port, result.User)
+			continue
+		}
+		if result.User != "" {
+			writef("nxc %s %s -u '%s' -p '%s' --port %d\n", proto, result.Host, result.User, result.Password, result.Port)
+		} else {
+			writef("nxc %s %s -p '%s' --port %d\n", proto, result.Host, result.Password, result.Port)
+		}
+	}
+
+	if err != nil {
+		fmt.Printf("Error writing NetExec commands file: %v\n", err)
+		return
+	}
+
+	fmt.Printf("NetExec commands written to: %s\n", filename)
+}

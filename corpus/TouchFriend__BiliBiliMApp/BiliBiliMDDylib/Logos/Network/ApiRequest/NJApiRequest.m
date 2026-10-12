@@ -1,0 +1,238 @@
+//
+//  NJApiRequest.m
+//  BiliBiliTweak
+//
+//  Created by touchWorld on 2026/3/2.
+//
+
+#import "NJApiRequest.h"
+#import "NJCommonDefine.h"
+#import "BFCApiOptions.h"
+#import "BFCApiRequest.h"
+#import "BFCApiModelDescription.h"
+#import "BFCAccount.h"
+#import "BFCAccountHTTPCookie.h"
+#import "NJMyPrivilegeModel.h"
+#import "NJResponseModel.h"
+#import "NJDailyTaskManager.h"
+
+// 领取每日视频分享经验
+#define NJ_RECEIVE_SHARE_EXPERIENCE_KEY @"NJ_RECEIVE_SHARE_EXPERIENCE_KEY"
+// 领取每日经验
+#define NJ_RECEIVE_DAILY_EXPERIENCE_KEY @"NJ_RECEIVE_DAILY_EXPERIENCE_KEY"
+// 获取大会员卡券列表
+#define NJ_LOAD_MY_PRIVILEGE_KEY @"NJ_LOAD_MY_PRIVILEGE_KEY"
+
+@implementation NJApiRequest
+
+/// 执行启动任务
++ (void)runLaunchTasks {
+    // 设置页开关
+    if (!NJ_AUTO_RECEIVE_COUPON_VALUE) {
+        return;
+    }
+    
+    // 用户未登录
+    if (![NSClassFromString(@"BFCAccount") nj_isLogin]) {
+        return;
+    }
+    
+    // 自动领取大会员福利
+    [self couponAutoReceiver];
+    
+    // 领取每日视频分享经验
+    if ([[NJDailyTaskManager shared] canRunTask:NJ_RECEIVE_SHARE_EXPERIENCE_KEY]) {
+        [self receiveShareExperienceWithCompletionHandler:^(NSDictionary *dict) {
+            NSLog(@"%@:%@-%p-%s-领取每日视频分享经验成功,dict:%@", nj_logPrefix, NSStringFromClass([(id)self class]), self, __FUNCTION__, dict);
+            [[NJDailyTaskManager shared] markTaskDone:NJ_RECEIVE_SHARE_EXPERIENCE_KEY];
+        } errorHandler:^(NSError *error, NSDictionary *dict) {
+            NSLog(@"%@:%@-%p-%s-领取每日视频分享经验失败,error:%@-dict:%@", nj_logPrefix, NSStringFromClass([(id)self class]), self, __FUNCTION__, error, dict);
+        }];
+    }
+}
+
+/// 自动领取大会员福利
++ (void)couponAutoReceiver {
+    // 不是大会员
+    if (![NSClassFromString(@"BFCAccount") nj_isVip]) {
+        return;
+    }
+    
+    // 获取大会员卡券列表
+    if ([[NJDailyTaskManager shared] canRunTask:NJ_LOAD_MY_PRIVILEGE_KEY]) {
+        __weak typeof(self) weakSelf = self;
+        [self loadMyPrivilegeWithCompletionHandler:^(NJMyPrivilegeModel *model) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            NSLog(@"%@:%@-%p-%s-获取大会员卡券列表成功，list count:%ld", nj_logPrefix, NSStringFromClass([(id)self class]), self, __FUNCTION__, [model list].count);
+            [[NJDailyTaskManager shared] markTaskDone:NJ_LOAD_MY_PRIVILEGE_KEY];
+            [strongSelf receiveCouponWithModel:model];
+        } errorHandler:^(NSError *error, NSDictionary *dict) {
+            NSLog(@"%@:%@-%p-%s-获取大会员卡券列表失败，error:%@-dict:%@", nj_logPrefix, NSStringFromClass([(id)self class]), self, __FUNCTION__, error, dict);
+        }];
+    }
+    
+    
+    // 领取每日经验
+    if ([[NJDailyTaskManager shared] canRunTask:NJ_RECEIVE_DAILY_EXPERIENCE_KEY]) {
+        [self receiveDailyExperienceWithCompletionHandler:^(NSDictionary *dict) {
+            NSLog(@"%@:%@-%p-%s-领取每日经验成功,dict:%@", nj_logPrefix, NSStringFromClass([(id)self class]), self, __FUNCTION__, dict);
+            [[NJDailyTaskManager shared] markTaskDone:NJ_RECEIVE_DAILY_EXPERIENCE_KEY];
+        } errorHandler:^(NSError *error, NSDictionary *dict) {
+            NSLog(@"%@:%@-%p-%s-领取每日经验失败,error:%@-dict:%@", nj_logPrefix, NSStringFromClass([(id)self class]), self, __FUNCTION__, error, dict);
+        }];
+    }
+}
+
+
+/// 领取优惠券
+/// - Parameter model: 大会员福利 model
++ (void)receiveCouponWithModel:(NJMyPrivilegeModel *)model {
+    NSArray<NJCouponInfo *> *list = model.list;
+    NSArray *couponBlacklist = @[@(8), @(9), @(14), @(20), @(21), @(24), @(25), @(26), @(27)];
+    for (NJCouponInfo *info in list) {
+        // 领取优惠券
+        if (![couponBlacklist containsObject:@(info.type)] && info.state == 0 && info.vip_type > 0) {
+            [self receiveCouponWithType:info.type completionHandler:^(NSDictionary *dict) {
+                NSLog(@"%@:%@-%p-%s-领取优惠券成功，type:%ld,dict:%@", nj_logPrefix, NSStringFromClass([(id)self class]), self, __FUNCTION__, info.type, dict);
+            } errorHandler:^(NSError *error, NSDictionary *dict) {
+                NSLog(@"%@:%@-%p-%s-领取优惠券失败，type:%ld,error:%@-dict:%@", nj_logPrefix, NSStringFromClass([(id)self class]), self, __FUNCTION__, info.type, error, dict);
+            }];
+        }
+    }
+}
+
+
+/// 领取优惠券
+/// - Parameter type: 优惠券类型
++ (void)receiveCouponWithType:(NSInteger)type
+            completionHandler:(void (^)(NSDictionary *dict))completionHandler
+                 errorHandler:(void (^)(NSError *error, NSDictionary *dict))errorHandler {
+    NSString *cookieBiliJct = [NSClassFromString(@"BFCAccount") nj_getCookieBiliJct];
+    BFCApiOptions *options = [NSClassFromString(@"BFCApiOptions") optionsWithBaseUrl:@"https://api.bilibili.com/x/vip/privilege/receive"];
+    // POST
+    options.requestMethod = 1;
+    options.params = @{ @"type": [@(type) stringValue],
+                        @"csrf": cookieBiliJct,};
+    BFCApiModelDescription *response_Des = [NSClassFromString(@"BFCApiModelDescription") modelWith:@"/" mappingClass:NSClassFromString(@"NJResponseModel") isArray:NO isOptional:YES];
+    options.modelDescriptions = @[response_Des];
+    BFCApiRequest *request = [(BFCApiRequest *)[NSClassFromString(@"BFCApiRequest") alloc] initWithOptions:options];
+    //     "Content-Type" = "application/json; charset=utf-8";
+//    request.requestInjection = ^NSURLRequest *(NSURLRequest *request) {
+//        NSMutableURLRequest *mutableRequest = [request mutableCopy];
+//        [mutableRequest setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+//        return mutableRequest;
+//    };
+    request.completionHandler = ^(NSDictionary *dict) {
+        if (completionHandler) {
+            completionHandler(dict);
+        }
+    };
+    request.errorHandler = ^(NSError *error, NSDictionary *dict) {
+        if (errorHandler) {
+            errorHandler(error, dict);
+        }
+    };
+    
+    [request requestAsync];
+}
+
+/// 领取每日经验
++ (void)receiveDailyExperienceWithCompletionHandler:(void (^)(NSDictionary *dict))completionHandler
+                                  errorHandler:(void (^)(NSError *error, NSDictionary *dict))errorHandler {
+    NSString *cookieBiliJct = [NSClassFromString(@"BFCAccount") nj_getCookieBiliJct];
+    BFCApiOptions *options = [NSClassFromString(@"BFCApiOptions") optionsWithBaseUrl:@"https://api.bilibili.com/x/vip/experience/add"];
+    // POST
+    options.requestMethod = 1;
+    options.params = @{ @"csrf": cookieBiliJct,};
+    BFCApiModelDescription *response_Des = [NSClassFromString(@"BFCApiModelDescription") modelWith:@"/" mappingClass:NSClassFromString(@"NJResponseModel") isArray:NO isOptional:YES];
+    options.modelDescriptions = @[response_Des];
+    BFCApiRequest *request = [(BFCApiRequest *)[NSClassFromString(@"BFCApiRequest") alloc] initWithOptions:options];
+    request.completionHandler = ^(NSDictionary *dict) {
+        if (completionHandler) {
+            completionHandler(dict);
+        }
+    };
+    request.errorHandler = ^(NSError *error, NSDictionary *dict) {
+        if (errorHandler) {
+            errorHandler(error, dict);
+        }
+    };
+    
+    [request requestAsync];
+}
+ 
+/// 获取大会员卡券列表
++ (void)loadMyPrivilegeWithCompletionHandler:(void (^)(NJMyPrivilegeModel *model))completionHandler errorHandler:(void (^)(NSError *error, NSDictionary *dict))errorHandler {
+    // https://github.com/pskdje/bilibili-API-collect/blob/main/docs/vip/info.md
+    BFCApiOptions *options = [NSClassFromString(@"BFCApiOptions") optionsWithBaseUrl:@"https://api.bilibili.com/x/vip/privilege/my"];
+    options.params = @{};
+    BFCApiModelDescription *coupon_Des = [NSClassFromString(@"BFCApiModelDescription") modelWith:@"/data" mappingClass:NSClassFromString(@"NJMyPrivilegeModel") isArray:NO isOptional:YES];
+    options.modelDescriptions = @[coupon_Des];
+    BFCApiRequest *request = [(BFCApiRequest *)[NSClassFromString(@"BFCApiRequest") alloc] initWithOptions:options];
+    
+    request.completionHandler = ^(NSDictionary *dict) {
+        if (completionHandler) {
+            completionHandler(dict[@"/data"]);
+        }
+    };
+    request.errorHandler = ^(NSError *error, NSDictionary *dict) {
+        if (errorHandler) {
+            errorHandler(error, dict);
+        }
+    };
+    
+    [request requestAsync];
+     
+}
+
+/// 领取每日视频分享经验
++ (void)receiveShareExperienceWithCompletionHandler:(void (^)(NSDictionary *dict))completionHandler
+                                       errorHandler:(void (^)(NSError *error, NSDictionary *dict))errorHandler {
+    NSString *oid = @"170001"; // aid
+    NSArray *sids = @[@"279786",
+                      @"275431",
+                      @"279787",
+                      @"280467",
+                      @"280468",
+                      @"280469",
+                      @"274491",
+                      @"267410",
+                      @"267714",
+                      @"270380",];
+    NSString *sid = sids.count ? sids[arc4random_uniform((u_int32_t)sids.count)] : nil;
+    NSString *accessKey = [NSClassFromString(@"BFCAccount") nj_accessKey];
+    if (oid.length == 0 || sid.length == 0 ||
+        accessKey.length == 0) {
+        return;
+    }
+    NSDictionary *params = @{@"access_key" : accessKey,
+                             @"oid" : oid,
+                             @"panel_type" : @"1",
+                             @"share_channel" : @"QQ",
+                             @"share_id" : @"main.ugc-video-detail.0.0.pv",
+                             @"share_origin" : @"vinfo_player",
+                             @"sid" : sid,
+                             @"success" : @"true",};
+    
+    BFCApiOptions *options = [NSClassFromString(@"BFCApiOptions") optionsWithBaseUrl:@"https://api.bilibili.com/x/share/finish"];
+    // POST
+    options.requestMethod = 1;
+    options.params = params;
+    BFCApiModelDescription *response_Des = [NSClassFromString(@"BFCApiModelDescription") modelWith:@"/" mappingClass:NSClassFromString(@"NJResponseModel") isArray:NO isOptional:YES];
+    options.modelDescriptions = @[response_Des];
+    BFCApiRequest *request = [(BFCApiRequest *)[NSClassFromString(@"BFCApiRequest") alloc] initWithOptions:options];
+    request.completionHandler = ^(NSDictionary *dict) {
+        if (completionHandler) {
+            completionHandler(dict);
+        }
+    };
+    request.errorHandler = ^(NSError *error, NSDictionary *dict) {
+        if (errorHandler) {
+            errorHandler(error, dict);
+        }
+    };
+    
+    [request requestAsync];
+}
+    
+@end

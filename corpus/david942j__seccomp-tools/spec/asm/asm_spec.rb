@@ -1,0 +1,202 @@
+# frozen_string_literal: true
+
+require 'seccomp-tools/asm/asm'
+require 'seccomp-tools/disasm/disasm'
+require 'seccomp-tools/util'
+
+describe SeccompTools::Asm do
+  before do
+    SeccompTools::Util.disable_color!
+  end
+
+  it 'normal-asm' do
+    raw = described_class.asm(<<-EOS, arch: :amd64)
+    # lines starting with '#' are comments
+      A = sys_number # here's a comment, too
+      A >= 0x40000000 ? dead : next # 'next' is a keyword, denoting the next instruction
+      A == read ? ok : next # custom-defined labels 'dead' and 'ok'
+      A == 1 ? ok : next # SYS_write = 1 in amd64
+      return ERRNO(1)
+    dead:
+      return KILL
+    ok:
+      return ALLOW
+    EOS
+    expect(SeccompTools::Disasm.disasm(raw, arch: :amd64)).to eq <<-EOS
+ line  CODE  JT   JF      K
+=================================
+ 0000: 0x20 0x00 0x00 0x00000000  A = sys_number
+ 0001: 0x35 0x03 0x00 0x40000000  if (A >= 0x40000000) goto 0005
+ 0002: 0x15 0x03 0x00 0x00000000  if (A == read) goto 0006
+ 0003: 0x15 0x02 0x00 0x00000001  if (A == write) goto 0006
+ 0004: 0x06 0x00 0x00 0x00050001  return ERRNO(1)
+ 0005: 0x06 0x00 0x00 0x00000000  return KILL
+ 0006: 0x06 0x00 0x00 0x7fff0000  return ALLOW
+    EOS
+  end
+
+  it 'assign cases' do
+    raw = described_class.asm(<<-EOS)
+      A = mem[3]
+      X= mem[15]
+      A=    X
+      X =A
+      A =arch
+      A = args[4]
+      A = data[16]
+      mem[15] = A
+      mem[1] = X
+    EOS
+    expect(SeccompTools::Disasm.disasm(raw)).to eq <<-EOS
+ line  CODE  JT   JF      K
+=================================
+ 0000: 0x60 0x00 0x00 0x00000003  A = mem[3]
+ 0001: 0x61 0x00 0x00 0x0000000f  X = mem[15]
+ 0002: 0x87 0x00 0x00 0x00000000  A = X
+ 0003: 0x07 0x00 0x00 0x00000000  X = A
+ 0004: 0x20 0x00 0x00 0x00000004  A = arch
+ 0005: 0x20 0x00 0x00 0x00000030  A = args[4]
+ 0006: 0x20 0x00 0x00 0x00000010  A = args[0]
+ 0007: 0x02 0x00 0x00 0x0000000f  mem[15] = A
+ 0008: 0x03 0x00 0x00 0x00000001  mem[1] = X
+    EOS
+  end
+
+  it 'arch' do
+    rule = <<-EOS
+      A = execve
+      A = sys_number
+      A == read ? 0004 : next
+      A = X
+0004: return ALLOW
+    EOS
+    raw = described_class.asm(rule, arch: :amd64)
+    expect(SeccompTools::Disasm.disasm(raw, arch: :amd64)).to include <<-EOS
+ 0000: 0x00 0x00 0x00 0x0000003b  A = 59
+ 0001: 0x20 0x00 0x00 0x00000000  A = sys_number
+ 0002: 0x15 0x01 0x00 0x00000000  if (A == read) goto 0004
+    EOS
+
+    raw = described_class.asm(rule, arch: :i386)
+    expect(SeccompTools::Disasm.disasm(raw, arch: :i386)).to include <<-EOS
+ 0000: 0x00 0x00 0x00 0x0000000b  A = 11
+ 0001: 0x20 0x00 0x00 0x00000000  A = sys_number
+ 0002: 0x15 0x01 0x00 0x00000003  if (A == read) goto 0004
+    EOS
+
+    raw = described_class.asm(rule, arch: :riscv64)
+    expect(SeccompTools::Disasm.disasm(raw, arch: :riscv64)).to include <<-EOS
+ 0000: 0x00 0x00 0x00 0x000000dd  A = 221
+ 0001: 0x20 0x00 0x00 0x00000000  A = sys_number
+ 0002: 0x15 0x01 0x00 0x0000003f  if (A == read) goto 0004
+    EOS
+  end
+
+  it 'returns' do
+    raw = described_class.asm(<<-EOS)
+  return KILL_PROCESS
+  return KILL_THREAD
+  return KILL
+  return TRAP
+  return ERRNO(3)
+  return TRACE
+  return ALLOW
+    EOS
+    expect(SeccompTools::Disasm.disasm(raw)).to eq <<-EOS
+ line  CODE  JT   JF      K
+=================================
+ 0000: 0x06 0x00 0x00 0x80000000  return KILL_PROCESS
+ 0001: 0x06 0x00 0x00 0x00000000  return KILL
+ 0002: 0x06 0x00 0x00 0x00000000  return KILL
+ 0003: 0x06 0x00 0x00 0x00030000  return TRAP
+ 0004: 0x06 0x00 0x00 0x00050003  return ERRNO(3)
+ 0005: 0x06 0x00 0x00 0x7ff00000  return TRACE
+ 0006: 0x06 0x00 0x00 0x7fff0000  return ALLOW
+    EOS
+  end
+
+  it 'return A' do
+    raw = described_class.asm('return A')
+    expect(SeccompTools::Disasm.disasm(raw)).to include <<-EOS
+ 0000: 0x16 0x00 0x00 0x00000000  return A
+    EOS
+  end
+
+  it 'alu' do
+    raw = described_class.asm(<<-EOS, arch: :amd64)
+      A &= read
+      A += write
+      A *= 0x1
+      A -= X
+      A /= 0xf
+      A |= 2
+      A >>= 1
+      A <<= 1
+      A = -A
+      A ^= 0x1337
+    EOS
+    expect(SeccompTools::Disasm.disasm(raw, arch: :amd64)).to eq <<-EOS
+ line  CODE  JT   JF      K
+=================================
+ 0000: 0x54 0x00 0x00 0x00000000  A &= 0x0
+ 0001: 0x04 0x00 0x00 0x00000001  A += 0x1
+ 0002: 0x24 0x00 0x00 0x00000001  A *= 0x1
+ 0003: 0x1c 0x00 0x00 0x00000000  A -= X
+ 0004: 0x34 0x00 0x00 0x0000000f  A /= 0xf
+ 0005: 0x44 0x00 0x00 0x00000002  A |= 0x2
+ 0006: 0x74 0x00 0x00 0x00000001  A >>= 1
+ 0007: 0x64 0x00 0x00 0x00000001  A <<= 1
+ 0008: 0x84 0x00 0x00 0x00000000  A = -A
+ 0009: 0xa4 0x00 0x00 0x00001337  A ^= 0x1337
+    EOS
+  end
+
+  it 'uses big-endian word order for 64-bit fields on s390x' do
+    # On s390x the high 32-bit word of a 64-bit seccomp_data field comes first (see
+    # arch_arg_offset_lo/hi in libseccomp and syscall_arg in the kernel's seccomp selftests),
+    # so args[2] (its low half) is at offset 0x24 and args[2] >> 32 at 0x20.
+    src = <<-EOS
+      A = args[2]
+      A = args[2] >> 32
+      A = args_h[2]
+      A = instruction_pointer
+      A = instruction_pointer >> 32
+      return ALLOW
+    EOS
+    raw = described_class.asm(src, arch: :s390x)
+    expect(SeccompTools::Disasm.disasm(raw, arch: :s390x)).to eq <<-EOS
+ line  CODE  JT   JF      K
+=================================
+ 0000: 0x20 0x00 0x00 0x00000024  A = args[2]
+ 0001: 0x20 0x00 0x00 0x00000020  A = args[2] >> 32
+ 0002: 0x20 0x00 0x00 0x00000020  A = args[2] >> 32
+ 0003: 0x20 0x00 0x00 0x0000000c  A = instruction_pointer
+ 0004: 0x20 0x00 0x00 0x00000008  A = instruction_pointer >> 32
+ 0005: 0x06 0x00 0x00 0x7fff0000  return ALLOW
+    EOS
+    # ... while a little-endian arch keeps the low half first.
+    raw = described_class.asm(src, arch: :amd64)
+    expect(SeccompTools::Disasm.disasm(raw, arch: :amd64)).to eq <<-EOS
+ line  CODE  JT   JF      K
+=================================
+ 0000: 0x20 0x00 0x00 0x00000020  A = args[2]
+ 0001: 0x20 0x00 0x00 0x00000024  A = args[2] >> 32
+ 0002: 0x20 0x00 0x00 0x00000024  A = args[2] >> 32
+ 0003: 0x20 0x00 0x00 0x00000008  A = instruction_pointer
+ 0004: 0x20 0x00 0x00 0x0000000c  A = instruction_pointer >> 32
+ 0005: 0x06 0x00 0x00 0x7fff0000  return ALLOW
+    EOS
+  end
+
+  it 'accepts output of disasm' do
+    files = Dir.glob('spec/data/*.bpf')
+    # Disassemble and reassemble under the same arch, otherwise the round-trip depends on the host arch:
+    # syscall names are arch-specific, so names emitted for one arch may not exist in another's table.
+    SeccompTools::Syscall::ABI.each_key do |arch|
+      files.each do |f|
+        input = SeccompTools::Disasm.disasm(File.binread(f), arch:, display_bpf: false, arg_infer: false)
+        expect { described_class.asm(input, arch:, filename: f) }.to_not raise_error
+      end
+    end
+  end
+end

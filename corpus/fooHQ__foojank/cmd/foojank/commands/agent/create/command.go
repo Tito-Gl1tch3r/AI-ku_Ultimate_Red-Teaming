@@ -1,0 +1,319 @@
+package create
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"os"
+	"runtime"
+	"strings"
+
+	petname "github.com/dustinkirkland/golang-petname"
+	"github.com/urfave/cli/v3"
+
+	"github.com/foohq/foojank/cmd/foojank/actions"
+	"github.com/foohq/foojank/cmd/foojank/flags"
+	"github.com/foohq/foojank/internal/auth"
+	"github.com/foohq/foojank/internal/authdir"
+	"github.com/foohq/foojank/internal/clients/daemon"
+	"github.com/foohq/foojank/internal/config"
+)
+
+func NewCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "create",
+		Usage: "Create an agent",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:  flags.Name,
+				Usage: "set agent name",
+			},
+			&cli.StringFlag{
+				Name:  flags.Description,
+				Usage: "set agent description",
+			},
+			&cli.StringFlag{
+				Name:  flags.Gateway,
+				Usage: "set agent's gateway",
+			},
+			&cli.StringFlag{
+				Name:  flags.Profile,
+				Usage: "set a profile to use",
+			},
+			&cli.StringFlag{
+				Name:  flags.Os,
+				Usage: "set target operating system",
+			},
+			&cli.StringFlag{
+				Name:  flags.Arch,
+				Usage: "set target architecture",
+			},
+			&cli.StringSliceFlag{
+				Name:  flags.Variable,
+				Usage: "set config variable (format: key=value)",
+			},
+			&cli.StringSliceFlag{
+				Name:  flags.WithoutVariable,
+				Usage: "unset config variable (format: key)",
+			},
+			&cli.StringFlag{
+				Name:  flags.ServerURL,
+				Usage: "set server URL",
+			},
+			&cli.StringFlag{
+				Name:      flags.ServerCertificate,
+				Usage:     "set path to server's certificate",
+				TakesFile: true,
+			},
+			&cli.StringFlag{
+				Name:  flags.Credential,
+				Usage: "set credential",
+			},
+			&cli.StringFlag{
+				Name:  flags.ConfigDir,
+				Usage: "set path to a configuration directory",
+			},
+		},
+		Before:          before,
+		Action:          action,
+		ShellComplete:   actions.CompleteFlags,
+		OnUsageError:    actions.UsageError,
+		HideHelpCommand: true,
+	}
+}
+
+func before(ctx context.Context, c *cli.Command) (context.Context, error) {
+	ctx, err := actions.LoadConfig(os.Stderr, validateConfiguration)(ctx, c)
+	if err != nil {
+		return ctx, err
+	}
+
+	ctx, err = actions.LoadProfiles(os.Stderr)(ctx, c)
+	if err != nil {
+		return ctx, err
+	}
+
+	ctx, err = actions.SetupLogger(os.Stderr)(ctx, c)
+	if err != nil {
+		return ctx, err
+	}
+
+	ctx, err = actions.SetupServer(os.Stderr)(ctx, c)
+	if err != nil {
+		return ctx, err
+	}
+
+	return ctx, nil
+}
+
+func action(ctx context.Context, _ *cli.Command) (err error) {
+	conf := actions.GetConfigFromContext(ctx)
+	profs := actions.GetProfilesFromContext(ctx)
+	logger := actions.GetLoggerFromContext(ctx)
+	srv := actions.GetServerFromContext(ctx)
+
+	credsName, _ := conf.String(flags.Credential)
+	targetOS, _ := conf.String(flags.Os)
+	targetArch, _ := conf.String(flags.Arch)
+	setVars, _ := conf.StringSlice(flags.Variable)
+	unsetVars, _ := conf.StringSlice(flags.WithoutVariable)
+	gatewayName, _ := conf.String(flags.Gateway)
+	agentName, _ := conf.String(flags.Name)
+	agentDesc, _ := conf.String(flags.Description)
+	profName, _ := conf.String(flags.Profile)
+
+	client := daemon.New(srv)
+
+	gateway, err := client.GetGateway(ctx, gatewayName)
+	if err != nil {
+		if errors.Is(err, daemon.ErrKeyNotFound) {
+			err = fmt.Errorf("%q not found", gatewayName)
+		}
+		logger.ErrorContext(ctx, "Cannot get gateway: %v", err)
+		return err
+	}
+
+	if agentName == "" {
+		agentName = petname.Generate(2, "-")
+	}
+
+	user, err := auth.NewUserKey()
+	if err != nil {
+		logger.ErrorContext(ctx, "Cannot generate a user key: %v", err)
+		return err
+	}
+
+	agentID, err := user.PublicKey()
+	if err != nil {
+		logger.ErrorContext(ctx, "Cannot create agent ID: %v", err)
+		return err
+	}
+
+	agentPerms := client.NewAgentPermissions(gateway.ID, agentID)
+	agentClaims, err := auth.NewUserJWT(agentName, agentPerms, user)
+	if err != nil {
+		logger.ErrorContext(ctx, "Cannot generate a user JWT: %v", err)
+		return err
+	}
+
+	// Get the client's user JWT.
+	userClaims, err := authdir.GetUserJWT(credsName)
+	if err != nil {
+		logger.ErrorContext(ctx, "Cannot get user JWT: %v", err)
+		return err
+	}
+
+	if userClaims.IssuerAccount != "" {
+		agentClaims.IssuerAccount = userClaims.IssuerAccount
+	}
+
+	// Get the client's account key.
+	account, err := authdir.GetAccountKey(credsName)
+	if err != nil {
+		logger.ErrorContext(ctx, "Cannot get account key: %v", err)
+		return err
+	}
+
+	agentJWT, err := agentClaims.Encode(account)
+	if err != nil {
+		logger.ErrorContext(ctx, "Cannot encode user JWT: %v", err)
+		return err
+	}
+
+	agentSeed, err := user.Seed()
+	if err != nil {
+		logger.ErrorContext(ctx, "Cannot encode user seed: %v", err)
+		return err
+	}
+
+	agent := daemon.AgentDirectoryEntry{
+		ID:          agentID,
+		Name:        agentName,
+		Description: agentDesc,
+		GatewayID:   gateway.ID,
+		Config: daemon.AgentBuildConfig{
+			OS:      runtime.GOOS,
+			Arch:    runtime.GOARCH,
+			UserJWT: agentJWT,
+			UserKey: string(agentSeed),
+			Extra:   make(map[string]string),
+		},
+	}
+
+	// Copy gateway extra configuration.
+	maps.Copy(agent.Config.Extra, gateway.Config.Extra)
+
+	// Parse profile file.
+	if profName != "" {
+		prof, err := profs.Get(profName)
+		if err != nil {
+			logger.ErrorContext(ctx, "Cannot get profile %q: %v", profName, err)
+			return err
+		}
+
+		v := prof.OS()
+		if v != "" {
+			agent.Config.OS = v
+		}
+
+		v = prof.Arch()
+		if v != "" {
+			agent.Config.Arch = v
+		}
+
+		maps.Copy(agent.Config.Extra, prof.Env())
+	}
+
+	// Parse command line flags.
+	if targetOS != "" {
+		agent.Config.OS = targetOS
+	}
+
+	if targetArch != "" {
+		agent.Config.Arch = targetArch
+	}
+
+	maps.Copy(agent.Config.Extra, parseKVPairs(setVars))
+
+	for _, v := range unsetVars {
+		delete(agent.Config.Extra, v)
+	}
+
+	agent, err = client.CreateAgent(ctx, agent)
+	if err != nil {
+		if errors.Is(err, daemon.ErrKeyExists) {
+			err = fmt.Errorf("%q already exists", agentName)
+		}
+		logger.ErrorContext(ctx, "Cannot create agent: %v", err)
+		return err
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		err = client.RemoveAgent(ctx, agent)
+		if err != nil {
+			logger.ErrorContext(ctx, "Cannot remove agent: %v", err)
+		}
+	}()
+
+	props, err := client.RequestRegisterAgent(ctx, agent)
+	if err != nil {
+		logger.ErrorContext(ctx, "Cannot register agent: %v", err)
+		return err
+	}
+
+	// Merge all properties together.
+	maps.Copy(agent.Config.Extra, props)
+
+	_, err = client.UpdateAgent(ctx, agent)
+	if err != nil {
+		logger.ErrorContext(ctx, "Cannot create agent: %v", err)
+		return err
+	}
+
+	logger.InfoContext(ctx, "Agent %q has been created!", agentName)
+
+	return nil
+}
+
+func parseKVPairs(pairs []string) map[string]string {
+	env := make(map[string]string, len(pairs))
+	for _, pair := range pairs {
+		parts := strings.SplitN(pair, "=", 2)
+		var v string
+		if len(parts) > 1 {
+			v = parts[1]
+		}
+		env[strings.TrimSpace(parts[0])] = v
+	}
+	return env
+}
+
+func validateConfiguration(conf *config.Config) error {
+	for _, opt := range []string{
+		flags.Gateway,
+		flags.ServerURL,
+		flags.Credential,
+	} {
+		switch opt {
+		case flags.Gateway:
+			v, ok := conf.String(opt)
+			if !ok || v == "" {
+				return errors.New("gateway not configured")
+			}
+		case flags.ServerURL:
+			v, ok := conf.String(opt)
+			if !ok || v == "" {
+				return errors.New("server URL not configured")
+			}
+		case flags.Credential:
+			v, ok := conf.String(opt)
+			if !ok || v == "" {
+				return errors.New("credential not configured")
+			}
+		}
+	}
+	return nil
+}

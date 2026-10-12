@@ -1,0 +1,255 @@
+"""Domain breaches endpoint for retrieving breach data and metrics."""
+
+from datetime import datetime
+from collections import defaultdict
+from typing import Dict, List
+from operator import itemgetter
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from pydantic import BaseModel, Field
+
+from config.clients import ds_client
+from models.base import BaseResponse
+from models.responses import DomainBreachesResponse
+from services.send_email import send_exception_email
+from utils.custom_limiter import custom_rate_limiter
+from utils.validation import validate_url
+
+router = APIRouter()
+
+
+# CSRF exemption dependency
+async def csrf_exempt():
+    """Dependency to exempt from CSRF protection."""
+    return True
+
+
+class BreachDetail(BaseModel):
+    """Model for detailed breach information."""
+
+    breached_date: datetime
+    logo: str
+    password_risk: str
+    searchable: bool
+    xposed_data: List[str] = Field(default_factory=list)
+    xposed_records: int
+    xposure_desc: str
+
+    @classmethod
+    def from_datastore(cls, data: dict) -> "BreachDetail":
+        """Create a BreachDetail instance from datastore data."""
+        # Convert string xposed_data to list if needed
+        if isinstance(data.get("xposed_data"), str):
+            data["xposed_data"] = [
+                item.strip() for item in data["xposed_data"].split(";")
+            ]
+        return cls(**data)
+
+
+class BreachSummary(BaseModel):
+    """Model for breach summary information."""
+
+    email: str
+    domain: str
+    breach: str
+
+
+class DomainBreachesResponse(BaseResponse):
+    """Response model for domain breaches endpoint."""
+
+    metrics: Dict = {
+        "Yearly_Metrics": Dict[str, int],
+        "Domain_Summary": Dict[str, int],
+        "Breach_Summary": Dict[str, int],
+        "Breaches_Details": List[BreachSummary],
+        "Top10_Breaches": Dict[str, int],
+        "Detailed_Breach_Info": Dict[str, Dict],
+    }
+
+
+@router.post(
+    "/domain-breaches/",
+    response_model=DomainBreachesResponse,
+    dependencies=[Depends(csrf_exempt)],
+)
+@custom_rate_limiter("2 per second;25 per hour;50 per day")
+async def protected(
+    request: Request,
+    x_api_key: str = Header(..., description="API key for authentication"),
+):
+    """Retrieves the data breaches and related metrics for an API-key"""
+    try:
+        if not x_api_key or x_api_key.strip() == "" or not validate_url(request):
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+        # Instantiate a datastore client
+        datastore_client = ds_client
+
+        # Try to find API key in xon_api_key table (existing users)
+        query = datastore_client.query(kind="xon_api_key")
+        query.add_filter("api_key", "=", x_api_key)
+        results = list(query.fetch())
+
+        email = None
+        custid = None
+
+        if results:
+            # Found in xon_api_key - existing user flow
+            email = results[0].key.name
+        else:
+            # Try plus_api_key table (enterprise users)
+            query = datastore_client.query(kind="plus_api_key")
+            query.add_filter("api_key", "=", x_api_key)
+            plus_results = list(query.fetch())
+
+            if plus_results:
+                plus_key_entity = plus_results[0]
+
+                # Validate product_stream is xonEnterprise
+                if plus_key_entity.get("product_stream") != "xonEnterprise":
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Invalid product stream for API key",
+                    )
+
+                # Validate API key is active
+                if not plus_key_entity.get("is_active"):
+                    raise HTTPException(status_code=401, detail="API key is not active")
+
+                # Get customer ID and validate customer
+                custid = plus_key_entity.get("custid")
+                if not custid:
+                    raise HTTPException(status_code=401, detail="Invalid customer ID")
+
+                # Check customer exists and is active
+                customer_key = datastore_client.key("plus_customers", custid)
+                customer = datastore_client.get(customer_key)
+
+                if not customer:
+                    raise HTTPException(status_code=401, detail="Customer not found")
+
+                if not customer.get("is_active"):
+                    raise HTTPException(
+                        status_code=401, detail="Customer account is not active"
+                    )
+
+                # Get email from created_by field
+                email = plus_key_entity.get("created_by")
+                if not email:
+                    raise HTTPException(
+                        status_code=401, detail="Email not found for API key"
+                    )
+
+        # If email not found in either table, reject the request
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+        # Fetch verified domains - enterprise uses custid, regular uses email
+        query = datastore_client.query(kind="xon_domains")
+        if custid:
+            query.add_filter("custid", "=", custid)
+        else:
+            query.add_filter("email", "=", email)
+        verified_domains = [entity["domain"] for entity in query.fetch()]
+
+        current_year = datetime.utcnow().year
+        yearly_summary = defaultdict(int)
+        yearly_summary = {str(year): 0 for year in range(2007, current_year + 1)}
+        yearly_breach_summary = {
+            str(year): defaultdict(int) for year in range(2007, current_year + 1)
+        }
+        breach_summary = defaultdict(int)
+        domain_summary = defaultdict(int)
+        detailed_breach_info = {}
+        breach_details = []
+
+        for domain in verified_domains:
+            query = datastore_client.query(kind="xon_domains_summary")
+            query.add_filter("domain", "=", domain)
+            domain_summary[domain] = 0
+
+            for entity in query.fetch():
+                if entity["breach"] == "No_Breaches":
+                    continue
+
+                breach_key = datastore_client.key("xon_breaches", entity["breach"])
+                breach = datastore_client.get(breach_key)
+
+                if breach:
+                    breach_year = breach["breached_date"].strftime("%Y")
+                    yearly_summary[breach_year] += entity["email_count"]
+                    yearly_breach_summary[breach_year][entity["breach"]] += entity[
+                        "email_count"
+                    ]
+                    breach_summary[entity["breach"]] += entity["email_count"]
+                    domain_summary[domain] += entity["email_count"]
+
+                    detailed_breach_info[entity["breach"]] = {
+                        "breached_date": breach["breached_date"],
+                        "logo": breach["logo"],
+                        "password_risk": breach["password_risk"],
+                        "searchable": breach["searchable"],
+                        "xposed_data": breach["xposed_data"],
+                        "xposed_records": breach["xposed_records"],
+                        "xposure_desc": breach["xposure_desc"],
+                    }
+
+            query = datastore_client.query(kind="xon_domains_details")
+            query.add_filter("domain", "=", domain)
+            for entity in query.fetch():
+                breach_details.append(
+                    BreachSummary(
+                        email=entity["email"],
+                        domain=entity["domain"],
+                        breach=entity["breach"],
+                    )
+                )
+
+        top10_breaches = dict(
+            sorted(breach_summary.items(), key=itemgetter(1), reverse=True)[:10]
+        )
+
+        metrics = {
+            "Yearly_Metrics": dict(yearly_summary),
+            "Domain_Summary": dict(domain_summary),
+            "Breach_Summary": dict(breach_summary),
+            "Breaches_Details": breach_details,
+            "Top10_Breaches": dict(top10_breaches),
+            "Detailed_Breach_Info": detailed_breach_info,
+        }
+
+        return DomainBreachesResponse(status="success", metrics=metrics)
+
+    except HTTPException:
+        raise
+    except Exception as exception_details:
+        await send_exception_email(
+            api_route="POST /v1/domain-breaches/",
+            error_message=str(exception_details),
+            exception_type=type(exception_details).__name__,
+            user_agent=request.headers.get("User-Agent"),
+            request_params=f"api_key={'provided' if x_api_key else 'missing'}",
+        )
+        raise HTTPException(
+            status_code=500, detail="An error occurred during processing"
+        ) from exception_details
+
+
+@router.get("/domain-breaches/")
+@custom_rate_limiter("2 per second;25 per hour;50 per day")
+async def domain_breaches_method_not_allowed(request: Request):
+    """Return 405 for GET requests to domain-breaches endpoint."""
+    raise HTTPException(
+        status_code=405,
+        detail="Method not allowed. Use POST with x-api-key header.",
+    )
+
+
+@router.get("/domain-breaches/{_:path}")
+@custom_rate_limiter("2 per second;25 per hour;50 per day")
+async def domain_breaches_invalid_path(request: Request):
+    """Return 405 for GET requests with path appended to domain-breaches."""
+    raise HTTPException(
+        status_code=405,
+        detail="Method not allowed. Use POST /v1/domain-breaches/ with x-api-key header.",
+    )

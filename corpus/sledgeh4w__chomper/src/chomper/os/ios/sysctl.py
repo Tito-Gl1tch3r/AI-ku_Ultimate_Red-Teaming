@@ -1,0 +1,266 @@
+import ctypes
+import os
+import random
+import socket
+import time
+import uuid
+from typing import Dict, Optional, Tuple
+
+from chomper.typing import SysctlReturnValue
+from chomper.utils import log_call
+
+from . import const
+from .structs import (
+    Timespec,
+    IfMsghdr,
+    IfaMsghdr,
+    SockaddrIn,
+    SockaddrIn6,
+    SockaddrDl,
+    KinfoProc,
+)
+
+# CTL Type map
+CTL_TYPE_MAP: Dict[Tuple[int, int], str] = {
+    (const.CTL_KERN, const.KERN_OSTYPE): "kern.ostype",
+    (const.CTL_KERN, const.KERN_OSRELEASE): "kern.osrelease",
+    (const.CTL_KERN, const.KERN_OSREV): "kern.osrevision",
+    (const.CTL_KERN, const.KERN_VERSION): "kern.version",
+    (const.CTL_KERN, const.KERN_MAXVNODES): "kern.maxvnodes",
+    (const.CTL_KERN, const.KERN_MAXPROC): "kern.maxproc",
+    (const.CTL_KERN, const.KERN_ARGMAX): "kern.argmax",
+    (const.CTL_KERN, const.KERN_HOSTNAME): "kern.hostname",
+    (const.CTL_KERN, const.KERN_HOSTID): "kern.hostid",
+    (const.CTL_KERN, const.KERN_NGROUPS): "kern.ngroups",
+    (const.CTL_KERN, const.KERN_SAVED_IDS): "kern.saved_ids",
+    (const.CTL_KERN, const.KERN_BOOTTIME): "kern.boottime",
+    (const.CTL_KERN, const.KERN_NISDOMAINNAME): "kern.nisdomainname",
+    (const.CTL_KERN, const.KERN_MAXFILESPERPROC): "kern.maxfilesperproc",
+    (const.CTL_KERN, const.KERN_USRSTACK32): "kern.usrstack",
+    (const.CTL_KERN, const.KERN_USRSTACK64): "kern.usrstack64",
+    (const.CTL_KERN, const.KERN_OSVERSION): "kern.osversion",
+    (const.CTL_HW, const.HW_MACHINE): "hw.machine",
+    (const.CTL_HW, const.HW_MODEL): "hw.model",
+    (const.CTL_HW, const.HW_TARGET): "hw.target",
+    (const.CTL_HW, const.HW_PRODUCT): "hw.product",
+    (const.CTL_HW, const.HW_NCPU): "hw.ncpu",
+    (const.CTL_HW, const.HW_BYTEORDER): "hw.byteorder",
+    (const.CTL_HW, const.HW_MEMSIZE): "hw.memsize",
+    (const.CTL_HW, const.HW_AVAILCPU): "hw.activecpu",
+    (const.CTL_HW, const.HW_PAGESIZE): "hw.pagesize",
+    (const.CTL_HW, const.HW_CACHELINE): "hw.cachelinesize",
+    (const.CTL_HW, const.HW_L1ICACHESIZE): "hw.l1icachesize",
+    (const.CTL_HW, const.HW_L1DCACHESIZE): "hw.l1dcachesize",
+    (const.CTL_HW, const.HW_L2CACHESIZE): "hw.l2cachesize",
+    (const.CTL_HW, const.HW_TB_FREQ): "hw.tbfrequency",
+}
+
+# Kernel parameters
+KERNEL_PARAMETERS: Dict[str, SysctlReturnValue] = {
+    "kern.ostype": "Darwin",
+    "kern.osrelease": "20.1.0",
+    "kern.osrevision": 199506,
+    "kern.version": (
+        "Darwin Kernel Version 20.1.0: Fri Oct 30 00:34:17 PDT 2020; "
+        "root:xnu-7195.42.3~1/RELEASE_ARM64_T8101"
+    ),
+    "kern.maxvnodes": 5700,
+    "kern.maxproc": 2000,
+    "kern.argmax": "262144",
+    "kern.hostname": "iPhone",
+    "kern.hostid": 0,
+    "kern.ngroups": 16,
+    "kern.saved_ids": 1,
+    "kern.boottime": Timespec.from_time_ns(
+        time.time_ns() - random.randint(8, 24) * 3600 * 10**9
+    ),
+    "kern.nisdomainname": "",
+    "kern.maxfilesperproc": 10240,
+    "kern.ipc.maxsockbuf": 6291456,
+    "kern.usrstack": 1840496640,
+    "kern.usrstack64": 6135463936,
+    "kern.osversion": "18B121",
+    "kern.osproductversion": "14.2.1",
+    "kern.bootargs": "",
+    "kern.bootsessionuuid": str(uuid.uuid4()).upper(),
+    "kern.memorystatus_level": 32,
+    "kern.secure_kernel": 1,
+    "kern.waketime": Timespec.from_time_ns(
+        time.time_ns() - random.randint(1800, 3600) * 10**9
+    ),
+    "kern.monotonicclock": 10931883,
+    "kern.monotonicclock_rate_usecs": 30,
+    "kern.monotoniclock_offset_usecs": 1728527904498687,
+    "kern.osvariant_status": 8070450536327063592,
+    "hw.machine": "iPhone13,1",
+    "hw.model": "D52gAP",
+    "hw.target": "D52gAP",
+    "hw.product": "iPhone13,1",
+    "hw.ncpu": 6,
+    "hw.byteorder": 1234,
+    "hw.memsize": 3899293696,
+    "hw.activecpu": 6,
+    "hw.physicalcpu": 6,
+    "hw.physicalcpu_max": 6,
+    "hw.logicalcpu": 6,
+    "hw.logicalcpu_max": 6,
+    "hw.cputype": 16777228,
+    "hw.cpusubtype": 2,
+    "hw.cpu64bit_capable": 1,
+    "hw.cpufamily": 458787763,
+    "hw.pagesize": 16384,
+    "hw.cachelinesize": 128,
+    "hw.l1icachesize": 131072,
+    "hw.l1dcachesize": 65536,
+    "hw.l2cachesize": 4194304,
+    "hw.tbfrequency": 24000000,
+    "security.mac.sandbox.sentinel": ".sb-b524d45c",
+    "machdep.virtual_address_size": 39,
+}
+
+
+NETWORK_INTERFACES = [
+    {
+        "index": 1,
+        "name": "en0",
+        "mac": "02:00:00:00:00:00",
+        "addresses": [
+            {
+                "family": "inet",
+                "address": "192.168.1.2",
+                "mask": "255.255.255.0",
+            }
+        ],
+    }
+]
+
+
+def _construct_sockaddr_in(address: str) -> SockaddrIn:
+    return SockaddrIn(
+        sin_len=ctypes.sizeof(SockaddrIn),
+        sin_family=const.AF_INET,
+        sin_addr=int.from_bytes(socket.inet_aton(address), "little"),
+    )
+
+
+def _construct_sockaddr_in6(address: str) -> SockaddrIn6:
+    return SockaddrIn6(
+        sin6_len=ctypes.sizeof(SockaddrIn),
+        sin6_family=const.AF_INET,
+        sin6_addr=socket.inet_pton(socket.AF_INET6, address),
+    )
+
+
+def _get_iflist():
+    msgs = []
+
+    for interface in NETWORK_INTERFACES:
+        index = interface["index"]
+        name = interface["name"]
+
+        msgs.append(
+            IfMsghdr(
+                ifm_msglen=ctypes.sizeof(IfMsghdr) + ctypes.sizeof(SockaddrDl),
+                ifm_version=const.RTM_VERSION,
+                ifm_type=const.RTM_IFINFO,
+                ifm_addrs=const.RTA_IFP,
+                ifm_index=index,
+            )
+        )
+
+        sdl_alen = 0
+        sdl_data = name.encode("utf-8")
+
+        if interface.get("mac"):
+            mac_bytes = bytes.fromhex(interface["mac"].replace(":", ""))
+            sdl_alen = len(mac_bytes)
+            sdl_data += mac_bytes
+
+        msgs.append(
+            SockaddrDl(
+                sdl_len=ctypes.sizeof(SockaddrDl),
+                sdl_family=const.AF_LINK,
+                sdl_index=index,
+                sdl_nlen=len(name),
+                sdl_alen=sdl_alen,
+                sdl_data=sdl_data,
+            )
+        )
+
+        for address in interface["addresses"]:
+            msgs.append(
+                IfaMsghdr(
+                    ifam_msglen=ctypes.sizeof(IfaMsghdr)
+                    + ctypes.sizeof(SockaddrIn) * 2,
+                    ifam_version=const.RTM_VERSION,
+                    ifam_type=const.RTM_NEWADDR,
+                    ifam_addrs=const.RTA_IFA | const.RTA_NETMASK,
+                    ifam_index=index,
+                )
+            )
+
+            if address["family"] == "inet":
+                mask = _construct_sockaddr_in(address["mask"])
+                addr = _construct_sockaddr_in(address["address"])
+                msgs.extend([mask, addr])
+            elif address["family"] == "inet6":
+                mask = _construct_sockaddr_in6(address["mask"])
+                addr = _construct_sockaddr_in6(address["address"])
+                msgs.extend([mask, addr])
+
+    return msgs
+
+
+def _get_kinfo_proc(emu, pid: int) -> Optional[KinfoProc]:
+    if pid != emu.os.getpid():
+        return None
+
+    comm = os.path.basename(emu.os.executable_path)[:16]
+
+    info = KinfoProc()
+
+    info.kp_proc.p_pid = pid
+    info.kp_proc.p_stat = const.SRUN
+    info.kp_proc.p_flag = const.P_LP64
+    info.kp_proc.p_oppid = 1
+    info.kp_proc.p_comm = comm.encode()
+
+    info.kp_eproc.e_ppid = 1
+    info.kp_eproc.e_pgid = pid
+
+    return info
+
+
+@log_call
+def sysctl(
+    emu,
+    mib: Tuple[int, int, int, int, int, int],
+) -> Optional[SysctlReturnValue]:
+    ctl_type, ctl_ident = mib[0], mib[1]
+
+    if (ctl_type, ctl_ident) in CTL_TYPE_MAP:
+        return KERNEL_PARAMETERS[CTL_TYPE_MAP[(ctl_type, ctl_ident)]]
+
+    if ctl_type == const.CTL_KERN and ctl_ident == const.KERN_PROC:
+        if mib[2] == const.KERN_PROC_PID:
+            return _get_kinfo_proc(emu, mib[3])
+
+    if ctl_type == const.CTL_NET and ctl_ident == const.PF_ROUTE:
+        if mib[4] == const.NET_RT_IFLIST:
+            return _get_iflist()
+
+    return None
+
+
+@log_call
+def sysctlbyname(name: str) -> Optional[SysctlReturnValue]:
+    result = KERNEL_PARAMETERS.get(name)
+
+    if name == "kern.osvariant_status" and isinstance(result, int):
+        # can_has_debugger = 3
+        result |= 3 << 2
+
+        # internal_release_type = 2
+        result |= 2 << 4
+
+    return result

@@ -1,0 +1,341 @@
+// Package logger will take care of all logging messages using logrus
+package logger
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+
+	"github.com/pkg/sftp"
+	"github.com/sirupsen/logrus"
+	"goshs.de/goshs/v2/webhook"
+)
+
+func isBase64(s string) bool {
+	_, err := base64.StdEncoding.DecodeString(s)
+	return err == nil
+}
+
+func validateAndParseJSON(input []byte) (bool, any) {
+	var data any
+
+	// Attempt to unmarshal the input
+	err := json.Unmarshal(input, &data)
+	if err != nil {
+		return false, nil
+	}
+
+	// If successful, return true and the parsed JSON
+	return true, data
+}
+
+// LogRequest will log the request in a uniform way
+func LogRequest(req *http.Request, status int, verbose bool, wh webhook.Webhook, body []byte) {
+	logger.Debug("We are about to log a request")
+	switch status {
+	case http.StatusInternalServerError, http.StatusNotFound, http.StatusUnauthorized, http.StatusForbidden, http.StatusBadRequest:
+		logger.Errorf("%s - [\x1b[1;31m%d\x1b[0m] - \"%s %s %s\"", req.RemoteAddr, status, req.Method, req.URL, req.Proto)
+	case http.StatusSeeOther, http.StatusMovedPermanently, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		logger.Infof("%s - [\x1b[1;34m%d\x1b[0m] - \"%s %s %s\"", req.RemoteAddr, status, req.Method, req.URL, req.Proto)
+	case http.StatusResetContent:
+		logger.Infof("%s - [\x1b[1;31m%d\x1b[0m] - \"%s %s %s\"", req.RemoteAddr, status, req.Method, req.URL, req.Proto)
+	default:
+		logger.Infof("%s - [\x1b[1;32m%d\x1b[0m] - \"%s %s %s\"", req.RemoteAddr, status, req.Method, req.URL, req.Proto)
+	}
+	if req.URL.Query() != nil {
+		for k, v := range req.URL.Query() {
+			logger.Debugf("Parameter %s is %s", k, v)
+		}
+	}
+	if verbose {
+		logger.Debug("We are using verbose logging")
+		logVerbose(req, wh, body)
+	}
+}
+
+func logVerbose(req *http.Request, wh webhook.Webhook, body []byte) {
+	// Headers
+	for k, v := range req.Header {
+		if k == "Authorization" {
+			auth := v[0]
+			logger.Verbosef("Authorization Header: %s", writeMagenta(auth))
+			HandleWebhookSend(fmt.Sprintf("[VERBOSE] Authorization Header: %s", auth), "verbose", wh)
+			if strings.Contains(strings.ToLower(auth), "basic") {
+				decodedAuth, err := base64.StdEncoding.DecodeString(auth[6:])
+				if err != nil {
+					logger.Warnf("error decoding basic auth: %s", err)
+					HandleWebhookSend(fmt.Sprintf("[VERBOSE] error decoding basic auth: %s", err), "verbose", wh)
+					return
+				}
+				logger.Verbosef("Decoded Authorization is: '%s'", writeMagenta(string(decodedAuth)))
+				HandleWebhookSend(fmt.Sprintf("[VERBOSE] Decoded Authorization is: `%s`", decodedAuth), "verbose", wh)
+			}
+		} else {
+			decodedBase64, err := base64.StdEncoding.DecodeString(v[0])
+			if err == nil && k != "Content-Type" && k != "Accept" && k != "Accept-Encoding" {
+				logger.Verbosef("Header %s is base64 and decodes to '%s'", writeMagenta(k), writeMagenta(string(decodedBase64)))
+				HandleWebhookSend(fmt.Sprintf("[VERBOSE] Header `%s` is base64 and decodes to\n```%s```\n", k, decodedBase64), "verbose", wh)
+			} else {
+				logger.Verbosef("Header %s is %s", writeMagenta(k), writeMagentaSlice(v))
+				HandleWebhookSend(fmt.Sprintf("[VERBOSE] Header `%s` is `%s`", k, v), "verbose", wh)
+			}
+		}
+	}
+	// URL Parameter
+	for k, v := range req.URL.Query() {
+		input, err := url.QueryUnescape(v[0])
+		if err != nil {
+			logger.Warnf("error unescaping url parameter: %+v", err)
+			HandleWebhookSend(fmt.Sprintf("[VERBOSE] error unescaping url parameter: %+v", err), "verbose", wh)
+		}
+		isValid, _ := validateAndParseJSON([]byte(input))
+		if isValid {
+			logger.Debug("JSON format detected")
+			dst := &bytes.Buffer{}
+			err := json.Indent(dst, []byte(v[0]), "", "  ")
+			if err != nil {
+				logger.Error(err)
+			}
+			logger.Verbosef("Parameter %s is %s\n", writeMagenta(k), writeMagenta(dst.String()))
+			HandleWebhookSend(fmt.Sprintf("[VERBOSE] JSON detected, Parameter %s is \n```%s```", k, dst.String()), "verbose", wh)
+			continue
+		}
+
+		if isBase64(v[0]) {
+			logger.Debug("Base64 detected")
+			logger.Verbosef("Decoding Base64 before printing")
+			decodedBytes, _ := base64.StdEncoding.DecodeString(v[0])
+			logger.Verbosef("Parameter %s is %s\n", writeMagenta(k), writeMagenta(string(decodedBytes)))
+			HandleWebhookSend(fmt.Sprintf("[VERBOSE] Base64 detected, Parameter `%s` is \n```%s```", k, string(decodedBytes)), "verbose", wh)
+
+			continue
+		}
+
+		logger.Debug("Neither JSON nor Base64 parameter, so printing plain")
+		logger.Verbosef("Parameter %s is %s", writeMagenta(k), writeMagenta(v[0]))
+		HandleWebhookSend(fmt.Sprintf("[VERBOSE] Parameter `%s` is `%s`", k, v[0]), "verbose", wh)
+	}
+
+	// Body
+	if body != nil {
+		if len(body) > 0 {
+			logger.Debug("Body is detected")
+			if req.Header.Get("Content-Type") == "application/json" {
+				var prettyJson bytes.Buffer
+				err := json.Indent(&prettyJson, body, "", "  ")
+				if err != nil {
+					logger.Warnf("error printing pretty json body: %+v", err)
+					HandleWebhookSend(fmt.Sprintf("[VERBOSE] error printing pretty json body: %+v", err), "verbose", wh)
+				}
+				logger.Verbosef("JSON Request Body: \n%s\n", writeMagenta(prettyJson.String()))
+				HandleWebhookSend(fmt.Sprintf("[VERBOSE] JSON Request Body: \n```%s```\n", prettyJson.String()), "verbose", wh)
+				return
+			}
+			if isBase64(string(body)) {
+				decodedBytes, _ := base64.StdEncoding.DecodeString(string(body))
+				logger.Verbosef("Base64 Request Body: \n%s\n", writeMagenta(string(decodedBytes)))
+				HandleWebhookSend(fmt.Sprintf("[VERBOSE] Base64 Request Body: \n```%s```\n", decodedBytes), "verbose", wh)
+				return
+			}
+
+			logger.Verbosef("Request Body: \n%s\n", writeMagenta(string(body)))
+			HandleWebhookSend(fmt.Sprintf("[VERBOSE] Request Body: \n```%s```\n", body), "verbose", wh)
+		}
+	}
+}
+
+func LogSFTPRequest(r *sftp.Request, ip string) {
+	switch r.Method {
+	case "Rename":
+		logger.Infof("SFTP: %s - [\x1b[1;32m%s\x1b[0m] - \"%s to %s\"", ip, r.Method, r.Filepath, r.Target)
+	default:
+		logger.Infof("SFTP: %s - [\x1b[1;32m%s\x1b[0m] - \"%s\"", ip, r.Method, r.Filepath)
+	}
+}
+
+func LogSFTPRequestBlocked(r *sftp.Request, ip string, err error) {
+	switch r.Method {
+	case "Rename":
+		logger.Errorf("SFTP: %s - [\x1b[1;31m%s\x1b[0m] - \"%s to %s\" - %+v", ip, r.Method, r.Filepath, r.Target, err.Error())
+	default:
+		logger.Errorf("SFTP: %s - [\x1b[1;31m%s\x1b[0m] - \"%s\": %+v", ip, r.Method, r.Filepath, err.Error())
+	}
+}
+
+func HandleWebhookSend(message string, event string, wh webhook.Webhook) {
+	if !wh.GetEnabled() {
+		return
+	}
+	send := wh.Contains(event) || (wh.Contains("all") && event != "verbose")
+	if send {
+		if err := wh.Send(message); err != nil {
+			logger.Error(err)
+		}
+	}
+}
+
+var logger *StandardLogger
+
+func writeMagenta(s string) string {
+	return fmt.Sprintf("\x1b[1;35m%s\x1b[0m", s)
+}
+
+func writeMagentaSlice(s []string) string {
+	return fmt.Sprintf("\x1b[1;35m%s\x1b[0m", strings.Join(s, " "))
+}
+
+func PrintBanner(version string) {
+	fmt.Printf("  __ _  ___  ___| |__  ___ \n")
+	fmt.Printf(" / _` |/ _ \\/ __| '_ \\/ __|\n")
+	fmt.Printf("| (_| | (_) \\__ \\ | | \\__ \\\n")
+	fmt.Printf(" \\__, |\\___/|___/_| |_|___/\n")
+	fmt.Printf("  __/ |                    \n")
+	fmt.Printf(" |___/              %s\n\n", version)
+}
+
+func init() {
+	logger = NewLogger()
+}
+
+// Event stores messages to log later, from our standard interface.
+type Event struct {
+	id      int
+	message string
+}
+
+// StandardLogger enforces specific log message formats.
+type StandardLogger struct {
+	*logrus.Logger
+}
+
+type CustomFormatter struct {
+	logrus.TextFormatter
+}
+
+func (f *CustomFormatter) Format(entry *logrus.Entry) ([]byte, error) {
+	// Check for custom 'verbose' field
+	if verbose, ok := entry.Data["verbose"]; ok && verbose == true {
+		// Format timestamp
+		timestamp := entry.Time.Format(f.TimestampFormat)
+		// Apply a different color (e.g. magenta: "\x1b[1;35m")
+		output := fmt.Sprintf("\x1b[1;35mVERB\x1b[0m   [%s] %s\n", timestamp, entry.Message)
+
+		return []byte(output), nil
+	}
+	return f.TextFormatter.Format(entry)
+}
+
+// NewLogger initializes the standard logger.
+func NewLogger() *StandardLogger {
+	baseLogger := logrus.New()
+	standardLogger := &StandardLogger{baseLogger}
+
+	standardLogger.SetFormatter(&CustomFormatter{
+		TextFormatter: logrus.TextFormatter{
+			FullTimestamp:   true,
+			ForceColors:     true,
+			PadLevelText:    true,
+			TimestampFormat: "2006-01-02 15:04:05",
+		},
+	})
+
+	// Log level
+	standardLogger.SetLevel(logrus.InfoLevel)
+
+	if os.Getenv("DEBUG") == "TRUE" {
+		standardLogger.SetLevel(logrus.DebugLevel)
+		// standardLogger.SetReportCaller(true)
+	}
+
+	return standardLogger
+}
+
+func LogFile(multiwriter io.Writer) {
+	logger.SetOutput(multiwriter)
+}
+
+// Declare variables to store log messages as new Events
+var (
+	missingEnvMessage = Event{1, "Missing env key: %s"}
+)
+
+// MissingEnv is a standard error message
+func MissingEnv(envName string) {
+	logger.Panicf(missingEnvMessage.message, envName)
+}
+
+// Debug Log
+func Debug(args ...any) {
+	logger.Debugln(args...)
+}
+
+// Debugf Log
+func Debugf(format string, args ...any) {
+	logger.Debugf(format, args...)
+}
+
+// Info Log
+func Info(args ...any) {
+	logger.Infoln(args...)
+}
+
+// Infof Log
+func Infof(format string, args ...any) {
+	logger.Infof(format, args...)
+}
+
+// Warn Log
+func Warn(args ...any) {
+	logger.Warnln(args...)
+}
+
+// Warnf Log
+func Warnf(format string, args ...any) {
+	logger.Warnf(format, args...)
+}
+
+// Panic Log
+func Panic(args ...any) {
+	logger.Panicln(args...)
+}
+
+// Panicf Log
+func Panicf(format string, args ...any) {
+	logger.Panicf(format, args...)
+}
+
+// Error Log
+func Error(args ...any) {
+	logger.Errorln(args...)
+}
+
+// Errorf Log
+func Errorf(format string, args ...any) {
+	logger.Errorf(format, args...)
+}
+
+// Fatal Log
+func Fatal(args ...any) {
+	logger.Fatalln(args...)
+}
+
+// Fatalf Log
+func Fatalf(format string, args ...any) {
+	logger.Fatalf(format, args...)
+}
+
+// Verbose Log
+func (l *StandardLogger) Verbose(args ...any) {
+	l.WithField("verbose", true).Infoln(args...)
+}
+
+// Verbosef Log
+func (l *StandardLogger) Verbosef(format string, args ...any) {
+	l.WithField("verbose", true).Infof(format, args...)
+}

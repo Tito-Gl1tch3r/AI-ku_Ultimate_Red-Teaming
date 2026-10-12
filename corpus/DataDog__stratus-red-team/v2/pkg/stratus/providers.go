@@ -1,0 +1,197 @@
+package stratus
+
+import (
+	"errors"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/datadog/stratus-red-team/v2/internal/providers"
+	"github.com/datadog/stratus-red-team/v2/internal/utils"
+	"github.com/google/uuid"
+	"k8s.io/client-go/rest"
+)
+
+// Re-exported provider option types so external consumers can use them
+// without importing the internal providers package.
+type (
+	AWSProviderOption     = providers.AWSProviderOption
+	GCPProviderOption     = providers.GCPProviderOption
+	AzureProviderOption   = providers.AzureProviderOption
+	EntraIdProviderOption = providers.EntraIdProviderOption
+	K8sProviderOption     = providers.K8sProviderOption
+	EKSProviderOption     = providers.EKSProviderOption
+)
+
+// AWS provider options
+
+func WithAWSConfig(cfg aws.Config) AWSProviderOption { return providers.WithAWSConfig(cfg) }
+
+// GCP provider options
+
+func WithGCPProjectID(projectId string) GCPProviderOption {
+	return providers.WithGCPProjectID(projectId)
+}
+
+// Azure provider options
+
+func WithAzureCredentials(cred azcore.TokenCredential) AzureProviderOption {
+	return providers.WithAzureCredentials(cred)
+}
+func WithAzureSubscriptionID(id string) AzureProviderOption {
+	return providers.WithAzureSubscriptionID(id)
+}
+
+// Entra ID provider options
+
+func WithEntraIdCredentials(cred azcore.TokenCredential) EntraIdProviderOption {
+	return providers.WithEntraIdCredentials(cred)
+}
+
+// Kubernetes provider options
+
+func WithK8sRestConfig(cfg *rest.Config) K8sProviderOption { return providers.WithK8sRestConfig(cfg) }
+
+// EKS provider options
+
+func WithEKSAWSProvider(p *providers.AWSProvider) EKSProviderOption {
+	return providers.WithEKSAWSProvider(p)
+}
+func WithEKSK8sProvider(p *providers.K8sProvider) EKSProviderOption {
+	return providers.WithEKSK8sProvider(p)
+}
+
+// Provider factory functions — delegate to internal constructors.
+
+func NewAWSProvider(correlationId uuid.UUID, opts ...AWSProviderOption) *providers.AWSProvider {
+	return providers.NewAWSProvider(correlationId, opts...)
+}
+func NewGCPProvider(correlationId uuid.UUID, opts ...GCPProviderOption) *providers.GCPProvider {
+	return providers.NewGCPProvider(correlationId, opts...)
+}
+func NewAzureProvider(correlationId uuid.UUID, opts ...AzureProviderOption) *providers.AzureProvider {
+	return providers.NewAzureProvider(correlationId, opts...)
+}
+func NewEntraIdProvider(correlationId uuid.UUID, opts ...EntraIdProviderOption) *providers.EntraIdProvider {
+	return providers.NewEntraIdProvider(correlationId, opts...)
+}
+func NewK8sProvider(correlationId uuid.UUID, opts ...K8sProviderOption) *providers.K8sProvider {
+	return providers.NewK8sProvider(correlationId, opts...)
+}
+func NewEKSProvider(correlationId uuid.UUID, opts ...EKSProviderOption) *providers.EKSProvider {
+	return providers.NewEKSProvider(correlationId, opts...)
+}
+
+// AWSConfigFromCredentials builds an aws.Config with explicit static
+// credentials. Re-exported from internal/utils for external consumers.
+var AWSConfigFromCredentials = utils.AwsConfigFromCredentials
+
+// CloudProviders provides a unified interface to access the various cloud providers SDKs
+type CloudProviders interface {
+	AWS() *providers.AWSProvider
+	K8s() *providers.K8sProvider
+	Azure() *providers.AzureProvider
+	EntraId() *providers.EntraIdProvider
+	GCP() *providers.GCPProvider
+	EKS() *providers.EKSProvider
+}
+
+type CloudProvidersImpl struct {
+	UniqueCorrelationID uuid.UUID
+	AWSProvider         *providers.AWSProvider
+	K8sProvider         *providers.K8sProvider
+	AzureProvider       *providers.AzureProvider
+	GCPProvider         *providers.GCPProvider
+	EKSProvider         *providers.EKSProvider
+	EntraIdProvider     *providers.EntraIdProvider
+}
+
+func (m CloudProvidersImpl) AWS() *providers.AWSProvider {
+	if m.AWSProvider == nil {
+		m.AWSProvider = providers.NewAWSProvider(m.UniqueCorrelationID)
+	}
+	return m.AWSProvider
+}
+
+func (m CloudProvidersImpl) K8s() *providers.K8sProvider {
+	if m.K8sProvider == nil {
+		m.K8sProvider = providers.NewK8sProvider(m.UniqueCorrelationID)
+	}
+	return m.K8sProvider
+}
+
+func (m CloudProvidersImpl) Azure() *providers.AzureProvider {
+	if m.AzureProvider == nil {
+		m.AzureProvider = providers.NewAzureProvider(m.UniqueCorrelationID)
+	}
+	return m.AzureProvider
+}
+
+func (m CloudProvidersImpl) GCP() *providers.GCPProvider {
+	if m.GCPProvider == nil {
+		m.GCPProvider = providers.NewGCPProvider(m.UniqueCorrelationID)
+	}
+	return m.GCPProvider
+}
+
+func (m CloudProvidersImpl) EKS() *providers.EKSProvider {
+	if m.EKSProvider == nil {
+		m.EKSProvider = providers.NewEKSProvider(m.UniqueCorrelationID)
+	}
+	return m.EKSProvider
+}
+
+func (m CloudProvidersImpl) EntraId() *providers.EntraIdProvider {
+	if m.EntraIdProvider == nil {
+		m.EntraIdProvider = providers.NewEntraIdProvider(m.UniqueCorrelationID)
+	}
+	return m.EntraIdProvider
+}
+
+// EnsureAuthenticated ensures that the current user is properly authenticated against a specific platform
+func EnsureAuthenticated(platform Platform) error {
+	providerFactory := CloudProvidersImpl{UniqueCorrelationID: uuid.New()}
+	switch platform {
+	case AWS:
+		if !providerFactory.AWS().IsAuthenticatedAgainstAWS() {
+			return errors.New("you are not authenticated against AWS, *or* you have not set your region. \n\n" +
+				"Troubleshooting:\n" +
+				"1. Are you authenticated against AWS?\n" +
+				"2. Do you have a region or default region set (whether in your AWS configuration file or in your environment)? If not, run 'export AWS_REGION=xxx'")
+		}
+	case Azure:
+		if !providerFactory.Azure().IsAuthenticatedAgainstAzure() {
+			return errors.New("you are not authenticated against Azure, or you have not set your subscription. " +
+				"Make sure you are authenticated against Azure and you have your Azure subscription ID set in your environment" +
+				" (export AZURE_SUBSCRIPTION_ID=xxx)")
+		}
+	case EntraID:
+		if !providerFactory.EntraId().IsAuthenticatedAgainstEntraId() {
+			return errors.New("you are not authenticated against Entra ID. " +
+				"Make sure you have run 'az login --allow-no-subscriptions'")
+		}
+	case Kubernetes:
+		if !providerFactory.K8s().IsAuthenticated() {
+			return errors.New("You do not have a kubeconfig set up, or you do not have proper permissions for " +
+				"this cluster. Make sure you have proper credentials set in " + providers.GetKubeConfigPath())
+		}
+	case GCP:
+		if !providerFactory.GCP().IsAuthenticated() {
+			return errors.New("you are not authenticated against GCP, or you have not set your project. " +
+				"Make sure you are authenticated against GCP and you have set your GCP Project ID in your environment variables" +
+				" (export GOOGLE_PROJECT=xxx)")
+		}
+	case EKS:
+		if !providerFactory.EKS().IsAuthenticatedAgainstEKS() {
+			return errors.New("you are not authenticated against AWS or an EKS cluster.\n" +
+				"To use Stratus Red Team's EKS modules, you need to be authenticated both to an AWS account through the AWS CLI, and to an EKS cluster.\n\n" +
+				"Troubleshooting:\n" +
+				"1. Are you authenticated against AWS?\n" +
+				"2. Do you have a region or default region set (whether in your AWS configuration file or in your environment)? If not, run 'export AWS_REGION=xxx'\n" +
+				"3. Are you authenticated against an EKS cluster? If not, run 'aws eks update-kubeconfig --name <cluster-name>'")
+		}
+	default:
+		return errors.New("unhandled platform " + string(platform))
+	}
+
+	return nil
+}

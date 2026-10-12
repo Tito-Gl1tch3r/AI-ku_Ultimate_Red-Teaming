@@ -1,0 +1,384 @@
+"""
+Checkers
+"""
+import os
+import subprocess
+import re
+
+import utils.color_print as color_print
+import utils.verbose as verbose_func
+import config
+from packaging import version
+
+def containerd_installed(verbose=False):
+    """Check whether containerd has been installed and is running.
+
+    Returns:
+        True if containerd service is active, else False.
+    """
+    _, stderr = verbose_func.verbose_output(verbose)
+    try:
+        temp_cmd = 'ctr version'.split()
+        subprocess.run(
+            temp_cmd,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            check=True)
+        color_print.debug('containerd already installed')
+        return True
+    except (FileNotFoundError, AttributeError, IndexError, subprocess.CalledProcessError):
+        return False
+
+
+def runtime_installed(runtime='docker', verbose=False):
+    """Check whether the specified container runtime is installed.
+
+    Args:
+        runtime: 'docker' or 'containerd'.
+        verbose: Verbose or not.
+
+    Returns:
+        True if the runtime is installed, else False.
+    """
+    if runtime == 'containerd':
+        return containerd_installed(verbose=verbose)
+    return docker_installed(verbose=verbose)
+
+
+def docker_kubernetes_installed(verbose=False, runtime='docker'):
+    """Check whether a container runtime AND Kubernetes have been installed.
+
+    Args:
+        verbose: Verbose or not.
+        runtime: Container runtime to check ('docker' or 'containerd').
+
+    Returns:
+        If runtime and Kubernetes have been both installed, return True, else False.
+    """
+    if not runtime_installed(runtime=runtime, verbose=verbose):
+        color_print.error(
+            'it seems {runtime} is not installed or correctly configured'.format(runtime=runtime))
+        if runtime == 'containerd':
+            color_print.error(
+                'you can run `metarget gadget install k8s --version 1.28.4` (containerd is auto-installed)')
+        else:
+            color_print.error(
+                'you can run `metarget gadget install docker --version 18.03.1` to install one')
+        return False
+    if not kubernetes_installed(verbose=verbose):
+        color_print.error(
+            'it seems kubernetes is not installed or correctly configured')
+        color_print.error(
+            'you can run `metarget gadget install k8s --version 1.28.4` to install one')
+        return False
+    return True
+
+
+def kubernetes_installed(verbose=False):
+    """Check whether Kubernetes has been installed.
+
+    Args:
+        verbose: Verbose or not.
+
+    Returns:
+        If Kubernetes has been installed, return True, else False.
+    """
+    _, stderr = verbose_func.verbose_output(verbose)
+    try:
+        subprocess.run(
+            ['kubectl', 'cluster-info'],
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            check=True)
+        color_print.debug('kubernetes already installed')
+        return True
+    except (FileNotFoundError, AttributeError, IndexError, subprocess.CalledProcessError):
+        return False
+
+
+def docker_installed(verbose=False):
+    """Check whether Docker has been installed.
+
+    Args:
+        verbose: Verbose or not.
+
+    Returns:
+        If Docker has been installed, return True, else False.
+    """
+    _, stderr = verbose_func.verbose_output(verbose)
+    try:
+        temp_cmd = 'docker version'.split()
+        subprocess.run(
+            temp_cmd,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            check=True)
+        color_print.debug('docker already installed')
+        return True
+    except (FileNotFoundError, AttributeError, IndexError, subprocess.CalledProcessError):
+        return False
+
+
+def kubernetes_specified_installed(temp_gadget, verbose=False):
+    """Check whether Kubernetes with specified version has been installed.
+
+    Uses kubelet --version (client-side, no API server connection needed) so
+    the check reliably returns True even when the cluster is not yet running.
+
+    Args:
+        temp_gadget: Kubernetes gadgets (e.g. kubelet, kubeadm).
+        verbose: Verbose or not.
+
+    Returns:
+        If Kubernetes with specified version has been installed, return True,
+        else False.
+    """
+    _, stderr = verbose_func.verbose_output(verbose)
+    try:
+        res = subprocess.run(
+            ['kubelet', '--version'],
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            check=True)
+        installed_version = re.search(
+            r'v([\d]+\.[\d]+\.[\d]+)',
+            res.stdout.decode('utf-8')).group(1)
+        requested = temp_gadget[0]['version'].lstrip('v')
+        # Minor-only input (e.g. '1.33') matches any installed patch of that minor
+        if requested.count('.') < 2:
+            installed_minor = '.'.join(installed_version.split('.')[:2])
+            return installed_minor == requested
+        return installed_version == requested
+    except (FileNotFoundError, AttributeError, IndexError, subprocess.CalledProcessError):
+        return False
+
+
+def docker_specified_installed(temp_gadgets, verbose=False):
+    """Check whether Docker with specified version has been installed.
+
+    Args:
+        temp_gadgets: Docker gadgets (e.g. docker-ce).
+        verbose: Verbose or not.
+
+    Returns:
+        If Docker with specified version has been installed, return True,
+        else False.
+    """
+    _, stderr = verbose_func.verbose_output(verbose)
+    try:
+        temp_cmd = 'docker version'.split()
+        res = subprocess.run(
+            temp_cmd,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            check=True)
+        server_string = res.stdout.decode('utf-8').split('Server')[1]
+        server_version = re.search(
+            r'Version: *([\d]+\.[\d]+\.[\d]+)',
+            server_string).group(1)
+        temp_version = _get_gadget_version_from_gadgets(
+            gadgets=temp_gadgets, name='docker-ce')
+        if temp_version and server_version == temp_version:
+            return True
+        return False
+    except (FileNotFoundError, AttributeError, IndexError, subprocess.CalledProcessError):
+        return False
+
+def whether_docker_newer_than_18_09(verbose=False):
+    """Check whether Docker is newer than 18.09.
+
+    Args:
+        verbose: Verbose or not.
+
+    Returns:
+        If Docker >=18.09, return True, else False.
+    """
+    _, stderr = verbose_func.verbose_output(verbose)
+    try:
+        temp_cmd = 'docker version'.split()
+        res = subprocess.run(
+            temp_cmd,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            check=True)
+        server_string = res.stdout.decode('utf-8').split('Server')[1]
+        server_version = re.search(
+            r'Version: *([\d]+\.[\d]+\.[\d]+)',
+            server_string).group(1)
+        if version.parse(server_version) >= version.parse('18.09'):
+            return True
+        return False
+    except (FileNotFoundError, AttributeError, IndexError, subprocess.CalledProcessError):
+        return False
+
+
+
+def containerd_specified_installed(temp_gadgets, verbose=False):
+    """Check whether Containerd with specified version has been installed.
+
+    Args:
+        temp_gadgets: Docker gadgets (e.g. containerd).
+        verbose: Verbose or not.
+
+    Returns:
+        If Containerd with specified version has been installed, return True,
+        else False.
+    """
+    _, stderr = verbose_func.verbose_output(verbose)
+    try:
+        temp_cmd = 'ctr version'.split()
+        res = subprocess.run(
+            temp_cmd,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            check=True)
+        server_string = res.stdout.decode('utf-8').split('Server')[1]
+        server_version = re.search(
+            r'Version:\s*(.*)\s+',
+            server_string).group(1)
+        temp_version = _get_gadget_version_from_gadgets(
+            gadgets=temp_gadgets, name='containerd.io')
+        if temp_version and server_version.startswith(temp_version):
+            return True
+        return False
+    except (FileNotFoundError, AttributeError, IndexError, subprocess.CalledProcessError):
+        return False
+
+def runc_executable(verbose=False):
+    _, stderr = verbose_func.verbose_output(verbose)
+    try:
+        # 执行 runc --version 命令
+        temp_cmd = 'chmod +x /usr/bin/runc'.split()
+        res = subprocess.run(
+            temp_cmd,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            check=True)
+    except (FileNotFoundError, AttributeError, IndexError, subprocess.CalledProcessError):
+        return False
+
+def runc_specified_installed(temp_gadgets, verbose=False):
+    """Check whether runc with specified version has been installed.
+
+    Args:
+        temp_gadgets: Docker gadgets (e.g. runc).
+        verbose: Verbose or not.
+
+    Returns:
+        If runc with specified version has been installed, return True,
+        else False.
+    """
+    _, stderr = verbose_func.verbose_output(verbose)
+    try:
+        # 执行 runc --version 命令
+        temp_cmd = 'runc --version'.split()
+        res = subprocess.run(
+            temp_cmd,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            check=True)
+        
+        # 提取 runc 版本信息
+        version_string = res.stdout.decode('utf-8')
+        # 从输出中提取版本号
+        runc_version = re.search(r'runc version (\S+)', version_string).group(1)
+        
+        # 获取传入的指定版本
+        temp_version = _get_gadget_version_from_gadgets(gadgets=temp_gadgets, name='runc')
+        
+        # 检查版本是否匹配
+        if temp_version and runc_version.startswith(temp_version):
+            return True
+        return False
+    except (FileNotFoundError, AttributeError, IndexError, subprocess.CalledProcessError):
+        return False
+
+
+def _get_gadget_version_from_gadgets(gadgets, name, verbose=False):
+    for gadget in gadgets:
+        if gadget['name'] == name:
+            return gadget['version']
+    return None
+
+
+def gadget_in_gadgets(gadgets, name, verbose=False):
+    for gadgets in gadgets:
+        if gadgets['name'] == name:
+            return True
+    return False
+
+
+def kernel_specified_installed(temp_gadget, verbose=False):
+    """Check whether Linux kernel with specified version has been installed.
+
+    Args:
+        temp_gadget: Kernel gadgets (e.g. kernel).
+        verbose: Verbose or not.
+
+    Returns:
+        If kernel with specified version has been installed, return True,
+        else False.
+    """
+    try:
+        _, stderr = verbose_func.verbose_output(verbose)
+        temp_cmd = 'uname -r'.split()
+        res = subprocess.run(
+            temp_cmd,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            check=True)
+        version_string = res.stdout.decode('utf-8')
+        if version_string.startswith(temp_gadget[0]['version']):
+            return True
+        return False
+    except (FileNotFoundError, AttributeError, IndexError, subprocess.CalledProcessError):
+        return False
+
+
+def kata_specified_installed(temp_gadget, kata_runtime_type, verbose=False):
+    """Check whether kata-containers with specified version has been installed.
+
+    Args:
+        temp_gadget: Kata-containers gadgets (e.g. kata-containers).
+        kata_runtime_type: Runtime of Kata (e.g. qemu/clh/...).
+        verbose:
+
+    Returns:
+        If kata-containers with specified version has been installed, return True,
+        else False.
+    """
+    try:
+        _, stderr = verbose_func.verbose_output(verbose)
+        temp_cmd = '{base_dir}/bin/kata-runtime --version'.format(
+            base_dir=config.kata_tar_decompress_dest).split()
+        res = subprocess.run(
+            temp_cmd,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            check=True)
+        version_string = res.stdout.decode('utf-8').split('\n')[0]
+        server_version = re.search(
+            r'.*([\d]+\.[\d]+\.[\d]+)',
+            version_string).group(1)
+        if server_version == temp_gadget[0]['version']:
+            # check whether kata runtime type is also correct
+            try:
+                link_target = os.readlink(
+                    '{kata_config_dir}/configuration.toml'.format(kata_config_dir=config.kata_config_dir))
+                actual_runtime_type = link_target.split('.')[0].split('-')[-1]
+                if actual_runtime_type != kata_runtime_type:
+                    color_print.warning(
+                        'your expected kata runtime type is {expected}, while current type is {actual}'.format(
+                            expected=kata_runtime_type, actual=actual_runtime_type))
+                    color_print.warning(
+                        'you can configure runtime type manually')
+            except (FileNotFoundError, OSError):
+                color_print.warning(
+                    'configuration.toml does not exist or is not an effective symbol link to real configurations')
+                color_print.warning(
+                    'please check configurations in {kata_config_dir} manually'.format(
+                        kata_config_dir=config.kata_config_dir))
+            return True
+        return False
+    except (IndexError, AttributeError, FileNotFoundError, subprocess.CalledProcessError):
+        return False

@@ -1,0 +1,148 @@
+package ldap
+
+import (
+	"encoding/hex"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+)
+
+func EndianConvert(sd string) (newSD string) {
+	sdBytes, _ := hex.DecodeString(sd)
+
+	for i, j := 0, len(sdBytes)-1; i < j; i, j = i+1, j-1 {
+		sdBytes[i], sdBytes[j] = sdBytes[j], sdBytes[i]
+	}
+
+	newSD = hex.EncodeToString(sdBytes)
+
+	return
+}
+
+func HexToDecimalString(hex string) (decimal string) {
+	integer, _ := strconv.ParseInt(hex, 16, 64)
+	decimal = strconv.Itoa(int(integer))
+
+	return
+}
+
+func ConvertSID(hexSID string) (SID string) {
+	if len(hexSID) < 16 {
+		return ""
+	}
+
+	var fields []string
+	fields = append(fields, hexSID[0:2])
+	if len(fields) > 0 && fields[0] == "01" {
+		fields[0] = "S-1"
+	}
+	numDashes, _ := strconv.Atoi(HexToDecimalString(hexSID[2:4]))
+
+	fields = append(fields, "-"+HexToDecimalString(hexSID[4:16]))
+
+	lower, upper := 16, 24
+	for i := 1; i <= numDashes; i++ {
+		if upper > len(hexSID) {
+			break
+		}
+		fields = append(fields, "-"+HexToDecimalString(EndianConvert(hexSID[lower:upper])))
+		lower += 8
+		upper += 8
+	}
+
+	for i := 0; i < len(fields); i++ {
+		SID += (fields[i])
+	}
+
+	return
+}
+
+func BytesToGUID(b []byte) string {
+	if len(b) != 16 {
+		return ""
+	}
+
+	hexStr := hex.EncodeToString(b)
+	return ConvertGUID(hexStr)
+}
+
+func ConvertGUID(portion string) string {
+	if len(portion) < 32 {
+		return ""
+	}
+
+	portion1 := EndianConvert(portion[0:8])
+	portion2 := EndianConvert(portion[8:12])
+	portion3 := EndianConvert(portion[12:16])
+	portion4 := portion[16:20]
+	portion5 := portion[20:]
+	return portion1 + "-" + portion2 + "-" + portion3 + "-" + portion4 + "-" + portion5
+}
+
+func EncodeGUID(guid string) (string, error) {
+	tokens := strings.Split(guid, "-")
+	if len(tokens) != 5 {
+		return "", fmt.Errorf("wrong GUID format")
+	}
+
+	result := ""
+	result += EndianConvert(tokens[0])
+	result += EndianConvert(tokens[1])
+	result += EndianConvert(tokens[2])
+	result += tokens[3]
+	result += tokens[4]
+	return result, nil
+}
+
+func DistinguishedNameToDomain(dn string) string {
+	// Convert DN to uppercase for consistent processing
+	dn = strings.ToUpper(dn)
+
+	// Find all DC= components
+	parts := strings.Split(dn, ",")
+	domainParts := []string{}
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "DC=") {
+			domainParts = append(domainParts, strings.TrimPrefix(part, "DC="))
+		}
+	}
+
+	if len(domainParts) == 0 {
+		return ""
+	}
+
+	return strings.Join(domainParts, ".")
+}
+
+// Converts time in format 20060102150405.0Z into Unix epoch seconds.
+func FormatTime1(whenCreatedStr string) int64 {
+	var whenCreatedEpoch int64
+	if whenCreatedStr != "" {
+		t, err := time.Parse("20060102150405.0Z", whenCreatedStr)
+		if err == nil {
+			whenCreatedEpoch = t.Unix()
+		}
+	}
+
+	return whenCreatedEpoch
+}
+
+// Converts a Windows FILETIME to Unix epoch seconds.
+func FormatTime2(fileTimeStr string) int64 {
+	if fileTimeStr == "" {
+		return 0
+	}
+
+	// Active Directory timestamps are in 100-nanosecond intervals since Jan 1, 1601.
+	var ft int64
+	_, err := fmt.Sscan(fileTimeStr, &ft)
+	if err != nil || ft == 0 {
+		return 0
+	}
+	// Convert: subtract epoch difference and divide by 10,000,000 to get seconds.
+	unixTime := (ft / 10000000) - 11644473600
+	return unixTime
+}

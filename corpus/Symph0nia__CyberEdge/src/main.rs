@@ -1,0 +1,238 @@
+use prost_types::Timestamp;
+use std::{
+    env, io,
+    os::unix::fs::FileTypeExt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use cyberedge::{
+    BASELINE_SERVICE_PORTS, CrtShSource, CyberEdgeService, DiscoveryWorker, NotificationDispatcher,
+    PostgresRepository, Repository, RuntimeReadiness, ScanVantage, SocketCveProbe,
+    SocketNucleiProbe, SocketPublicCodeProbe, SocketRegistrationProbe, SocketScreenshotProbe,
+    StaticAuthorizer, SystemCertificateProbe, SystemDnsResolver, SystemPortConnector,
+    SystemScreenshotProbe, SystemServiceProbe, SystemWebsiteProbe, WebAccess, WebhookSink,
+    serve_read_only_web,
+};
+use tokio::{net::UnixListener, signal};
+use tokio_stream::wrappers::UnixListenerStream;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let database_url = env::var("DATABASE_URL").map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "DATABASE_URL is required for persistent runtime",
+        )
+    })?;
+    let policy_path = env::var("CYBEREDGE_AGENT_POLICY").map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CYBEREDGE_AGENT_POLICY is required",
+        )
+    })?;
+    let repository = Arc::new(PostgresRepository::connect(&database_url).await?);
+    let authorizer = Arc::new(StaticAuthorizer::load(policy_path)?);
+    let execution_enabled = !env::var("CYBEREDGE_EXECUTION_ENABLED")
+        .is_ok_and(|value| value == "false" || value == "0");
+    let readiness = RuntimeReadiness {
+        screenshot: env::var_os("CYBEREDGE_SCREENSHOT_RENDERER_SOCKET").is_some()
+            || env::var("CYBEREDGE_SCREENSHOTS_ENABLED")
+                .is_ok_and(|value| value == "true" || value == "1"),
+        nuclei: env::var_os("CYBEREDGE_NUCLEI_ADAPTER_SOCKET").is_some(),
+        public_code: env::var_os("CYBEREDGE_PUBLIC_CODE_ADAPTER_SOCKET").is_some(),
+        cve: env::var_os("CYBEREDGE_CVE_ADAPTER_SOCKET").is_some(),
+        registration: env::var_os("CYBEREDGE_REGISTRATION_ADAPTER_SOCKET").is_some(),
+    };
+    let scan_vantage = env::var("CYBEREDGE_SCAN_VANTAGE").unwrap_or_else(|_| "external".to_owned());
+    let scan_vantage = ScanVantage::parse(&scan_vantage).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CYBEREDGE_SCAN_VANTAGE must be external, internal, or mixed",
+        )
+    })?;
+    let intelligence_proxy = env::var("CYBEREDGE_INTELLIGENCE_PROXY").ok();
+    let mut discovery = DiscoveryWorker::new(repository.clone(), Arc::new(SystemDnsResolver))
+        .with_certificate_source(Arc::new(CrtShSource::with_proxy(
+            intelligence_proxy.as_deref(),
+        )?))
+        .with_port_connector(
+            Arc::new(SystemPortConnector),
+            BASELINE_SERVICE_PORTS.to_vec(),
+        )
+        .with_scan_vantage(scan_vantage)
+        .with_service_probe(Arc::new(SystemServiceProbe))
+        .with_certificate_probe(Arc::new(SystemCertificateProbe::new()))
+        .with_website_probe(Arc::new(SystemWebsiteProbe));
+    if let Ok(socket) = env::var("CYBEREDGE_SCREENSHOT_RENDERER_SOCKET") {
+        discovery = discovery.with_screenshot_probe(Arc::new(SocketScreenshotProbe::new(socket)));
+    } else if env::var("CYBEREDGE_SCREENSHOTS_ENABLED")
+        .is_ok_and(|value| value == "true" || value == "1")
+    {
+        let binary =
+            env::var("CYBEREDGE_CHROMIUM_BIN").unwrap_or_else(|_| "/usr/bin/chromium".to_owned());
+        discovery = discovery.with_screenshot_probe(Arc::new(SystemScreenshotProbe::new(binary)));
+    }
+    if let Ok(socket) = env::var("CYBEREDGE_NUCLEI_ADAPTER_SOCKET") {
+        discovery = discovery.with_nuclei_probe(Arc::new(SocketNucleiProbe::new(socket)));
+    }
+    if let Ok(socket) = env::var("CYBEREDGE_PUBLIC_CODE_ADAPTER_SOCKET") {
+        discovery = discovery.with_public_code_probe(Arc::new(SocketPublicCodeProbe::new(socket)));
+    }
+    if let Ok(socket) = env::var("CYBEREDGE_CVE_ADAPTER_SOCKET") {
+        discovery = discovery.with_cve_probe(Arc::new(SocketCveProbe::new(socket)));
+    }
+    if let Ok(socket) = env::var("CYBEREDGE_REGISTRATION_ADAPTER_SOCKET") {
+        discovery =
+            discovery.with_registration_probe(Arc::new(SocketRegistrationProbe::new(socket)));
+    }
+    let scheduler_repository = repository.clone();
+    let scheduler = execution_enabled.then(|| {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let duration = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system time must be after Unix epoch");
+                let timestamp = Timestamp {
+                    seconds: duration.as_secs() as i64,
+                    nanos: duration.subsec_nanos() as i32,
+                };
+                if let Err(error) = scheduler_repository.enqueue_due_schedules(timestamp).await {
+                    eprintln!("schedule worker error: {error}");
+                }
+            }
+        })
+    });
+    let worker = execution_enabled.then(|| {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                if let Err(error) = discovery.run_once().await {
+                    eprintln!("discovery worker error: {error}");
+                }
+            }
+        })
+    });
+    let notification = match (execution_enabled, env::var("CYBEREDGE_WEBHOOK_URL")) {
+        (false, _) => None,
+        (true, Ok(url)) => {
+            let sink = Arc::new(WebhookSink::new(
+                &url,
+                env::var("CYBEREDGE_WEBHOOK_BEARER_TOKEN").ok(),
+            )?);
+            let dispatcher = NotificationDispatcher::new(repository.clone(), sink);
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    if let Err(error) = dispatcher.dispatch_once().await {
+                        eprintln!("notification dispatcher error: {error}");
+                    }
+                }
+            }))
+        }
+        (true, Err(env::VarError::NotPresent)) => None,
+        (true, Err(error)) => return Err(error.into()),
+    };
+    let web = match env::var("CYBEREDGE_WEB_BIND") {
+        Ok(value) => {
+            let address = value.parse()?;
+            let access = WebAccess::from_env(address).await?;
+            let dist = PathBuf::from(
+                env::var("CYBEREDGE_WEB_DIST").unwrap_or_else(|_| "web/dist".to_owned()),
+            );
+            let repository = repository.clone();
+            Some(tokio::spawn(async move {
+                if let Err(error) = serve_read_only_web(repository, address, dist, access).await {
+                    eprintln!("read-only web error: {error}");
+                }
+            }))
+        }
+        Err(env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let service = CyberEdgeService::new(repository, authorizer)
+        .with_readiness(readiness)
+        .server();
+    if let Ok(value) = env::var("CYBEREDGE_RPC_ADDR") {
+        let address = value.parse()?;
+        let identity = Identity::from_pem(
+            required_file("CYBEREDGE_TLS_CERT")?,
+            required_file("CYBEREDGE_TLS_KEY")?,
+        );
+        let client_ca = Certificate::from_pem(required_file("CYBEREDGE_TLS_CLIENT_CA")?);
+        println!("CyberEdge RPC listening with mTLS on https://{address}");
+        Server::builder()
+            .tls_config(
+                ServerTlsConfig::new()
+                    .identity(identity)
+                    .client_ca_root(client_ca),
+            )?
+            .add_service(service)
+            .serve_with_shutdown(address, shutdown_signal())
+            .await?;
+    } else if let Ok(value) = env::var("CYBEREDGE_RPC_LOCAL_ADDR") {
+        let address: std::net::SocketAddr = value.parse()?;
+        println!("CyberEdge RPC listening on local transport http://{address}");
+        Server::builder()
+            .add_service(service)
+            .serve_with_shutdown(address, shutdown_signal())
+            .await?;
+    } else {
+        let socket_path =
+            env::var("CYBEREDGE_RPC_SOCKET").unwrap_or_else(|_| "/tmp/cyberedge.sock".to_owned());
+        prepare_socket(Path::new(&socket_path))?;
+        let listener = UnixListener::bind(&socket_path)?;
+        println!("CyberEdge RPC listening on unix://{socket_path}");
+        Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown_signal())
+            .await?;
+    }
+    if let Some(worker) = worker {
+        worker.abort();
+    }
+    if let Some(scheduler) = scheduler {
+        scheduler.abort();
+    }
+    if let Some(notification) = notification {
+        notification.abort();
+    }
+    if let Some(web) = web {
+        web.abort();
+    }
+
+    Ok(())
+}
+
+fn required_file(variable: &str) -> io::Result<Vec<u8>> {
+    let path = env::var(variable).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{variable} is required for mTLS"),
+        )
+    })?;
+    std::fs::read(path)
+}
+
+fn prepare_socket(path: &Path) -> io::Result<()> {
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "RPC socket path exists and is not a socket",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn shutdown_signal() {
+    if let Err(error) = signal::ctrl_c().await {
+        eprintln!("failed to listen for shutdown signal: {error}");
+    }
+}

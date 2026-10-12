@@ -1,0 +1,641 @@
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/tls"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	_ "net/http/pprof"
+
+	units "github.com/docker/go-units"
+	"github.com/projectdiscovery/goflags"
+	"github.com/projectdiscovery/gologger"
+	"github.com/projectdiscovery/gologger/levels"
+	"github.com/projectdiscovery/interactsh/internal/runner"
+	"github.com/projectdiscovery/interactsh/pkg/options"
+	"github.com/projectdiscovery/interactsh/pkg/server"
+	"github.com/projectdiscovery/interactsh/pkg/server/acme"
+	"github.com/projectdiscovery/interactsh/pkg/settings"
+	"github.com/projectdiscovery/interactsh/pkg/storage"
+	folderutil "github.com/projectdiscovery/utils/folder"
+	iputil "github.com/projectdiscovery/utils/ip"
+	stringsutil "github.com/projectdiscovery/utils/strings"
+	updateutils "github.com/projectdiscovery/utils/update"
+)
+
+var (
+	healthcheck           bool
+	defaultConfigLocation = filepath.Join(folderutil.HomeDirOrDefault("."), ".config/interactsh-server/config.yaml")
+	pprofServerAddress    = "127.0.0.1:8086"
+)
+
+func main() {
+	cliOptions := &options.CLIServerOptions{}
+	flagSet := goflags.NewFlagSet()
+	flagSet.SetDescription(`Interactsh server - Go client to configure and host interactsh server.`)
+
+	flagSet.CreateGroup("input", "Input",
+		flagSet.StringSliceVarP(&cliOptions.Domains, "domain", "d", []string{}, "single/multiple configured domain to use for server", goflags.CommaSeparatedStringSliceOptions),
+		flagSet.StringSliceVarP(&cliOptions.IPAddresses, "ip", "i", []string{}, "public IP address(es) to use for interactsh server (comma-separated, supports both IPv4 & IPv6)", goflags.CommaSeparatedStringSliceOptions),
+		flagSet.StringVarP(&cliOptions.ListenIP, "listen-ip", "lip", "0.0.0.0", "public ip address to listen on"),
+		flagSet.IntVarP(&cliOptions.Eviction, "eviction", "e", 30, "number of days to persist interaction data in memory"),
+		flagSet.BoolVarP(&cliOptions.NoEviction, "no-eviction", "ne", false, "disable periodic data eviction from memory"),
+		flagSet.StringVarP(&cliOptions.EvictionStrategy, "eviction-strategy", "es", "sliding", "eviction strategy for interactions (sliding, fixed)"),
+		flagSet.BoolVarP(&cliOptions.Auth, "auth", "a", false, "enable authentication to server using random generated token"),
+		flagSet.StringVarP(&cliOptions.Token, "token", "t", "", "enable authentication to server using given token"),
+		flagSet.StringVar(&cliOptions.OriginURL, "acao-url", "*", "origin url to send in acao header to use web-client)"), // cli flag set to deprecate
+		flagSet.BoolVarP(&cliOptions.SkipAcme, "skip-acme", "sa", false, "skip acme registration (certificate checks/handshake + TLS protocols will be disabled)"),
+		flagSet.BoolVarP(&cliOptions.ScanEverywhere, "scan-everywhere", "se", false, "scan canary token everywhere"),
+		flagSet.IntVarP(&cliOptions.CorrelationIdLength, "correlation-id-length", "cidl", settings.CorrelationIdLengthDefault, fmt.Sprintf("length of the correlation id preamble (min %d, default %d)", settings.CorrelationIdLengthMinimum, settings.CorrelationIdLengthDefault)),
+		flagSet.IntVarP(&cliOptions.CorrelationIdNonceLength, "correlation-id-nonce-length", "cidn", settings.CorrelationIdNonceLengthDefault, fmt.Sprintf("length of the correlation id nonce (min %d, default %d)", settings.CorrelationIdNonceLengthMinimum, settings.CorrelationIdNonceLengthDefault)),
+		flagSet.StringVar(&cliOptions.CertificatePath, "cert", "", "custom certificate path"),
+		flagSet.StringVar(&cliOptions.PrivateKeyPath, "privkey", "", "custom private key path"),
+		flagSet.StringVarP(&cliOptions.OriginIPHeader, "origin-ip-header", "oih", "", "HTTP header containing origin ip (interactsh behind a reverse proxy)"),
+	)
+
+	flagSet.CreateGroup("config", "config",
+		flagSet.StringSliceVarP(&cliOptions.Resolvers, "resolvers", "r", nil, "list of resolvers to use (file or comma separated)", goflags.FileCommaSeparatedStringSliceOptions),
+		flagSet.StringVar(&cliOptions.Config, "config", defaultConfigLocation, "flag configuration file"),
+		flagSet.BoolVarP(&cliOptions.DynamicResp, "dynamic-resp", "dr", false, "enable setting up arbitrary response data"),
+		flagSet.StringVarP(&cliOptions.CustomRecords, "custom-records", "cr", "", "custom dns records YAML file for DNS server"),
+		flagSet.StringVarP(&cliOptions.HTTPIndex, "http-index", "hi", "", "custom index file for http server"),
+		flagSet.StringVarP(&cliOptions.HTTPDirectory, "http-directory", "hd", "", "directory with files to serve with http server"),
+		flagSet.StringVarP(&cliOptions.DefaultHTTPResponseFile, "default-http-response", "dhr", "", "file to serve for all http requests (takes priority over other options)"),
+		flagSet.BoolVarP(&cliOptions.DiskStorage, "disk", "ds", false, "disk based storage"),
+		flagSet.StringVarP(&cliOptions.DiskStoragePath, "disk-path", "dsp", "", "disk storage path"),
+		flagSet.StringVarP(&cliOptions.RedisURL, "redis-url", "ru", "", "redis connection URL (enables shared state for multi-instance deployments)"),
+		flagSet.StringVarP(&cliOptions.RedisKeyPrefix, "redis-prefix", "rp", "", "redis key prefix (default \"interactsh:\")"),
+		flagSet.StringVarP(&cliOptions.HeaderServer, "server-header", "csh", "", "custom value of Server header in response"),
+		flagSet.BoolVarP(&cliOptions.NoVersionHeader, "disable-version", "dv", false, "disable publishing interactsh version in response header"),
+	)
+
+	flagSet.CreateGroup("update", "Update",
+		flagSet.CallbackVarP(options.GetUpdateCallback("interactsh-server"), "update", "up", "update interactsh-server to latest version"),
+		flagSet.BoolVarP(&cliOptions.DisableUpdateCheck, "disable-update-check", "duc", false, "disable automatic interactsh-server update check"),
+	)
+
+	flagSet.CreateGroup("services", "Services",
+		flagSet.IntVar(&cliOptions.DnsPort, "dns-port", 53, "port to use for dns service"),
+		flagSet.IntVar(&cliOptions.HttpPort, "http-port", 80, "port to use for http service"),
+		flagSet.IntVar(&cliOptions.HttpsPort, "https-port", 443, "port to use for https service"),
+		flagSet.IntVar(&cliOptions.SmtpPort, "smtp-port", 25, "port to use for smtp service"),
+		flagSet.IntVar(&cliOptions.SmtpsPort, "smtps-port", 587, "port to use for smtps service"),
+		flagSet.IntVar(&cliOptions.SmtpAutoTLSPort, "smtp-autotls-port", 465, "port to use for smtps autotls service"),
+		flagSet.IntVar(&cliOptions.LdapPort, "ldap-port", 389, "port to use for ldap service"),
+		flagSet.BoolVar(&cliOptions.LdapWithFullLogger, "ldap", false, "enable ldap server with full logging (authenticated)"),
+		flagSet.BoolVarP(&cliOptions.RootTLD, "wildcard", "wc", false, "enable wildcard interaction for interactsh domain (authenticated)"),
+		flagSet.BoolVar(&cliOptions.Smb, "smb", false, "start in-process smb agent for NetNTLMv2 hash capture (authenticated)"),
+		flagSet.BoolVar(&cliOptions.Responder, "responder", false, "start in-process responder agent (multi-port SMB NetNTLMv2 hash capture, authenticated)"),
+		flagSet.BoolVar(&cliOptions.Ftp, "ftp", false, "start ftp agent (authenticated)"),
+		flagSet.IntVar(&cliOptions.SmbPort, "smb-port", 445, "port to use for smb service"),
+		flagSet.IntVar(&cliOptions.FtpPort, "ftp-port", 21, "port to use for ftp service"),
+		flagSet.IntVar(&cliOptions.FtpsPort, "ftps-port", 990, "port to use for ftps service"),
+		flagSet.StringVar(&cliOptions.FTPDirectory, "ftp-dir", "", "ftp directory - temporary if not specified"),
+	)
+
+	flagSet.CreateGroup("upload", "Upload",
+		flagSet.BoolVar(&cliOptions.Upload, "upload", false, "enable client file upload and hosting - self-hosted servers only (authenticated)"),
+		flagSet.StringVarP(&cliOptions.UploadDirectory, "upload-directory", "ud", "", "directory to host uploaded files from - temporary if not specified; interactsh creates and prunes .interactsh-user-uploads inside it"),
+		flagSet.SizeVarP(&cliOptions.UploadMaxFileSize, "upload-max-file-size", "umfs", "1mb", "maximum size of a single uploaded file"),
+		flagSet.IntVarP(&cliOptions.UploadMaxFiles, "upload-max-files", "umf", 5, "maximum number of uploaded files per session"),
+		flagSet.SizeVarP(&cliOptions.UploadMaxTotalSize, "upload-max-total-size", "umts", "1gb", "maximum total size of all uploaded files on the server"),
+		flagSet.DurationVarP(&cliOptions.UploadTTL, "upload-ttl", "ut", 24*time.Hour, "maximum lifetime of uploaded files"),
+	)
+
+	flagSet.CreateGroup("debug", "Debug",
+		flagSet.BoolVar(&cliOptions.Version, "version", false, "show version of the project"),
+		flagSet.BoolVar(&cliOptions.Debug, "debug", false, "start interactsh server in debug mode"),
+		flagSet.BoolVarP(&cliOptions.EnablePprof, "enable-pprof", "ep", false, "enable pprof debugging server"),
+		flagSet.BoolVarP(&healthcheck, "hc", "health-check", false, "run diagnostic check up"),
+		flagSet.BoolVar(&cliOptions.EnableMetrics, "metrics", false, "enable metrics endpoint"),
+		flagSet.BoolVarP(&cliOptions.Verbose, "verbose", "v", false, "display verbose interaction"),
+	)
+
+	if err := flagSet.Parse(); err != nil {
+		gologger.Fatal().Msgf("Could not parse options: %s\n", err)
+	}
+	options.ShowBanner()
+
+	if healthcheck {
+		cfgFilePath, _ := flagSet.GetConfigFilePath()
+		gologger.Print().Msgf("%s\n", runner.DoHealthCheck(cfgFilePath))
+		os.Exit(0)
+	}
+	if cliOptions.Version {
+		gologger.Info().Msgf("Current Version: %s\n", options.Version)
+		os.Exit(0)
+	}
+
+	if !cliOptions.DisableUpdateCheck {
+		latestVersion, err := updateutils.GetToolVersionCallback("interactsh-server", options.Version)()
+		if err != nil {
+			if cliOptions.Verbose {
+				gologger.Error().Msgf("interactsh version check failed: %v", err.Error())
+			}
+		} else {
+			gologger.Info().Msgf("Current interactsh version %v %v", options.Version, updateutils.GetVersionDescription(options.Version, latestVersion))
+		}
+	}
+
+	if cliOptions.Config != defaultConfigLocation {
+		if err := flagSet.MergeConfigFile(cliOptions.Config); err != nil {
+			gologger.Fatal().Msgf("Could not read config: %s\n", err)
+		}
+	}
+
+	if len(cliOptions.Domains) == 0 {
+		gologger.Fatal().Msgf("No domains specified\n")
+	}
+
+	if cliOptions.CorrelationIdLength < settings.CorrelationIdLengthMinimum {
+		gologger.Fatal().Msgf("CorrelationIdLength (cidl) must be at least %d\n", settings.CorrelationIdLengthMinimum)
+	}
+	if cliOptions.CorrelationIdNonceLength < settings.CorrelationIdNonceLengthMinimum {
+		gologger.Fatal().Msgf("CorrelationIdNonceLength (cidn) must be at least %d\n", settings.CorrelationIdNonceLengthMinimum)
+	}
+
+	if len(cliOptions.IPAddresses) == 0 && cliOptions.ListenIP == "0.0.0.0" {
+		publicIP, _ := getPublicIP()
+		outboundIP, _ := iputil.GetSourceIP("scanme.sh")
+
+		if publicIP == "" && outboundIP == nil {
+			gologger.Fatal().Msgf("Could not determine public IP address\n")
+		}
+		if publicIP == "" && outboundIP != nil {
+			publicIP = outboundIP.String()
+		}
+		gologger.Info().Msgf("Public IP: %s\n", publicIP)
+		gologger.Info().Msgf("Outbound IP: %s\n", outboundIP)
+		// it's essential to be able to bind to cliOptions.DnsPort on any of the two ips
+		bindableIP, err := iputil.GetBindableAddress(cliOptions.DnsPort, publicIP, outboundIP.String())
+		if bindableIP == "" && err != nil {
+			var addressesBuilder strings.Builder
+			networkInterfaces, _ := net.Interfaces()
+			for _, networkInterface := range networkInterfaces {
+				addresses, _ := networkInterface.Addrs()
+				var addressesStr []string
+				for _, address := range addresses {
+					addressesStr = append(addressesStr, address.String())
+				}
+				if len(addressesStr) > 0 {
+					_, _ = fmt.Fprintf(&addressesBuilder, "%s: %s\n", networkInterface.Name, strings.Join(addressesStr, ","))
+				}
+			}
+			gologger.Fatal().Msgf("%s\nNo bindable address could be found for port %d\nPlease ensure to have proper privileges and/or choose the correct ip:\n%s\n", err, cliOptions.DnsPort, addressesBuilder.String())
+		}
+		cliOptions.ListenIP = bindableIP
+		cliOptions.IPAddresses = append(cliOptions.IPAddresses, publicIP)
+	}
+
+	if len(cliOptions.IPAddresses) > 0 {
+		gologger.Info().Msgf("Configured IP addresses: %s\n", strings.Join(cliOptions.IPAddresses, ", "))
+	}
+
+	for _, domain := range cliOptions.Domains {
+		hostmaster := fmt.Sprintf("admin@%s", domain)
+		cliOptions.Hostmasters = append(cliOptions.Hostmasters, hostmaster)
+	}
+
+	serverOptions := cliOptions.AsServerOptions()
+	if cliOptions.Debug {
+		gologger.DefaultLogger.SetMaxLevel(levels.LevelDebug)
+	}
+
+	// responder and smb can't be active at the same time
+	if cliOptions.Responder && cliOptions.Smb {
+		gologger.Fatal().Msgf("responder and smb can't be active at the same time\n")
+	}
+
+	// Requires auth if token is specified or enables it automatically for responder and smb options
+	if serverOptions.Token != "" || cliOptions.Responder || cliOptions.Smb || cliOptions.Ftp || cliOptions.LdapWithFullLogger || cliOptions.Upload {
+		serverOptions.Auth = true
+	}
+
+	// if root-tld is enabled we enable auth - This ensures that any client has the token
+	if serverOptions.RootTLD {
+		serverOptions.Auth = true
+	}
+
+	// of in case a custom token is specified
+	if serverOptions.Token != "" {
+		serverOptions.Auth = true
+	}
+
+	if serverOptions.Auth && serverOptions.Token == "" {
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			gologger.Fatal().Msgf("Could not generate token\n")
+		}
+		serverOptions.Token = hex.EncodeToString(b)
+		gologger.Info().Msgf("Client Token: %s\n", serverOptions.Token)
+	}
+
+	evictionTTL := time.Duration(cliOptions.Eviction) * time.Hour * 24
+	if cliOptions.NoEviction {
+		evictionTTL = -1
+	}
+
+	// Parse eviction strategy
+	var evictionStrategy storage.EvictionStrategy
+	switch strings.ToLower(cliOptions.EvictionStrategy) {
+	case "fixed":
+		evictionStrategy = storage.EvictionStrategyFixed
+	case "sliding":
+		evictionStrategy = storage.EvictionStrategySliding
+	default:
+		gologger.Fatal().Msgf("invalid eviction strategy '%s', must be 'sliding' or 'fixed'\n", cliOptions.EvictionStrategy)
+	}
+
+	var store storage.Storage
+	storeOptions := storage.DefaultOptions
+	storeOptions.EvictionTTL = evictionTTL
+	storeOptions.EvictionStrategy = evictionStrategy
+	if cliOptions.DiskStorage {
+		if cliOptions.DiskStoragePath == "" {
+			gologger.Fatal().Msgf("disk storage path must be specified\n")
+		}
+		storeOptions.DbPath = cliOptions.DiskStoragePath
+	}
+	if v := os.Getenv("INTERACTSH_MAX_SHARED_INTERACTIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			storeOptions.MaxSharedInteractions = n
+		}
+	}
+
+	serverOptions.Stats = &server.Metrics{}
+	storeOptions.OnRemoval = func() {
+		atomic.AddInt64(&serverOptions.Stats.Sessions, -1)
+	}
+
+	// The upload store must exist before the HTTP and FTP servers are built,
+	// since both serve from its root.
+	var uploadStore *server.UploadStore
+	if cliOptions.Upload {
+		// Hosted bytes live on this instance's local filesystem and the
+		// capacity quota is an in-process counter, so file hosting cannot be
+		// combined with a storage backend shared between instances: peers
+		// would advertise files they do not have.
+		if cliOptions.RedisURL != "" {
+			gologger.Fatal().Msgf("-upload cannot be used with -redis-url: hosted files are stored on a single instance's local filesystem\n")
+		}
+		var err error
+		if uploadStore, err = server.NewUploadStore(serverOptions); err != nil {
+			gologger.Fatal().Msgf("could not create upload store: %s\n", err)
+		}
+		serverOptions.UploadStore = uploadStore
+
+		// Sharing the root is what lets the existing FTP file driver serve
+		// uploads. If the operator pinned both to different places, say so and
+		// stop advertising FTP, rather than printing ftp:// payload URLs that
+		// resolve to nothing.
+		switch serverOptions.FTPDirectory {
+		case "":
+			serverOptions.FTPDirectory = uploadStore.Root()
+			serverOptions.FTPServesUploads = true
+		default:
+			// Compared as resolved paths, not as the operator typed them:
+			// "./uploads", "/abs/uploads/" and a symlink to the same place are
+			// one directory, and warning about a working configuration teaches
+			// the operator to ignore the warning that matters.
+			shared, err := sameDirectory(serverOptions.FTPDirectory, uploadStore.Root())
+			if err != nil {
+				gologger.Fatal().Msgf("could not compare ftp and upload directories: %s\n", err)
+			}
+			serverOptions.FTPServesUploads = shared
+			if !shared && cliOptions.Ftp {
+				gologger.Error().Msgf("ftp directory %s is not the upload directory %s, so uploaded files will not be served over FTP; ftp:// URLs will not be offered to clients\n",
+					serverOptions.FTPDirectory, uploadStore.Root())
+			}
+		}
+
+		// Deleting a session's files is driven by the correlation-id leaving
+		// the cache, whatever the reason.
+		storeOptions.OnEviction = func(correlationID string, _ *storage.CorrelationData) {
+			uploadStore.RemoveSession(correlationID)
+		}
+	}
+
+	var err error
+	switch {
+	case cliOptions.RedisURL != "":
+		// Redis-backed storage shares state across multiple interactsh-server
+		// instances behind a load balancer. Disk/in-memory flags are ignored
+		// in this mode by design.
+		if cliOptions.DiskStorage {
+			gologger.Warning().Msgf("--redis-url is set; disk-storage flags will be ignored\n")
+		}
+		store, err = storage.NewRedis(&storage.RedisOptions{
+			URL:                   cliOptions.RedisURL,
+			KeyPrefix:             cliOptions.RedisKeyPrefix,
+			EvictionTTL:           evictionTTL,
+			EvictionStrategy:      evictionStrategy,
+			MaxSharedInteractions: storeOptions.MaxSharedInteractions,
+		})
+	default:
+		store, err = storage.New(&storeOptions)
+	}
+	if err != nil {
+		gologger.Fatal().Msgf("couldn't create storage: %s\n", err)
+	}
+
+	serverOptions.Storage = store
+
+	if uploadStore != nil {
+		uploadStore.Start()
+		gologger.Info().Msgf("Uploads enabled, hosting from %s (max %d files of %s each)\n",
+			uploadStore.Root(), cliOptions.UploadMaxFiles, units.BytesSize(float64(cliOptions.UploadMaxFileSize)))
+	}
+
+	if serverOptions.Auth {
+		_ = serverOptions.Storage.SetID(serverOptions.Token)
+	}
+
+	// If root-tld is enabled create a singleton unencrypted record in the store
+	if serverOptions.RootTLD {
+		for _, domain := range serverOptions.Domains {
+			_ = store.SetID(domain)
+		}
+	}
+
+	acmeStore := acme.NewProvider()
+	serverOptions.ACMEStore = acmeStore
+
+	dnsTcpServer := server.NewDNSServer("tcp", serverOptions)
+	dnsUdpServer := server.NewDNSServer("udp", serverOptions)
+	dnsTcpAlive := make(chan bool, 1)
+	dnsUdpAlive := make(chan bool, 1)
+	go dnsTcpServer.ListenAndServe(dnsTcpAlive)
+	go dnsUdpServer.ListenAndServe(dnsUdpAlive)
+
+	var (
+		tlsConfig   *tls.Config
+		domainCerts []tls.Certificate
+		certFiles   []acme.CertificateFiles
+	)
+	switch {
+	case cliOptions.CertificatePath != "" && cliOptions.PrivateKeyPath != "":
+		reloader, reloaderErr := acme.NewCertReloader(cliOptions.CertificatePath, cliOptions.PrivateKeyPath)
+		if reloaderErr != nil {
+			gologger.Error().Msgf("https will be disabled: %s", reloaderErr)
+		} else {
+			go reloader.Start(context.Background())
+			tlsConfig = &tls.Config{
+				GetCertificate: reloader.GetCertificate,
+				NextProtos:     []string{"h2", "http/1.1"},
+			}
+		}
+	case !cliOptions.SkipAcme && len(cliOptions.Domains) > 0 && len(serverOptions.Hostmasters) > 0:
+		cfg, cfgErr := acme.NewCertmagicConfig(serverOptions.Hostmasters[0], acmeStore, cliOptions.Debug, cliOptions.Resolvers)
+		if cfgErr != nil {
+			gologger.Error().Msgf("Could not configure ACME: %s", cfgErr)
+		} else {
+			for _, domain := range cliOptions.Domains {
+				trimmedDomain := strings.TrimSuffix(domain, ".")
+				certs, files, acmeErr := acme.HandleWildcardCertificates(cfg, fmt.Sprintf("*.%s", trimmedDomain))
+				if acmeErr != nil {
+					gologger.Error().Msgf("An error occurred while applying for a certificate for %s: %v", domain, acmeErr)
+					gologger.Error().Msgf("Could not generate certs for auto TLS, https will be disabled")
+				} else {
+					domainCerts = append(domainCerts, certs...)
+					certFiles = append(certFiles, files...)
+				}
+			}
+			if len(domainCerts) > 0 {
+				tlsConfig = &tls.Config{
+					GetCertificate: cfg.GetCertificate,
+					NextProtos:     []string{"h2", "http/1.1"},
+				}
+			}
+		}
+	}
+
+	serverOptions.Certificates = domainCerts
+	serverOptions.CertFiles = certFiles
+
+	// manually cleans up stale OCSP from storage
+	acme.CleanupStorage()
+
+	httpServer, err := server.NewHTTPServer(serverOptions)
+	if err != nil {
+		gologger.Fatal().Msgf("Could not create HTTP server: %s", err)
+	}
+	httpAlive := make(chan bool)
+	httpsAlive := make(chan bool)
+	go httpServer.ListenAndServe(tlsConfig, httpAlive, httpsAlive)
+
+	smtpServer, err := server.NewSMTPServer(serverOptions)
+	if err != nil {
+		gologger.Fatal().Msgf("Could not create SMTP server: %s", err)
+	}
+	smtpAlive := make(chan bool)
+	smtpsAlive := make(chan bool)
+	go smtpServer.ListenAndServe(tlsConfig, smtpAlive, smtpsAlive)
+
+	ldapAlive := make(chan bool)
+	ldapServer, err := server.NewLDAPServer(serverOptions, cliOptions.LdapWithFullLogger)
+	if err != nil {
+		gologger.Fatal().Msgf("Could not create LDAP server: %s", err)
+	}
+	go ldapServer.ListenAndServe(tlsConfig, ldapAlive)
+	defer func() {
+		if err := ldapServer.Close(); err != nil {
+			gologger.Error().Msgf("Error closing LDAP server: %v", err)
+		}
+	}()
+
+	ftpAlive := make(chan bool)
+	ftpsAlive := make(chan bool)
+	if cliOptions.Ftp {
+		ftpServer, err := server.NewFTPServer(serverOptions)
+		if err != nil {
+			gologger.Fatal().Msgf("Could not create FTP server: %s", err)
+		}
+		go ftpServer.ListenAndServe(tlsConfig, ftpAlive, ftpsAlive) //nolint
+	}
+
+	responderAlive := make(chan bool)
+	if cliOptions.Responder {
+		responderServer, err := server.NewResponderServer(serverOptions)
+		if err != nil {
+			gologger.Fatal().Msgf("Could not create SMB server: %s", err)
+		}
+		go responderServer.ListenAndServe(responderAlive) //nolint
+		defer responderServer.Close()
+	}
+
+	smbAlive := make(chan bool)
+	if cliOptions.Smb {
+		smbServer, err := server.NewSMBServer(serverOptions)
+		if err != nil {
+			gologger.Fatal().Msgf("Could not create SMB server: %s", err)
+		}
+		go smbServer.ListenAndServe(smbAlive) //nolint
+		defer smbServer.Close()
+	}
+
+	gologger.Info().Msgf("Listening with the following services:\n")
+	go func() {
+		for {
+			service := ""
+			network := ""
+			port := 0
+			status := true
+			fatal := false
+			select {
+			case status = <-dnsUdpAlive:
+				service = "DNS"
+				network = "UDP"
+				port = serverOptions.DnsPort
+				fatal = true
+			case status = <-dnsTcpAlive:
+				service = "DNS"
+				network = "TCP"
+				port = serverOptions.DnsPort
+			case status = <-httpAlive:
+				service = "HTTP"
+				network = "TCP"
+				port = serverOptions.HttpPort
+				fatal = true
+			case status = <-httpsAlive:
+				service = "HTTPS"
+				network = "TCP"
+				port = serverOptions.HttpsPort
+			case status = <-smtpAlive:
+				service = "SMTP"
+				network = "TCP"
+				port = serverOptions.SmtpPort
+			case status = <-smtpsAlive:
+				service = "SMTPS"
+				network = "TCP"
+				port = serverOptions.SmtpsPort
+			case status = <-ftpAlive:
+				service = "FTP"
+				network = "TCP"
+				port = serverOptions.FtpPort
+			case status = <-ftpsAlive:
+				service = "FTPS"
+				network = "TCP"
+				port = serverOptions.FtpsPort
+			case status = <-responderAlive:
+				service = "Responder"
+				network = "TCP"
+				port = 445
+			case status = <-smbAlive:
+				service = "SMB"
+				network = "TCP"
+				port = serverOptions.SmbPort
+			case status = <-ldapAlive:
+				service = "LDAP"
+				network = "TCP"
+				port = serverOptions.LdapPort
+			}
+			address := net.JoinHostPort(serverOptions.ListenIP, strconv.Itoa(port))
+			if status {
+				gologger.Silent().Msgf("[%s] Listening on %s %s", service, network, address)
+			} else if fatal {
+				gologger.Fatal().Msgf("The %s %s service has unexpectedly stopped", network, service)
+			} else {
+				gologger.Warning().Msgf("The %s %s service has unexpectedly stopped", network, service)
+			}
+		}
+	}()
+
+	var pprofServer *http.Server
+	if cliOptions.EnablePprof {
+		pprofServer = &http.Server{
+			Addr:    pprofServerAddress,
+			Handler: http.DefaultServeMux,
+		}
+		gologger.Info().Msgf("Listening pprof debug server on: %s", pprofServerAddress)
+		go func() {
+			_ = pprofServer.ListenAndServe()
+		}()
+	}
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	for range c {
+		// Closed first: cache.Close blocks until every removal callback has run,
+		// so all session deletions are queued by the time we drain them below.
+		if err := store.Close(); err != nil {
+			gologger.Warning().Msgf("Couldn't close the storage: %s\n", err)
+		}
+		if uploadStore != nil {
+			if err := uploadStore.Close(); err != nil {
+				gologger.Warning().Msgf("Couldn't close the upload store: %s\n", err)
+			}
+		}
+		if pprofServer != nil {
+			if err := pprofServer.Close(); err != nil {
+				gologger.Warning().Msgf("Couldn't close the pprof server: %s\n", err)
+			}
+		}
+		os.Exit(1)
+	}
+}
+
+func getPublicIP() (string, error) {
+	ip, err := iputil.WhatsMyIP()
+	if err != nil {
+		return "", err
+	}
+
+	// public ip should match one of the configured interfaces
+	addresses, err := net.InterfaceAddrs()
+	if err != nil {
+		return "", err
+	}
+	externalIP := ip
+	for _, address := range addresses {
+		if stringsutil.EqualFoldAny(externalIP, address.String()) {
+			return externalIP, nil
+		}
+	}
+
+	return externalIP, errors.New("couldn't find an interface configured with external ip")
+}
+
+// sameDirectory reports whether two paths name the same directory. Both are made
+// absolute and symlink-resolved first, so that the FTP root and the upload root
+// are compared as directories rather than as the strings the operator typed.
+//
+// A path that does not exist yet is compared in its cleaned absolute form:
+// EvalSymlinks fails on a missing path, and that is not an error worth refusing
+// to start over.
+func sameDirectory(a, b string) (bool, error) {
+	resolve := func(p string) (string, error) {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return "", err
+		}
+		resolved, err := filepath.EvalSymlinks(abs)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return filepath.Clean(abs), nil
+			}
+			return "", err
+		}
+		return resolved, nil
+	}
+	ra, err := resolve(a)
+	if err != nil {
+		return false, err
+	}
+	rb, err := resolve(b)
+	if err != nil {
+		return false, err
+	}
+	return ra == rb, nil
+}

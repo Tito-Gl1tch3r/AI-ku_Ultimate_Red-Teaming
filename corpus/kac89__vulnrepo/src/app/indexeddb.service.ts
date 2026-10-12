@@ -1,0 +1,1867 @@
+import { Injectable } from '@angular/core';
+import { Router } from '@angular/router';
+import { v4 as uuid } from 'uuid';
+import { Observable } from 'rxjs';
+
+import { MessageService } from './message.service';
+import { MatDialog } from '@angular/material/dialog';
+import { Subject } from 'rxjs';
+import { ApiService } from './api.service';
+import { MatSnackBar } from '@angular/material/snack-bar';
+import { SessionstorageserviceService } from "./sessionstorageservice.service"
+import { CurrentdateService } from './currentdate.service';
+import { CryptoUtilsService } from './crypto-utils.service';
+import { KeyVaultService } from './key-vault.service';
+import { ReportSchemaService } from './report-schema.service';
+import { UtilsService } from './utils.service';
+
+// One save event, stripped of the report it belongs to. See getHistoryActivity.
+export interface HistoryActivityEntry {
+  report_id: string;
+  report_name: string;
+  ts: number;
+  total: number;
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  info: number;
+}
+
+@Injectable({
+  providedIn: 'root'
+})
+export class IndexeddbService {
+
+  reportlist = [];
+
+  private decryptstatusObs = new Subject<any>();
+  public changesStatus = new Subject<any>();
+
+  constructor(public router: Router, private messageService: MessageService, public dialog: MatDialog,
+    private apiService: ApiService, private snackBar: MatSnackBar, public sessionsub: SessionstorageserviceService,
+    private currentdateService: CurrentdateService, private cryptoUtils: CryptoUtilsService,
+    private keyVault: KeyVaultService, private reportSchema: ReportSchemaService,
+    private utilsService: UtilsService) {
+
+    this.updateEncStatus(false);
+    /*
+    const test = [
+      {
+        report_id: '07f8026e-23c9-40f8-9001-53c3240a2c7d',
+        report_name: 'Testing security infrastructure apple.com',
+        report_createdate: 1541259311298,
+        encrypted_data: 'encdata'
+      },
+      {
+        report_id: '64f8026e-23c9-40f8-9001-53c3240a2c7d',
+        report_name: 'PCI DSS Security report',
+        report_createdate: 1541260948293,
+        encrypted_data: 'encdata'
+      }
+    ];
+
+    this.reportlist.push(test);
+    this.Obsreportlist.next(test);
+    */
+  }
+
+  getReports() {
+    return new Promise<any>((resolve, reject) => {
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-db', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('reports', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('reports', 'readwrite');
+        const store = tx.objectStore('reports');
+
+        // add, clear, count, delete, get, getAll, getAllKeys, getKey, put
+        const request = store.getAll();
+
+        request.onsuccess = function (evt) {
+          resolve(request.result);
+        };
+
+        tx.oncomplete = function () {
+          db.close();
+        };
+        request.onerror = function (e) {
+          reject(e);
+        };
+      };
+
+    });
+  }
+
+  setProfile(base_array, profile) {
+
+    if (profile) {
+
+      base_array.report_settings.report_logo.logo = profile.logo;
+      base_array.report_settings.report_logo.width = profile.logow;
+      base_array.report_settings.report_logo.height = profile.logoh;
+
+      base_array.researcher[0].reportername = profile.ResName;
+      base_array.researcher[0].reportersocial = profile.ResSocial;
+      base_array.researcher[0].reporterwww = profile.ResWeb;
+      base_array.researcher[0].reporteremail = profile.ResEmail;
+
+      base_array.report_settings.report_theme = profile.theme;
+
+      base_array.report_settings.report_css = profile.report_css;
+      base_array.report_settings.report_html = profile.report_custom_content;
+      base_array.report_settings.report_video_embed = profile.video_embed;
+      base_array.report_settings.report_remove_lastpage = profile.remove_lastpage;
+      base_array.report_settings.report_remove_issuestatus = profile.remove_issueStatus;
+      base_array.report_settings.report_remove_issuecvss = profile.remove_issuecvss;
+      base_array.report_settings.report_remove_issuecve = profile.remove_issuecve;
+      base_array.report_settings.report_remove_researchers = profile.remove_researcher;
+      base_array.report_settings.report_changelog_page = profile.remove_changelog;
+      base_array.report_settings.report_remove_issuetags = profile.remove_tags;
+      base_array.report_settings.report_parsing_desc = profile.report_parsing_desc;
+      base_array.report_settings.report_parsing_poc_markdown = profile.report_parsing_poc_markdown;
+
+    }
+
+    return base_array;
+
+  }
+
+  async addnewReport(title: string, pass: string, profile: any): Promise<boolean> {
+
+    if (!title || !pass) {
+      this.failCreate('A report needs both a title and a key.');
+      return false;
+    }
+
+    // A key containing whitespace cannot be used. This used to be a
+    // console.log and a silent return: "Save report" did nothing, said
+    // nothing, and the strength meter had already rated such a key Strong
+    // because it counts a space as a special character. The form now blocks
+    // it at type time; this is the backstop, and it speaks.
+    if (/\s/.test(pass)) {
+      this.failCreate('A security key cannot contain spaces.');
+      return false;
+    }
+
+
+
+    //        report_vulns: [
+    //          {
+    //            title: '[XSS] Cross site scripting vulnerability',
+    //            poc: '',
+    //            files: [],
+    //            desc: 'desc',
+    //            severity: 'Medium',
+    //            status: 1,
+    //            ref: 'https://www.owasp.org/',
+    //            cvss: '4.3',
+    //            cve: '',
+    //            tags: [],
+    //            bounty: [],
+    //            date: today
+    //          },
+    //          {
+    //            title: '[XSS] DOM',
+    //            poc: '',
+    //            files: [],
+    //            desc: 'desc',
+    //            severity: 'Medium',
+    //            status: 1,
+    //            ref: 'https://www.owasp.org/',
+    //            cvss: '4.3',
+    //            cve: '',
+    //            tags: [],
+    //            bounty: [],
+    //            date: today
+    //          }
+    //        ],
+
+
+    const defaultContent = `### Methodology and Standards:
+
+* OSTTMM(Open Source Security Testing Methodology Manual)
+* OWASP(Open Web Application Security Project)
+* ISSAF(Information Systems Security Assessment Framework)
+* WASC-TC(Web Application Security Consortium Threat Classification)
+* PTF(Penetration Testing Framework)
+* OISSG(Information Systems Security Assessment Framework)
+* NIST SP800-115(Technical Guide to Information Security Testing and Assessment)
+`;
+
+    const today: number = Date.now();
+
+    let empty_vulns = {
+      report_vulns: [],
+      report_scope: '',
+      report_assets: [],
+      report_summary: '',
+      report_changelog: [
+        {
+          date: today,
+          desc: 'Create report: \"' + title + '\".'
+        }
+      ],
+      report_version: 0,
+      report_metadata: {
+        starttest: today,
+        endtest: ''
+      },
+      researcher: [
+        {
+          reportername: '',
+          reportersocial: '',
+          reporterwww: '',
+          reporteremail: ''
+        }
+      ],
+      report_settings: {
+        report_html: defaultContent,
+        report_logo: {
+          logo: '',
+          width: 600,
+          height: 500
+        },
+        report_theme: 'white',
+        report_video_embed: true,
+        report_remove_lastpage: false,
+        report_remove_issuestatus: false,
+        report_remove_issuecvss: true,
+        report_remove_issuecve: true,
+        report_remove_researchers: false,
+        report_changelog_page: false,
+        report_remove_issuetags: false,
+        report_parsing_desc: false,
+        report_parsing_poc_markdown: true
+      }
+    };
+
+    // check profile and set profile
+    empty_vulns = this.setProfile(empty_vulns, profile);
+
+    // Encrypt
+    const ciphertext = await this.cryptoUtils.encrypt(JSON.stringify(empty_vulns), pass);
+    const reportId = uuid();
+    const data = {
+      report_id: reportId,
+      report_name: title,
+      report_createdate: today,
+      report_lastupdate: '',
+      encrypted_data: ciphertext
+    };
+
+    // indexeddb communication
+    const indexedDB = window.indexedDB;
+    const open = indexedDB.open('vulnrepo-db', 1);
+
+    open.onupgradeneeded = function () {
+      const db = open.result;
+      db.createObjectStore('reports', { autoIncrement: true });
+    };
+
+    open.onsuccess = function () {
+      const db = open.result;
+      const tx = db.transaction('reports', 'readwrite');
+      const store = tx.objectStore('reports');
+
+      store.put(data);
+
+      tx.oncomplete = function () {
+        db.close();
+      };
+    };
+
+
+    this.keyVault.set(reportId, pass);
+    this.router.navigate(['/my-reports']);
+
+    return true;
+
+  }
+
+  // One place where "the report was not created" becomes something the user
+  // can actually see. Every early return out of the two create paths goes
+  // through it, so no create can fail in silence again.
+  private failCreate(message: string) {
+    this.snackBar.open(message, 'OK', {
+      duration: 5000,
+      panelClass: ['notify-snackbar-fail']
+    });
+  }
+
+  async addnewReportonAPI(apiurl: string, apikey: string, title: string, pass: string, profile: any): Promise<boolean> {
+
+    if (!title || !pass) {
+      this.failCreate('A report needs both a title and a key.');
+      return false;
+    }
+
+    if (/\s/.test(pass)) {
+      this.failCreate('A security key cannot contain spaces.');
+      return false;
+    }
+
+    const defaultContent = `### Methodology and Standards:
+
+* OSTTMM(Open Source Security Testing Methodology Manual)
+* OWASP(Open Web Application Security Project)
+* ISSAF(Information Systems Security Assessment Framework)
+* WASC-TC(Web Application Security Consortium Threat Classification)
+* PTF(Penetration Testing Framework)
+* OISSG(Information Systems Security Assessment Framework)
+* NIST SP800-115(Technical Guide to Information Security Testing and Assessment)
+`;
+
+    const today: number = Date.now();
+
+    let empty_vulns = {
+      report_vulns: [],
+      report_scope: '',
+      report_assets: [],
+      report_summary: '',
+      report_changelog: [
+        {
+          date: today,
+          desc: 'Create report: \"' + title + '\".'
+        }
+      ],
+      report_version: 0,
+      report_metadata: {
+        starttest: today,
+        endtest: ''
+      },
+      researcher: [
+        {
+          reportername: '',
+          reportersocial: '',
+          reporterwww: '',
+          reporteremail: ''
+        }
+      ],
+      report_settings: {
+        report_html: defaultContent,
+        report_logo: {
+          logo: '',
+          width: 600,
+          height: 500
+        }
+      }
+    };
+
+    // check profile and set profile
+    empty_vulns = this.setProfile(empty_vulns, profile);
+
+    // Encrypt
+    const ciphertext = await this.cryptoUtils.encrypt(JSON.stringify(empty_vulns), pass);
+    const reportid = uuid();
+    const data = {
+      report_id: reportid,
+      report_name: title,
+      report_createdate: today,
+      report_lastupdate: '',
+      encrypted_data: ciphertext
+    };
+
+
+    // Awaited, so the caller learns whether the report exists. An
+    // unreachable host used to fall off the end of an un-caught .then()
+    // and leave the form looking like nothing had happened.
+    try {
+      // tslint:disable-next-line:max-line-length
+      const resp = await this.apiService.APISend(apiurl, apikey, 'savereport', 'reportdata=' + btoa(JSON.stringify(data)));
+
+      if (!resp) {
+        this.failCreate('No answer from ' + apiurl + '. The report was not created.');
+        return false;
+      }
+
+      if (resp.STORAGE === 'NOSPACE') {
+        this.failCreate('API ERROR: NO SPACE LEFT! The report was not created.');
+        return false;
+      }
+
+      this.keyVault.set(reportid, pass);
+      this.router.navigate(['/my-reports']);
+      return true;
+
+    } catch {
+      this.failCreate('Could not reach ' + apiurl + '. The report was not created.');
+      return false;
+    }
+
+  }
+
+
+  importReport(data) {
+    return new Promise<any>((resolve) => {
+      const result = this.reportSchema.validateReportFile(data);
+      if (!result.valid) {
+        this.snackBar.open('Import rejected: ' + result.error, 'OK', {
+          duration: 4000,
+          panelClass: ['notify-snackbar-fail']
+        });
+        resolve(false);
+        return;
+      }
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-db', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('reports', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('reports', 'readwrite');
+        const store = tx.objectStore('reports');
+
+        store.put(result.data);
+
+        tx.oncomplete = function () {
+          db.close();
+          resolve(true);
+        };
+      };
+    });
+  }
+
+
+
+  importReportfromfile(data) {
+    const result = this.reportSchema.validateReportFile(data);
+    if (!result.valid) {
+      this.snackBar.open('Import rejected: ' + result.error, 'OK', {
+        duration: 4000,
+        panelClass: ['notify-snackbar-fail']
+      });
+      return;
+    }
+
+    const indexedDB = window.indexedDB;
+    const open = indexedDB.open('vulnrepo-db', 1);
+
+    open.onupgradeneeded = function () {
+      const db = open.result;
+      db.createObjectStore('reports', { autoIncrement: true });
+    };
+
+    open.onsuccess = function () {
+      const db = open.result;
+      const tx = db.transaction('reports', 'readwrite');
+      const store = tx.objectStore('reports');
+
+      store.put(result.data);
+
+      tx.oncomplete = function () {
+        db.close();
+      };
+    };
+
+  }
+
+
+  importReportfromfileSettings(data) {
+    const result = this.reportSchema.validateReportObject(data);
+    if (!result.valid) {
+      this.snackBar.open('Backup entry skipped: ' + result.error, 'OK', {
+        duration: 4000,
+        panelClass: ['notify-snackbar-fail']
+      });
+      return;
+    }
+
+    const indexedDB = window.indexedDB;
+    const open = indexedDB.open('vulnrepo-db', 1);
+
+    open.onupgradeneeded = function () {
+      const db = open.result;
+      db.createObjectStore('reports', { autoIncrement: true });
+    };
+
+    open.onsuccess = function () {
+      const db = open.result;
+      const tx = db.transaction('reports', 'readwrite');
+      const store = tx.objectStore('reports');
+
+      store.put(result.data);
+
+      tx.oncomplete = function () {
+        db.close();
+      };
+    };
+
+  }
+
+
+  deleteReport(item: any, removehistory: any) {
+    return new Promise<any>((resolve, reject) => {
+      this.getkeybyReportID(item.report_id).then(data => {
+        if (data) {
+
+          if (data.NotFound === 'NOOK') {
+            console.log('no locally report');
+          } else {
+
+            if (removehistory) {
+              //remove from history
+              this.removeReporthistory(item.report_id).then(data => { });
+            }
+
+            // indexeddb communication
+            const indexedDB = window.indexedDB;
+            const open = indexedDB.open('vulnrepo-db', 1);
+
+            open.onupgradeneeded = function () {
+              const db = open.result;
+              db.createObjectStore('reports', { autoIncrement: true });
+            };
+
+            open.onsuccess = function () {
+              const db = open.result;
+              const tx = db.transaction('reports', 'readwrite');
+              const store = tx.objectStore('reports');
+
+              store.delete(data.key);
+
+              tx.oncomplete = function () {
+                db.close();
+                resolve(true);
+              };
+            };
+          }
+
+        }
+      });
+    });
+  }
+
+
+  checkifreportexist(report_id: string) {
+    return new Promise<any>((resolve, reject) => {
+      // indexeddb communication
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-db', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('reports', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('reports', 'readwrite');
+        const store = tx.objectStore('reports');
+        const request = store.getAll();
+        request.onsuccess = function (evt) {
+          request.result.forEach((item) => {
+            if (item.report_id === report_id) {
+              resolve(item);
+            }
+          });
+        };
+        tx.oncomplete = function () {
+          db.close();
+          resolve(false);
+        };
+        request.onerror = function (e) {
+          reject(e);
+        };
+      };
+    });
+  }
+
+  decrypt(pass: string, report_id: string): Promise<any> {
+    return this.checkifreportexist(report_id).then(data => {
+      if (data) {
+        return this.decodeAES(data, pass);
+      }
+    });
+  }
+
+
+
+  async decodeAES(data: any, pass: string): Promise<boolean> {
+    try {
+      // Decrypt
+      const plaintext = await this.cryptoUtils.decrypt(data.encrypted_data.toString(), pass);
+      const decryptedData = JSON.parse(plaintext);
+      if (decryptedData) {
+        this.keyVault.set(data.report_id, pass);
+      }
+      this.updateEncStatus(true);
+      this.messageService.sendDecrypted(decryptedData);
+      return true;
+    } catch (except) {
+      console.log('wrong pass');
+      return false;
+    }
+  }
+
+  getstatusencryption(): Observable<any> {
+    return this.decryptstatusObs.asObservable();
+  }
+
+  updateEncStatus(message: any) {
+    this.decryptstatusObs.next(message);
+  }
+
+  getchangesStatus(): Observable<any> {
+    return this.changesStatus.asObservable();
+  }
+
+  updatechangesStatus(message: any) {
+    this.changesStatus.next(message);
+  }
+
+
+  getkeybyReportID(reportid) {
+    return new Promise<any>((resolve, reject) => {
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-db', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('reports', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('reports', 'readwrite');
+        const store = tx.objectStore('reports');
+
+        // add, clear, count, delete, get, getAll, getAllKeys, getKey, put
+        const request = store.openCursor();
+
+        request.onsuccess = function (evt) {
+
+          const cursor = request.result;
+          if (cursor) {
+            const key = cursor.primaryKey;
+            const value = cursor.value.report_id;
+
+            if (reportid === value) {
+              const finded = { key, value };
+              resolve(finded);
+            }
+            cursor.continue();
+          } else {
+            // no more results
+
+          }
+
+        };
+
+        tx.oncomplete = function () {
+          db.close();
+          resolve({ 'NotFound': 'NOOK' });
+        };
+        request.onerror = function (e) {
+          reject(e);
+        };
+      };
+
+    });
+  }
+
+
+  deletesingleReporthistory(item: any) {
+    return new Promise<any>((resolve, reject) => {
+      this.getSinglekeybyReporthistoryID(item).then(data => {
+        if (data) {
+
+          // indexeddb communication
+          const indexedDB = window.indexedDB;
+          const open = indexedDB.open('vulnrepo-db-history', 1);
+
+          open.onupgradeneeded = function () {
+            const db = open.result;
+            db.createObjectStore('reports-history', { autoIncrement: true });
+          };
+
+          open.onsuccess = function () {
+            const db = open.result;
+            const tx = db.transaction('reports-history', 'readwrite');
+            const store = tx.objectStore('reports-history');
+
+            store.delete(data.key);
+
+            tx.oncomplete = function () {
+              db.close();
+              resolve(true);
+            };
+          };
+
+        }
+      });
+    });
+  }
+
+  getSinglekeybyReporthistoryID(report) {
+    return new Promise<any>((resolve, reject) => {
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-db-history', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('reports-history', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('reports-history', 'readwrite');
+        const store = tx.objectStore('reports-history');
+
+        // add, clear, count, delete, get, getAll, getAllKeys, getKey, put
+        const request = store.openCursor();
+
+        request.onsuccess = function (evt) {
+
+          const cursor = request.result;
+          if (cursor) {
+            const key = cursor.primaryKey;
+            const value = cursor.value.report_id;
+
+            if (report.report_id === value) {
+
+              if (JSON.stringify(report) === JSON.stringify(cursor.value)) {
+
+                const finded = { key, value };
+                resolve(finded);
+              }
+
+
+            }
+            cursor.continue();
+          } else {
+            // no more results
+
+          }
+
+        };
+
+        tx.oncomplete = function () {
+          db.close();
+          resolve({ 'NotFound': 'NOOK' });
+        };
+        request.onerror = function (e) {
+          reject(e);
+        };
+      };
+
+    });
+  }
+
+  getkeybyReporthistoryID(reportid) {
+    return new Promise<any>((resolve, reject) => {
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-db-history', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('reports-history', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('reports-history', 'readwrite');
+        const store = tx.objectStore('reports-history');
+
+        // add, clear, count, delete, get, getAll, getAllKeys, getKey, put
+        const request = store.openCursor();
+        const arr: any = [];
+
+        request.onsuccess = function (evt) {
+
+          const cursor = request.result;
+          if (cursor) {
+            const key = cursor.primaryKey;
+            const value = cursor.value.report_id;
+
+            if (reportid === value) {
+              const finded = { key, value };
+              arr.push(finded);
+            }
+            cursor.continue();
+          } else {
+            // no more results
+            resolve(arr);
+          }
+
+        };
+
+        tx.oncomplete = function () {
+          db.close();
+          resolve({ 'NotFound': 'NOOK' });
+        };
+        request.onerror = function (e) {
+          reject(e);
+        };
+      };
+
+    });
+  }
+
+  deleteReporthistory(item: any) {
+    return new Promise<any>((resolve, reject) => {
+      this.getkeybyReporthistoryID(item.report_id).then(data => {
+        if (data) {
+
+          data.forEach(function (item) {
+
+            // indexeddb communication
+            const indexedDB = window.indexedDB;
+            const open = indexedDB.open('vulnrepo-db-history', 1);
+
+            open.onupgradeneeded = function () {
+              const db = open.result;
+              db.createObjectStore('reports-history', { autoIncrement: true });
+            };
+
+            open.onsuccess = function () {
+              const db = open.result;
+              const tx = db.transaction('reports-history', 'readwrite');
+              const store = tx.objectStore('reports-history');
+
+              store.delete(item.key);
+
+              tx.oncomplete = function () {
+                db.close();
+              };
+            };
+
+          });
+
+        }
+      });
+    });
+  }
+
+  removeReporthistory(report_id: string) {
+    return new Promise<any>((resolve, reject) => {
+
+      this.getReportsHistory(report_id).then(retdata => {
+        if (retdata.length > 0) {
+
+          retdata.forEach(function (item) {
+
+            this.deleteReporthistory(item).then(data => { });
+          }, this);
+
+        }
+      });
+
+    });
+  }
+
+
+  add_report_to_history(value) {
+    return new Promise<any>((resolve, reject) => {
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-db-history', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('reports-history', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('reports-history', 'readwrite');
+        const store = tx.objectStore('reports-history');
+
+        store.put(value);
+
+        tx.oncomplete = function () {
+          db.close();
+        };
+      };
+
+    });
+  }
+
+  getReportsHistory(reportid) {
+    return new Promise<any>((resolve, reject) => {
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-db-history', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('reports-history', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('reports-history', 'readwrite');
+        const store = tx.objectStore('reports-history');
+
+        // add, clear, count, delete, get, getAll, getAllKeys, getKey, put
+        const request = store.getAll();
+
+        request.onsuccess = function (evt) {
+
+          const historical_versions = request.result.filter(function (el) {
+            return (el.report_id === reportid);
+          });
+
+          resolve(historical_versions);
+        };
+
+        tx.oncomplete = function () {
+          db.close();
+        };
+        request.onerror = function (e) {
+          reject(e);
+        };
+      };
+
+    });
+  }
+
+  updatereportDB(key, value) {
+    return new Promise<any>((resolve, reject) => {
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-db', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('reports', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('reports', 'readwrite');
+        const store = tx.objectStore('reports');
+
+        // add, clear, count, delete, get, getAll, getAllKeys, getKey, put
+        const request = store.put(value, key);
+
+        request.onsuccess = function (evt) {
+          resolve('encrypted:ok');
+        };
+
+        tx.oncomplete = function () {
+          db.close();
+        };
+        request.onerror = function (e) {
+          reject(e);
+        };
+      };
+
+    });
+  }
+
+  async prepareupdatereport(data: any, pass: string, reportid: any, reportname: any, reportcreatedate: any, reportorder: any): Promise<any> {
+    try {
+      // Encrypt
+      const ciphertext = await this.cryptoUtils.encrypt(JSON.stringify(data), pass);
+      const now: number = Date.now();
+      const vulns = data.report_vulns || [];
+      const report_stats = {
+        total: vulns.length,
+        critical: vulns.filter((v: any) => v.severity === 'Critical').length,
+        high: vulns.filter((v: any) => v.severity === 'High').length,
+        medium: vulns.filter((v: any) => v.severity === 'Medium').length,
+        low: vulns.filter((v: any) => v.severity === 'Low').length,
+        info: vulns.filter((v: any) => v.severity === 'Info').length,
+      };
+      const to_update = {
+        report_id: reportid,
+        report_name: reportname,
+        report_createdate: reportcreatedate,
+        report_lastupdate: now,
+        report_stats,
+        encrypted_data: ciphertext
+      };
+
+      //add to history
+      this.add_report_to_history(to_update).then(_ => { });
+
+      const retu = await this.updatereportDB(reportorder, to_update);
+      if (retu === 'encrypted:ok') {
+        //execute navbar refresh
+        this.sessionsub.removeSessionStorageItem('encrypted:ok');
+        return now;
+      }
+    } catch (except) {
+      console.log(except);
+    }
+  }
+
+
+  async prepareupdateAPIreport(apiurl: string, apikey: string, data: any, pass: string, reportid: any, reportname: any, reportcreatedate: any): Promise<any> {
+    try {
+      // Encrypt
+      const ciphertext = await this.cryptoUtils.encrypt(JSON.stringify(data), pass);
+      const now: number = Date.now();
+      const vulns = data.report_vulns || [];
+      const report_stats = {
+        total: vulns.length,
+        critical: vulns.filter((v: any) => v.severity === 'Critical').length,
+        high: vulns.filter((v: any) => v.severity === 'High').length,
+        medium: vulns.filter((v: any) => v.severity === 'Medium').length,
+        low: vulns.filter((v: any) => v.severity === 'Low').length,
+        info: vulns.filter((v: any) => v.severity === 'Info').length,
+      };
+      const to_update = {
+        report_id: reportid,
+        report_name: reportname,
+        report_createdate: reportcreatedate,
+        report_lastupdate: now,
+        report_stats,
+        encrypted_data: ciphertext
+      };
+
+      const localkey = this.keyVault.getApiVault();
+      if (localkey) {
+        // tslint:disable-next-line:max-line-length
+        const resp = await this.apiService.APISend(apiurl, apikey, 'updatereport', 'reportdata=' + btoa(JSON.stringify(to_update)));
+        if (resp.STORAGE === 'NOSPACE') {
+          this.snackBar.open('API ERROR: NO SPACE LEFT!', 'OK', {
+            duration: 3000,
+            panelClass: ['notify-snackbar-fail']
+          });
+          return 'NOSPACE';
+        } else if (resp.REPORT_UPDATE === 'OK') {
+          //execute navbar refresh
+          this.sessionsub.removeSessionStorageItem('encrypted:ok');
+          return now;
+        }
+      }
+    } catch (except) {
+      console.log(except);
+    }
+  }
+
+
+  downloadEncryptedReport(report_id) {
+
+    this.checkifreportexist(report_id).then(data => {
+      if (data) {
+        this.preparedownload(data);
+      } else {
+        this.checkAPIreport(report_id).then(re => {
+          this.preparedownload(re);
+        });
+      }
+
+    });
+
+  }
+
+  preparedownload(data) {
+    const enc = btoa(JSON.stringify(data));
+    const blob = new Blob([encodeURIComponent(enc)], { type: 'text/plain' });
+    this.utilsService.downloadWithIntegrity(
+      blob,
+      data.report_name + ' ' + data.report_id + ' (vulnrepo.com).vulnr'
+    );
+  }
+
+  cloneReportadd(report: any) {
+    return new Promise<any>((resolve, reject) => {
+      // indexeddb communication
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-db', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('reports', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('reports', 'readwrite');
+        const store = tx.objectStore('reports');
+
+        store.put(report);
+
+        tx.oncomplete = function () {
+          db.close();
+          resolve(true);
+        };
+      };
+
+    });
+  }
+
+  encryptKEY(key: string, pass: string): Promise<string> {
+    return this.cryptoUtils.encrypt(key, pass);
+  }
+
+  decryptKEY(key: string, pass: string): Promise<string> {
+    return this.cryptoUtils.decrypt(key.toString(), pass);
+  }
+
+  saveKEYinDB(key) {
+    return new Promise<any>((resolve, reject) => {
+      // indexeddb communication
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-api', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('api');
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('api', 'readwrite');
+        const store = tx.objectStore('api');
+
+        store.put(key, 'vulnrepo-api-vault');
+
+        tx.oncomplete = function () {
+          db.close();
+          resolve(true);
+        };
+      };
+
+    });
+  }
+
+  retrieveAPIkey() {
+    return new Promise<any>((resolve, reject) => {
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-api', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('api', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('api', 'readwrite');
+        const store = tx.objectStore('api');
+
+        // add, clear, count, delete, get, getAll, getAllKeys, getKey, put
+        const request = store.get('vulnrepo-api-vault');
+
+        request.onsuccess = function (evt) {
+          resolve(request.result);
+        };
+
+        tx.oncomplete = function () {
+          db.close();
+        };
+        request.onerror = function (e) {
+          reject(e);
+        };
+      };
+
+    });
+  }
+
+  // ── Existence probes ──────────────────────────────────────────────────────
+  // These ask "is this report also on a configured server?" on the app's own
+  // initiative — the navbar runs one per held key every time the key vault
+  // changes. A local-only report is simply absent there, so a server that
+  // answers anything but 404 would otherwise raise "CAN'T CONNECT TO API" over
+  // a page that is working fine. They pass silent=true and report absence to
+  // their caller instead; user-initiated calls (save, update, remove, connect)
+  // keep the snackbar.
+  checkAPIreport_single(reportid, url, key) {
+    return new Promise<any>((resolve, reject) => {
+
+      this.apiService.APISend(url, key, 'getreport', 'reportid=' + reportid, true).then(resp => {
+        if (Array.isArray(resp) && resp.length > 0) {
+          console.log('Report exist in API: OK');
+          resolve(resp[0]);
+        } else {
+          // Absent, or the endpoint did not answer — same thing to the caller.
+          resolve(false);
+        }
+
+      });
+
+    });
+  }
+
+  checkAPIreport(reportid) {
+    return new Promise<any>((resolve, reject) => {
+
+      const localkey = this.keyVault.getApiVault();
+      if (localkey) {
+
+        const vaultobj = JSON.parse(localkey);
+        vaultobj.forEach((element) => {
+          this.apiService.APISend(element.value, element.apikey, 'getreport', 'reportid=' + reportid, true).then(resp => {
+            if (resp) {
+              if (resp.length > 0) {
+                console.log('Report exist in API: OK');
+                resolve(resp[0]);
+              }
+            }
+
+          });
+
+        });
+
+      } else {
+        resolve(false);
+
+      }
+
+
+    });
+  }
+
+  checkAPIreportchanges(reportid) {
+    return new Promise<any>((resolve, reject) => {
+
+      const localkey = this.keyVault.getApiVault();
+      if (localkey) {
+
+        const vaultobj = JSON.parse(localkey);
+
+        vaultobj.forEach((element) => {
+          this.apiService.APISend(element.value, element.apikey, 'getreport', 'reportid=' + reportid, true).then(resp => {
+            if (resp) {
+              if (resp.length > 0) {
+                console.log('Report exist in API changes: OK');
+                resolve(resp[0]);
+              }
+            }
+          });
+
+        });
+
+      } else {
+        resolve(false);
+      }
+
+
+    });
+  }
+
+
+  searchAPIreport(reportid) {
+    return new Promise<any>((resolve, reject) => {
+
+      const localkey = this.keyVault.getApiVault();
+      if (localkey) {
+
+        const vaultobj = JSON.parse(localkey);
+
+        vaultobj.forEach((element) => {
+
+          this.apiService.APISend(element.value, element.apikey, 'getreport', 'reportid=' + reportid, true).then(resp => {
+
+            if (resp) {
+              if (resp.length > 0) {
+                console.log('Report exist in API: OK');
+                resolve({ data: resp[0], api: element.value, apikey: element.apikey });
+              }
+            }
+
+          }).then((resp) => {
+            //if (check !== true) {
+            //resolve('API_ERROR');
+            //}
+          });
+
+        });
+
+      }
+
+
+    });
+  }
+
+  saveReportProfileinDB(key) {
+    return new Promise<any>((resolve, reject) => {
+      // indexeddb communication
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-profiles', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('report-profiles', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('report-profiles', 'readwrite');
+        const store = tx.objectStore('report-profiles');
+
+        store.put(key);
+
+        tx.oncomplete = function () {
+          db.close();
+          resolve(true);
+        };
+      };
+
+    });
+  }
+
+  retrieveReportProfile() {
+    return new Promise<any>((resolve, reject) => {
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-profiles', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('report-profiles', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('report-profiles', 'readwrite');
+        const store = tx.objectStore('report-profiles');
+
+        // add, clear, count, delete, get, getAll, getAllKeys, getKey, put
+        const request = store.openCursor();
+        const arr: any = [];
+        request.onsuccess = function (evt) {
+          let cursor = request.result;
+          if (cursor) {
+            let key = cursor.primaryKey;
+            let value = cursor.value;
+            const ret = Object.assign({}, { "_key": key }, value);
+            arr.push(ret)
+            cursor.continue();
+          }
+          else {
+            // no more results
+
+          }
+
+        };
+
+        tx.oncomplete = function () {
+          resolve(arr);
+          db.close();
+        };
+        request.onerror = function (e) {
+          reject(e);
+        };
+      };
+
+    });
+  }
+
+  getkeybyProfileID(keyid) {
+    return new Promise<any>((resolve, reject) => {
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-profiles', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('report-profiles', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('report-profiles', 'readwrite');
+        const store = tx.objectStore('report-profiles');
+
+        // add, clear, count, delete, get, getAll, getAllKeys, getKey, put
+        const request = store.openCursor();
+
+        request.onsuccess = function (evt) {
+
+          const cursor = request.result;
+          if (cursor) {
+            const key = cursor.primaryKey;
+            const value = cursor.value;
+
+            if (key === keyid) {
+              const finded = { key, value };
+              resolve(finded);
+            }
+            cursor.continue();
+          } else {
+            // no more results
+
+          }
+
+        };
+
+        tx.oncomplete = function () {
+          db.close();
+          resolve({ 'NotFound': 'NOOK' });
+        };
+        request.onerror = function (e) {
+          reject(e);
+        };
+      };
+
+    });
+  }
+
+  deleteProfile(item: any) {
+    return new Promise<any>((resolve, reject) => {
+      this.getkeybyProfileID(item._key).then(data => {
+        if (data) {
+
+          if (data.NotFound === 'NOOK') {
+            console.log('no locally profile');
+          } else {
+            // indexeddb communication
+            const indexedDB = window.indexedDB;
+            const open = indexedDB.open('vulnrepo-profiles', 1);
+
+            open.onupgradeneeded = function () {
+              const db = open.result;
+              db.createObjectStore('report-profiles', { autoIncrement: true });
+            };
+
+            open.onsuccess = function () {
+              const db = open.result;
+              const tx = db.transaction('report-profiles', 'readwrite');
+              const store = tx.objectStore('report-profiles');
+
+              store.delete(data.key);
+
+              tx.oncomplete = function () {
+                db.close();
+                resolve(true);
+              };
+            };
+          }
+
+        }
+      });
+    });
+  }
+
+  updateProfile(newvalue, key) {
+    return new Promise<any>((resolve, reject) => {
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-profiles', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('report-profiles', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('report-profiles', 'readwrite');
+        const store = tx.objectStore('report-profiles');
+
+        // add, clear, count, delete, get, getAll, getAllKeys, getKey, put
+        const request = store.put(newvalue, key);
+
+        request.onsuccess = function (evt) {
+          resolve(true);
+        };
+
+        tx.oncomplete = function () {
+          db.close();
+        };
+        request.onerror = function (e) {
+          reject(e);
+        };
+      };
+
+    });
+  }
+
+  saveReportTemplateinDB(item) {
+    return new Promise<any>((resolve, reject) => {
+      // indexeddb communication
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-templates', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('report-templates', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('report-templates', 'readwrite');
+        const store = tx.objectStore('report-templates');
+
+        store.put(item);
+
+        tx.oncomplete = function () {
+          db.close();
+          resolve(true);
+        };
+      };
+
+    });
+  }
+
+  retrieveReportTemplates() {
+    return new Promise<any>((resolve, reject) => {
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-templates', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('report-templates', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('report-templates', 'readwrite');
+        const store = tx.objectStore('report-templates');
+
+        // add, clear, count, delete, get, getAll, getAllKeys, getKey, put
+        const request = store.openCursor();
+        const arr: any = [];
+        request.onsuccess = function (evt) {
+          let cursor = request.result;
+          if (cursor) {
+            let key = cursor.primaryKey;
+            let value = cursor.value;
+            const ret = Object.assign({}, { "_key": key }, value);
+            arr.push(ret)
+            cursor.continue();
+          }
+          else {
+            // no more results
+
+          }
+
+        };
+
+        tx.oncomplete = function () {
+          resolve(arr);
+          db.close();
+        };
+        request.onerror = function (e) {
+          reject(e);
+        };
+      };
+
+    });
+  }
+
+  getkeybyTemplateID(keyid) {
+    return new Promise<any>((resolve, reject) => {
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-templates', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('report-templates', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('report-templates', 'readwrite');
+        const store = tx.objectStore('report-templates');
+
+        // add, clear, count, delete, get, getAll, getAllKeys, getKey, put
+        const request = store.openCursor();
+
+        request.onsuccess = function (evt) {
+
+          const cursor = request.result;
+          if (cursor) {
+            const key = cursor.primaryKey;
+            const value = cursor.value.title;
+
+            if (key === keyid) {
+              const finded = { key, value };
+              resolve(finded);
+            }
+            cursor.continue();
+          } else {
+            // no more results
+
+          }
+
+        };
+
+        tx.oncomplete = function () {
+          db.close();
+          resolve({ 'NotFound': 'NOOK' });
+        };
+        request.onerror = function (e) {
+          reject(e);
+        };
+      };
+
+    });
+  }
+
+  deleteTemplate(item: any) {
+    return new Promise<any>((resolve, reject) => {
+      this.getkeybyTemplateID(item._key).then(data => {
+        if (data) {
+
+          if (data.NotFound === 'NOOK') {
+            console.log('no locally template');
+          } else {
+            // indexeddb communication
+            const indexedDB = window.indexedDB;
+            const open = indexedDB.open('vulnrepo-templates', 1);
+
+            open.onupgradeneeded = function () {
+              const db = open.result;
+              db.createObjectStore('report-templates', { autoIncrement: true });
+            };
+
+            open.onsuccess = function () {
+              const db = open.result;
+              const tx = db.transaction('report-templates', 'readwrite');
+              const store = tx.objectStore('report-templates');
+
+              store.delete(data.key);
+
+              tx.oncomplete = function () {
+                db.close();
+                resolve(true);
+              };
+            };
+          }
+
+        }
+      });
+    });
+  }
+
+
+  updateTemplate(newvalue, key) {
+    return new Promise<any>((resolve, reject) => {
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-templates', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('report-templates', { autoIncrement: true });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('report-templates', 'readwrite');
+        const store = tx.objectStore('report-templates');
+
+        // add, clear, count, delete, get, getAll, getAllKeys, getKey, put
+        const request = store.put(newvalue, key);
+
+        request.onsuccess = function (evt) {
+          resolve(true);
+        };
+
+        tx.oncomplete = function () {
+          db.close();
+        };
+        request.onerror = function (e) {
+          reject(e);
+        };
+      };
+
+    });
+  }
+
+  updateAiintegration(newvalue, key) {
+    return new Promise<any>((resolve, reject) => {
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-ollama', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('report-ollama', { autoIncrement: false });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('report-ollama', 'readwrite');
+        const store = tx.objectStore('report-ollama');
+
+        // add, clear, count, delete, get, getAll, getAllKeys, getKey, put
+        const request = store.put(newvalue, key);
+
+        request.onsuccess = function (evt) {
+          resolve(true);
+        };
+
+        tx.oncomplete = function () {
+          db.close();
+        };
+        request.onerror = function (e) {
+          reject(e);
+        };
+      };
+
+    });
+  }
+
+
+  getAllHistoryEntriesWithKeys(): Promise<{ key: any; entry: any }[]> {
+    return new Promise((resolve, reject) => {
+      const idb = window.indexedDB;
+      const open = idb.open('vulnrepo-db-history', 1);
+      open.onupgradeneeded = () => {
+        open.result.createObjectStore('reports-history', { autoIncrement: true });
+      };
+      open.onsuccess = () => {
+        const db = open.result;
+        const tx = db.transaction('reports-history', 'readonly');
+        const store = tx.objectStore('reports-history');
+        const req = store.openCursor();
+        const arr: { key: any; entry: any }[] = [];
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (cursor) { arr.push({ key: cursor.primaryKey, entry: cursor.value }); cursor.continue(); }
+        };
+        tx.oncomplete = () => { db.close(); resolve(arr); };
+        req.onerror = (e) => reject(e);
+      };
+    });
+  }
+
+  // Every save event as metadata only — what /home's activity panel counts.
+  //
+  // A history snapshot is a whole report: report_stats plus the full
+  // encrypted_data ciphertext, attachments included. getAll() on this store
+  // would therefore hand back every version of every report at once, which is
+  // tens of MB on a working database. The cursor still deserializes each
+  // record (there is no index to project through), but only the metadata is
+  // kept, so what survives this call is a few dozen bytes per save.
+  //
+  // Returns one entry per save, in store order. The caller windows and buckets
+  // them in memory — that is what lets the activity period change without
+  // touching IndexedDB again. `cap` is a backstop for a database that was
+  // never purged; hitting it loses the oldest-written records, not the newest
+  // reports, so the panel degrades to a shorter usable window.
+  getHistoryActivity(cap: number = 20000): Promise<HistoryActivityEntry[]> {
+    return new Promise<HistoryActivityEntry[]>((resolve, reject) => {
+      const idb = window.indexedDB;
+      const open = idb.open('vulnrepo-db-history', 1);
+      open.onupgradeneeded = () => {
+        open.result.createObjectStore('reports-history', { autoIncrement: true });
+      };
+      open.onsuccess = () => {
+        const db = open.result;
+        const tx = db.transaction('reports-history', 'readonly');
+        const store = tx.objectStore('reports-history');
+        const req = store.openCursor();
+        const out: HistoryActivityEntry[] = [];
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor) { return; }
+          const val = cursor.value;
+          const ts = Number(val?.report_lastupdate) || 0;
+          // A snapshot with no usable timestamp cannot be placed on a day, and
+          // one with no report_id cannot be attributed — both are dropped
+          // rather than counted against an arbitrary report or date.
+          if (ts > 0 && val?.report_id) {
+            const stats = val.report_stats;
+            out.push({
+              report_id: val.report_id,
+              report_name: val.report_name || '',
+              ts,
+              total: stats?.total || 0,
+              critical: stats?.critical || 0,
+              high: stats?.high || 0,
+              medium: stats?.medium || 0,
+              low: stats?.low || 0,
+              info: stats?.info || 0
+            });
+          }
+          // Not calling continue() ends the walk; the transaction then
+          // completes normally and resolves with what was gathered.
+          if (out.length >= cap) { return; }
+          cursor.continue();
+        };
+        tx.oncomplete = () => { db.close(); resolve(out); };
+        req.onerror = (e) => reject(e);
+      };
+      open.onerror = (e) => reject(e);
+    });
+  }
+
+  deleteHistoryByKey(key: any): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const idb = window.indexedDB;
+      const open = idb.open('vulnrepo-db-history', 1);
+      open.onupgradeneeded = () => {
+        open.result.createObjectStore('reports-history', { autoIncrement: true });
+      };
+      open.onsuccess = () => {
+        const db = open.result;
+        const tx = db.transaction('reports-history', 'readwrite');
+        tx.objectStore('reports-history').delete(key);
+        tx.oncomplete = () => { db.close(); resolve(); };
+        tx.onerror = (e) => reject(e);
+      };
+    });
+  }
+
+  async purgeOldHistorySnapshots(keepN: number): Promise<number> {
+    const all = await this.getAllHistoryEntriesWithKeys();
+    const byReport: Record<string, { key: any; entry: any }[]> = {};
+    for (const item of all) {
+      const id = item.entry.report_id;
+      if (!byReport[id]) byReport[id] = [];
+      byReport[id].push(item);
+    }
+    let deleted = 0;
+    for (const items of Object.values(byReport)) {
+      items.sort((a, b) => (b.entry.report_lastupdate || 0) - (a.entry.report_lastupdate || 0));
+      for (const item of items.slice(keepN)) {
+        await this.deleteHistoryByKey(item.key);
+        deleted++;
+      }
+    }
+    return deleted;
+  }
+
+  getkeybyAiintegration() {
+    return new Promise<any>((resolve, reject) => {
+
+      const indexedDB = window.indexedDB;
+      const open = indexedDB.open('vulnrepo-ollama', 1);
+
+      open.onupgradeneeded = function () {
+        const db = open.result;
+        db.createObjectStore('report-ollama', { autoIncrement: false });
+      };
+
+      open.onsuccess = function () {
+        const db = open.result;
+        const tx = db.transaction('report-ollama', 'readwrite');
+        const store = tx.objectStore('report-ollama');
+
+        // add, clear, count, delete, get, getAll, getAllKeys, getKey, put
+        const request = store.getAll();
+
+        request.onsuccess = function (evt) {
+          resolve(request.result);
+        };
+
+        tx.oncomplete = function () {
+          db.close();
+        };
+        request.onerror = function (e) {
+          reject(e);
+        };
+      };
+
+    });
+  }
+
+
+
+}

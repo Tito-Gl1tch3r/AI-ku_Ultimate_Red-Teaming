@@ -1,0 +1,79 @@
+// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+use tauri::Manager;
+
+#[cfg(desktop)]
+use tauri_plugin_window_state::{AppHandleExt, StateFlags};
+
+mod basex;
+mod command;
+mod crypto;
+mod file_ops;
+mod log_manager;
+mod time_utils;
+
+#[tauri::command]
+fn greet(name: &str) -> String {
+    format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let builder = tauri::Builder::default();
+
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_window_state::Builder::default().build());
+
+    builder
+        .plugin(tauri_plugin_store::Builder::new().build())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .manage(log_manager::LogState::new())
+        .setup(|app| {
+            let state = app.state::<log_manager::LogState>();
+            if let Err(e) = log_manager::init_log_state(app.handle(), &state) {
+                eprintln!("Failed to init log state: {}", e);
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            command::trivium_xor,
+            crypto::sm4::sm4_encrypt,
+            crypto::sm4::sm4_decrypt,
+            file_ops::process_base64_file,
+            file_ops::hash_file,
+            file_ops::aes_encrypt_file,
+            file_ops::aes_decrypt_file,
+            basex::basex_encode,
+            basex::basex_decode,
+            log_manager::append_log,
+            log_manager::load_logs,
+            log_manager::clear_logs_file,
+            log_manager::start_new_log,
+            log_manager::get_current_session_info,
+            log_manager::update_log_note,
+            log_manager::remove_log_note,
+            log_manager::list_log_sessions,
+            log_manager::get_logs_by_session,
+            log_manager::get_logs_page,
+            log_manager::get_log_detail,
+            log_manager::delete_log,
+            log_manager::delete_log_session,
+            log_manager::update_log_fields,
+            log_manager::update_session_note,
+            log_manager::remove_session_note,
+            log_manager::switch_to_session,
+            time_utils::get_system_time
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            #[cfg(desktop)]
+            if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+                if let Err(error) = app_handle.save_window_state(StateFlags::all()) {
+                    eprintln!("Failed to save window state on exit: {}", error);
+                }
+            }
+        });
+}

@@ -1,0 +1,84 @@
+/*-
+ * =================================LICENSE_START==================================
+ * jdbq
+ * ====================================SECTION=====================================
+ * Copyright (C) 2022 Andy Boothe
+ * ====================================SECTION=====================================
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * ==================================LICENSE_END===================================
+ */
+package com.sigpwned.jdbq.mapper.column;
+
+import java.sql.SQLException;
+import com.google.cloud.bigquery.FieldValue;
+import com.google.cloud.bigquery.FieldValueList;
+import com.sigpwned.jdbq.config.ConfigRegistry;
+import com.sigpwned.jdbq.statement.StatementContext;
+
+/**
+ * Maps result set columns to objects.
+ *
+ * @param <T> The mapped type
+ * @see ColumnMapperFactory
+ * @see ColumnMappers
+ * @see org.jdbi.v3.core.result.ResultBearing#map(ColumnMapper)
+ * @see org.jdbi.v3.core.config.Configurable#registerColumnMapper(ColumnMapper)
+ * @see org.jdbi.v3.core.config.Configurable#registerColumnMapper(java.lang.reflect.Type,
+ *      ColumnMapper)
+ * @see StatementContext#findColumnMapperFor(java.lang.reflect.Type)
+ */
+@FunctionalInterface
+public interface ColumnMapper<T> {
+  /**
+   * Map the given column of the current row of the result set to an Object. This method should not
+   * cause the result set to advance; allow Jdbi to do that, please.
+   *
+   * @param r the result set being iterated
+   * @param columnNumber the column number to map (starts at 1)
+   * @param ctx the statement context
+   * @return the value to return for this column
+   * @throws SQLException if anything goes wrong go ahead and let this percolate; Jdbi will handle
+   *         it
+   */
+  default T map(FieldValueList r, int columnNumber, StatementContext ctx) {
+    return map(r.get(columnNumber), ctx);
+  }
+
+  /**
+   * Map the given column of the current row of the result set to an Object. This method should not
+   * cause the result set to advance; allow Jdbi to do that, please.
+   *
+   * @param r the result set being iterated
+   * @param columnLabel the column label to map
+   * @param ctx the statement context
+   * @return the value to return for this column
+   * @throws SQLException if anything goes wrong go ahead and let this percolate; Jdbi will handle
+   *         it
+   */
+  default T map(FieldValueList r, String columnLabel, StatementContext ctx) {
+    return map(r.get(columnLabel), ctx);
+  }
+
+  T map(FieldValue value, StatementContext ctx);
+
+  /**
+   * Allows for initialization of the column mapper instance within a ConfigRegistry scope. This
+   * method is called once when the column mapper is first used from a ConfigRegistry.
+   * <p>
+   * Note that handles, statements, sql objects etc. all create copies of the registry, and this
+   * method will be called for every copy
+   *
+   * @param registry A reference to the {@link ConfigRegistry} that this instance belongs to.
+   */
+  default void init(ConfigRegistry registry) {}
+}

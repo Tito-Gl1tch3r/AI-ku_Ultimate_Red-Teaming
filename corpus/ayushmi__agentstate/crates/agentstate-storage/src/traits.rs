@@ -1,0 +1,232 @@
+use agentstate_core::{Object, PutRequest, QueryRequest, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone)]
+pub struct GetOptions {
+    pub at_ts: Option<DateTime<Utc>>, // time-travel
+}
+
+#[derive(Debug, Clone)]
+pub struct WatchFilter {
+    pub ns: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum WatchEvent {
+    Put(Object),
+    Delete {
+        ns: String,
+        id: String,
+        commit_seq: u64,
+    },
+}
+
+#[async_trait::async_trait]
+pub trait Storage: Send + Sync + 'static {
+    async fn put(&self, ns: &str, req: PutRequest) -> Result<Object>;
+    async fn get(&self, ns: &str, id: &str, opts: GetOptions) -> Result<Object>;
+    async fn query(&self, ns: &str, req: QueryRequest) -> Result<Vec<Object>>;
+    async fn delete(&self, ns: &str, id: &str) -> Result<()>;
+    async fn sweep_expired(&self, retention_secs: u64) -> Result<u64>; // returns removed count
+
+    // Subscribe from an optional resume token (commit_seq)
+    fn subscribe(&self, filter: WatchFilter, from_commit: Option<u64>) -> Box<dyn WatchHandle>;
+
+    // Leases
+    async fn lease_acquire(&self, ns: &str, key: &str, owner: &str, ttl_secs: u64)
+        -> Result<Lease>;
+    async fn lease_renew(
+        &self,
+        ns: &str,
+        key: &str,
+        owner: &str,
+        token: u64,
+        ttl_secs: u64,
+    ) -> Result<Lease>;
+    async fn lease_release(&self, ns: &str, key: &str, owner: &str, token: u64) -> Result<()>;
+
+    // Idempotency
+    async fn idempotency_lookup(
+        &self,
+        ns: &str,
+        key: &str,
+        body_hash: &str,
+    ) -> Result<Option<IdempotencyRecord>>;
+    async fn idempotency_commit(
+        &self,
+        ns: &str,
+        key: &str,
+        body_hash: &str,
+        response: serde_json::Value,
+        commit_seq: u64,
+        expires_at: DateTime<Utc>,
+    ) -> Result<()>;
+
+    // Fence validation for writes
+    async fn validate_fence(&self, ns: &str, resource: &str, fence: u64) -> Result<()>;
+
+    // Admin
+    async fn admin_snapshot(&self) -> Result<(String, u64)>;
+    async fn admin_manifest(&self) -> Result<serde_json::Value>;
+    async fn admin_trim_wal(&self, snapshot_id: &str) -> Result<Vec<String>>;
+
+    // Backlog monitoring
+    fn backlog_map(&self) -> std::collections::HashMap<String, u64> {
+        Default::default()
+    }
+
+    // Export all objects (for admin dump)
+    fn all_objects(&self) -> Vec<Object> {
+        Vec::new()
+    }
+
+    // Verify hash chain integrity. Returns chain breaks as JSON values.
+    fn verify_chain(&self, _ns: Option<&str>) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+
+    // Namespace invariant management
+    async fn set_namespace_invariant(
+        &self,
+        _ns: &str,
+        _spec: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        Err(agentstate_core::StateError::Internal(
+            "not supported".into(),
+        ))
+    }
+    async fn get_namespace_invariant(&self, _ns: &str) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+
+    // Claim verification storage
+    async fn store_claim(
+        &self,
+        _ns: &str,
+        _claim_id: &str,
+        _claim: serde_json::Value,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn get_claim(
+        &self,
+        _ns: &str,
+        _claim_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+    async fn store_proof(
+        &self,
+        _ns: &str,
+        _claim_id: &str,
+        _proof_id: &str,
+        _proof: serde_json::Value,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn get_proof_by_claim(
+        &self,
+        _ns: &str,
+        _claim_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+    async fn list_claims(&self, _ns: &str) -> Result<Vec<serde_json::Value>> {
+        Ok(vec![])
+    }
+    async fn store_challenge(
+        &self,
+        _ns: &str,
+        _claim_id: &str,
+        _challenge: serde_json::Value,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn get_challenges(
+        &self,
+        _ns: &str,
+        _claim_id: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        Ok(vec![])
+    }
+    async fn get_proofs_for_ns(&self, _ns: &str) -> Result<Vec<serde_json::Value>> {
+        Ok(vec![])
+    }
+
+    // Domain pack runtime registration
+    async fn register_domain_pack(&self, _key: String, _pack: serde_json::Value) -> Result<String> {
+        Err(agentstate_core::StateError::Internal("not supported".into()))
+    }
+    async fn list_registered_domain_packs(&self) -> Result<Vec<serde_json::Value>> {
+        Ok(vec![])
+    }
+
+    // Proof status updates (challenge feedback, expiry, consequence violation)
+    async fn update_proof_status(
+        &self,
+        _ns: &str,
+        _claim_id: &str,
+        _proof_id: &str,
+        _status: &str,
+        _challenge_id: Option<String>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    // Consequence status updates
+    async fn update_consequence_status(
+        &self,
+        _ns: &str,
+        _claim_id: &str,
+        _idx: usize,
+        _status: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    // Multi-party signing
+    async fn sign_proof(
+        &self,
+        _ns: &str,
+        _claim_id: &str,
+        _proof_id: &str,
+        _signer: &str,
+        _token: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn get_proof_signatures(
+        &self,
+        _ns: &str,
+        _claim_id: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        Ok(vec![])
+    }
+}
+
+pub trait WatchHandle: Send {
+    fn try_next(&mut self) -> Option<WatchEvent>;
+    fn last_commit(&self) -> u64;
+    fn overflow_meta(&self) -> Option<(u64, u32)>; // (last_commit, retry_after_ms)
+}
+
+#[derive(Debug, Clone)]
+pub struct Lease {
+    pub ns: String,
+    pub key: String,
+    pub owner: String,
+    pub token: u64,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdempotencyRecord {
+    pub ns: String,
+    pub key: String,
+    pub body_hash: String,
+    pub response_hash: String,
+    pub commit_seq: u64,
+    pub expires_at: DateTime<Utc>,
+    pub response: serde_json::Value,
+}

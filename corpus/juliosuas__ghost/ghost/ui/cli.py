@@ -1,0 +1,588 @@
+"""Rich CLI with interactive menus and progress tracking."""
+
+import asyncio
+import json
+import sys
+from pathlib import Path
+
+import click
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+from rich.prompt import Prompt, Confirm
+from rich.tree import Tree
+from rich.text import Text
+from rich import box
+
+from ghost.core.investigator import GhostInvestigator
+from ghost.core.config import config
+from ghost.core.doctor import has_error, run_doctor_checks, summarize_doctor_checks
+from ghost.backend.db import (
+    delete_investigation,
+    get_graph_data,
+    get_investigation,
+    init_db,
+    list_investigations,
+    save_investigation,
+)
+from ghost.core.ingest import IngestError, ingest_file
+
+console = Console()
+
+BANNER = """
+ ██████╗ ██╗  ██╗ ██████╗ ███████╗████████╗
+██╔════╝ ██║  ██║██╔═══██╗██╔════╝╚══██╔══╝
+██║  ███╗███████║██║   ██║███████╗   ██║
+██║   ██║██╔══██║██║   ██║╚════██║   ██║
+╚██████╔╝██║  ██║╚██████╔╝███████║   ██║
+ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝
+    Local OSINT case files + provenance
+"""
+
+DISCLAIMER = (
+    "[bold red]LEGAL DISCLAIMER:[/bold red] This tool is for authorized use only. "
+    "Unauthorized surveillance, stalking, or privacy violation is illegal. "
+    "You are solely responsible for lawful use."
+)
+
+
+def print_banner():
+    console.print(
+        Panel(
+            Text(BANNER, style="bold green", justify="center"),
+            border_style="green",
+            padding=(0, 2),
+        )
+    )
+    console.print(DISCLAIMER, justify="center")
+    console.print()
+
+
+def create_progress():
+    return Progress(
+        SpinnerColumn(style="green"),
+        TextColumn("[bold green]{task.description}"),
+        BarColumn(bar_width=30, style="green", complete_style="bold green"),
+        TextColumn("[dim]{task.fields[status]}"),
+        TimeElapsedColumn(),
+        console=console,
+    )
+
+
+@click.group(invoke_without_command=True)
+@click.option("--target", "-t", help="Investigation target")
+@click.option("--type", "-T", "input_type", default="auto", help="Input type: username/email/phone/domain/image/auto")
+@click.option("--modules", "-m", help="Comma-separated modules to run")
+@click.option("--output", "-o", help="Output file path")
+@click.option("--format", "-f", "fmt", default="html", help="Report format: html/pdf/json/markdown")
+@click.option("--no-ai", is_flag=True, help="Disable OpenAI calls and use deterministic heuristic analysis")
+@click.option(
+    "--scope", default="authorized CLI investigation", help="Authorized scope/purpose recorded in report provenance"
+)
+@click.option("--authorized", is_flag=True, help="Acknowledge this investigation is authorized")
+@click.pass_context
+def cli(ctx, target, input_type, modules, output, fmt, no_ai, scope, authorized):
+    """Ghost — local authorized OSINT case files + provenance."""
+    # Create the SQLite schema on first use so `ghost list`, `ghost import`, etc.
+    # work on a fresh install. `doctor` manages its own database check.
+    if ctx.invoked_subcommand != "doctor":
+        init_db()
+    if ctx.invoked_subcommand is not None:
+        return
+
+    print_banner()
+
+    if target:
+        # Direct investigation mode
+        module_list = modules.split(",") if modules else None
+        run_investigation(target, input_type, module_list, output, fmt, no_ai=no_ai, scope=scope, authorized=authorized)
+    else:
+        # Interactive mode
+        interactive_menu()
+
+
+@cli.command()
+@click.argument("target")
+@click.option("--type", "-T", "input_type", default="auto")
+@click.option("--modules", "-m", help="Comma-separated modules")
+@click.option("--output", "-o")
+@click.option("--format", "-f", "fmt", default="html", help="Report format: html/pdf/json/markdown")
+@click.option("--no-ai", is_flag=True, help="Disable OpenAI calls and use deterministic heuristic analysis")
+@click.option(
+    "--scope", default="authorized CLI investigation", help="Authorized scope/purpose recorded in report provenance"
+)
+@click.option("--authorized", is_flag=True, help="Acknowledge this investigation is authorized")
+def investigate(target, input_type, modules, output, fmt, no_ai, scope, authorized):
+    """Run an investigation on a target."""
+    print_banner()
+    module_list = modules.split(",") if modules else None
+    run_investigation(target, input_type, module_list, output, fmt, no_ai=no_ai, scope=scope, authorized=authorized)
+
+
+@cli.command()
+def interactive():
+    """Launch interactive investigation mode."""
+    print_banner()
+    interactive_menu()
+
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable readiness JSON")
+def doctor(as_json):
+    """Check local Ghost configuration, optional capabilities, and exposure gates.
+
+    Fail-closed (exit 1, JSON ok=false) when:
+
+    \b
+      GHOST_SECRET_KEY  missing or equal to ghost-dev-key / example placeholders
+      GHOST_HOST        set to anything other than 127.0.0.1 or localhost
+                        (unset is OK for CLI-only; 0.0.0.0 / public binds fail)
+      GHOST_API_TOKEN   empty (API readiness; Flask token auth is not wired yet)
+
+    These gates do not block CLI-only `investigate --authorized --no-ai`,
+    which never starts Flask.
+    """
+    checks = run_doctor_checks()
+
+    if as_json:
+        click.echo(json.dumps(summarize_doctor_checks(checks), indent=2))
+        if has_error(checks):
+            raise click.exceptions.Exit(1)
+        return
+
+    print_banner()
+
+    table = Table(title="Ghost Doctor", box=box.ROUNDED, border_style="green")
+    table.add_column("Check", style="bold")
+    table.add_column("Status")
+    table.add_column("Detail", overflow="fold")
+
+    def add(name: str, ok: bool, detail: str, severity: str = "warn"):
+        status = "[green]OK[/green]" if ok else "[red]FAIL[/red]" if severity == "error" else "[yellow]WARN[/yellow]"
+        table.add_row(name, status, detail)
+
+    for check in checks:
+        add(check.name, check.ok, check.detail, check.severity)
+    console.print(table)
+    if has_error(checks):
+        raise click.exceptions.Exit(1)
+
+
+@cli.command(name="list")
+@click.option("--limit", default=10, show_default=True, help="Maximum investigations to show")
+@click.option("--offset", default=0, show_default=True, help="Pagination offset")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def list_cases(limit, offset, as_json):
+    """List saved investigation case files."""
+    investigations = list_investigations(limit=limit, offset=offset)
+
+    if as_json:
+        click.echo(json.dumps(investigations, indent=2, default=str))
+        return
+
+    table = Table(title="Ghost Investigations", box=box.ROUNDED, border_style="green")
+    table.add_column("ID", overflow="fold")
+    table.add_column("Target", style="bold")
+    table.add_column("Type")
+    table.add_column("Status")
+    table.add_column("Risk")
+    table.add_column("Authorized")
+    table.add_column("Scope", overflow="fold")
+
+    for inv in investigations:
+        table.add_row(
+            inv.get("id", "")[:8],
+            inv.get("target", ""),
+            inv.get("input_type", ""),
+            inv.get("status", ""),
+            f"{float(inv.get('risk_score') or 0):.0%}",
+            "yes" if inv.get("authorized_use") else "no",
+            inv.get("scope", ""),
+        )
+
+    if investigations:
+        console.print(table)
+    else:
+        console.print("[dim]No saved investigations yet.[/dim]")
+
+
+@cli.command()
+@click.argument("investigation_id")
+@click.option("--json", "as_json", is_flag=True, help="Emit full machine-readable JSON")
+def show(investigation_id, as_json):
+    """Show one saved investigation by full ID or unique prefix."""
+    investigation = _find_investigation_by_id_or_prefix(investigation_id)
+    if investigation is None:
+        raise click.ClickException(f"No investigation found for '{investigation_id}'")
+    if investigation == "ambiguous":
+        raise click.ClickException(f"Investigation prefix '{investigation_id}' is ambiguous")
+
+    if as_json:
+        click.echo(json.dumps(investigation, indent=2, default=str))
+        return
+
+    console.print(
+        Panel(
+            f"[bold green]ID:[/bold green] {investigation['id']}\n"
+            f"[bold green]Target:[/bold green] {investigation['target']}\n"
+            f"[bold green]Type:[/bold green] {investigation['input_type']}\n"
+            f"[bold green]Status:[/bold green] {investigation['status']}\n"
+            f"[bold green]Risk:[/bold green] {float(investigation.get('risk_score') or 0):.0%}\n"
+            f"[bold green]Authorized:[/bold green] {'yes' if investigation.get('authorized_use') else 'no'}\n"
+            f"[bold green]Scope:[/bold green] {investigation.get('scope', '')}",
+            title="[bold green]CASE FILE[/bold green]",
+            border_style="green",
+        )
+    )
+
+    if investigation.get("summary"):
+        console.print(Panel(investigation["summary"], title="Summary", border_style="green"))
+
+    graph = get_graph_data(investigation["id"]) or {"nodes": [], "links": []}
+    console.print(
+        f"[dim]Findings modules:[/dim] {', '.join(sorted(investigation.get('findings', {}).keys())) or 'none'}"
+    )
+    console.print(f"[dim]Graph:[/dim] {len(graph['nodes'])} nodes, {len(graph['links'])} links")
+
+
+@cli.command(name="export")
+@click.argument("investigation_id")
+@click.option("--output", "-o", type=click.Path(dir_okay=False, path_type=Path), help="Destination JSON file")
+def export_case(investigation_id, output):
+    """Export one saved investigation as a portable JSON case file."""
+    investigation = _find_investigation_by_id_or_prefix(investigation_id)
+    if investigation is None:
+        raise click.ClickException(f"No investigation found for '{investigation_id}'")
+    if investigation == "ambiguous":
+        raise click.ClickException(f"Investigation prefix '{investigation_id}' is ambiguous")
+
+    output = output or Path(f"ghost-case-{investigation['id']}.json")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(investigation, indent=2, default=str), encoding="utf-8")
+    console.print(f"[green]Exported case[/green] {investigation['id']} [dim]to[/dim] {output}")
+
+
+@cli.command(name="import")
+@click.argument("case_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--replace", is_flag=True, help="Replace an existing case with the same investigation ID")
+def import_case(case_file, replace):
+    """Import a portable JSON case file into the local SQLite store."""
+    try:
+        case_data = json.loads(case_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(f"Invalid JSON case file: {exc}") from exc
+
+    required = {"id", "target", "input_type", "status", "started_at"}
+    missing = sorted(required - set(case_data))
+    if missing:
+        raise click.ClickException(f"Invalid Ghost case file; missing: {', '.join(missing)}")
+
+    existing = get_investigation(case_data["id"])
+    if existing and not replace:
+        raise click.ClickException(f"Case {case_data['id']} already exists. Re-run with --replace to overwrite it.")
+
+    save_investigation(case_data)
+    console.print(f"[green]Imported case[/green] {case_data['id']} [dim]from[/dim] {case_file}")
+
+
+@cli.command()
+@click.argument("source_file", metavar="FILE", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--tool", type=click.Choice(["sherlock", "maigret", "holehe"]), required=True)
+@click.option(
+    "--case",
+    default=None,
+    help="Existing case id, unique id prefix, or target name. Unknown names create a case.",
+)
+@click.option(
+    "--scope", default="authorized tool ingest", show_default=True, help="Scope stored when a new case is created"
+)
+@click.option("--authorized", is_flag=True, help="Record the case as an authorized investigation")
+def ingest(source_file, tool, case, scope, authorized):
+    """Import a local Sherlock, Maigret, or Holehe report into a case file.
+
+    Reads the file only. Does not fetch URLs, spawn the other tool, or run investigate.
+    """
+    try:
+        result = ingest_file(
+            source_file,
+            tool,
+            case=case,
+            scope=scope,
+            authorized_use=authorized,
+        )
+    except IngestError as exc:
+        raise click.ClickException(f"{exc} Nothing was imported.") from exc
+
+    action = "Created case" if result.created else "Updated case"
+    console.print(
+        f"[green]{action}[/green] {result.investigation['id']} "
+        f"[dim]target[/dim] {result.investigation['target']} "
+        f"[dim]records[/dim] {result.imported_records} "
+        f"[dim]sha256[/dim] {result.source_sha256}"
+    )
+
+
+@cli.command(name="delete")
+@click.argument("investigation_id")
+@click.option("--yes", is_flag=True, help="Skip confirmation prompt")
+def delete_case(investigation_id, yes):
+    """Delete one saved investigation case file."""
+    investigation = _find_investigation_by_id_or_prefix(investigation_id)
+    if investigation is None:
+        raise click.ClickException(f"No investigation found for '{investigation_id}'")
+    if investigation == "ambiguous":
+        raise click.ClickException(f"Investigation prefix '{investigation_id}' is ambiguous")
+
+    if not yes and not Confirm.ask(f"Delete case {investigation['id']} for {investigation['target']}?", default=False):
+        console.print("[dim]Delete cancelled.[/dim]")
+        return
+
+    if delete_investigation(investigation["id"]):
+        console.print(f"[green]Deleted case[/green] {investigation['id']}")
+    else:
+        raise click.ClickException(f"Could not delete case {investigation['id']}")
+
+
+def _find_investigation_by_id_or_prefix(investigation_id: str):
+    investigation = get_investigation(investigation_id)
+    if investigation:
+        return investigation
+
+    matches = [item for item in list_investigations(limit=500) if item.get("id", "").startswith(investigation_id)]
+    if len(matches) == 1:
+        return get_investigation(matches[0]["id"])
+    if len(matches) > 1:
+        return "ambiguous"
+    return None
+
+
+def interactive_menu():
+    """Interactive menu for investigations."""
+    while True:
+        console.print()
+        console.print(
+            Panel(
+                "[bold green]INVESTIGATION MENU[/bold green]",
+                border_style="green",
+                padding=(0, 2),
+            )
+        )
+
+        table = Table(show_header=False, box=box.SIMPLE, border_style="green")
+        table.add_column(style="bold green", width=6)
+        table.add_column(style="white")
+        table.add_row("[1]", "Username Investigation")
+        table.add_row("[2]", "Email Investigation")
+        table.add_row("[3]", "Phone Number Investigation")
+        table.add_row("[4]", "Domain Investigation")
+        table.add_row("[5]", "Image Analysis")
+        table.add_row("[6]", "Full Investigation (all modules)")
+        table.add_row("[7]", "Custom Module Selection")
+        table.add_row("[0]", "Exit")
+        console.print(table)
+
+        choice = Prompt.ask("[green]Select option", choices=["0", "1", "2", "3", "4", "5", "6", "7"], default="1")
+
+        if choice == "0":
+            console.print("[dim]Exiting Ghost...[/dim]")
+            sys.exit(0)
+
+        type_map = {
+            "1": "username",
+            "2": "email",
+            "3": "phone",
+            "4": "domain",
+            "5": "image",
+            "6": "auto",
+            "7": "auto",
+        }
+
+        input_type = type_map[choice]
+        target = Prompt.ask(f"[green]Enter {input_type if input_type != 'auto' else 'target'}")
+
+        if not target.strip():
+            console.print("[red]No target provided.[/red]")
+            continue
+
+        modules = None
+        if choice == "7":
+            console.print(f"[dim]Available modules: {', '.join(config.enabled_modules)}[/dim]")
+            mod_input = Prompt.ask("[green]Enter modules (comma-separated)")
+            modules = [m.strip() for m in mod_input.split(",")]
+
+        fmt = Prompt.ask("[green]Report format", choices=["html", "pdf", "json", "markdown"], default="html")
+
+        if Confirm.ask(f"[green]Start investigation on [bold]{target}[/bold]?", default=True):
+            run_investigation(target, input_type, modules, None, fmt)
+
+
+def run_investigation(
+    target: str,
+    input_type: str,
+    modules: list = None,
+    output: str = None,
+    fmt: str = "html",
+    no_ai: bool = False,
+    scope: str = "authorized CLI investigation",
+    authorized: bool = False,
+):
+    """Execute an investigation with progress display."""
+    original_openai_key = config.openai_api_key
+    if no_ai:
+        config.openai_api_key = ""
+    try:
+        investigator = GhostInvestigator()
+
+        console.print()
+        console.print(
+            Panel(
+                f"[bold green]TARGET:[/bold green] {target}\n"
+                f"[bold green]TYPE:[/bold green] {input_type}\n"
+                f"[bold green]MODULES:[/bold green] {', '.join(modules) if modules else 'auto'}\n"
+                f"[bold green]AI:[/bold green] {'disabled' if no_ai else 'enabled when configured'}\n"
+                f"[bold green]SCOPE:[/bold green] {scope}\n"
+                f"[bold green]AUTHORIZED:[/bold green] {'yes' if authorized else 'not acknowledged'}",
+                title="[bold green]INVESTIGATION STARTING[/bold green]",
+                border_style="green",
+            )
+        )
+        console.print()
+
+        # Progress tracking
+        module_tasks = {}
+
+        with create_progress() as progress:
+            main_task = progress.add_task("Investigation", total=100, status="initializing...")
+
+            def progress_callback(module, status, detail):
+                if module == "complete":
+                    progress.update(main_task, completed=100, status="Complete!")
+                    return
+
+                if module not in module_tasks:
+                    module_tasks[module] = progress.add_task(f"  {module}", total=100, status=status)
+
+                if status == "done":
+                    progress.update(module_tasks[module], completed=100, status=detail)
+                elif status == "error":
+                    progress.update(module_tasks[module], completed=100, status=f"[red]{detail}[/red]")
+                else:
+                    progress.update(module_tasks[module], completed=50, status=detail)
+
+                # Update main progress
+                done_count = sum(1 for m in module_tasks.values() if progress.tasks[m].completed >= 100)
+                total_modules = max(len(module_tasks), 1)
+                progress.update(
+                    main_task,
+                    completed=int(done_count / total_modules * 90),
+                    status=f"{done_count}/{total_modules} modules",
+                )
+
+            investigator.set_progress_callback(progress_callback)
+
+            # Run the investigation
+            investigation = asyncio.run(
+                investigator.investigate_async(target, input_type, modules, scope=scope, authorized_use=authorized)
+            )
+
+        console.print()
+
+        # Display results
+        display_results(investigation)
+
+        # Generate report
+        report_path = investigator.generate_report(investigation, fmt, output)
+        console.print()
+        console.print(
+            Panel(
+                f"[bold green]Report saved to:[/bold green] {report_path}",
+                border_style="green",
+            )
+        )
+    finally:
+        if no_ai:
+            config.openai_api_key = original_openai_key
+
+
+def display_results(investigation):
+    """Display investigation results in a rich format."""
+    inv = investigation.to_dict()
+
+    # Summary
+    if inv.get("summary"):
+        console.print(
+            Panel(
+                inv["summary"],
+                title="[bold green]EXECUTIVE SUMMARY[/bold green]",
+                border_style="green",
+            )
+        )
+
+    # Risk Score
+    risk = inv.get("risk_score", 0)
+    risk_color = "green" if risk < 0.4 else "yellow" if risk < 0.7 else "red"
+    console.print(
+        Panel(
+            f"[bold {risk_color}]Risk Score: {risk:.0%}[/bold {risk_color}]",
+            border_style=risk_color,
+        )
+    )
+
+    # Findings tree
+    tree = Tree("[bold green]Investigation Findings[/bold green]")
+    for module, data in inv.get("findings", {}).items():
+        if isinstance(data, dict) and "error" not in data:
+            branch = tree.add(f"[green]{module}[/green]")
+            _add_dict_to_tree(branch, data, depth=0, max_depth=2)
+        elif isinstance(data, dict) and "error" in data:
+            tree.add(f"[red]{module}: {data['error']}[/red]")
+
+    console.print(tree)
+
+    # Errors
+    if inv.get("errors"):
+        console.print()
+        err_table = Table(title="Errors", border_style="red", box=box.ROUNDED)
+        err_table.add_column("Error", style="red")
+        for err in inv["errors"]:
+            err_table.add_row(str(err))
+        console.print(err_table)
+
+
+def _add_dict_to_tree(tree, data, depth=0, max_depth=2):
+    """Recursively add dict data to a Rich tree."""
+    if depth >= max_depth:
+        return
+
+    if isinstance(data, dict):
+        for key, val in data.items():
+            if key in ("raw", "all_tags", "encoding"):
+                continue
+            if isinstance(val, dict):
+                branch = tree.add(f"[dim]{key}:[/dim]")
+                _add_dict_to_tree(branch, val, depth + 1, max_depth)
+            elif isinstance(val, list):
+                if len(val) == 0:
+                    tree.add(f"[dim]{key}:[/dim] []")
+                elif len(val) <= 3:
+                    branch = tree.add(f"[dim]{key}:[/dim]")
+                    for item in val:
+                        if isinstance(item, dict):
+                            sub = branch.add("")
+                            _add_dict_to_tree(sub, item, depth + 1, max_depth)
+                        else:
+                            branch.add(str(item)[:100])
+                else:
+                    tree.add(f"[dim]{key}:[/dim] [{len(val)} items]")
+            else:
+                val_str = str(val)[:100]
+                tree.add(f"[dim]{key}:[/dim] {val_str}")
+
+
+def main():
+    cli()
+
+
+if __name__ == "__main__":
+    main()

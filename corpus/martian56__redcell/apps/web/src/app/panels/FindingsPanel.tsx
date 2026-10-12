@@ -1,0 +1,211 @@
+import { useMemo, useState } from 'react';
+import type { Finding, FindingStatus } from '@redcell/api-client';
+import { cn } from '@/lib/cn';
+import { useUI } from '@/store/ui';
+import { useFindings, useMergeFindings, useSetFindingStatus } from '@/features/hooks';
+import { Button, Empty, SeverityTag, Spinner } from '@/components/ui/primitives';
+import { Select } from '@/components/ui/Dropdown';
+
+// Group active findings that likely describe the same issue: same location and
+// either the same title or the same CWE. The first in each group (most recent)
+// is the canonical record; the rest are duplicates the operator can merge in.
+function duplicateGroups(findings: Finding[]) {
+  const active = findings.filter((f) => f.status !== 'dismissed');
+  const parent = new Map<string, string>(active.map((f) => [f.id, f.id]));
+  const find = (x: string): string => {
+    let r = x;
+    while (parent.get(r) !== r) r = parent.get(r)!;
+    while (parent.get(x) !== r) {
+      const next = parent.get(x)!;
+      parent.set(x, r);
+      x = next;
+    }
+    return r;
+  };
+  const union = (a: string, b: string) => parent.set(find(a), find(b));
+  for (let i = 0; i < active.length; i++) {
+    for (let j = i + 1; j < active.length; j++) {
+      const a = active[i]!;
+      const b = active[j]!;
+      const sameLoc = !!a.location && a.location.toLowerCase() === b.location.toLowerCase();
+      if (!sameLoc) continue;
+      const sameTitle = a.title.toLowerCase() === b.title.toLowerCase();
+      const sameCwe = !!a.cwe && a.cwe === b.cwe;
+      if (sameTitle || sameCwe) union(a.id, b.id);
+    }
+  }
+  const byRoot = new Map<string, Finding[]>();
+  for (const f of active) {
+    const r = find(f.id);
+    (byRoot.get(r) ?? byRoot.set(r, []).get(r)!).push(f);
+  }
+  const dupsOf = new Map<string, string[]>();
+  const isDup = new Set<string>();
+  for (const group of byRoot.values()) {
+    if (group.length < 2) continue;
+    const [canonical, ...rest] = group;
+    dupsOf.set(canonical!.id, rest.map((r) => r.id));
+    rest.forEach((r) => isDup.add(r.id));
+  }
+  return { dupsOf, isDup };
+}
+
+export function FindingsPanel() {
+  const engId = useUI((s) => s.activeSessionId);
+  const selection = useUI((s) => s.selection);
+  const select = useUI((s) => s.select);
+  const { data, isLoading } = useFindings(engId);
+  const setStatus = useSetFindingStatus();
+  const merge = useMergeFindings();
+  const busy = setStatus.isPending || merge.isPending;
+
+  const [q, setQ] = useState('');
+  const [sev, setSev] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
+
+  const { dupsOf, isDup } = useMemo(() => duplicateGroups(data ?? []), [data]);
+  const filtered = useMemo(
+    () =>
+      (data ?? []).filter(
+        (f) =>
+          (!sev || f.severity === sev) &&
+          (!statusFilter || f.status === statusFilter) &&
+          (!q || `${f.title} ${f.location} ${f.id}`.toLowerCase().includes(q.toLowerCase())),
+      ),
+    [data, sev, statusFilter, q],
+  );
+
+  if (isLoading) return <div className="grid h-full place-items-center"><Spinner /></div>;
+  if (!data || data.length === 0) return <Empty>No findings yet.</Empty>;
+
+  const th = 'sticky top-0 z-10 bg-bg2 px-3 py-2 text-left font-mono text-[9.5px] font-bold uppercase tracking-wider text-faint border-b border-border';
+
+  const move = (e: React.MouseEvent, id: string, status: FindingStatus) => {
+    e.stopPropagation();
+    setStatus.mutate({ id, status });
+  };
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="flex flex-none items-center gap-2 border-b border-border bg-bg2 px-3 py-1.5">
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Filter findings…"
+          className="h-7 min-w-0 flex-1 rounded-[var(--radius)] border border-border bg-bg px-2 text-[11px] text-text outline-none placeholder:text-faint focus:border-accent"
+        />
+        <div className="w-28 flex-none">
+          <Select
+            value={sev}
+            onChange={setSev}
+            placeholder="Severity"
+            className="!h-7 !py-0 !text-[11px]"
+            options={[
+              { value: '', label: 'All severities' },
+              ...['critical', 'high', 'medium', 'low', 'info'].map((s) => ({ value: s, label: s })),
+            ]}
+          />
+        </div>
+        <div className="w-28 flex-none">
+          <Select
+            value={statusFilter}
+            onChange={setStatusFilter}
+            placeholder="Status"
+            className="!h-7 !py-0 !text-[11px]"
+            options={[
+              { value: '', label: 'All statuses' },
+              ...['candidate', 'verified', 'dismissed'].map((s) => ({ value: s, label: s })),
+            ]}
+          />
+        </div>
+      </div>
+      <div className="min-h-0 flex-1 overflow-auto">
+      <table className="w-full border-collapse text-xs">
+        <thead>
+          <tr>
+            <th className={th}>ID</th>
+            <th className={th}>Sev</th>
+            <th className={th}>Title</th>
+            <th className={th}>Location</th>
+            <th className={th}>Status</th>
+            <th className={th} />
+          </tr>
+        </thead>
+        <tbody>
+          {filtered.map((f) => {
+            const active = selection?.type === 'finding' && selection.id === f.id;
+            const dupIds = dupsOf.get(f.id);
+            const dismissed = f.status === 'dismissed';
+            return (
+              <tr
+                key={f.id}
+                onClick={() => select({ type: 'finding', id: f.id })}
+                className={cn(
+                  'cursor-pointer border-b border-border hover:bg-panel2',
+                  active && 'bg-panel2',
+                  dismissed && 'opacity-50',
+                )}
+              >
+                <td className="px-3 py-2 font-mono text-[11px] text-faint">{f.id}</td>
+                <td className="px-3 py-2"><SeverityTag sev={f.severity} cvss={f.cvss} /></td>
+                <td className={cn('px-3 py-2 text-text', dismissed && 'line-through')}>{f.title}</td>
+                <td className="px-3 py-2 font-mono text-faint">{f.location}</td>
+                <td className="px-3 py-2 whitespace-nowrap">
+                  {f.status === 'verified' ? (
+                    <span className="font-mono text-[11px] font-bold text-live">✓ verified</span>
+                  ) : dismissed ? (
+                    <span className="font-mono text-[11px] text-faint">dismissed</span>
+                  ) : (
+                    <span className="font-mono text-[11px] text-faint">{f.status}</span>
+                  )}
+                  {isDup.has(f.id) && (
+                    <span className="ml-2 rounded border border-border px-1 font-mono text-[9px] uppercase tracking-wider text-faint">
+                      dup
+                    </span>
+                  )}
+                </td>
+                <td className="px-3 py-2 text-right whitespace-nowrap">
+                  <div className="flex justify-end gap-1">
+                    {dupIds && dupIds.length > 0 && (
+                      <Button
+                        variant="subtle"
+                        className="h-6 px-2 text-[11px]"
+                        disabled={busy}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          merge.mutate({ primaryId: f.id, duplicateIds: dupIds });
+                        }}
+                        data-tip="Dismiss the likely duplicates of this finding"
+                      >
+                        Merge {dupIds.length}
+                      </Button>
+                    )}
+                    {f.status !== 'verified' && !dismissed && (
+                      <Button variant="subtle" className="h-6 px-2 text-[11px]" disabled={busy}
+                        onClick={(e) => move(e, f.id, 'verified')}>
+                        Verify
+                      </Button>
+                    )}
+                    {!dismissed ? (
+                      <Button variant="subtle" className="h-6 px-2 text-[11px]" disabled={busy}
+                        onClick={(e) => move(e, f.id, 'dismissed')}>
+                        Dismiss
+                      </Button>
+                    ) : (
+                      <Button variant="subtle" className="h-6 px-2 text-[11px]" disabled={busy}
+                        onClick={(e) => move(e, f.id, 'candidate')}>
+                        Reopen
+                      </Button>
+                    )}
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      {filtered.length === 0 ? <Empty>No findings match the filter.</Empty> : null}
+      </div>
+    </div>
+  );
+}

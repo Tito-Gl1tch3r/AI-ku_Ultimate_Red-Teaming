@@ -1,0 +1,588 @@
+"""Tests for Ghost investigation engine and backend."""
+
+import asyncio
+import json
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from ghost.core.investigator import (
+    GhostInvestigator,
+    Investigation,
+    _detect_input_type,
+    INPUT_TYPE_MODULES,
+)
+from ghost.backend.db import (
+    init_db,
+    save_investigation,
+    get_investigation,
+    list_investigations,
+    get_graph_data,
+    delete_investigation,
+)
+
+
+# ── Input detection ─────────────────────────────────────────────────
+
+
+class TestInputDetection:
+    def test_email(self):
+        assert _detect_input_type("user@example.com") == "email"
+
+    def test_phone_plus(self):
+        assert _detect_input_type("+15551234567") == "phone"
+
+    def test_phone_digits(self):
+        assert _detect_input_type("555-123-4567") == "phone"
+
+    def test_domain(self):
+        assert _detect_input_type("example.com") == "domain"
+
+    def test_domain_subdomain(self):
+        assert _detect_input_type("sub.example.co.uk") == "domain"
+
+    def test_name(self):
+        assert _detect_input_type("John Doe") == "name"
+
+    def test_username(self):
+        assert _detect_input_type("johndoe") == "username"
+
+
+# ── Investigation model ─────────────────────────────────────────────
+
+
+class TestInvestigationModel:
+    def test_create(self):
+        inv = Investigation("johndoe", "username")
+        assert inv.target == "johndoe"
+        assert inv.input_type == "username"
+        assert inv.status == "pending"
+        assert inv.risk_score == 0.0
+        assert isinstance(inv.id, str) and len(inv.id) == 36
+
+    def test_to_dict(self):
+        inv = Investigation("test@example.com", "email", scope="self-audit", authorized_use=True)
+        d = inv.to_dict()
+        assert d["target"] == "test@example.com"
+        assert d["input_type"] == "email"
+        assert d["scope"] == "self-audit"
+        assert d["authorized_use"] is True
+        assert "id" in d
+        assert "started_at" in d
+        assert d["status"] == "pending"
+
+    def test_to_dict_serializable(self):
+        inv = Investigation("target", "username")
+        inv.findings = {"username": {"profiles": [{"platform": "GitHub", "url": "https://github.com/target"}]}}
+        d = inv.to_dict()
+        # Should be JSON-serializable
+        json.dumps(d)
+
+
+# ── Module routing ──────────────────────────────────────────────────
+
+
+class TestModuleRouting:
+    def test_username_modules(self):
+        assert INPUT_TYPE_MODULES["username"] == ["username"]
+        assert "social" not in INPUT_TYPE_MODULES["username"]
+        assert "darkweb" not in INPUT_TYPE_MODULES["username"]
+
+    def test_email_modules(self):
+        assert "email" in INPUT_TYPE_MODULES["email"]
+        assert "username" in INPUT_TYPE_MODULES["email"]
+        assert "social" not in INPUT_TYPE_MODULES["email"]
+        assert "darkweb" not in INPUT_TYPE_MODULES["email"]
+
+    def test_phone_modules(self):
+        assert INPUT_TYPE_MODULES["phone"] == ["phone"]
+        assert "social" not in INPUT_TYPE_MODULES["phone"]
+
+    def test_domain_modules(self):
+        assert "domain" in INPUT_TYPE_MODULES["domain"]
+        assert "geolocation" in INPUT_TYPE_MODULES["domain"]
+
+
+# ── Database layer ──────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _setup_test_db(tmp_path, monkeypatch):
+    """Use a temporary database for each test."""
+    test_db = tmp_path / "test_ghost.db"
+    monkeypatch.setattr("ghost.backend.db.DB_PATH", test_db)
+    init_db()
+
+
+class TestDatabase:
+    def test_save_and_retrieve(self):
+        inv = Investigation("johndoe", "username")
+        inv.status = "completed"
+        inv.risk_score = 0.65
+        inv.summary = "Test summary"
+        inv.findings = {
+            "username": {
+                "username": "johndoe",
+                "profiles": [
+                    {"platform": "GitHub", "url": "https://github.com/johndoe", "status": "found"},
+                    {"platform": "Twitter", "url": "https://x.com/johndoe", "status": "found"},
+                ],
+                "found_count": 2,
+            }
+        }
+        save_investigation(inv.to_dict())
+
+        loaded = get_investigation(inv.id)
+        assert loaded is not None
+        assert loaded["target"] == "johndoe"
+        assert loaded["authorized_use"] is False
+        assert loaded["status"] == "completed"
+        assert loaded["risk_score"] == 0.65
+        assert "username" in loaded["findings"]
+        assert loaded["findings"]["username"]["found_count"] == 2
+
+    def test_list_investigations(self):
+        for i in range(3):
+            inv = Investigation(f"target{i}", "username", scope="client-owned audit", authorized_use=True)
+            save_investigation(inv.to_dict())
+        results = list_investigations()
+        assert len(results) == 3
+        assert results[0]["scope"] == "client-owned audit"
+        assert results[0]["authorized_use"] is True
+
+    def test_get_nonexistent(self):
+        assert get_investigation("nonexistent-id") is None
+
+    def test_delete(self):
+        inv = Investigation("todelete", "username")
+        save_investigation(inv.to_dict())
+        assert delete_investigation(inv.id) is True
+        assert get_investigation(inv.id) is None
+
+    def test_delete_nonexistent(self):
+        assert delete_investigation("nope") is False
+
+    def test_graph_data(self):
+        inv = Investigation("graphtest", "username")
+        inv.findings = {
+            "username": {
+                "profiles": [
+                    {"platform": "GitHub", "url": "https://github.com/graphtest", "status": "found"},
+                ]
+            }
+        }
+        save_investigation(inv.to_dict())
+        graph = get_graph_data(inv.id)
+        assert graph is not None
+        assert "nodes" in graph
+        assert "links" in graph
+        # At least the target node and one profile
+        assert len(graph["nodes"]) >= 1
+
+    def test_graph_nonexistent(self):
+        assert get_graph_data("nope") is None
+
+    def test_entities_stored(self):
+        inv = Investigation("entitytest", "email")
+        inv.findings = {
+            "email": {
+                "email": "test@example.com",
+                "breaches": {
+                    "breaches": [
+                        {"name": "TestBreach", "date": "2023-01-01"},
+                    ]
+                },
+            }
+        }
+        inv.correlations = {
+            "identities": [{"type": "email", "value": "test@example.com", "confidence": 0.9}],
+            "locations": [{"value": "New York", "source": "email"}],
+        }
+        save_investigation(inv.to_dict())
+
+        loaded = get_investigation(inv.id)
+        assert len(loaded["entities"]) > 0
+        types = {e["entity_type"] for e in loaded["entities"]}
+        assert "target" in types
+
+
+# ── Database configuration ──────────────────────────────────────────
+
+
+class TestDatabaseConfiguration:
+    def test_sqlite_database_url_resolves_absolute_path(self, tmp_path):
+        from ghost.backend.db import resolve_database_path
+
+        db_path = tmp_path / "ghost-v2.db"
+        assert resolve_database_path(f"sqlite:///{db_path}") == db_path
+
+    def test_plain_relative_database_path_resolves_under_data_dir(self):
+        from ghost.backend.db import resolve_database_path
+        from ghost.core.config import DATA_DIR
+
+        assert resolve_database_path("ghost-local.db") == DATA_DIR / "ghost-local.db"
+        assert resolve_database_path("sqlite:///ghost-local.db") == DATA_DIR / "ghost-local.db"
+
+    def test_unsupported_database_scheme_is_explicit(self):
+        from ghost.backend.db import resolve_database_path
+
+        with pytest.raises(ValueError, match="Unsupported DATABASE_URL scheme"):
+            resolve_database_path("postgresql://user:pass@localhost/ghost")
+
+    def test_doctor_checks_return_structured_results(self):
+        from ghost.core.doctor import run_doctor_checks, summarize_doctor_checks
+
+        checks = run_doctor_checks()
+        names = {check.name for check in checks}
+
+        assert "database" in names
+        assert "enabled modules" in names
+        assert "GHOST_SECRET_KEY" in names
+        assert "GHOST_HOST" in names
+        assert "GHOST_API_TOKEN" in names
+
+        summary = summarize_doctor_checks(checks)
+        assert isinstance(summary["ok"], bool)
+        assert isinstance(summary["error_count"], int)
+        assert isinstance(summary["warning_count"], int)
+        assert {check["name"] for check in summary["checks"]} == names
+
+    def test_doctor_cli_json_output(self, monkeypatch):
+        from click.testing import CliRunner
+        from ghost.ui.cli import cli
+
+        monkeypatch.setenv("GHOST_SECRET_KEY", "unit-test-secret-not-a-default")
+        monkeypatch.setenv("GHOST_HOST", "127.0.0.1")
+        monkeypatch.setenv("GHOST_API_TOKEN", "unit-test-api-token")
+
+        result = CliRunner().invoke(cli, ["doctor", "--json"])
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["ok"] is True
+        assert payload["error_count"] == 0
+        assert "checks" in payload
+        assert "Ghost Doctor" not in result.output
+
+    def test_doctor_cli_json_exits_nonzero_on_hard_error(self, monkeypatch):
+        from click.testing import CliRunner
+        from ghost.core.doctor import DoctorCheck
+        from ghost.ui import cli as cli_module
+
+        monkeypatch.setattr(
+            cli_module,
+            "run_doctor_checks",
+            lambda: [DoctorCheck("database", False, "unavailable", "error")],
+        )
+
+        result = CliRunner().invoke(cli_module.cli, ["doctor", "--json"])
+
+        assert result.exit_code == 1
+        assert json.loads(result.output)["ok"] is False
+
+    def test_doctor_cli_human_output_exits_nonzero_on_hard_error(self, monkeypatch):
+        from click.testing import CliRunner
+        from ghost.core.doctor import DoctorCheck
+        from ghost.ui import cli as cli_module
+
+        monkeypatch.setattr(
+            cli_module,
+            "run_doctor_checks",
+            lambda: [DoctorCheck("database", False, "unavailable", "error")],
+        )
+
+        result = CliRunner().invoke(cli_module.cli, ["doctor"])
+
+        assert result.exit_code == 1
+        assert "FAIL" in result.output
+
+    def test_doctor_reports_unsupported_database_override(self):
+        from ghost.core.config import Config
+        from ghost.core.doctor import has_error, run_doctor_checks, summarize_doctor_checks
+
+        cfg = Config()
+        cfg.database_url = "postgresql://user:pass@localhost/ghost"
+
+        checks = run_doctor_checks(cfg)
+        database_check = next(check for check in checks if check.name == "database")
+
+        assert database_check.ok is False
+        assert database_check.severity == "error"
+        assert "Unsupported DATABASE_URL scheme 'postgresql'" in database_check.detail
+        assert has_error(checks) is True
+        assert summarize_doctor_checks(checks)["ok"] is False
+
+
+# ── Report provenance ───────────────────────────────────────────────
+
+
+class TestReportProvenance:
+    def test_json_report_includes_provenance(self, tmp_path):
+        from ghost.core.report_generator import ReportGenerator
+
+        inv = Investigation("johndoe", "username", scope="consented demo", authorized_use=True)
+        inv.findings = {
+            "username": {
+                "profiles": [
+                    {"platform": "GitHub", "url": "https://github.com/johndoe", "status": "found"},
+                    {"platform": "GitHub", "url": "https://github.com/johndoe", "status": "found"},
+                ]
+            },
+            "social": {"error": "rate limited"},
+        }
+        output = tmp_path / "report.json"
+
+        ReportGenerator().generate(inv, "json", str(output))
+
+        data = json.loads(output.read_text())
+        provenance = data["provenance"]
+        assert provenance["modules_run"] == ["social", "username"]
+        assert provenance["scope"] == "consented demo"
+        assert provenance["authorized_use"] is True
+        assert provenance["source_urls"] == ["https://github.com/johndoe"]
+        assert provenance["source_url_count"] == 1
+        assert provenance["module_errors"] == {"social": "rate limited"}
+
+
+# ── API safety gates ────────────────────────────────────────────────
+
+_TEST_API_TOKEN = "test-api-token-not-for-production"
+
+
+class TestApiSafetyGates:
+    @pytest.fixture(autouse=True)
+    def _api_security(self, monkeypatch):
+        monkeypatch.setattr("ghost.core.config.config.api_token", _TEST_API_TOKEN)
+        from ghost.backend import server as server_mod
+
+        server_mod.reset_rate_limiter()
+
+    def test_api_requires_authorized_use_acknowledgement(self):
+        from ghost.backend.server import app
+
+        client = app.test_client()
+        response = client.post(
+            "/api/investigate",
+            json={"target": "johndoe", "input_type": "username"},
+            headers={"X-Ghost-Token": _TEST_API_TOKEN},
+        )
+
+        assert response.status_code == 400
+        assert response.get_json()["error"] == "authorized_use must be true for API investigations"
+
+    @patch("ghost.backend.server.threading.Thread")
+    def test_api_accepts_authorized_scope(self, mock_thread):
+        from ghost.backend.server import app
+
+        client = app.test_client()
+        response = client.post(
+            "/api/investigate",
+            json={
+                "target": "johndoe",
+                "input_type": "username",
+                "authorized_use": True,
+                "scope": "self-audit",
+                "modules": ["username"],
+            },
+            headers={"Authorization": f"Bearer {_TEST_API_TOKEN}"},
+        )
+
+        assert response.status_code == 202
+        assert response.get_json()["status"] == "running"
+        mock_thread.return_value.start.assert_called_once()
+
+
+# ── CLI saved case commands ────────────────────────────────────────
+
+
+class TestCliCaseCommands:
+    def test_cli_list_outputs_saved_case(self):
+        from click.testing import CliRunner
+        from ghost.ui.cli import cli
+
+        inv = Investigation("johndoe", "username", scope="self-audit", authorized_use=True)
+        inv.risk_score = 0.25
+        save_investigation(inv.to_dict())
+
+        result = CliRunner().invoke(cli, ["list", "--json"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data[0]["target"] == "johndoe"
+        assert data[0]["scope"] == "self-audit"
+        assert data[0]["authorized_use"] is True
+
+    def test_cli_show_accepts_unique_prefix(self):
+        from click.testing import CliRunner
+        from ghost.ui.cli import cli
+
+        inv = Investigation("janedoe", "username", scope="consented demo", authorized_use=True)
+        inv.summary = "Found public profiles."
+        save_investigation(inv.to_dict())
+
+        result = CliRunner().invoke(cli, ["show", inv.id[:8], "--json"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["id"] == inv.id
+        assert data["summary"] == "Found public profiles."
+
+    def test_cli_export_writes_portable_case_file(self, tmp_path):
+        from click.testing import CliRunner
+        from ghost.ui.cli import cli
+
+        inv = Investigation("exportme", "username", scope="client-owned audit", authorized_use=True)
+        inv.summary = "Portable case."
+        save_investigation(inv.to_dict())
+        output = tmp_path / "case.json"
+
+        result = CliRunner().invoke(cli, ["export", inv.id[:8], "--output", str(output)])
+
+        assert result.exit_code == 0
+        data = json.loads(output.read_text())
+        assert data["id"] == inv.id
+        assert data["target"] == "exportme"
+        assert data["scope"] == "client-owned audit"
+
+    def test_cli_import_rejects_existing_case_without_replace(self, tmp_path):
+        from click.testing import CliRunner
+        from ghost.ui.cli import cli
+
+        inv = Investigation("importme", "username")
+        case_file = tmp_path / "case.json"
+        case_file.write_text(json.dumps(inv.to_dict()), encoding="utf-8")
+
+        save_investigation(inv.to_dict())
+        result = CliRunner().invoke(cli, ["import", str(case_file)])
+
+        assert result.exit_code != 0
+        assert "already exists" in result.output
+
+    def test_cli_import_with_replace_updates_case(self, tmp_path):
+        from click.testing import CliRunner
+        from ghost.ui.cli import cli
+
+        inv = Investigation("old-target", "username")
+        save_investigation(inv.to_dict())
+        exported = inv.to_dict()
+        exported["target"] = "new-target"
+        exported["summary"] = "Replaced case."
+        case_file = tmp_path / "case.json"
+        case_file.write_text(json.dumps(exported), encoding="utf-8")
+
+        result = CliRunner().invoke(cli, ["import", str(case_file), "--replace"])
+
+        assert result.exit_code == 0
+        loaded = get_investigation(inv.id)
+        assert loaded["target"] == "new-target"
+        assert loaded["summary"] == "Replaced case."
+
+    def test_cli_delete_removes_case_with_yes(self):
+        from click.testing import CliRunner
+        from ghost.ui.cli import cli
+
+        inv = Investigation("deleteme", "username")
+        save_investigation(inv.to_dict())
+
+        result = CliRunner().invoke(cli, ["delete", inv.id[:8], "--yes"])
+
+        assert result.exit_code == 0
+        assert get_investigation(inv.id) is None
+
+
+# ── GhostInvestigator (mocked modules) ─────────────────────────────
+
+
+class TestGhostInvestigator:
+    @patch("ghost.core.investigator.UsernameModule")
+    @patch("ghost.core.investigator.EmailModule")
+    @patch("ghost.core.investigator.PhoneModule")
+    @patch("ghost.core.investigator.SocialModule")
+    @patch("ghost.core.investigator.DomainModule")
+    @patch("ghost.core.investigator.ImageModule")
+    @patch("ghost.core.investigator.DarkWebModule")
+    @patch("ghost.core.investigator.GeolocationModule")
+    @patch("ghost.core.investigator.Correlator")
+    @patch("ghost.core.investigator.AIAnalyzer")
+    @patch("ghost.core.investigator.Summarizer")
+    def test_investigate_username(
+        self,
+        MockSummarizer,
+        MockAnalyzer,
+        MockCorrelator,
+        MockGeo,
+        MockDarkweb,
+        MockImage,
+        MockDomain,
+        MockSocial,
+        MockPhone,
+        MockEmail,
+        MockUsername,
+    ):
+        # Set up mocks
+        mock_username = MagicMock()
+        mock_username.run = AsyncMock(
+            return_value={
+                "username": "johndoe",
+                "profiles": [{"platform": "GitHub", "url": "https://github.com/johndoe", "status": "found"}],
+                "found_count": 1,
+            }
+        )
+        MockUsername.return_value = mock_username
+
+        mock_social = MagicMock()
+        mock_social.run = AsyncMock(return_value={"profiles": [], "total_found": 0})
+        MockSocial.return_value = mock_social
+
+        mock_darkweb = MagicMock()
+        mock_darkweb.run = AsyncMock(return_value={"results": []})
+        MockDarkweb.return_value = mock_darkweb
+
+        # Other modules (not called for username type)
+        for Mock in (MockEmail, MockPhone, MockDomain, MockImage, MockGeo):
+            m = MagicMock()
+            m.run = AsyncMock(return_value={})
+            Mock.return_value = m
+
+        mock_correlator = MagicMock()
+        mock_correlator.correlate = AsyncMock(
+            return_value={
+                "identities": [],
+                "connections": [],
+                "timeline": [],
+                "locations": [],
+            }
+        )
+        MockCorrelator.return_value = mock_correlator
+
+        mock_analyzer = MagicMock()
+        mock_analyzer.analyze = AsyncMock(
+            return_value={
+                "risk_score": 0.3,
+                "risk_assessment": {"risk_level": "low"},
+            }
+        )
+        MockAnalyzer.return_value = mock_analyzer
+
+        mock_summarizer = MagicMock()
+        mock_summarizer.summarize = AsyncMock(return_value="Test investigation summary.")
+        MockSummarizer.return_value = mock_summarizer
+
+        investigator = GhostInvestigator()
+        result = asyncio.run(investigator.investigate_async("johndoe", "username"))
+
+        assert result.status == "completed"
+        assert result.target == "johndoe"
+        assert "username" in result.findings
+        assert "social" not in result.findings
+        assert "darkweb" not in result.findings
+        assert result.summary == "Test investigation summary."
+        mock_username.run.assert_called_once()
+        mock_social.run.assert_not_called()
+        mock_darkweb.run.assert_not_called()
+
+    def test_progress_callback(self):
+        events = []
+        inv = GhostInvestigator.__new__(GhostInvestigator)
+        inv._progress_callback = lambda m, s, d: events.append((m, s, d))
+        inv._report_progress("test", "start", "testing")
+        assert len(events) == 1
+        assert events[0] == ("test", "start", "testing")

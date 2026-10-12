@@ -1,0 +1,229 @@
+import binsync.extras.aux_server as aux_server
+import urllib.parse
+import requests
+import logging
+import time
+from declib.artifacts import (
+    Context
+)
+l = logging.getLogger(__name__)
+
+def _connection_required(func):
+    def check_for_connected(self, *args, **kwargs):
+        if self.connected:
+            try:
+                return func(self, *args, **kwargs)
+            except requests.ConnectionError:
+                self.connected = False
+                l.info("Server seems to be unresponsive... (Click the disconnect button so that you can reconnect)")
+        else:
+            l.error("Tried to call a method that requires a connection to be established beforehand") 
+        
+    return check_for_connected
+
+class ServerClient():
+    def __init__(self, host:str, port:int, controller):
+        self.host = host
+        self.port = str(port)
+        self.controller = controller
+        self.old_post_data = {}
+        self.connected = False
+        self.callback_registered = False
+        
+    
+    # Try connecting to the server. Return True on successful connection and False on fail.
+    def connect(self):
+        self.server_url = f"http://{self.host}:{self.port}"
+        parsed = urllib.parse.urlparse(self.server_url)
+        if parsed.netloc != f"{self.host}:{self.port}":
+            l.error("HOST AND PORT COMBINATION IS NOT VALID: NETLOC %s BUT HOST %s AND PORT %s",parsed.netloc,parsed.hostname,parsed.port)
+            return False
+
+        self.sess = requests.Session()
+        try:
+            client_version_nums = aux_server.__version__.split(".")
+            server_version = self.sess.get(self.server_url+"/version").text
+            server_version_nums = server_version.split(".")
+            if len(server_version_nums) != 3:
+                raise ValueError(f"Server version was expected to have 3 parts but had {len(server_version_nums)}")
+            
+            # Compare versions
+            if client_version_nums[0] != server_version_nums[0]:
+                l.error("Client major version (%s) and server major version (%s) do not match. Refusing to connect." \
+                        " Update the out-of-date application to restore functionality.", 
+                        client_version_nums[0], server_version_nums[0])
+                return False
+            elif client_version_nums[1] != server_version_nums[1]:
+                l.warning("Client minor version (%s) and server minor version (%s) do not match." \
+                        " Can still connect, but there may be some missing functionality." \
+                        " Update the out-of-date application for full functionality.")
+            # Patch version difference should not be relevant
+        except requests.ConnectionError as e:
+            l.info("Unable to establish a connection with the auxiliary server")
+            return False
+        except ValueError as e:
+            l.error("Tried to get version from auxiliary server but response was malformed. Encountered error: %s", e)
+            return False
+        
+        try:
+            username = self.controller.client.master_user
+        except AttributeError:
+            l.error("Tried to access username but was not set")
+            return False
+
+        self._etag = None
+        self.sess.cookies.set("user", username)
+        try:
+            l.info(self.sess.get(self.server_url+"/connect").text)
+        except requests.ConnectionError as e:
+            l.error("Tried to connect to server at self.server_url but received error %s", e)
+            return False
+        self.connected = True
+        self.controller.deci.artifact_change_callbacks[Context].append(self._submit_new_context)
+        self.callback_registered = True
+        self._submit_new_context(self.controller.deci.gui_active_context())
+        return True
+        
+
+    @_connection_required
+    def poll_users_data(self):
+        """
+        Contacts server to check if there were any updates to user contexts
+        """
+        if self._etag == None:
+            r = self.sess.get(self.server_url+"/status")
+            self.users_data = r.json()
+            self._etag = r.headers["ETag"]
+            l.info(self.users_data)
+        else:
+            r = self.sess.get(self.server_url+"/status",headers={
+                "If-None-Match":str(self._etag)
+            })
+            if r.status_code != 304:
+                self.users_data:dict[str, dict[str, int | None]] = r.json()
+                self._etag = r.headers["ETag"]
+                l.info(self.users_data)
+        return self.users_data
+    
+    @_connection_required
+    def _submit_new_context(self, context, **_):
+        post_data = {}
+        if context.addr:
+            post_data["address"] = context.addr
+        if context.func_addr:
+            post_data["function_address"] = context.func_addr
+        if post_data != self.old_post_data: # No need to do extra communication with server if no change
+            try:
+                self.sess.post(self.server_url+"/function",data=post_data)
+                self.old_post_data = post_data
+            except requests.ConnectionError:
+                self.connected = False
+
+    @_connection_required
+    def _link_project(self, url, group=None):
+        '''
+        Attempts to link a project to the server. 
+        
+        Returns (True,"") on success (200 response) and (False,"error message") on error
+        '''
+        post_data = {
+            "url":url 
+        }
+        if group is not None:
+            post_data[group] = group
+        result = self.sess.post(self.server_url+"/link_project", data=post_data)
+        if result.status_code == 200:
+            return (True, "")
+        else:
+            return (False, result.text)
+
+    @_connection_required
+    def create_group(self, group):
+        '''
+        Attempts to create a project group.
+        
+        Returns (True,"") on success (200 response) and (False,"error message") on error
+        '''
+        post_data = {
+            "group": group
+        }
+        result = self.sess.post(self.server_url+"/create_group", data=post_data)
+        if result.status_code == 200:
+            return (True, "")
+        else:
+            return (False, result.text)
+        
+    @_connection_required
+    def delete_group(self, group):
+        '''
+        Attempts to delete a project group.
+        
+        Returns (True,"") on success (200 response) and (False,"error message") on error
+        '''
+        post_data = {
+            "group": group
+        }
+        result = self.sess.post(self.server_url+"/delete_group", data=post_data)
+        if result.status_code == 200:
+            return (True, "")
+        else:
+            return (False, result.text)
+
+    @_connection_required
+    def link_project(self, url, group=None):
+        '''
+        Attempts to link a project to the server. 
+        
+        Returns (True,"") on success (200 response) and (False,"error message") on error
+        '''
+        post_data = {
+            "url":url 
+        }
+        if group is not None:
+            post_data["group"] = group
+        result = self.sess.post(self.server_url+"/link_project", data=post_data)
+        if result.status_code == 200:
+            return (True, "")
+        else:
+            return (False, result.text)
+    
+    @_connection_required
+    def unlink_project(self, url, group=None):
+        '''
+        Attempts to unlink a project from the server. 
+        
+        Returns (True,"") on success (200 response) and (False,"error message") on error
+        '''
+        post_data = {
+            "url":url 
+        }
+        if group is not None:
+            post_data["group"] = group
+        result = self.sess.post(self.server_url+"/unlink_project", data=post_data)
+        if result.status_code == 200:
+            return (True, "")
+        else:
+            return (False, result.text)
+        
+    @_connection_required
+    def list_projects(self):
+        result = self.sess.get(self.server_url+"/list_projects")
+        return result.json()
+
+    def stop(self):
+        if self.callback_registered:
+            self.controller.deci.artifact_change_callbacks[Context].remove(self._submit_new_context)
+            self.callback_registered = False
+        if self.connected:
+            try:
+                disconnect_resp = self.sess.get(self.server_url+"/disconnect")
+                disconnect_resp.raise_for_status()
+                l.info("%s", disconnect_resp.text)
+            except requests.ConnectionError:
+                l.info("Server unresponsive (considering to be disconnected)")
+            except requests.HTTPError:
+                l.info(f"Disconnected strangely: Server returned {disconnect_resp.text}") # pyright: ignore[reportPossiblyUnboundVariable]
+            finally:
+                self.connected = False
+        else:
+            l.info("Disconnected without contacting server as it was previously unreachable")

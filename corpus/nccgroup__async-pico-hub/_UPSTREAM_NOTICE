@@ -1,0 +1,12 @@
+This repository contains third-party components.
+
+tgt-monitor-pico/
+  src/main.h and include/kerb.h 
+  Contains code derived from Jakob Friedl's implementation,
+  licensed under the BSD 3-Clause License, with modifications.
+
+pico-tools/cpp-bof-fixer/include/coffi/
+  Contains modified portions of the COFFI library by
+  Serge Lamikhov-Center (MIT License).
+
+See ./licenses for full license texts.

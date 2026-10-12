@@ -1,0 +1,49 @@
+namespace BitMono.Core.Tests;
+
+public static class Setup
+{
+    public static ModelAttributeCriticalAnalyzer ModelAttributeCriticalAnalyzer(CriticalsSettings criticals)
+    {
+        return new ModelAttributeCriticalAnalyzer(criticals);
+    }
+    public static CriticalMethodsCriticalAnalyzer CriticalMethodsCriticalAnalyzer(CriticalsSettings criticals)
+    {
+        return new CriticalMethodsCriticalAnalyzer(criticals);
+    }
+    public static CriticalMethodsStartsWithAnalyzer CriticalMethodsStartsWithCriticalAnalyzer(CriticalsSettings criticals)
+    {
+        return new CriticalMethodsStartsWithAnalyzer(criticals);
+    }
+    public static NoInliningMethodMemberResolver NoInliningMethodMemberResolver(ObfuscationSettings obfuscation)
+    {
+        return new NoInliningMethodMemberResolver(obfuscation);
+    }
+    public static ObfuscationAttributeResolver ObfuscationAttributeResolver(ObfuscationSettings obfuscation)
+    {
+        return new ObfuscationAttributeResolver(obfuscation);
+    }
+    public static ObfuscateAssemblyAttributeResolver ObfuscateAssemblyAttributeResolver(ObfuscationSettings obfuscation)
+    {
+        return new ObfuscateAssemblyAttributeResolver(obfuscation);
+    }
+    public static SerializableBitCriticalAnalyzer SerializableBitCriticalAnalyzer(ObfuscationSettings obfuscation)
+    {
+        return new SerializableBitCriticalAnalyzer(obfuscation);
+    }
+    public static ReflectionCriticalAnalyzer ReflectionCriticalAnalyzer(ObfuscationSettings obfuscation)
+    {
+        return new ReflectionCriticalAnalyzer(obfuscation);
+    }
+    public static SerializationCriticalAnalyzer SerializationCriticalAnalyzer(ObfuscationSettings obfuscation)
+    {
+        return new SerializationCriticalAnalyzer(obfuscation);
+    }
+    public static UnitySerializationCriticalAnalyzer UnitySerializationCriticalAnalyzer(ObfuscationSettings obfuscation)
+    {
+        return new UnitySerializationCriticalAnalyzer(obfuscation);
+    }
+    public static UnityStringInvokeCriticalAnalyzer UnityStringInvokeCriticalAnalyzer(ObfuscationSettings obfuscation)
+    {
+        return new UnityStringInvokeCriticalAnalyzer(obfuscation);
+    }
+}

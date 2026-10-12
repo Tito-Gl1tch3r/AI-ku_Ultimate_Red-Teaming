@@ -1,0 +1,112 @@
+#include "../testutils.hpp"
+
+#include <gtest/gtest.h>
+#include <zasm/testdata/x86/instructions.hpp>
+#include <zasm/zasm.hpp>
+
+namespace zasm::tests
+{
+    class InstructionInfoTestsFixture : public ::testing::TestWithParam<data::InstrTest>
+    {
+    };
+
+    TEST_P(InstructionInfoTestsFixture, InstructionInfoX64Test)
+    {
+        const auto& instrTest = GetParam();
+
+        Program program(MachineMode::AMD64);
+
+        x86::Assembler assembler(program);
+        ASSERT_EQ(instrTest.emitter(assembler), ErrorCode::None) << instrTest.operation;
+
+        const auto* node = assembler.getCursor();
+        ASSERT_NE(node, nullptr);
+
+        const auto& instr = node->get<Instruction>();
+
+        const auto info = instr.getDetail(program.getMode());
+        ASSERT_EQ(info.hasValue(), true);
+
+        ASSERT_EQ(instr.getOperandCount(), info->getVisibleOperandCount());
+
+        const auto& instrInfo = info.value();
+        for (std::size_t i = 0; i < instr.getOperandCount(); i++)
+        {
+            const auto& opInfo = instrInfo.getOperand(i);
+            const auto& op = instr.getOperand(i);
+
+            ASSERT_EQ(opInfo.getTypeIndex(), op.getTypeIndex());
+            if (auto* opInfoMem = opInfo.getIf<Mem>(); opInfoMem != nullptr)
+            {
+                auto* opMem = op.getIf<Mem>();
+                if (opMem->getSegment().isValid())
+                {
+                    // Segment can be optional, only compare if one is specified by user.
+                    ASSERT_EQ(opInfoMem->getSegment(), opMem->getSegment());
+                }
+                ASSERT_EQ(opInfoMem->getBase(), opMem->getBase());
+                ASSERT_EQ(opInfoMem->getIndex(), opMem->getIndex());
+                ASSERT_EQ(opInfoMem->getScale(), opMem->getScale());
+                ASSERT_EQ(opInfoMem->getDisplacement(), opMem->getDisplacement());
+            }
+            else
+            {
+                ASSERT_EQ(opInfo, op);
+            }
+        }
+    }
+
+    INSTANTIATE_TEST_SUITE_P(
+        InstructionInfoTestsFixture, InstructionInfoTestsFixture,
+        ::testing::ValuesIn(std::begin(data::Instructions), std::end(data::Instructions)),
+        [](const ::testing::TestParamInfo<data::InstrTest>& info) { return std::string{ info.param.instrBytes }; });
+
+    TEST(InstructionInfoTests, LargeDisplacement)
+    {
+        Program program(MachineMode::AMD64);
+
+        x86::Assembler assembler(program);
+
+        const auto instr = zasm::Instruction()                                                         //
+                               .setMnemonic(x86::Mnemonic::Lea)                                        //
+                               .addOperand(x86::rcx)                                                   //
+                               .addOperand(zasm::Mem(BitSize::_64, {}, x86::rip, {}, 0, 0x123456789)); //
+
+        const auto instrDetail = instr.getDetail(MachineMode::AMD64);
+        ASSERT_EQ(instrDetail.hasValue(), true);
+
+        const auto& instrInfo = instrDetail.value();
+
+        const auto op0 = instrInfo.getOperand(0);
+        auto* opReg = op0.getIf<Reg>();
+        ASSERT_NE(opReg, nullptr);
+        ASSERT_EQ(opReg->getId(), x86::rcx.getId());
+
+        const auto& op1 = instrInfo.getOperand(1);
+        auto* opMem = op1.getIf<Mem>();
+        ASSERT_NE(opMem, nullptr);
+        ASSERT_EQ(opMem->getDisplacement(), 0x123456789);
+    }
+
+    TEST(InstructionInfoTests, LargeJsAddress)
+    {
+        Program program(MachineMode::AMD64);
+
+        x86::Assembler assembler(program);
+
+        const auto instr = zasm::Instruction()                      //
+                               .setMnemonic(x86::Mnemonic::Js)      //
+                               .addOperand(zasm::Imm(0x18342F417)); //
+
+        const auto instrDetail = instr.getDetail(MachineMode::AMD64);
+        ASSERT_EQ(instrDetail.hasValue(), true);
+
+        const auto& instrInfo = instrDetail.value();
+
+        const auto op0 = instrInfo.getOperand(0);
+        auto* opImm = op0.getIf<Imm>();
+        ASSERT_NE(opImm, nullptr);
+        ASSERT_EQ(opImm->value<int64_t>(), 0x18342F417);
+    }
+
+} // namespace zasm::tests

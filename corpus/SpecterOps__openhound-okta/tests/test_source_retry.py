@@ -1,0 +1,1703 @@
+import inspect
+import logging
+from collections.abc import Iterator
+from threading import Event, Thread
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import requests
+from requests import Request
+from requests.adapters import BaseAdapter
+from requests.exceptions import ChunkedEncodingError
+from dlt.sources.helpers.rest_client.paginators import HeaderLinkPaginator
+from dlt.sources.helpers.rest_client.auth import APIKeyAuth
+from dlt.sources.helpers.requests.session import Session
+
+from openhound_okta.models.token import Token
+from openhound_okta.source import (
+    APPLICATION_GRANTS_ACCESS_DENIED_LIMIT,
+    APPLICATION_GROUP_ASSIGNMENTS_PAGE_SIZE,
+    APPLICATION_USERS_PAGE_SIZE,
+    GROUPS_PAGE_SIZE,
+    GROUP_PUSH_MAPPINGS_PAGE_SIZE,
+    IDENTITY_PROVIDER_USERS_PAGE_SIZE,
+    ConsecutiveAccessDeniedBreaker,
+    OktaTokenCredentials,
+    _microsoft_tenant_id_from_onmicrosoft_domain,
+    _office365_tenant_id_fields,
+    _saml_idp_metadata_fields,
+    _saml_metadata_fields,
+    _tenant_domain_from_base_url,
+    api_services,
+    application_grants,
+    application_group_assignment_rows,
+    application_secrets,
+    application_group_push_mapping_row,
+    application_group_push_mappings,
+    application_jwk_rows,
+    application_user_rows,
+    _group_page_sizes,
+    groups,
+    identity_provider_users,
+    source,
+    user_role_assignment_rows,
+)
+from openhound_okta.utils.auth import OktaBearerAuth, UnauthorizedClassification
+from openhound_okta.utils.http import (
+    EndpointThrottle,
+    InitialReadTimeoutBudget,
+    OktaRESTClient,
+    OktaRetryContext,
+    OktaRetryExhaustedError,
+)
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 1_000.0
+        self.sleeps: list[float] = []
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, delay: float) -> None:
+        self.sleeps.append(delay)
+        self.now += delay
+
+
+def test_tenant_domain_uses_hostname_without_port_or_user_info():
+    assert (
+        _tenant_domain_from_base_url("https://user:secret@MIXED.Example:443/api/v1")
+        == "mixed.example"
+    )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "preview.example",
+        "https:///missing-host",
+        "https://[invalid",
+        "https://preview.example:not-a-port",
+        "https://preview.example:65536",
+    ],
+)
+def test_tenant_domain_rejects_urls_without_scheme_or_hostname(base_url):
+    with pytest.raises(ValueError, match="URL scheme and hostname"):
+        _tenant_domain_from_base_url(base_url)
+
+
+def _response(
+    status_code: int,
+    url: str,
+    headers: dict[str, str] | None = None,
+    content: bytes = b"[]",
+):
+    response = requests.Response()
+    response.status_code = status_code
+    response.url = url
+    response.headers.update(headers or {})
+    response._content = content
+    return response
+
+
+class SequencedOktaClient(OktaRESTClient):
+    def __init__(self, responses, **kwargs):
+        self.responses = list(responses)
+        self.requested_urls: list[str] = []
+        super().__init__(
+            base_url="https://example.okta.test",
+            endpoint_family="/api/v1/apps*",
+            **kwargs,
+        )
+
+    def _send_once(self, request, **kwargs):
+        self.requested_urls.append(request.url)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        if response.status_code >= 400:
+            raise requests.HTTPError(response=response)
+        return response
+
+
+def _client(
+    responses,
+    *,
+    max_attempts=5,
+    throttle=None,
+    clock=None,
+    rate_limit_max_elapsed_seconds=900.0,
+):
+    fake_clock = clock or FakeClock()
+    return SequencedOktaClient(
+        responses,
+        throttle=throttle
+        or EndpointThrottle(clock=fake_clock.time, sleep=fake_clock.sleep),
+        max_attempts=max_attempts,
+        rate_limit_max_elapsed_seconds=rate_limit_max_elapsed_seconds,
+        clock=fake_clock.time,
+        elapsed_clock=fake_clock.time,
+        sleep=fake_clock.sleep,
+        jitter=lambda: 0.0,
+    ), fake_clock
+
+
+def test_explicit_zero_max_attempts_is_rejected():
+    with pytest.raises(ValueError, match="max_attempts must be at least 1"):
+        OktaRESTClient(
+            base_url="https://example.okta.test",
+            endpoint_family="/api/v1/apps*",
+            throttle=EndpointThrottle(),
+            max_attempts=0,
+        )
+
+
+class SequencedAdapter(BaseAdapter):
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requested_urls: list[str] = []
+        self.authorization_headers: list[str | None] = []
+
+    def send(self, request, **kwargs):
+        self.requested_urls.append(request.url)
+        self.authorization_headers.append(request.headers.get("Authorization"))
+        response = self.responses.pop(0)
+        response.request = request
+        response.connection = self
+        return response
+
+    def close(self):
+        pass
+
+
+def test_retries_the_same_application_users_cursor_after_429():
+    cursor_url = (
+        "https://example.okta.test/api/v1/apps/0oa123/users?after=00u456&limit=50"
+    )
+    client, clock = _client(
+        [
+            _response(429, cursor_url, {"Retry-After": "2"}),
+            _response(200, cursor_url),
+        ]
+    )
+
+    response = client._send_request(Request("GET", cursor_url))
+
+    assert response.status_code == 200
+    assert client.requested_urls == [cursor_url, cursor_url]
+    assert clock.sleeps == [2.0]
+
+
+def test_dlt_paginator_retries_the_same_cursor_through_the_real_session_path():
+    clock = FakeClock()
+    first_url = "https://example.okta.test/api/v1/apps/0oa123/users?limit=500"
+    cursor_url = f"{first_url}&after=00u456"
+    first_page = _response(
+        200,
+        first_url,
+        {"Link": f'<{cursor_url}>; rel="next"'},
+    )
+    first_page._content = b'[{"id":"00u123"}]'
+    rate_limited_page = _response(429, cursor_url, {"Retry-After": "1"})
+    second_page = _response(200, cursor_url)
+    second_page._content = b'[{"id":"00u456"}]'
+    adapter = SequencedAdapter([first_page, rate_limited_page, second_page])
+    session = Session(raise_for_status=False)
+    session.mount("https://", adapter)
+    client = OktaRESTClient(
+        base_url="https://example.okta.test",
+        endpoint_family="/api/v1/apps*",
+        throttle=EndpointThrottle(clock=clock.time, sleep=clock.sleep),
+        paginator=HeaderLinkPaginator(),
+        session=session,
+        clock=clock.time,
+        elapsed_clock=clock.time,
+        sleep=clock.sleep,
+        jitter=lambda: 0.0,
+    )
+
+    pages = list(client.paginate(first_url))
+
+    assert [list(page) for page in pages] == [
+        [{"id": "00u123"}],
+        [{"id": "00u456"}],
+    ]
+    assert adapter.requested_urls == [first_url, cursor_url, cursor_url]
+    assert clock.sleeps == [1.0]
+
+
+def test_initial_read_timeout_retry_budget_only_applies_to_the_first_page():
+    clock = FakeClock()
+    first_url = "https://example.okta.test/api/v1/groups?expand=stats&limit=200"
+    cursor_url = f"{first_url}&after=00g456"
+    first_page = _response(
+        200,
+        first_url,
+        {"Link": f'<{cursor_url}>; rel="next"'},
+    )
+    first_page._content = b'[{"id":"00g123"}]'
+    second_page = _response(200, cursor_url)
+    second_page._content = b'[{"id":"00g456"}]'
+    client, _ = _client(
+        [
+            first_page,
+            requests.ReadTimeout("timed out"),
+            requests.ReadTimeout("timed out"),
+            second_page,
+        ],
+        max_attempts=5,
+        clock=clock,
+    )
+
+    pages = list(
+        client.paginate(
+            first_url,
+            paginator=HeaderLinkPaginator(),
+            initial_read_timeout_budget=InitialReadTimeoutBudget(2),
+        )
+    )
+
+    assert [list(page) for page in pages] == [
+        [{"id": "00g123"}],
+        [{"id": "00g456"}],
+    ]
+    assert client.requested_urls == [first_url, cursor_url, cursor_url, cursor_url]
+    assert clock.sleeps == [1.0, 2.0]
+
+
+def test_initial_read_timeout_retry_budget_limits_the_first_page():
+    url = "https://example.okta.test/api/v1/groups?expand=stats&limit=200"
+    client, clock = _client(
+        [
+            requests.ReadTimeout("timed out"),
+            requests.ReadTimeout("timed out"),
+            _response(200, url),
+        ],
+        max_attempts=5,
+    )
+
+    with pytest.raises(OktaRetryExhaustedError):
+        client._send_request(
+            Request("GET", url),
+            initial_read_timeout_budget=InitialReadTimeoutBudget(2),
+        )
+
+    assert client.requested_urls == [url, url]
+    assert clock.sleeps == [1.0]
+
+
+def test_initial_read_timeout_retry_budget_does_not_limit_other_transient_errors():
+    url = "https://example.okta.test/api/v1/groups?expand=stats&limit=200"
+    client, clock = _client(
+        [
+            requests.ConnectionError("connection failed"),
+            requests.ConnectionError("connection failed"),
+            _response(200, url),
+        ],
+        max_attempts=5,
+    )
+
+    response = client._send_request(
+        Request("GET", url),
+        initial_read_timeout_budget=InitialReadTimeoutBudget(2),
+    )
+
+    assert response.status_code == 200
+    assert client.requested_urls == [url, url, url]
+    assert clock.sleeps == [1.0, 2.0]
+
+
+def test_application_group_assignments_follow_opaque_next_link_without_query_expansion():
+    first_url = "https://example.okta.test/api/v1/apps/0oa123/groups?limit=200"
+    cursor_url = (
+        "https://example.okta.test/api/v1/apps/0oa123/groups"
+        "?after=opaque%2Fcursor%3Dvalue&limit=200"
+    )
+    first_page = _response(
+        200,
+        first_url,
+        {"Link": f'<{cursor_url}>; rel="next"'},
+        b'[{"id":"00g-first","priority":0}]',
+    )
+    second_page = _response(
+        200,
+        cursor_url,
+        content=b'[{"id":"00g-second","priority":1}]',
+    )
+    adapter = SequencedAdapter([first_page, second_page])
+    session = Session(raise_for_status=False)
+    session.mount("https://", adapter)
+    client = OktaRESTClient(
+        base_url="https://example.okta.test",
+        endpoint_family="/api/v1/apps*",
+        throttle=EndpointThrottle(),
+        paginator=HeaderLinkPaginator(),
+        session=session,
+    )
+    ctx = SimpleNamespace(
+        pool=client,
+        application_group_assignments_page_size=(
+            APPLICATION_GROUP_ASSIGNMENTS_PAGE_SIZE
+        ),
+    )
+    application = SimpleNamespace(
+        id="0oa123",
+        name="example_app",
+        label="Example App",
+        status="ACTIVE",
+        last_updated=None,
+        sign_on_mode="SAML_2_0",
+    )
+
+    rows = list(application_group_assignment_rows(application, ctx))
+
+    assert [row["group_id"] for row in rows] == ["00g-first", "00g-second"]
+    assert adapter.requested_urls == [first_url, cursor_url]
+
+
+def test_dlt_paginator_refreshes_expired_bearer_token_between_pages():
+    clock = FakeClock()
+    first_url = "https://example.okta.test/api/v1/groups/00g123/users?limit=1000"
+    cursor_url = f"{first_url}&after=00u456"
+    first_page = _response(
+        200,
+        first_url,
+        {"Link": f'<{cursor_url}>; rel="next"'},
+    )
+    first_page._content = b'[{"id":"00u123"}]'
+    second_page = _response(200, cursor_url)
+    second_page._content = b'[{"id":"00u456"}]'
+
+    class ExpiringTokenAdapter(SequencedAdapter):
+        def send(self, request, **kwargs):
+            response = super().send(request, **kwargs)
+            if len(self.requested_urls) == 1:
+                clock.now += 2.0
+            return response
+
+    adapter = ExpiringTokenAdapter([first_page, second_page])
+    session = Session(raise_for_status=False)
+    session.mount("https://", adapter)
+    tokens = iter(
+        [
+            Token(
+                access_token="token-1",
+                token_type="Bearer",
+                expires_in=1,
+                scope="okta.groups.read",
+            ),
+            Token(
+                access_token="token-2",
+                token_type="Bearer",
+                expires_in=1,
+                scope="okta.groups.read",
+            ),
+        ]
+    )
+    auth = OktaBearerAuth(
+        lambda: next(tokens),
+        refresh_skew_seconds=0,
+        clock=clock.time,
+    )
+    client = OktaRESTClient(
+        base_url="https://example.okta.test",
+        endpoint_family="/api/v1/groups*",
+        throttle=EndpointThrottle(clock=clock.time, sleep=clock.sleep),
+        paginator=HeaderLinkPaginator(),
+        session=session,
+        clock=clock.time,
+        elapsed_clock=clock.time,
+        sleep=clock.sleep,
+        jitter=lambda: 0.0,
+        auth=auth,
+    )
+
+    pages = list(client.paginate(first_url))
+
+    assert [list(page) for page in pages] == [
+        [{"id": "00u123"}],
+        [{"id": "00u456"}],
+    ]
+    assert adapter.requested_urls == [first_url, cursor_url]
+    assert adapter.authorization_headers == ["Bearer token-1", "Bearer token-2"]
+
+
+def test_unknown_401_refreshes_bearer_token_once_through_the_real_session_path(caplog):
+    url = "https://example.okta.test/api/v1/groups/00g123/users?after=00u456&limit=1000"
+    adapter = SequencedAdapter([_response(401, url), _response(200, url)])
+    session = Session(raise_for_status=False)
+    session.mount("https://", adapter)
+    tokens = iter(
+        [
+            Token(
+                access_token="token-1",
+                token_type="Bearer",
+                expires_in=3600,
+                scope="okta.groups.read",
+            ),
+            Token(
+                access_token="token-2",
+                token_type="Bearer",
+                expires_in=3600,
+                scope="okta.groups.read",
+            ),
+        ]
+    )
+    auth = OktaBearerAuth(lambda: next(tokens))
+    client = OktaRESTClient(
+        base_url="https://example.okta.test",
+        endpoint_family="/api/v1/groups*",
+        throttle=EndpointThrottle(),
+        session=session,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        response = client._send_request(Request("GET", url, auth=auth))
+
+    assert response.status_code == 200
+    assert adapter.requested_urls == [url, url]
+    assert adapter.authorization_headers == ["Bearer token-1", "Bearer token-2"]
+    assert "classification=unknown" in caplog.text
+    assert "reason=current_token_unknown_401" in caplog.text
+
+
+def test_invalid_token_401_refreshes_bearer_token():
+    url = "https://example.okta.test/api/v1/groups/00g123/users"
+    adapter = SequencedAdapter(
+        [
+            _response(
+                401,
+                url,
+                content=b'{"errorCode":"E0000011","errorSummary":"Invalid token"}',
+            ),
+            _response(200, url),
+        ]
+    )
+    session = Session(raise_for_status=False)
+    session.mount("https://", adapter)
+    tokens = iter(
+        [
+            Token(
+                access_token="token-1",
+                token_type="Bearer",
+                expires_in=3600,
+                scope="okta.groups.read",
+            ),
+            Token(
+                access_token="token-2",
+                token_type="Bearer",
+                expires_in=3600,
+                scope="okta.groups.read",
+            ),
+        ]
+    )
+    auth = OktaBearerAuth(lambda: next(tokens))
+    client = OktaRESTClient(
+        base_url="https://example.okta.test",
+        endpoint_family="/api/v1/groups*",
+        throttle=EndpointThrottle(),
+        session=session,
+    )
+
+    response = client._send_request(Request("GET", url, auth=auth))
+
+    assert response.status_code == 200
+    assert adapter.requested_urls == [url, url]
+    assert adapter.authorization_headers == ["Bearer token-1", "Bearer token-2"]
+
+
+def test_non_token_401_preserves_current_bearer_token():
+    url = "https://example.okta.test/api/v1/groups/00g123/users"
+    adapter = SequencedAdapter(
+        [
+            _response(
+                401,
+                url,
+                content=b'{"errorCode":"E0000015","errorSummary":"Feature not enabled"}',
+            ),
+            _response(200, url),
+        ]
+    )
+    session = Session(raise_for_status=False)
+    session.mount("https://", adapter)
+    fetch_count = 0
+
+    def fetch_token():
+        nonlocal fetch_count
+        fetch_count += 1
+        return Token(
+            access_token=f"token-{fetch_count}",
+            token_type="Bearer",
+            expires_in=3600,
+            scope="okta.groups.read",
+        )
+
+    auth = OktaBearerAuth(fetch_token)
+    client = OktaRESTClient(
+        base_url="https://example.okta.test",
+        endpoint_family="/api/v1/groups*",
+        throttle=EndpointThrottle(),
+        session=session,
+    )
+
+    with pytest.raises(requests.HTTPError):
+        client._send_request(Request("GET", url, auth=auth))
+
+    assert adapter.requested_urls == [url]
+    assert adapter.authorization_headers == ["Bearer token-1"]
+    assert auth.authorization_header() == "Bearer token-1"
+    assert fetch_count == 1
+
+
+def test_stale_token_401_retries_with_current_bearer_without_rotating_again():
+    url = "https://example.okta.test/api/v1/groups/00g123/users"
+    fetch_count = 0
+
+    def fetch_token():
+        nonlocal fetch_count
+        fetch_count += 1
+        return Token(
+            access_token=f"token-{fetch_count}",
+            token_type="Bearer",
+            expires_in=3600,
+            scope="okta.groups.read",
+        )
+
+    auth = OktaBearerAuth(fetch_token)
+
+    class RefreshBeforeResponseAdapter(SequencedAdapter):
+        def send(self, request, **kwargs):
+            response = super().send(request, **kwargs)
+            if len(self.requested_urls) == 1:
+                assert auth.invalidate("token-1") is True
+                assert auth.authorization_header() == "Bearer token-2"
+            return response
+
+    adapter = RefreshBeforeResponseAdapter([_response(401, url), _response(200, url)])
+    session = Session(raise_for_status=False)
+    session.mount("https://", adapter)
+    client = OktaRESTClient(
+        base_url="https://example.okta.test",
+        endpoint_family="/api/v1/groups*",
+        throttle=EndpointThrottle(),
+        session=session,
+    )
+
+    response = client._send_request(Request("GET", url, auth=auth))
+
+    assert response.status_code == 200
+    assert adapter.requested_urls == [url, url]
+    assert adapter.authorization_headers == ["Bearer token-1", "Bearer token-2"]
+    assert fetch_count == 2
+
+
+@pytest.mark.parametrize(
+    ("headers", "content", "expected"),
+    [
+        (
+            {"WWW-Authenticate": 'Bearer error="invalid_token"'},
+            b"[]",
+            UnauthorizedClassification.INVALID_TOKEN,
+        ),
+        (
+            {"WWW-Authenticate": 'Bearer error="insufficient_scope"'},
+            b"[]",
+            UnauthorizedClassification.NON_TOKEN,
+        ),
+        (
+            {},
+            b'{"errorCode":"E0000011"}',
+            UnauthorizedClassification.INVALID_TOKEN,
+        ),
+        (
+            {},
+            b'{"errorCode":"E0000015"}',
+            UnauthorizedClassification.NON_TOKEN,
+        ),
+        ({}, b"[]", UnauthorizedClassification.UNKNOWN),
+    ],
+)
+def test_401_classification_uses_oauth_challenges_and_okta_error_codes(
+    headers,
+    content,
+    expected,
+):
+    response = _response(
+        401,
+        "https://example.okta.test/api/v1/groups/00g123/users",
+        headers=headers,
+        content=content,
+    )
+
+    assert OktaRESTClient._classify_unauthorized(response) is expected
+
+
+def test_401_bearer_refresh_retry_is_bounded_to_once():
+    url = "https://example.okta.test/api/v1/groups/00g123/users"
+    adapter = SequencedAdapter(
+        [_response(401, url), _response(401, url), _response(200, url)]
+    )
+    session = Session(raise_for_status=False)
+    session.mount("https://", adapter)
+    tokens = iter(
+        [
+            Token(
+                access_token="token-1",
+                token_type="Bearer",
+                expires_in=3600,
+                scope="okta.groups.read",
+            ),
+            Token(
+                access_token="token-2",
+                token_type="Bearer",
+                expires_in=3600,
+                scope="okta.groups.read",
+            ),
+        ]
+    )
+    auth = OktaBearerAuth(lambda: next(tokens))
+    client = OktaRESTClient(
+        base_url="https://example.okta.test",
+        endpoint_family="/api/v1/groups*",
+        throttle=EndpointThrottle(),
+        session=session,
+    )
+
+    with pytest.raises(requests.HTTPError):
+        client._send_request(Request("GET", url, auth=auth))
+
+    assert adapter.requested_urls == [url, url]
+    assert adapter.authorization_headers == ["Bearer token-1", "Bearer token-2"]
+
+
+def test_401_static_auth_is_not_retried():
+    url = "https://example.okta.test/api/v1/groups/00g123/users"
+    adapter = SequencedAdapter([_response(401, url), _response(200, url)])
+    session = Session(raise_for_status=False)
+    session.mount("https://", adapter)
+    auth = APIKeyAuth(name="Authorization", api_key="SSWS token-1", location="header")
+    client = OktaRESTClient(
+        base_url="https://example.okta.test",
+        endpoint_family="/api/v1/groups*",
+        throttle=EndpointThrottle(),
+        session=session,
+    )
+
+    with pytest.raises(requests.HTTPError):
+        client._send_request(Request("GET", url, auth=auth))
+
+    assert adapter.requested_urls == [url]
+    assert adapter.authorization_headers == ["SSWS token-1"]
+
+
+def test_retry_exhaustion_includes_app_and_cursor_context():
+    cursor_url = (
+        "https://example.okta.test/api/v1/apps/0oa123/users?after=00u456&limit=50"
+    )
+    client, _ = _client(
+        [
+            _response(429, cursor_url, {"Retry-After": "1"}),
+            _response(429, cursor_url, {"Retry-After": "1"}),
+            _response(429, cursor_url, {"Retry-After": "1"}),
+        ],
+        max_attempts=3,
+        rate_limit_max_elapsed_seconds=3.0,
+    )
+
+    with pytest.raises(OktaRetryExhaustedError) as exc:
+        client._send_request(Request("GET", cursor_url))
+
+    assert exc.value.context.endpoint_family == "/api/v1/apps*"
+    assert exc.value.context.status_code == 429
+    assert exc.value.context.attempts == 3
+    assert exc.value.context.app_id == "0oa123"
+    assert exc.value.context.cursor == "00u456"
+    assert "app_id=0oa123" in str(exc.value)
+    assert "cursor=00u456" in str(exc.value)
+
+
+def test_retries_the_same_application_users_cursor_after_timeout():
+    cursor_url = (
+        "https://example.okta.test/api/v1/apps/0oa123/users?after=00u456&limit=50"
+    )
+    client, clock = _client(
+        [
+            requests.Timeout("timed out"),
+            _response(200, cursor_url),
+        ]
+    )
+
+    response = client._send_request(Request("GET", cursor_url))
+
+    assert response.status_code == 200
+    assert client.requested_urls == [cursor_url, cursor_url]
+    assert clock.sleeps == [1.0]
+
+
+def test_retries_truncated_responses():
+    cursor_url = (
+        "https://example.okta.test/api/v1/apps/0oa123/users?after=00u456&limit=500"
+    )
+    client, clock = _client(
+        [
+            ChunkedEncodingError("response ended early"),
+            _response(200, cursor_url),
+        ]
+    )
+
+    response = client._send_request(Request("GET", cursor_url))
+
+    assert response.status_code == 200
+    assert client.requested_urls == [cursor_url, cursor_url]
+    assert clock.sleeps == [1.0]
+
+
+def test_rate_limit_attempts_do_not_inflate_server_error_backoff():
+    cursor_url = (
+        "https://example.okta.test/api/v1/apps/0oa123/users?after=00u456&limit=500"
+    )
+    client, clock = _client(
+        [
+            _response(429, cursor_url, {"Retry-After": "1"}),
+            _response(500, cursor_url),
+            _response(200, cursor_url),
+        ]
+    )
+
+    response = client._send_request(Request("GET", cursor_url))
+
+    assert response.status_code == 200
+    assert clock.sleeps == [1.0, 1.0]
+
+
+def test_transient_request_exhaustion_includes_app_and_cursor_context():
+    cursor_url = (
+        "https://example.okta.test/api/v1/apps/0oa123/users?after=00u456&limit=50"
+    )
+    client, _ = _client(
+        [
+            requests.ConnectionError("connection failed"),
+            requests.ConnectionError("connection failed"),
+            requests.ConnectionError("connection failed"),
+        ],
+        max_attempts=3,
+    )
+
+    with pytest.raises(OktaRetryExhaustedError) as exc:
+        client._send_request(Request("GET", cursor_url))
+
+    assert exc.value.context.endpoint_family == "/api/v1/apps*"
+    assert exc.value.context.status_code is None
+    assert exc.value.context.attempts == 3
+    assert exc.value.context.app_id == "0oa123"
+    assert exc.value.context.cursor == "00u456"
+
+
+def test_endpoint_throttle_honors_a_shared_cooldown():
+    clock = FakeClock()
+    throttle = EndpointThrottle(clock=clock.time, sleep=clock.sleep)
+    throttle.defer(5)
+    client, _ = _client(
+        [_response(200, "https://example.okta.test/api/v1/apps/0oa789/users")],
+        throttle=throttle,
+        clock=clock,
+    )
+
+    client._send_request(Request("GET", "/api/v1/apps/0oa789/users"))
+
+    assert clock.sleeps == [5.0]
+
+
+def test_endpoint_throttle_rechecks_a_cooldown_extended_while_sleeping():
+    clock = FakeClock()
+    extended = False
+    throttle = None
+
+    def sleep(delay):
+        nonlocal extended
+        if not extended:
+            extended = True
+            throttle.defer(10)
+        clock.sleep(delay)
+
+    throttle = EndpointThrottle(clock=clock.time, sleep=sleep)
+    throttle.defer(5)
+
+    throttle.wait()
+
+    assert clock.sleeps == [5.0, 5.0]
+    assert clock.now == 1_010.0
+
+
+def test_endpoint_throttle_bounds_concurrent_requests():
+    throttle = EndpointThrottle(max_concurrency=1)
+    second_acquired = Event()
+
+    throttle.acquire()
+
+    def acquire_second_slot():
+        throttle.acquire()
+        second_acquired.set()
+        throttle.release()
+
+    worker = Thread(target=acquire_second_slot)
+    worker.start()
+    assert not second_acquired.wait(0.05)
+
+    throttle.release()
+
+    assert second_acquired.wait(1.0)
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+
+
+def test_occupied_throttle_slots_are_not_reported_as_active_http_requests():
+    clock = FakeClock()
+    throttle = EndpointThrottle(
+        clock=clock.time,
+        sleep=clock.sleep,
+        max_concurrency=2,
+    )
+    telemetry = Mock()
+    client = SequencedOktaClient(
+        [_response(200, "https://example.okta.test/api/v1/apps/0oa123/users")],
+        throttle=throttle,
+        elapsed_clock=clock.time,
+        telemetry=telemetry,
+    )
+    throttle.acquire()
+
+    try:
+        client._send_request(Request("GET", "/api/v1/apps/0oa123/users"))
+    finally:
+        throttle.release()
+
+    throttle_wait = telemetry.record_http_response.call_args.kwargs["throttle_wait"]
+    assert throttle_wait["observed_concurrency"] == 1
+
+
+@pytest.mark.parametrize(
+    ("proactive_delay", "retry_delay", "expected_proactive", "expected_retry"),
+    [
+        (31.0, 1.0, 31.0, 0.0),
+        (2.0, 5.0, 0.0, 5.0),
+    ],
+)
+def test_endpoint_throttle_attributes_wait_to_the_controlling_deadline(
+    proactive_delay,
+    retry_delay,
+    expected_proactive,
+    expected_retry,
+):
+    clock = FakeClock()
+    throttle = EndpointThrottle(
+        clock=clock.time,
+        wall_clock=clock.time,
+        sleep=clock.sleep,
+        remaining_reserve=1,
+    )
+    response = _response(
+        200,
+        "https://example.okta.test/api/v1/apps/0oa123/users",
+        {
+            "X-Rate-Limit-Remaining": "0",
+            "X-Rate-Limit-Reset": str(clock.now + proactive_delay - 1.0),
+        },
+    )
+    throttle.observe_response(response)
+    throttle.defer(retry_delay)
+
+    wait = throttle.acquire()
+    throttle.release()
+
+    assert wait.proactive_pacing_seconds == expected_proactive
+    assert wait.retry_backoff_seconds == expected_retry
+    assert clock.sleeps == [max(proactive_delay, retry_delay)]
+
+
+def test_successful_rate_headers_pace_the_next_request():
+    clock = FakeClock()
+    throttle = EndpointThrottle(
+        clock=clock.time,
+        wall_clock=clock.time,
+        sleep=clock.sleep,
+        remaining_reserve=1,
+    )
+    response = _response(
+        200,
+        "https://example.okta.test/api/v1/apps/0oa123/users",
+        {
+            "X-Rate-Limit-Limit": "10",
+            "X-Rate-Limit-Remaining": "5",
+            "X-Rate-Limit-Reset": "1010",
+        },
+    )
+
+    throttle.observe_response(response)
+    throttle.wait()
+
+    assert clock.sleeps == [2.5]
+
+
+def test_out_of_order_headers_keep_the_lowest_remaining_value_for_a_window():
+    clock = FakeClock()
+    throttle = EndpointThrottle(
+        clock=clock.time,
+        wall_clock=clock.time,
+        sleep=clock.sleep,
+        remaining_reserve=1,
+    )
+    newest_response = _response(
+        200,
+        "https://example.okta.test/api/v1/apps/0oa123/users",
+        {
+            "X-Rate-Limit-Remaining": "2",
+            "X-Rate-Limit-Reset": "1010",
+        },
+    )
+    older_response = _response(
+        200,
+        "https://example.okta.test/api/v1/apps/0oa456/users",
+        {
+            "X-Rate-Limit-Remaining": "9",
+            "X-Rate-Limit-Reset": "1010",
+        },
+    )
+
+    throttle.observe_response(newest_response)
+    throttle.observe_response(older_response)
+
+    assert throttle._request_interval == 10.0
+
+
+def test_server_retry_delay_is_clamped_to_configured_maximum():
+    cursor_url = "https://example.okta.test/api/v1/apps/0oa123/users"
+    client, clock = _client([])
+    response = _response(
+        429,
+        cursor_url,
+        {"X-Rate-Limit-Reset": str(int(clock.now + 10_000))},
+    )
+
+    assert client._retry_delay(response, 1) == 300.0
+
+
+def test_successful_rate_header_cooldown_is_clamped():
+    clock = FakeClock()
+    throttle = EndpointThrottle(
+        clock=clock.time,
+        wall_clock=clock.time,
+        sleep=clock.sleep,
+        max_cooldown_seconds=300.0,
+    )
+    response = _response(
+        200,
+        "https://example.okta.test/api/v1/apps/0oa123/users",
+        {
+            "X-Rate-Limit-Remaining": "0",
+            "X-Rate-Limit-Reset": "11000",
+        },
+    )
+
+    throttle.observe_response(response)
+    throttle.wait()
+
+    assert clock.sleeps == [300.0]
+
+
+class RecordingPool:
+    def __init__(self, pages=None, responses=None):
+        self.pages = pages or []
+        self.responses = responses or {}
+        self.path = None
+        self.kwargs = None
+        self.get_paths = []
+
+    def paginate(self, path, **kwargs):
+        self.path = path
+        self.kwargs = kwargs
+        yield from self.pages
+
+    def get(self, path, **kwargs):
+        self.get_paths.append(path)
+        return SimpleNamespace(json=lambda: self.responses[path])
+
+
+def test_groups_request_the_default_expanded_page_size():
+    pool = RecordingPool(pages=[[{"id": "00g123"}]])
+    ctx = SimpleNamespace(pool=pool, groups_page_size=GROUPS_PAGE_SIZE)
+
+    rows = list(groups.__wrapped__(ctx))
+
+    assert rows == [{"id": "00g123"}]
+    assert pool.path == "/api/v1/groups?expand=stats"
+    assert pool.kwargs == {
+        "params": {"limit": 200},
+        "initial_read_timeout_budget": InitialReadTimeoutBudget(2),
+    }
+
+
+def test_groups_request_a_custom_expanded_page_size():
+    pool = RecordingPool(pages=[[{"id": "00g123"}]])
+    ctx = SimpleNamespace(pool=pool, groups_page_size=50)
+
+    rows = list(groups.__wrapped__(ctx))
+
+    assert rows == [{"id": "00g123"}]
+    assert pool.path == "/api/v1/groups?expand=stats"
+    assert pool.kwargs == {
+        "params": {"limit": 50},
+        "initial_read_timeout_budget": InitialReadTimeoutBudget(2),
+    }
+
+
+@pytest.mark.parametrize(
+    ("initial_page_size", "expected"),
+    [
+        (GROUPS_PAGE_SIZE, (200, 100, 50)),
+        (80, (80, 40, 20)),
+        (3, (3, 1)),
+        (1, (1,)),
+    ],
+)
+def test_group_page_sizes_scale_from_the_configured_start(initial_page_size, expected):
+    assert _group_page_sizes(initial_page_size) == expected
+
+
+class AdaptiveGroupsPool:
+    def __init__(self, *, fail_limits=(), pages_by_limit=None):
+        self.fail_limits = set(fail_limits)
+        self.pages_by_limit = pages_by_limit or {}
+        self.calls = []
+
+    def paginate(self, path, **kwargs):
+        self.calls.append((path, kwargs))
+        page_size = kwargs["params"]["limit"]
+        if page_size in self.fail_limits:
+            raise OktaRetryExhaustedError(
+                OktaRetryContext(
+                    endpoint_family="/api/v1/groups*",
+                    url=f"https://example.okta.test{path}&limit={page_size}",
+                    status_code=None,
+                    attempts=2,
+                )
+            ) from requests.ReadTimeout("timed out")
+        yield from self.pages_by_limit.get(page_size, [])
+
+
+def test_groups_reduce_page_size_after_initial_read_timeout(caplog):
+    pool = AdaptiveGroupsPool(
+        fail_limits={GROUPS_PAGE_SIZE, 100},
+        pages_by_limit={50: [[{"id": "00g123"}]]},
+    )
+    ctx = SimpleNamespace(pool=pool, groups_page_size=GROUPS_PAGE_SIZE)
+
+    with caplog.at_level(logging.WARNING):
+        rows = list(groups.__wrapped__(ctx))
+
+    assert rows == [{"id": "00g123"}]
+    assert [call[1]["params"]["limit"] for call in pool.calls] == [200, 100, 50]
+    assert "previous_page_size=200 next_page_size=100" in caplog.text
+    assert "previous_page_size=100 next_page_size=50" in caplog.text
+
+
+def test_groups_do_not_restart_after_a_later_page_timeout():
+    class LaterPageTimeoutPool:
+        def __init__(self):
+            self.calls = []
+
+        def paginate(self, path, **kwargs):
+            self.calls.append((path, kwargs))
+            yield [{"id": "00g123"}]
+            raise OktaRetryExhaustedError(
+                OktaRetryContext(
+                    endpoint_family="/api/v1/groups*",
+                    url=f"https://example.okta.test{path}&limit=200&after=00g123",
+                    status_code=None,
+                    attempts=15,
+                )
+            ) from requests.ReadTimeout("timed out")
+
+    pool = LaterPageTimeoutPool()
+    ctx = SimpleNamespace(pool=pool, groups_page_size=GROUPS_PAGE_SIZE)
+
+    with pytest.raises(OktaRetryExhaustedError):
+        list(inspect.unwrap(groups)(ctx))
+
+    assert [call[1]["params"]["limit"] for call in pool.calls] == [200]
+
+
+@pytest.mark.parametrize("groups_page_size", [0, -1, GROUPS_PAGE_SIZE + 1])
+def test_source_rejects_invalid_groups_page_size(groups_page_size):
+    credentials = OktaTokenCredentials(
+        base_url="https://example.okta.test",
+        token="token",
+    )
+
+    with pytest.raises(ValueError, match="groups_page_size must be between 1 and 200"):
+        inspect.unwrap(source)(
+            credentials=credentials,
+            groups_page_size=groups_page_size,
+        )
+
+
+def test_group_push_mappings_request_the_maximum_page_size():
+    application = SimpleNamespace(
+        id="0oa123",
+        features=["GROUP_PUSH"],
+        name="example_app",
+    )
+    pool = RecordingPool(pages=[[{"id": "gpm123"}]])
+    ctx = SimpleNamespace(
+        pool=pool,
+        group_push_mappings_page_size=GROUP_PUSH_MAPPINGS_PAGE_SIZE,
+    )
+
+    rows = list(application_group_push_mappings.__wrapped__(application, ctx))
+
+    assert rows == [{"app_id": "0oa123", "app_name": "example_app", "id": "gpm123"}]
+    assert pool.path == "/api/v1/apps/0oa123/group-push/mappings"
+    assert pool.kwargs == {"params": {"limit": 1000}}
+
+
+def test_group_push_mapping_rows_fetch_target_group_name():
+    application = SimpleNamespace(id="0oa123", name="okta_org2org")
+    pool = RecordingPool(
+        responses={
+            "/api/v1/groups/00g-target": {
+                "profile": {"name": "Engineering"},
+            }
+        }
+    )
+    ctx = SimpleNamespace(pool=pool)
+
+    row = application_group_push_mapping_row(
+        application,
+        {
+            "id": "gpm123",
+            "sourceGroupId": "00g-source",
+            "targetGroupId": "00g-target",
+        },
+        ctx,
+    )
+
+    assert row["target_group_name"] == "Engineering"
+    assert pool.get_paths == ["/api/v1/groups/00g-target"]
+
+
+def test_microsoft_tenant_id_is_derived_from_openid_configuration():
+    requested = []
+
+    def get(url, **kwargs):
+        requested.append((url, kwargs))
+        response = requests.Response()
+        response.status_code = 200
+        response._content = (
+            b'{"token_endpoint":"https://login.microsoftonline.com/'
+            b'31537af4-6d77-4bb9-a681-d2394888ea26/oauth2/v2.0/token"}'
+        )
+        return response
+
+    tenant_id = _microsoft_tenant_id_from_onmicrosoft_domain(
+        "contoso",
+        get=get,
+    )
+
+    assert tenant_id == "31537af4-6d77-4bb9-a681-d2394888ea26"
+    assert requested == [
+        (
+            "https://login.microsoftonline.com/contoso.onmicrosoft.com/"
+            ".well-known/openid-configuration",
+            {"timeout": 30},
+        )
+    ]
+
+
+def test_office365_saml_app_is_enriched_with_microsoft_tenant_id():
+    def get(url, **kwargs):
+        response = requests.Response()
+        response.status_code = 200
+        response._content = (
+            b'{"token_endpoint":"https://login.microsoftonline.com/'
+            b'tenant-id/oauth2/v2.0/token"}'
+        )
+        return response
+
+    application = {
+        "name": "office365",
+        "signOnMode": "SAML_1_1",
+        "settings": {"app": {"msftTenant": "contoso"}},
+    }
+
+    enriched = _office365_tenant_id_fields(application, get=get)
+
+    assert enriched["settings"]["app"] == {
+        "msftTenant": "contoso",
+        "microsoftTenantId": "tenant-id",
+    }
+
+
+def test_identity_provider_users_request_the_maximum_page_size():
+    identity_provider = SimpleNamespace(
+        id="0oa123",
+        name="example_idp",
+        type="SAML2",
+        status="ACTIVE",
+        idp_url="https://idp.example.test",
+        policy=None,
+    )
+    pool = RecordingPool(pages=[[{"id": "00u123"}]])
+    ctx = SimpleNamespace(
+        pool=pool,
+        identity_provider_users_page_size=IDENTITY_PROVIDER_USERS_PAGE_SIZE,
+    )
+
+    rows = list(identity_provider_users.__wrapped__(identity_provider, ctx))
+
+    assert rows == [
+        {
+            "idp_id": "0oa123",
+            "idp_name": "example_idp",
+            "idp_type": "SAML2",
+            "idp_protocol_type": None,
+            "idp_status": "ACTIVE",
+            "idp_url": "https://idp.example.test",
+            "idp_subject_user_name_template": None,
+            "idp_subject_match_type": None,
+            "idp_subject_filter": None,
+            "id": "00u123",
+        }
+    ]
+    assert pool.path == "/api/v1/idps/0oa123/users"
+    assert pool.kwargs == {"params": {"limit": 200}}
+
+
+def test_saml_metadata_retry_exhaustion_is_not_silently_discarded():
+    error = OktaRetryExhaustedError(
+        OktaRetryContext(
+            endpoint_family="/api/v1/apps*",
+            url="https://example.okta.test/api/v1/apps/0oa123/sso/saml/metadata",
+            status_code=429,
+            attempts=4,
+        )
+    )
+
+    class FailingMetadataPool:
+        def get_saml_metadata(self, path):
+            raise error
+
+    application = {
+        "id": "0oa123",
+        "_links": {"metadata": {"href": "https://example.okta.test/metadata"}},
+    }
+    ctx = SimpleNamespace(pool=FailingMetadataPool())
+
+    with pytest.raises(OktaRetryExhaustedError) as exc:
+        _saml_metadata_fields(ctx, application)
+
+    assert exc.value is error
+
+
+def test_inbound_idp_metadata_preserves_entity_and_all_acs_routes():
+    metadata = """\
+<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
+                     entityID="https://www.okta.com/saml2/service-provider">
+  <md:SPSSODescriptor>
+    <md:AssertionConsumerService
+        Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
+        Location="https://example.okta.test/sso/saml2/0oa123"
+        index="0"
+        isDefault="true"/>
+    <md:AssertionConsumerService
+        Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect"
+        Location="https://example.okta.test/sso/saml2/alternate"
+        index="2"/>
+  </md:SPSSODescriptor>
+</md:EntityDescriptor>
+"""
+
+    class MetadataPool:
+        def get_saml_metadata(self, path):
+            assert path == "/api/v1/idps/0oa123/metadata.xml"
+            return SimpleNamespace(content=metadata.encode())
+
+    identity_provider = {
+        "id": "0oa123",
+        "_links": {
+            "metadata": {
+                "href": "https://example.okta.test/api/v1/idps/0oa123/metadata.xml"
+            }
+        },
+    }
+
+    assert _saml_idp_metadata_fields(
+        SimpleNamespace(pool=MetadataPool()),
+        identity_provider,
+    ) == {
+        "saml_metadata_entity_id": ("https://www.okta.com/saml2/service-provider"),
+        "saml_metadata_acs_endpoints": [
+            {
+                "url": "https://example.okta.test/sso/saml2/0oa123",
+                "binding": "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+                "index": 0,
+                "is_default": True,
+            },
+            {
+                "url": "https://example.okta.test/sso/saml2/alternate",
+                "binding": "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect",
+                "index": 2,
+                "is_default": None,
+            },
+        ],
+    }
+
+
+def test_saml_metadata_rejects_entity_declarations():
+    metadata = b"""\
+<!DOCTYPE EntityDescriptor [
+  <!ENTITY xxe "unexpected">
+]>
+<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
+                     entityID="&xxe;">
+</md:EntityDescriptor>
+"""
+
+    class MetadataPool:
+        def get_saml_metadata(self, path):
+            assert path == "/api/v1/apps/0oa123/sso/saml/metadata"
+            return SimpleNamespace(content=metadata)
+
+    application = {
+        "id": "0oa123",
+        "_links": {"metadata": {"href": "https://example.okta.test/metadata"}},
+    }
+
+    assert (
+        _saml_metadata_fields(SimpleNamespace(pool=MetadataPool()), application) == {}
+    )
+
+
+def test_inbound_idp_metadata_retry_exhaustion_is_not_silently_discarded():
+    error = OktaRetryExhaustedError(
+        OktaRetryContext(
+            endpoint_family="/api/v1/idps*",
+            url="https://example.okta.test/api/v1/idps/0oa123/metadata.xml",
+            status_code=429,
+            attempts=4,
+        )
+    )
+
+    class FailingMetadataPool:
+        def get_saml_metadata(self, path):
+            raise error
+
+    identity_provider = {
+        "id": "0oa123",
+        "_links": {"metadata": {"href": "https://example.okta.test/metadata"}},
+    }
+    ctx = SimpleNamespace(pool=FailingMetadataPool())
+
+    with pytest.raises(OktaRetryExhaustedError) as exc:
+        _saml_idp_metadata_fields(ctx, identity_provider)
+
+    assert exc.value is error
+
+
+def test_user_role_retry_exhaustion_is_not_silently_discarded():
+    error = OktaRetryExhaustedError(
+        OktaRetryContext(
+            endpoint_family="/api/v1/users*",
+            url="https://example.okta.test/api/v1/users/00u123/roles",
+            status_code=429,
+            attempts=4,
+        )
+    )
+
+    class FailingRolePool:
+        def paginate(self, path):
+            raise error
+            yield
+
+    ctx = SimpleNamespace(pool=FailingRolePool())
+
+    with pytest.raises(OktaRetryExhaustedError) as exc:
+        next(user_role_assignment_rows("00u123", ctx))
+
+    assert exc.value is error
+
+
+def test_application_jwk_retry_exhaustion_is_not_silently_discarded():
+    error = OktaRetryExhaustedError(
+        OktaRetryContext(
+            endpoint_family="/api/v1/apps*",
+            url="https://example.okta.test/api/v1/apps/0oa123/credentials/jwks",
+            status_code=429,
+            attempts=4,
+        )
+    )
+
+    class FailingJwkPool:
+        def paginate(self, path):
+            raise error
+            yield
+
+    application = SimpleNamespace(
+        id="0oa123",
+        name="example-app",
+        settings=SimpleNamespace(
+            oauth_client=SimpleNamespace(
+                jwks=SimpleNamespace(
+                    keys=[
+                        SimpleNamespace(
+                            model_dump=lambda: {
+                                "id": "jwk-1",
+                                "kid": "k1",
+                                "status": "ACTIVE",
+                            }
+                        )
+                    ]
+                )
+            )
+        ),
+    )
+    ctx = SimpleNamespace(pool=FailingJwkPool())
+
+    with pytest.raises(OktaRetryExhaustedError) as exc:
+        next(application_jwk_rows(application, ctx))
+
+    assert exc.value is error
+
+
+def test_application_grants_retry_exhaustion_is_not_silently_discarded():
+    error = OktaRetryExhaustedError(
+        OktaRetryContext(
+            endpoint_family="/api/v1/apps*",
+            url="https://example.okta.test/api/v1/apps/0oa123/grants",
+            status_code=429,
+            attempts=4,
+        )
+    )
+
+    class FailingGrantPool:
+        def paginate(self, path):
+            raise error
+            yield
+
+    application = SimpleNamespace(
+        id="0oa123",
+        sign_on_mode="OPENID_CONNECT",
+        settings=None,
+    )
+    ctx = SimpleNamespace(
+        pool=FailingGrantPool(),
+        application_grants_breaker=ConsecutiveAccessDeniedBreaker(
+            APPLICATION_GRANTS_ACCESS_DENIED_LIMIT
+        ),
+    )
+
+    with pytest.raises(OktaRetryExhaustedError) as exc:
+        next(inspect.unwrap(application_grants)(application, ctx))
+
+    assert exc.value is error
+
+
+def _grants_application(app_id: str) -> SimpleNamespace:
+    """Return a minimal stand-in for an OIDC application record."""
+    return SimpleNamespace(id=app_id, sign_on_mode="OPENID_CONNECT", settings=None)
+
+
+ScriptedPoolAction = int | list[dict[str, str]]
+
+
+class ScriptedGrantsPool:
+    """Pool whose paginate replies follow a per-call script.
+
+    Attributes:
+        script: Remaining actions, consumed one per paginate call. An int
+            entry is an HTTP status code (the call raises an HTTPError with
+            that status); a list entry is one page of items the call yields.
+        calls: Number of paginate calls made so far.
+    """
+
+    def __init__(self, script: list[ScriptedPoolAction]) -> None:
+        self.script: list[ScriptedPoolAction] = list(script)
+        self.calls: int = 0
+
+    def paginate(self, path: str) -> Iterator[list[dict[str, str]]]:
+        """Replay the next scripted action for a paginated request.
+
+        Args:
+            path: Requested API path, used only to build the error URL.
+
+        Yields:
+            The next scripted page of items.
+
+        Raises:
+            requests.HTTPError: When the next scripted action is a status code.
+        """
+        self.calls += 1
+        action = self.script.pop(0)
+        if isinstance(action, int):
+            raise requests.HTTPError(
+                response=_response(action, f"https://example.okta.test{path}")
+            )
+        yield action
+
+
+def test_application_grants_stop_after_consecutive_access_denied(caplog):
+    pool = ScriptedGrantsPool([403] * 3)
+    ctx = SimpleNamespace(
+        pool=pool,
+        application_grants_breaker=ConsecutiveAccessDeniedBreaker(3),
+    )
+    grants = inspect.unwrap(application_grants)
+
+    with caplog.at_level(logging.WARNING):
+        for index in range(6):
+            assert list(grants(_grants_application(f"0oa{index}"), ctx)) == []
+
+    assert pool.calls == 3
+    assert ctx.application_grants_breaker.tripped
+    # Pre-trip denials log at debug level, so the whole run emits exactly one
+    # warning-or-above record: the breaker trip message.
+    warnings = [
+        record for record in caplog.records if record.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "Skipping app grant collection" in warnings[0].getMessage()
+    assert warnings[0].levelno == logging.WARNING
+
+
+def test_application_grants_success_resets_consecutive_access_denied_count():
+    grant_page = [{"id": "grant-1", "scopeId": "okta.users.read"}]
+    pool = ScriptedGrantsPool([403, 403, grant_page, 403, 403, 403])
+    ctx = SimpleNamespace(
+        pool=pool,
+        application_grants_breaker=ConsecutiveAccessDeniedBreaker(3),
+    )
+    grants = inspect.unwrap(application_grants)
+
+    rows = []
+    for index in range(7):
+        rows.extend(grants(_grants_application(f"0oa{index}"), ctx))
+
+    # Two denials, one success (resetting the run), then three denials trip
+    # the breaker; the seventh application must not trigger a request.
+    assert pool.calls == 6
+    assert ctx.application_grants_breaker.tripped
+    assert rows == [{"app_id": "0oa2", "id": "grant-1", "scopeId": "okta.users.read"}]
+
+
+def test_application_grants_not_found_does_not_trip_the_breaker(caplog):
+    pool = ScriptedGrantsPool([404] * 5)
+    ctx = SimpleNamespace(
+        pool=pool,
+        application_grants_breaker=ConsecutiveAccessDeniedBreaker(1),
+    )
+    grants = inspect.unwrap(application_grants)
+
+    with caplog.at_level(logging.WARNING):
+        for index in range(5):
+            assert list(grants(_grants_application(f"0oa{index}"), ctx)) == []
+
+    assert pool.calls == 5
+    assert not ctx.application_grants_breaker.tripped
+    assert not caplog.records
+
+
+def test_application_grants_not_found_does_not_shield_the_breaker():
+    # A 404 carries no permission signal: it neither counts toward the limit
+    # nor resets the denial run the way a successful response does.
+    pool = ScriptedGrantsPool([403, 404, 403, 403])
+    ctx = SimpleNamespace(
+        pool=pool,
+        application_grants_breaker=ConsecutiveAccessDeniedBreaker(3),
+    )
+    grants = inspect.unwrap(application_grants)
+
+    for index in range(5):
+        assert list(grants(_grants_application(f"0oa{index}"), ctx)) == []
+
+    assert pool.calls == 4
+    assert ctx.application_grants_breaker.tripped
+
+
+def test_api_services_access_denied_is_skipped_with_a_warning(caplog):
+    pool = ScriptedGrantsPool([403])
+    ctx = SimpleNamespace(pool=pool)
+
+    with caplog.at_level(logging.WARNING):
+        assert list(inspect.unwrap(api_services)(ctx)) == []
+
+    assert pool.calls == 1
+    assert any(
+        "Access denied listing API service integrations" in record.getMessage()
+        for record in caplog.records
+    )
+    assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
+def test_api_services_other_http_errors_propagate():
+    pool = ScriptedGrantsPool([400])
+    ctx = SimpleNamespace(pool=pool)
+
+    with pytest.raises(requests.HTTPError):
+        list(inspect.unwrap(api_services)(ctx))
+
+
+def test_application_secrets_skips_applications_without_credentials():
+    application = SimpleNamespace(
+        id="0oa123",
+        name="example_app",
+        credentials=None,
+    )
+
+    class UnexpectedPool:
+        def paginate(self, path, **kwargs):
+            raise AssertionError("the secrets endpoint must not be requested")
+
+    ctx = SimpleNamespace(pool=UnexpectedPool())
+
+    assert list(inspect.unwrap(application_secrets)(application, ctx)) == []
+
+
+class FailingPool:
+    def __init__(self):
+        self.path = None
+        self.kwargs = None
+
+    def paginate(self, path, **kwargs):
+        self.path = path
+        self.kwargs = kwargs
+        yield [{"id": "00u_first"}]
+        raise RuntimeError("cursor failed")
+
+
+def test_application_users_streams_rows_and_requests_the_maximum_page_size():
+    application = SimpleNamespace(
+        id="0oa123",
+        features=[],
+        name="example_app",
+        label="Example App",
+        status="ACTIVE",
+        settings=None,
+        credentials=None,
+        sign_on_mode="SAML_2_0",
+    )
+    pool = FailingPool()
+    ctx = SimpleNamespace(
+        pool=pool,
+        application_users_page_size=APPLICATION_USERS_PAGE_SIZE,
+    )
+    rows = application_user_rows(application, ctx)
+
+    first_row = next(rows)
+    assert first_row["id"] == "00u_first"
+    assert first_row["app_status"] == "ACTIVE"
+    with pytest.raises(RuntimeError, match="cursor failed"):
+        next(rows)
+
+    assert pool.path == "/api/v1/apps/0oa123/users"
+    assert pool.kwargs == {"params": {"limit": 500}}

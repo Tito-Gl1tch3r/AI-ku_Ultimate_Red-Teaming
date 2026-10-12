@@ -1,0 +1,473 @@
+use clap::{Parser, ValueEnum};
+use colored::control;
+use std::fmt;
+
+/// Default method for the attack request. Kept as a named constant so the
+/// `--raw-request` override can tell whether the user explicitly set `--method`
+/// (anything other than this default) before warning about a conflict.
+pub const DEFAULT_METHOD: &str = "POST";
+
+/// Every check name smugglex understands: the payload-string checks, the CL.0
+/// connection-sequence probes, the parser discrepancy audit, plus the
+/// real-HTTP/2 downgrade check. Used to validate `--checks` so a typo does not
+/// silently run zero checks and report a clean target.
+pub const KNOWN_CHECK_NAMES: [&str; 10] = [
+    "cl-te",
+    "te-cl",
+    "te-te",
+    "h2c",
+    "h2",
+    "cl-edge",
+    "cl-0",
+    "0-cl",
+    "parser-discrepancy",
+    "h2-downgrade",
+];
+
+/// Every exploit mode smugglex understands. Used to reject a typo before a
+/// scan starts instead of silently skipping the requested post-scan action.
+pub const KNOWN_EXPLOIT_NAMES: [&str; 5] = [
+    "localhost-access",
+    "path-fuzz",
+    "smuggle",
+    "capture",
+    "reveal",
+];
+
+fn unknown_names(requested: &str, known: &[&str]) -> Vec<String> {
+    requested
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter(|s| !known.contains(s))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn has_any_known_name(requested: &str, known: &[&str]) -> bool {
+    requested
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .any(|s| known.contains(&s))
+}
+
+/// Return the names in a comma-separated `--checks` value that match no known
+/// check (trimmed; empty segments ignored). An empty result means every
+/// requested name was recognized.
+pub fn unknown_check_names(requested: &str, known: &[&str]) -> Vec<String> {
+    unknown_names(requested, known)
+}
+
+/// Whether `requested` selects at least one known check. False means a typo'd
+/// `--checks` that would otherwise scan nothing.
+pub fn has_any_known_check(requested: &str, known: &[&str]) -> bool {
+    has_any_known_name(requested, known)
+}
+
+/// Return the names in a comma-separated `--exploit` value that match no known
+/// exploit (trimmed; empty segments ignored).
+pub fn unknown_exploit_names(requested: &str) -> Vec<String> {
+    unknown_names(requested, &KNOWN_EXPLOIT_NAMES)
+}
+
+/// Whether `requested` selects at least one known exploit.
+pub fn has_any_known_exploit(requested: &str) -> bool {
+    has_any_known_name(requested, &KNOWN_EXPLOIT_NAMES)
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+/// Validate user-supplied `-H/--header` values before interpolating them into
+/// raw HTTP requests. Header names must be HTTP tokens and values may not carry
+/// line breaks or other control characters that could inject another header or
+/// request.
+pub fn validate_custom_headers(headers: &[String]) -> std::result::Result<(), String> {
+    for (index, header) in headers.iter().enumerate() {
+        let Some((name, value)) = header.split_once(':') else {
+            return Err(format!(
+                "--header #{} must use the format 'Name: Value'",
+                index + 1
+            ));
+        };
+
+        if name.is_empty() || !name.bytes().all(is_http_token_byte) {
+            return Err(format!(
+                "--header #{} has an invalid header name",
+                index + 1
+            ));
+        }
+
+        if value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() && byte != b'\t')
+        {
+            return Err(format!(
+                "--header #{} value must not contain control characters",
+                index + 1
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Output format type
+#[derive(Debug, Clone, ValueEnum)]
+pub enum OutputFormat {
+    /// Plain text output (human-readable)
+    Plain,
+    /// JSON output (structured)
+    Json,
+}
+
+impl fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OutputFormat::Plain => write!(f, "plain"),
+            OutputFormat::Json => write!(f, "json"),
+        }
+    }
+}
+
+impl OutputFormat {
+    /// Check if format is JSON
+    pub fn is_json(&self) -> bool {
+        matches!(self, OutputFormat::Json)
+    }
+}
+
+/// A powerful HTTP Request Smuggling testing tool for detecting CL.TE, TE.CL, TE.TE, H2C, and H2 smuggling vulnerabilities
+#[derive(Parser, Debug, Clone)]
+#[command(
+    author,
+    version,
+    about,
+    long_about = None,
+    disable_help_flag = true,
+    disable_version_flag = true,
+    before_help = r#"
+
+        ████
+       ██   █
+       ██   █
+        ██ █████               < SmuggleX >
+    ████ ██   ██   Rust-powered HTTP Request Smuggling Scanner.
+   ███   ███   ██
+    ███  ███ ███
+      █   █  ██
+"#)]
+pub struct Cli {
+    /// Target URLs (supports multiple URLs and stdin input)
+    #[arg(help_heading = "TARGET")]
+    pub urls: Vec<String>,
+
+    /// Custom method for the attack request
+    #[arg(help_heading = "REQUEST", short, long, default_value = DEFAULT_METHOD)]
+    pub method: String,
+
+    /// Socket timeout in seconds
+    #[arg(help_heading = "REQUEST", short, long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
+    pub timeout: u64,
+
+    /// Custom headers (format: "Header: Value")
+    #[arg(help_heading = "REQUEST", short = 'H', long = "header")]
+    pub headers: Vec<String>,
+
+    /// Virtual host to use in Host header (overrides URL hostname)
+    #[arg(help_heading = "REQUEST", long = "vhost")]
+    pub vhost: Option<String>,
+
+    /// Read a raw HTTP request from a file and use it as the request template
+    #[arg(help_heading = "REQUEST", long = "raw-request", value_name = "FILE")]
+    pub raw_request: Option<String>,
+
+    /// Scheme for --raw-request when the request line is origin-form (http or https)
+    #[arg(
+        help_heading = "REQUEST",
+        long = "raw-request-proto",
+        value_name = "SCHEME",
+        default_value = "https",
+        requires = "raw_request",
+        value_parser = ["http", "https"]
+    )]
+    pub raw_request_proto: String,
+
+    /// Literal request-target captured from `--raw-request`, applied verbatim so the
+    /// exact bytes (dot-segments, `#`, params) survive instead of being normalized by
+    /// re-parsing a synthetic URL. Not a user-facing flag; populated by the raw-request
+    /// pipeline.
+    #[arg(skip)]
+    pub raw_target: Option<String>,
+
+    /// Fetch and append cookies from initial request
+    #[arg(help_heading = "REQUEST", long = "cookies", action = clap::ArgAction::SetTrue)]
+    pub use_cookies: bool,
+
+    /// Output file for results (JSON format)
+    #[arg(help_heading = "OUTPUT", short, long)]
+    pub output: Option<String>,
+
+    /// Output format (plain or json)
+    #[arg(help_heading = "OUTPUT", short = 'f', long = "format", default_value_t = OutputFormat::Plain)]
+    pub format: OutputFormat,
+
+    /// Shorthand for --format json (machine-readable output for scripts and AI agents)
+    #[arg(help_heading = "OUTPUT", long = "json", action = clap::ArgAction::SetTrue)]
+    pub json: bool,
+
+    /// Export payloads to directory when vulnerabilities are found
+    #[arg(help_heading = "OUTPUT", long = "export-payloads")]
+    pub export_dir: Option<String>,
+
+    /// Verbose mode
+    #[arg(help_heading = "OUTPUT", short = 'V', long, action = clap::ArgAction::SetTrue)]
+    pub verbose: bool,
+
+    /// Specify which checks to run (comma-separated: cl-te,te-cl,te-te,h2c,h2,cl-edge,cl-0,0-cl,parser-discrepancy,h2-downgrade).
+    /// h2-downgrade speaks real HTTP/2 (ALPN h2) to detect H2.CL/H2.TE and runs only on https targets.
+    /// cl-0 performs a same-connection response-queue probe and is opt-in because it is stateful.
+    /// 0-cl uses an Expect/body pause probe and is opt-in because it is stateful.
+    /// parser-discrepancy performs a focused control-vs-probe response comparison and is opt-in.
+    #[arg(help_heading = "DETECT", short = 'c', long = "checks")]
+    pub checks: Option<String>,
+
+    /// Exit quickly after finding the first vulnerability
+    #[arg(help_heading = "DETECT", short = '1', long = "exit-first", action = clap::ArgAction::SetTrue)]
+    pub exit_first: bool,
+
+    /// Enable proxy fingerprinting before scan
+    #[arg(help_heading = "DETECT", long = "fingerprint", action = clap::ArgAction::SetTrue)]
+    pub fingerprint: bool,
+
+    /// Enable mutation-based fuzzing
+    #[arg(help_heading = "DETECT", long = "fuzz", action = clap::ArgAction::SetTrue)]
+    pub fuzz: bool,
+
+    /// Mutation seed for reproducibility (default: 42)
+    #[arg(help_heading = "DETECT", long = "fuzz-seed", default_value_t = 42)]
+    pub fuzz_seed: u64,
+
+    /// Exploit types to run after detection (comma-separated:
+    /// localhost-access,path-fuzz,smuggle,capture,reveal)
+    #[arg(help_heading = "EXPLOIT", short = 'e', long = "exploit")]
+    pub exploit: Option<String>,
+
+    /// Reflecting endpoint for the `reveal` exploit (a page that echoes a form
+    /// field, e.g. a search box). Defaults to the scanned path.
+    #[arg(
+        help_heading = "EXPLOIT",
+        long = "reveal-endpoint",
+        value_name = "PATH"
+    )]
+    pub reveal_endpoint: Option<String>,
+
+    /// Form parameter the `reveal` endpoint reflects back in its response
+    #[arg(
+        help_heading = "EXPLOIT",
+        long = "reveal-param",
+        value_name = "NAME",
+        default_value = "q"
+    )]
+    pub reveal_param: String,
+
+    /// Inner request for the `smuggle`/`capture` exploits (raw request line +
+    /// headers; use \r\n for line breaks). For `smuggle` it defaults to a request
+    /// that makes the back-end process method GPOST; for `capture` it defaults to
+    /// `GET /admin` (whose smuggled response is then recovered).
+    #[arg(help_heading = "EXPLOIT", long = "smuggle-request")]
+    pub smuggle_request: Option<String>,
+
+    /// Ports to test for localhost access exploit (comma-separated)
+    #[arg(
+        help_heading = "EXPLOIT",
+        long = "exploit-ports",
+        default_value = "22,80,443,8080,3306"
+    )]
+    pub exploit_ports: String,
+
+    /// Wordlist file for path-fuzz exploit (one path per line)
+    #[arg(help_heading = "EXPLOIT", long = "exploit-wordlist")]
+    pub exploit_wordlist: Option<String>,
+
+    /// Print version information
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::SetTrue)]
+    pub version: bool,
+
+    /// Print help information
+    #[arg(short = 'h', long = "help", action = clap::ArgAction::SetTrue)]
+    pub help: bool,
+
+    /// Delay between requests in milliseconds (rate limiting)
+    #[arg(
+        help_heading = "REQUEST",
+        short = 'd',
+        long = "delay",
+        default_value_t = 0
+    )]
+    pub delay: u64,
+
+    /// Quiet mode (only show vulnerabilities)
+    #[arg(help_heading = "OUTPUT", short = 'q', long, action = clap::ArgAction::SetTrue)]
+    pub quiet: bool,
+
+    /// Disable colored output
+    #[arg(help_heading = "OUTPUT", long = "no-color", action = clap::ArgAction::SetTrue)]
+    pub no_color: bool,
+
+    /// Number of URLs to scan concurrently
+    #[arg(
+        help_heading = "REQUEST",
+        short = 'j',
+        long = "concurrency",
+        default_value_t = 1,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    pub concurrency: usize,
+
+    /// HTTP CONNECT proxy URL (http:// or https://). SOCKS is not supported.
+    #[arg(help_heading = "REQUEST", short = 'x', long = "proxy")]
+    pub proxy: Option<String>,
+
+    /// Maximum number of payloads to test per check type
+    #[arg(help_heading = "DETECT", long = "max-payloads", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub max_payloads: Option<usize>,
+
+    /// Number of baseline requests for timing measurement
+    #[arg(help_heading = "DETECT", long = "baseline-count", default_value_t = 3, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub baseline_count: usize,
+
+    /// Skip TLS certificate verification (allow self-signed certificates)
+    #[arg(help_heading = "TLS", short = 'k', long = "insecure", action = clap::ArgAction::SetTrue)]
+    pub insecure: bool,
+
+    /// Custom CA certificate file (PEM format) for self-signed/internal certificates
+    #[arg(help_heading = "TLS", long = "cacert", value_name = "FILE")]
+    pub cacert: Option<String>,
+}
+
+impl Cli {
+    /// Apply global settings like no-color mode
+    pub fn apply_global_settings(&self) {
+        if self.no_color {
+            control::set_override(false);
+        }
+        if self.quiet {
+            crate::utils::set_quiet(true);
+        }
+        if let Some(ref proxy) = self.proxy {
+            crate::http::set_proxy(proxy.clone());
+        }
+    }
+
+    /// Returns the effective output format, honoring both --format and the --json shorthand.
+    /// --json takes precedence for convenience in scripting/AI usage.
+    pub fn effective_format(&self) -> OutputFormat {
+        if self.json {
+            OutputFormat::Json
+        } else {
+            self.format.clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_check_names_flags_only_unrecognized() {
+        // A mix of valid and typo'd names returns just the unknown ones.
+        assert_eq!(
+            unknown_check_names("clte,cl-te,h2", &KNOWN_CHECK_NAMES),
+            vec!["clte".to_string()]
+        );
+        // All valid → empty.
+        assert!(unknown_check_names("cl-te, te-cl , h2-downgrade", &KNOWN_CHECK_NAMES).is_empty());
+        // Empty segments are ignored.
+        assert!(unknown_check_names("cl-te,,  ,h2", &KNOWN_CHECK_NAMES).is_empty());
+        // All invalid → every name reported.
+        assert_eq!(
+            unknown_check_names("clte,CL-TE,cl_te", &KNOWN_CHECK_NAMES),
+            vec!["clte".to_string(), "CL-TE".to_string(), "cl_te".to_string()]
+        );
+    }
+
+    #[test]
+    fn has_any_known_check_detects_all_typos() {
+        assert!(has_any_known_check("clte,cl-te", &KNOWN_CHECK_NAMES));
+        assert!(has_any_known_check("h2-downgrade", &KNOWN_CHECK_NAMES));
+        // A wholly typo'd selection must report no known check (the dangerous
+        // case: scanning nothing while reporting a clean target).
+        assert!(!has_any_known_check("clte", &KNOWN_CHECK_NAMES));
+        assert!(!has_any_known_check("CL-TE,cl_te", &KNOWN_CHECK_NAMES));
+        assert!(!has_any_known_check("  , ,", &KNOWN_CHECK_NAMES));
+    }
+
+    #[test]
+    fn exploit_selection_rejects_unknown_names() {
+        assert_eq!(
+            unknown_exploit_names("reveal, typo",),
+            vec!["typo".to_string()]
+        );
+        assert!(unknown_exploit_names("smuggle, capture").is_empty());
+        assert!(has_any_known_exploit("typo,reveal"));
+        assert!(!has_any_known_exploit("typo"));
+    }
+
+    #[test]
+    fn custom_headers_reject_injection_and_malformed_names() {
+        assert!(
+            validate_custom_headers(&[
+                "X-Trace: value".to_string(),
+                "Authorization: Bearer token".to_string(),
+            ])
+            .is_ok()
+        );
+        assert!(validate_custom_headers(&["missing-colon".to_string()]).is_err());
+        assert!(validate_custom_headers(&["Bad Name: value".to_string()]).is_err());
+        assert!(validate_custom_headers(&["X-Trace: value\r\nInjected: yes".to_string()]).is_err());
+    }
+
+    #[test]
+    fn help_is_parsed_for_main_to_render_in_the_selected_format() {
+        let cli = Cli::try_parse_from(["smugglex", "--help"]).unwrap();
+        assert!(cli.help);
+    }
+
+    #[test]
+    fn timeout_zero_is_rejected_at_parse_time() {
+        // `-t 0` makes every request elapse instantly; clap must reject it.
+        assert!(Cli::try_parse_from(["smugglex", "http://x", "-t", "0"]).is_err());
+        // A positive timeout still parses.
+        let cli = Cli::try_parse_from(["smugglex", "http://x", "-t", "5"]).unwrap();
+        assert_eq!(cli.timeout, 5);
+    }
+
+    #[test]
+    fn count_flags_reject_zero_at_parse_time() {
+        // `-j 0` silently degraded to sequential; `--baseline-count 0` and
+        // `--max-payloads 0` produced meaningless scans. All must be rejected.
+        assert!(Cli::try_parse_from(["smugglex", "http://x", "-j", "0"]).is_err());
+        assert!(Cli::try_parse_from(["smugglex", "http://x", "--baseline-count", "0"]).is_err());
+        assert!(Cli::try_parse_from(["smugglex", "http://x", "--max-payloads", "0"]).is_err());
+
+        // Positive values still parse.
+        let cli = Cli::try_parse_from([
+            "smugglex",
+            "http://x",
+            "-j",
+            "4",
+            "--baseline-count",
+            "2",
+            "--max-payloads",
+            "10",
+        ])
+        .unwrap();
+        assert_eq!(cli.concurrency, 4);
+        assert_eq!(cli.baseline_count, 2);
+        assert_eq!(cli.max_payloads, Some(10));
+    }
+}

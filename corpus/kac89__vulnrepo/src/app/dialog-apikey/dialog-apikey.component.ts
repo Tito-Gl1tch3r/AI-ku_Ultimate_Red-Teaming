@@ -1,0 +1,92 @@
+import { Component, OnInit, ChangeDetectionStrategy } from '@angular/core';
+import { MatDialogRef, MAT_DIALOG_DATA } from '@angular/material/dialog';
+import { Inject } from '@angular/core';
+import { IndexeddbService } from '../indexeddb.service';
+import { UntypedFormControl } from '@angular/forms';
+import { SessionstorageserviceService } from "../sessionstorageservice.service"
+
+@Component({
+  standalone: false,
+  //imports: [],
+  selector: 'app-dialog-apikey',
+  templateUrl: './dialog-apikey.component.html',
+  changeDetection: ChangeDetectionStrategy.Eager,
+  styleUrls: ['./dialog-apikey.component.scss']
+})
+export class DialogApikeyComponent implements OnInit {
+  hide = true;
+  alert = '';
+  removedialog = false;
+  insertkeypass = new UntypedFormControl();
+  // @ts-ignore
+  constructor(@Inject(MAT_DIALOG_DATA) public data, public dialogRef: MatDialogRef<DialogApikeyComponent>,
+    private indexeddbService: IndexeddbService, public sessionsub: SessionstorageserviceService) { }
+
+  ngOnInit(): void {
+    this.insertkeypass.setValue("");
+    if (this.sessionsub.getSessionStorageItem('hidedialog') === 'true') {
+      this.removedialog = true;
+    }
+
+  }
+
+  cancel(): void {
+    this.dialogRef.close();
+  }
+
+  onKeydown(event, keypass: string) {
+    if (event.key === 'Enter') {
+      this.decrypt(keypass);
+    }
+  }
+
+  decrypt(keypass) {
+
+    if (this.data === 'addtovault') {
+
+      this.indexeddbService.retrieveAPIkey().then(ret => {
+
+        if (ret) {
+          this.indexeddbService.decryptKEY(ret, keypass).then(ret2 => {
+            if (ret2) {
+              this.insertkeypass.setErrors(null);
+              this.dialogRef.close(keypass);
+            } else {
+              this.insertkeypass.setErrors({'incorrect': true});
+              
+            }
+          });
+
+        }
+      });
+
+    } else {
+      this.indexeddbService.decryptKEY(this.data, keypass).then(ret => {
+        if (ret) {
+          this.insertkeypass.setErrors(null);
+          this.dialogRef.close(ret);
+        } else {
+          this.insertkeypass.setErrors({'incorrect': true});
+        }
+      });
+    }
+
+  }
+
+  removedialogFunc(event) {
+    if (event.checked === true) {
+      this.sessionsub.setSessionStorageItem('hidedialog', 'true');
+      this.removedialog = true;
+
+      // nothing to unlock, user just wants to dismiss the vault for this session
+      const keypass = this.insertkeypass.value;
+      if (!keypass) {
+        this.dialogRef.close();
+      }
+    }
+    if (event.checked === false) {
+      this.sessionsub.removeSessionStorageItem('hidedialog');
+      this.removedialog = false;
+    }
+  }
+}

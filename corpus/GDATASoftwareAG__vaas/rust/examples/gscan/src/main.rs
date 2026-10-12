@@ -1,0 +1,122 @@
+use clap::{crate_authors, crate_description, crate_name, crate_version, Arg, ArgAction, Command};
+use reqwest::Url;
+use std::{collections::HashMap, path::PathBuf, str::FromStr};
+use vaas::options::{ForFileOptions, ForUrlOptions};
+use vaas::{
+    authentication::ClientCredentials, error::VResult, CancellationToken, Vaas, VaasVerdict,
+};
+
+#[tokio::main]
+async fn main() -> VResult<()> {
+    let matches = Command::new(crate_name!())
+        .version(crate_version!())
+        .author(crate_authors!())
+        .about(crate_description!())
+        .arg(
+            Arg::new("files")
+                .short('f')
+                .long("files")
+                .required_unless_present("urls")
+                .action(ArgAction::Append)
+                .help("List of files to scan separated by whitepace"),
+        )
+        .arg(
+            Arg::new("urls")
+                .short('u')
+                .long("urls")
+                .action(ArgAction::Append)
+                .required_unless_present("files")
+                .help("List of urls to scan separated by whitepace"),
+        )
+        .arg(
+            Arg::new("client_id")
+                .short('i')
+                .long("client_id")
+                .env("CLIENT_ID")
+                .action(ArgAction::Set)
+                .help("Set your vaas username"),
+        )
+        .arg(
+            Arg::new("client_secret")
+                .short('s')
+                .long("client_secret")
+                .env("CLIENT_SECRET")
+                .action(ArgAction::Set)
+                .help("Set your vaas password"),
+        )
+        .get_matches();
+
+    let files = matches
+        .get_many::<String>("files")
+        .unwrap_or_default()
+        .map(|f| PathBuf::from_str(f).unwrap_or_else(|_| panic!("Not a valid file path: {}", f)))
+        .collect::<Vec<PathBuf>>();
+
+    let urls = matches
+        .get_many::<String>("urls")
+        .unwrap_or_default()
+        .map(|f| Url::parse(f).unwrap_or_else(|_| panic!("Not a valid url: {}", f)))
+        .collect::<Vec<Url>>();
+
+    let client_id = matches
+        .get_one::<String>("client_id")
+        .expect("--client_id or the enviroment variable CLIENT_ID must be set");
+    let client_secret = matches
+        .get_one::<String>("client_secret")
+        .expect("--client_secret or the enviroment variable CLIENT_SECRET must be set");
+
+    let authenticator = ClientCredentials::try_new(client_id.to_owned(), client_secret.to_owned())?;
+    let vaas = Vaas::builder(authenticator).build()?;
+
+    let file_verdicts = scan_files(&files, &vaas).await?;
+    let url_verdicts = scan_urls(&urls, &vaas).await?;
+
+    file_verdicts
+        .iter()
+        .for_each(|(f, v)| print_verdicts(f.display().to_string(), v));
+
+    url_verdicts.iter().for_each(|(u, v)| print_verdicts(u, v));
+
+    Ok(())
+}
+
+fn print_verdicts<I: AsRef<str>>(i: I, v: &VResult<VaasVerdict>) {
+    print!("{} -> ", i.as_ref());
+    match v {
+        Ok(v) => {
+            println!("{}", v.verdict);
+        }
+        Err(e) => {
+            println!("{}", e);
+        }
+    };
+}
+
+async fn scan_files<'a>(
+    files: &'a [PathBuf],
+    vaas: &Vaas,
+) -> VResult<Vec<(&'a PathBuf, VResult<VaasVerdict>)>> {
+    let ct = CancellationToken::new();
+    let mut results = Vec::new();
+    for f in files {
+        let verdict = vaas.for_file(f, ForFileOptions::new(), &ct).await;
+        results.push(verdict);
+    }
+    let results = files.iter().zip(results).collect();
+
+    Ok(results)
+}
+
+async fn scan_urls(
+    urls: &[Url],
+    vaas: &Vaas,
+) -> VResult<HashMap<Url, Result<VaasVerdict, vaas::error::Error>>> {
+    let ct = CancellationToken::new();
+    let mut verdicts = HashMap::new();
+    for url in urls {
+        let verdict = vaas.for_url(url, ForUrlOptions::new(), &ct).await;
+        verdicts.insert(url.to_owned(), verdict);
+    }
+
+    Ok(verdicts)
+}

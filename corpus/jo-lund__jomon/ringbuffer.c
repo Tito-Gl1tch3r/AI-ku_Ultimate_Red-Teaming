@@ -1,0 +1,82 @@
+#include <stdlib.h>
+#include "ringbuffer.h"
+#include "jomon.h"
+
+typedef struct ringbuffer {
+    void **buf;
+    uint32_t head;
+    uint32_t tail;
+    uint32_t size;
+    uint32_t it;
+} ringbuffer_t;
+
+ringbuffer_t *ringbuffer_init(const int sz)
+{
+    ringbuffer_t *rb;
+
+    rb = xcalloc(1, sizeof(*rb));
+    rb->size = clp2(sz);
+    rb->buf = xcalloc(rb->size, sizeof(void*));
+    return rb;
+}
+
+void ringbuffer_free(ringbuffer_t *rb)
+{
+    free(rb->buf);
+    free(rb);
+}
+
+void ringbuffer_push(ringbuffer_t *rb, void *data)
+{
+    if (((rb->head + 1) & (rb->size - 1)) == rb->tail)
+        ringbuffer_pop(rb);
+    rb->buf[rb->head] = data;
+    rb->head = (rb->head + 1) & (rb->size - 1);
+}
+
+void *ringbuffer_pop(ringbuffer_t *rb)
+{
+    void *data;
+
+    data = NULL;
+    if (rb->head != rb->tail) {
+        data = rb->buf[rb->tail];
+        rb->tail = (rb->tail + 1) & (rb->size - 1);
+    }
+    return data;
+}
+
+int ringbuffer_size(ringbuffer_t *rb)
+{
+    return (rb->head - rb->tail) & (rb->size - 1);
+}
+
+int ringbuffer_available(ringbuffer_t *rb)
+{
+    /* an empty buffer has head == tail, so the buffer is at full capacity when
+       (head + 1) % size == tail */
+    return rb->size - 1 - ringbuffer_size(rb);
+}
+
+bool ringbuffer_empty(ringbuffer_t *rb)
+{
+    return rb->head == rb->tail;
+}
+
+const void *ringbuffer_first(ringbuffer_t *rb)
+{
+    if (ringbuffer_empty(rb))
+        return NULL;
+    rb->it = rb->tail;
+    return rb->buf[rb->tail];
+}
+
+const void *ringbuffer_next(ringbuffer_t *rb)
+{
+    if (ringbuffer_empty(rb))
+        return NULL;
+    if (((rb->it + 1) & (rb->size - 1)) == rb->head)
+        return NULL;
+    rb->it = (rb->it + 1) & (rb->size - 1);
+    return rb->buf[rb->it];
+}

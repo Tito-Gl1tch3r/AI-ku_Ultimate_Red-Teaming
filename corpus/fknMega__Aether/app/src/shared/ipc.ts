@@ -1,0 +1,143 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// IPC contract. Channel names live here so main and preload can't drift, and
+// `AetherApi` is the exact surface exposed to the renderer as `window.aether`.
+// ─────────────────────────────────────────────────────────────────────────────
+import type {
+  AetherSettings, AuthStatus, ChatRequest, Conversation, Message,
+  CaseGraph, GraphCaseInfo, AgentEvent, ModuleConfig, ModuleTestResult, ProviderStatus, Provider, UpdateStatus,
+  ToolStatus, InstallProgress, PermissionRequest, PermissionReply,
+} from "./types";
+
+export const IPC = {
+  settingsGet: "settings:get",
+  settingsSet: "settings:set",
+  authStatus: "auth:status",
+  authLogin: "auth:login",
+
+  updateGet: "update:get",
+  updateCheck: "update:check",
+  updateInstall: "update:install",
+
+  providerStatus: "provider:status",
+  providerSetKey: "provider:setKey",
+
+  permissionReply: "permission:reply",
+
+  toolsStatus: "tools:status",
+  toolInstall: "tools:install",
+  toolInstallAll: "tools:installAll",
+  toolCancel: "tools:cancel",
+
+  modulesList: "modules:list",
+  moduleSave: "modules:save",
+  moduleDelete: "modules:delete",
+  moduleToggle: "modules:toggle",
+  moduleTest: "modules:test",
+
+  conversationsList: "conversations:list",
+  conversationGet: "conversations:get",
+  conversationRename: "conversation:rename",
+  conversationDelete: "conversation:delete",
+  attachmentGet: "attachment:get",
+
+  graphCases: "graph:cases",
+  graphGet: "graph:get",
+  graphGetByName: "graph:getByName",
+  graphDelete: "graph:delete",
+
+  chatSend: "chat:send",
+  chatCancel: "chat:cancel",
+
+  // main -> renderer broadcasts
+  chatEvent: "chat:event",
+  graphChanged: "graph:changed",
+  conversationsChanged: "conversations:changed",
+  modulesChanged: "modules:changed",
+  installProgress: "tools:progress",
+  permissionRequest: "permission:request",
+  updateStatus: "update:status",
+} as const;
+
+export interface ConversationDetail {
+  conversation: Conversation;
+  messages: Message[];
+}
+
+export interface AttachmentPayload {
+  mimeType: string;
+  /** A ready-to-use `data:` URL for an <img src>. */
+  dataUrl: string;
+}
+
+/** Wrapper the renderer receives for every streamed agent event. */
+export interface ChatEventEnvelope {
+  turnId: string;
+  event: AgentEvent;
+}
+
+/** The typed bridge exposed on `window.aether`. */
+export interface AetherApi {
+  /** The host OS, so the renderer can adapt window chrome (win32/darwin/linux). */
+  platform: string;
+
+  getSettings(): Promise<AetherSettings>;
+  setSettings(patch: Partial<AetherSettings>): Promise<AetherSettings>;
+
+  authStatus(): Promise<AuthStatus>;
+  authLogin(): Promise<{ ok: boolean; message: string }>;
+
+  /** App auto-update. */
+  updateStatusGet(): Promise<UpdateStatus>;
+  checkForUpdate(): Promise<UpdateStatus>;
+  installUpdate(): Promise<void>;
+
+  /** Provider readiness: whether a key/sign-in is present, and any listable models. */
+  providerStatus(): Promise<ProviderStatus>;
+  /** Store (or clear, with "") an API key for a provider (OpenAI, Gemini). Never read back. */
+  setProviderKey(provider: Provider, key: string): Promise<ProviderStatus>;
+
+  /** Command-line tools the bundled modules wrap: what is installed, and what
+   *  it would take to install the rest. */
+  toolStatuses(): Promise<ToolStatus[]>;
+  /** Install one tool. Resolves when it finishes; progress streams separately. */
+  installTool(moduleId: string): Promise<boolean>;
+  /** Install everything missing, serially. */
+  installAllTools(): Promise<{ installed: number; failed: number; skipped: number }>;
+  /** Stop an in-flight install (or the whole run, with no argument). */
+  cancelInstall(moduleId?: string): Promise<void>;
+  onInstallProgress(cb: (p: InstallProgress) => void): () => void;
+
+  /** Aether wants to do something that needs a decision. Reply with answerPermission. */
+  onPermissionRequest(cb: (req: PermissionRequest) => void): () => void;
+  answerPermission(reply: PermissionReply): void;
+
+  /** Modules (secrets redacted — values never leave the main process). */
+  listModules(): Promise<ModuleConfig[]>;
+  saveModule(mod: ModuleConfig): Promise<ModuleConfig[]>;
+  deleteModule(id: string): Promise<ModuleConfig[]>;
+  toggleModule(id: string, enabled: boolean): Promise<ModuleConfig[]>;
+  /** Run a module draft once with a sample input — what the model would get.
+   *  Nothing is saved; secrets typed into the draft are used for this call only. */
+  testModule(mod: ModuleConfig, sample: string): Promise<ModuleTestResult>;
+
+  listConversations(): Promise<Conversation[]>;
+  getConversation(id: string): Promise<ConversationDetail | null>;
+  renameConversation(id: string, title: string): Promise<boolean>;
+  deleteConversation(id: string): Promise<boolean>;
+  getAttachment(id: string): Promise<AttachmentPayload | null>;
+
+  listGraphCases(): Promise<GraphCaseInfo[]>;
+  getGraph(caseId: string): Promise<CaseGraph | null>;
+  getGraphByName(name: string): Promise<CaseGraph | null>;
+  deleteGraph(caseId: string): Promise<boolean>;
+
+  sendChat(req: ChatRequest): Promise<{ conversationId: string }>;
+  cancelChat(turnId: string): Promise<void>;
+
+  // subscriptions — each returns an unsubscribe fn
+  onChatEvent(cb: (env: ChatEventEnvelope) => void): () => void;
+  onGraphChanged(cb: (payload: { caseName: string }) => void): () => void;
+  onConversationsChanged(cb: () => void): () => void;
+  onModulesChanged(cb: () => void): () => void;
+  onUpdateStatus(cb: (s: UpdateStatus) => void): () => void;
+}

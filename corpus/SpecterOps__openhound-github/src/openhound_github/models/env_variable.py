@@ -1,0 +1,121 @@
+from dataclasses import dataclass
+from datetime import datetime
+
+from openhound.core.asset import BaseAsset, EdgeDef, NodeDef
+from openhound.core.models.entries_dataclass import Edge, EdgePath, EdgeProperties
+
+from openhound_github.graph import (
+    GHNode,
+    GHNodeProperties,
+)
+from openhound_github.kinds import edges as ek
+from openhound_github.kinds import nodes as nk
+from openhound_github.main import app
+
+
+@dataclass
+class GHEnvVariableProperties(GHNodeProperties):
+    """Properties for GHEnvVariableProperties.
+
+    Attributes:
+        environment_name: The name of the environment (GitHub organization).
+        deployment_environment_name: The name of the deployment environment (GitHub organization).
+        value: The plaintext value of the variable.
+        created_at: When the variable was created.
+        updated_at: When the variable was last updated.
+        repository_name: The name of the containing repository.
+        repository_id: The id of the containing repository.
+    """
+
+    environment_name: str
+    deployment_environment_name: str
+    value: str
+    created_at: datetime | None
+    updated_at: datetime | None
+    repository_name: str
+    repository_id: str
+    deployment_environmentid: str | None = None
+
+
+@app.asset(
+    node=NodeDef(
+        kind=nk.ENVIRONMENT_VARIABLE,
+        description="GitHub Environment Variable",
+        icon="lock-open",
+        properties=GHEnvVariableProperties,
+    ),
+    edges=[
+        EdgeDef(
+            start=nk.ENVIRONMENT,
+            end=nk.ENVIRONMENT_VARIABLE,
+            kind=ek.CONTAINS,
+            description="Environment contains variable",
+            traversable=False,
+        ),
+        EdgeDef(
+            start=nk.ENVIRONMENT,
+            end=nk.ENVIRONMENT_VARIABLE,
+            kind=ek.HAS_VARIABLE,
+            description="Environment has variable",
+            traversable=True,
+        ),
+    ],
+)
+class EnvironmentVariable(BaseAsset):
+    """One record from `environment_variables` → one GH_EnvironmentVariable node + GH_Contains edge from env."""
+
+    name: str
+    value: str
+    created_at: datetime
+    updated_at: datetime | None = None
+
+    # Additional
+    org_login: str
+    environment_node_id: str
+    environment_name: str
+    repository_name: str
+    repository_node_id: str
+
+    @property
+    def org_node_id(self) -> str | None:
+        return self._lookup.org_id_for_login(self.org_login)
+
+    @property
+    def node_id(self) -> str:
+        return f"GH_EnvironmentVariable_{self.environment_node_id}_{self.name}"
+
+    @property
+    def as_node(self) -> GHNode:
+        vid = self.node_id
+        return GHNode(
+            kinds=[nk.ENVIRONMENT_VARIABLE, nk.VARIABLE],
+            properties=GHEnvVariableProperties(
+                name=self.name,
+                displayname=self.name,
+                node_id=vid,
+                deployment_environment_name=self.environment_name,
+                environment_name=self.org_login,
+                repository_name=self.repository_name,
+                repository_id=self.repository_node_id,
+                environmentid=self.org_node_id,
+                deployment_environmentid=self.environment_node_id,
+                updated_at=self.updated_at,
+                created_at=self.created_at,
+                value=self.value,
+            ),
+        )
+
+    @property
+    def edges(self):
+        yield Edge(
+            kind=ek.CONTAINS,
+            start=EdgePath(value=self.environment_node_id, match_by="id"),
+            end=EdgePath(value=self.node_id, match_by="id"),
+            properties=EdgeProperties(traversable=False),
+        )
+        yield Edge(
+            kind=ek.HAS_VARIABLE,
+            start=EdgePath(value=self.environment_node_id, match_by="id"),
+            end=EdgePath(value=self.node_id, match_by="id"),
+            properties=EdgeProperties(traversable=True),
+        )

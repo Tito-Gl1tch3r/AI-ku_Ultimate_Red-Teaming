@@ -1,0 +1,684 @@
+# frozen_string_literal: true
+
+require "test_helper"
+
+class ApiV2PushesTest < ActionDispatch::IntegrationTest
+  def bearer_headers(user)
+    {"Authorization" => "Bearer #{user.authentication_token}"}
+  end
+
+  teardown do
+    Settings.reload!
+    Rails.application.reload_routes!
+  end
+
+  def test_help_api_page_is_available
+    get "/help/api"
+    assert_response :success
+  end
+
+  def test_help_api_page_documents_notify_emails_endpoint
+    get "/help/api"
+
+    assert_response :success
+    assert_includes response.body, "POST /api/v2/pushes/:url_token/notify_emails"
+    assert_includes response.body, "Authentication and ownership are required"
+    assert_includes response.body, "route is not registered and requests return 404 Not Found"
+    assert_includes response.body, "Recipient(s) are added to the queue to be sent."
+    assert_includes response.body, '"notify_emails_to": ["are not available"]'
+    assert_includes response.body, "Too many requests (notify_emails or generate)"
+  end
+
+  def test_legacy_api_v1_docs_are_redirected
+    get "/api"
+    assert_response :redirect
+  end
+
+  def test_versioned_requests_and_accounts_endpoints_are_not_exposed
+    get "/api/v2/requests"
+    assert_response :not_found
+
+    get "/api/v2/accounts"
+    assert_response :not_found
+  end
+
+  def test_create_push_with_v2_payload
+    assert_difference("Push.count", 1) do
+      post "/api/v2/pushes",
+        params: {
+          push: {
+            payload: "api-v2-secret",
+            expire_after_days: 1,
+            expire_after_views: 3
+          }
+        },
+        as: :json
+    end
+
+    assert_response :created
+    body = JSON.parse(response.body)
+    assert body["url_token"].present?
+  end
+
+  def test_unknown_kind_is_rejected
+    assert_no_difference("Push.count") do
+      post "/api/v2/pushes",
+        params: {
+          push: {
+            kind: "not-a-kind",
+            payload: "secret"
+          }
+        },
+        as: :json
+    end
+
+    assert_response :unprocessable_content
+    body = JSON.parse(response.body)
+    assert body["kind"].present?
+  end
+
+  def test_show_push_is_public_when_token_is_valid
+    push = pushes(:test_push)
+
+    get "/api/v2/pushes/#{push.url_token}", as: :json
+
+    assert_response :success
+  end
+
+  def test_show_rejects_invalid_token_header_even_for_public_endpoint
+    push = pushes(:test_push)
+
+    get "/api/v2/pushes/#{push.url_token}",
+      headers: {"Authorization" => "Bearer invalid-token"},
+      as: :json
+
+    assert_response :unauthorized
+  end
+
+  def test_preview_rejects_invalid_token_header_even_for_public_endpoint
+    push = pushes(:test_push)
+
+    get "/api/v2/pushes/#{push.url_token}/preview",
+      headers: {"Authorization" => "Bearer invalid-token"},
+      as: :json
+
+    assert_response :unauthorized
+  end
+
+  def test_show_requires_passphrase_when_set
+    push = pushes(:test_push)
+    push.update!(passphrase: "super-secret")
+
+    get "/api/v2/pushes/#{push.url_token}", as: :json
+
+    assert_response :unauthorized
+  end
+
+  def test_show_rejects_wrong_passphrase
+    push = pushes(:test_push)
+    push.update!(passphrase: "super-secret")
+
+    get "/api/v2/pushes/#{push.url_token}",
+      params: {passphrase: "wrong-passphrase"},
+      as: :json
+
+    assert_response :unauthorized
+  end
+
+  def test_show_accepts_valid_passphrase
+    push = pushes(:test_push)
+    push.update!(passphrase: "super-secret")
+
+    get "/api/v2/pushes/#{push.url_token}",
+      params: {passphrase: "super-secret"},
+      as: :json
+
+    assert_response :success
+  end
+
+  def test_show_passphrase_is_rate_limited_after_five_attempts_per_push
+    push = pushes(:test_push)
+    push.update!(passphrase: "super-secret")
+
+    5.times do
+      get "/api/v2/pushes/#{push.url_token}",
+        params: {passphrase: "wrong-passphrase"},
+        as: :json
+
+      assert_response :unauthorized
+    end
+
+    get "/api/v2/pushes/#{push.url_token}",
+      params: {passphrase: "wrong-passphrase"},
+      as: :json
+
+    assert_response :too_many_requests
+    body = response.parsed_body
+    assert_match(/Too many passphrase attempts/, body["error"])
+  end
+
+  def test_active_requires_authentication
+    get "/api/v2/pushes/active", as: :json
+    assert_response :unauthorized
+  end
+
+  def test_expired_requires_authentication
+    get "/api/v2/pushes/expired", as: :json
+    assert_response :unauthorized
+  end
+
+  def test_audit_requires_authentication
+    push = pushes(:test_push)
+
+    get "/api/v2/pushes/#{push.url_token}/audit", as: :json
+    assert_response :unauthorized
+  end
+
+  def test_audit_forbidden_for_authenticated_non_owner
+    push = pushes(:test_push)
+    user = users(:one)
+
+    get "/api/v2/pushes/#{push.url_token}/audit",
+      headers: bearer_headers(user),
+      as: :json
+
+    assert_response :forbidden
+  end
+
+  def test_audit_allowed_for_authenticated_owner
+    push = pushes(:test_push)
+    owner = users(:giuliana)
+
+    get "/api/v2/pushes/#{push.url_token}/audit",
+      headers: bearer_headers(owner),
+      as: :json
+
+    assert_response :success
+  end
+
+  def test_audit_includes_notify_by_email_details
+    push = pushes(:test_push)
+    owner = users(:giuliana)
+
+    get "/api/v2/pushes/#{push.url_token}/audit",
+      headers: bearer_headers(owner),
+      as: :json
+
+    body = JSON.parse(response.body)
+    log = body["logs"].select { |view| view["kind"] == "creation_email_send" }.first
+
+    assert_equal "en", log["notify_by_email"]["locale"]
+    assert_equal "one@example.com", log["notify_by_email"]["recipients"]
+    assert_equal "pending", log["notify_by_email"]["status"]
+    assert_nil log["notify_by_email"]["successful_sends"]
+    assert_nil log["notify_by_email"]["proceed_at"]
+  end
+
+  def test_audit_includes_notify_by_email_details_for_completed_notify_by_email
+    push = pushes(:test_push)
+    notify_by_email = notify_by_emails(:one)
+    owner = users(:giuliana)
+
+    Settings.stub(:notify_by_email_available?, true) do
+      travel_to Time.zone.local(2026, 1, 1, 1, 0, 0) do
+        SendNotifyByEmailJob.perform_now(notify_by_email.id)
+      end
+    end
+
+    get "/api/v2/pushes/#{push.url_token}/audit",
+      headers: bearer_headers(owner),
+      as: :json
+
+    body = JSON.parse(response.body)
+    log = body["logs"].find { |log| log["kind"] == "creation_email_send" }
+
+    assert_equal "one@example.com", log["notify_by_email"]["recipients"]
+    assert_equal "en", log["notify_by_email"]["locale"]
+    assert_equal "completed", log["notify_by_email"]["status"]
+    assert_equal "one@example.com", log["notify_by_email"]["successful_sends"]
+    assert_equal "2026-01-01T01:00:00.000Z", log["notify_by_email"]["proceed_at"]
+  end
+
+  def test_active_allows_authenticated_access
+    user = users(:one)
+
+    get "/api/v2/pushes/active",
+      headers: {
+        "Authorization" => "Bearer #{user.authentication_token}"
+      },
+      as: :json
+
+    assert_response :success
+  end
+
+  def test_destroy_forbidden_for_authenticated_non_owner_when_not_deletable_by_viewer
+    push = pushes(:test_push)
+    push.update!(deletable_by_viewer: false)
+    user = users(:one)
+
+    delete "/api/v2/pushes/#{push.url_token}",
+      headers: bearer_headers(user),
+      as: :json
+
+    assert_response :unauthorized
+  end
+
+  def test_destroy_allowed_for_authenticated_owner
+    push = pushes(:test_push)
+    owner = users(:giuliana)
+
+    delete "/api/v2/pushes/#{push.url_token}",
+      headers: bearer_headers(owner),
+      as: :json
+
+    assert_response :success
+    assert push.reload.expired?
+  end
+
+  def test_destroy_allowed_for_anonymous_viewer_when_deletable_by_viewer
+    push = pushes(:test_push)
+    push.update!(deletable_by_viewer: true)
+
+    delete "/api/v2/pushes/#{push.url_token}", as: :json
+
+    assert_response :success
+    assert push.reload.expired?
+  end
+
+  def test_destroy_forbidden_for_anonymous_push_when_not_deletable_by_viewer
+    post "/api/v2/pushes",
+      params: {
+        push: {
+          payload: "anonymous-secret",
+          deletable_by_viewer: false
+        }
+      },
+      as: :json
+    assert_response :created
+
+    token = JSON.parse(@response.body)["url_token"]
+    push = Push.find_by!(url_token: token)
+    assert_nil push.user_id
+    assert_equal false, push.deletable_by_viewer
+
+    delete "/api/v2/pushes/#{token}", as: :json
+    assert_response :unauthorized
+    assert_not push.reload.expired?
+  end
+
+  def test_create_requires_auth_when_allow_anonymous_disabled
+    Settings.allow_anonymous = false
+
+    post "/api/v2/pushes",
+      params: {
+        push: {
+          payload: "blocked-anon-create"
+        }
+      },
+      as: :json
+
+    assert_includes [401, 302], response.status
+  end
+
+  def test_create_with_missing_payload_returns_json_validation_error_without_accept_header
+    post "/api/v2/pushes",
+      params: {
+        push: {
+          expire_after_days: 1,
+          expire_after_views: 5
+        }
+      }.to_json,
+      headers: {"Content-Type" => "application/json"}
+
+    assert_response :unprocessable_content
+    assert_equal "application/json; charset=utf-8", response.content_type
+    body = JSON.parse(response.body)
+    assert body.key?("payload")
+  end
+
+  def test_create_file_upload_requires_authentication_even_when_allow_anonymous_enabled
+    Settings.allow_anonymous = true
+    Settings.enable_file_pushes = true
+    Rails.application.reload_routes!
+
+    post "/api/v2/pushes",
+      params: {
+        push: {
+          payload: "v2-file-push-without-auth",
+          files: [fixture_file_upload("monkey.png", "image/jpeg")]
+        }
+      }
+
+    assert_response :unauthorized
+  end
+
+  def test_create_file_upload_allows_authenticated_user_when_allow_anonymous_enabled
+    Settings.allow_anonymous = true
+    Settings.enable_file_pushes = true
+    Rails.application.reload_routes!
+    user = users(:luca)
+
+    post "/api/v2/pushes",
+      params: {
+        push: {
+          payload: "v2-file-push-with-auth",
+          files: [fixture_file_upload("monkey.png", "image/jpeg")]
+        }
+      },
+      headers: bearer_headers(user)
+
+    assert_response :created
+    body = JSON.parse(response.body)
+    assert body["url_token"].present?
+  end
+
+  def test_create_with_empty_files_key_requires_authentication_even_when_allow_anonymous_enabled
+    Settings.allow_anonymous = true
+    Settings.enable_file_pushes = true
+    Rails.application.reload_routes!
+
+    post "/api/v2/pushes",
+      params: {
+        push: {
+          payload: "v2-file-key-empty-without-auth",
+          files: []
+        }
+      },
+      as: :json
+
+    assert_response :unauthorized
+  end
+
+  def test_create_with_valid_payload_returns_json_created_without_accept_header
+    assert_difference("Push.count", 1) do
+      post "/api/v2/pushes",
+        params: {
+          push: {
+            payload: "valid-secret-without-accept",
+            expire_after_days: 1,
+            expire_after_views: 5
+          }
+        }.to_json,
+        headers: {"Content-Type" => "application/json"}
+    end
+
+    assert_response :created
+    assert_equal "application/json; charset=utf-8", response.content_type
+    body = JSON.parse(response.body)
+    assert body["url_token"].present?
+  end
+
+  def test_create_with_null_payload_returns_json_validation_error_without_accept_header
+    post "/api/v2/pushes",
+      params: {
+        push: {
+          payload: nil,
+          expire_after_days: 1,
+          expire_after_views: 5
+        }
+      }.to_json,
+      headers: {"Content-Type" => "application/json"}
+
+    assert_response :unprocessable_content
+    assert_equal "application/json; charset=utf-8", response.content_type
+    body = JSON.parse(response.body)
+    assert body.key?("payload")
+  end
+
+  def test_create_with_missing_push_param_returns_json_bad_request_without_accept_header
+    post "/api/v2/pushes",
+      params: {}.to_json,
+      headers: {"Content-Type" => "application/json"}
+
+    assert_response :bad_request
+    assert_equal "application/json; charset=utf-8", response.content_type
+    body = JSON.parse(response.body)
+    assert body["error"].present?
+  end
+
+  def test_create_with_notify_by_email_params_adds_a_job_to_the_queue
+    Settings.mail.smtp_address = "smtp.example.com"
+    user = users(:one)
+
+    send_email_job = assert_enqueued_with(job: SendNotifyByEmailJob) do
+      post "/api/v2/pushes",
+        params: {
+          push: {
+            payload: "some-secret",
+            notify_emails_to: "recipient@example.com",
+            notify_emails_to_locale: "en"
+          }
+        },
+        headers: bearer_headers(user),
+        as: :json
+
+      assert_response :success
+    end
+
+    notify_by_email_id = send_email_job.arguments.first
+    notify_by_email = NotifyByEmail.find(notify_by_email_id)
+
+    assert_equal "recipient@example.com", notify_by_email.recipients
+    assert_equal "en", notify_by_email.locale
+
+    body = JSON.parse(response.body)
+    assert_equal "recipient@example.com", body["notify_emails_to"]
+    assert_equal "en", body["notify_emails_to_locale"]
+  end
+
+  def test_create_with_notify_by_email_params_fails_when_feature_is_disabled
+    Settings.mail.smtp_address = "smtp.example.com"
+    Settings.notify_by_email.enabled = false
+    user = users(:one)
+
+    post "/api/v2/pushes",
+      params: {
+        push: {
+          payload: "some-secret",
+          notify_emails_to: "recipient@example.com",
+          notify_emails_to_locale: "en"
+        }
+      },
+      headers: bearer_headers(user),
+      as: :json
+
+    assert_response :unprocessable_entity
+    body = JSON.parse(response.body)
+    assert_equal "are not available", body["notify_emails_to"][0]
+    assert_equal "is not available", body["notify_emails_to_locale"][0]
+  end
+
+  def test_create_with_notify_by_email_params_fails_when_email_service_is_not_configured
+    user = users(:one)
+
+    post "/api/v2/pushes",
+      params: {
+        push: {
+          payload: "some-secret",
+          notify_emails_to: "recipient@example.com",
+          notify_emails_to_locale: "en"
+        }
+      },
+      headers: bearer_headers(user),
+      as: :json
+
+    assert_response :unprocessable_entity
+    body = JSON.parse(response.body)
+    assert_equal "are not available", body["notify_emails_to"][0]
+    assert_equal "is not available", body["notify_emails_to_locale"][0]
+  end
+
+  def test_create_with_notify_by_email_params_fails_when_user_is_not_signed_in
+    Settings.mail.smtp_address = "smtp.example.com"
+
+    post "/api/v2/pushes",
+      params: {
+        push: {
+          payload: "some-secret",
+          notify_emails_to: "recipient@example.com",
+          notify_emails_to_locale: "en"
+        }
+      },
+      as: :json
+
+    assert_response :unprocessable_entity
+    body = JSON.parse(response.body)
+    assert_equal "are not allowed for unknown users", body["notify_emails_to"][0]
+    assert_equal "is not allowed for unknown users", body["notify_emails_to_locale"][0]
+  end
+
+  def test_notify_emails_with_valid_params_returns_json_created
+    Settings.mail.smtp_address = "smtp.example.com"
+    push = pushes(:test_push)
+    owner = push.user
+
+    send_email_job = assert_enqueued_with(job: SendNotifyByEmailJob) do
+      post "/api/v2/pushes/#{push.url_token}/notify_emails",
+        params: {
+          notify_emails_to: "recipient@example.com",
+          notify_emails_to_locale: "en"
+        },
+        headers: bearer_headers(owner),
+        as: :json
+
+      assert_response :success
+      assert_equal "Recipient(s) are added to the queue to be sent.", JSON.parse(response.body)["message"]
+    end
+
+    notify_by_email_id = send_email_job.arguments.first
+    notify_by_email = NotifyByEmail.find(notify_by_email_id)
+
+    assert_equal "recipient@example.com", notify_by_email.recipients
+    assert_equal "en", notify_by_email.locale
+    assert_equal push, notify_by_email.push
+  end
+
+  def test_notify_emails_returns_not_found_when_feature_is_disabled
+    Settings.mail.smtp_address = "smtp.example.com"
+    Settings.notify_by_email.enabled = false
+    Rails.application.reload_routes!
+    push = pushes(:test_push)
+    owner = push.user
+
+    post "/api/v2/pushes/#{push.url_token}/notify_emails",
+      params: {
+        notify_emails_to: "recipient@example.com",
+        notify_emails_to_locale: "en"
+      },
+      headers: bearer_headers(owner),
+      as: :json
+
+    assert_response :not_found
+  end
+
+  def test_notify_emails_with_valid_params_returns_error_when_email_service_is_not_configured
+    push = pushes(:test_push)
+    owner = push.user
+
+    post "/api/v2/pushes/#{push.url_token}/notify_emails",
+      params: {
+        notify_emails_to: "recipient@example.com",
+        notify_emails_to_locale: "en"
+      },
+      headers: bearer_headers(owner),
+      as: :json
+
+    assert_response :unprocessable_entity
+
+    body = JSON.parse(response.body)
+    assert_equal "are not available", body["notify_emails_to"][0]
+    assert_equal "is not available", body["notify_emails_to_locale"][0]
+  end
+
+  def test_notify_emails_requires_authentication
+    push = pushes(:test_push)
+
+    post "/api/v2/pushes/#{push.url_token}/notify_emails",
+      params: {
+        notify_emails_to: "recipient@example.com",
+        notify_emails_to_locale: "en"
+      },
+      as: :json
+
+    assert_response :unauthorized
+  end
+
+  def test_notify_emails_forbidden_for_non_owner
+    push = pushes(:test_push)
+    non_owner = users(:one)
+
+    post "/api/v2/pushes/#{push.url_token}/notify_emails",
+      params: {
+        notify_emails_to: "recipient@example.com",
+        notify_emails_to_locale: "en"
+      },
+      headers: bearer_headers(non_owner),
+      as: :json
+
+    assert_response :forbidden
+  end
+
+  def test_notify_emails_is_rate_limited_after_five_bursts_per_user
+    Rails.cache.clear
+    Settings.mail.smtp_address = "smtp.example.com"
+    push = pushes(:test_push)
+    owner = push.user
+
+    5.times do |i|
+      post "/api/v2/pushes/#{push.url_token}/notify_emails",
+        params: {notify_emails_to: "recipient#{i}@example.com", notify_emails_to_locale: "en"},
+        headers: bearer_headers(owner),
+        as: :json
+    end
+
+    post "/api/v2/pushes/#{push.url_token}/notify_emails",
+      params: {notify_emails_to: "recipient5@example.com", notify_emails_to_locale: "en"},
+      headers: bearer_headers(owner),
+      as: :json
+
+    assert_response :too_many_requests
+    body = JSON.parse(response.body)
+    assert_match(/Too many email notification requests/, body["error"])
+  end
+
+  def test_active_pagination_headers
+    luca = users(:luca)
+
+    60.times do |i|
+      post "/api/v2/pushes",
+        params: {push: {payload: "api-v2-page-#{i}"}},
+        headers: bearer_headers(luca),
+        as: :json
+      assert_response :created
+    end
+
+    get "/api/v2/pushes/active", headers: bearer_headers(luca), as: :json
+    assert_response :success
+
+    res = JSON.parse(response.body)
+    assert_equal 50, res.count
+    assert_equal "1", response.headers["X-Page"]
+    assert_equal "50", response.headers["X-Per-Page"]
+    assert response.headers["X-Total"].to_i >= 60
+    assert_equal (response.headers["X-Total"].to_i.to_f / 50).ceil.to_s, response.headers["X-Total-Pages"]
+    assert_includes response.headers["Link"], 'rel="next"'
+    assert_includes response.headers["Link"], 'rel="first"'
+    assert_includes response.headers["Link"], 'rel="last"'
+    assert_not_includes response.headers["Link"], 'rel="prev"'
+
+    get "/api/v2/pushes/active?page=2", headers: bearer_headers(luca), as: :json
+    assert_response :success
+    assert_equal "2", response.headers["X-Page"]
+    assert_includes response.headers["Link"], 'rel="prev"'
+  end
+
+  def test_active_pagination_invalid_page_omits_headers
+    luca = users(:luca)
+
+    get "/api/v2/pushes/active?page=invalid", headers: bearer_headers(luca), as: :json
+    assert_response :bad_request
+    assert_nil response.headers["X-Page"]
+    assert_nil response.headers["X-Total"]
+    assert_nil response.headers["Link"]
+  end
+end

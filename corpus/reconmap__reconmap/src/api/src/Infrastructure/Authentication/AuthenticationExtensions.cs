@@ -1,0 +1,57 @@
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
+
+namespace api_v2.Infrastructure.Authentication;
+
+public class KeycloakOptions
+{
+    public string ClientId { get; set; } = string.Empty;
+    public string ClientSecret { get; set; } = string.Empty;
+    public string KeycloakUrl { get; set; } = string.Empty;
+    public string Realm { get; set; } = string.Empty;
+}
+
+public static class AuthenticationExtensions
+{
+    public static IServiceCollection AddReconmapAuthentication(this IServiceCollection services, IConfiguration config,
+    IHostEnvironment environment)
+    {
+        services.Configure<KeycloakOptions>(
+            config.GetSection("Keycloak"));
+
+        services
+            .AddAuthentication(options =>
+            {
+                options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+                options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+            })
+            .AddJwtBearer(options =>
+            {
+                options.RequireHttpsMetadata = !environment.IsDevelopment(); ;
+                options.Audience = config["Keycloak:Audience"];
+                options.MetadataAddress = config["Keycloak:MetadataAddress"];
+                options.TokenValidationParameters = new TokenValidationParameters
+                {
+                    ValidIssuer = config["Keycloak:ValidIssuer"],
+                    ValidateIssuerSigningKey = true
+                };
+                options.Events = new JwtBearerEvents
+                {
+                    OnMessageReceived = context =>
+                    {
+                        var accessToken = context.Request.Query["access_token"];
+                        var path = context.HttpContext.Request.Path;
+                        if (!string.IsNullOrEmpty(accessToken) &&
+                            path.StartsWithSegments("/api/notifications/stream"))
+                        {
+                            context.Token = accessToken;
+                        }
+                        return Task.CompletedTask;
+                    }
+                };
+            })
+            .AddScheme<ApiTokenOptions, ApiTokenHandler>("ApiToken", _ => { });
+
+        return services;
+    }
+}

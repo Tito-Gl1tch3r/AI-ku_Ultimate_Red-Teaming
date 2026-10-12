@@ -1,0 +1,504 @@
+# frozen_string_literal: true
+
+class Api::V1::PushesController < Api::BaseController
+  include SetPushAttributes
+  include LogEvents
+  include Pwpush::AssignNotifiableByEmailFields
+
+  before_action :set_push, only: %i[show preview audit destroy]
+
+  rate_limit to: 5, within: 1.minute, only: :show,
+    if: -> { params[:passphrase].present? },
+    by: -> { params[:id] },
+    scope: :passphrase_attempts, name: "per-push",
+    with: -> { render json: {error: I18n._("Too many passphrase attempts. Please try again in a minute.")}, status: :too_many_requests }
+
+  resource_description do
+    name "Pushes"
+    short "Interact directly with pushes."
+  end
+
+  api :GET, "/p/:url_token.json", "Retrieve a push."
+  param :url_token, String, desc: "Secret URL token of a previously created push.", required: true
+  formats ["JSON"]
+  description <<-EOS
+    == Retrieving a Push
+
+    Retrieves a push and its payload. If the push is active, this request will count as a view and be logged in the audit log.
+
+    === Security Features
+
+    * Passphrase protection - Requires a passphrase to view.
+
+      Provide the passphrase as a GET parameter: ?passphrase=xxx
+
+    == Language Specific Examples
+
+    For language-specific examples and detailed API documentation, see:
+    https://docs.pwpush.com/docs/json-api/
+  EOS
+  def show
+    # Expire pushes that are already past days/views so passphrase-protected
+    # exhausted pushes still skip the passphrase gate (legacy behavior).
+    @push.check_limits
+
+    # Passphrase gate before any payload access or view claim
+    if @push.passphrase.present? && !@push.expired?
+      # JSON requests must pass the passphrase in the params
+      has_passphrase = ActiveSupport::SecurityUtils.secure_compare(@push.passphrase.to_s, params[:passphrase].to_s)
+
+      unless has_passphrase
+        log_failed_passphrase(@push)
+
+        render json: {
+          error: "That passphrase is incorrect.",
+          message: "This push requires a passphrase. Please provide it using the 'passphrase' parameter (e.g. ?passphrase=mysecret)",
+          status: :unauthorized
+        }, status: :unauthorized
+        return
+      end
+    end
+
+    result = @push.claim_view!(
+      viewer: user_signed_in? ? current_user : nil,
+      admin: user_signed_in? && current_user.admin?,
+      ip: request.remote_ip,
+      user_agent: request.env["HTTP_USER_AGENT"],
+      referrer: request.env["HTTP_REFERER"]
+    )
+
+    expires_now
+    render template: "pushes/show", status: :ok
+
+    # Expire after response so the last successful view still reports
+    # expired=false with payload (legacy API shape). View was logged under lock.
+    @push.expire! if result.expire_after_response
+  end
+
+  api :POST, "/p.json", "Create a new push."
+  param :password, Hash, "Push details", required: true do
+    param :payload, String, desc: "The URL encoded password or secret text to share.", required: true
+    param :files, Array, desc: "File(s) to upload and attach to the push."
+    param :passphrase, String, desc: "Require recipients to enter this passphrase to view the created push."
+    param :name, String, desc: "A name shown in the dashboard, notifications and emails.", allow_blank: true
+    param :note, String, desc: "If authenticated, the URL encoded note for this push.  Visible only to the push creator.", allow_blank: true
+    param :expire_after_days, Integer, desc: "Expire secret link and delete after this many days."
+    param :expire_after_views, Integer, desc: "Expire secret link and delete after this many views."
+    param :deletable_by_viewer, %w[true false], desc: "Allow users to delete passwords once retrieved."
+    param :retrieval_step, %w[true false], desc: "Helps to avoid chat systems and URL scanners from eating up views."
+    param :kind, %w[text file url qr], desc: "The kind of push to create. Defaults to 'text'.", required: false
+  end
+  formats ["JSON"]
+  description <<-EOS
+    == Creating a New Push
+
+    Creates a new push (secret URL) containing the provided payload. The payload can be:
+
+    * Text/password (default)
+    * File attachments (requires authentication & subscription)
+    * URLs
+    * QR codes
+
+    === Required Parameters
+
+    The push must be created with a payload parameter containing the secret content.
+    All other parameters are optional and will use system defaults if not specified.
+
+    === Expiration Settings
+
+    Pushes can be configured to expire after:
+
+    * A number of views (expire_after_views)
+    * A number of days (expire_after_days)
+    * Both views and days (first trigger wins)
+
+    === Security Options
+
+    * Passphrase protection requires viewers to enter a secret phrase
+    * Retrieval step helps prevent automated URL scanners from burning views
+    * Deletable by viewer allows recipients to manually expire the push
+
+    == Language Specific Examples
+
+    See language specific examples in the docs: https://docs.pwpush.com/docs/json-api/
+
+    == Example Request
+
+      curl -X POST \\
+        -H "X-User-Email: user@example.com" \\
+        -H "X-User-Token: MyAPIToken" \\
+        -H "Content-Type: application/json" \\
+        -d '{"password": {"payload": "secret_text"}}' \\
+        https://pwpush.com/p.json
+
+    == Example Response
+
+      {
+        "url_token": "fkwjfvhall92",
+        "html_url": "https://pwpush.com/p/fkwjfvhall92",
+        "json_url": "https://pwpush.com/p/fkwjfvhall92.json",
+        "created_at": "2023-10-20T15:32:01Z",
+        "expires_at": "2023-10-20T15:32:01Z",
+        "views_remaining": 10,
+        "views_total": 10,
+        "files": [],
+        "passphrase": null,
+        "name": null,
+        "note": null,
+        "expire_after_days": null,
+      }
+  EOS
+  def create
+    permitted_params = push_params
+
+    # Require authentication if anonymous creation is disabled or
+    # when creating file pushes / uploading attachments.
+    authenticate_user! if requires_authentication_for_create?(permitted_params)
+
+    @push = Push.new(permitted_params)
+
+    if !permitted_params[:kind].present?
+      # These are used to determine the default kind based on the request path
+      # for old push records. Their paths are generated based on their kind.
+      # And, QR code pushes are created by using `/p/` path.
+      # So, it is not necessary to check for a special path.
+      @push.kind = if request.path.include?("/f.json")
+        "file"
+      elsif request.path.include?("/r.json")
+        "url"
+      elsif request.path.include?("/p.json") && permitted_params.key?(:files)
+        "file"
+      else
+        "text"
+      end
+    end
+
+    @push.user = current_user if user_signed_in?
+
+    assign_deletable_by_viewer(@push, permitted_params)
+    assign_retrieval_step(@push, permitted_params)
+
+    assign_notify_by_email_fields(@push, required: false)
+
+    if @push.save
+      log_creation(@push)
+
+      render template: "pushes/show", status: :created
+    else
+      render json: @push.errors, status: :unprocessable_content
+    end
+  end
+
+  api :GET, "/p/:url_token/preview.json", "Helper endpoint to retrieve the fully qualified secret URL of a push."
+  param :url_token, String, desc: "Secret URL token of a previously created push.", required: true
+  formats ["JSON"]
+  description <<-EOS
+    == Preview a Push
+
+    This method retrieves the preview URL of a push.  This is useful for getting the
+    fully qualified URL of a push before sharing it with others.
+
+    == Language Specific Examples
+
+    For language-specific examples and detailed API documentation, see:
+    https://docs.pwpush.com/docs/json-api/
+  EOS
+  def preview
+    @secret_url = helpers.secret_url(@push)
+    render json: {url: @secret_url}, status: :ok
+  end
+
+  api :GET, "/p/:url_token/audit.json", "Retrieve the audit log for a push."
+  param :url_token, String, desc: "Secret URL token of a previously created push.", required: true
+  formats ["JSON"]
+  description <<-EOS
+    == Push Audit Log Retrieval
+
+    Returns the audit log for a push, containing an array of view events with metadata including:
+    - IP address of viewer
+    - User agent
+    - Referrer URL
+    - Timestamp
+    - Event type (view, failed_view, expire, etc)
+
+    Results are paginated with a maximum of 50 audit log entries per page and 200 pages total.
+    Pagination metadata is returned in response headers (Link, X-Page, X-Per-Page, X-Total, X-Total-Pages).
+
+    Authentication is required. Only the owner of the push can retrieve its audit log.
+    Requests for pushes not owned by the authenticated user will receive a 403 Forbidden response.
+
+    == Parameters
+
+    * +page+ - Page number (default: 1)
+
+    == Example Request
+
+      curl -X GET \\
+        -H "X-User-Email: user@example.com" \\
+        -H "X-User-Token: MyAPIToken" \\
+        https://pwpush.com/p/fk27vnslkd/audit.json?page=1
+
+    == Example Response
+
+      {
+        "views": [
+          {
+            "ip": "x.x.x.x",
+            "user_agent": "Mozilla/5.0...",
+            "referrer": "https://example.com",
+            "created_at": "2023-10-20T15:32:01Z",
+            "kind": "view"
+          }
+        ]
+      }
+
+    == Language Specific Examples
+
+    For language-specific examples and detailed API documentation, see:
+    https://docs.pwpush.com/docs/json-api/
+  EOS
+  def audit
+    unless @push.owned_by?(current_user)
+      render json: {error: I18n._("That push doesn't belong to you.")}, status: :forbidden
+      return
+    end
+
+    page = validate_page_parameter
+    return if page.nil?
+
+    @audit_logs = @push.audit_logs
+      .order(created_at: :desc)
+      .page(page)
+      .per(API_PAGE_SIZE)
+
+    set_pagination_headers(
+      page: @audit_logs.current_page,
+      per_page: @audit_logs.limit_value,
+      total: @audit_logs.total_count
+    )
+
+    @secret_url = helpers.secret_url(@push)
+    render json: {views: @audit_logs}.to_json(except: %i[user_id push_id id])
+  end
+
+  api :DELETE, "/p/:url_token.json", "Expire a push: delete the payload and expire the secret URL."
+  param :url_token, String, desc: "Secret URL token of a previously created push.", required: true
+  formats ["JSON"]
+  description <<-EOS
+    == Push Expiration
+
+    Expires a push immediately.  Must be authenticated & owner of the push _or_ the push must
+    have been created with _deleteable_by_viewer_.
+
+    == Example Request
+
+      curl -X DELETE \\
+        -H "X-User-Email: user@example.com" \\
+        -H "X-User-Token: MyAPIToken" \\
+        https://pwpush.com/p/fkwjfvhall92.json
+
+    == Example Response
+
+      {
+        "expired": true,
+        "expired_on": "2023-10-20T15:32:01Z"
+      }
+
+    == Language Specific Examples
+
+    For language-specific examples and detailed API documentation, see:
+    https://docs.pwpush.com/docs/json-api/
+  EOS
+  def destroy
+    if @push.deletable_by?(current_user)
+      unless @push.expired?
+        # Deletable by the owner or viewer
+        @push.expire!
+        log_expire(@push)
+      end
+
+      render template: "pushes/show", status: :ok
+    else
+      notice = I18n._("That push is not deletable by viewers.")
+      render json: {error: notice}, status: :unauthorized
+    end
+  end
+
+  api :GET, "/p/active.json", "Retrieve your active pushes."
+  formats ["JSON"]
+  description <<-EOS
+    == Active Pushes Retrieval
+
+    Returns the list of pushes that are still active.
+    Results are paginated with a maximum of 50 pushes per page and 200 pages total.
+    Pagination metadata is returned in response headers (Link, X-Page, X-Per-Page, X-Total, X-Total-Pages).
+
+    == Parameters
+
+    * +page+ - Page number (default: 1)
+
+    == Example Request
+
+      curl -X GET \\
+        -H "X-User-Email: user@example.com" \\
+        -H "X-User-Token: MyAPIToken" \\
+        https://pwpush.com/p/active.json
+
+    == Example Response
+
+        [
+          {
+            "url_token": "fkwjfvhall92",
+            "html_url": "https://pwpush.com/p/fkwjfvhall92",
+            "json_url": "https://pwpush.com/p/fkwjfvhall92.json",
+            "created_at": "2023-10-20T15:32:01Z",
+            "expires_at": "2023-10-20T15:32:01Z",
+            ...
+          },
+          ...
+        ]
+
+    == Language Specific Examples
+
+    For language-specific examples and detailed API documentation, see:
+    https://docs.pwpush.com/docs/json-api/
+  EOS
+  def active
+    authenticate_user!
+    page = validate_page_parameter
+    return if page.nil?
+
+    @pushes = Push.includes(:audit_logs)
+      .where(user_id: current_user.id, expired: false)
+      .page(page)
+      .per(API_PAGE_SIZE)
+      .order(created_at: :desc)
+
+    set_pagination_headers(
+      page: @pushes.current_page,
+      per_page: @pushes.limit_value,
+      total: @pushes.total_count
+    )
+
+    render template: "pushes/index", status: :ok
+  end
+
+  api :GET, "/p/expired.json", "Retrieve your expired pushes."
+  formats ["JSON"]
+  description <<-EOS
+    == Expired Pushes Retrieval
+
+    Returns the list of pushes that have expired.
+    Results are paginated with a maximum of 50 pushes per page and 200 pages total.
+    Pagination metadata is returned in response headers (Link, X-Page, X-Per-Page, X-Total, X-Total-Pages).
+
+    == Parameters
+
+    * +page+ - Page number (default: 1)
+
+    == Example Request
+
+      curl -X GET \\
+        -H "X-User-Email: user@example.com" \\
+        -H "X-User-Token: MyAPIToken" \\
+        https://pwpush.com/p/expired.json
+
+    == Example Response
+
+      [
+        {
+          "url_token": "fkwjfvhall92",
+          "html_url": "https://pwpush.com/p/fkwjfvhall92",
+          "json_url": "https://pwpush.com/p/fkwjfvhall92.json",
+          "created_at": "2023-10-20T15:32:01Z",
+          "expires_at": "2023-10-20T15:32:01Z",
+          ...
+        },
+        ...
+      ]
+
+    == Language Specific Examples
+
+    For language-specific examples and detailed API documentation, see:
+    https://docs.pwpush.com/docs/json-api/
+  EOS
+  def expired
+    authenticate_user!
+    page = validate_page_parameter
+    return if page.nil?
+
+    @pushes = Push.includes(:audit_logs)
+      .where(user_id: current_user.id, expired: true)
+      .page(page)
+      .per(API_PAGE_SIZE)
+      .order(created_at: :desc)
+
+    set_pagination_headers(
+      page: @pushes.current_page,
+      per_page: @pushes.limit_value,
+      total: @pushes.total_count
+    )
+
+    render template: "pushes/index", status: :ok
+  end
+
+  private
+
+  def requires_authentication_for_create?(permitted_params)
+    return true unless Settings.allow_anonymous
+    return true if request.path.start_with?("/f")
+
+    # Keep auth semantics aligned with API surface:
+    # - v1 /p.json treats files key presence as file intent
+    # - v2 /api/v2/pushes should do the same for auth gating
+    ((request.path.include?("/p.json") || params["controller"] == "api/v2/pushes") &&
+      permitted_params.key?(:files)) ||
+      permitted_params[:kind] == "file"
+  end
+
+  def set_push
+    @push = Push.includes(:audit_logs).find_by!(url_token: params[:id])
+  rescue ActiveRecord::RecordNotFound
+    # Showing a 404 reveals that this Secret URL never existed
+    # which is an information leak (not a secret anymore)
+    # We also don't want data in general. We entirely delete old pushes that:
+    # 1. have expired (payloads already deleted long ago)
+    # 2. are anonymous/not linked to a user account (audit log not needed)
+    # Old, expired & anonymous pushes have no value to anybody.
+    # When not found, show the 'expired' page so even very old secret URLs
+    # when clicked they will be accurate - this secret URL has expired.
+    # No easy fix for JSON unfortunately as we don't have a record to show.
+    respond_to do |format|
+      format.json { render json: {error: "not-found"}.to_json, status: :not_found }
+    end
+  end
+
+  def push_params
+    if request.path.start_with?("/f")
+      params.require(:file_push).permit(:name, :expire_after_days, :expire_after_views, :deletable_by_viewer,
+        :retrieval_step, :payload, :note, :passphrase, files: [])
+    elsif request.path.start_with?("/r")
+      params.require(:url).permit(:name, :expire_after_days, :expire_after_views,
+        :retrieval_step, :payload, :note, :passphrase)
+    else
+      # https://docs.pwpush.com/docs/json-api/#curl
+      # curl -X POST -H "X-User-Email: <email>" -H "X-User-Token: MyAPIToken"
+      # -F "password[payload]=my_secure_payload"
+      # -F "password[note]=For New Employee ID 12345"
+      # -F "password[files][]=@/path/to/file/file1.extension"
+      # -F "password[files][]=@/path/to/file/file2.extension"
+      # https://pwpush.com/p.json
+      # There is a differences between the premium and OSS features.
+      # It is allowed to create password pushes by using files on the premium one.
+      # To respond same request, password[files] are allowed, but it will create a file push.
+      #
+      # More, kind can be used to create different kind pushes.
+      params.require(:password).permit(:name, :kind, :expire_after_days, :expire_after_views, :deletable_by_viewer,
+        :retrieval_step, :payload, :note, :passphrase, files: [])
+    end
+  rescue => e
+    Rails.logger.error("Error in push_params: #{e.message}")
+
+    raise e
+  end
+end

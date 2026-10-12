@@ -1,0 +1,2553 @@
+import logging
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from datetime import datetime
+from threading import Lock
+from typing import Any, Iterator
+from urllib.parse import quote
+
+from dlt.sources.helpers import requests
+from dlt.sources.helpers.rest_client.client import RESTClient
+from dlt.sources.helpers.rest_client.paginators import (
+    OffsetPaginator,
+)
+from requests.exceptions import JSONDecodeError
+
+from openhound_github.graphql import (
+    MEMBERS_WITH_ROLE_QUERY,
+    PROTECTION_RULES_QUERY,
+    REF_OVERFLOW_QUERY,
+    REPO_REFS_QUERY,
+    SAML_IDENTITIES_QUERY,
+    SAML_QUERY,
+    TEAM_MEMBERS_OVERFLOW_QUERY,
+    TEAMS_QUERY,
+)
+from openhound_github.github_retry import (
+    is_primary_rate_limit_response,
+    is_secondary_rate_limit_response,
+)
+from openhound_github.helpers import (
+    AdaptiveGraphQLPageError,
+    DEFAULT_GITHUB_REST_API_URL,
+    GraphQLCursorPaginator,
+    adaptive_graphql_paginate,
+    graphql_client_and_path,
+    scim_skip_reason,
+)
+from openhound_github.main import app
+from openhound_github.models import (
+    ActionPermission,
+    App,
+    AppInstallation,
+    AppInstallationRepoAccess,
+    BaseRepoRole,
+    Branch,
+    BranchProtectionRule,
+    DeployKey,
+    Environment,
+    EnvironmentBranchPolicy,
+    EnvironmentSecret,
+    EnvironmentVariable,
+    ExternalIdentity,
+    Organization,
+    OrgRole,
+    OrgRoleMember,
+    OrgRoleTeam,
+    OrgRunner,
+    OrgRunnerGroup,
+    OrgRunnerGroupAccess,
+    OrgRunnerGroupMembership,
+    OrgSecret,
+    OrgVariable,
+    PatRepoAccess,
+    PersonalAccessToken,
+    PersonalAccessTokenRequest,
+    ProjectedEnterpriseTeam,
+    RepoRole,
+    RepoRoleAssignment,
+    RepoRunner,
+    RepoSecret,
+    Repository,
+    Scope,
+    RepositoryQL,
+    RepoVariable,
+    SamlProvider,
+    SamlServiceProvider,
+    SamlAssertionConsumerService,
+    SamlIssuer,
+    ScimOrganization,
+    ScimResource,
+    SecretScanningAlert,
+    SelectedOrgSecret,
+    SelectedOrgVariable,
+    Team,
+    TeamExternalGroup,
+    TeamMember,
+    TeamRole,
+    User,
+    Workflow,
+    WorkflowJob,
+    WorkflowStep,
+)
+from openhound_github.models.repo_role_assignment import TEAM_PERMISSION_MAP
+from openhound_github.models.repository_role import DEFAULT_REPO_ROLES
+from openhound_github.models.saml_helpers import (
+    DEFAULT_GITHUB_DEPLOYMENT_ID,
+    DEFAULT_GITHUB_WEB_ORIGIN,
+)
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class OrgContext:
+    client: RESTClient
+    org_name: str
+    graphql_client: RESTClient | None = None
+    enterprise_name: str | None = None
+    github_deployment_id: str = DEFAULT_GITHUB_DEPLOYMENT_ID
+    github_web_origin: str = DEFAULT_GITHUB_WEB_ORIGIN
+    deployment_type: str = "unknown"
+    ghes_version: str | None = None
+    enterprise_version_header: str | None = None
+
+
+@dataclass
+class SourceContext:
+    client: RESTClient
+    organizations: list[OrgContext] = field(default_factory=list)
+    graphql_client: RESTClient | None = None
+    enterprise_name: str | None = None
+    github_deployment_id: str = DEFAULT_GITHUB_DEPLOYMENT_ID
+    github_web_origin: str = DEFAULT_GITHUB_WEB_ORIGIN
+    deployment_type: str = "unknown"
+    ghes_version: str | None = None
+    enterprise_version_header: str | None = None
+    selected_installation_repo_access_stopped: bool = False
+    cache_lock: Lock = field(default_factory=Lock)
+    organizations_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    app_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    team_rest_cache: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    actions_permissions_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    runner_permissions_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    workflow_permissions_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    repository_workflow_permissions_cache: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )
+
+
+class RepositoryRoleCache:
+    def __init__(self, ctx: SourceContext):
+        self.ctx = ctx
+        self._roles: list[dict[str, Any]] | None = None
+        self._lock = Lock()
+
+    @property
+    def roles(self) -> list[dict[str, Any]]:
+        if self._roles is None:
+            with self._lock:
+                if self._roles is None:
+                    self._roles = _repository_roles(self.ctx)
+        return self._roles
+
+    def __iter__(self):
+        return iter(self.roles)
+
+
+def _client_for_org(ctx: SourceContext, org_login: str) -> RESTClient:
+    for org in ctx.organizations:
+        if org.org_name == org_login:
+            return org.client
+    return ctx.client
+
+
+def _graphql_client_for_org(
+    ctx: SourceContext, org_login: str
+) -> tuple[RESTClient, str]:
+    for org in ctx.organizations:
+        if org.org_name == org_login:
+            return graphql_client_and_path(org.client, org.graphql_client)
+    return graphql_client_and_path(ctx.client, ctx.graphql_client)
+
+
+def _rest_api_url(client: RESTClient) -> str:
+    base_url = getattr(client, "base_url", DEFAULT_GITHUB_REST_API_URL)
+    return str(base_url).strip().rstrip("/") or DEFAULT_GITHUB_REST_API_URL
+
+
+def _encode_path_segment(value: str) -> str:
+    return quote(value, safe="")
+
+
+def _repository_roles(ctx: SourceContext) -> list[dict[str, Any]]:
+    roles: list[dict[str, Any]] = []
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client = org.client
+        for page in client.paginate(
+            f"/orgs/{org_name}/custom-repository-roles", params={"per_page": 100}
+        ):
+            for item in page:
+                roles.append({**item, "org_login": org_name})
+    return roles
+
+
+def _cached_org_response(
+    ctx: SourceContext,
+    cache: dict[str, dict[str, Any]],
+    client: RESTClient,
+    org_name: str,
+    path: str,
+) -> dict[str, Any]:
+    if org_name not in cache:
+        with ctx.cache_lock:
+            if org_name not in cache:
+                cache[org_name] = client.get(path).json()
+    return cache[org_name]
+
+
+def _actions_permissions(
+    ctx: SourceContext, client: RESTClient, org_name: str
+) -> dict[str, Any]:
+    return _cached_org_response(
+        ctx,
+        ctx.actions_permissions_cache,
+        client,
+        org_name,
+        f"/orgs/{org_name}/actions/permissions",
+    )
+
+
+def _runner_permissions(
+    ctx: SourceContext, client: RESTClient, org_name: str
+) -> dict[str, Any]:
+    return _cached_org_response(
+        ctx,
+        ctx.runner_permissions_cache,
+        client,
+        org_name,
+        f"/orgs/{org_name}/actions/permissions/self-hosted-runners",
+    )
+
+
+def _workflow_permissions(
+    ctx: SourceContext, client: RESTClient, org_name: str
+) -> dict[str, Any]:
+    return _cached_org_response(
+        ctx,
+        ctx.workflow_permissions_cache,
+        client,
+        org_name,
+        f"/orgs/{org_name}/actions/permissions/workflow",
+    )
+
+
+def _repository_workflow_permissions(
+    ctx: SourceContext, client: RESTClient, repository_full_name: str
+) -> dict[str, Any]:
+    cache_key = repository_full_name.casefold()
+    if cache_key not in ctx.repository_workflow_permissions_cache:
+        with ctx.cache_lock:
+            if cache_key not in ctx.repository_workflow_permissions_cache:
+                try:
+                    ctx.repository_workflow_permissions_cache[cache_key] = client.get(
+                        f"/repos/{repository_full_name}/actions/permissions/workflow"
+                    ).json()
+                except (requests.HTTPError, JSONDecodeError) as e:
+                    logger.warning(
+                        "Unable to fetch workflow permissions for repository '%s': %s",
+                        repository_full_name,
+                        e,
+                    )
+                    ctx.repository_workflow_permissions_cache[cache_key] = {}
+    return ctx.repository_workflow_permissions_cache[cache_key]
+
+
+def _rest_teams_for_org(
+    ctx: SourceContext, client: RESTClient, org_name: str
+) -> list[dict[str, Any]]:
+    if org_name not in ctx.team_rest_cache:
+        with ctx.cache_lock:
+            if org_name not in ctx.team_rest_cache:
+                ctx.team_rest_cache[org_name] = [
+                    team
+                    for page in client.paginate(
+                        f"/orgs/{org_name}/teams", params={"per_page": 100}
+                    )
+                    for team in page
+                ]
+    return ctx.team_rest_cache[org_name]
+
+
+def _external_group_skip_reason(exception: BaseException) -> str | None:
+    if not isinstance(exception, requests.HTTPError) or exception.response is None:
+        return None
+
+    status_code = exception.response.status_code
+    if status_code in (401, 403):
+        return "the configured credentials do not have Members organization permission at write level"
+    if status_code == 404:
+        return "the GitHub scope does not expose external groups"
+    return None
+
+
+def _external_group_failure_is_terminal(exception: BaseException) -> bool:
+    if not isinstance(exception, requests.HTTPError) or exception.response is None:
+        return False
+    return exception.response.status_code in (401, 403)
+
+
+def _team_cannot_be_externally_managed(exception: BaseException) -> bool:
+    if not isinstance(exception, requests.HTTPError) or exception.response is None:
+        return False
+    if exception.response.status_code != 400:
+        return False
+
+    try:
+        message = str(exception.response.json().get("message", "")).casefold()
+    except ValueError:
+        return False
+    return "cannot be externally managed" in message and "explicit members" in message
+
+
+def _log_org_external_group_failure(
+    resource: str,
+    org_name: str,
+    exception: BaseException,
+    *,
+    group_id: int | str | None = None,
+) -> None:
+    skip_reason = _external_group_skip_reason(exception)
+    if skip_reason:
+        logger.warning(
+            "Skipping %s for organization '%s': %s",
+            resource,
+            org_name,
+            skip_reason,
+            extra={"resource": resource, "phase": "resource_iteration"},
+        )
+        return
+
+    group_context = f" external group '{group_id}'" if group_id is not None else ""
+    logger.error(
+        "Error in resource '%s' processing organization '%s'%s: %s",
+        resource,
+        org_name,
+        group_context,
+        exception,
+        extra={"resource": resource, "phase": "resource_iteration"},
+    )
+
+
+def _team_database_id(team_id: Any) -> int | None:
+    try:
+        return int(team_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _team_external_group_row(
+    org_name: str,
+    team_id: Any,
+    group_id: Any,
+    group_name: Any,
+    updated_at: Any,
+) -> dict[str, Any] | None:
+    team_database_id = _team_database_id(team_id)
+    if group_id is None or not group_name:
+        return None
+    if team_database_id is None:
+        return None
+    try:
+        return {
+            "org_login": org_name,
+            "team_database_id": team_database_id,
+            "external_group_id": int(group_id),
+            "external_group_name": str(group_name),
+            "external_group_updated_at": updated_at,
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def _team_external_groups_by_group(
+    client: RESTClient,
+    org_name: str,
+    groups: list[dict[str, Any]],
+    allowed_team_database_ids: set[int],
+) -> Iterator[dict[str, Any]]:
+    for group in groups:
+        group_id = group.get("group_id")
+        try:
+            response = client.get(f"/orgs/{org_name}/external-group/{group_id}")
+            response.raise_for_status()
+            group_details = response.json()
+        except Exception as e:
+            _log_org_external_group_failure(
+                "team_external_groups",
+                org_name,
+                e,
+                group_id=group_id,
+            )
+            if _external_group_failure_is_terminal(e):
+                return
+            continue
+
+        group_name = group_details.get("group_name") or group.get("group_name")
+        updated_at = group_details.get("updated_at") or group.get("updated_at")
+        for team in group_details.get("teams") or []:
+            team_database_id = _team_database_id(team.get("team_id"))
+            if team_database_id not in allowed_team_database_ids:
+                continue
+            row = _team_external_group_row(
+                org_name,
+                team_database_id,
+                group_id,
+                group_name,
+                updated_at,
+            )
+            if row:
+                yield row
+
+
+def _team_external_groups_by_team(
+    client: RESTClient, org_name: str, teams: list[dict[str, Any]]
+) -> Iterator[dict[str, Any]]:
+    for team in teams:
+        try:
+            response = client.get(
+                f"/orgs/{org_name}/teams/{_encode_path_segment(str(team['slug']))}/external-groups"
+            )
+            response.raise_for_status()
+            group_details = response.json()
+        except Exception as e:
+            if _team_cannot_be_externally_managed(e):
+                continue
+            _log_org_external_group_failure("team_external_groups", org_name, e)
+            if _external_group_failure_is_terminal(e):
+                return
+            continue
+
+        for group in group_details.get("groups") or []:
+            row = _team_external_group_row(
+                org_name,
+                team.get("id"),
+                group.get("group_id"),
+                group.get("group_name"),
+                group.get("updated_at"),
+            )
+            if row:
+                yield row
+
+
+def _repo_permission_role(repo: dict[str, Any]) -> str:
+    role_name = repo.get("role_name")
+    if role_name:
+        return role_name
+
+    permissions = repo.get("permissions") or {}
+    for permission in ("admin", "maintain", "push", "triage", "pull"):
+        if permissions.get(permission):
+            return TEAM_PERMISSION_MAP[permission]
+    return ""
+
+
+def _selected_runner_group_repo_node_ids(
+    group: dict[str, Any], client: RESTClient, org_login: str
+) -> list[str]:
+    visibility = group.get("visibility")
+    if visibility != "selected":
+        return []
+
+    repo_node_ids: list[str] = []
+    try:
+        for page in client.paginate(
+            f"/orgs/{org_login}/actions/runner-groups/{group['id']}/repositories",
+            params={"per_page": 100},
+            data_selector="repositories",
+        ):
+            repo_node_ids.extend(
+                repo.get("node_id") for repo in page if repo.get("node_id")
+            )
+    except Exception:
+        return []
+    return repo_node_ids
+
+
+@app.resource(name="organizations", columns=Organization, parallelized=True)
+def organizations(ctx: SourceContext):
+    """Fetch organization details, actions permissions, and org roles from GitHub API.
+
+    Yields organization data to the `organizations` table, custom and default org roles
+    to the `org_roles` table, and per-role user/team assignments to `org_role_members`
+    and `org_role_teams` tables via dlt.mark.with_table_name().
+
+    Args:
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        Organization (Organization): Organization, org role, member, and team records.
+    """
+
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client = org.client
+        try:
+            org_data = _cached_org_response(
+                ctx,
+                ctx.organizations_cache,
+                client,
+                org_name,
+                f"/orgs/{org_name}",
+            )
+
+            actions = _actions_permissions(ctx, client, org_name)
+            self_hosted_runners = _runner_permissions(ctx, client, org_name)
+            workflow_perms = _workflow_permissions(ctx, client, org_name)
+
+            org_data["actions_enabled_repositories"] = actions.get("enabled_repositories")
+            org_data["actions_allowed_actions"] = actions.get("allowed_actions")
+            org_data["actions_sha_pinning_required"] = actions.get("sha_pinning_required")
+            org_data["self_hosted_runners_enabled_repositories"] = self_hosted_runners.get(
+                "enabled_repositories"
+            )
+            org_data["default_workflow_permissions"] = workflow_perms.get(
+                "default_workflow_permissions"
+            )
+            org_data["can_approve_pull_request_reviews"] = workflow_perms.get(
+                "can_approve_pull_request_reviews"
+            )
+            org_data["database_id"] = org_data.get("id")
+            org_data["github_deployment_type"] = ctx.deployment_type
+            org_data["ghes_version"] = ctx.ghes_version
+
+            yield org_data
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'organizations' processing organization '{org_name}': {e}",
+                extra={"resource": "organizations", "phase": "resource_iteration"},
+            )
+            continue
+
+
+@app.transformer(name="org_roles", columns=OrgRole, parallelized=True)
+def org_roles(org: Organization, ctx: SourceContext):
+    """Fetch default and custom organization roles from the GitHub API.
+
+    Yields the built-in 'owners' and 'members' roles, then fetches any custom
+    organization roles from the API.
+
+    Args:
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+        orgs (list[dict]): Organization records from the organizations resource.
+
+    Yields:
+        OrgRole (OrgRole): Organization role record.
+    """
+
+    yield {
+        "id": 1,
+        "name": "owners",
+        "type": "default",
+        "base_role": "admin",
+        "created_at": datetime.now().isoformat(),
+        "permissions": [],
+        "org_node_id": org.node_id,
+        "org_login": org.login,
+    }
+
+    yield {
+        "id": 2,
+        "name": "members",
+        "type": "default",
+        "created_at": datetime.now().isoformat(),
+        "base_role": org.default_repository_permission,
+        "permissions": [],
+        "org_node_id": org.node_id,
+        "org_login": org.login,
+    }
+
+    client = _client_for_org(ctx, org.login)
+    for page in client.paginate(
+        f"/orgs/{org.login}/organization-roles", params={"per_page": 100}
+    ):
+        for role in page:
+            yield {
+                **role,
+                "type": "custom",
+                "org_node_id": org.node_id,
+                "org_login": org.login,
+            }
+
+
+@app.transformer(name="org_role_teams", columns=OrgRoleTeam, parallelized=True)
+def org_role_teams(role: OrgRole, ctx: SourceContext):
+    """Fetch teams assigned to a custom organization role.
+
+    Only fetches team assignments for custom roles (not default built-in roles).
+
+    Args:
+        role (OrgRole): The organization role to fetch team assignments for.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        OrgRoleTeam (OrgRoleTeam): Team-to-org-role assignment record.
+    """
+
+    if role.type == "custom":
+        client = _client_for_org(ctx, role.org_login)
+        for page in client.paginate(
+            f"/orgs/{role.org_login}/organization-roles/{role.id}/teams"
+        ):
+            for team in page:
+                yield {
+                    "org_role_id": role.id,
+                    "org_role_name": role.name,
+                    "org_node_id": role.org_node_id,
+                    "org_login": role.org_login,
+                    **team,
+                }
+
+
+@app.transformer(name="org_role_members", columns=OrgRoleMember, parallelized=True)
+def org_role_members(role: OrgRole, ctx: SourceContext):
+    """Fetch users assigned to a custom organization role.
+
+    Only fetches user assignments for custom roles (not default built-in roles).
+
+    Args:
+        role (OrgRole): The organization role to fetch user assignments for.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        OrgRoleMember (OrgRoleMember): User-to-org-role assignment record.
+    """
+    if role.type == "custom":
+        client = _client_for_org(ctx, role.org_login)
+        for page in client.paginate(
+            f"/orgs/{role.org_login}/organization-roles/{role.id}/users"
+        ):
+            for user in page:
+                yield {
+                    **user,
+                    "org_role_name": role.name,
+                    "org_role_id": role.id,
+                    "org_node_id": role.org_node_id,
+                    "org_login": role.org_login,
+                }
+
+
+@app.resource(name="app_installations", columns=AppInstallation, parallelized=True)
+def app_installations(ctx: SourceContext):
+    """Fetch GitHub App installations for the organization.
+
+    Args:
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        AppInstallation (AppInstallation): App installation record.
+    """
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client = org.client
+        try:
+            for page in client.paginate(f"/orgs/{org_name}/installations"):
+                for item in page:
+                    yield {**item, "org_login": org_name}
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'app_installations' processing organization '{org_name}': {e}",
+                extra={"resource": "app_installations", "phase": "resource_iteration"},
+            )
+            continue
+
+
+@app.transformer(
+    name="app_installation_repo_access",
+    columns=AppInstallationRepoAccess,
+    parallelized=False,
+)
+def app_installation_repo_access(app_install: AppInstallation, ctx: SourceContext):
+    """List the repositories granted to a selected organization installation."""
+    if (
+        app_install.repository_selection != "selected"
+        or not ctx.client
+        or not ctx.enterprise_name
+        or ctx.deployment_type == "ghes"
+        or ctx.selected_installation_repo_access_stopped
+    ):
+        return
+
+    path = (
+        f"/enterprises/{ctx.enterprise_name}/apps/organizations/"
+        f"{app_install.org_login}/installations/{app_install.id}/repositories"
+    )
+    try:
+        # Read every page before yielding so a failed page cannot create partial access.
+        repositories = [
+            repository
+            for page in ctx.client.paginate(
+                path,
+                params={"per_page": 100},
+                headers={"X-GitHub-Api-Version": "2026-03-10"},
+            )
+            for repository in page
+        ]
+    except requests.HTTPError as exc:
+        response = exc.response
+        if response is not None and (
+            response.status_code == 429
+            or is_primary_rate_limit_response(response)
+            or is_secondary_rate_limit_response(response)
+            or (response.status_code == 403 and response.headers.get("Retry-After"))
+        ):
+            ctx.selected_installation_repo_access_stopped = True
+            logger.warning(
+                "GitHub rate-limited selected app installation repository access; "
+                "skipping remaining installations in this collection"
+            )
+            return
+        logger.warning(
+            "Skipping repository access for app installation %s in organization '%s': %s",
+            app_install.id,
+            app_install.org_login,
+            exc,
+        )
+        return
+    except Exception as exc:
+        logger.warning(
+            "Skipping repository access for app installation %s in organization '%s': %s",
+            app_install.id,
+            app_install.org_login,
+            exc,
+        )
+        return
+
+    for repository in repositories:
+        if repository.get("id") is None:
+            logger.warning(
+                "Skipping repository without an id for app installation %s",
+                app_install.id,
+            )
+            continue
+        yield {
+            "installation_node_id": app_install.node_id,
+            "repository_database_id": repository["id"],
+            "repo_full_name": repository.get("full_name"),
+            "org_login": app_install.org_login,
+        }
+
+
+@app.transformer(name="applications", columns=App, parallelized=True)
+def applications(app_install: AppInstallation, ctx: SourceContext):
+    """Fetch full GitHub App details for an installed app.
+
+    Args:
+        app_install (AppInstallation): The app installation to fetch app details for.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        App (App): GitHub App record.
+    """
+    app_slug = app_install.app_slug if app_install.app_slug else app_install.app_id
+    if app_install.id:
+        client = _client_for_org(ctx, app_install.org_login)
+        app_slug = str(app_slug)
+        if app_slug not in ctx.app_cache:
+            with ctx.cache_lock:
+                if app_slug not in ctx.app_cache:
+                    ctx.app_cache[app_slug] = client.get(f"/apps/{app_slug}").json()
+        app_data = ctx.app_cache[app_slug]
+        if app_data.get("node_id"):
+            yield {**app_data, "slug": app_slug, "org_login": app_install.org_login}
+
+
+@app.resource(name="users", columns=User, parallelized=True)
+def users(ctx: SourceContext) -> Iterator[dict[str, Any]]:
+    """Fetch organization members from GitHub GraphQL API, including their org role.
+
+    Uses the membersWithRole connection to retrieve user details (login, name, email,
+    company) and organization role (ADMIN or MEMBER) in a single paginated query.
+
+    Args:
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        User (User): User record.
+    """
+
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client, graphql_path = _graphql_client_for_org(ctx, org_name)
+        try:
+            paginator = GraphQLCursorPaginator(
+                page_info_path="data.organization.membersWithRole.pageInfo",
+                cursor_variable="after",
+                cursor_field="endCursor",
+                has_next_field="hasNextPage",
+            )
+            data = {
+                "query": MEMBERS_WITH_ROLE_QUERY,
+                "variables": {"login": org_name, "count": 100, "after": None},
+            }
+
+            for page_data in client.paginate(
+                graphql_path,
+                method="POST",
+                json=data,
+                paginator=paginator,
+                data_selector="data",
+            ):
+                for edge in page_data[0]["organization"]["membersWithRole"]["edges"]:
+                    node = edge.get("node", {})
+                    yield {**node, **edge, "org_login": org_name}
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'users' processing organization '{org_name}': {e}",
+                extra={"resource": "users", "phase": "resource_iteration"},
+            )
+            continue
+
+
+@app.resource(name="teams", columns=Team, parallelized=True)
+def teams(ctx: SourceContext):
+    """Fetch teams and team member assignments from GitHub GraphQL API.
+
+    Uses the Organization.teams connection with nested IMMEDIATE members to fetch
+    team info and member-role assignments in a single paginated query. Teams with
+    more than 100 members are followed up with additional member pagination queries.
+
+    Yields team records to the `teams` table and member-role records to the
+    `team_members` table via dlt.mark.with_table_name().
+
+    Args:
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        Team (Team): Team record lol!.
+    """
+
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client, graphql_path = _graphql_client_for_org(ctx, org_name)
+        try:
+            paginator = GraphQLCursorPaginator(
+                page_info_path="data.organization.teams.pageInfo",
+                cursor_variable="after",
+                cursor_field="endCursor",
+                has_next_field="hasNextPage",
+            )
+            data = {
+                "query": TEAMS_QUERY,
+                "variables": {"login": org_name, "count": 100, "after": None},
+            }
+            for page_data in client.paginate(
+                graphql_path,
+                method="POST",
+                json=data,
+                paginator=paginator,
+                data_selector="data",
+            ):
+                teams_data = page_data[0]["organization"]["teams"]
+                for team in teams_data["nodes"]:
+                    yield {**team, "org_login": org_name}
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'teams' processing organization '{org_name}': {e}",
+                extra={"resource": "teams", "phase": "resource_iteration"},
+            )
+            continue
+
+
+@app.resource(
+    name="projected_enterprise_teams",
+    columns=ProjectedEnterpriseTeam,
+    parallelized=True,
+)
+def projected_enterprise_teams(ctx: SourceContext):
+    """Fetch REST-based enterprise teams (starts with ent:) since these are not returned via GraphQL."""
+
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client = org.client
+        try:
+            for team in _rest_teams_for_org(ctx, client, org_name):
+                if str(team.get("slug", "")).startswith("ent:") and team.get("node_id"):
+                    yield {**team, "org_login": org_name}
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'projected_enterprise_teams' processing organization '{org_name}': {e}",
+                extra={"resource": "projected_enterprise_teams", "phase": "resource_iteration"},
+            )
+            continue
+
+
+@app.resource(
+    name="team_external_groups",
+    columns=TeamExternalGroup,
+    parallelized=True,
+)
+def team_external_groups(ctx: SourceContext):
+    """Collect external IdP group mappings for normal organization teams."""
+
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client = org.client
+        try:
+            groups = [
+                group
+                for page in client.paginate(
+                    f"/orgs/{org_name}/external-groups",
+                    params={"per_page": 100},
+                    data_selector="groups",
+                )
+                for group in page
+                if group.get("group_id") is not None
+            ]
+            if not groups:
+                continue
+
+            teams = [
+                team
+                for team in _rest_teams_for_org(ctx, client, org_name)
+                if team.get("id") is not None
+                and team.get("slug")
+                and not str(team["slug"]).startswith("ent:")
+            ]
+            team_database_ids = {
+                team_database_id
+                for team in teams
+                if (team_database_id := _team_database_id(team["id"])) is not None
+            }
+
+            if len(groups) <= len(teams):
+                yield from _team_external_groups_by_group(
+                    client,
+                    org_name,
+                    groups,
+                    team_database_ids,
+                )
+            else:
+                yield from _team_external_groups_by_team(client, org_name, teams)
+        except Exception as e:
+            _log_org_external_group_failure("team_external_groups", org_name, e)
+            continue
+
+
+@app.transformer(name="team_roles", columns=TeamRole, parallelized=True)
+def team_roles(team: Team):
+    """Yield the two built-in team roles (members and maintainers) for a team.
+
+    Args:
+        team (Team): The team to generate role records for.
+
+    Yields:
+        TeamRole (TeamRole): Team role records (one for members, one for maintainers).
+    """
+    for role_type in ("members", "maintainers"):
+        yield {
+            "type": role_type,
+            "team_node_id": team.node_id,
+            "team_name": team.name,
+            "team_slug": team.slug,
+            "org_login": team.org_login,
+        }
+
+
+@app.transformer(name="team_members", columns=TeamMember, parallelized=True)
+def team_members(team: Team, ctx: SourceContext):
+    """Fetch team member assignments including their role (member or maintainer).
+
+    Processes members from the initial team query and handles overflow pagination
+    for teams with more than 100 members via a follow-up GraphQL query.
+
+    Args:
+        team (Team): The team to fetch member assignments for.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        TeamMember (TeamMember): Team member assignment record.
+    """
+    for member in team.members.edges:
+        yield {
+            "team_id": team.id,
+            "id": member.node.id,
+            "login": member.node.login,
+            "role": member.role,
+            "org_login": team.org_login,
+        }
+
+    paginator = GraphQLCursorPaginator(
+        page_info_path="data.organization.team.members.pageInfo",
+        cursor_variable="after",
+        cursor_field="endCursor",
+        has_next_field="hasNextPage",
+    )
+
+    if team.members.page_info.has_next_page:
+        if not team.members.page_info.end_cursor:
+            raise RuntimeError(
+                f"GitHub team {team.org_login}/{team.slug} has more members but no endCursor"
+            )
+        client, graphql_path = _graphql_client_for_org(ctx, team.org_login)
+        data = {
+            "query": TEAM_MEMBERS_OVERFLOW_QUERY,
+            "variables": {
+                "login": team.org_login,
+                "count": 100,
+                "after": team.members.page_info.end_cursor,
+                "slug": team.slug,
+            },
+        }
+        for page_data in client.paginate(
+            graphql_path,
+            method="POST",
+            json=data,
+            paginator=paginator,
+            data_selector="data",
+        ):
+            for member in page_data[0]["organization"]["team"]["members"]["edges"]:
+                yield {
+                    "team_id": team.id,
+                    "id": member["node"]["id"],
+                    "login": member["node"]["login"],
+                    "role": member["role"],
+                    "org_login": team.org_login,
+                }
+
+
+@app.resource(name="actions_permissions", columns=ActionPermission, parallelized=True)
+def actions_permissions(ctx):
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client = org.client
+        try:
+            actions = _actions_permissions(ctx, client, org_name)
+            yield {
+                **actions,
+                "org_login": org_name,
+            }
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'actions_permissions' processing organization '{org_name}': {e}",
+                extra={"resource": "actions_permissions", "phase": "resource_iteration"},
+            )
+            continue
+
+
+@app.resource(name="repositories", columns=Repository, parallelized=True)
+def repositories(ctx: SourceContext):
+    """Fetch repositories for the organization.
+
+    Args:
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        Repository (Repository): Repository record.
+    """
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client = org.client
+        try:
+            actions = _actions_permissions(ctx, client, org_name)
+            runner_settings = _runner_permissions(ctx, client, org_name)
+
+            enabled_repo_ids: set[str] | None = None
+            if actions.get("enabled_repositories") == "selected":
+                enabled_repo_ids = set()
+                for page in client.paginate(
+                    f"/orgs/{org_name}/actions/permissions/repositories",
+                    params={"per_page": 100},
+                    data_selector="repositories",
+                ):
+                    enabled_repo_ids.update(
+                        repo["node_id"] for repo in page if repo.get("node_id")
+                    )
+
+            runner_enabled_repo_ids: set[str] | None = None
+            if runner_settings.get("enabled_repositories") == "selected":
+                runner_enabled_repo_ids = set()
+                for page in client.paginate(
+                    f"/orgs/{org_name}/actions/permissions/self-hosted-runners/repositories",
+                    params={"per_page": 100},
+                    data_selector="repositories",
+                ):
+                    runner_enabled_repo_ids.update(
+                        repo["node_id"] for repo in page if repo.get("node_id")
+                    )
+
+            for page in client.paginate(
+                f"/orgs/{org_name}/repos", params={"per_page": 100}
+            ):
+                for repo in page:
+                    repo_node_id = repo.get("node_id")
+                    actions_enabled = actions.get("enabled_repositories") == "all" or (
+                        enabled_repo_ids is not None and repo_node_id in enabled_repo_ids
+                    )
+                    self_hosted_runners_enabled = runner_settings.get(
+                        "enabled_repositories"
+                    ) == "all" or (
+                        runner_enabled_repo_ids is not None
+                        and repo_node_id in runner_enabled_repo_ids
+                    )
+                    yield {
+                        **repo,
+                        "database_id": repo.get("id"),
+                        "actions_enabled": actions_enabled,
+                        "self_hosted_runners_enabled": self_hosted_runners_enabled,
+                        "org_login": org_name,
+                    }
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'repositories' processing organization '{org_name}': {e}",
+                extra={"resource": "repositories", "phase": "resource_iteration"},
+            )
+            continue
+
+
+@app.transformer(
+    name="repo_role_assignments", columns=RepoRoleAssignment, parallelized=True
+)
+def repo_role_assignments(
+    repo: Repository, ctx: SourceContext, roles: Iterable[dict[str, Any]]
+) -> Iterator[dict[str, Any]]:
+    """Fetch direct collaborator role assignments for each repository.
+
+    Team assignments are collected by `team_repo_role_assignments` to avoid one
+    `/repos/{owner}/{repo}/teams` request per repository in large organizations.
+
+    API endpoints:
+    - GET /repos/{org}/{repo}/collaborators?affiliation=direct
+
+    Args:
+        repo (Repository): The repository to fetch role assignments for.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+        roles (list[dict]): Custom role definitions from repository_roles_base.
+
+    Yields:
+        RepoRoleAssignment (RepoRoleAssignment): Role assignment records for direct collaborators.
+    """
+
+    repo_node_id = repo.node_id
+    repo_name = repo.name
+    custom_roles = {
+        role["name"]: BaseRepoRole(**role)
+        for role in roles
+        if role.get("org_login") == repo.org_login
+    }
+
+    client = _client_for_org(ctx, repo.org_login)
+
+    for collab_page in client.paginate(
+        f"/repos/{repo.org_login}/{repo_name}/collaborators",
+        params={"affiliation": "direct", "per_page": 100},
+    ):
+        for collaborator in collab_page:
+            role = collaborator.get("role_name", "")
+            custom_role = custom_roles.get(role)
+            yield {
+                **collaborator,
+                "org_login": repo.org_login,
+                "assignee_type": "user",
+                "repo_node_id": repo_node_id,
+                "repo_name": repo_name,
+                "role_name": role,
+                "base_role": custom_role.base_role if custom_role else None,
+                "role_permissions": custom_role.permissions if custom_role else [],
+            }
+
+
+@app.transformer(
+    name="team_repo_role_assignments",
+    table_name="repo_role_assignments",
+    columns=RepoRoleAssignment,
+    parallelized=True,
+)
+def team_repo_role_assignments(
+    team: Team, ctx: SourceContext, roles: Iterable[dict[str, Any]]
+) -> Iterator[dict[str, Any]]:
+    """Fetch repository role assignments for one team.
+
+    This writes to the existing `repo_role_assignments` table and preserves the
+    `RepoRoleAssignment` row shape while changing team grant collection from
+    repository-driven fan-out to team-driven fan-out.
+    """
+    custom_roles = {
+        role["name"]: BaseRepoRole(**role)
+        for role in roles
+        if role.get("org_login") == team.org_login
+    }
+    client = _client_for_org(ctx, team.org_login)
+    for repo_page in client.paginate(
+        f"/orgs/{team.org_login}/teams/{team.slug}/repos",
+        params={"per_page": 100},
+    ):
+        for repo in repo_page:
+            role = _repo_permission_role(repo)
+            custom_role = custom_roles.get(role)
+            yield {
+                "id": team.database_id or 0,
+                "node_id": team.node_id,
+                "type": "Team",
+                "assignee_type": "team",
+                "repo_node_id": repo["node_id"],
+                "org_login": team.org_login,
+                "repo_name": repo["name"],
+                "role_name": role,
+                "base_role": custom_role.base_role if custom_role else None,
+                "role_permissions": custom_role.permissions if custom_role else [],
+            }
+
+
+@app.resource(name="repository_roles_base", parallelized=True, columns=BaseRepoRole)
+def repository_roles_base(ctx: SourceContext):
+    """Fetch custom repository roles from GitHub API.
+
+    Args:
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        list[dict] (list[dict]): Pages of raw custom repository role records from the GitHub API.
+    """
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client = org.client
+        try:
+            for page in client.paginate(
+                f"/orgs/{org_name}/custom-repository-roles", params={"per_page": 100}
+            ):
+                for item in page:
+                    yield {
+                        **item,
+                        "org_login": org_name,
+                    }
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'repository_roles_base' processing organization '{org_name}': {e}",
+                extra={"resource": "repository_roles_base", "phase": "resource_iteration"},
+            )
+            continue
+
+
+@app.transformer(name="repo_roles", columns=RepoRole, parallelized=True)
+def repository_roles(repository: Repository, roles: Iterable[dict[str, Any]]):
+    """Yield default and custom repository role records for a repository.
+
+    Emits the five built-in default roles (read, triage, write, maintain, admin) and
+    any custom repository roles defined at the organization level.
+
+    Args:
+        repository (Repository): The repository to generate role records for.
+        roles (list[dict]): Custom role definitions from repository_roles_base.
+
+    Yields:
+        RepoRole (RepoRole): Repository role record.
+    """
+    for idx, role in enumerate(DEFAULT_REPO_ROLES):
+        yield {
+            "id": idx,
+            "name": role["name"],
+            "type": "default",
+            "base_role": role["base_role"],
+            "permissions": [],
+            "repository_full_name": repository.full_name,
+            "repository_name": repository.name,
+            "repository_node_id": repository.node_id,
+            "repository_visibility": repository.visibility,
+            "org_login": repository.org_login,
+        }
+
+    for role in roles:
+        if role.get("org_login") != repository.org_login:
+            continue
+        role = BaseRepoRole(**role)
+        yield {
+            "id": role.id,
+            "name": role.name,
+            "type": "custom",
+            "base_role": role.base_role,
+            "permissions": role.permissions,
+            "repository_full_name": repository.full_name,
+            "repository_name": repository.name,
+            "repository_node_id": repository.node_id,
+            "repository_visibility": repository.visibility,
+            "org_login": repository.org_login,
+        }
+
+
+@app.resource(name="repositories_graphql", columns=RepositoryQL, parallelized=True)
+def repositories_graphql(ctx: SourceContext):
+    """Fetch repositories with branch and protection rule metadata via GraphQL.
+
+    Uses the organization repositories connection to retrieve branches with their
+    associated branch protection rule IDs, used as input for the branches and
+    branch_protection_rules transformers.
+
+    Args:
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        RepositoryQL (RepositoryQL): Repository record with nested branch ref data.
+    """
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client, graphql_path = _graphql_client_for_org(ctx, org_name)
+        repository_cursor: str | None = None
+        emitted_repositories = 0
+        try:
+            for page_data in adaptive_graphql_paginate(
+                client,
+                graphql_path=graphql_path,
+                query=REPO_REFS_QUERY,
+                variables={"login": org_name, "after": None},
+                page_info_path="data.organization.repositories.pageInfo",
+                resource_name="repositories_graphql",
+                scope_name="organization",
+                scope_value=org_name,
+                log=logger,
+            ):
+                repos_page = page_data["organization"]["repositories"]
+                for repo in repos_page["nodes"]:
+                    repo_record = {**repo}
+                    branch_rulesets = repo_record.pop("branchRulesets", None) or {}
+                    environments = repo_record.pop("environments", None) or {}
+                    deploy_keys = repo_record.pop("deployKeys", None) or {}
+                    refs = repo_record.get("refs") or {}
+                    emitted_repositories += 1
+                    yield {
+                        **repo_record,
+                        "branch_ruleset_count": branch_rulesets.get("totalCount"),
+                        "branch_count": refs.get("totalCount"),
+                        "environment_count": environments.get("totalCount"),
+                        "deploy_key_count": deploy_keys.get("totalCount"),
+                        "org_login": org_name,
+                    }
+
+                page_info = repos_page.get("pageInfo") or {}
+                if isinstance(page_info, dict):
+                    repository_cursor = page_info.get("endCursor")
+        except Exception as e:
+            failure = e.error if isinstance(e, AdaptiveGraphQLPageError) else e
+            failure_cursor = (
+                e.cursor if isinstance(e, AdaptiveGraphQLPageError) else repository_cursor
+            )
+            page_size = e.page_size if isinstance(e, AdaptiveGraphQLPageError) else None
+            logger.error(
+                "Error in resource 'repositories_graphql' processing organization '%s' "
+                "at repository cursor %r with page size %r after emitting %d repositories "
+                "(%s): %s",
+                org_name,
+                failure_cursor,
+                page_size,
+                emitted_repositories,
+                type(failure).__name__,
+                failure,
+                extra={
+                    "resource": "repositories_graphql",
+                    "phase": "resource_iteration",
+                    "org_name": org_name,
+                    "repository_cursor": failure_cursor,
+                    "page_size": page_size,
+                    "emitted_repositories": emitted_repositories,
+                    "error_type": type(failure).__name__,
+                },
+            )
+            continue
+
+
+@app.transformer(name="branches", columns=Branch, parallelized=True)
+def branches(repository: RepositoryQL, ctx: SourceContext):
+    """Yield branches for a repository.
+
+    Processes branches from the initial repository query and handles overflow
+    pagination for repos with more than 100 branches via a follow-up GraphQL query.
+
+    Args:
+        repository (RepositoryQL): The repository with refs data.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        Branch (Branch): Branch record.
+    """
+    paginator = GraphQLCursorPaginator(
+        page_info_path="data.repository.refs.pageInfo",
+        cursor_variable="after",
+        cursor_field="endCursor",
+        has_next_field="hasNextPage",
+    )
+
+    for branch in repository.refs.nodes:
+        yield {
+            **branch.model_dump(),
+            "repository_node_id": repository.id,
+            "repository_name": repository.name,
+            "org_login": repository.org_login,
+        }
+
+    if repository.refs.page_info.has_next_page:
+        client, graphql_path = _graphql_client_for_org(ctx, repository.org_login)
+        data = {
+            "query": REF_OVERFLOW_QUERY,
+            "variables": {
+                "owner": repository.org_login,
+                "count": 100,
+                "after": repository.refs.page_info.end_cursor,
+                "name": repository.name,
+            },
+        }
+
+        for page_data in client.paginate(
+            graphql_path,
+            method="POST",
+            json=data,
+            paginator=paginator,
+            data_selector="data",
+        ):
+            for branch in page_data[0]["repository"]["refs"]["nodes"]:
+                yield {
+                    **branch,
+                    "repository_node_id": repository.id,
+                    "repository_name": repository.name,
+                    "org_login": repository.org_login,
+                }
+
+
+@app.transformer(
+    name="branch_protection_rules", columns=BranchProtectionRule, parallelized=True
+)
+def branch_protection_rules(repository: RepositoryQL, ctx: SourceContext):
+    """Batch-fetch branch protection rule details for a repository.
+
+    For a given repository, extracts all unique protection rule IDs from its branches
+    (including overflow pagination), batch-fetches the full rule details (settings, allowances),
+    and yields BranchProtectionRule objects.
+
+    Args:
+        repository (RepositoryQL): The repository with refs data (can have nested branches).
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        BranchProtectionRule (BranchProtectionRule): Protection rule record with full details.
+    """
+    # Note: multiple branches can reference the same branch protection rule
+    # so use a set to prevent duplicates
+    rule_ids_seen: set[str] = set()
+    for branch in repository.refs.nodes:
+        if branch.branch_protection_rule:
+            rule_id = branch.branch_protection_rule.get("id")
+            if rule_id:
+                rule_ids_seen.add(rule_id)
+
+    rule_ids_list = list(rule_ids_seen)
+    client, graphql_path = _graphql_client_for_org(ctx, repository.org_login)
+    for i in range(0, len(rule_ids_list), 100):
+        rules_chunk = rule_ids_list[i : i + 100]
+        if rules_chunk:
+            data = {"query": PROTECTION_RULES_QUERY, "variables": {"ids": rules_chunk}}
+            response = client.post(graphql_path, json=data).json()
+            for rule in response["data"].get("nodes", []):
+                # GitHub can return null actors for deleted or inaccessible allowance actors.
+                for allowance_key in ("bypassPullRequestAllowances", "pushAllowances"):
+                    allowances = rule.get(allowance_key)
+                    if allowances and allowances.get("nodes"):
+                        allowances["nodes"] = [
+                            node
+                            for node in allowances["nodes"]
+                            if node.get("actor") is not None
+                        ]
+                yield {
+                    **rule,
+                    "org_login": repository.org_login,
+                    "repository_node_id": repository.id,
+                    "repository_name": repository.name,
+                }
+
+
+@app.transformer(name="workflows", columns=Workflow, parallelized=True)
+def workflows(repo: Repository, ctx: SourceContext):
+    """Fetch GitHub Actions workflows for a single repository.
+
+    Args:
+        repo (Repository): The repository to fetch workflows for.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        Workflow (Workflow): An active workflow record.
+    """
+
+    @app.defer
+    def _workflow_file_contents(
+        client: RESTClient,
+        repo: Repository,
+        workflow: dict[str, Any],
+        workflow_permissions: dict[str, Any],
+    ) -> dict | None:
+        path = workflow.get("path")
+        if not path:
+            return None
+
+        params = {"ref": repo.default_branch} if repo.default_branch else None
+        response = client.get(
+            f"/repos/{repo.full_name}/contents/{path}", params=params
+        ).json()
+
+        content = response.get("content")
+        if not content:
+            return None
+
+        return {
+            **workflow,
+            "contents": content,
+            "branch": repo.default_branch,
+            "repository_name": repo.name,
+            "repository_node_id": repo.node_id,
+            "org_login": repo.org_login,
+            "repository_default_workflow_permissions": workflow_permissions.get(
+                "default_workflow_permissions"
+            ),
+            "repository_can_approve_pull_request_reviews": workflow_permissions.get(
+                "can_approve_pull_request_reviews"
+            ),
+        }
+
+    client = _client_for_org(ctx, repo.org_login)
+    workflow_permissions: dict[str, Any] | None = None
+    for page in client.paginate(
+        f"/repos/{repo.full_name}/actions/workflows", params={"per_page": 100}
+    ):
+        for workflow in page:
+            if workflow.get("state") == "active":
+                if workflow_permissions is None:
+                    workflow_permissions = _repository_workflow_permissions(
+                        ctx, client, repo.full_name
+                    )
+                yield _workflow_file_contents(
+                    client, repo, workflow, workflow_permissions
+                )
+
+
+@app.transformer(name="workflow_jobs", columns=WorkflowJob, parallelized=True)
+def workflow_jobs(workflow: Workflow):
+    for row in workflow.workflow_job_rows():
+        yield row
+
+
+@app.transformer(name="workflow_steps", columns=WorkflowStep, parallelized=True)
+def workflow_steps(workflow: Workflow):
+    for row in workflow.workflow_step_rows():
+        yield row
+
+
+@app.transformer(name="environments", columns=Environment, parallelized=True)
+def environments(repo: RepositoryQL, ctx: SourceContext):
+    """Fetch deployment environments for a repository.
+
+    Args:
+        repo (RepositoryQL): Repository metadata with the GitHub-reported environment count.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        Environment (Environment): Deployment environment record.
+    """
+
+    if repo.environment_count == 0:
+        return
+
+    full_name = f"{repo.org_login}/{repo.name}"
+    repo_name = repo.name
+    repo_node_id = repo.id
+    client = _client_for_org(ctx, repo.org_login)
+    for page in client.paginate(
+        f"/repos/{full_name}/environments",
+        params={"per_page": 100},
+        data_selector="environments",
+    ):
+        for env in page:
+            yield {
+                **env,
+                "org_login": repo.org_login,
+                "repository_name": repo_name,
+                "repository_full_name": full_name,
+                "repository_node_id": repo_node_id,
+            }
+
+
+@app.resource(name="runner_groups", columns=OrgRunnerGroup, parallelized=True)
+def runner_groups(ctx: SourceContext):
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client = org.client
+        try:
+            for page in client.paginate(
+                f"/orgs/{org_name}/actions/runner-groups",
+                params={"per_page": 100},
+                data_selector="runner_groups",
+            ):
+                for group in page:
+                    yield {
+                        **group,
+                        "org_login": org_name,
+                    }
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'runner_groups' processing organization '{org_name}': {e}",
+                extra={"resource": "runner_groups", "phase": "resource_iteration"},
+            )
+            continue
+
+
+@app.resource(name="org_runners", columns=OrgRunner, parallelized=True)
+def org_runners(ctx: SourceContext):
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client = org.client
+        try:
+            for page in client.paginate(
+                f"/orgs/{org_name}/actions/runners",
+                params={"per_page": 100},
+                data_selector="runners",
+            ):
+                for runner in page:
+                    yield {
+                        **runner,
+                        "org_login": org_name,
+                    }
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'org_runners' processing organization '{org_name}': {e}",
+                extra={"resource": "org_runners", "phase": "resource_iteration"},
+            )
+            continue
+
+
+@app.transformer(
+    name="org_runner_group_access",
+    columns=OrgRunnerGroupAccess,
+    parallelized=True,
+)
+def org_runner_group_access(group: OrgRunnerGroup, ctx: SourceContext):
+    org_name = group.org_login
+    client = _client_for_org(ctx, org_name)
+    group_row = {
+        "id": group.id,
+        "visibility": group.visibility,
+    }
+    yield {
+        "runner_group_id": group.id,
+        "runner_group_name": group.name,
+        "runner_group_visibility": group.visibility,
+        "allows_public_repositories": group.allows_public_repositories,
+        "restricted_to_workflows": getattr(group, "restricted_to_workflows", None),
+        "inherited": group.inherited,
+        "accessible_repo_node_ids": _selected_runner_group_repo_node_ids(
+            group_row, client, org_name
+        ),
+        "org_login": org_name,
+    }
+
+
+@app.transformer(
+    name="org_runner_group_memberships",
+    columns=OrgRunnerGroupMembership,
+    parallelized=True,
+)
+def org_runner_group_memberships(
+    access: OrgRunnerGroupAccess | dict[str, Any],
+    ctx: SourceContext,
+    repos: list | None = None,
+):
+    if isinstance(access, dict):
+        access = OrgRunnerGroupAccess.model_validate(access)
+
+    if access.inherited:
+        return
+
+    org_name = access.org_login
+    client = _client_for_org(ctx, org_name)
+    try:
+        for runner_page in client.paginate(
+            f"/orgs/{org_name}/actions/runner-groups/{access.runner_group_id}/runners",
+            params={"per_page": 100},
+            data_selector="runners",
+        ):
+            for runner in runner_page:
+                yield {
+                    "runner_group_id": access.runner_group_id,
+                    "runner_group_name": access.runner_group_name,
+                    "runner_id": runner["id"],
+                    "runner_group_visibility": access.runner_group_visibility,
+                    "allows_public_repositories": access.allows_public_repositories,
+                    "accessible_repo_node_ids": access.accessible_repo_node_ids,
+                    "org_login": org_name,
+                }
+    except requests.RequestException as e:
+        logger.error(
+            f"Error in resource 'org_runner_group_memberships' processing organization '{org_name}': {e}",
+            extra={
+                "resource": "org_runner_group_memberships",
+                "phase": "resource_iteration",
+            },
+        )
+        return
+
+
+@app.transformer(name="repo_runners", columns=RepoRunner, parallelized=True)
+def repo_runners(repo: Repository, ctx: SourceContext):
+    if not repo.self_hosted_runners_enabled:
+        return
+    client = _client_for_org(ctx, repo.org_login)
+    for page in client.paginate(
+        f"/repos/{repo.full_name}/actions/runners",
+        params={"per_page": 100},
+        data_selector="runners",
+    ):
+        for runner in page:
+            yield {
+                **runner,
+                "repository_name": repo.name,
+                "repository_node_id": repo.node_id,
+                "repository_full_name": repo.full_name,
+                "org_login": repo.org_login,
+            }
+
+
+@app.transformer(
+    name="environment_variables", columns=EnvironmentVariable, parallelized=True
+)
+def environment_variables(environment: Environment, ctx: SourceContext):
+    """Fetch variables for a deployment environment.
+
+    Args:
+        environment (Environment): The environment to fetch variables for.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        EnvironmentVariable (EnvironmentVariable): Environment variable record.
+    """
+    env_name = environment.name
+    encoded_env_name = _encode_path_segment(env_name)
+    env_node_id = environment.node_id
+
+    full_repo_name = environment.repository_full_name
+    repo_name = environment.repository_name
+    repo_node_id = environment.repository_node_id
+
+    client = _client_for_org(ctx, environment.org_login)
+    for page in client.paginate(
+        f"/repos/{full_repo_name}/environments/{encoded_env_name}/variables"
+    ):
+        for item in page:
+            yield {
+                **item,
+                "org_login": environment.org_login,
+                "environment_node_id": env_node_id,
+                "environment_name": env_name,
+                "repository_name": repo_name,
+                "repository_node_id": repo_node_id,
+            }
+
+
+@app.transformer(
+    name="environment_branch_policies",
+    columns=EnvironmentBranchPolicy,
+    parallelized=True,
+)
+def environment_branch_policies(environment: Environment, ctx: SourceContext):
+    """Fetch deployment branch policies for an environment.
+
+    Only fetches policies when the environment has custom branch policies configured.
+
+    Args:
+        environment (Environment): The environment to fetch branch policies for.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        EnvironmentBranchPolicy (EnvironmentBranchPolicy): Environment branch policy record.
+    """
+    has_custom = environment.has_custom_branch_policies
+    if has_custom:
+        full_repo_name = environment.repository_full_name
+        repo_name = environment.repository_name
+        repo_node_id = environment.repository_node_id
+        env_name = environment.name
+        encoded_env_name = _encode_path_segment(env_name)
+        env_node_id = environment.node_id
+        client = _client_for_org(ctx, environment.org_login)
+        for page in client.paginate(
+            f"/repos/{full_repo_name}/environments/{encoded_env_name}/deployment-branch-policies"
+        ):
+            for policy in page:
+                yield {
+                    **policy,
+                    "environment_node_id": env_node_id,
+                    "environment_name": env_name,
+                    "repository_name": repo_name,
+                    "repository_node_id": repo_node_id,
+                    "org_login": environment.org_login,
+                    "required_reviewers": environment.required_reviewers,
+                    "prevent_self_review": environment.prevent_self_review,
+                }
+
+
+@app.transformer(
+    name="environment_secrets", columns=EnvironmentSecret, parallelized=True
+)
+def environment_secrets(environment: Environment, ctx: SourceContext):
+    """Fetch secrets for a deployment environment.
+
+    Args:
+        environment (Environment): The environment to fetch secrets for.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        EnvironmentSecret (EnvironmentSecret): Environment secret record.
+    """
+    repo_name = environment.repository_name
+    repo_node_id = environment.repository_node_id
+    full_repo_name = environment.repository_full_name
+
+    env_name = environment.name
+    encoded_env_name = _encode_path_segment(env_name)
+    env_node_id = environment.node_id
+    client = _client_for_org(ctx, environment.org_login)
+    for page in client.paginate(
+        f"/repos/{full_repo_name}/environments/{encoded_env_name}/secrets"
+    ):
+        for secret in page:
+            yield {
+                **secret,
+                "org_login": environment.org_login,
+                "repository_name": repo_name,
+                "repository_node_id": repo_node_id,
+                "environment_name": env_name,
+                "environment_node_id": env_node_id,
+            }
+
+
+@app.resource(name="organization_secrets", columns=OrgSecret, parallelized=True)
+def organization_secrets(ctx: SourceContext):
+    """Fetch organization-level GitHub Actions secrets and variables with repository access.
+
+    Yields records to the following tables:
+    - organization_secrets: org-level secret metadata
+    - organization_variables: org-level variable metadata (with values)
+    - org_secret_repo_access: junction table linking secrets to accessible repos
+    - org_variable_repo_access: junction table linking variables to accessible repos
+
+    Visibility semantics:
+    - "all": all org repos have access
+    - "private": private and internal repos only
+    - "selected": specific repos fetched via API
+
+    API Reference:
+    - https://docs.github.com/en/rest/actions/secrets#list-organization-secrets
+    - https://docs.github.com/en/rest/actions/variables#list-organization-variables
+
+    Args:
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        OrgSecret (OrgSecret): Organization secret record.
+    """
+
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client = org.client
+        try:
+            for page in client.paginate(
+                f"/orgs/{org_name}/actions/secrets", params={"per_page": 100}
+            ):
+                for item in page:
+                    yield {
+                        **item,
+                        "org_login": org_name,
+                    }
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'organization_secrets' processing organization '{org_name}': {e}",
+                extra={"resource": "organization_secrets", "phase": "resource_iteration"},
+            )
+            continue
+
+
+@app.transformer(
+    name="selected_organization_secrets", columns=SelectedOrgSecret, parallelized=True
+)
+def selected_organization_secrets(secret: OrgSecret, ctx: SourceContext):
+    """Fetch repositories that a 'selected' visibility organization secret is accessible to.
+
+    Only fetches repository access for secrets with visibility set to 'selected'.
+
+    Args:
+        secret (OrgSecret): The organization secret to fetch repository access for.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        SelectedOrgSecret (SelectedOrgSecret): Secret-to-repository access record.
+    """
+    if secret.visibility == "selected":
+        client = _client_for_org(ctx, secret.org_login)
+        for page in client.paginate(
+            f"/orgs/{secret.org_login}/actions/secrets/{secret.name}/repositories",
+            params={"per_page": 100},
+        ):
+            for repo in page:
+                yield {
+                    "name": secret.name,
+                    "repository_full_name": repo["full_name"],
+                    "repository_node_id": repo["node_id"],
+                    "org_login": secret.org_login,
+                }
+
+
+@app.resource(name="organization_variables", columns=OrgVariable, parallelized=True)
+def organization_variables(ctx: SourceContext):
+    """Fetch organization-level GitHub Actions variables.
+
+    Args:
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        OrgVariable (OrgVariable): Organization variable record.
+    """
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client = org.client
+        try:
+            for page in client.paginate(
+                f"/orgs/{org_name}/actions/variables", params={"per_page": 100}
+            ):
+                for item in page:
+                    yield {
+                        **item,
+                        "org_login": org_name,
+                    }
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'organization_variables' processing organization '{org_name}': {e}",
+                extra={"resource": "organization_variables", "phase": "resource_iteration"},
+            )
+            continue
+
+
+@app.transformer(
+    name="selected_organization_variables",
+    columns=SelectedOrgVariable,
+    parallelized=True,
+)
+def selected_organization_variables(variable: OrgVariable, ctx: SourceContext):
+    """Fetch repositories that a 'selected' visibility organization variable is accessible to.
+
+    Only fetches repository access for variables with visibility set to 'selected'.
+
+    Args:
+        variable (OrgVariable): The organization variable to fetch repository access for.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        SelectedOrgVariable (SelectedOrgVariable): Variable-to-repository access record.
+    """
+    if variable.visibility == "selected":
+        client = _client_for_org(ctx, variable.org_login)
+        for page in client.paginate(
+            f"/orgs/{variable.org_login}/actions/variables/{variable.name}/repositories",
+            params={"per_page": 100},
+        ):
+            for repo in page:
+                yield {
+                    "name": variable.name,
+                    "repository_node_id": repo["node_id"],
+                    "org_login": variable.org_login,
+                }
+
+
+@app.transformer(name="repository_secrets", columns=RepoSecret, parallelized=True)
+def repository_secrets(repo: Repository, ctx: SourceContext):
+    """Fetch repository-level GitHub Actions secrets for each repository.
+
+    Args:
+        repo (dict): Individual repository data dictionary from repositories() resource.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        RepoSecret (RepoSecret): Repository secret record.
+    """
+    client = _client_for_org(ctx, repo.org_login)
+    for page in client.paginate(
+        f"/repos/{repo.full_name}/actions/secrets", params={"per_page": 100}
+    ):
+        for secret in page:
+            yield {
+                **secret,
+                "org_login": repo.org_login,
+                "repository_name": repo.full_name,
+                "repository_node_id": repo.node_id,
+            }
+
+
+@app.transformer(name="repository_variables", columns=RepoVariable, parallelized=True)
+def repository_variables(repo: Repository, ctx: SourceContext):
+    """Fetch repository-level GitHub Actions variables for each repository.
+
+    API Reference:
+    - https://docs.github.com/en/rest/actions/variables#list-repository-variables
+
+    Args:
+        repo (Repository): Individual repository data (as model) from repositories() resource.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        RepoVariable (RepoVariable): Repository variable record.
+    """
+    client = _client_for_org(ctx, repo.org_login)
+    for page in client.paginate(
+        f"/repos/{repo.full_name}/actions/variables", params={"per_page": 100}
+    ):
+        for variable in page:
+            yield {
+                **variable,
+                "org_login": repo.org_login,
+                "repository_name": repo.full_name,
+                "repository_node_id": repo.node_id,
+            }
+
+
+@app.transformer(name="repository_deploy_keys", columns=DeployKey, parallelized=True)
+def repository_deploy_keys(repo: RepositoryQL, ctx: SourceContext):
+    """Fetch repository deploy keys, including keys disabled by organization policy."""
+    if repo.deploy_key_count == 0:
+        return
+
+    client = _client_for_org(ctx, repo.org_login)
+    full_name = f"{repo.org_login}/{repo.name}"
+
+    try:
+        for page in client.paginate(
+            f"/repos/{full_name}/keys", params={"per_page": 100}
+        ):
+            for deploy_key in page:
+                yield {
+                    **deploy_key,
+                    "org_login": repo.org_login,
+                    "repository_name": full_name,
+                    "repository_node_id": repo.id,
+                }
+    except Exception as e:
+        logger.error(
+            f"Error in resource 'repository_deploy_keys' processing repository '{full_name}': {e}",
+            extra={"resource": "repository_deploy_keys", "phase": "resource_iteration"},
+        )
+
+
+@app.resource(
+    name="secret_scanning_alerts", columns=SecretScanningAlert, parallelized=True
+)
+def secret_scanning_alerts(ctx: SourceContext):
+    """Fetch secret scanning alerts for the organization.
+
+    Produces a flat record per alert with a synthetic node_id.
+
+    API Reference:
+    - https://docs.github.com/en/rest/secret-scanning/secret-scanning#list-secret-scanning-alerts-for-an-organization
+
+    Args:
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        SecretScanningAlert (SecretScanningAlert): A secret scanning alert.
+    """
+
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client = org.client
+        try:
+            for page in client.paginate(
+                f"/orgs/{org_name}/secret-scanning/alerts", params={"per_page": 100}
+            ):
+                for alert in page:
+                    valid_token_user_node_id: str | None = None
+                    secret = alert.get("secret")
+                    if (
+                        alert.get("state") == "open"
+                        and alert.get("secret_type") == "github_personal_access_token"
+                        and secret
+                    ):
+                        try:
+                            resp = requests.get(
+                                f"{_rest_api_url(client)}/user",
+                                headers={"Authorization": f"Bearer {secret}"},
+                                timeout=10,
+                            )
+                            if resp.status_code == 200:
+                                valid_token_user_node_id = resp.json().get("node_id")
+                        except Exception:
+                            pass
+
+                    yield {
+                        **alert,
+                        "valid_token_user_node_id": valid_token_user_node_id,
+                        "org_login": org_name,
+                    }
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'secret_scanning_alerts' processing organization '{org_name}': {e}",
+                extra={"resource": "secret_scanning_alerts", "phase": "resource_iteration"},
+            )
+            continue
+
+
+@app.resource(
+    name="personal_access_tokens", columns=PersonalAccessToken, parallelized=True
+)
+def personal_access_tokens(ctx: SourceContext):
+    """Fetch fine-grained PATs granted access to the organization.
+
+    API Reference:
+    - https://docs.github.com/en/rest/orgs/personal-access-tokens#list-fine-grained-personal-access-tokens-with-access-to-organization-resources
+    - https://docs.github.com/en/rest/orgs/personal-access-tokens#list-repositories-a-fine-grained-personal-access-token-has-access-to
+
+    Args:
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        PersonalAccessToken (PersonalAccessToken): Fine-grained personal access token record.
+    """
+
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client = org.client
+        try:
+            for page in client.paginate(
+                f"/orgs/{org_name}/personal-access-tokens", params={"per_page": 100}
+            ):
+                for pat in page:
+                    yield {
+                        **pat,
+                        "org_login": org_name,
+                    }
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'personal_access_tokens' processing organization '{org_name}': {e}",
+                extra={"resource": "personal_access_tokens", "phase": "resource_iteration"},
+            )
+            continue
+
+
+@app.transformer(name="pat_repo_access", columns=PatRepoAccess, parallelized=True)
+def pat_repo_access(pat: PersonalAccessToken, ctx: SourceContext):
+    """Fetch repositories a fine-grained PAT has access to within the organization.
+
+    Args:
+        pat (PersonalAccessToken): The personal access token to fetch repository access for.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        PatRepoAccess (PatRepoAccess): PAT-to-repository access record.
+    """
+    if pat.repository_selection == "all" or pat.repository_selection == "none":
+        return
+
+    client = _client_for_org(ctx, pat.org_login)
+    for page in client.paginate(
+        f"/orgs/{pat.org_login}/personal-access-tokens/{pat.id}/repositories",
+        params={"per_page": 100},
+    ):
+        for item in page:
+            yield {"pat_id": pat.id, **item, "org_login": pat.org_login}
+
+
+@app.resource(
+    name="personal_access_token_requests",
+    columns=PersonalAccessTokenRequest,
+    parallelized=True,
+)
+def personal_access_token_requests(ctx: SourceContext):
+    """Fetch pending fine-grained PAT requests for organization resources.
+
+    API Reference:
+    - https://docs.github.com/en/rest/orgs/personal-access-token-requests#list-requests-to-access-organization-resources-with-fine-grained-personal-access-tokens
+
+    Args:
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        PersonalAccessTokenRequest (PersonalAccessTokenRequest): PAT request record.
+    """
+
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client = org.client
+        try:
+            for page in client.paginate(
+                f"/orgs/{org_name}/personal-access-token-requests",
+                params={"per_page": 100},
+            ):
+                for item in page:
+                    yield {
+                        **item,
+                        "org_login": org_name,
+                    }
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'personal_access_token_requests' processing organization '{org_name}': {e}",
+                extra={"resource": "personal_access_token_requests", "phase": "resource_iteration"},
+            )
+            continue
+
+
+@app.resource(name="saml_provider", columns=SamlProvider, parallelized=True)
+def saml_provider(ctx: SourceContext):
+    """Fetch the SAML identity provider for the organization.
+
+    Yields records to the saml_provider table only. External identities are yielded
+    separately by the external_identities transformer.
+
+    Args:
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        SamlProvider (SamlProvider): SAML provider record.
+    """
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client, graphql_path = _graphql_client_for_org(ctx, org_name)
+        try:
+            data = {
+                "query": SAML_QUERY,
+                "variables": {"login": org_name, "count": 100, "after": None},
+            }
+
+            response = client.post(graphql_path, json=data).json()
+            response_data = response.get("data", {})
+            org_data = response_data.get("organization", {})
+            if response_data and org_data:
+                saml_provider = org_data.get("samlIdentityProvider")
+                if not saml_provider:
+                    continue
+
+                yield {
+                    **saml_provider,
+                    "environment_node_id": org_data["id"],
+                    "environment_name": org_data["name"],
+                    "environment_slug": org_name,
+                    "environment_type": "org",
+                    "github_deployment_id": org.github_deployment_id,
+                    "github_web_origin": org.github_web_origin,
+                }
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'saml_provider' processing organization '{org_name}': {e}",
+                extra={"resource": "saml_provider", "phase": "resource_iteration"},
+            )
+            continue
+
+
+@app.resource(name="external_identities", columns=ExternalIdentity, parallelized=True)
+def external_identities(ctx: SourceContext):
+    """Fetch external identities linked to the SAML provider.
+
+    Args:
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        ExternalIdentity (ExternalIdentity): External identity record.
+    """
+    for org in ctx.organizations:
+        org_name = org.org_name
+        client, graphql_path = _graphql_client_for_org(ctx, org_name)
+        github_deployment_id = org.github_deployment_id
+        try:
+            paginator = GraphQLCursorPaginator(
+                page_info_path="data.organization.samlIdentityProvider.externalIdentities.pageInfo",
+                cursor_variable="after",
+                cursor_field="endCursor",
+                has_next_field="hasNextPage",
+                allow_missing_page_info=True,
+            )
+            data = {
+                "query": SAML_IDENTITIES_QUERY,
+                "variables": {"login": org_name, "count": 100, "after": None},
+            }
+
+            for page_data in client.paginate(
+                graphql_path,
+                method="POST",
+                json=data,
+                paginator=paginator,
+                data_selector="data",
+            ):
+                for org in page_data:
+                    org_data = org.get("organization")
+                    idp = org_data.get("samlIdentityProvider")
+                    if not idp:
+                        continue
+                    for identity in (idp.get("externalIdentities") or {}).get(
+                        "nodes"
+                    ) or []:
+                        yield {
+                            **identity,
+                            "environment_slug": org_data.get("login"),
+                            "github_deployment_id": github_deployment_id,
+                        }
+        except Exception as e:
+            logger.error(
+                f"Error in resource 'external_identities' processing organization '{org_name}': {e}",
+                extra={"resource": "external_identities", "phase": "resource_iteration"},
+            )
+            continue
+
+@app.transformer(name="saml_service_provider", columns=SamlServiceProvider, parallelized=True)
+def saml_service_provider(saml_provider: SamlProvider, ctx: SourceContext):
+    """Transform SAML provider data into a normalized SAML interface representation.
+
+    Args:
+        saml_provider (SamlProvider): The SAML provider to transform.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        SamlInterface (SamlInterface): Normalized SAML interface record.
+    """
+    yield {
+        "id": saml_provider["id"],
+        "issuer": saml_provider.get("issuer"),
+        "environment_node_id": saml_provider["environment_node_id"],
+        "environment_name": saml_provider["environment_name"],
+        "environment_slug": saml_provider["environment_slug"],
+        "environment_type": saml_provider["environment_type"],
+        "github_deployment_id": saml_provider.get("github_deployment_id"),
+        "github_web_origin": saml_provider.get("github_web_origin"),
+    }
+
+@app.transformer(name="saml_assertion_consumer_service", columns=SamlAssertionConsumerService, parallelized=True)
+def saml_assertion_consumer_service(saml_provider: SamlProvider, ctx: SourceContext):
+    yield {
+        "environment_slug": saml_provider.get("environment_slug"),
+        "environment_type": saml_provider.get("environment_type"),
+        "environment_node_id": saml_provider.get("environment_node_id"),
+        "environment_name": saml_provider.get("environment_name"),
+        "github_deployment_id": saml_provider.get("github_deployment_id"),
+        "github_web_origin": saml_provider.get("github_web_origin"),
+    }
+
+@app.transformer(name="saml_issuer", columns=SamlIssuer, parallelized=True)
+def saml_issuer(saml_provider: SamlProvider, ctx: SourceContext):
+    issuer = saml_provider.get("issuer")
+    if not issuer:
+        return
+
+    yield {
+        "issuer": issuer,
+        "environment_slug": saml_provider.get("environment_slug"),
+        "environment_type": saml_provider.get("environment_type"),
+        "environment_node_id": saml_provider.get("environment_node_id"),
+        "environment_name": saml_provider.get("environment_name"),
+        "github_deployment_id": saml_provider.get("github_deployment_id"),
+        "github_web_origin": saml_provider.get("github_web_origin"),
+    }
+
+def iter_organization_scim_users(
+    client: RESTClient,
+    org_name: str,
+    *,
+    count: int = 100,
+):
+    scim_paginator = OffsetPaginator(
+        offset_param="startIndex",
+        limit_param="count",
+        limit=count,
+        offset=1,
+        total_path="totalResults",
+    )
+    for page in client.paginate(
+        f"/scim/v2/organizations/{org_name}/Users",
+        params={"startIndex": 1, "count": count},
+        paginator=scim_paginator,
+        data_selector="Resources",
+    ):
+        yield from page
+
+
+def _org_context_for_login(ctx: SourceContext, org_login: str) -> OrgContext | None:
+    for org in ctx.organizations:
+        if org.org_name == org_login:
+            return org
+    return None
+
+
+def _log_org_scim_failure(resource: str, org_name: str, exception: BaseException):
+    skip_reason = scim_skip_reason(exception)
+    if skip_reason:
+        logger.warning(
+            "Skipping %s for organization '%s': %s",
+            resource,
+            org_name,
+            skip_reason,
+            extra={"resource": resource, "phase": "resource_iteration"},
+        )
+        return
+
+    logger.error(
+        f"Error in resource '{resource}' processing organization '{org_name}': {exception}",
+        extra={"resource": resource, "phase": "resource_iteration"},
+    )
+
+
+@app.transformer(name="scim_users", columns=ScimResource, parallelized=True)
+def scim_users(scim_organization: ScimOrganization, ctx: SourceContext):
+    """Fetch SCIM users for the organization.
+
+    Args:
+        scim_organization (ScimOrganization): The SCIM scope whose users should be fetched.
+        ctx (SourceContext): The shared context containing the REST client and organization name.
+
+    Yields:
+        ScimResource (ScimResource): SCIM user record.
+    """
+    org_name = scim_organization.org_login
+    org = _org_context_for_login(ctx, org_name)
+    if not org:
+        raise ValueError(f"SCIM collection requires a configured client for organization '{org_name}'")
+
+    try:
+        for user in iter_organization_scim_users(org.client, org_name):
+            yield {
+                **user,
+                "org_login": org_name,
+            }
+    except Exception as e:
+        _log_org_scim_failure("scim_users", org_name, e)
+        return
+
+
+@app.transformer(
+    name="org_scim_organizations",
+    columns=ScimOrganization,
+    parallelized=True,
+)
+def org_scim_organizations(org: Organization, ctx: SourceContext):
+    org_context = _org_context_for_login(ctx, org.login)
+    if not org_context:
+        raise ValueError(
+            f"SCIM collection requires a configured client for organization '{org.login}'"
+        )
+
+    try:
+        next(
+            iter_organization_scim_users(
+                org_context.client,
+                org.login,
+                count=1,
+            ),
+            None,
+        )
+    except Exception as e:
+        _log_org_scim_failure("org_scim_organizations", org.login, e)
+        return
+
+    yield {
+        "org_login": org.login,
+        "org_node_id": org.node_id,
+    }
+
+
+@app.transformer(
+    name="scopes",
+    columns=Scope,
+    parallelized=True,
+)
+def scopes(org: Organization):
+    for scope_type in (
+        "repository",
+        "runner_group",
+        "organization_secret",
+        "organization_variable",
+    ):
+        for scope in ("all", "private_or_internal"):
+            yield {
+                "org_login": org.login,
+                "org_node_id": org.node_id,
+                "scope_type": scope_type,
+                "scope": scope,
+            }
+
+
+def organization_resources(ctx: SourceContext):
+    """Assemble organization resources, including selected installation access."""
+    org_resource = organizations(ctx)
+    roles_resource = org_roles(ctx)
+    repo_roles_base = RepositoryRoleCache(ctx)
+    repos_resource = repositories(ctx)
+    workflows_resource = repos_resource | workflows(ctx)
+    personal_access_tokens_resource = personal_access_tokens(ctx)
+
+    teams_resource = teams(ctx)
+    team_external_groups_resource = team_external_groups(ctx)
+    repositories_graphql_resource = repositories_graphql(ctx)
+    environments_resource = repositories_graphql_resource | environments(ctx)
+    app_installs_resource = app_installations(ctx)
+    runner_groups_resource = runner_groups(ctx)
+    runner_group_access_resource = runner_groups_resource | org_runner_group_access(ctx)
+    branch_prot_rules_resource = (
+        repositories_graphql_resource | branch_protection_rules(ctx)
+    )
+    organization_secrets_resource = organization_secrets(ctx)
+    organization_vars_resource = organization_variables(ctx)
+    projected_enterprise_teams_resource = projected_enterprise_teams(ctx)
+    saml_resource = saml_provider(ctx)
+    org_scim_organizations_resource = org_resource | org_scim_organizations(ctx)
+    scopes_resource = org_resource | scopes()
+
+    return (
+        org_resource,
+        scopes_resource,
+        org_resource | roles_resource,
+        org_resource | roles_resource | org_role_teams(ctx),
+        org_resource | roles_resource | org_role_members(ctx),
+        app_installs_resource,
+        app_installs_resource | app_installation_repo_access(ctx),
+        app_installs_resource | applications(ctx),
+        users(ctx),
+        actions_permissions(ctx),
+        repos_resource,
+        repos_resource | repository_roles(repo_roles_base),
+        repos_resource | repo_role_assignments(ctx, repo_roles_base),
+        repos_resource | repo_runners(ctx),
+        repos_resource | repository_secrets(ctx),
+        repos_resource | repository_variables(ctx),
+        teams_resource,
+        team_external_groups_resource,
+        projected_enterprise_teams_resource,
+        org_scim_organizations_resource,
+        teams_resource | team_members(ctx),
+        teams_resource | team_roles(),
+        teams_resource | team_repo_role_assignments(ctx, repo_roles_base),
+        org_scim_organizations_resource | scim_users(ctx),
+        repositories_graphql_resource,
+        repositories_graphql_resource | repository_deploy_keys(ctx),
+        repositories_graphql_resource | branches(ctx),
+        branch_prot_rules_resource,
+        secret_scanning_alerts(ctx),
+        saml_resource,
+        saml_resource | saml_service_provider(ctx),
+        saml_resource | saml_assertion_consumer_service(ctx),
+        saml_resource | saml_issuer(ctx),
+        external_identities(ctx),
+        workflows_resource,
+        workflows_resource | workflow_jobs(),
+        workflows_resource | workflow_steps(),
+        environments_resource,
+        environments_resource | environment_variables(ctx),
+        environments_resource | environment_secrets(ctx),
+        environments_resource | environment_branch_policies(ctx),
+        runner_groups_resource,
+        org_runners(ctx),
+        runner_group_access_resource,
+        runner_group_access_resource | org_runner_group_memberships(ctx),
+        personal_access_tokens_resource,
+        personal_access_tokens_resource | pat_repo_access(ctx),
+        organization_secrets_resource,
+        organization_secrets_resource | selected_organization_secrets(ctx),
+        organization_vars_resource,
+        organization_vars_resource | selected_organization_variables(ctx),
+        personal_access_token_requests(ctx),
+    )

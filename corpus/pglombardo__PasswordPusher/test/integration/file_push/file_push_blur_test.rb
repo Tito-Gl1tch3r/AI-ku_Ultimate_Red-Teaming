@@ -1,0 +1,75 @@
+# frozen_string_literal: true
+
+require "test_helper"
+
+class FilePushBlurTest < ActionDispatch::IntegrationTest
+  include Devise::Test::IntegrationHelpers
+
+  setup do
+    Settings.enable_file_pushes = true
+    Rails.application.reload_routes!
+    @luca = users(:luca)
+    sign_in @luca
+
+    Settings.files.enable_blur = true
+  end
+
+  teardown do
+    Settings.reload!
+    Rails.application.reload_routes!
+  end
+
+  def test_blur_enabled
+    post pushes_path, params: {
+      push: {
+        kind: "file",
+        payload: "Message",
+        files: [
+          fixture_file_upload("monkey.png", "image/jpeg")
+        ]
+      }
+    }
+    assert_response :redirect
+
+    # Preview page
+    follow_redirect!
+    assert_response :success
+    assert_select "h2", "Push Created"
+
+    # File Push page
+    get request.url.sub("/preview", "")
+    assert_response :success
+
+    # Validate that blur is enabled
+    tags = assert_select "#push_payload"
+    assert tags.first.attr("class").include?("spoiler")
+  end
+
+  def test_blur_when_disabled
+    Settings.files.enable_blur = false
+
+    post pushes_path, params: {
+      push: {
+        kind: "file",
+        payload: "Message",
+        files: [
+          fixture_file_upload("monkey.png", "image/jpeg")
+        ]
+      }
+    }
+    assert_response :redirect
+
+    # Preview page
+    follow_redirect!
+    assert_response :success
+    assert_select "h2", "Push Created"
+
+    # File Push page
+    get request.url.sub("/preview", "")
+    assert_response :success
+
+    # Validate that blur is enabled
+    tags = assert_select "#push_payload"
+    assert_not tags.first.attr("class").include?("spoiler")
+  end
+end

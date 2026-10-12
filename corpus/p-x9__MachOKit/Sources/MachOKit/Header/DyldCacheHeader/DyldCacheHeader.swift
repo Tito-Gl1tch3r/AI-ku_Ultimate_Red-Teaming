@@ -1,0 +1,206 @@
+//
+//  DyldCacheHeader.swift
+//
+//
+//  Created by p-x9 on 2024/01/14.
+//  
+//
+
+import Foundation
+
+public struct DyldCacheHeader: LayoutWrapper, Sendable {
+    public typealias Layout = dyld_cache_header
+
+    public var layout: Layout
+}
+
+extension DyldCacheHeader {
+    /// dyld_cache magic number identifier
+    public var magic: String {
+        .init(tuple: layout.magic)
+    }
+
+    /// Unique value for each shared cache file
+    public var uuid: UUID {
+        .init(uuid: layout.uuid)
+    }
+
+    /// Type of dyld  cache.
+    public var cacheType: DyldCacheType! {
+        .init(rawValue: layout.cacheType)
+    }
+
+    /// Sub type of dyld cache for a multi-cache, nil otherwise.
+    public var cacheSubType: DyldCacheSubType? {
+        guard cacheType == .multiCache else { return nil }
+        return .init(rawValue: layout.cacheSubType)
+    }
+
+    /// Target Platform
+    public var platform: Platform {
+        .init(rawValue: layout.platform) ?? .unknown
+    }
+
+    /// A boolean value that indicates whether this cache targets simulator
+    public var isSimulator: Bool {
+        layout.simulator != 0
+    }
+
+    /// Target OS version
+    public var osVersion: Version {
+        .init(layout.osVersion)
+    }
+
+    /// Alternative target platform.
+    public var altPlatform: Platform {
+        .init(rawValue: layout.altPlatform) ?? .unknown
+    }
+
+    /// Alternative target OS version
+    public var altOsVersion: Version {
+        .init(layout.altOsVersion)
+    }
+
+    /// UUID of the associated symbol file.
+    public var symbolFileUUID: UUID {
+        .init(uuid: layout.symbolFileUUID)
+    }
+}
+
+extension DyldCacheHeader {
+    public var imagesCount: Int {
+        if hasProperty(\.imagesCount) {
+            return numericCast(layout.imagesCount)
+        } else {
+            return numericCast(layout.imagesCountOld)
+        }
+    }
+
+    public var imagesOffset: Int {
+        if hasProperty(\.imagesOffset) {
+            return numericCast(layout.imagesOffset)
+        } else {
+            return numericCast(layout.imagesOffsetOld)
+        }
+    }
+}
+
+extension DyldCacheHeader {
+    /// CPU the images in this cache are built for.
+    ///
+    /// Only a cache whose header states the architecture outright answers this.
+    /// That field pair arrived with the macOS 27 / iOS 27 cache format, once the
+    /// architecture outgrew ``magic``: the field is 16 bytes, `"dyld_v1"` takes
+    /// 7, and `"arm64ex1"` fills the remaining 8 exactly, leaving no room for a
+    /// longer name.
+    ///
+    /// An older cache answers `nil` — there the architecture can only be read
+    /// back out of ``magic``, which is what ``DyldCache`` falls back to.
+    public var cpu: CPU? {
+        guard hasProperty(\.cpusubtype) else { return nil }
+        return .init(
+            typeRawValue: layout.cputype,
+            subtypeRawValue: layout.cpusubtype
+        )
+    }
+
+    /// CPU information resolved from the best source available in this header.
+    ///
+    /// Newer cache headers carry the raw CPU pair directly. Older headers are
+    /// resolved from ``magic`` instead. The two sources are kept as a pair so
+    /// that subtype feature bits are preserved and values from different
+    /// sources are never combined. A known CPU type remains usable when its
+    /// subtype is newer than MachOKit's typed subtype model.
+    internal var _resolvedCPU: CPU? {
+        if let cpu {
+            guard cpu.type != nil else { return nil }
+            return cpu
+        }
+
+        guard let type = _cpuTypeFromMagic,
+              let subtype = _cpuSubTypeFromMagic else {
+            return nil
+        }
+        return .init(
+            typeRawValue: type.rawValue,
+            subtypeRawValue: subtype.rawValue
+        )
+    }
+
+    /// CPU type of the images in this cache.
+    ///
+    /// Read from the header when it carries the architecture, otherwise
+    /// recovered from ``magic``.
+    internal var _cpuType: CPUType? {
+        _resolvedCPU?.type
+    }
+
+    /// CPU subtype of the images in this cache.
+    ///
+    /// Read from the header when it carries the architecture, otherwise
+    /// recovered from ``magic``.
+    internal var _cpuSubType: CPUSubType? {
+        _resolvedCPU?.subtype
+    }
+
+    // https://github.com/apple-oss-distributions/dyld/blob/d1a0f6869ece370913a3f749617e457f3b4cd7c4/dyld/SharedCacheRuntime.cpp#L100
+    // https://github.com/opensource-apple/dyld/blob/3f928f32597888c5eac6003b9199d972d49857b5/src/dyld.cpp#L3112
+    private var _cpuTypeFromMagic: CPUType? {
+        switch magic {
+        case "dyld_v1    i386": return .i386
+        case "dyld_v1  x86_64": return .x86_64
+        case "dyld_v1 x86_64h": return .x86_64
+        case "dyld_v1   armv5": return .arm
+        case "dyld_v1   armv6": return .arm
+        case "dyld_v1  armv7f": return .arm
+        case "dyld_v1  armv7k": return .arm
+        case "dyld_v1   armv7": return .arm
+        case "dyld_v1  armv7s": return .arm
+        case "dyld_v1  arm64e": return .arm64
+        case "dyld_v1   arm64": return .arm64
+        case "dyld_v1arm64_32": return .arm64_32
+        case "dyld_v1arm64ex1": return .arm64
+        default: return nil
+        }
+    }
+
+    private var _cpuSubTypeFromMagic: CPUSubType? {
+        switch magic {
+        case "dyld_v1    i386": return .i386(.i386_all)
+        case "dyld_v1  x86_64": return .x86(.x86_64_all)
+        case "dyld_v1 x86_64h": return .x86(.x86_64_h)
+        case "dyld_v1   armv5": return .arm(.arm_v5tej) // == CPU_SUBTYPE_ARM_V5
+        case "dyld_v1   armv6": return .arm(.arm_v6)
+        case "dyld_v1  armv7f": return .arm(.arm_v7f)
+        case "dyld_v1  armv7k": return .arm(.arm_v7k)
+        case "dyld_v1   armv7": return .arm(.arm_v7)
+        case "dyld_v1  armv7s": return .arm(.arm_v7s)
+        case "dyld_v1  arm64e": return .arm64(.arm64e)
+        case "dyld_v1   arm64": return .arm64(.arm64_all)
+        case "dyld_v1arm64_32": return .arm64_32(.arm64_32_all)
+        case "dyld_v1arm64ex1": return .arm64(.arm64e_x1)
+        default: return nil
+        }
+    }
+}
+
+extension DyldCacheHeader {
+    /// Actual size of the header that this dyld cache has
+    ///
+    /// There are properties in the dyld_cache_header that are not present in the old dyld cache format.
+    /// In this case, a value smaller than sizeof(dyld_cache_header) is returned.
+    public var actualSize: Int {
+        numericCast(layout.mappingOffset)
+    }
+
+    /// Whether the property is included in the header of this dyld cache.
+    /// - Parameter keyPath: keyPath of property.
+    /// - Returns: True if included, false if not.
+    public func hasProperty<Value>(_ keyPath: KeyPath<Layout, Value>) -> Bool {
+        guard let offset = MemoryLayout<Layout>.offset(of: keyPath) else {
+            return false
+        }
+        let size = MemoryLayout<Value>.size
+        return actualSize >= offset + size
+    }
+}

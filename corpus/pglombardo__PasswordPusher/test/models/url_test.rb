@@ -1,0 +1,108 @@
+# frozen_string_literal: true
+
+require "test_helper"
+
+class UrlTest < ActiveSupport::TestCase
+  setup do
+    Settings.enable_url_pushes = true
+  end
+
+  teardown do
+    Settings.reload!
+  end
+
+  test "should create url with name" do
+    url = Push.new(
+      kind: "url",
+      payload: "https://example.com",
+      name: "Test URL"
+    )
+    assert url.save
+    assert_equal "Test URL", url.name
+  end
+
+  test "should save url without name" do
+    url = Push.new(
+      kind: "url",
+      payload: "https://example.com"
+    )
+    assert url.save
+    assert_equal "", url.name
+  end
+
+  test "should include name in json representation when owner is true" do
+    url = Push.new(
+      kind: "url",
+      payload: "https://example.com",
+      name: "Test URL",
+      expire_after_days: 7,
+      expire_after_views: 10
+    )
+    assert url.save
+
+    json = JSON.parse(url.to_json({owner: true}))
+    assert_equal "Test URL", json["name"]
+  end
+
+  test "should not include name in json representation when owner is false" do
+    url = Push.new(
+      kind: "url",
+      payload: "https://example.com",
+      name: "Test URL",
+      expire_after_days: 7,
+      expire_after_views: 10
+    )
+    assert url.save
+
+    json = JSON.parse(url.to_json({}))
+    assert_not json.key?("name")
+  end
+
+  test "should reject data uri payloads" do
+    url = Push.new(
+      kind: "url",
+      payload: "data:text/html,<script>alert(1)</script>"
+    )
+
+    assert_not url.valid?
+    assert_includes url.errors[:payload], I18n._("must be a valid HTTP or HTTPS URL.")
+  end
+
+  test "should reject javascript uri payloads" do
+    url = Push.new(
+      kind: "url",
+      payload: "javascript:alert(1)"
+    )
+
+    assert_not url.valid?
+    assert_includes url.errors[:payload], I18n._("must be a valid HTTP or HTTPS URL.")
+  end
+
+  test "should reject ftp uri payloads" do
+    url = Push.new(
+      kind: "url",
+      payload: "ftp://example.com"
+    )
+
+    assert_not url.valid?
+    assert_includes url.errors[:payload], I18n._("must be a valid HTTP or HTTPS URL.")
+  end
+
+  test "should accept http uri payloads" do
+    url = Push.new(
+      kind: "url",
+      payload: "http://example.com"
+    )
+
+    assert url.valid?
+  end
+
+  test "should accept https uri payloads" do
+    url = Push.new(
+      kind: "url",
+      payload: "https://example.com"
+    )
+
+    assert url.valid?
+  end
+end

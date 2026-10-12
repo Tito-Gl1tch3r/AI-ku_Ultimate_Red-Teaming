@@ -1,0 +1,240 @@
+# frozen_string_literal: true
+
+require 'timeout'
+
+require 'seccomp-tools/bpf'
+require 'seccomp-tools/const'
+require 'seccomp-tools/disasm/disasm'
+require 'seccomp-tools/instruction/instruction'
+require 'seccomp-tools/symbolic/executor'
+
+describe SeccompTools::Symbolic::Executor do
+  # Assemble a BPF opcode from its named parts, e.g. cmd(:jmp, jmp: :jeq, src: :k).
+  def cmd(command, **parts)
+    c = SeccompTools::Const::BPF
+    maps = { jmp: c::JMP, mode: c::MODE, op: c::OP, misc: c::MISCOP, src: c::SRC }
+    parts.reduce(c::COMMAND[command]) { |code, (key, name)| code | maps[key][name] }
+  end
+
+  def inst(code, jt: 0, jf: 0, k: 0)
+    SeccompTools::BPF.new({ code:, jt:, jf:, k: }, :amd64, 0).inst
+  end
+
+  def run(insts)
+    described_class.new(insts).run
+  end
+
+  def leaves_of(insts)
+    run(insts).first
+  end
+
+  def rets(leaves)
+    leaves.map { |l| l.ret.imm? ? l.ret.val : l.ret.kind }
+  end
+
+  it 'exercises every instruction kind and reaches a return' do
+    insts = [
+      inst(cmd(:ldx, mode: :imm), k: 7),           # X = 7           (ld into X, immediate)
+      inst(cmd(:ld, mode: :abs), k: 0),            # A = data[0]     (ld from data buffer)
+      inst(cmd(:st), k: 3),                        # mem[3] = A
+      inst(cmd(:stx), k: 4),                       # mem[4] = X
+      inst(cmd(:ld, mode: :mem), k: 3),            # A = mem[3]      (ld from scratch)
+      inst(cmd(:ld, mode: :imm), k: 9),            # A = 9           (ld immediate)
+      inst(cmd(:alu, op: :and, src: :k), k: 0xff), # A &= 0xff       (alu, immediate operand)
+      inst(cmd(:alu, op: :add, src: :x)),          # A += X          (alu, X operand)
+      inst(cmd(:misc, misc: :tax)),                # X = A
+      inst(cmd(:misc, misc: :txa)),                # A = X
+      inst(cmd(:jmp, jmp: :ja), k: 0),             # goto next
+      inst(cmd(:ret), k: 0x7fff0000)               # return ALLOW
+    ]
+    leaves, truncated = run(insts)
+    expect(truncated).to be false
+    expect(rets(leaves)).to eq [0x7fff0000]
+    expect(leaves.first.line).to be 11
+  end
+
+  it 'returns the accumulator for `return A`' do
+    leaves, = run([inst(cmd(:ld, mode: :imm), k: 5), inst(cmd(:ret, src: :a))])
+    expect(leaves.first.ret).to eq SeccompTools::Symbolic::Expr.imm(5)
+  end
+
+  it 'starts with the kernel-guaranteed zeroed registers' do
+    # `return A` with A never written returns 0: the kernel clears A and X before a filter runs.
+    leaves, = run([inst(cmd(:ret, src: :a))])
+    expect(leaves.first.ret).to eq SeccompTools::Symbolic::Expr.imm(0)
+  end
+
+  it 'takes only the real branch of a comparison between constants' do
+    insts = [
+      inst(cmd(:jmp, jmp: :jeq, src: :x), jt: 0, jf: 1), # A == X, both are the initial 0
+      inst(cmd(:ret), k: 0x7fff0000),
+      inst(cmd(:ret), k: 0)
+    ]
+    leaves, = run(insts)
+    expect(rets(leaves)).to eq [0x7fff0000]
+    expect(leaves.first.path).to eq [] # a constant comparison teaches nothing
+  end
+
+  it 'collects one leaf per reachable return with its path condition' do
+    raw = File.binread(File.join(__dir__, '..', 'data', 'libseccomp.bpf'))
+    insts = SeccompTools::Disasm.to_bpf(raw, :amd64).map(&:inst)
+    leaves, = run(insts)
+    # write/close/dup/exit -> ALLOW, ERRNO(5) default, KILL (x32 range and non-x86_64)
+    expect(rets(leaves)).to include(0x7fff0000, 0x00050005, 0)
+    allow_leaf = leaves.find { |l| l.ret.val == 0x7fff0000 && l.path.size == 3 }
+    expect(allow_leaf.path.map(&:op)).to include(:==)
+  end
+
+  it 'narrows on a comparison against register X' do
+    insts = [
+      inst(cmd(:ldx, mode: :imm), k: 1),
+      inst(cmd(:ld, mode: :abs), k: 0),
+      inst(cmd(:jmp, jmp: :jeq, src: :x), jt: 0, jf: 1), # if A == X goto next else skip
+      inst(cmd(:ret), k: 0x7fff0000),
+      inst(cmd(:ret), k: 0)
+    ]
+    expect(rets(leaves_of(insts))).to contain_exactly(0x7fff0000, 0)
+  end
+
+  it 'records a data-to-data computation as a binop constraint' do
+    insts = [
+      inst(cmd(:ld, mode: :abs), k: 16),             # A = data[16]
+      inst(cmd(:misc, misc: :tax)),                  # X = data[16]
+      inst(cmd(:ld, mode: :abs), k: 24),             # A = data[24]
+      inst(cmd(:alu, op: :and, src: :x)),            # A = data[24] & data[16]
+      inst(cmd(:jmp, jmp: :jeq), jt: 0, jf: 1, k: 5), # A == 5 -> ALLOW
+      inst(cmd(:ret), k: 0x7fff0000),
+      inst(cmd(:ret), k: 0)
+    ]
+    leaves, = run(insts)
+    expr = leaves.find { |l| l.ret.val == 0x7fff0000 }.path.first.lhs
+    expect(expr.kind).to be :binop
+    expect([expr.op, expr.lhs, expr.rhs])
+      .to eq [:&, SeccompTools::Symbolic::Expr.data(24), SeccompTools::Symbolic::Expr.data(16)]
+  end
+
+  it 'handles unary negation without crashing on its nil operand' do
+    insts = [
+      inst(cmd(:ld, mode: :abs), k: 16),             # A = data[16]
+      inst(cmd(:alu, op: :neg)),                     # A = -A
+      inst(cmd(:jmp, jmp: :jeq), jt: 0, jf: 1, k: 5), # -A == 5 -> ALLOW
+      inst(cmd(:ret), k: 0x7fff0000),
+      inst(cmd(:ret), k: 0)
+    ]
+    leaves, = run(insts)
+    expr = leaves.find { |l| l.ret.val == 0x7fff0000 }.path.first.lhs
+    expect([expr.kind, expr.op, expr.lhs]).to eq [:unop, :neg, SeccompTools::Symbolic::Expr.data(16)]
+  end
+
+  it 'treats a jump with equal targets as unconditional (no fact learned)' do
+    insts = [
+      inst(cmd(:ld, mode: :abs), k: 0),
+      inst(cmd(:jmp, jmp: :jeq), jt: 1, jf: 1, k: 5), # both branches go to the same line
+      inst(cmd(:ret), k: 0),                          # skipped
+      inst(cmd(:ret), k: 0x7fff0000)
+    ]
+    leaves, = run(insts)
+    expect(rets(leaves)).to eq [0x7fff0000]
+    expect(leaves.first.path).to eq [] # unconditional jump adds no constraint
+  end
+
+  it 'ignores instructions that run off the end of the program' do
+    leaves, = run([inst(cmd(:ld, mode: :abs), k: 0)]) # no return
+    expect(leaves).to eq []
+  end
+
+  it 'reports truncation when the step cap is hit' do
+    stub_const('SeccompTools::Symbolic::Executor::STEP_CAP', 1)
+    _, truncated = run([inst(cmd(:ld, mode: :abs), k: 0), inst(cmd(:ret), k: 0)])
+    expect(truncated).to be true
+  end
+
+  it 'walks re-merging control flow without the visited set degrading to a linear scan' do
+    # A chain of N diamonds: each loads a distinct data word, forks on `== k`, and rejoins before
+    # the next. Because both branches rejoin, 2^N distinct path conditions reach the final return.
+    # The visited set dedups on the state key, which embeds the path condition; that only keeps the
+    # walk tractable if the state *hashes* well. Its hash used to be that of a nested Array, which
+    # collapses when siblings differ only in a comparison operator (Ruby maps :== and :!= to one
+    # hash), turning every insert into an O(n) scan and this walk into minutes of work.
+    n = 11
+    insts = Array.new(n) do |i|
+      [inst(cmd(:ld, mode: :abs), k: i * 4), # A = data[i*4] (a distinct word)
+       inst(cmd(:jmp, jmp: :jeq, src: :k), jt: 1, jf: 0, k: 0x1000 + i), # A == k -> merge, skipping
+       inst(cmd(:jmp, jmp: :ja), k: 0)] # ...the unconditional rejoin
+    end.flatten << inst(cmd(:ret), k: 0x7fff0000)
+
+    leaves = Timeout.timeout(5) { leaves_of(insts) }
+    # Every word is independent, so all 2^N paths are feasible and reach ALLOW.
+    expect(leaves.size).to be(2**n)
+    expect(rets(leaves).uniq).to eq [0x7fff0000]
+  end
+
+  context 'feasibility pruning' do
+    it 'drops a path that requires one word to equal two different values' do
+      # if A == 1 { if A == 2 { ALLOW } }  -- both eqs can never hold together
+      insts = [
+        inst(cmd(:ld, mode: :abs), k: 0),
+        inst(cmd(:jmp, jmp: :jeq), jt: 0, jf: 1, k: 1), # A == 1 -> next, else KILL
+        inst(cmd(:jmp, jmp: :jeq), jt: 1, jf: 0, k: 2), # A == 2 -> ALLOW(line4), else KILL(line3)
+        inst(cmd(:ret), k: 0),
+        inst(cmd(:ret), k: 0x7fff0000)
+      ]
+      expect(rets(leaves_of(insts))).not_to include(0x7fff0000)
+    end
+
+    it 'drops an equality that contradicts an inequality on the same word' do
+      # the only path to ALLOW is `A > 10 && A == 5`, which is impossible
+      insts = [
+        inst(cmd(:ld, mode: :abs), k: 0),
+        inst(cmd(:jmp, jmp: :jgt), jt: 0, jf: 3, k: 10), # A > 10 -> line2, A <= 10 -> KILL(5)
+        inst(cmd(:jmp, jmp: :jeq), jt: 1, jf: 2, k: 5),  # A == 5 -> ALLOW(4), A != 5 -> KILL(5)
+        inst(cmd(:ret), k: 0),                           # line3: unreached
+        inst(cmd(:ret), k: 0x7fff0000),                  # line4: ALLOW (impossible path)
+        inst(cmd(:ret), k: 0)                            # line5: KILL
+      ]
+      expect(rets(leaves_of(insts))).not_to include(0x7fff0000)
+    end
+
+    it 'drops a path that requires one derived value to equal two different values' do
+      # A rule that masks an argument and then rechecks it below - the shape a filter gets when its
+      # rules re-join one chain. `(A & 0xff) == 3` and `== 4` constrain the same expression, so the
+      # path is impossible even though neither fact is about a bare data word.
+      insts = [
+        inst(cmd(:ld, mode: :abs), k: 0),                    # A = data[0]
+        inst(cmd(:alu, op: :and, src: :k), k: 0xff),         # A &= 0xff
+        inst(cmd(:jmp, jmp: :jeq), jt: 0, jf: 1, k: 3),      # == 3 -> next, else KILL(4)
+        inst(cmd(:jmp, jmp: :jeq), jt: 1, jf: 0, k: 4),      # == 4 -> ALLOW(5), else KILL(4)
+        inst(cmd(:ret), k: 0),
+        inst(cmd(:ret), k: 0x7fff0000)
+      ]
+      expect(rets(leaves_of(insts))).not_to include(0x7fff0000)
+    end
+
+    it 'keeps a path that pins two distinct opaque values to different constants' do
+      # Facts are grouped by the expression they constrain, and every opaque value shares one key.
+      # Grouping those together would read this path as `o == 1 && o == 2` and wrongly drop it,
+      # so opaque values are left out of the check entirely.
+      insts = [
+        inst(cmd(:ld, mode: :mem), k: 0),                    # A = mem[0] (opaque)
+        inst(cmd(:jmp, jmp: :jeq), jt: 0, jf: 2, k: 1),      # == 1 -> next, else KILL(4)
+        inst(cmd(:ld, mode: :mem), k: 1),                    # A = mem[1] (a *different* opaque)
+        inst(cmd(:jmp, jmp: :jeq), jt: 1, jf: 0, k: 2),      # == 2 -> ALLOW(5), else KILL(4)
+        inst(cmd(:ret), k: 0),
+        inst(cmd(:ret), k: 0x7fff0000)
+      ]
+      expect(rets(leaves_of(insts))).to include(0x7fff0000)
+    end
+
+    it 'keeps and drops leaves by whether an inequality range is non-empty' do
+      insts = [
+        inst(cmd(:ld, mode: :abs), k: 0),
+        inst(cmd(:jmp, jmp: :jgt), jt: 1, jf: 0, k: 10), # A > 10 -> line3, A <= 10 -> line2
+        inst(cmd(:ret), k: 0x1111),                      # line2: A <= 10 (covers <=)
+        inst(cmd(:jmp, jmp: :jge), jt: 1, jf: 0, k: 5),  # A >= 5 -> line5, A < 5 -> line4
+        inst(cmd(:ret), k: 0x2222),                      # line4: A > 10 && A < 5 -> impossible (covers <)
+        inst(cmd(:ret), k: 0x3333)                       # line5: A > 10 && A >= 5 (covers >, >=)
+      ]
+      expect(rets(leaves_of(insts))).to contain_exactly(0x1111, 0x3333)
+    end
+  end
+end

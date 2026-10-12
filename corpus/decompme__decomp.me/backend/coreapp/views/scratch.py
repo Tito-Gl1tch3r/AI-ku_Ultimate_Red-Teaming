@@ -1,0 +1,686 @@
+import base64
+import hashlib
+import io
+import json
+import logging
+import re
+import zipfile
+from datetime import datetime
+from typing import Any
+
+import django_filters
+from django.core.files import File
+from django.db.models import Case, F, FloatField, Value, When
+from django.db.models.functions import Cast
+from django.db.models.query import QuerySet
+from django.http import HttpResponse, QueryDict
+from django.utils.decorators import method_decorator
+from rest_framework import filters, mixins, serializers, status
+from rest_framework.decorators import action
+from rest_framework.exceptions import APIException
+from rest_framework.response import Response
+from rest_framework.viewsets import GenericViewSet
+
+from ..compiler_utils import filter_compiler_flags
+from ..cromper_client import (
+    CromperError,
+    CromperTimeoutError,
+    CromperUnavailableError,
+    get_cromper_client,
+)
+from ..decorators.cache import globally_cacheable
+from ..decorators.django import condition
+from ..filters.scratch import ScratchFilter
+from ..filters.search import NonEmptySearchFilter
+from ..middleware import Request
+from ..models.best_fork import update_best_forks_for_scratch
+from ..models.preset import Preset
+from ..models.scratch import Asm, Assembly, Library, Scratch
+from ..pagination import SafeCursorPagination
+from ..serializers import (
+    ClaimableScratchSerializer,
+    ScratchCompileSerializer,
+    ScratchCreateSerializer,
+    ScratchDecompileSerializer,
+    ScratchSerializer,
+    TerseScratchSerializer,
+)
+from ..wrapper_result import CompilationResult, DiffResult
+
+logger = logging.getLogger(__name__)
+
+
+class ProjectNotMemberException(APIException):
+    status_code = status.HTTP_403_FORBIDDEN
+    default_detail = "You must be a maintainer of the project to perform this action."
+
+
+def get_db_asm(request_asm: str) -> Asm:
+    h = hashlib.sha256(request_asm.encode()).hexdigest()
+    asm, _ = Asm.objects.get_or_create(
+        hash=h,
+        defaults={
+            "data": request_asm,
+        },
+    )
+    return asm
+
+
+# 1 MB
+MAX_FILE_SIZE = 1000 * 1024
+
+
+def cache_object(platform_arch: str, file: File[Any]) -> Assembly:
+    # Validate file size
+    if file.size > MAX_FILE_SIZE:
+        raise serializers.ValidationError(
+            f"Object must be less than {MAX_FILE_SIZE} bytes"
+        )
+
+    # Check if ELF, Mach-O, or PE
+    obj_bytes = file.read()
+    is_elf = obj_bytes[:4] == b"\x7fELF"
+    is_macho = obj_bytes[:4] == b"\xcf\xfa\xed\xfe"
+    is_coff = obj_bytes[:2] in (b"\x4c\x01", b"\x64\x86", b"\xf2\x01")
+    if not (is_elf or is_macho or is_coff):
+        raise serializers.ValidationError("Object must be an ELF, Mach-O, or COFF file")
+
+    assembly, _ = Assembly.objects.get_or_create(
+        hash=hashlib.sha256(obj_bytes).hexdigest(),
+        defaults={
+            "arch": platform_arch,
+            "elf_object": obj_bytes,
+        },
+    )
+    return assembly
+
+
+def compile_scratch(scratch: Scratch, context: str | None = None) -> CompilationResult:
+    try:
+        scratch_context = (
+            scratch.context_fk.text
+            if context is None and scratch.context_fk
+            else context
+        ) or ""
+        libraries = [lib.to_json() for lib in scratch.libraries]
+        cromper_client = get_cromper_client()
+        return cromper_client.compile_code(
+            compiler_id=scratch.compiler,
+            compiler_flags=scratch.compiler_flags,
+            code=scratch.source_code,
+            context=scratch_context,
+            function=scratch.diff_label,
+            libraries=libraries,
+        )
+    except (CromperError, APIException) as e:
+        if isinstance(e, (CromperUnavailableError, CromperTimeoutError)):
+            return CompilationResult(
+                b"",
+                "The compiler service is unavailable. Please try again in a moment.",
+            )
+        return CompilationResult(b"", str(e))
+
+
+def diff_compilation(
+    scratch: Scratch,
+    compilation: CompilationResult,
+) -> DiffResult:
+    try:
+        cromper_client = get_cromper_client()
+        return cromper_client.diff(
+            platform_id=scratch.platform,
+            target_elf=bytes(scratch.target_assembly.elf_object),
+            compiled_elf=compilation.elf_object,
+            diff_label=scratch.diff_label,
+            diff_flags=scratch.diff_flags,
+        )
+    except CromperError as e:
+        if isinstance(e, (CromperUnavailableError, CromperTimeoutError)):
+            return DiffResult(
+                None, "The diff service is unavailable. Please try again in a moment."
+            )
+        return DiffResult(None, str(e))
+
+
+def update_scratch_score(
+    scratch: Scratch,
+    diff: DiffResult,
+) -> None:
+    """
+    Given a scratch and a diff, update the scratch's score
+    """
+
+    if diff.result is None:
+        return
+    score = diff.result.get("current_score", scratch.score)
+    max_score = diff.result.get("max_score", scratch.max_score)
+    if score != scratch.score or max_score != scratch.max_score:
+        scratch.score = score
+        scratch.max_score = max_score
+        scratch.save(update_fields=["score", "max_score"])
+        update_best_forks_for_scratch(scratch)
+
+
+def compile_scratch_update_score(
+    scratch: Scratch,
+) -> None:
+    """
+    Initialize the scratch's score and ignore errors should they occur
+    """
+
+    compilation = compile_scratch(scratch)
+    try:
+        diff = diff_compilation(scratch, compilation)
+        update_scratch_score(scratch, diff)
+    except Exception:
+        logger.exception("Failed to compile and score scratch")
+
+
+def scratch_last_modified(
+    request: Request,
+    pk: str | None = None,
+    partial: bool | None = False,
+) -> datetime | None:
+    scratch: Scratch | None = Scratch.objects.filter(slug=pk).first()
+    if scratch:
+        return scratch.last_updated
+    else:
+        return None
+
+
+scratch_condition = condition(last_modified_func=scratch_last_modified)
+
+
+def is_contentful_asm(asm: Asm | None) -> bool:
+    if asm is None:
+        return False
+
+    asm_text = asm.data.strip()
+
+    return not (asm_text == "" or asm_text == "nop")
+
+
+def update_needs_recompile(partial: dict[str, Any]) -> bool:
+    recompile_params = [
+        "compiler",
+        "compiler_flags",
+        "diff_flags",
+        "diff_label",
+        "source_code",
+        "context",
+    ]
+
+    for param in recompile_params:
+        if param in partial:
+            return True
+
+    return False
+
+
+def create_scratch(data: dict[str, Any]) -> Scratch:
+    create_ser = ScratchCreateSerializer(data=data)
+    create_ser.is_valid(raise_exception=True)
+    data = create_ser.validated_data
+
+    cromper_client = get_cromper_client()
+    try:
+        compiler = cromper_client.get_compiler_by_id(data["compiler"])
+    except ValueError as e:
+        raise APIException(str(e))
+
+    platform = data.get("platform", compiler.platform)
+
+    target_asm: str = data.get("target_asm", "")
+    target_obj: File[Any] | None = data.get("target_obj")
+    context: str = data["context"]
+    diff_label: str = data.get("diff_label", "")
+
+    if target_obj:
+        asm = None
+        assembly = cache_object(platform.arch, target_obj)
+    else:
+        asm = get_db_asm(target_asm)
+        asm_result = cromper_client.assemble_asm(platform.id, asm)
+
+        assembly, _ = Assembly.objects.get_or_create(
+            hash=asm_result.hash,
+            defaults={
+                "arch": asm_result.arch,
+                "elf_object": asm_result.elf_object,
+                "source_asm": asm,
+            },
+        )
+
+    source_code = data.get("source_code")
+    if asm and not source_code:
+        default_source_code = f"void {diff_label or 'func'}(void) {{\n    // ...\n}}\n"
+        try:
+            source_code = cromper_client.decompile(
+                platform_id=platform.id,
+                compiler_id=compiler.id,
+                asm=asm.data,
+                default_source_code=default_source_code,
+                context=context,
+            )
+        except CromperError:
+            logger.warning(
+                "Failed to decompile assembly when creating scratch; "
+                "falling back to default source code",
+                exc_info=True,
+            )
+            source_code = default_source_code
+
+    compiler_flags = data.get("compiler_flags", "")
+    compiler_flags = filter_compiler_flags(compiler_flags)
+
+    diff_flags = data.get("diff_flags", [])
+
+    preset_id: str | None = None
+    if data.get("preset"):
+        preset: Preset = data["preset"]
+        preset_id = str(preset.id)
+
+    name = data.get("name", diff_label) or "Untitled"
+
+    libraries = [
+        Library(**lib) if isinstance(lib, dict) else lib for lib in data["libraries"]
+    ]
+
+    ser = ScratchSerializer(
+        data={
+            "name": name,
+            "compiler": compiler.id,
+            "compiler_flags": compiler_flags,
+            "diff_flags": diff_flags,
+            "preset": preset_id,
+            "context": context,
+            "diff_label": diff_label,
+            "source_code": source_code,
+        }
+    )
+    ser.is_valid(raise_exception=True)
+    scratch = ser.save(
+        target_assembly=assembly,
+        platform=platform.id,
+        libraries=libraries,
+    )
+
+    compile_scratch_update_score(scratch)
+
+    return scratch
+
+
+def profile_can_own_scratch(request: Request) -> bool:
+    return request.profile.id is not None
+
+
+class ScratchPagination(SafeCursorPagination):
+    ordering = "-creation_time"
+    page_size = 10
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
+@method_decorator(globally_cacheable(max_age=5, stale_while_revalidate=1), name="list")
+@method_decorator(globally_cacheable(max_age=1), name="retrieve")
+class ScratchViewSet(
+    mixins.CreateModelMixin,
+    mixins.DestroyModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    mixins.ListModelMixin,
+    GenericViewSet,  # type: ignore
+):
+    match_percent = Case(
+        When(max_score__lte=0, then=Value(0.0)),
+        When(score__lt=0, then=Value(0.0)),
+        When(score__gt=F("max_score"), then=Value(0.0)),
+        When(score=0, then=Value(1.0)),
+        When(match_override=True, then=Value(1.0)),
+        default=1.0 - (F("score") / Cast("max_score", FloatField())),
+    )
+
+    queryset = (
+        Scratch.objects.all()
+        .select_related(
+            "owner__user__github",
+            "best_fork__fork__owner__user__github",
+        )
+        .annotate(match_percent=match_percent)
+    )
+    pagination_class = ScratchPagination
+    filterset_class = ScratchFilter
+    filter_backends = [
+        django_filters.rest_framework.DjangoFilterBackend,
+        NonEmptySearchFilter,
+        filters.OrderingFilter,
+    ]
+    search_fields = ["name", "diff_label"]
+    ordering_fields = ["creation_time", "last_updated", "score", "match_percent"]
+
+    def get_serializer_class(self) -> type[serializers.ModelSerializer[Scratch]]:
+        if self.action == "list":
+            return TerseScratchSerializer
+        else:
+            return ScratchSerializer
+
+    @scratch_condition
+    def retrieve(self, request: Request, *args: Any, **kwargs: Any) -> Response:
+        return super().retrieve(request, *args, **kwargs)
+
+    def create(self, request: Any, *args: Any, **kwargs: Any) -> Response:
+        scratch = create_scratch(request.data)
+
+        return Response(
+            ClaimableScratchSerializer(scratch, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    # TODO: possibly move this logic into ScratchSerializer.save method
+    def update(self, request: Any, *args: Any, **kwargs: Any) -> Response:
+        # Check permission
+        scratch = self.get_object()
+        if scratch.owner != request.profile:
+            response = self.retrieve(request, *args, **kwargs)
+            response.status_code = status.HTTP_403_FORBIDDEN
+            return response
+
+        match_override_was_enabled = scratch.match_override
+        response = super().update(request, *args, **kwargs)
+        scratch = self.get_object()
+
+        if match_override_was_enabled != scratch.match_override:
+            update_best_forks_for_scratch(scratch)
+
+        if update_needs_recompile(request.data):
+            compile_scratch_update_score(scratch)
+            return Response(
+                ScratchSerializer(scratch, context={"request": request}).data
+            )
+
+        return response
+
+    def destroy(self, request: Any, *args: Any, **kwargs: Any) -> Response:
+        # Check permission
+        scratch = self.get_object()
+        if scratch.owner != request.profile and not request.profile.is_staff():
+            response = self.retrieve(request, *args, **kwargs)
+            response.status_code = status.HTTP_403_FORBIDDEN
+            return response
+
+        response = super().destroy(request, *args, **kwargs)
+
+        return response
+
+    # POST on compile takes a partial and does not update the scratch's compilation status
+    @action(detail=True, methods=["GET", "POST"])
+    def compile(self, request: Request, pk: str) -> Response:
+        scratch: Scratch = self.get_object()
+
+        # Apply partial
+        include_objects = False
+        scratch_context = None
+        if request.method == "POST":
+            compile_ser = ScratchCompileSerializer(
+                data=request.data, context={"scratch": scratch}
+            )
+            compile_ser.is_valid(raise_exception=True)
+            partial = compile_ser.validated_data
+
+            if "compiler" in partial:
+                scratch.compiler = partial["compiler"]
+            if "compiler_flags" in partial:
+                scratch.compiler_flags = partial["compiler_flags"]
+            if "diff_flags" in partial:
+                scratch.diff_flags = partial["diff_flags"]
+            if "diff_label" in partial:
+                scratch.diff_label = partial["diff_label"]
+            if "source_code" in partial:
+                scratch.source_code = partial["source_code"] or ""
+            if "context" in partial:
+                scratch_context = partial["context"]
+            if "libraries" in partial:
+                scratch.libraries = partial["libraries"]
+            include_objects = partial["include_objects"]
+
+        compilation = compile_scratch(scratch, context=scratch_context)
+        diff = diff_compilation(scratch, compilation)
+
+        if request.method == "GET":
+            update_scratch_score(scratch, diff)
+
+        compiler_output = ""
+        if compilation.errors:
+            compiler_output += compilation.errors + "\n"
+        if diff.errors:
+            compiler_output += diff.errors + "\n"
+
+        response = {
+            "diff_output": diff.result,
+            "compiler_output": compiler_output,
+            "success": compilation.elf_object is not None
+            and len(compilation.elf_object) > 0,
+        }
+
+        if include_objects or request.method == "GET":
+
+            def to_base64(obj: bytes) -> str:
+                return base64.b64encode(obj).decode("utf-8")
+
+            response["left_object"] = to_base64(
+                bytes(scratch.target_assembly.elf_object)
+            )
+            response["right_object"] = to_base64(compilation.elf_object)
+
+        return Response(response)
+
+    @action(detail=True, methods=["POST"])
+    def decompile(self, request: Request, pk: str) -> Response:
+        scratch: Scratch = self.get_object()
+        if scratch.target_assembly.source_asm is None:
+            return Response(
+                {
+                    "decompilation": "This scratch cannot currently be run through the decompiler because it was created via object file."
+                }
+            )
+
+        decompile_ser = ScratchDecompileSerializer(
+            data=request.data, context={"scratch": scratch}
+        )
+        decompile_ser.is_valid(raise_exception=True)
+        partial = decompile_ser.validated_data
+
+        context = partial.get(
+            "context", scratch.context_fk.text if scratch.context_fk else ""
+        )
+        if not isinstance(context, str):
+            context = str(context)
+        compiler_id = partial.get("compiler", scratch.compiler)
+
+        cromper_client = get_cromper_client()
+        try:
+            decompilation = cromper_client.decompile(
+                platform_id=scratch.platform,
+                compiler_id=compiler_id,
+                asm=scratch.target_assembly.source_asm.data,
+                default_source_code="",
+                context=context,
+            )
+        except (CromperUnavailableError, CromperTimeoutError):
+            return Response(
+                {
+                    "decompilation": "The compiler service is unavailable. "
+                    "Please try again in a moment."
+                }
+            )
+        except CromperError as e:
+            logger.warning(
+                "Decompilation failed for scratch %s", scratch.slug, exc_info=True
+            )
+            return Response({"decompilation": f"Decompilation failed: {e}"})
+
+        return Response({"decompilation": decompilation})
+
+    @action(detail=True, methods=["POST"])
+    def claim(self, request: Request, pk: str) -> Response:
+        scratch: Scratch = self.get_object()
+        token: Any = (
+            request.data.get("token") if isinstance(request.data, dict) else None
+        )
+
+        if (
+            not isinstance(token, str)
+            or not scratch.is_claimable()
+            or not scratch.verify_claim_token(token)
+        ):
+            return Response({"success": False})
+
+        if not profile_can_own_scratch(request):
+            return Response({"success": False}, status=status.HTTP_403_FORBIDDEN)
+
+        profile = request.profile
+
+        logger.debug(f"Granting ownership of scratch {scratch} to {profile}")
+
+        scratch.owner = profile
+        scratch.save()
+
+        return Response({"success": True})
+
+    @action(detail=True, methods=["POST"])
+    def fork(self, request: Request, pk: str) -> Response:
+        parent: Scratch = self.get_object()
+
+        if not profile_can_own_scratch(request):
+            return Response(
+                {"detail": "A persistent user profile is required to fork scratches."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # TODO Needed for test_fork_scratch test?
+        if isinstance(request.data, QueryDict):
+            request_data = request.data.dict()
+        elif isinstance(request.data, dict):
+            request_data = request.data
+        else:
+            request_data = {}
+
+        parent_data = ScratchSerializer(parent, context={"request": request}).data
+        fork_data = {**parent_data, **request_data}
+
+        ser = ScratchSerializer(data=fork_data, context={"request": request})
+        ser.is_valid(raise_exception=True)
+
+        libraries = ser.validated_data["libraries"]
+        new_scratch = ser.save(
+            parent=parent,
+            owner=request.profile,
+            target_assembly=parent.target_assembly,
+            platform=parent.platform,
+            libraries=libraries,
+        )
+
+        compile_scratch_update_score(new_scratch)
+
+        return Response(
+            ScratchSerializer(new_scratch, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True)
+    @scratch_condition
+    def export(self, request: Request, pk: str) -> HttpResponse:
+        scratch: Scratch = self.get_object()
+
+        metadata = ScratchSerializer(scratch, context={"request": request}).data
+        metadata.pop("source_code")
+        metadata.pop("context")
+
+        zip_bytes = io.BytesIO()
+        with zipfile.ZipFile(
+            zip_bytes, mode="w", compression=zipfile.ZIP_DEFLATED
+        ) as zip_f:
+            zip_f.writestr("metadata.json", json.dumps(metadata, indent=4))
+            if scratch.target_assembly.source_asm is not None:
+                zip_f.writestr("target.s", scratch.target_assembly.source_asm.data)
+            zip_f.writestr("target.o", scratch.target_assembly.elf_object)
+
+            try:
+                compiler = get_cromper_client().get_compiler_by_id(scratch.compiler)
+                src_ext = compiler.resolve_language(scratch.compiler_flags).extension
+            except (CromperError, ValueError):
+                logger.warning(
+                    "Could not resolve language for export; falling back to .c",
+                    exc_info=True,
+                )
+                src_ext = "c"
+            zip_f.writestr(f"code.{src_ext}", scratch.source_code)
+            if scratch.context_fk and scratch.context_fk.text:
+                zip_f.writestr(f"ctx.{src_ext}", scratch.context_fk.text)
+
+            if request.GET.get("target_only") != "1":
+                compilation = compile_scratch(scratch)
+                if compilation.elf_object:
+                    zip_f.writestr("current.o", compilation.elf_object)
+
+        # Prevent possible header injection attacks
+        safe_name = re.sub(r"[^a-zA-Z0-9_:]", "_", scratch.name)[:64]
+
+        return HttpResponse(
+            zip_bytes.getvalue(),
+            headers={
+                "Content-Type": "application/zip",
+                "Content-Disposition": f"attachment; filename={safe_name}.zip",
+            },
+        )
+
+    @action(detail=True)
+    def family(self, request: Request, pk: str) -> Response:
+        scratch: Scratch = self.get_object()
+
+        subqueries: list[QuerySet[Scratch]] = []
+
+        if is_contentful_asm(scratch.target_assembly.source_asm):
+            assert scratch.target_assembly.source_asm is not None
+            subqueries.append(
+                Scratch.objects.filter(
+                    target_assembly__source_asm__hash=scratch.target_assembly.source_asm.hash
+                )
+            )
+        elif (
+            scratch.target_assembly.elf_object is not None
+            and len(scratch.target_assembly.elf_object) > 0
+        ):
+            subqueries.append(
+                Scratch.objects.filter(
+                    target_assembly__hash=scratch.target_assembly.hash,
+                    diff_label=scratch.diff_label,
+                )
+            )
+        else:
+            subqueries.append(Scratch.objects.filter(slug=scratch.slug))
+
+        if scratch.family_id is not None:
+            subqueries.append(Scratch.objects.filter(family_id=scratch.family_id))
+
+        if scratch.parent_id is not None:
+            subqueries.append(Scratch.objects.filter(parent_id=scratch.parent_id))
+
+        # Avoid 'ORDER BY not allowed in subqueries of compound statements.'
+        subqueries = [sq.order_by() for sq in subqueries]
+
+        if len(subqueries) == 1:
+            family = subqueries[0]
+        else:
+            family = subqueries[0].union(*subqueries[1:])
+
+        # Materialize the union before the final fetch so Postgres can use slug
+        # index lookups instead of planning joins across the full scratch table.
+        family_ids = list(family.values_list("slug", flat=True))
+        family = ScratchViewSet.queryset.filter(slug__in=family_ids).order_by(
+            "creation_time"
+        )
+
+        return Response(
+            TerseScratchSerializer(family, many=True, context={"request": request}).data
+        )

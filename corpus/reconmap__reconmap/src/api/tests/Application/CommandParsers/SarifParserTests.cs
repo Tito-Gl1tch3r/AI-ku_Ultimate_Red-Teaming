@@ -1,0 +1,163 @@
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using api_v2.Application.CommandParsers;
+using api_v2.Application.Services;
+using api_v2.Controllers;
+using Xunit;
+
+namespace tests.Application.CommandParsers;
+
+public class SarifParserTests
+{
+    private class FakeAttachmentStorage : IAttachmentStorage
+    {
+        private readonly string _content;
+
+        public FakeAttachmentStorage(string content)
+        {
+            _content = content;
+        }
+
+        public Task<Stream> GetFileStreamAsync(string fileName)
+        {
+            var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(_content));
+            return Task.FromResult<Stream>(stream);
+        }
+
+        public Task SaveFileAsync(string fileName, Stream stream) => Task.CompletedTask;
+        public Task DeleteFileAsync(string fileName) => Task.CompletedTask;
+        public Task<string> GetFileHashAsync(string fileName) => Task.FromResult(string.Empty);
+    }
+
+    [Fact]
+    public void Parse_InvalidJson_ReturnsEmptyResult()
+    {
+        var fakeStorage = new FakeAttachmentStorage("{ malformed json }");
+        var parser = new SarifParser(fakeStorage);
+        var job = new CommandProcessorJob { FilePath = "test.sarif" };
+
+        var result = parser.Parse(job);
+
+        Assert.Empty(result.vulnerabilities);
+        Assert.Empty(result.assets);
+    }
+
+    [Fact]
+    public void Parse_ValidSarifWithOneFinding_ParsesCorrectly()
+    {
+        var sarifContent = @"{
+          ""$schema"": ""https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.5.json"",
+          ""version"": ""2.1.0"",
+          ""runs"": [
+            {
+              ""tool"": {
+                ""driver"": {
+                  ""name"": ""gosec"",
+                  ""rules"": [
+                    {
+                      ""id"": ""G104"",
+                      ""name"": ""AuditErrors"",
+                      ""shortDescription"": {
+                        ""text"": ""Errors unhandled""
+                      },
+                      ""fullDescription"": {
+                        ""text"": ""Audit unhandled errors in Go code.""
+                      },
+                      ""helpUri"": ""https://securego.io/rule-details.html#G104""
+                    }
+                  ]
+                }
+              },
+              ""results"": [
+                {
+                  ""ruleId"": ""G104"",
+                  ""ruleIndex"": 0,
+                  ""level"": ""error"",
+                  ""message"": {
+                    ""text"": ""Unhandled error detected.""
+                  },
+                  ""locations"": [
+                    {
+                      ""physicalLocation"": {
+                        ""artifactLocation"": {
+                          ""uri"": ""main.go""
+                        },
+                        ""region"": {
+                          ""startLine"": 42
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }";
+
+        var fakeStorage = new FakeAttachmentStorage(sarifContent);
+        var parser = new SarifParser(fakeStorage);
+        var job = new CommandProcessorJob { FilePath = "test.sarif" };
+
+        var result = parser.Parse(job);
+
+        Assert.Single(result.vulnerabilities);
+        var vulnerability = result.vulnerabilities.First();
+        Assert.Equal("Errors unhandled", vulnerability.Summary);
+        Assert.Equal("Audit unhandled errors in Go code.", vulnerability.Description);
+        Assert.Equal("https://securego.io/rule-details.html#G104", vulnerability.ExternalRefs);
+        Assert.Equal("Locations:\nmain.go:42", vulnerability.ProofOfConcept);
+        Assert.Equal("high", vulnerability.Risk);
+    }
+
+    [Fact]
+    public void Parse_SarifLevelMapping_MapsCorrectly()
+    {
+        var sarifContent = @"{
+          ""version"": ""2.1.0"",
+          ""runs"": [
+            {
+              ""tool"": {
+                ""driver"": {
+                  ""name"": ""test-tool""
+                }
+              },
+              ""results"": [
+                {
+                  ""ruleId"": ""R1"",
+                  ""level"": ""warning"",
+                  ""message"": { ""text"": ""Warning message"" }
+                },
+                {
+                  ""ruleId"": ""R2"",
+                  ""level"": ""note"",
+                  ""message"": { ""text"": ""Note message"" }
+                },
+                {
+                  ""ruleId"": ""R3"",
+                  ""level"": ""none"",
+                  ""message"": { ""text"": ""None message"" }
+                }
+              ]
+            }
+          ]
+        }";
+
+        var fakeStorage = new FakeAttachmentStorage(sarifContent);
+        var parser = new SarifParser(fakeStorage);
+        var job = new CommandProcessorJob { FilePath = "test.sarif" };
+
+        var result = parser.Parse(job);
+
+        Assert.Equal(3, result.vulnerabilities.Count);
+        
+        var r1 = result.vulnerabilities.First(f => f.Summary == "Warning message");
+        Assert.Equal("medium", r1.Risk);
+
+        var r2 = result.vulnerabilities.First(f => f.Summary == "Note message");
+        Assert.Equal("low", r2.Risk);
+
+        var r3 = result.vulnerabilities.First(f => f.Summary == "None message");
+        Assert.Equal("none", r3.Risk);
+    }
+}

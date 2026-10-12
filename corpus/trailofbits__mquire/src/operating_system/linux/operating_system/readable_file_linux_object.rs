@@ -1,0 +1,300 @@
+//
+// Copyright (c) 2025-present, Trail of Bits, Inc.
+// All rights reserved.
+//
+// This source code is licensed in accordance with the terms specified in
+// the LICENSE file found in the root directory of this source tree.
+//
+
+use crate::{
+    core::{
+        architecture::Architecture,
+        error::{Error, ErrorKind, Result},
+        virtual_memory_reader::VirtualMemoryReader,
+    },
+    memory::{
+        error::{Error as MemoryError, ErrorKind as MemoryErrorKind, Result as MemoryResult},
+        primitives::{PhysicalAddress, RawVirtualAddress},
+        readable::Readable,
+        virtual_address::VirtualAddress,
+    },
+    operating_system::linux::{kallsyms::Kallsyms, virtual_struct::VirtualStruct, xarray::XArray},
+};
+
+use btfparse::TypeInformation;
+
+use std::{collections::BTreeMap, ops::Range, sync::Arc};
+
+/// Standard page size
+const PAGE_SIZE: u64 = 4096;
+
+/// Max amount of pages per folio structure
+const MAX_FOLIO_PAGES: u64 = 512;
+
+/// PG_head flag bit indicating a large/compound folio
+const PG_HEAD_BIT: u64 = 1 << 6;
+
+/// Implements reading from a Linux file object in memory
+pub(super) struct ReadableLinuxFileObject {
+    /// Underlying memory dump
+    memory_dump: Arc<dyn Readable>,
+
+    /// Base virtual address of the vmemmap
+    vmemmap_base: VirtualAddress,
+
+    /// Size of struct page
+    page_struct_size: u64,
+
+    /// Size of the file
+    file_size: u64,
+
+    /// Page map
+    cached_page_map: BTreeMap<u64, VirtualAddress>,
+}
+
+impl ReadableLinuxFileObject {
+    /// Creates a new reader for the `struct file` object at the given vaddr
+    pub(super) fn from_file_vaddr(
+        memory_dump: Arc<dyn Readable>,
+        architecture: Arc<dyn Architecture>,
+        type_information: &TypeInformation,
+        kallsyms: &Kallsyms,
+        file_vaddr: VirtualAddress,
+    ) -> Result<Arc<dyn Readable>> {
+        let vmemmap_base_ptr = kallsyms.get("vmemmap_base").ok_or_else(|| {
+            Error::new(
+                ErrorKind::OperatingSystemInitializationFailed,
+                "Failed to find vmemmap_base symbol in kallsyms",
+            )
+        })?;
+
+        let vmem_reader = VirtualMemoryReader::new(memory_dump.as_ref(), architecture.as_ref());
+        let vmemmap_base = match vmem_reader.read_vaddr(vmemmap_base_ptr) {
+            Ok(value) => value,
+            Err(err) => {
+                return Err(Error::new(
+                    ErrorKind::OperatingSystemInitializationFailed,
+                    &format!("Failed to read vmemmap_base: {:?}", err),
+                ));
+            }
+        };
+
+        let page_tid = type_information.id_of("page").ok_or(Error::new(
+            ErrorKind::OperatingSystemInitializationFailed,
+            "Failed to find 'page' struct in BTF",
+        ))?;
+
+        let page_struct_size = type_information.size_of(page_tid)? as u64;
+        let file = VirtualStruct::from_name(&vmem_reader, type_information, "file", &file_vaddr)?;
+
+        let inode = file.traverse("f_inode")?.dereference()?;
+        let file_size = inode.traverse("i_size")?.read_u64()?;
+        let i_pages_vaddr = inode
+            .traverse("i_mapping")?
+            .dereference()?
+            .traverse("i_pages")?
+            .virtual_address();
+
+        let xarray = XArray::new(
+            memory_dump.as_ref(),
+            architecture.as_ref(),
+            type_information,
+            i_pages_vaddr,
+        )?;
+
+        let page_vaddr_list = xarray.entries();
+        let mut cached_page_map = BTreeMap::new();
+
+        // Determine how to parse this data based on type availability, rather than
+        // checking for kernel version numbers.
+        let folio_tid = type_information.id_of("folio");
+
+        let folio_nr_pages_field = match folio_tid {
+            Some(tid) => {
+                if type_information.offset_of(tid, "_folio_nr_pages").is_ok() {
+                    log::debug!("Using folio nr_pages field: _folio_nr_pages");
+                    Some("_folio_nr_pages")
+                } else if type_information.offset_of(tid, "_nr_pages").is_ok() {
+                    log::debug!("Using folio nr_pages field: _nr_pages");
+                    Some("_nr_pages")
+                } else {
+                    return Err(Error::new(
+                        ErrorKind::TypeInformationError,
+                        "Could not find folio nr_pages field (_folio_nr_pages or _nr_pages) in BTF",
+                    ));
+                }
+            }
+
+            None => None,
+        };
+
+        for &page_vaddr in page_vaddr_list.iter() {
+            if folio_tid.is_some() {
+                let folio =
+                    VirtualStruct::from_name(&vmem_reader, type_information, "folio", &page_vaddr)?;
+
+                let page_index = folio.traverse("index")?.read_u64()?;
+
+                // The vmemmap is an array of `struct page` entries (64 bytes each). Folio objects
+                // are larger than a single entry, and are allocated at `struct page` granularity
+                // within this array.
+                //
+                // The first member in a folio is a union containing `struct page`, so the beginning
+                // of both structures overlap.
+                //
+                // Fields beyond the first 64 bytes (like `_folio_nr_pages` at offset 96) live in what
+                // would be the next `struct page` slot in vmemmap, so we need to check how large
+                // our folio is before we can use it.
+                //
+                // A folio can span one or more `struct page` entries:
+                //  ________________________________
+                // | struct page N | struct page N+1|
+                // |--------------------------------|
+                // |        struct folio N          |
+                // |________________________________|
+                // 0               64               128
+                //
+                // When PG_head is not set, we can only access the fields within folio
+                // that do not go beyond the first 64 bytes.
+                let flags = folio.traverse("flags")?.read_u64().unwrap_or_else(|err| {
+                    log::error!("Failed to read folio flags at {:?}: {err:?}", page_vaddr);
+                    0
+                });
+
+                let is_large_folio = (flags & PG_HEAD_BIT) != 0;
+                let nr_pages = if is_large_folio {
+                    folio_nr_pages_field
+                        .and_then(|field| folio.traverse(field).ok())
+                        .and_then(|field| field.read_u32().ok())
+                        .unwrap_or(1) as u64
+                } else {
+                    1
+                };
+
+                if nr_pages > MAX_FOLIO_PAGES {
+                    log::error!(
+                        "Folio has suspicious page count: {} (max: {}), treating as single page",
+                        nr_pages,
+                        MAX_FOLIO_PAGES
+                    );
+
+                    cached_page_map.insert(page_index, page_vaddr);
+                } else {
+                    for i in 0..nr_pages {
+                        cached_page_map.insert(page_index + i, page_vaddr);
+                    }
+                }
+            } else {
+                let page =
+                    VirtualStruct::from_name(&vmem_reader, type_information, "page", &page_vaddr)?;
+
+                let page_index = page.traverse("index")?.read_u64()?;
+                cached_page_map.insert(page_index, page_vaddr);
+            }
+        }
+
+        Ok(Arc::new(Self {
+            memory_dump,
+            vmemmap_base,
+            page_struct_size,
+            file_size,
+            cached_page_map,
+        }))
+    }
+
+    /// Converts a `struct page` virtual address to a physical address.
+    fn page_to_phys(&self, page_vaddr: RawVirtualAddress) -> PhysicalAddress {
+        let raw_vmemmap_base_vaddr = self.vmemmap_base.value();
+        let offset_from_vmemmap = page_vaddr.value() - raw_vmemmap_base_vaddr.value();
+        let pfn = offset_from_vmemmap / self.page_struct_size;
+
+        PhysicalAddress::new(pfn * PAGE_SIZE)
+    }
+}
+
+impl Readable for ReadableLinuxFileObject {
+    fn read(&self, buffer: &mut [u8], physical_address: PhysicalAddress) -> MemoryResult<usize> {
+        let mut total_bytes_read = 0;
+        let mut current_offset = physical_address;
+        let mut buffer_offset = 0;
+
+        while buffer_offset < buffer.len() {
+            let page_index = current_offset.value() / PAGE_SIZE;
+            let offset_in_page = (current_offset.value() % PAGE_SIZE) as usize;
+
+            let page_vaddr = self.cached_page_map.get(&page_index).ok_or_else(|| {
+                MemoryError::new(
+                    MemoryErrorKind::IOError,
+                    &format!("Page {} not in cache", page_index),
+                )
+            })?;
+
+            let phys_addr = self.page_to_phys(page_vaddr.value());
+            let read_phys_addr = PhysicalAddress::new(phys_addr.value() + offset_in_page as u64);
+
+            let remaining_in_buffer = buffer.len() - buffer_offset;
+            let remaining_in_page = PAGE_SIZE as usize - offset_in_page;
+            let bytes_to_read = remaining_in_buffer.min(remaining_in_page);
+
+            let bytes_read = self.memory_dump.read(
+                &mut buffer[buffer_offset..buffer_offset + bytes_to_read],
+                read_phys_addr,
+            )?;
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            total_bytes_read += bytes_read;
+            buffer_offset += bytes_read;
+            current_offset = PhysicalAddress::new(current_offset.value() + bytes_read as u64);
+
+            if bytes_read < bytes_to_read {
+                break;
+            }
+        }
+
+        Ok(total_bytes_read)
+    }
+
+    fn len(&self) -> MemoryResult<u64> {
+        Ok(self.file_size)
+    }
+
+    fn regions(&self) -> MemoryResult<Vec<Range<PhysicalAddress>>> {
+        let page_index_list = {
+            let mut key_list = self.cached_page_map.keys().cloned().collect::<Vec<u64>>();
+            key_list.sort();
+
+            key_list
+        };
+
+        let range_list: Vec<Range<PhysicalAddress>> = page_index_list
+            .iter()
+            .map(|page_index| {
+                let page_offset = PhysicalAddress::new(page_index.wrapping_mul(PAGE_SIZE));
+
+                Range {
+                    start: page_offset,
+                    end: page_offset + PAGE_SIZE,
+                }
+            })
+            .collect();
+
+        let mut region_list: Vec<Range<PhysicalAddress>> = Vec::new();
+
+        for range in range_list {
+            if let Some(last) = region_list.last_mut() {
+                if last.end >= range.start {
+                    last.end = last.end.max(range.end);
+                } else {
+                    region_list.push(range);
+                }
+            } else {
+                region_list.push(range);
+            }
+        }
+
+        Ok(region_list)
+    }
+}

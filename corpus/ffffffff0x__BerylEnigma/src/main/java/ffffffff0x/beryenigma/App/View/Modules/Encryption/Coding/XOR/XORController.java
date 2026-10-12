@@ -1,0 +1,108 @@
+package ffffffff0x.beryenigma.App.View.Modules.Encryption.Coding.XOR;
+
+import com.jfoenix.controls.JFXComboBox;
+import com.jfoenix.controls.JFXTextField;
+import com.jfoenix.controls.JFXToggleButton;
+import ffffffff0x.beryenigma.App.View.Modules.Encryption.Coding.BaseEncoding.Base64.Base64Impl;
+import ffffffff0x.beryenigma.App.View.Modules.Encryption.Coding.HEXCoder.HEXCoderImpl;
+import ffffffff0x.beryenigma.App.View.Viewobj.PopupSettingNode;
+import ffffffff0x.beryenigma.App.View.Viewobj.PopupSettingView;
+import ffffffff0x.beryenigma.App.View.Viewobj.ViewControllerFileMode;
+import ffffffff0x.beryenigma.Init.Init;
+import ffffffff0x.beryenigma.Init.ViewInit;
+import ffffffff0x.beryenigma.Kit.Utils.FileUtils;
+import ffffffff0x.beryenigma.Kit.Utils.ViewNode;
+import ffffffff0x.beryenigma.Kit.Utils.ViewUtils;
+import javafx.collections.FXCollections;
+import javafx.collections.ObservableList;
+import javafx.fxml.FXML;
+
+import java.io.IOException;
+import java.io.UnsupportedEncodingException;
+
+/**
+ * @author: RyuZUSUNC
+ * @create: 2021-03-18 13:20
+ **/
+@ViewNode(name = "XOR",folderPath = "Root/Encryption/Coding/",fxmlName = "XORView.fxml")
+public class XORController extends ViewControllerFileMode {
+    @FXML
+    JFXTextField JTF_key;
+    @FXML
+    JFXComboBox JCB_charset;
+
+    private JFXComboBox<String> JCB_outPutMode;
+    private JFXToggleButton JTB_keyMode;
+
+    @Override
+    protected void initialize() {
+        super.initialize();
+        setFileSelectButton();
+        initCharsetComboBox();
+    }
+
+    @Override
+    public void ONClickConfirm() {
+        super.ONClickConfirm();
+        try {
+            if(JTB_modeSelect.getText().equals(Init.getLanguage("TextMode"))){
+                try {
+                    JTA_dst.setText(OutputEncode(TextModeEnCode(),JCB_outPutMode.getValue()));
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }else{
+                FileUtils.outPutFile(FileModeEnCode());
+                fileEncodeEnd();
+            }
+        }catch (Exception e){
+            ViewUtils.textAreaValidate(JTA_dst);
+        }
+    }
+
+//    @Override
+//    public void getFile() {
+//        File file_temp = ViewUtils.getFile();
+//        JTA_src.setText(file_temp.toString());
+//        file = file_temp;
+//    }
+
+    @Override
+    protected void LoadPopupSettingNode() {
+        ObservableList<String> options =
+                FXCollections.observableArrayList(
+                        "Base64",
+                        "HEX"
+                );
+        JCB_outPutMode = new JFXComboBox<>(options);
+        JCB_outPutMode.setValue(Init.getLanguage("HEX"));
+        PopupSettingView popupSettingView = new PopupSettingView(ACP_controllerAnchorPane);
+        popupSettingView.setSetting(new PopupSettingNode(Init.getLanguage("OutputEncoding"), JCB_outPutMode,true));
+    }
+
+    private void initCharsetComboBox() {
+        ViewInit.comboBoxCharset(JCB_charset);
+    }
+
+    private void initJTBKeyMode() {
+
+    }
+
+    private byte[] TextModeEnCode() throws UnsupportedEncodingException {
+        return XORImpl.encrypt(JTA_src.getText().getBytes(JCB_charset.getValue().toString()),JTF_key.getText().getBytes(JCB_charset.getValue().toString()));
+    }
+
+    private byte[] FileModeEnCode() throws UnsupportedEncodingException {
+        return XORImpl.encrypt(FileUtils.getFilebyte(file),JTF_key.getText().getBytes(JCB_charset.getValue().toString()));
+    }
+
+    private String OutputEncode(byte[] msg,String mode) {
+        if (mode.equals("Base64")) {
+            return Base64Impl.encodeToString(msg);
+        } else if (mode.equals("HEX")) {
+            return HEXCoderImpl.encodeToString(msg);
+        }
+        return "";
+    }
+
+}

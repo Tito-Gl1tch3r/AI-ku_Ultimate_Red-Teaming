@@ -1,0 +1,271 @@
+//nolint:predeclared // preserve the package name
+package copy
+
+import (
+	"context"
+	"errors"
+	"io"
+	"os"
+	stdpath "path"
+
+	"github.com/urfave/cli/v3"
+
+	"github.com/foohq/foojank/cmd/foojank/flags"
+
+	"github.com/foohq/foojank/cmd/foojank/actions"
+	"github.com/foohq/foojank/internal/clients/agent"
+	"github.com/foohq/foojank/internal/config"
+	"github.com/foohq/foojank/internal/path"
+)
+
+func NewCommand() *cli.Command {
+	return &cli.Command{
+		Name:      "copy",
+		ArgsUsage: "[storage:]<file> [storage:]<destination-path>",
+		Usage:     "Copy files between local filesystem and a storage or vice versa",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:  flags.ServerURL,
+				Usage: "set server URL",
+			},
+			&cli.StringFlag{
+				Name:      flags.ServerCertificate,
+				Usage:     "set path to server's certificate",
+				TakesFile: true,
+			},
+			&cli.StringFlag{
+				Name:  flags.Credential,
+				Usage: "set credential",
+			},
+			&cli.StringFlag{
+				Name:  flags.ConfigDir,
+				Usage: "set path to a configuration directory",
+			},
+		},
+		Before:          before,
+		Action:          action,
+		Aliases:         []string{"cp"},
+		ShellComplete:   actions.CompleteFlags,
+		OnUsageError:    actions.UsageError,
+		HideHelpCommand: true,
+	}
+}
+
+func before(ctx context.Context, c *cli.Command) (context.Context, error) {
+	ctx, err := actions.LoadConfig(os.Stderr, validateConfiguration)(ctx, c)
+	if err != nil {
+		return ctx, err
+	}
+
+	ctx, err = actions.SetupLogger(os.Stderr)(ctx, c)
+	if err != nil {
+		return ctx, err
+	}
+
+	ctx, err = actions.SetupServer(os.Stderr)(ctx, c)
+	if err != nil {
+		return ctx, err
+	}
+
+	return ctx, nil
+}
+
+func action(ctx context.Context, c *cli.Command) error {
+	logger := actions.GetLoggerFromContext(ctx)
+	srv := actions.GetServerFromContext(ctx)
+
+	client := agent.New(srv)
+
+	if c.Args().Len() != 2 {
+		logger.ErrorContext(ctx, "Command expects the following arguments: %s", c.ArgsUsage)
+		return errors.New("not enough arguments")
+	}
+
+	files := c.Args().Slice()
+	src := files[0]
+	srcPath, err := path.Parse(src)
+	if err != nil {
+		logger.ErrorContext(ctx, "Invalid path %q: %v.", src, err)
+		return err
+	}
+
+	dst := files[len(files)-1]
+	dstPath, err := path.Parse(dst)
+	if err != nil {
+		logger.ErrorContext(ctx, "Invalid path %q: %v.", src, err)
+		return err
+	}
+
+	if srcPath.IsLocal() && dstPath.IsLocal() {
+		logger.ErrorContext(ctx, "Source and destination paths are both local paths. This operation is currently not supported.")
+		return errors.New("matching source and destination type")
+	}
+
+	if !srcPath.IsLocal() && !dstPath.IsLocal() {
+		logger.ErrorContext(ctx, "Source and destination paths are both storages. This operation is currently not supported.")
+		return errors.New("matching source and destination type")
+	}
+
+	var destPath string
+	if dstPath.IsDir() {
+		destPath = stdpath.Join("/", dstPath.FilePath, srcPath.Base())
+	} else {
+		destPath = stdpath.Join("/", dstPath.FilePath)
+	}
+
+	// Copy local file to a remote storage
+	if srcPath.IsLocal() {
+		err := copyLocalFile(ctx, client, srcPath.FilePath, dstPath.Storage, destPath)
+		if err != nil {
+			logger.ErrorContext(ctx, "Cannot copy file %q to %q: %v", srcPath.String(), dstPath.String(), err)
+			return err
+		}
+		return nil
+	}
+
+	// Copy file from a remote storage to a local directory
+	if !srcPath.IsLocal() {
+		err := copyRemoteFile(ctx, client, srcPath.Storage, srcPath.FilePath, destPath)
+		if err != nil {
+			logger.ErrorContext(ctx, "Cannot copy file %q to %q: %v", srcPath.String(), dstPath.String(), err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+func copyLocalFile(ctx context.Context, client *agent.Client, src string, storageName, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = srcFile.Close()
+	}()
+
+	srcInfo, err := srcFile.Stat()
+	if err != nil {
+		return err
+	}
+
+	if srcInfo.IsDir() {
+		return errors.New("source file is a directory")
+	}
+
+	storageName, err = client.GetStorageName(ctx, storageName)
+	if err != nil {
+		return err
+	}
+
+	storage, err := client.GetStorage(ctx, storageName)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = storage.Close()
+	}()
+
+	err = storage.Wait(ctx)
+	if err != nil {
+		return err
+	}
+
+	err = storage.MkdirAll(stdpath.Dir(dst), 0755)
+	if err != nil {
+		return err
+	}
+
+	dstFile, err := storage.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = dstFile.Close()
+	}()
+
+	_, err = io.Copy(dstFile, srcFile)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func copyRemoteFile(ctx context.Context, client *agent.Client, storageName, src string, dst string) error {
+	storageName, err := client.GetStorageName(ctx, storageName)
+	if err != nil {
+		return err
+	}
+
+	storage, err := client.GetStorage(ctx, storageName)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = storage.Close()
+	}()
+
+	err = storage.Wait(ctx)
+	if err != nil {
+		return err
+	}
+
+	srcFile, err := storage.OpenFile(src, os.O_RDONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = srcFile.Close()
+	}()
+
+	srcInfo, err := srcFile.Stat()
+	if err != nil {
+		return err
+	}
+
+	if srcInfo.IsDir() {
+		return errors.New("source file is a directory")
+	}
+
+	err = os.MkdirAll(stdpath.Dir(dst), 0755)
+	if err != nil {
+		return err
+	}
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = dstFile.Close()
+	}()
+
+	_, err = io.Copy(dstFile, srcFile)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func validateConfiguration(conf *config.Config) error {
+	for _, opt := range []string{
+		flags.ServerURL,
+		flags.Credential,
+	} {
+		switch opt {
+		case flags.ServerURL:
+			v, ok := conf.String(opt)
+			if !ok || v == "" {
+				return errors.New("server URL not configured")
+			}
+		case flags.Credential:
+			v, ok := conf.String(opt)
+			if !ok || v == "" {
+				return errors.New("credential not configured")
+			}
+		}
+	}
+	return nil
+}

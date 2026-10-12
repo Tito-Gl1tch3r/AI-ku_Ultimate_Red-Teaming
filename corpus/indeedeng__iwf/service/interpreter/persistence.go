@@ -1,0 +1,271 @@
+package interpreter
+
+import (
+	"github.com/indeedeng/iwf/gen/iwfidl"
+	"github.com/indeedeng/iwf/service"
+	"github.com/indeedeng/iwf/service/common/mapper"
+	"github.com/indeedeng/iwf/service/common/utils"
+	"github.com/indeedeng/iwf/service/interpreter/interfaces"
+)
+
+type PersistenceManager struct {
+	dataAttributes   map[string]iwfidl.KeyValue
+	searchAttributes map[string]iwfidl.SearchAttribute
+	provider         interfaces.WorkflowProvider
+
+	lockedDataAttributesKeys  map[string]bool
+	lockedSearchAttributeKeys map[string]bool
+
+	useMemo bool
+}
+
+func NewPersistenceManager(
+	provider interfaces.WorkflowProvider, initDataAttributes []iwfidl.KeyValue, initSearchAttributes []iwfidl.SearchAttribute,
+	useMemo bool,
+) *PersistenceManager {
+	searchAttributes := make(map[string]iwfidl.SearchAttribute)
+	for _, sa := range initSearchAttributes {
+		searchAttributes[sa.GetKey()] = sa
+	}
+	dataAttributes := make(map[string]iwfidl.KeyValue)
+	for _, da := range initDataAttributes {
+		dataAttributes[da.GetKey()] = da
+	}
+	return &PersistenceManager{
+		dataAttributes:   dataAttributes,
+		searchAttributes: searchAttributes,
+		provider:         provider,
+
+		lockedDataAttributesKeys:  make(map[string]bool),
+		lockedSearchAttributeKeys: make(map[string]bool),
+
+		useMemo: useMemo,
+	}
+}
+
+func RebuildPersistenceManager(
+	provider interfaces.WorkflowProvider,
+	dolist []iwfidl.KeyValue, salist []iwfidl.SearchAttribute,
+	useMemo bool,
+) *PersistenceManager {
+	dataAttributes := make(map[string]iwfidl.KeyValue)
+	searchAttributes := make(map[string]iwfidl.SearchAttribute)
+	for _, do := range dolist {
+		dataAttributes[do.GetKey()] = do
+	}
+	for _, sa := range salist {
+		searchAttributes[sa.GetKey()] = sa
+	}
+	return &PersistenceManager{
+		dataAttributes:   dataAttributes,
+		searchAttributes: searchAttributes,
+		provider:         provider,
+
+		// locks will not be carried over during continueAsNew
+		lockedDataAttributesKeys:  make(map[string]bool),
+		lockedSearchAttributeKeys: make(map[string]bool),
+
+		useMemo: useMemo,
+	}
+}
+
+func (am *PersistenceManager) GetDataAttributesByKey(request service.GetDataAttributesQueryRequest) service.GetDataAttributesQueryResponse {
+	all := false
+	if len(request.Keys) == 0 {
+		all = true
+	}
+	var res []iwfidl.KeyValue
+	keyMap := map[string]bool{}
+	for _, k := range request.Keys {
+		keyMap[k] = true
+	}
+	for _, key := range DeterministicKeys(am.dataAttributes) {
+		if keyMap[key] || all {
+			res = append(res, am.dataAttributes[key])
+		}
+	}
+	return service.GetDataAttributesQueryResponse{
+		DataAttributes: res,
+	}
+}
+
+func (am *PersistenceManager) LoadSearchAttributes(
+	ctx interfaces.UnifiedContext, loadingPolicy *iwfidl.PersistenceLoadingPolicy,
+) []iwfidl.SearchAttribute {
+	var loadingType iwfidl.PersistenceLoadingType
+	var partialLoadingKeys []string
+	if loadingPolicy != nil {
+		loadingType = loadingPolicy.GetPersistenceLoadingType()
+		partialLoadingKeys = loadingPolicy.PartialLoadingKeys
+		if loadingType == iwfidl.PARTIAL_WITH_EXCLUSIVE_LOCK {
+			partialLoadingKeys = utils.MergeStringSlice(loadingPolicy.PartialLoadingKeys, loadingPolicy.LockingKeys)
+		}
+
+		if loadingType == iwfidl.PARTIAL_WITH_EXCLUSIVE_LOCK || loadingType == iwfidl.ALL_WITH_PARTIAL_LOCK {
+			am.awaitAndLockForKeys(ctx, am.lockedSearchAttributeKeys, loadingPolicy.GetLockingKeys())
+		}
+	}
+
+	if loadingType == "" || loadingType == iwfidl.ALL_WITHOUT_LOCKING || loadingType == iwfidl.ALL_WITH_PARTIAL_LOCK {
+		return am.GetAllSearchAttributes()
+	} else if loadingType == iwfidl.PARTIAL_WITHOUT_LOCKING || loadingType == iwfidl.PARTIAL_WITH_EXCLUSIVE_LOCK {
+		var res []iwfidl.SearchAttribute
+		keyMap := map[string]bool{}
+		for _, k := range partialLoadingKeys {
+			keyMap[k] = true
+		}
+		for _, key := range DeterministicKeys(am.searchAttributes) {
+			if keyMap[key] {
+				res = append(res, am.searchAttributes[key])
+			}
+		}
+		return res
+	} else if loadingType == iwfidl.NONE {
+		return []iwfidl.SearchAttribute{}
+	} else {
+		panic("not supported loading type " + loadingType)
+	}
+}
+
+func (am *PersistenceManager) LoadDataAttributes(
+	ctx interfaces.UnifiedContext, loadingPolicy *iwfidl.PersistenceLoadingPolicy,
+) []iwfidl.KeyValue {
+	var loadingType iwfidl.PersistenceLoadingType
+	var partialLoadingKeys []string
+	if loadingPolicy != nil {
+		loadingType = loadingPolicy.GetPersistenceLoadingType()
+		partialLoadingKeys = loadingPolicy.PartialLoadingKeys
+		if loadingType == iwfidl.PARTIAL_WITH_EXCLUSIVE_LOCK {
+			partialLoadingKeys = utils.MergeStringSlice(loadingPolicy.PartialLoadingKeys, loadingPolicy.LockingKeys)
+		}
+
+		if loadingType == iwfidl.PARTIAL_WITH_EXCLUSIVE_LOCK || loadingType == iwfidl.ALL_WITH_PARTIAL_LOCK {
+			am.awaitAndLockForKeys(ctx, am.lockedDataAttributesKeys, loadingPolicy.GetLockingKeys())
+		}
+	}
+
+	if loadingType == "" || loadingType == iwfidl.ALL_WITHOUT_LOCKING || loadingType == iwfidl.ALL_WITH_PARTIAL_LOCK {
+		return am.GetAllDataAttributes()
+	} else if loadingType == iwfidl.PARTIAL_WITHOUT_LOCKING || loadingType == iwfidl.PARTIAL_WITH_EXCLUSIVE_LOCK {
+		res := am.GetDataAttributesByKey(service.GetDataAttributesQueryRequest{
+			Keys: partialLoadingKeys,
+		})
+		return res.DataAttributes
+	} else if loadingType == iwfidl.NONE {
+		return []iwfidl.KeyValue{}
+	} else {
+		panic("not supported loading type " + loadingType)
+	}
+}
+
+func (am *PersistenceManager) GetAllSearchAttributes() []iwfidl.SearchAttribute {
+	var res []iwfidl.SearchAttribute
+	// NOTE: using DeterministicKeys so that the JSON snapshot for continueAsNew is stable for pagination
+	// TODO: we should use DeterministicKeys for every map iteration in interpreter for safety
+	// https://github.com/indeedeng/iwf/issues/510
+	for _, k := range DeterministicKeys(am.searchAttributes) {
+		res = append(res, am.searchAttributes[k])
+	}
+	return res
+}
+
+func (am *PersistenceManager) GetAllDataAttributes() []iwfidl.KeyValue {
+	var res []iwfidl.KeyValue
+
+	// NOTE: using DeterministicKeys so that the JSON snapshot for continueAsNew is stable for pagination
+	// TODO: we should use DeterministicKeys for every map iteration in interpreter for safety
+	// https://github.com/indeedeng/iwf/issues/510
+	for _, k := range DeterministicKeys(am.dataAttributes) {
+		res = append(res, am.dataAttributes[k])
+	}
+	return res
+}
+
+func (am *PersistenceManager) ProcessUpsertSearchAttribute(
+	ctx interfaces.UnifiedContext, attributes []iwfidl.SearchAttribute,
+) error {
+	if len(attributes) == 0 {
+		return nil
+	}
+
+	for _, attr := range attributes {
+		am.searchAttributes[attr.GetKey()] = attr
+	}
+	attrsToUpsert, err := mapper.MapToInternalSearchAttributes(attributes)
+	if err != nil {
+		return err
+	}
+	return am.provider.UpsertSearchAttributes(ctx, attrsToUpsert)
+}
+
+func (am *PersistenceManager) ProcessUpsertDataAttribute(ctx interfaces.UnifiedContext, attributes []iwfidl.KeyValue) error {
+	if len(attributes) == 0 {
+		return nil
+	}
+	for _, attr := range attributes {
+		am.dataAttributes[attr.GetKey()] = attr
+	}
+	if am.useMemo {
+		memo := map[string]iwfidl.EncodedObject{}
+		for _, att := range attributes {
+			memo[att.GetKey()] = att.GetValue()
+		}
+		return am.provider.UpsertMemo(ctx, memo)
+	}
+	return nil
+}
+
+func (am *PersistenceManager) CheckDataAndSearchAttributesKeysAreUnlocked(dataAttrKeysToCheck, searchAttrKeysToCheck []string) bool {
+	return am.checkKeysAreUnlocked(am.lockedDataAttributesKeys, dataAttrKeysToCheck) &&
+		am.checkKeysAreUnlocked(am.lockedSearchAttributeKeys, searchAttrKeysToCheck)
+}
+
+func (am *PersistenceManager) checkKeysAreUnlocked(lockedKeys map[string]bool, keysToCheck []string) bool {
+	for _, k := range keysToCheck {
+		if lockedKeys[k] {
+			return false
+		}
+	}
+	return true
+}
+
+func (am *PersistenceManager) awaitAndLockForKeys(ctx interfaces.UnifiedContext, lockedKeys map[string]bool, keysToLock []string) {
+	// wait until all keys are not locked
+	err := am.provider.Await(ctx, func() bool {
+		for _, k := range keysToLock {
+			if lockedKeys[k] {
+				return false
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return
+	}
+	// then lock the keys
+	for _, k := range keysToLock {
+		lockedKeys[k] = true
+	}
+}
+
+func (am *PersistenceManager) unlockKeys(lockedKeys map[string]bool, keysToUnlock []string) {
+	for _, k := range keysToUnlock {
+		delete(lockedKeys, k)
+	}
+}
+
+func (am *PersistenceManager) UnlockPersistence(
+	saPolicy *iwfidl.PersistenceLoadingPolicy, daPolicy *iwfidl.PersistenceLoadingPolicy,
+) {
+	if saPolicy != nil &&
+		(saPolicy.GetPersistenceLoadingType() == iwfidl.PARTIAL_WITH_EXCLUSIVE_LOCK ||
+			saPolicy.GetPersistenceLoadingType() == iwfidl.ALL_WITH_PARTIAL_LOCK) {
+		am.unlockKeys(am.lockedSearchAttributeKeys, saPolicy.GetLockingKeys())
+	}
+
+	if daPolicy != nil &&
+		(daPolicy.GetPersistenceLoadingType() == iwfidl.PARTIAL_WITH_EXCLUSIVE_LOCK ||
+			daPolicy.GetPersistenceLoadingType() == iwfidl.ALL_WITH_PARTIAL_LOCK) {
+		am.unlockKeys(am.lockedDataAttributesKeys, daPolicy.GetLockingKeys())
+	}
+}

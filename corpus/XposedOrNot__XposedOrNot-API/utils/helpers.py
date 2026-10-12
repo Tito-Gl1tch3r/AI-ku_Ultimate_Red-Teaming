@@ -1,0 +1,127 @@
+"""General utility functions for the application."""
+
+# Standard library imports
+import hashlib
+import ipaddress
+import re
+import logging
+from typing import Optional, Dict, Any
+
+# Third-party imports
+from fastapi import Request
+from user_agents import parse
+
+# Local imports
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def get_client_ip(request: Request) -> str:
+    """
+    Extract the real client IP address for rate limiting and logging.
+
+    All legitimate traffic reaches us through Cloudflare, which sets
+    ``CF-Connecting-IP`` and a caller cannot forge it *through* Cloudflare, so
+    we trust ONLY that header. The other forwarding headers
+    (``X-Forwarded-For``, ``True-Client-IP``, ``X-Real-IP``) are
+    caller-controlled on our topology — trusted proxies append the real client
+    on the right while the left is whatever the caller prepended — so keying on
+    them would let a caller mint a fresh rate-limit key per request and bypass
+    limiting. Requests without ``CF-Connecting-IP`` did not come through
+    Cloudflare; collapse them into a single bucket so that path is throttled
+    collectively (until the origin is locked to Cloudflare).
+    """
+    cf_ip = (request.headers.get("CF-Connecting-IP") or "").strip()
+    if cf_ip:
+        try:
+            ipaddress.ip_address(cf_ip)
+            return cf_ip
+        except ValueError:
+            logger.warning("Malformed CF-Connecting-IP header received")
+
+    return "non-cloudflare"
+
+
+def validate_domain(domain: str) -> bool:
+    """Returns True if the domain is valid, False otherwise."""
+    if not domain:
+        return False
+    domain_pattern = (
+        r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
+        r"[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]$"
+    )
+
+    parts = domain.split(".")
+    if len(parts) < 2 or len(parts[-1]) < 2:
+        return False
+
+    return bool(re.match(domain_pattern, domain))
+
+
+def is_valid_domain_name(domain: str) -> bool:
+    """Check if a domain name is valid."""
+    return validate_domain(domain)
+
+
+def is_valid_ip(ip_address: str) -> bool:
+    """Check if an IP address is valid."""
+    try:
+        ipaddress.ip_address(ip_address)
+        return True
+    except ValueError:
+        return False
+
+
+def get_preferred_ip_address(x_forwarded_for: str) -> Optional[str]:
+    """Get the preferred IP address from X-Forwarded-For header."""
+    if not x_forwarded_for:
+        return None
+
+    # Split the string into individual IP addresses
+    ip_addresses = x_forwarded_for.split(",")
+
+    # Return the first IP address that is valid
+    for ip in ip_addresses:
+        ip = ip.strip()
+        if is_valid_ip(ip):
+            return ip
+
+    return None
+
+
+def get_location_from_headers(request: Request) -> str:
+    """Get approximate visitor location from Cloudflare visitor-location headers."""
+    city = (request.headers.get("cf-ipcity") or "").strip()
+    country = (request.headers.get("cf-ipcountry") or "").strip()
+    if country in ("XX", ""):
+        country = ""
+    if city and country:
+        return f"{city}, {country}"
+    if country:
+        return country
+    return "Unknown"
+
+
+def generate_request_hash(data: Dict[str, Any]) -> str:
+    """Generate a hash for the request data."""
+    data_str = str(sorted(data.items()))
+    return hashlib.sha256(data_str.encode()).hexdigest()
+
+
+def get_client_info(request: Request) -> Dict[str, str]:
+    """Get client information from the request."""
+    user_agent_string = request.headers.get("user-agent", "")
+    user_agent = parse(user_agent_string)
+
+    return {
+        "ip_address": request.client.host if request.client else "unknown",
+        "browser_type": f"{user_agent.browser.family} {user_agent.browser.version_string}",
+        "client_platform": f"{user_agent.os.family} {user_agent.os.version_string}",
+    }
+
+
+def string_to_boolean(value: str) -> bool:
+    """Convert a string to a boolean value."""
+    return value.strip().lower() in ("true", "t", "yes", "y", "1")

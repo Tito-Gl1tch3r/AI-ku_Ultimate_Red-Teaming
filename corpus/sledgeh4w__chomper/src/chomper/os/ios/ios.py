@@ -1,0 +1,1304 @@
+import ctypes
+import os
+import plistlib
+import random
+import shutil
+import socket
+import string
+import sys
+from contextlib import contextmanager
+from typing import List, Optional
+
+from chomper.const import TLS_ADDRESS
+from chomper.exceptions import (
+    EmulatorCrashed,
+    ObjCUnrecognizedSelector,
+    SystemOperationFailed,
+)
+from chomper.feature import Feature
+from chomper.loader import MachoLoader, Module
+from chomper.os.device import NullDevice, RandomDevice, UrandomDevice
+from chomper.os.posix import FileProperty, FdType, PosixOs, SyscallError
+from chomper.os.handle import HandleManager
+from chomper.utils import log_call, struct_to_bytes, to_unsigned, read_struct
+
+from . import const
+from .fixup import SystemModuleFixer
+from .hooks import get_hooks, hook_read_class
+from .mach import MachMsgHandler
+from .structs import Dirent, Flock, Kevent, SockaddrIn, Stat64, Statfs64, Timespec
+from .syscall import IosSyscallHandler
+from .xpc import XpcMessageHandler
+
+
+ENVIRON_VARIABLES = r"""SHELL=/bin/sh
+PWD=/var/root
+LOGNAME=root
+HOME=/var/root
+LS_COLORS=rs=0:di=01
+CLICOLOR=
+SSH_CONNECTION=127.0.0.1 59540 127.0.0.1 22
+TERM=xterm
+USER=root
+SHLVL=1
+PS1=\h:\w \u\$
+SSH_CLIENT=127.0.0.1 59540 22
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/bin/X11:/usr/games
+MAIL=/var/mail/root
+SSH_TTY=/dev/ttys000
+_=/usr/bin/env
+SBUS_INSERT_LIBRARIES=/usr/lib/substitute-inserter.dylib
+__CF_USER_TEXT_ENCODING=0x0:0:0
+CFN_USE_HTTP3=0
+CFStringDisableROM=1"""
+
+# System libraries and frameworks to load
+SYSTEM_MODULES = [
+    "/usr/lib/libSystem.B.dylib",
+    "/usr/lib/system/libsystem_kernel.dylib",
+    "/usr/lib/system/libsystem_platform.dylib",
+    "/usr/lib/system/libsystem_c.dylib",
+    "/usr/lib/system/libsystem_featureflags.dylib",
+    "/usr/lib/system/libsystem_malloc.dylib",
+    "/usr/lib/system/libsystem_pthread.dylib",
+    "/usr/lib/system/libcompiler_rt.dylib",
+    "/usr/lib/libc++abi.dylib",
+    "/usr/lib/libc++.1.dylib",
+    "/usr/lib/system/libmacho.dylib",
+    "/usr/lib/system/libdyld.dylib",
+    "/usr/lib/libobjc.A.dylib",
+    "/usr/lib/system/libcache.dylib",
+    "/usr/lib/system/libcorecrypto.dylib",
+    "/usr/lib/system/libcommonCrypto.dylib",
+    "/usr/lib/system/libdispatch.dylib",
+    "/usr/lib/system/libremovefile.dylib",
+    "/usr/lib/system/libsystem_blocks.dylib",
+    "/usr/lib/system/libsystem_configuration.dylib",
+    "/usr/lib/system/libsystem_coreservices.dylib",
+    "/usr/lib/system/libsystem_darwin.dylib",
+    "/usr/lib/system/libsystem_info.dylib",
+    "/usr/lib/system/libsystem_networkextension.dylib",
+    "/usr/lib/system/libsystem_notify.dylib",
+    "/usr/lib/system/libsystem_m.dylib",
+    "/usr/lib/system/libsystem_sandbox.dylib",
+    "/usr/lib/system/libsystem_trace.dylib",
+    "/usr/lib/system/libxpc.dylib",
+    "/usr/lib/libAccessibility.dylib",
+    "/usr/lib/libbsm.0.dylib",
+    "/usr/lib/libcompression.dylib",
+    "/usr/lib/libcupolicy.dylib",
+    "/usr/lib/libicucore.A.dylib",
+    "/usr/lib/libnetwork.dylib",
+    "/usr/lib/libMobileGestalt.dylib",
+    "/usr/lib/libresolv.9.dylib",
+    "/usr/lib/libsqlite3.dylib",
+    "/usr/lib/libTelephonyUtilDynamic.dylib",
+    "/usr/lib/libxml2.2.dylib",
+    "/usr/lib/libz.1.dylib",
+    "/System/Library/Frameworks/CoreFoundation",
+    "/System/Library/Frameworks/Foundation",
+    "/System/Library/Frameworks/CFNetwork",
+    "/System/Library/Frameworks/CoreGraphics",
+    "/System/Library/Frameworks/CoreLocation",
+    "/System/Library/Frameworks/CoreServices",
+    "/System/Library/Frameworks/CoreTelephony",
+    "/System/Library/Frameworks/CoreText",
+    "/System/Library/Frameworks/IOKit",
+    "/System/Library/Frameworks/QuartzCore",
+    "/System/Library/Frameworks/Security",
+    "/System/Library/Frameworks/SystemConfiguration",
+    "/System/Library/PrivateFrameworks/BackBoardServices",
+    "/System/Library/PrivateFrameworks/BaseBoard",
+    "/System/Library/PrivateFrameworks/BoardServices",
+    "/System/Library/PrivateFrameworks/CoreAutoLayout",
+    "/System/Library/PrivateFrameworks/CoreServicesStore",
+    "/System/Library/PrivateFrameworks/FontServices.framework/libGSFont.dylib",
+    "/System/Library/PrivateFrameworks/FontServices.framework/libGSFontCache.dylib",
+    "/System/Library/PrivateFrameworks/FrontBoardServices",
+    "/System/Library/PrivateFrameworks/LocationSupport",
+    "/System/Library/PrivateFrameworks/MobileKeyBag",
+    "/System/Library/PrivateFrameworks/Pasteboard",
+    "/System/Library/PrivateFrameworks/PhysicsKit",
+    "/System/Library/PrivateFrameworks/PrototypeTools",
+    "/System/Library/PrivateFrameworks/RunningBoardServices",
+    "/System/Library/PrivateFrameworks/TextInput",
+    "/System/Library/PrivateFrameworks/UIFoundation",
+    "/System/Library/PrivateFrameworks/UIKitCore",
+    "/System/Library/PrivateFrameworks/UIKitServices",
+]
+
+SWIFT_MODULES = [
+    "/usr/lib/swift/libswiftCore.dylib",
+    "/usr/lib/swift/libswiftCoreFoundation.dylib",
+    "/usr/lib/swift/libswiftDarwin.dylib",
+    "/usr/lib/swift/libswiftDispatch.dylib",
+    "/usr/lib/swift/libswiftFoundation.dylib",
+    "/usr/lib/swift/libswiftObjectiveC.dylib",
+    "/usr/lib/swift/libswiftos.dylib",
+    "/usr/lib/swift/libswiftSystem.dylib",
+    "/usr/lib/swift/libswiftUIKit.dylib",
+]
+
+# Symbolic links in the file system
+SYMBOLIC_LINKS = {
+    "/etc": "/private/etc",
+    "/tmp": "/private/var/tmp",
+    "/var": "/private/var",
+    "/usr/share/zoneinfo": "/var/db/timezone/zoneinfo",
+    "/var/db/timezone/icutz": "/var/db/timezone/tz/2024a.1.0/icutz/",
+    "/var/db/timezone/localtime": "/var/db/timezone/zoneinfo/Asia/Shanghai",
+    "/var/db/timezone/tz_latest": " /var/db/timezone/tz/2024a.1.0/",
+    "/var/db/timezone/zoneinfo": "/var/db/timezone/tz/2024a.1.0/zoneinfo/",
+}
+
+# Default bundle values until an executable with Info.plist is loaded
+BUNDLE_UUID = "2305AA14-F491-40E0-BF02-88BDBABF51AE"
+BUNDLE_EXECUTABLE = "Chomper"
+
+PREFERENCES = {
+    "AppleLanguages": [
+        "zh-Hans",
+        "en",
+    ],
+    "AppleLocale": "zh-Hans",
+}
+
+# Virtual device files
+DEVICES_FILES = {
+    "/dev/null": NullDevice,
+    "/dev/random": RandomDevice,
+    "/dev/urandom": UrandomDevice,
+}
+
+FILE_PROPERTIES = [
+    # path, is_dir, readable, writeable, executable
+    ("/", True, True, False, False),
+    ("/private/var/tmp", True, True, True, False),
+]
+
+
+class IosOs(PosixOs):
+    """Provide iOS environment."""
+
+    AT_FDCWD = to_unsigned(-2, size=4)
+
+    MACH_PORT_NULL = 0
+    MACH_PORT_HOST = 1
+    MACH_PORT_TASK = 2
+    MACH_PORT_THREAD = 3
+    MACH_PORT_BOOTSTRAP = 4
+    MACH_PORT_REPLY = 5
+    MACH_PORT_CLOCK = 6
+    MACH_PORT_IO_MASTER = 7
+    MACH_PORT_DEBUG_CONTROL = 8
+
+    MACH_PORT_TIMER = 256
+
+    MACH_PORT_NOTIFICATION_CENTER = 4096
+    MACH_PORT_CA_RENDER_SERVER = 4097
+    MACH_PORT_ADVERTISING_IDENTIFIERS = 4098
+    MACH_PORT_BKS_HID_SERVER = 4099
+    MACH_PORT_CONFIGD = 4100
+
+    MACH_PORT_START_VALUE = 65536
+    MACH_PORT_MAX_NUM = 10000
+
+    MACH_SERVERS = {
+        "com.apple.system.notification_center": MACH_PORT_NOTIFICATION_CENTER,
+        "com.apple.CARenderServer": MACH_PORT_CA_RENDER_SERVER,
+        "com.apple.lsd.advertisingidentifiers": MACH_PORT_ADVERTISING_IDENTIFIERS,
+        "com.apple.backboard.hid.services": MACH_PORT_BKS_HID_SERVER,
+        "com.apple.SystemConfiguration.configd": MACH_PORT_CONFIGD,
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self._loader = MachoLoader(self.emu)
+        self._syscall_handler = IosSyscallHandler(self.emu)
+
+        self._initialized = False
+
+        # mobile user
+        self._uid = 501
+
+        self._pid = random.randint(1000, 2000)
+        self._tid = random.randint(10000, 20000) | 1
+
+        self._boot_hash = self._random_boot_hash()
+
+        self.executable_path = (
+            f"/private/var/containers/Bundle/Application"
+            f"/{BUNDLE_UUID}"
+            f"/{BUNDLE_EXECUTABLE}.app"
+            f"/{BUNDLE_EXECUTABLE}"
+        )
+        self.executable_file = ""
+
+        self.preferences = PREFERENCES.copy()
+
+        self._pthread_ptr = None
+        self._pthread_errno = None
+
+        # Used to validate the sig field of `pthread_t`
+        self._pthread_ptr_munge_token = 0
+
+        # Semaphore
+        self._semaphore_map = {}
+        self._semaphore_queue = {}
+
+        # Mach port
+        self._mach_port_manager = HandleManager(
+            start_value=self.MACH_PORT_START_VALUE,
+            max_num=self.MACH_PORT_MAX_NUM,
+        )
+
+        self._mach_servers = {}
+
+        # Mach msg
+        self._mach_msg_handler = MachMsgHandler(self.emu, self._mach_port_manager)
+
+        # Xpc message
+        self._xpc_message_handler = XpcMessageHandler(self.emu)
+
+        # keychain
+        self._sec_items = []
+
+    @property
+    def loader(self) -> MachoLoader:
+        return self._loader
+
+    @property
+    def syscall_handler(self) -> IosSyscallHandler:
+        return self._syscall_handler
+
+    def get_errno(self) -> int:
+        errno = self.emu.get_symbol("_errno")
+        return self.emu.read_s32(errno.address)
+
+    def set_errno(self, value: int):
+        errno = self.emu.get_symbol("_errno")
+        self.emu.write_s32(errno.address, value)
+
+        self.emu.write_s32(self._pthread_errno, value)
+
+    @staticmethod
+    def _random_boot_hash() -> str:
+        return "".join(
+            [random.choice(string.digits + string.ascii_uppercase) for _ in range(40)]
+        )
+
+    def _get_main_thread(self) -> int:
+        return self._pthread_ptr
+
+    @staticmethod
+    def _resolve_flags(flags: int) -> int:
+        """Create flags that will be actually passed into the host machine.
+
+        On Windows, the meaning of flags is different with Unix-like operating systems.
+        """
+        _flags = 0
+
+        access_mode = flags & 3
+        if access_mode == 0:
+            _flags |= os.O_RDONLY
+        elif access_mode == 1:
+            _flags |= os.O_WRONLY
+        elif access_mode == 2:
+            _flags |= os.O_RDWR
+
+        if flags & 0x8:
+            _flags |= os.O_APPEND
+        if flags & 0x200:
+            _flags |= os.O_CREAT
+        if flags & 0x400:
+            _flags |= os.O_TRUNC
+        if flags & 0x800:
+            _flags |= os.O_EXCL
+
+        if sys.platform == "win32":
+            _flags |= os.O_BINARY
+
+        return _flags
+
+    def _construct_stat(self, st: os.stat_result) -> ctypes.Structure:
+        if sys.platform == "win32":
+            block_size = 4096
+
+            rdev = 0
+            blocks = st.st_size // (block_size // 8) + 1
+            blksize = block_size
+        else:
+            rdev = st.st_rdev
+            blocks = st.st_blocks
+            blksize = st.st_blksize
+
+        if sys.platform == "darwin":
+            flags = st.st_flags
+        else:
+            flags = 0
+
+        atime = Timespec.from_time_ns(st.st_atime_ns)
+        mtime = Timespec.from_time_ns(st.st_mtime_ns)
+        ctime = Timespec.from_time_ns(st.st_ctime_ns)
+
+        return Stat64(
+            st_dev=st.st_dev,
+            st_mode=st.st_mode,
+            st_nlink=st.st_nlink,
+            st_ino=st.st_ino,
+            st_uid=st.st_uid,
+            st_gid=st.st_gid,
+            st_rdev=rdev,
+            st_atimespec=atime,
+            st_mtimespec=mtime,
+            st_ctimespec=ctime,
+            st_size=st.st_size,
+            st_blocks=blocks,
+            st_blksize=blksize,
+            st_flags=flags,
+        )
+
+    def _construct_device_stat(self) -> ctypes.Structure:
+        atime = Timespec.from_time_ns(0)
+        mtime = Timespec.from_time_ns(0)
+        ctime = Timespec.from_time_ns(0)
+
+        return Stat64(
+            st_dev=0,
+            st_mode=0x2000,
+            st_nlink=0,
+            st_ino=0,
+            st_uid=0,
+            st_gid=0,
+            st_rdev=0,
+            st_atimespec=atime,
+            st_mtimespec=mtime,
+            st_ctimespec=ctime,
+            st_size=0,
+            st_blocks=0,
+            st_blksize=0,
+            st_flags=0,
+        )
+
+    def _construct_statfs(self) -> ctypes.Structure:
+        return Statfs64(
+            f_bsize=4096,
+            f_iosize=1048576,
+            f_blocks=31218501,
+            f_bfree=29460883,
+            f_bavail=25672822,
+            f_files=1248740040,
+            f_ffree=1248421957,
+            f_fsid=103095992327,
+            f_owner=0,
+            f_type=24,
+            f_flags=343986176,
+            f_fssubtype=0,
+            f_fstypename=b"apfs",
+            f_mntonname=b"/",
+            f_mntfromname=b"com.apple.os.update-%s@/dev/disk0s1s1"
+            % self._boot_hash.encode("utf-8"),
+        )
+
+    def _construct_sockaddr_in(self, address: str, port: int) -> ctypes.Structure:
+        return SockaddrIn(
+            sin_len=ctypes.sizeof(SockaddrIn),
+            sin_family=self.AF_INET,
+            sin_port=socket.htons(port),
+            sin_addr=int.from_bytes(socket.inet_aton(address), "little"),
+        )
+
+    def _construct_flock(self, lock_type: int) -> ctypes.Structure:
+        return Flock(
+            l_start=0,
+            l_len=0,
+            l_pid=0,
+            l_type=lock_type,
+            l_whence=0,
+        )
+
+    def getuid(self) -> int:
+        return self._uid
+
+    def getgid(self) -> int:
+        return self._uid
+
+    def getpid(self) -> int:
+        return self._pid
+
+    def getpgid(self) -> int:
+        return self._pid
+
+    def gettid(self) -> int:
+        return self._tid
+
+    def _check_kqueue(self, kq: int):
+        """Check kqueue."""
+        self._check_fd(kq)
+
+        fd_type = self._file_manager.get_prop(kq, "type")
+
+        if fd_type != FdType.KQUEUE:
+            raise SystemOperationFailed(f"Bad kqueue: {kq}", SyscallError.EBADF)
+
+    @log_call
+    def getdirentries(self, fd: int, offset: int) -> Optional[bytes]:
+        if not self._is_dir_fd(fd):
+            raise SystemOperationFailed(f"Not a directory: {fd}", SyscallError.ENOTDIR)
+
+        path = self._get_fd_path(fd)
+        real_path = self._get_real_path(path)
+
+        dir_entries = list(os.scandir(real_path))
+        if offset >= len(dir_entries):
+            return None
+
+        dir_entry = dir_entries[offset]
+
+        st = Dirent(
+            d_ino=dir_entry.inode(),
+            d_seekoff=0,
+            d_reclen=ctypes.sizeof(Dirent),
+            d_namlen=len(dir_entry.name),
+            d_type=(4 if dir_entry.is_dir() else 0),
+            d_name=dir_entry.name.encode("utf-8"),
+        )
+        return struct_to_bytes(st)
+
+    def _clonefile(self, src_path: str, dst_path: str):
+        real_src_path = self._get_real_path(src_path)
+        real_dst_path = self._get_real_path(dst_path)
+
+        shutil.copy2(real_src_path, real_dst_path)
+
+    @log_call
+    def clonefileat(
+        self,
+        src_dir_fd: int,
+        src_path: str,
+        dst_dir_fd: int,
+        dst_path: str,
+    ):
+        src_path = self._resolve_dir_fd(src_dir_fd, src_path)
+        dst_path = self._resolve_dir_fd(dst_dir_fd, dst_path)
+
+        self._clonefile(src_path, dst_path)
+
+    @log_call
+    def fclonefileat(
+        self,
+        src_fd: int,
+        dst_dir_fd: int,
+        dst_path: str,
+    ):
+        self._check_fd(src_fd)
+
+        src_path = self._get_fd_path(src_fd)
+        dst_path = self._resolve_dir_fd(dst_dir_fd, dst_path)
+
+        self._clonefile(src_path, dst_path)
+
+    @log_call
+    def renameatx_np(
+        self,
+        old_dir_fd: int,
+        old: str,
+        new_dir_fd: int,
+        new: str,
+        flags: int,
+    ):
+        old = self._resolve_dir_fd(old_dir_fd, old)
+        new = self._resolve_dir_fd(new_dir_fd, new)
+
+        real_old = self._get_real_path(old)
+        real_new = self._get_real_path(new)
+
+        if flags & const.RENAME_EXCL and os.path.exists(real_new):
+            raise SystemOperationFailed(f"File existed: {new}", SyscallError.EEXIST)
+
+        if flags & const.RENAME_SWAP:
+            if not os.path.exists(real_old):
+                raise SystemOperationFailed(f"No such file: {old}", SyscallError.ENOENT)
+            elif not os.path.exists(real_new):
+                raise SystemOperationFailed(f"No such file: {new}", SyscallError.ENOENT)
+
+            swap_path = old + ".swap"
+            self._rename(old, swap_path)
+            self._rename(new, old)
+            self._rename(swap_path, new)
+        else:
+            self._rename(old, new)
+
+    @log_call
+    def sendfile(self, fd: int, sock: int, offset: int, length_ptr: int):
+        real_sock = self._get_fd_sock(sock)
+        length = self.emu.read_s64(length_ptr)
+
+        sent = 0
+        chunk = 4096
+
+        while not length or sent < length:
+            if length:
+                remaining = length - sent
+                if chunk > remaining:
+                    chunk = remaining
+
+            data = self._pread(fd, chunk, offset + sent)
+            if not data:
+                break
+
+            off = 0
+
+            while off < len(data):
+                off += real_sock.send(data[off:])
+                self.emu.write_s64(length_ptr, sent + off)
+
+            sent += off
+
+    @log_call
+    def kqueue(self) -> int:
+        return self._new_fd(FdType.KQUEUE)
+
+    @log_call
+    def kevent(
+        self,
+        kq: int,
+        change_ptr: int,
+        n_changes: int,
+        event_ptr: int,
+        n_event: int,
+        timeout: int,
+    ) -> int:
+        self._check_kqueue(kq)
+
+        change_list = []
+        event_list = []
+
+        if n_changes and change_ptr:
+            for _ in range(n_changes):
+                event = read_struct(self.emu, change_ptr, Kevent)
+                change_list.append(event)
+                change_ptr += ctypes.sizeof(Kevent)
+
+        if n_event and event_ptr:
+            for _ in range(n_event):
+                event = read_struct(self.emu, event_ptr, Kevent)
+                event_list.append(event)
+                event_ptr += ctypes.sizeof(Kevent)
+
+        return -1
+
+    def _setup_tls(self):
+        """Initialize thread local storage (TLS)."""
+        self._pthread_ptr = TLS_ADDRESS - 224
+        self._pthread_errno = self.emu.create_buffer(4)
+
+        # Initialize `pthread_t`
+        sig = self._pthread_ptr ^ self._pthread_ptr_munge_token
+        self.emu.write_u64(self._pthread_ptr, sig)
+
+        # tl_plist.tqe_prev
+        tqe_prev = self.emu.create_buffer(224)
+        self.emu.write_u64(self._pthread_ptr + 0x18, tqe_prev)
+
+        self.emu.write_u64(TLS_ADDRESS - 8, self.gettid())
+
+        # Initialize thread specific data
+        tsd = [
+            self._pthread_ptr,
+            self._pthread_errno,
+            0,
+            self.gettid(),
+        ]
+
+        for index, value in enumerate(tsd):
+            self.emu.write_u64(TLS_ADDRESS + 8 * index, value)
+
+    def _setup_system_registers(self):
+        """Initialize MMIO for system registers."""
+
+        def read_cb(uc, offset, size_, read_ud):
+            # Arch type
+            if offset == 0x23:
+                return 0x2
+            # vm_page_shift
+            elif offset == 0x25:
+                return 0xE
+            # vm_kernel_page_shift
+            elif offset == 0x37:
+                return 0xE
+            # whether to trace
+            elif offset == 0x100:
+                return 0x0
+            # Unknown, appear at _os_trace_init_slow
+            elif offset == 0x104:
+                return 0x100
+
+            return 0
+
+        def write_cb(uc, offset, size_, value, write_ud):
+            pass
+
+        address = 0xFFFFFC000
+        size = 0x1000
+
+        self.emu.uc.mmio_map(address, size, read_cb, None, write_cb, None)
+
+    def _setup_file_properties(self):
+        """Initialize file properties."""
+        for path, is_dir, readable, writeable, executable in FILE_PROPERTIES:
+            file_prop = FileProperty(
+                path=path,
+                is_dir=is_dir,
+                readable=readable,
+                writeable=writeable,
+                executable=executable,
+            )
+            self.add_file_property(file_prop)
+
+    def _init_lib_dyld(self):
+        g_use_dyld3 = self.emu.get_symbol("_gUseDyld3")
+        self.emu.write_u8(g_use_dyld3.address, 1)
+
+        dyld_all_images = self.emu.get_symbol("__ZN5dyld310gAllImagesE")
+
+        # dyld3::closure::ContainerTypedBytes::findAttributePayload()
+        attribute_payload_ptr = self.emu.create_buffer(8)
+
+        self.emu.write_u32(attribute_payload_ptr, 2**10)
+        self.emu.write_u8(attribute_payload_ptr + 4, 0x20)
+
+        self.emu.write_pointer(dyld_all_images.address, attribute_payload_ptr)
+
+        # dyld3::AllImages::platform()
+        platform_ptr = self.emu.create_buffer(0x144)
+        self.emu.write_u32(platform_ptr + 0x140, 2)
+
+        self.emu.write_pointer(dyld_all_images.address + 0x50, platform_ptr)
+
+        # environ
+        environ_pointer = self.emu.get_symbol("_environ_pointer")
+        environ_value = self.emu.read_pointer(environ_pointer.address)
+
+        environ_buf = self.emu.create_buffer(8)
+        self.emu.write_pointer(environ_buf, environ_value)
+
+        environ = self.emu.get_symbol("_environ")
+        self.emu.write_pointer(environ.address, environ_buf)
+
+        self.emu.call_symbol("_tlv_initializer")
+
+    def _init_lib_system_c(self):
+        # __program_vars_init
+        argc = self.emu.create_buffer(8)
+        self.emu.write_int(argc, 0, 8)
+
+        nx_argc_pointer = self.emu.get_symbol("_NXArgc_pointer")
+        self.emu.write_pointer(nx_argc_pointer.address, argc)
+
+        argv_val = self.emu.create_buffer(8)
+        self.emu.write_string(argv_val, "")
+
+        argv = self.emu.create_buffer(8)
+        self.emu.write_pointer(argv, argv_val)
+
+        nx_argv_pointer = self.emu.get_symbol("_NXArgv_pointer")
+        self.emu.write_pointer(nx_argv_pointer.address, argv)
+
+        environ = self.emu.create_buffer(8)
+        self.emu.write_pointer(environ, self._create_environ(ENVIRON_VARIABLES))
+
+        environ_pointer = self.emu.get_symbol("_environ_pointer")
+        self.emu.write_pointer(environ_pointer.address, environ)
+
+        progname = self.emu.create_buffer(8)
+        self.emu.write_pointer(progname, self.emu.create_string(BUNDLE_EXECUTABLE))
+
+        progname_pointer = self.emu.get_symbol("___progname_pointer")
+        self.emu.write_pointer(progname_pointer.address, progname)
+
+        # ___xlocale_init
+        locale_key = self.emu.get_symbol("___locale_key")
+        if self.emu.read_s64(locale_key.address) == -1:
+            self.emu.write_s64(locale_key.address, 10)
+
+        self.emu.call_symbol("___atexit_init")
+
+        # _init_clock_port
+        clock_port = self.emu.get_symbol("_clock_port")
+        self.emu.write_u32(clock_port.address, self.MACH_PORT_CLOCK)
+
+    def _init_lib_system_pthread(self):
+        main_thread_ptr = self.emu.get_symbol("__main_thread_ptr")
+        self.emu.write_pointer(main_thread_ptr.address, self._get_main_thread())
+
+        pthread_ptr_munge_token = self.emu.get_symbol("__pthread_ptr_munge_token")
+        self.emu.write_pointer(
+            pthread_ptr_munge_token.address, self._pthread_ptr_munge_token
+        )
+
+        pthread_supported_features = self.emu.get_symbol(
+            "___pthread_supported_features"
+        )
+        self.emu.write_u32(pthread_supported_features.address, 0x50)
+
+        mach_task_self = self.emu.get_symbol("_mach_task_self_")
+        self.emu.write_u32(mach_task_self.address, self.MACH_PORT_TASK)
+
+    def _init_lib_system_malloc(self):
+        functions_ptr = self.emu.create_buffer(8 * 13)
+
+        system_malloc = self.emu.find_module("libsystem_malloc.dylib")
+
+        for symbol in system_malloc.symbols:
+            if symbol.name == "_malloc":
+                self.emu.write_pointer(functions_ptr + 8 * 2, symbol.address)
+            elif symbol.name == "_free":
+                self.emu.write_pointer(functions_ptr + 8 * 3, symbol.address)
+            elif symbol.name == "_realloc":
+                self.emu.write_pointer(functions_ptr + 8 * 4, symbol.address)
+
+        libkernel_functions = self.emu.get_symbol("__libkernel_functions")
+        self.emu.write_pointer(libkernel_functions.address, functions_ptr)
+
+        malloc_engaged_nano = self.emu.get_symbol("__malloc_engaged_nano")
+        self.emu.write_u32(malloc_engaged_nano.address, 1)
+
+    def _init_lib_objc(self):
+        prototypes = self.emu.get_symbol("__ZL10prototypes")
+        self.emu.write_u64(prototypes.address, 0)
+
+        gdb_objc_realized_classes = self.emu.get_symbol("_gdb_objc_realized_classes")
+        protocolsv_ret = self.emu.call_symbol("__ZL9protocolsv")
+
+        self.emu.write_pointer(gdb_objc_realized_classes.address, protocolsv_ret)
+
+        opt = self.emu.get_symbol("__ZL3opt")
+        self.emu.write_pointer(opt.address, 0)
+
+        # Disable pre-optimization
+        disable_preopt = self.emu.get_symbol("_DisablePreopt")
+        self.emu.write_u8(disable_preopt.address, 1)
+
+        self.emu.call_symbol("__objc_init")
+
+    def _init_system_symbols(self):
+        # libsandbox.dylib
+        amkrtemp_sentinel = self.emu.get_symbol("__amkrtemp.sentinel")
+        if amkrtemp_sentinel:
+            self.emu.write_pointer(
+                amkrtemp_sentinel.address,
+                self.emu.create_string(""),
+            )
+
+        # CoreFoundation
+        is_cf_prefs_d = self.emu.get_symbol("_isCFPrefsD")
+        if is_cf_prefs_d:
+            self.emu.write_u8(is_cf_prefs_d.address, 1)
+
+        # BackBoardServices
+        bks_hid_sever_port = self.emu.get_symbol("_BKSHIDServerPort")
+        if bks_hid_sever_port:
+            self.emu.write_u32(
+                bks_hid_sever_port.address,
+                self.MACH_PORT_BKS_HID_SERVER,
+            )
+
+        # MobileKeyBag
+        g_user_unlocked_since_boot = self.emu.get_symbol("_gUserUnlockedSinceBoot")
+        if g_user_unlocked_since_boot:
+            self.emu.write_u8(g_user_unlocked_since_boot.address, 1)
+
+    def _perform_module_init(self, name: str, module: Module):
+        """For certain system modules, perform additional initialization before
+        and after Objective-C initialization."""
+        if name == "libsystem_kernel.dylib":
+            self.emu.call_symbol("_mach_init_doit")
+        elif name == "libsystem_c.dylib":
+            self._init_lib_system_c()
+        elif name == "libdyld.dylib":
+            self._init_lib_dyld()
+        elif name == "libsystem_pthread.dylib":
+            self._init_lib_system_pthread()
+        elif name == "libsystem_malloc.dylib":
+            self._init_lib_system_malloc()
+        elif name == "libsystem_trace.dylib":
+            self.emu.call_symbol("__libtrace_init")
+        elif name == "libobjc.A.dylib":
+            self._init_lib_objc()
+
+        # Initialize Objective-C
+        self.init_objc(module)
+
+        if name == "libxpc.dylib":
+            self.emu.call_symbol("__libxpc_initializer")
+        elif name == "CoreFoundation":
+            self.emu.call_symbol("___CFInitialize")
+        elif name == "Foundation":
+            self.emu.call_symbol("__NSInitializePlatform")
+        elif name == "CoreText":
+            self.emu.call_symbol("___CTInitialize")
+
+    def notify_load(self, module: Module):
+        """Triggered after the module is loaded."""
+        if not self.emu.find_module("libdyld.dylib"):
+            return
+
+        # Initialize thread-local variables
+        self.emu.call_symbol(
+            "_tlv_load_notification",
+            module.macho_info.image_header,
+            0,
+        )
+
+    def init_objc(self, module: Module):
+        """Initialize Objective-C for the module."""
+        if not self.emu.find_module("libobjc.A.dylib"):
+            return
+
+        mach_header_ptr = module.macho_info.image_header
+        mach_header_ptrs = self.emu.create_buffer(self.emu.arch.addr_size)
+
+        mh_execute_header_pointer = self.emu.get_symbol("__mh_execute_header_pointer")
+
+        self.emu.write_pointer(mach_header_ptrs, mach_header_ptr)
+        self.emu.write_pointer(mh_execute_header_pointer.address, mach_header_ptr)
+
+        try:
+            self.emu.call_symbol("_map_images", 1, 0, mach_header_ptrs)
+            self.emu.call_symbol("_load_images", 0, mach_header_ptr)
+        except (EmulatorCrashed, ObjCUnrecognizedSelector):
+            self.emu.logger.warning("Initialize Objective-C failed.")
+
+            # Release locks
+            runtime_lock = self.emu.get_symbol("_runtimeLock")
+            self.emu.write_u64(runtime_lock.address, 0)
+
+            lcl_rwlock = self.emu.get_symbol("_lcl_rwlock")
+            self.emu.write_u64(lcl_rwlock.address, 0)
+
+    def search_module_binary(self, name: str) -> str:
+        """Search system module binary in rootfs directory.
+
+        Args:
+            name: The module name.
+
+        Returns:
+            Full file path if module found.
+
+        raises:
+            FileNotFoundError: If module not found.
+        """
+        lib_dirs = [
+            "usr/lib/system",
+            "usr/lib",
+            "System/Library/Frameworks",
+            "System/Library/PrivateFrameworks",
+        ]
+
+        for lib_dir in lib_dirs:
+            path = os.path.join(self.rootfs_path or ".", lib_dir)
+
+            lib_path = os.path.join(path, name)
+            if os.path.exists(lib_path):
+                return lib_path
+
+            framework_path = os.path.join(path, f"{name}.framework")
+            if os.path.exists(framework_path):
+                return os.path.join(framework_path, name)
+
+        raise FileNotFoundError("Module '%s' not found" % name)
+
+    def resolve_modules(self, paths: List[str]):
+        """Load and initialize system modules."""
+        for path in paths:
+            name = os.path.basename(path)
+            if self.emu.find_module(name):
+                continue
+
+            module_file = None
+
+            if path.startswith("/"):
+                module_file = os.path.join(self.rootfs_path or ".", path[1:])
+
+            if not module_file or not os.path.exists(module_file):
+                module_file = self.search_module_binary(name)
+
+            module = self.emu.load_module(
+                module_file=module_file,
+                exec_objc_init=False,
+                exec_init_array=False,
+            )
+
+            # Fixup must be executed before initializing Objective-C
+            fixer = SystemModuleFixer(self.emu, module)
+            fixer.fixup_all()
+
+            # Execute initialization functions after fixup
+            if module.init_array:
+                init_array = [
+                    module.base - module.macho_info.image_base + init_func
+                    for init_func in module.init_array
+                ]
+                self.emu.exec_init_array(init_array)
+
+            self._perform_module_init(name, module)
+
+    def _setup_bundle_dir(self):
+        """Set bundle directory as current working directory."""
+        bundle_path = os.path.dirname(self.executable_path)
+        container_path = os.path.dirname(bundle_path)
+
+        self.set_working_dir(bundle_path)
+
+        local_container_path = os.path.join(
+            self.rootfs_path,
+            "private",
+            "var",
+            "containers",
+            "Bundle",
+            "Application",
+            BUNDLE_UUID,
+        )
+        local_bundle_path = os.path.join(
+            local_container_path, f"{BUNDLE_EXECUTABLE}.app"
+        )
+
+        self.forward_path(container_path, local_container_path)
+        self.forward_path(bundle_path, local_bundle_path)
+
+        # Set env `HOME`
+        if self._initialized:
+            with self.emu.memory_scope() as mem:
+                key = mem.create_string("HOME")
+                value = mem.create_string(bundle_path)
+                self.emu.call_symbol("_setenv", key, value, 1)
+
+        # Setting bundle dir permissions
+        file_prop = FileProperty(
+            path=bundle_path,
+            is_dir=True,
+            readable=True,
+            writeable=True,
+            executable=True,
+        )
+        self.add_file_property(file_prop)
+
+    def set_executable_file(self, path: str):
+        """Set program path and name to global variables while forwarding
+        the file access to executable.
+
+        When an `Info.plist` file is located in the same directory as
+        the executable, the runtime automatically extracts its `CFBundleIdentifier`
+        and `CFBundleExecutable` values.
+        """
+        self.executable_file = path
+
+        bundle_path = os.path.dirname(self.executable_path)
+        container_path = os.path.dirname(bundle_path)
+
+        executable_dir = os.path.dirname(self.executable_file)
+        info_path = os.path.join(executable_dir, "Info.plist")
+
+        if os.path.exists(info_path):
+            with open(info_path, "rb") as f:
+                info_data = plistlib.load(f)
+
+            bundle_executable = info_data["CFBundleExecutable"]
+
+            bundle_path = f"{container_path}/{bundle_executable}.app"
+            self.executable_path = f"{bundle_path}/{bundle_executable}"
+
+            progname_str = self.emu.create_string(self.executable_path.split("/")[-1])
+            process_path_str = self.emu.create_string(self.executable_path)
+
+            progname = self.emu.create_buffer(8)
+            self.emu.write_pointer(progname, progname_str)
+
+            progname_pointer = self.emu.get_symbol("___progname_pointer")
+            self.emu.write_pointer(progname_pointer.address, progname)
+
+            cf_progname = self.emu.get_symbol("___CFprogname")
+            cf_process_path = self.emu.get_symbol("___CFProcessPath")
+
+            self.emu.write_pointer(cf_progname.address, progname_str)
+            self.emu.write_pointer(cf_process_path.address, process_path_str)
+
+        # Set path forwarding to executable and Info.plist
+        self.forward_path(
+            src_path=self.executable_path,
+            dst_path=self.executable_file,
+        )
+        self.forward_path(
+            src_path=f"{bundle_path}/Info.plist",
+            dst_path=info_path,
+        )
+
+        self._setup_bundle_dir()
+
+    def get_executable_file(self) -> str:
+        return self.executable_file
+
+    def _create_fp(self, fd: int, mode: str, unbuffered: bool = False) -> int:
+        """Wrap file descriptor to file object by calling `fdopen`.
+
+        Args:
+            fd: File descriptor.
+            mode: File open mode.
+            unbuffered: If True, set unbuffered flag to the file object.
+
+        Returns:
+            File object pointer.
+        """
+        with self.emu.memory_scope() as mem:
+            mode_ptr = mem.create_string(mode)
+
+            fp = self.emu.call_symbol("_fdopen", fd, mode_ptr)
+            flags = self.emu.read_u32(fp + 16)
+
+            if unbuffered:
+                flags |= 0x2
+
+            self.emu.write_u32(fp + 16, flags)
+            return fp
+
+    def _setup_stdio(self):
+        """Convert standard Input/Output file descriptors to FILE objects and assign
+        them to target symbols.
+        """
+        stdin = self.emu.get_symbol("___stdinp")
+        stdout = self.emu.get_symbol("___stdoutp")
+        stderr = self.emu.get_symbol("___stderrp")
+
+        if isinstance(self._stdin_fd, int):
+            stdin_fp = self._create_fp(self._stdin_fd, "r")
+            self.emu.write_pointer(stdin.address, stdin_fp)
+
+        stdout_fp = self._create_fp(self._stdout_fd, "w", unbuffered=True)
+        self.emu.write_pointer(stdout.address, stdout_fp)
+
+        stderr_fp = self._create_fp(self._stderr_fd, "w", unbuffered=True)
+        self.emu.write_pointer(stderr.address, stderr_fp)
+
+    def dlopen(self, path: str) -> Optional[int]:
+        """Used for `dlopen` and `_sl_dlopen_audited`.
+
+        Presently supports system module loading only.
+
+        Args:
+            path: Module path or just the module name.
+
+        Returns:
+            If the module exists or is loaded successfully, returns the module's base
+            address; otherwise returns `None`.
+        """
+        module_name = path.split("/")[-1]
+
+        # Check module loading status
+        for module in self.emu.modules:
+            if path.endswith(module.name):
+                return module.base
+
+        # For system modules, attempt to load
+        try:
+            self.search_module_binary(module_name)
+            self.resolve_modules([module_name])
+
+            found_module = self.emu.find_module(module_name)
+            if found_module:
+                return found_module.base
+        except FileNotFoundError:
+            pass
+
+        return None
+
+    def set_dispatch_queue(self, queue: int):
+        """Store current async dispatch queue in TLS.
+
+        Certain async callback functions invoke `dispatch_assert_queue$V2`
+        or `dispatch_assert_queue_not$V2` to perform assertion checks on
+        the current dispatch queue.
+        """
+        self.emu.write_u64(TLS_ADDRESS + 0xA0, queue)
+        self.emu.write_u64(TLS_ADDRESS + 0xA8, 0)
+
+    def get_dispatch_queue(self) -> int:
+        """Get current async dispatch queue from TLS."""
+        return self.emu.read_u64(TLS_ADDRESS + 0xA0)
+
+    def semaphore_create(self, value: int) -> int:
+        sem = 1
+        while sem < 10000:
+            if sem not in self._semaphore_map:
+                break
+            sem += 1
+        else:
+            return 0
+
+        self._semaphore_map[sem] = value
+        return sem
+
+    def semaphore_destroy(self, sem: int):
+        if sem in self._semaphore_map:
+            del self._semaphore_map[sem]
+
+    def semaphore_wait(self, sem: int, timeout: int = -1) -> int:
+        value = self._semaphore_map[sem]
+
+        # Need to wait
+        if value <= 0:
+            # start_time = time.time()
+            # rand_id = uuid.uuid4()
+            #
+            # if semaphore not in self._semaphore_queue:
+            #     self._semaphore_queue[semaphore] = []
+            # self._semaphore_queue[semaphore].append(rand_id)
+            #
+            # while True:
+            #     if 0 < timeout < time.time() - start_time:
+            #         return -1
+            #
+            #     if rand_id not in self._semaphore_queue[semaphore]:
+            #         return 0
+            #
+            #     time.sleep(0.1)
+
+            self.emu.logger.warning("Ignored a semaphore waiting.")
+            return -1
+
+        self._semaphore_map[sem] -= 1
+        return 0
+
+    def semaphore_signal(self, sem: int) -> int:
+        if self._semaphore_queue.get(sem):
+            self._semaphore_queue[sem].pop(0)
+        else:
+            self._semaphore_map[sem] += 1
+
+        return const.KERN_SUCCESS
+
+    @log_call
+    def mach_port_construct(self) -> int:
+        mach_port = self._mach_port_manager.new()
+        return mach_port if mach_port else 0
+
+    @log_call
+    def mach_port_destruct(self, mach_port: int):
+        self._mach_port_manager.free(mach_port)
+
+    def bootstrap_look_up(self, name: str) -> int:
+        """Find registered mach service.
+
+        Returns:
+            The port of this mach service.
+        """
+        if name in self._mach_servers:
+            return self._mach_servers[name]
+
+        return 0
+
+    def mach_msg(
+        self,
+        msg: int,
+        option: int,
+        send_size: int,
+        rcv_size: int,
+        rcv_name: int,
+        timeout: int,
+        notify: int,
+    ) -> int:
+        """Respond to `mach_msg`."""
+        return self._mach_msg_handler.handle_msg(
+            msg,
+            option,
+            send_size,
+            rcv_size,
+            rcv_name,
+            timeout,
+            notify,
+        )
+
+    def xpc_connection_send_message(self, connection: int, message: int) -> int:
+        """Respond to `xpc_connection_send_message_with_reply_sync`."""
+        return self._xpc_message_handler.handle_message(
+            connection,
+            message,
+        )
+
+    def _set_tid(self, tid: int):
+        self._tid = tid
+        self.emu.write_u32(TLS_ADDRESS + 0x18, tid)
+
+    @contextmanager
+    def worker_thread(self, tid: Optional[int] = None, queue: Optional[int] = None):
+        """Manage worker thread environment, automatically switch tid and dispatch
+        queue."""
+        original_tid = self._tid
+        original_queue = self.get_dispatch_queue()
+
+        tid = tid or (random.randint(20000 + 1, 30000) | 1)
+        self._set_tid(tid)
+
+        if queue:
+            self.set_dispatch_queue(queue)
+
+        yield
+
+        self._set_tid(original_tid)
+        self.set_dispatch_queue(original_queue)
+
+    def sec_item_add(self, attributes: dict):
+        self._sec_items.append(attributes)
+
+    def sec_item_copy_matching(self, query: dict) -> Optional[dict]:
+        match_keys = ["SecClass", "SecAttrKeyType"]
+
+        for item in self._sec_items:
+            if all((query[key] == item[key] for key in match_keys)):
+                return item
+
+        return None
+
+    def sec_item_delete(self, query: dict):
+        match_keys = ["SecClass", "SecAttrKeyType"]
+
+        for item in self._sec_items:
+            if all((query[key] == item[key] for key in match_keys)):
+                self._sec_items.remove(item)
+
+    def initialize(self):
+        # Setup hooks
+        self.emu.hooks.update(get_hooks())
+
+        if Feature.OBJC_COMPATIBILITY_MODE:
+            self.emu.hooks["__ZL9readClassP10objc_classbb"] = hook_read_class
+
+        # Mount virtual device files
+        self.mount_devices(DEVICES_FILES)
+
+        self._setup_tls()
+        self._setup_file_properties()
+        self._setup_system_registers()
+
+        # Setup symbolic links
+        for src, dst in SYMBOLIC_LINKS.items():
+            self.set_symbolic_link(src, dst)
+
+        self._setup_bundle_dir()
+
+        # Setup mach servers
+        self._mach_servers.update(self.MACH_SERVERS)
+
+        modules = SYSTEM_MODULES.copy()
+
+        if Feature.SWIFT_ENABLED:
+            modules.extend(SWIFT_MODULES)
+
+        # Setup system modules
+        self.resolve_modules(modules)
+        self._init_system_symbols()
+
+        self._setup_stdio()
+
+        self._initialized = True

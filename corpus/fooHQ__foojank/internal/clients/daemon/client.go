@@ -1,0 +1,1122 @@
+package daemon
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+	"github.com/nats-io/nuid"
+
+	protoagent "github.com/foohq/foojank/proto/agent"
+	protodaemon "github.com/foohq/foojank/proto/daemon"
+	protogw "github.com/foohq/foojank/proto/gateway"
+
+	"github.com/foohq/foojank/internal/clients/server"
+)
+
+const EventStream = "event-stream"
+
+type Client struct {
+	srv    *server.Client
+	stream string
+}
+
+func New(srv *server.Client) *Client {
+	return &Client{
+		srv:    srv,
+		stream: EventStream,
+	}
+}
+
+func (c *Client) InitDaemon(ctx context.Context) (err error) {
+	streamName := c.stream
+	_, err = c.srv.CreateStream(ctx, jetstream.StreamConfig{
+		Name: streamName,
+		Subjects: []string{
+			protoagent.CmdStartWorkerSubject("*", "*", "*"),
+			protoagent.CmdStopWorkerSubject("*", "*", "*"),
+			protoagent.CmdWriteStdinSubject("*", "*", "*"),
+			protoagent.EvtStartWorkerSubject("*", "*", "*"),
+			protoagent.EvtStopWorkerSubject("*", "*", "*"),
+			protoagent.EvtWorkerStdoutSubject("*", "*", "*"),
+			protoagent.EvtWorkerStatusSubject("*", "*", "*"),
+			protoagent.EvtAgentInfoSubject("*", "*"),
+		},
+	})
+	if err != nil {
+		return translate(err)
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		_ = c.srv.DeleteStream(ctx, c.stream)
+	}()
+
+	consumerName := c.srv.UserID()
+	_, err = c.srv.CreateConsumer(ctx, streamName, jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		DeliverPolicy: jetstream.DeliverLastPolicy,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		MaxAckPending: 1,
+	})
+	if err != nil {
+		return translate(err)
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		_ = c.srv.DeleteConsumer(ctx, streamName, consumerName)
+	}()
+
+	return nil
+}
+
+func (c *Client) CreateAgent(ctx context.Context, agent AgentDirectoryEntry) (AgentDirectoryEntry, error) {
+	dir, err := c.openAgentDirectory(ctx)
+	if err != nil {
+		return AgentDirectoryEntry{}, translate(err)
+	}
+
+	agent, err = dir.Create(ctx, agent)
+	if err != nil {
+		return AgentDirectoryEntry{}, translate(err)
+	}
+
+	return agent, nil
+}
+
+func (c *Client) UpdateAgent(ctx context.Context, agent AgentDirectoryEntry) (AgentDirectoryEntry, error) {
+	dir, err := c.openAgentDirectory(ctx)
+	if err != nil {
+		return AgentDirectoryEntry{}, translate(err)
+	}
+
+	agent, err = dir.Update(ctx, agent)
+	if err != nil {
+		return AgentDirectoryEntry{}, translate(err)
+	}
+
+	return agent, nil
+}
+
+func (c *Client) RemoveAgent(ctx context.Context, agent AgentDirectoryEntry) error {
+	dir, err := c.openAgentDirectory(ctx)
+	if err != nil {
+		return translate(err)
+	}
+
+	err = dir.Delete(ctx, agent)
+	if err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+		return translate(err)
+	}
+
+	return nil
+}
+
+func (c *Client) GetAgent(ctx context.Context, key string) (AgentDirectoryEntry, error) {
+	dir, err := c.openAgentDirectory(ctx)
+	if err != nil {
+		return AgentDirectoryEntry{}, translate(err)
+	}
+
+	agent, err := dir.Get(ctx, key)
+	if err != nil {
+		return AgentDirectoryEntry{}, translate(err)
+	}
+
+	return agent, nil
+}
+
+func (c *Client) ListAgents(ctx context.Context) ([]AgentDirectoryEntry, error) {
+	dir, err := c.openAgentDirectory(ctx)
+	if err != nil {
+		return nil, translate(err)
+	}
+
+	entries, err := dir.List(ctx)
+	if err != nil {
+		return nil, translate(err)
+	}
+
+	return entries, nil
+}
+
+func (c *Client) GetAgentHost(ctx context.Context, key string) (AgentHostDirectoryEntry, error) {
+	dir, err := c.openAgentHostDirectory(ctx)
+	if err != nil {
+		return AgentHostDirectoryEntry{}, translate(err)
+	}
+
+	host, err := dir.Get(ctx, key)
+	if err != nil {
+		return AgentHostDirectoryEntry{}, translate(err)
+	}
+
+	return host, nil
+}
+
+func (c *Client) ListAgentHosts(ctx context.Context) ([]AgentHostDirectoryEntry, error) {
+	dir, err := c.openAgentHostDirectory(ctx)
+	if err != nil {
+		return nil, translate(err)
+	}
+
+	entries, err := dir.List(ctx)
+	if err != nil {
+		return nil, translate(err)
+	}
+
+	return entries, nil
+}
+
+func (c *Client) CreateGateway(ctx context.Context, gateway GatewayDirectoryEntry) (GatewayDirectoryEntry, error) {
+	dir, err := c.openGatewayDirectory(ctx)
+	if err != nil {
+		return GatewayDirectoryEntry{}, translate(err)
+	}
+
+	gateway, err = dir.Create(ctx, gateway)
+	if err != nil {
+		return GatewayDirectoryEntry{}, translate(err)
+	}
+
+	return gateway, nil
+}
+
+func (c *Client) UpdateGateway(ctx context.Context, gateway GatewayDirectoryEntry) (GatewayDirectoryEntry, error) {
+	dir, err := c.openGatewayDirectory(ctx)
+	if err != nil {
+		return GatewayDirectoryEntry{}, translate(err)
+	}
+
+	gateway, err = dir.Update(ctx, gateway)
+	if err != nil {
+		return GatewayDirectoryEntry{}, translate(err)
+	}
+
+	return gateway, nil
+}
+
+func (c *Client) RemoveGateway(ctx context.Context, gateway GatewayDirectoryEntry) error {
+	dir, err := c.openGatewayDirectory(ctx)
+	if err != nil {
+		return translate(err)
+	}
+
+	err = dir.Delete(ctx, gateway)
+	if err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+		return translate(err)
+	}
+
+	return nil
+}
+
+func (c *Client) GetGateway(ctx context.Context, key string) (GatewayDirectoryEntry, error) {
+	dir, err := c.openGatewayDirectory(ctx)
+	if err != nil {
+		return GatewayDirectoryEntry{}, translate(err)
+	}
+
+	gateway, err := dir.Get(ctx, key)
+	if err != nil {
+		return GatewayDirectoryEntry{}, translate(err)
+	}
+
+	return gateway, nil
+}
+
+func (c *Client) ListGateways(ctx context.Context) ([]GatewayDirectoryEntry, error) {
+	dir, err := c.openGatewayDirectory(ctx)
+	if err != nil {
+		return nil, translate(err)
+	}
+
+	entries, err := dir.List(ctx)
+	if err != nil {
+		return nil, translate(err)
+	}
+
+	return entries, nil
+}
+
+func (c *Client) CreateJob(ctx context.Context, job JobDirectoryEntry) (JobDirectoryEntry, error) {
+	dir, err := c.openJobDirectory(ctx)
+	if err != nil {
+		return JobDirectoryEntry{}, translate(err)
+	}
+
+	job, err = dir.Create(ctx, job)
+	if err != nil {
+		return JobDirectoryEntry{}, translate(err)
+	}
+
+	return job, nil
+}
+
+func (c *Client) UpdateJob(ctx context.Context, job JobDirectoryEntry) (JobDirectoryEntry, error) {
+	dir, err := c.openJobDirectory(ctx)
+	if err != nil {
+		return JobDirectoryEntry{}, translate(err)
+	}
+
+	job, err = dir.Update(ctx, job)
+	if err != nil {
+		return JobDirectoryEntry{}, translate(err)
+	}
+
+	return job, nil
+}
+
+func (c *Client) GetJob(ctx context.Context, key string) (JobDirectoryEntry, error) {
+	dir, err := c.openJobDirectory(ctx)
+	if err != nil {
+		return JobDirectoryEntry{}, translate(err)
+	}
+
+	job, err := dir.Get(ctx, key)
+	if err != nil {
+		return JobDirectoryEntry{}, translate(err)
+	}
+
+	return job, nil
+}
+
+func (c *Client) ListJobsByAgentID(ctx context.Context, agentID string) ([]JobDirectoryEntry, error) {
+	dir, err := c.openJobDirectory(ctx)
+	if err != nil {
+		return nil, translate(err)
+	}
+
+	entries, err := dir.ListByAgentID(ctx, agentID)
+	if err != nil {
+		return nil, translate(err)
+	}
+
+	return entries, nil
+}
+
+func (c *Client) ListJobs(ctx context.Context) ([]JobDirectoryEntry, error) {
+	dir, err := c.openJobDirectory(ctx)
+	if err != nil {
+		return nil, translate(err)
+	}
+
+	entries, err := dir.List(ctx)
+	if err != nil {
+		return nil, translate(err)
+	}
+
+	return entries, nil
+}
+
+func (c *Client) ListJobOutputLines(ctx context.Context, job JobDirectoryEntry, count, skip int) ([]byte, error) {
+	msgCh := make(chan Message)
+	err := c.listStreamMessages(
+		ctx,
+		[]string{
+			protoagent.EvtWorkerStdoutSubject(job.GatewayID, job.AgentID, "*"),
+		},
+		1+uint64(skip),
+		count,
+		msgCh,
+	)
+	if err != nil {
+		return nil, translate(err)
+	}
+
+	var buff bytes.Buffer
+	for msg := range msgCh {
+		buff.Write(msg.Data())
+	}
+
+	return buff.Bytes(), nil
+}
+
+func (c *Client) RegisterGateway(ctx context.Context, gateway GatewayDirectoryEntry) error {
+	consumerName := gateway.ID
+	_, err := c.srv.CreateConsumer(ctx, c.stream, jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		DeliverPolicy: jetstream.DeliverLastPolicy,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		MaxAckPending: 1,
+		FilterSubjects: []string{
+			protoagent.CmdStartWorkerSubject(gateway.ID, "*", "*"),
+			protoagent.CmdStopWorkerSubject(gateway.ID, "*", "*"),
+			protoagent.CmdWriteStdinSubject(gateway.ID, "*", "*"),
+			protogw.RegisterAgentSubject(gateway.ID),
+			protogw.UnregisterAgentSubject(gateway.ID),
+		},
+	})
+	if err != nil {
+		return translate(err)
+	}
+
+	return nil
+}
+
+func (c *Client) UnregisterGateway(ctx context.Context, gateway GatewayDirectoryEntry) error {
+	// TODO: verify that current users of the API are able to handle the error caused by non-existent consumer!
+	consumerName := gateway.ID
+	err := c.srv.DeleteConsumer(ctx, c.stream, consumerName)
+	if err != nil {
+		return translate(err)
+	}
+	return nil
+}
+
+func (c *Client) RequestCreateUser(ctx context.Context, req protodaemon.CreateUserRequest) (protodaemon.CreateUserResponse, error) {
+	b, err := protodaemon.Marshal(req)
+	if err != nil {
+		return protodaemon.CreateUserResponse{}, err
+	}
+
+	resp, err := c.request(ctx, &nats.Msg{
+		Subject: protodaemon.CreateUserSubject(),
+		Data:    b,
+	})
+	if err != nil {
+		return protodaemon.CreateUserResponse{}, translate(err)
+	}
+
+	data, err := protodaemon.Unmarshal(resp.Data)
+	if err != nil {
+		return protodaemon.CreateUserResponse{}, err
+	}
+
+	v, ok := data.(protodaemon.CreateUserResponse)
+	if !ok {
+		return protodaemon.CreateUserResponse{}, fmt.Errorf("invalid response: %T", data)
+	}
+
+	if v.Error != nil {
+		return protodaemon.CreateUserResponse{}, v.Error
+	}
+
+	return v, nil
+}
+
+func (c *Client) RequestGetUser(ctx context.Context, req protodaemon.GetUserRequest) (protodaemon.GetUserResponse, error) {
+	b, err := protodaemon.Marshal(req)
+	if err != nil {
+		return protodaemon.GetUserResponse{}, err
+	}
+
+	resp, err := c.request(ctx, &nats.Msg{
+		Subject: protodaemon.GetUserSubject(),
+		Data:    b,
+	})
+	if err != nil {
+		return protodaemon.GetUserResponse{}, translate(err)
+	}
+
+	data, err := protodaemon.Unmarshal(resp.Data)
+	if err != nil {
+		return protodaemon.GetUserResponse{}, err
+	}
+
+	v, ok := data.(protodaemon.GetUserResponse)
+	if !ok {
+		return protodaemon.GetUserResponse{}, fmt.Errorf("invalid response: %T", data)
+	}
+
+	if v.Error != nil {
+		return protodaemon.GetUserResponse{}, v.Error
+	}
+
+	return v, nil
+}
+
+func (c *Client) RequestListUsers(ctx context.Context, req protodaemon.ListUsersRequest) (protodaemon.ListUsersResponse, error) {
+	b, err := protodaemon.Marshal(req)
+	if err != nil {
+		return protodaemon.ListUsersResponse{}, err
+	}
+
+	resp, err := c.request(ctx, &nats.Msg{
+		Subject: protodaemon.ListUsersSubject(),
+		Data:    b,
+	})
+	if err != nil {
+		return protodaemon.ListUsersResponse{}, translate(err)
+	}
+
+	data, err := protodaemon.Unmarshal(resp.Data)
+	if err != nil {
+		return protodaemon.ListUsersResponse{}, err
+	}
+
+	v, ok := data.(protodaemon.ListUsersResponse)
+	if !ok {
+		return protodaemon.ListUsersResponse{}, fmt.Errorf("invalid response: %T", data)
+	}
+
+	if v.Error != nil {
+		return protodaemon.ListUsersResponse{}, v.Error
+	}
+
+	return v, nil
+}
+
+func (c *Client) RequestUpdateUser(ctx context.Context, req protodaemon.UpdateUserRequest) (protodaemon.UpdateUserResponse, error) {
+	b, err := protodaemon.Marshal(req)
+	if err != nil {
+		return protodaemon.UpdateUserResponse{}, err
+	}
+
+	resp, err := c.request(ctx, &nats.Msg{
+		Subject: protodaemon.UpdateUserSubject(),
+		Data:    b,
+	})
+	if err != nil {
+		return protodaemon.UpdateUserResponse{}, translate(err)
+	}
+
+	data, err := protodaemon.Unmarshal(resp.Data)
+	if err != nil {
+		return protodaemon.UpdateUserResponse{}, err
+	}
+
+	v, ok := data.(protodaemon.UpdateUserResponse)
+	if !ok {
+		return protodaemon.UpdateUserResponse{}, fmt.Errorf("invalid response: %T", data)
+	}
+
+	if v.Error != nil {
+		return protodaemon.UpdateUserResponse{}, v.Error
+	}
+
+	return v, nil
+}
+
+func (c *Client) RequestCreateAgent(ctx context.Context, req protodaemon.CreateAgentRequest) (protodaemon.CreateAgentResponse, error) {
+	b, err := protodaemon.Marshal(req)
+	if err != nil {
+		return protodaemon.CreateAgentResponse{}, err
+	}
+
+	resp, err := c.request(ctx, &nats.Msg{
+		Subject: protodaemon.CreateAgentSubject(),
+		Data:    b,
+	})
+	if err != nil {
+		return protodaemon.CreateAgentResponse{}, translate(err)
+	}
+
+	data, err := protodaemon.Unmarshal(resp.Data)
+	if err != nil {
+		return protodaemon.CreateAgentResponse{}, err
+	}
+
+	v, ok := data.(protodaemon.CreateAgentResponse)
+	if !ok {
+		return protodaemon.CreateAgentResponse{}, fmt.Errorf("invalid response: %T", data)
+	}
+
+	if v.Error != nil {
+		return protodaemon.CreateAgentResponse{}, v.Error
+	}
+
+	return v, nil
+}
+
+func (c *Client) RequestGetAgent(ctx context.Context, req protodaemon.GetAgentRequest) (protodaemon.GetAgentResponse, error) {
+	b, err := protodaemon.Marshal(req)
+	if err != nil {
+		return protodaemon.GetAgentResponse{}, err
+	}
+
+	resp, err := c.request(ctx, &nats.Msg{
+		Subject: protodaemon.GetAgentSubject(),
+		Data:    b,
+	})
+	if err != nil {
+		return protodaemon.GetAgentResponse{}, translate(err)
+	}
+
+	data, err := protodaemon.Unmarshal(resp.Data)
+	if err != nil {
+		return protodaemon.GetAgentResponse{}, err
+	}
+
+	v, ok := data.(protodaemon.GetAgentResponse)
+	if !ok {
+		return protodaemon.GetAgentResponse{}, fmt.Errorf("invalid response: %T", data)
+	}
+
+	if v.Error != nil {
+		return protodaemon.GetAgentResponse{}, v.Error
+	}
+
+	return v, nil
+}
+
+func (c *Client) RequestListAgents(ctx context.Context, req protodaemon.ListAgentsRequest) (protodaemon.ListAgentsResponse, error) {
+	b, err := protodaemon.Marshal(req)
+	if err != nil {
+		return protodaemon.ListAgentsResponse{}, err
+	}
+
+	resp, err := c.request(ctx, &nats.Msg{
+		Subject: protodaemon.ListAgentsSubject(),
+		Data:    b,
+	})
+	if err != nil {
+		return protodaemon.ListAgentsResponse{}, translate(err)
+	}
+
+	data, err := protodaemon.Unmarshal(resp.Data)
+	if err != nil {
+		return protodaemon.ListAgentsResponse{}, err
+	}
+
+	v, ok := data.(protodaemon.ListAgentsResponse)
+	if !ok {
+		return protodaemon.ListAgentsResponse{}, fmt.Errorf("invalid response: %T", data)
+	}
+
+	if v.Error != nil {
+		return protodaemon.ListAgentsResponse{}, v.Error
+	}
+
+	return v, nil
+}
+
+func (c *Client) RequestCreateGateway(ctx context.Context, req protodaemon.CreateGatewayRequest) (protodaemon.CreateGatewayResponse, error) {
+	b, err := protodaemon.Marshal(req)
+	if err != nil {
+		return protodaemon.CreateGatewayResponse{}, err
+	}
+
+	resp, err := c.request(ctx, &nats.Msg{
+		Subject: protodaemon.CreateGatewaySubject(),
+		Data:    b,
+	})
+	if err != nil {
+		return protodaemon.CreateGatewayResponse{}, translate(err)
+	}
+
+	data, err := protodaemon.Unmarshal(resp.Data)
+	if err != nil {
+		return protodaemon.CreateGatewayResponse{}, err
+	}
+
+	v, ok := data.(protodaemon.CreateGatewayResponse)
+	if !ok {
+		return protodaemon.CreateGatewayResponse{}, fmt.Errorf("invalid response: %T", data)
+	}
+
+	if v.Error != nil {
+		return protodaemon.CreateGatewayResponse{}, v.Error
+	}
+
+	return v, nil
+}
+
+func (c *Client) RequestGetGateway(ctx context.Context, req protodaemon.GetGatewayRequest) (protodaemon.GetGatewayResponse, error) {
+	b, err := protodaemon.Marshal(req)
+	if err != nil {
+		return protodaemon.GetGatewayResponse{}, err
+	}
+
+	resp, err := c.request(ctx, &nats.Msg{
+		Subject: protodaemon.GetGatewaySubject(),
+		Data:    b,
+	})
+	if err != nil {
+		return protodaemon.GetGatewayResponse{}, translate(err)
+	}
+
+	data, err := protodaemon.Unmarshal(resp.Data)
+	if err != nil {
+		return protodaemon.GetGatewayResponse{}, err
+	}
+
+	v, ok := data.(protodaemon.GetGatewayResponse)
+	if !ok {
+		return protodaemon.GetGatewayResponse{}, fmt.Errorf("invalid response: %T", data)
+	}
+
+	if v.Error != nil {
+		return protodaemon.GetGatewayResponse{}, v.Error
+	}
+
+	return v, nil
+}
+
+func (c *Client) RequestListGateways(ctx context.Context, req protodaemon.ListGatewaysRequest) (protodaemon.ListGatewaysResponse, error) {
+	b, err := protodaemon.Marshal(req)
+	if err != nil {
+		return protodaemon.ListGatewaysResponse{}, err
+	}
+
+	resp, err := c.request(ctx, &nats.Msg{
+		Subject: protodaemon.ListGatewaysSubject(),
+		Data:    b,
+	})
+	if err != nil {
+		return protodaemon.ListGatewaysResponse{}, translate(err)
+	}
+
+	data, err := protodaemon.Unmarshal(resp.Data)
+	if err != nil {
+		return protodaemon.ListGatewaysResponse{}, err
+	}
+
+	v, ok := data.(protodaemon.ListGatewaysResponse)
+	if !ok {
+		return protodaemon.ListGatewaysResponse{}, fmt.Errorf("invalid response: %T", data)
+	}
+
+	if v.Error != nil {
+		return protodaemon.ListGatewaysResponse{}, v.Error
+	}
+
+	return v, nil
+}
+
+func (c *Client) RequestCreateRole(ctx context.Context, req protodaemon.CreateRoleRequest) (protodaemon.CreateRoleResponse, error) {
+	b, err := protodaemon.Marshal(req)
+	if err != nil {
+		return protodaemon.CreateRoleResponse{}, err
+	}
+
+	resp, err := c.request(ctx, &nats.Msg{
+		Subject: protodaemon.CreateRoleSubject(),
+		Data:    b,
+	})
+	if err != nil {
+		return protodaemon.CreateRoleResponse{}, translate(err)
+	}
+
+	data, err := protodaemon.Unmarshal(resp.Data)
+	if err != nil {
+		return protodaemon.CreateRoleResponse{}, err
+	}
+
+	v, ok := data.(protodaemon.CreateRoleResponse)
+	if !ok {
+		return protodaemon.CreateRoleResponse{}, fmt.Errorf("invalid response: %T", data)
+	}
+
+	if v.Error != nil {
+		return protodaemon.CreateRoleResponse{}, v.Error
+	}
+
+	return v, nil
+}
+
+func (c *Client) RequestGetRole(ctx context.Context, req protodaemon.GetRoleRequest) (protodaemon.GetRoleResponse, error) {
+	b, err := protodaemon.Marshal(req)
+	if err != nil {
+		return protodaemon.GetRoleResponse{}, err
+	}
+
+	resp, err := c.request(ctx, &nats.Msg{
+		Subject: protodaemon.GetRoleSubject(),
+		Data:    b,
+	})
+	if err != nil {
+		return protodaemon.GetRoleResponse{}, translate(err)
+	}
+
+	data, err := protodaemon.Unmarshal(resp.Data)
+	if err != nil {
+		return protodaemon.GetRoleResponse{}, err
+	}
+
+	v, ok := data.(protodaemon.GetRoleResponse)
+	if !ok {
+		return protodaemon.GetRoleResponse{}, fmt.Errorf("invalid response: %T", data)
+	}
+
+	if v.Error != nil {
+		return protodaemon.GetRoleResponse{}, v.Error
+	}
+
+	return v, nil
+}
+
+func (c *Client) RequestListRoles(ctx context.Context, req protodaemon.ListRolesRequest) (protodaemon.ListRolesResponse, error) {
+	b, err := protodaemon.Marshal(req)
+	if err != nil {
+		return protodaemon.ListRolesResponse{}, err
+	}
+
+	resp, err := c.request(ctx, &nats.Msg{
+		Subject: protodaemon.ListRolesSubject(),
+		Data:    b,
+	})
+	if err != nil {
+		return protodaemon.ListRolesResponse{}, translate(err)
+	}
+
+	data, err := protodaemon.Unmarshal(resp.Data)
+	if err != nil {
+		return protodaemon.ListRolesResponse{}, err
+	}
+
+	v, ok := data.(protodaemon.ListRolesResponse)
+	if !ok {
+		return protodaemon.ListRolesResponse{}, fmt.Errorf("invalid response: %T", data)
+	}
+
+	if v.Error != nil {
+		return protodaemon.ListRolesResponse{}, v.Error
+	}
+
+	return v, nil
+}
+
+func (c *Client) RequestDeleteRole(ctx context.Context, req protodaemon.DeleteRoleRequest) (protodaemon.DeleteRoleResponse, error) {
+	b, err := protodaemon.Marshal(req)
+	if err != nil {
+		return protodaemon.DeleteRoleResponse{}, err
+	}
+
+	resp, err := c.request(ctx, &nats.Msg{
+		Subject: protodaemon.DeleteRoleSubject(),
+		Data:    b,
+	})
+	if err != nil {
+		return protodaemon.DeleteRoleResponse{}, translate(err)
+	}
+
+	data, err := protodaemon.Unmarshal(resp.Data)
+	if err != nil {
+		return protodaemon.DeleteRoleResponse{}, err
+	}
+
+	v, ok := data.(protodaemon.DeleteRoleResponse)
+	if !ok {
+		return protodaemon.DeleteRoleResponse{}, fmt.Errorf("invalid response: %T", data)
+	}
+
+	if v.Error != nil {
+		return protodaemon.DeleteRoleResponse{}, v.Error
+	}
+
+	return v, nil
+}
+
+func (c *Client) RequestRegisterAgent(ctx context.Context, agent AgentDirectoryEntry) (map[string]string, error) {
+	b, err := protogw.Marshal(protogw.RegisterAgentRequest{
+		AgentID: agent.ID,
+		OS:      agent.Config.OS,
+		Arch:    agent.Config.Arch,
+		Env:     agent.Config.Extra,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.request(ctx, &nats.Msg{
+		Subject: protogw.RegisterAgentSubject(agent.GatewayID),
+		Data:    b,
+	})
+	if err != nil {
+		return nil, translate(err)
+	}
+
+	data, err := protogw.Unmarshal(resp.Data)
+	if err != nil {
+		return nil, err
+	}
+
+	v, ok := data.(protogw.RegisterAgentResponse)
+	if !ok {
+		return nil, fmt.Errorf("invalid response: %T", data)
+	}
+
+	if v.Error != nil {
+		return nil, v.Error
+	}
+
+	return v.Env, nil
+}
+
+func (c *Client) RequestUnregisterAgent(ctx context.Context, agent AgentDirectoryEntry) error {
+	b, err := protogw.Marshal(protogw.UnregisterAgentRequest{
+		AgentID: agent.ID,
+	})
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.request(ctx, &nats.Msg{
+		Subject: protogw.UnregisterAgentSubject(agent.GatewayID),
+		Data:    b,
+	})
+	if err != nil {
+		return translate(err)
+	}
+
+	data, err := protogw.Unmarshal(resp.Data)
+	if err != nil {
+		return err
+	}
+
+	v, ok := data.(protogw.UnregisterAgentResponse)
+	if !ok {
+		return fmt.Errorf("invalid response: %T", data)
+	}
+
+	if v.Error != nil {
+		return v.Error
+	}
+
+	return nil
+}
+
+func (c *Client) PublishStartWorker(ctx context.Context, job JobDirectoryEntry) error {
+	b, err := protoagent.Marshal(protoagent.StartWorker{
+		Command: job.Config.Command,
+		Args:    job.Config.Args,
+		Env:     job.Config.Env,
+	})
+	if err != nil {
+		return err
+	}
+
+	err = c.publishMsgToStream(
+		ctx,
+		&nats.Msg{
+			Subject: protoagent.CmdStartWorkerSubject(job.GatewayID, job.AgentID, job.WorkerID),
+			Data:    b,
+		},
+	)
+	if err != nil {
+		return translate(err)
+	}
+
+	return nil
+}
+
+func (c *Client) PublishStopWorker(ctx context.Context, job JobDirectoryEntry) error {
+	b, err := protoagent.Marshal(protoagent.StopWorker{})
+	if err != nil {
+		return err
+	}
+
+	err = c.publishMsgToStream(
+		ctx,
+		&nats.Msg{
+			Subject: protoagent.CmdStopWorkerSubject(job.GatewayID, job.AgentID, job.WorkerID),
+			Data:    b,
+		},
+	)
+	if err != nil {
+		return translate(err)
+	}
+
+	return nil
+}
+
+func (c *Client) PublishWorkerInput(ctx context.Context, job JobDirectoryEntry, data []byte) error {
+	b, err := protoagent.Marshal(protoagent.WorkerInput{
+		Data: data,
+	})
+	if err != nil {
+		return err
+	}
+
+	err = c.publishMsgToStream(
+		ctx,
+		&nats.Msg{
+			Subject: protoagent.CmdWriteStdinSubject(job.GatewayID, job.AgentID, job.WorkerID),
+			Data:    b,
+		},
+	)
+	if err != nil {
+		return translate(err)
+	}
+
+	return nil
+}
+
+func (c *Client) NewAgentPermissions(gatewayID, agentID string) jwt.Permissions {
+	return jwt.Permissions{
+		Pub: jwt.Permission{
+			Allow: []string{
+				protoagent.EvtStartWorkerSubject(gatewayID, agentID, "*"),
+				protoagent.EvtStopWorkerSubject(gatewayID, agentID, "*"),
+				protoagent.EvtWorkerStdoutSubject(gatewayID, agentID, "*"),
+				protoagent.EvtWorkerStatusSubject(gatewayID, agentID, "*"),
+				protoagent.EvtAgentInfoSubject(gatewayID, agentID),
+			},
+		},
+		Sub: jwt.Permission{
+			Allow: []string{
+				inboxName(gatewayID) + ".>",
+			},
+		},
+	}
+}
+
+func (c *Client) NewGatewayPermissions(gatewayID string) jwt.Permissions {
+	return jwt.Permissions{
+		Pub: jwt.Permission{
+			Allow: []string{
+				/*"$JS.API.STREAM.INFO." + gatewayID,
+				"$JS.API.STREAM.INFO.OBJ_" + gatewayID,
+				"$JS.API.STREAM.PURGE.OBJ_" + gatewayID,*/
+				fmt.Sprintf("$JS.API.CONSUMER.INFO.%s.%s", c.stream, gatewayID),
+				fmt.Sprintf("$JS.API.CONSUMER.MSG.NEXT.%s.%s", c.stream, gatewayID),
+				fmt.Sprintf("$JS.ACK.%s.%s.>", c.stream, gatewayID),
+				"_INBOX.>",
+				/*fmt.Sprintf("$JS.API.CONSUMER.CREATE.OBJ_%s.>", gatewayID),
+				fmt.Sprintf("$JS.API.CONSUMER.DELETE.OBJ_%s.*", gatewayID),
+				fmt.Sprintf("$JS.API.DIRECT.GET.OBJ_%s.>", gatewayID),*/
+				/*fmt.Sprintf("$O.%s.M.*", gatewayID),
+				fmt.Sprintf("$O.%s.C.*", gatewayID),*/
+			},
+		},
+		Sub: jwt.Permission{
+			Allow: []string{
+				inboxName(gatewayID) + ".>",
+				protogw.RegisterAgentSubject(gatewayID),
+				protogw.UnregisterAgentSubject(gatewayID),
+			},
+		},
+	}
+}
+
+func (c *Client) publishMsgToStream(ctx context.Context, msg *nats.Msg) error {
+	if msg.Header == nil {
+		msg.Header = make(nats.Header)
+	}
+	msg.Header.Set(nats.MsgIdHdr, nuid.Next())
+	_, err := c.srv.PublishMsg(
+		ctx,
+		msg,
+		jetstream.WithExpectStream(c.stream),
+	)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+const agentDirectoryName = "agents"
+
+func (c *Client) openAgentDirectory(ctx context.Context) (*AgentDirectory, error) {
+	dir, err := c.srv.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: agentDirectoryName,
+	})
+	if err != nil && !errors.Is(err, jetstream.ErrBucketExists) {
+		return nil, err
+	}
+	return &AgentDirectory{
+		Directory: Directory{
+			store: dir,
+		},
+	}, nil
+}
+
+const agentHostDirectoryName = "agent-hosts"
+
+func (c *Client) openAgentHostDirectory(ctx context.Context) (*AgentHostDirectory, error) {
+	dir, err := c.srv.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: agentHostDirectoryName,
+	})
+	if err != nil && !errors.Is(err, jetstream.ErrBucketExists) {
+		return nil, err
+	}
+	return &AgentHostDirectory{
+		Directory: Directory{
+			store: dir,
+		},
+	}, nil
+}
+
+const gatewayDirectoryName = "gateways"
+
+func (c *Client) openGatewayDirectory(ctx context.Context) (*GatewayDirectory, error) {
+	dir, err := c.srv.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: gatewayDirectoryName,
+	})
+	if err != nil && !errors.Is(err, jetstream.ErrBucketExists) {
+		return nil, err
+	}
+	return &GatewayDirectory{
+		Directory: Directory{
+			store: dir,
+		},
+	}, nil
+}
+
+const jobsDirectoryName = "jobs"
+
+func (c *Client) openJobDirectory(ctx context.Context) (*JobDirectory, error) {
+	dir, err := c.srv.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: jobsDirectoryName,
+	})
+	if err != nil && !errors.Is(err, jetstream.ErrBucketExists) {
+		return nil, err
+	}
+	return &JobDirectory{
+		Directory: Directory{
+			store: dir,
+		},
+	}, nil
+}
+
+func (c *Client) request(ctx context.Context, msg *nats.Msg) (*nats.Msg, error) {
+	if msg.Header == nil {
+		msg.Header = make(nats.Header)
+	}
+	msg.Header.Set(nats.MsgIdHdr, nuid.Next())
+	return c.srv.Conn().RequestMsgWithContext(ctx, msg)
+}
+
+func (c *Client) listStreamMessages(ctx context.Context, subjects []string, startSeq uint64, limit int, outputCh chan<- Message) error {
+	consumer, err := c.srv.CreateConsumer(ctx, c.stream, jetstream.ConsumerConfig{
+		DeliverPolicy:  jetstream.DeliverByStartSequencePolicy,
+		AckPolicy:      jetstream.AckNonePolicy,
+		MaxAckPending:  1,
+		FilterSubjects: subjects,
+		OptStartSeq:    startSeq,
+	})
+	if err != nil {
+		return err
+	}
+
+	if limit <= 0 {
+		limit = 50
+	}
+
+	iter, err := consumer.FetchNoWait(limit)
+	if err != nil {
+		return err
+	}
+
+	for msg := range iter.Messages() {
+		meta, err := msg.Metadata()
+		if err != nil {
+			return err
+		}
+
+		outputCh <- Message{
+			msg:  msg,
+			meta: meta,
+		}
+	}
+
+	close(outputCh)
+
+	err = iter.Error()
+	if err != nil {
+		return iter.Error()
+	}
+
+	return nil
+}
+
+func inboxName(name string) string {
+	return "_INBOX_" + name
+}

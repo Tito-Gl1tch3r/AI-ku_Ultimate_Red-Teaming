@@ -1,0 +1,246 @@
+export interface Page<T> {
+    next: string | null;
+    previous: string | null;
+    results: T[];
+}
+
+export interface AnonymousUser {
+    is_anonymous: true;
+    is_ephemeral: boolean;
+    id: number | null;
+    is_online: boolean;
+    is_admin: boolean;
+    username: string;
+
+    frog_color: [number, number, number];
+}
+
+export interface User {
+    is_anonymous: false;
+    id: number;
+    is_online: boolean;
+    is_admin: boolean;
+    username: string;
+
+    github_id: number | null;
+}
+
+export interface ScratchUser extends User {
+    num_scratches: number;
+    num_presets: number;
+}
+
+export interface TerseScratch {
+    slug: string;
+    owner: AnonymousUser | User | null; // null = unclaimed
+    parent: string | null;
+    name: string;
+    creation_time: string;
+    last_updated: string;
+    compiler: string;
+    preset: number;
+    platform: string;
+    score: number; // -1 = doesn't compile
+    max_score: number;
+    match_override: boolean;
+    project: string;
+    libraries: Library[];
+    best_fork: BestFork | null;
+}
+
+export interface BestFork {
+    slug: string;
+    owner: AnonymousUser | User | null;
+    score: number;
+    max_score: number;
+    is_match: boolean;
+    updated_at: string;
+}
+
+export interface Scratch extends TerseScratch {
+    description: string;
+    compiler_flags: string;
+    diff_flags: string[];
+    source_code: string;
+    context: string;
+    diff_label: string;
+}
+
+export interface ClaimableScratch extends Scratch {
+    claim_token: string;
+}
+
+export type Compilation = {
+    compiler_output: string;
+    diff_output: DiffOutput | null;
+    left_object: string | null; // base64 encoded
+    right_object: string | null; // base64 encoded
+    success: boolean;
+};
+
+export type DiffOutput = {
+    arch_str: string;
+    current_score: number;
+    max_score: number;
+    header: DiffHeader;
+    rows: DiffRow[];
+};
+
+export type DiffHeader = {
+    base: DiffText[];
+    current: DiffText[];
+    previous?: DiffText[];
+};
+
+export type DiffRow = {
+    key: string;
+    base?: DiffCell;
+    current?: DiffCell;
+    previous?: DiffCell;
+};
+
+export type DiffCell = {
+    text: DiffText[];
+    line?: number;
+    branch?: number;
+    src?: string;
+    src_comment?: string;
+    src_line?: number;
+    src_path?: string;
+};
+
+export type DiffText = {
+    text: string;
+    format?: string;
+    group?: string;
+    index?: number;
+    key?: string;
+};
+
+export type Flag =
+    | {
+          type: "checkbox";
+          id: string;
+          flag: string;
+      }
+    | {
+          type: "flagset";
+          id: string;
+          flags: string[];
+      }
+    | {
+          type: "parameter";
+          format: "string" | "int" | "hex" | "int-or-hex";
+          id: string;
+          flag: string;
+      };
+
+export type Library = {
+    name: string;
+    version: string;
+};
+
+export type LibraryVersions = {
+    name: string;
+    supported_versions: string[];
+    platform: string;
+};
+
+export type PresetBase = {
+    id: number;
+    name: string;
+};
+
+export type TersePreset = PresetBase & {
+    platform: string;
+    compiler: string;
+    compiler_flags: string;
+    diff_flags: string[];
+    libraries: Library[];
+    owner: User | null; // null = default
+};
+
+export type Preset = TersePreset & {
+    assembler_flags: string;
+    decompiler_flags: string;
+    num_scratches: number;
+};
+
+export type ScratchCount = {
+    num_scratches: number;
+};
+
+export type CompilerBase = {
+    id: string;
+};
+
+export type CompilerMetadata = CompilerBase & {
+    platform: string;
+    flags_class: string;
+    diff_flags_class: string;
+    language: CompilerLanguage;
+};
+
+export type Language = {
+    id: string;
+    display_name: string;
+    extension: string;
+};
+
+export type LanguageOverride = Language & {
+    flag: string;
+};
+
+export type CompilerLanguage = {
+    default: Language;
+    overrides: LanguageOverride[];
+};
+
+export type FlagClass = {
+    flags: Flag[];
+    parent?: string;
+};
+
+export type CompilersResponse = {
+    compilers: Record<string, CompilerMetadata>;
+    flags: Record<string, FlagClass>;
+    diff_flags: Record<string, FlagClass>;
+};
+
+export type Compiler = CompilerMetadata & {
+    flags: Flag[];
+    diff_flags: Flag[];
+};
+
+export interface PlatformBase {
+    id: string;
+    name: string;
+    description: string;
+    arch: string;
+    has_decompiler: boolean;
+}
+
+export interface Platform extends PlatformBase {
+    compilers: string[];
+}
+
+export interface ScratchResult {
+    type: "scratch";
+    item: TerseScratch;
+}
+
+export interface PresetResult {
+    type: "preset";
+    item: Preset;
+}
+
+export interface UserResult {
+    type: "user";
+    item: User;
+}
+
+export type SearchResult = ScratchResult | PresetResult | UserResult;
+
+export function isAnonUser(user: User | AnonymousUser): user is AnonymousUser {
+    return user.is_anonymous;
+}

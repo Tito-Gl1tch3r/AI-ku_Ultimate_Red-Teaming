@@ -1,0 +1,191 @@
+import django_filters
+from django.contrib.auth import logout
+from django.db.models import Count
+from django.db.models.query import QuerySet
+from django.shortcuts import get_object_or_404
+from django.utils.decorators import method_decorator
+from rest_framework import filters, generics
+from rest_framework.decorators import api_view
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from ..decorators.cache import globally_cacheable
+from ..filters.search import NonEmptySearchFilter
+from ..middleware import Request
+from ..models.github import GitHubUser
+from ..models.preset import Preset
+from ..models.profile import Profile
+from ..models.scratch import Scratch
+from ..serializers import PresetSerializer, TerseScratchSerializer, serialize_profile
+from .preset import PresetPagination
+from .scratch import ScratchPagination, ScratchViewSet
+
+
+class CurrentUser(APIView):
+    """
+    View to access the current user profile.
+    """
+
+    def get(self, request: Request) -> Response:
+        user = serialize_profile(request.profile)
+        return Response(user)
+
+    def post(self, request: Request) -> Response:
+        """
+        Login if the 'code' parameter is provided. Log out otherwise.
+        """
+
+        code = request.data.get("code") if isinstance(request.data, dict) else None
+        if isinstance(code, str):
+            GitHubUser.login(request, code)
+            assert not request.profile.is_anonymous()
+            return self.get(request)
+        else:
+            logout(request)
+
+            profile = Profile()
+            profile.save()
+            request.profile = profile
+            request.session["profile_id"] = request.profile.id
+
+            return self.get(request)
+
+
+class CurrentUserScratchList(generics.ListAPIView):  # type: ignore
+    """
+    Gets the current user's scratches
+    """
+
+    pagination_class = ScratchPagination
+    serializer_class = TerseScratchSerializer
+
+    filterset_fields = ["platform", "compiler", "preset"]
+    filter_backends = [
+        django_filters.rest_framework.DjangoFilterBackend,
+        NonEmptySearchFilter,
+        filters.OrderingFilter,
+    ]
+    ordering_fields = ["creation_time", "last_updated", "score", "match_percent"]
+
+    def get_queryset(self) -> QuerySet[Scratch]:
+        profile: Profile | None = self.request.profile  # type: ignore[attr-defined]
+        if profile is None:  # should be impossible due to middleware
+            return Scratch.objects.none()
+        return ScratchViewSet.queryset.filter(owner__id=profile.id)
+
+
+@method_decorator(
+    globally_cacheable(max_age=60, stale_while_revalidate=30), name="dispatch"
+)
+class UserScratchList(generics.ListAPIView):  # type: ignore
+    """
+    Gets a user's scratches
+    """
+
+    pagination_class = ScratchPagination
+    serializer_class = TerseScratchSerializer
+    filterset_fields = ["platform", "compiler", "preset"]
+    filter_backends = [
+        django_filters.rest_framework.DjangoFilterBackend,
+        NonEmptySearchFilter,
+        filters.OrderingFilter,
+    ]
+    ordering_fields = ["creation_time", "last_updated", "score", "match_percent"]
+
+    def get_queryset(self) -> QuerySet[Scratch]:
+        return ScratchViewSet.queryset.filter(
+            owner__user__username=self.kwargs["username"]
+        )
+
+
+@method_decorator(
+    globally_cacheable(max_age=60, stale_while_revalidate=30), name="dispatch"
+)
+class UserPresetList(generics.ListAPIView):  # type: ignore
+    """
+    Gets a user's presets
+    """
+
+    pagination_class = PresetPagination
+    serializer_class = PresetSerializer
+    filterset_fields = ["platform", "compiler"]
+    filter_backends = [
+        django_filters.rest_framework.DjangoFilterBackend,
+        NonEmptySearchFilter,
+        filters.OrderingFilter,
+    ]
+    ordering_fields = ["creation_time", "id", "name", "compiler", "num_scratches"]
+
+    def get_queryset(self) -> QuerySet[Preset]:
+        return (
+            Preset.objects.filter(owner__user__username=self.kwargs["username"])
+            .select_related("owner__user", "owner__user__github")
+            .annotate(num_scratches=Count("scratch"))
+        )
+
+
+@api_view(["GET"])  # type: ignore
+@globally_cacheable(max_age=300, stale_while_revalidate=30)
+def user(request: Request, username: str) -> Response:
+    """
+    Gets a user's basic data
+    """
+
+    return Response(
+        serialize_profile(
+            get_object_or_404(Profile, user__username=username), num_scratches=True
+        )
+    )
+
+
+@method_decorator(
+    globally_cacheable(max_age=60, stale_while_revalidate=30), name="dispatch"
+)
+class UserScratchStats(APIView):
+    def get(self, request: Request, username: str) -> Response:
+        groupby = "platform"
+
+        qs = Scratch.objects.filter(owner__user__username=username)
+        data = qs.values(groupby).annotate(count=Count("slug")).order_by("-count")
+
+        resp = Response(
+            {
+                "groupby": groupby,
+                "results": [
+                    {"group": row[groupby], "count": row["count"]} for row in data
+                ],
+            }
+        )
+        return resp
+
+
+class AnonymousProfileDetail(APIView):
+    def get(self, request: Request, pk: int) -> Response:
+        if not request.profile.is_staff():
+            raise PermissionDenied()
+
+        profile = get_object_or_404(Profile, pk=pk, user__isnull=True)
+        return Response(serialize_profile(profile, num_scratches=True))
+
+
+class AnonymousProfileScratchList(generics.ListAPIView):  # type: ignore
+    pagination_class = ScratchPagination
+    serializer_class = TerseScratchSerializer
+    filterset_fields = ["platform", "compiler", "preset"]
+    filter_backends = [
+        django_filters.rest_framework.DjangoFilterBackend,
+        NonEmptySearchFilter,
+        filters.OrderingFilter,
+    ]
+    ordering_fields = ["creation_time", "last_updated", "score", "match_percent"]
+
+    def get_queryset(self) -> QuerySet[Scratch]:
+        profile: Profile | None = self.request.profile  # type: ignore[attr-defined]
+        if profile is None or not profile.is_staff():
+            raise PermissionDenied()
+
+        anon_profile = get_object_or_404(
+            Profile, pk=self.kwargs["pk"], user__isnull=True
+        )
+        return ScratchViewSet.queryset.filter(owner=anon_profile)

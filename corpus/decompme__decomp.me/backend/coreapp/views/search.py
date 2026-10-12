@@ -1,0 +1,85 @@
+from django.db.models import Case, Count, IntegerField, When
+from rest_framework.response import Response
+from rest_framework.serializers import ValidationError
+from rest_framework.views import APIView
+
+from ..decorators.cache import globally_cacheable
+from ..filters.search import validate_search_query
+from ..middleware import Request
+from ..models.preset import Preset
+from ..models.profile import Profile
+from ..models.scratch import Scratch
+from ..serializers import PresetSerializer, TerseScratchSerializer, serialize_profile
+
+MAX_SEARCH_PAGE_SIZE = 50
+
+
+def get_page_size(raw_page_size: str) -> int:
+    try:
+        page_size = int(raw_page_size)
+    except ValueError:
+        raise ValidationError({"page_size": "Must be an integer."})
+
+    if page_size < 1:
+        raise ValidationError({"page_size": "Must be at least 1."})
+
+    return min(page_size, MAX_SEARCH_PAGE_SIZE)
+
+
+class SearchViewSet(APIView):
+    @globally_cacheable(max_age=60, stale_while_revalidate=30)
+    def get(self, request: Request) -> Response:
+        query = validate_search_query(request.query_params.get("search", ""))
+        page_size = get_page_size(request.query_params.get("page_size", "5"))
+
+        user_qs = Profile.objects.filter(user__username__icontains=query)[:page_size]
+        preset_qs = (
+            Preset.objects.filter(name__icontains=query)
+            .select_related("owner__user", "owner__user__github")
+            .annotate(num_scratches=Count("scratch"))[:page_size]
+        )
+        # Returns up to 3x page_size, but we should prioritize scratches
+        scratch_page_size = page_size * 3 - user_qs.count() - preset_qs.count()
+        scratch_qs = (
+            Scratch.objects.filter(name__icontains=query)
+            .select_related(
+                "owner__user__github",
+                "best_fork__fork__owner__user__github",
+            )
+            .annotate(
+                exact_match=Case(
+                    When(name__iexact=query, then=1),
+                    default=0,
+                    output_field=IntegerField(),
+                )
+            )
+            .order_by("-exact_match", "name", "slug")[:scratch_page_size]
+        )
+
+        results = []
+
+        for user in user_qs:
+            results.append(
+                {
+                    "type": "user",
+                    "item": serialize_profile(user),
+                }
+            )
+
+        for preset in PresetSerializer(preset_qs, many=True).data:
+            results.append(
+                {
+                    "type": "preset",
+                    "item": preset,
+                }
+            )
+
+        for scratch in TerseScratchSerializer(scratch_qs, many=True).data:
+            results.append(
+                {
+                    "type": "scratch",
+                    "item": scratch,
+                }
+            )
+
+        return Response(results)

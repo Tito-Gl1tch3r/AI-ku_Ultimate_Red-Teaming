@@ -1,0 +1,297 @@
+//! Module containing helper functions and utilities.
+//!
+//! This module provides various utility functions used throughout the zff crate,
+//! including data structure helpers and encoding/decoding utilities.
+
+// - STD
+use std::collections::BTreeMap;
+use std::io::{Error as IoError, ErrorKind as IoEKind, Read};
+
+// - internal
+use crate::{
+    ChunkContent, DEFAULT_LENGTH_HEADER_IDENTIFIER, DEFAULT_LENGTH_VALUE_HEADER_LENGTH,
+    ERROR_MALFORMED_SEGMENT, ERROR_UNEXPECTED_DUPLICATE_CHUNK_CONTENT, Result, ValueDecoder,
+    ZffError, ZffErrorKind,
+};
+// - external
+#[cfg(feature = "serde")]
+use base64::{Engine, engine::general_purpose::STANDARD as base64engine};
+#[cfg(feature = "serde")]
+use hex::FromHex;
+#[cfg(feature = "serde")]
+use serde::Deserialize;
+
+#[cfg(feature = "serde")]
+pub(crate) fn string_to_str(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+#[cfg(feature = "serde")]
+pub(crate) fn as_hex<S>(x: &u64, s: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    s.serialize_str(&format!("0x{:X}", x))
+}
+
+/// Returns the greatest key-value pair whose key is less than or equal to
+/// `key`.
+#[inline]
+pub(crate) fn floor_btree_entry<T>(map: &BTreeMap<u64, T>, key: u64) -> Option<(&u64, &T)> {
+    map.range(..=key).next_back()
+}
+
+#[cfg(feature = "serde")]
+/// Serializes `buffer` to a lowercase hex string.
+pub fn buffer_to_hex<T, S>(buffer: &T, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    T: AsRef<[u8]>,
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&hex::encode(buffer))
+}
+
+#[cfg(feature = "serde")]
+/// Deserializes a lowercase hex string to a `Vec<u8>`.
+pub fn hex_to_buffer<'de, D>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    String::deserialize(deserializer)
+        .and_then(|string| Vec::from_hex(string).map_err(|err| Error::custom(err.to_string())))
+}
+
+#[cfg(feature = "serde")]
+/// Serializes `buffer` to a lowercase base64 string.
+pub fn buffer_to_base64<T, S>(buffer: &T, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    T: AsRef<[u8]>,
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&base64engine.encode(buffer))
+}
+
+#[cfg(feature = "serde")]
+/// Serializes `buffer` (Option) to a lowercase base64 `Option<String>`.
+pub fn option_buffer_to_base64<S>(
+    buffer: &Option<Vec<u8>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match buffer {
+        Some(buffer) => buffer_to_base64(&buffer, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+#[cfg(feature = "serde")]
+/// Deserializes a lowercase base64 string to a `Vec<u8>`.
+pub fn base64_to_buffer<'de, D>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    String::deserialize(deserializer).and_then(|string| {
+        base64engine
+            .decode(string)
+            .map_err(|err| Error::custom(err.to_string()))
+    })
+}
+
+/// Returns the segment number of a given chunk number.
+pub(crate) fn get_segment_of_chunk_no(
+    chunk_no: u64,
+    mainfooter_chunkmap: &BTreeMap<u64, u64>,
+) -> Option<u64> {
+    // If the chunk_no is exactly matched, return the corresponding value.
+    if let Some(&value) = mainfooter_chunkmap.get(&chunk_no) {
+        return Some(value);
+    }
+
+    // If the chunk_no is higher than the highest key, return None.
+    if let Some((&highest_chunk_no, _)) = mainfooter_chunkmap.iter().next_back()
+        && chunk_no > highest_chunk_no
+    {
+        return None;
+    }
+
+    // Find the next higher key and return its value.
+    if let Some((_, &segment_no)) = mainfooter_chunkmap.iter().find(|(key, _)| key > &&chunk_no) {
+        return Some(segment_no);
+    }
+
+    // If no next higher key is found, it means the chunk_no is higher than all keys,
+    // so we should return None.
+    None
+}
+
+pub(crate) fn result_combine<T, V>(t: (Result<T>, V)) -> Result<(T, V)> {
+    let (r, x) = t;
+    r.map(|v| (v, x))
+}
+
+/// merges the major and minor rdev to a single rdev.
+#[cfg(any(feature = "los_tar", feature = "vos_tar"))]
+pub(crate) fn makedev(major: u32, minor: u32) -> u64 {
+    let major = major as u64;
+    let minor = minor as u64;
+
+    ((major & 0xfff) << 8) | (minor & 0xff) | ((minor & !0xff) << 12)
+}
+
+#[cfg(any(feature = "los_tar", feature = "vos_tar"))]
+pub(crate) fn parse_unix_timestamp_nanos(s: &str) -> Option<u64> {
+    let bytes = s.as_bytes();
+
+    let mut secs: u64 = 0;
+    let mut nanos: u64 = 0;
+    let mut seen_dot = false;
+    let mut frac_digits = 0usize;
+
+    for &b in bytes {
+        if b == b'.' {
+            if seen_dot {
+                return None; // second dot
+            }
+            seen_dot = true;
+            continue;
+        }
+
+        if !b.is_ascii_digit() {
+            return None;
+        }
+
+        let digit = (b - b'0') as u64;
+
+        if !seen_dot {
+            secs = secs.checked_mul(10)?.checked_add(digit)?;
+        } else if frac_digits < 9 {
+            nanos = nanos.checked_mul(10)?.checked_add(digit)?;
+            frac_digits += 1;
+        }
+        // extra digits silently ignored
+    }
+
+    // scale to nanoseconds
+    if seen_dot {
+        for _ in frac_digits..9 {
+            nanos = nanos.checked_mul(10)?;
+        }
+    }
+
+    secs.checked_mul(1_000_000_000)?.checked_add(nanos)
+}
+
+pub(crate) fn copy_chunk_content_to_buf(
+    chunk_content: &ChunkContent,
+    buf: &mut [u8],
+    read_bytes: usize,
+    current_read_len: usize,
+    inner_position: usize,
+) -> Result<()> {
+    match chunk_content {
+        ChunkContent::Raw(data) => {
+            let end = inner_position
+                .checked_add(current_read_len)
+                .ok_or_else(|| IoError::new(IoEKind::InvalidData, ERROR_MALFORMED_SEGMENT))?;
+            let chunk_slice = data
+                .get(inner_position..end)
+                .ok_or_else(|| IoError::new(IoEKind::UnexpectedEof, ERROR_MALFORMED_SEGMENT))?;
+            buf[read_bytes..read_bytes + current_read_len].copy_from_slice(chunk_slice);
+        }
+        ChunkContent::SameBytes(byte) => {
+            buf[read_bytes..read_bytes + current_read_len].fill(*byte);
+        }
+        // Duplicates are resolved by get_chunk_data() before reaching this point.
+        ChunkContent::Duplicate(_) => {
+            return Err(ZffError::new(
+                ZffErrorKind::Invalid,
+                ERROR_UNEXPECTED_DUPLICATE_CHUNK_CONTENT,
+            ));
+        }
+    };
+    Ok(())
+}
+
+/// Reads exactly `length` bytes from `data`.
+///
+/// Lengths are decoded from the container and are therefore untrusted.
+/// Allocating one up front lets a corrupted value reserve, and then zero, an
+/// arbitrary amount of memory: under Linux overcommit the reservation succeeds
+/// and the zeroing turns a malformed container into minutes of page faults
+/// instead of a clean error. The buffer is grown while the data is actually
+/// read, so memory use stays proportional to the bytes that really exist, and a
+/// short read is reported as a malformed segment.
+pub(crate) fn read_exact_buffer<R: Read>(data: &mut R, length: usize) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    let read_bytes = data.take(length as u64).read_to_end(&mut buffer)?;
+    if read_bytes != length {
+        return Err(ZffError::new(
+            ZffErrorKind::EncodingError,
+            ERROR_MALFORMED_SEGMENT,
+        ));
+    }
+    Ok(buffer)
+}
+
+pub(crate) fn decode_len<R: Read>(data: &mut R) -> Result<usize> {
+    let length = u64::decode_directly(data)?;
+    usize::try_from(length).map_err(|_| {
+        ZffError::new(
+            ZffErrorKind::EncodingError,
+            "decoded length does not fit usize",
+        )
+    })
+}
+
+pub(crate) fn decode_header_content_len(
+    header_length: u64,
+    already_read_content_len: usize,
+) -> Result<usize> {
+    let header_length = usize::try_from(header_length).map_err(|_| {
+        ZffError::new(
+            ZffErrorKind::EncodingError,
+            "decoded header length does not fit usize",
+        )
+    })?;
+    header_length
+        .checked_sub(
+            DEFAULT_LENGTH_HEADER_IDENTIFIER
+                + DEFAULT_LENGTH_VALUE_HEADER_LENGTH
+                + already_read_content_len,
+        )
+        .ok_or_else(|| ZffError::new(ZffErrorKind::EncodingError, ERROR_MALFORMED_SEGMENT))
+}
+
+pub(crate) fn zstd_compress_if_worthwhile(
+    buf: &[u8],
+    compression_level: i32,
+    compression_threshold: f32,
+) -> Result<Option<Vec<u8>>> {
+    if !compression_threshold.is_finite() || compression_threshold <= 0.0 {
+        return Err(ZffError::new(
+            ZffErrorKind::Invalid,
+            "invalid compression threshold",
+        ));
+    }
+
+    let max_compressed_len = ((buf.len() as f64) / compression_threshold as f64).floor() as usize;
+    let read_limit = max_compressed_len.saturating_add(1) as u64;
+
+    let mut stream = zstd::stream::read::Encoder::new(buf, compression_level)?;
+    let mut compressed = Vec::new();
+
+    stream
+        .by_ref()
+        .take(read_limit)
+        .read_to_end(&mut compressed)?;
+
+    if compressed.len() > max_compressed_len {
+        Ok(None)
+    } else {
+        Ok(Some(compressed))
+    }
+}

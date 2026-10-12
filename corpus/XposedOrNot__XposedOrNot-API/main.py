@@ -1,0 +1,1425 @@
+"""Main XON-API entry point."""
+
+# Third-party imports
+import asyncio
+import json
+import os
+import time
+from datetime import datetime
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+from starlette.responses import Response
+
+# Local imports - Config
+from config.middleware import (
+    setup_middleware,
+    setup_security_headers,
+    setup_globe_middleware,
+)
+from config.settings import (
+    API_VERSION,
+    API_TITLE,
+    API_DESCRIPTION,
+    CF_UNBLOCK_MAGIC,
+    MAX_EMAIL_LENGTH,
+    OPENAPI_SERVERS,
+)
+from config.limiter import (
+    RATE_LIMIT_HELP,
+    RATE_LIMIT_UNBLOCK,
+)
+
+# Local imports - API Routers
+from api.v1 import (
+    alert,
+    analytics,
+    api_keys,
+    breaches,
+    domain_breaches,
+    domain_phishing,
+    domain_seniority,
+    domain_verification,
+    enterprise_validation,
+    feeds,
+    metrics,
+    monitor,
+    monthly_digest,
+    slack,
+    teams,
+    webhook,
+)
+
+# Local imports - Services
+from services.analytics import get_detailed_metrics
+from services.cloudflare import unblock
+from services.scheduler import start_scheduler
+
+# Local imports - Models
+from models.responses import AlertResponse
+
+# Local imports - Utils
+from utils.custom_limiter import (
+    custom_rate_limiter,
+    get_healthy_redis_connection,
+    is_rate_limited,
+    parse_rate_limit,
+    redis_pool,
+)
+from utils.helpers import get_client_ip, validate_domain
+from utils.http_client import aclose_http_client
+from utils.validation import validate_email_with_tld
+from utils.scan_protection import handle_404_with_protection
+
+# Initialize FastAPI app
+app = FastAPI(
+    title=API_TITLE,
+    description=API_DESCRIPTION,
+    version=API_VERSION,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url="/openapi.json",
+    openapi_tags=[
+        {
+            "name": "breaches",
+            "description": "Core breach detection and monitoring endpoints",
+        },
+        {"name": "analytics", "description": "Advanced breach analysis and statistics"},
+        {"name": "metrics", "description": "System-wide and breach-specific metrics"},
+    ],
+)
+
+# Setup middleware and security
+setup_middleware(app)
+setup_security_headers(app)
+setup_globe_middleware(app)
+
+
+# MCP Integration - Manual endpoint approach
+_MCP_PROTOCOL_VERSIONS = ("2025-06-18", "2024-11-05")
+
+
+@app.get("/mcp")
+async def mcp_get_handler():
+    """Reject GET per streamable HTTP; MCP requests are POST-only."""
+    return JSONResponse(
+        status_code=405,
+        content={"detail": "Method Not Allowed. Send MCP JSON-RPC requests via POST."},
+        headers={"Allow": "POST"},
+    )
+
+
+# MCP tool definitions (advertised via tools/list)
+_READ_ONLY = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+}
+
+_MCP_TOOLS = [
+    {
+        "name": "check_email_breaches",
+        "title": "Check Email for Breaches",
+        "description": (
+            "Check whether an email address appears in the XposedOrNot index of "
+            "known public data breaches. Returns the list of breach names only. "
+            "Never returns passwords."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string",
+                    "format": "email",
+                    "description": "Email address to check for breaches",
+                }
+            },
+            "required": ["email"],
+        },
+        "annotations": _READ_ONLY,
+    },
+    {
+        "name": "get_breach_analytics",
+        "title": "Get Email Breach Analytics",
+        "description": (
+            "Get a detailed breach history for one email address: the breaches "
+            "it appeared in with dates and descriptions, exposure broken down "
+            "by industry and by year, risk scoring, and any paste exposure. "
+            "Never returns passwords."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string",
+                    "format": "email",
+                    "description": "Email address to get analytics for",
+                }
+            },
+            "required": ["email"],
+        },
+        "annotations": _READ_ONLY,
+    },
+    {
+        "name": "list_breaches",
+        "title": "List Indexed Breaches",
+        "description": (
+            "List breaches in the XposedOrNot catalog, optionally filtered by "
+            "the breached company domain or by a specific breach ID. Returns "
+            "breach name, date, industry, record count, categories of data "
+            "exposed and a reference URL."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "domain": {
+                    "type": "string",
+                    "description": (
+                        "Optional domain of the breached company, "
+                        "for example adobe.com"
+                    ),
+                },
+                "breach_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional specific breach identifier, for example Adobe"
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 25,
+                    "description": "Maximum breaches to return, default 25",
+                },
+            },
+            "required": [],
+        },
+        "annotations": _READ_ONLY,
+    },
+    {
+        "name": "domain_breach_summary",
+        "title": "Summarize Domain Breach Exposure",
+        "description": (
+            "Get an aggregate breach summary for a domain, including the number "
+            "of breaches, affected email accounts, pastes, and the most recent "
+            "breach date. Returns only counts, not individual email addresses."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "domain": {
+                    "type": "string",
+                    "description": "Domain to summarize breaches for",
+                }
+            },
+            "required": ["domain"],
+        },
+        "annotations": _READ_ONLY,
+    },
+    {
+        "name": "get_breach_metrics",
+        "title": "Get Breach Index Metrics",
+        "description": (
+            "Get system-wide breach statistics: total breaches and records "
+            "indexed, breaches per year and industry, the largest and most "
+            "recent breaches, and when the latest breach was added."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "annotations": _READ_ONLY,
+    },
+    {
+        "name": "get_recent_breaches",
+        "title": "Get Recent Breaches",
+        "description": (
+            "Get the breaches most recently added to XposedOrNot, newest first. "
+            "Returns title, date, a short summary and a URL for each."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "default": 10,
+                    "description": "Maximum breaches to return, default 10",
+                }
+            },
+            "required": [],
+        },
+        "annotations": _READ_ONLY,
+    },
+]
+
+# Light rate limit for cheap MCP envelope methods (initialize / tools/list),
+# keyed on the real caller IP. tools/call is throttled by the underlying
+# route's own @custom_rate_limiter when called in-process.
+_MCP_ENVELOPE_LIMIT = parse_rate_limit("5 per second;150 per hour;500 per day")
+
+
+def _validate_mcp_email(request_id, email):
+    """Return an actionable -32602 error for an invalid email, else None."""
+    if (
+        not isinstance(email, str)
+        or len(email) > MAX_EMAIL_LENGTH
+        or not validate_email_with_tld(email)
+    ):
+        return _mcp_error(
+            request_id,
+            -32602,
+            f"'{str(email)[:64]}' is not a valid email address. "
+            "Provide a full address such as user@example.com.",
+        )
+    return None
+
+
+def _mcp_error(request_id, code, message, data=None):
+    """Build a JSON-RPC error envelope."""
+    err = {"code": code, "message": message}
+    if data is not None:
+        err["data"] = data
+    return {"jsonrpc": "2.0", "id": request_id, "error": err}
+
+
+def _normalize_route_result(result):
+    """Convert an in-process route return value into a JSON-serializable object."""
+    if isinstance(result, BaseModel):
+        return result.model_dump()
+    if isinstance(result, Response):  # JSONResponse / HTMLResponse / etc.
+        try:
+            return json.loads(result.body)
+        except Exception:  # pylint: disable=broad-except
+            return {"detail": result.body.decode("utf-8", "replace")}
+    return result  # already a dict/list
+
+
+async def _mcp_envelope_limited(request: Request):
+    """Apply a light per-IP rate limit to cheap MCP envelope methods."""
+    try:
+        client_ip = get_client_ip(request)
+        redis_conn = await get_healthy_redis_connection()
+        key = f"rate-limit:/mcp-envelope:{client_ip}"
+        limited, retry_after, _ = await is_rate_limited(
+            key, _MCP_ENVELOPE_LIMIT, redis_conn
+        )
+        return limited, retry_after
+    except Exception:  # pylint: disable=broad-except
+        # Never let limiter infrastructure errors break the envelope
+        return False, 0
+
+
+async def _mcp_envelope_guard(request: Request, request_id=None):
+    """Return a 429 JSON-RPC response when the per-IP envelope limit is hit."""
+    limited, retry_after = await _mcp_envelope_limited(request)
+    if limited:
+        return JSONResponse(
+            status_code=429,
+            content=_mcp_error(
+                request_id,
+                -32000,
+                "Rate limit exceeded",
+                data={"retry_after": retry_after},
+            ),
+        )
+    return None
+
+
+async def _run_mcp_tool(request_id, coro, label, transform=None):
+    """
+    Run an in-process route coroutine and wrap it as a JSON-RPC response.
+
+    The route's own @custom_rate_limiter executes here, keyed on the real
+    caller's IP (from the original /mcp request), so MCP traffic is throttled
+    per-client using each route's configured limits. "Not found" (404) is
+    returned as a normal result; 429 and other failures become JSON-RPC errors.
+    """
+    try:
+        data = _normalize_route_result(await coro)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            data = (
+                exc.detail
+                if isinstance(exc.detail, (dict, list))
+                else {"detail": exc.detail}
+            )
+        elif exc.status_code == 429:
+            retry_after = (
+                exc.detail.get("retry_after") if isinstance(exc.detail, dict) else None
+            )
+            message = f"Rate limit reached for {label}."
+            if retry_after:
+                message += f" Retry after {retry_after} seconds."
+            return _mcp_error(
+                request_id,
+                -32000,
+                message,
+                data={"status": 429, "retry_after": retry_after},
+            )
+        else:
+            detail = (
+                exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail)
+            )
+            return _mcp_error(
+                request_id,
+                -32603,
+                f"{label} failed (HTTP {exc.status_code}): {detail}",
+                data={"status": exc.status_code},
+            )
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"MCP {label} error: {exc}")
+        return _mcp_error(
+            request_id,
+            -32603,
+            f"Internal error while running {label}. Please retry; if it "
+            "persists the service may be having issues.",
+        )
+
+    if transform is not None:
+        data = transform(data)
+    text = json.dumps(data, default=str)
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {"content": [{"type": "text", "text": text}]},
+    }
+
+
+@app.post("/mcp")
+async def mcp_post_handler(fastapi_request: Request):
+    """Handle MCP protocol requests manually."""
+    # Guard malformed JSON (previously raised an unhandled 500)
+    try:
+        request_body = await fastapi_request.json()
+    except Exception:  # pylint: disable=broad-except
+        limited = await _mcp_envelope_guard(fastapi_request)
+        if limited:
+            return limited
+        return JSONResponse(
+            status_code=400,
+            content=_mcp_error(None, -32700, "Parse error: invalid JSON"),
+        )
+    if not isinstance(request_body, dict):
+        limited = await _mcp_envelope_guard(fastapi_request)
+        if limited:
+            return limited
+        return JSONResponse(
+            status_code=400,
+            content=_mcp_error(None, -32600, "Invalid request"),
+        )
+
+    req_id = request_body.get("id")
+    method = request_body.get("method")
+
+    if isinstance(method, str) and method.startswith("notifications/"):
+        return Response(status_code=202)
+
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+
+    if method != "tools/call":
+        limited = await _mcp_envelope_guard(fastapi_request, req_id)
+        if limited:
+            return limited
+
+    if method in ("initialize", "tools/list"):
+        if method == "initialize":
+            init_params = request_body.get("params", {}) or {}
+            requested_version = init_params.get("protocolVersion")
+            protocol_version = (
+                requested_version
+                if requested_version in _MCP_PROTOCOL_VERSIONS
+                else _MCP_PROTOCOL_VERSIONS[0]
+            )
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "protocolVersion": protocol_version,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {
+                        "name": "XON_MCP",
+                        "title": "XposedOrNot Breach Intelligence",
+                        "version": API_VERSION,
+                    },
+                },
+            }
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"tools": _MCP_TOOLS},
+        }
+
+    if method == "tools/call":
+        params = request_body.get("params", {}) or {}
+        tool_name = params.get("name")
+        tool_args = params.get("arguments", {}) or {}
+
+        if tool_name == "check_email_breaches":
+            email = tool_args.get("email")
+            if not email:
+                return _mcp_error(req_id, -32602, "Missing email parameter")
+            invalid = _validate_mcp_email(req_id, email)
+            if invalid:
+                return invalid
+            return await _run_mcp_tool(
+                req_id,
+                breaches.search_email(
+                    request=fastapi_request, email=email, details=False
+                ),
+                "Breach check results",
+            )
+
+        if tool_name == "get_breach_analytics":
+            email = tool_args.get("email")
+            if not email:
+                return _mcp_error(req_id, -32602, "Missing email parameter")
+            invalid = _validate_mcp_email(req_id, email)
+            if invalid:
+                return invalid
+            return await _run_mcp_tool(
+                req_id,
+                breaches.search_data_breaches(
+                    request=fastapi_request, email=email, token=None
+                ),
+                "Breach analytics",
+            )
+
+        if tool_name == "list_breaches":
+            breach_id = tool_args.get("breach_id") or None
+            try:
+                limit = int(tool_args.get("limit") or 25)
+            except (TypeError, ValueError):
+                return _mcp_error(
+                    req_id, -32602, "limit must be an integer between 1 and 100"
+                )
+            limit = max(1, min(limit, 100))
+
+            def _trim_breach_list(data):
+                breach_rows = (
+                    data.get("exposedBreaches") if isinstance(data, dict) else None
+                )
+                if not isinstance(breach_rows, list):
+                    return data
+                total = len(breach_rows)
+                trimmed = breach_rows[:limit]
+                if not breach_id:
+                    trimmed = [
+                        {
+                            key: value
+                            for key, value in row.items()
+                            if key != "exposureDescription"
+                        }
+                        for row in trimmed
+                    ]
+                data["exposedBreaches"] = trimmed
+                if total > limit:
+                    data["message"] = (
+                        f"Showing {limit} of {total} breaches. Filter by domain "
+                        "or breach_id, or raise limit (max 100), to narrow results."
+                    )
+                return data
+
+            return await _run_mcp_tool(
+                req_id,
+                breaches.get_xposed_breaches(
+                    request=fastapi_request,
+                    response=Response(),
+                    domain=tool_args.get("domain") or None,
+                    breach_id=breach_id,
+                    if_modified_since=None,
+                ),
+                "Breach list",
+                transform=_trim_breach_list,
+            )
+
+        if tool_name == "domain_breach_summary":
+            domain = tool_args.get("domain")
+            if not domain:
+                return _mcp_error(req_id, -32602, "Missing domain parameter")
+            if not isinstance(domain, str) or not validate_domain(domain):
+                return _mcp_error(
+                    req_id,
+                    -32602,
+                    f"'{str(domain)[:64]}' is not a valid domain. "
+                    "Provide a bare domain such as example.com.",
+                )
+            return await _run_mcp_tool(
+                req_id,
+                breaches.get_domain_breach_summary(request=fastapi_request, d=domain),
+                "Domain breach summary",
+            )
+
+        if tool_name == "get_breach_metrics":
+            return await _run_mcp_tool(
+                req_id,
+                metrics.get_detailed_metrics_endpoint(request=fastapi_request),
+                "Breach metrics",
+            )
+
+        if tool_name == "get_recent_breaches":
+            try:
+                limit = int(tool_args.get("limit") or 10)
+            except (TypeError, ValueError):
+                return _mcp_error(
+                    req_id, -32602, "limit must be an integer between 1 and 50"
+                )
+            limit = max(1, min(limit, 50))
+
+            def _trim_recent(data):
+                rows = data.get("data") if isinstance(data, dict) else None
+                if not isinstance(rows, list):
+                    return data
+
+                def _when(row):
+                    try:
+                        return datetime.strptime(row.get("date", ""), "%Y-%b-%d")
+                    except (TypeError, ValueError):
+                        return datetime.min
+
+                rows = sorted(rows, key=_when, reverse=True)
+                total = len(rows)
+                data["data"] = rows[:limit]
+                if total > limit:
+                    data["message"] = (
+                        f"Showing the {limit} most recent of {total} breaches. "
+                        "Raise limit (max 50) to see more."
+                    )
+                return data
+
+            return await _run_mcp_tool(
+                req_id,
+                analytics.get_news_feed(request=fastapi_request),
+                "Recent breaches",
+                transform=_trim_recent,
+            )
+
+        return _mcp_error(req_id, -32601, f"Unknown tool: {tool_name}")
+
+    return _mcp_error(req_id, -32601, "Method not found")
+
+
+_MCP_SERVER_CARD = {
+    "serverInfo": {
+        "name": "XON_MCP",
+        "version": API_VERSION,
+        "title": "XposedOrNot Breach Intelligence",
+        "description": (
+            "Real-time data-breach lookup and analytics for emails and domains."
+        ),
+        "vendor": "XposedOrNot",
+        "homepage": "https://xposedornot.com",
+        "documentation": "https://xposedornot.com/mcp",
+        "repository": "https://github.com/XposedOrNot/XposedOrNot-API",
+        "license": "MIT",
+    },
+    "protocolVersion": _MCP_PROTOCOL_VERSIONS[0],
+    "supportedProtocolVersions": list(_MCP_PROTOCOL_VERSIONS),
+    "transport": {"type": "http", "url": "https://api.xposedornot.com/mcp"},
+    "capabilities": {"tools": {}},
+    "tools": _MCP_TOOLS,
+}
+
+
+@app.get("/.well-known/mcp/server-card.json", include_in_schema=False)
+async def serve_mcp_server_card():
+    """Serve the MCP server card built from the live tool definitions."""
+    return JSONResponse(content=_MCP_SERVER_CARD)
+
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+
+app.include_router(
+    breaches.router, prefix="/v1", tags=["breaches"], include_in_schema=False
+)
+app.include_router(
+    analytics.router, prefix="/v1", tags=["analytics"], include_in_schema=False
+)
+app.include_router(metrics.router, prefix="/v1", tags=["metrics"])
+app.include_router(
+    alert.router,
+    prefix="/v1",
+    tags=["alert"],
+    include_in_schema=False,
+    responses={
+        "200": {"model": AlertResponse},
+        "404": {"model": AlertResponse},
+        "500": {"model": AlertResponse},
+    },
+)
+app.include_router(
+    api_keys.router, prefix="/v1", tags=["api_keys"], include_in_schema=False
+)
+app.include_router(feeds.router, prefix="/v1", tags=["feeds"], include_in_schema=False)
+app.include_router(
+    domain_verification.router,
+    prefix="/v1",
+    tags=["domain_verification"],
+    include_in_schema=False,
+)
+app.include_router(
+    domain_breaches.router,
+    prefix="/v1",
+    tags=["domain_breaches"],
+    include_in_schema=False,
+)
+app.include_router(
+    enterprise_validation.router,
+    prefix="/v1",
+    tags=["enterprise_validation"],
+    include_in_schema=False,
+)
+app.include_router(
+    domain_phishing.router,
+    prefix="/v1",
+    tags=["domain_phishing"],
+    include_in_schema=False,
+)
+app.include_router(
+    domain_seniority.router,
+    prefix="/v1",
+    tags=["domain_seniority"],
+    include_in_schema=False,
+)
+app.include_router(
+    monthly_digest.router,
+    prefix="/v1",
+    tags=["monthly_digest"],
+    include_in_schema=True,
+)
+app.include_router(
+    monitor.router, prefix="/v1", tags=["monitor"], include_in_schema=False
+)
+app.include_router(
+    slack.router, prefix="/v1", tags=["notifications"], include_in_schema=False
+)
+app.include_router(
+    teams.router, prefix="/v1", tags=["notifications"], include_in_schema=False
+)
+app.include_router(
+    webhook.router, prefix="/v1", tags=["notifications"], include_in_schema=False
+)
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on startup."""
+    if os.environ.get("ENABLE_SCHEDULER", "false").lower() == "true":
+        start_scheduler()
+    else:
+        print("Scheduler disabled (set ENABLE_SCHEDULER=true to enable)")
+
+
+_health_requests = {}  # {ip: [timestamps]}
+_HEALTH_LIMIT = 10  # max requests per minute
+
+
+@app.get("/v1/health", include_in_schema=False)
+async def health_check(request: Request, token: str = None):
+    """Health check endpoint — reports Redis and app status. Requires magic token."""
+    if not token or token != CF_UNBLOCK_MAGIC:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    timestamps = _health_requests.get(client_ip, [])
+    timestamps = [t for t in timestamps if now - t < 60]
+    if len(timestamps) >= _HEALTH_LIMIT:
+        raise HTTPException(status_code=429, detail="Too many requests")
+    timestamps.append(now)
+    _health_requests[client_ip] = timestamps
+
+    redis_status = "healthy"
+    try:
+        await redis_pool.ping()
+    except Exception:
+        redis_status = "unhealthy"
+
+    status = "healthy" if redis_status == "healthy" else "degraded"
+    status_code = 200 if status == "healthy" else 503
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": status,
+            "services": {"redis": redis_status, "app": "healthy"},
+        },
+    )
+
+
+LANDING_STATS_FALLBACK = {
+    "records_headline": "11.5 billion",
+    "records_display": "11.5B+",
+    "breaches_display": "775+",
+    "passwords_display": "835M+",
+    "last_breach_display": None,
+}
+
+
+def _format_compact_count(value):
+    """Format a large count as a compact display string."""
+    number = float(value)
+    if number >= 1_000_000_000:
+        text = f"{number / 1_000_000_000:.2f}".rstrip("0").rstrip(".")
+        return f"{text}B"
+    if number >= 1_000_000:
+        return f"{number / 1_000_000:.0f}M"
+    return f"{int(number):,}"
+
+
+def _format_records_headline(value):
+    """Format the record count as a billions phrase for the hero headline."""
+    billions = int(value) // 100_000_000 / 10
+    text = f"{billions:.1f}".rstrip("0").rstrip(".")
+    return f"{text} billion"
+
+
+def _format_breach_date(value):
+    """Format an ISO timestamp as a short display date."""
+    try:
+        return datetime.fromisoformat(value).strftime("%b %d, %Y")
+    except (TypeError, ValueError):
+        return None
+
+
+async def _get_landing_stats():
+    """Build landing page stats from cached metrics with a static fallback."""
+    try:
+        data = metrics.get_cached_metrics("metrics:basic:v2")
+        if not data:
+            detailed = await get_detailed_metrics()
+            data = {
+                "Breaches_Count": detailed["breaches_count"],
+                "Breaches_Records": detailed["breaches_total_records"],
+                "Pastes_Count": str(detailed["pastes_count"]),
+                "Pastes_Records": detailed["pastes_total_records"],
+                "Last_Breach_Added": metrics.get_last_breach_added(detailed),
+            }
+            metrics.cache_metrics("metrics:basic:v2", data)
+        return {
+            "records_headline": _format_records_headline(data["Breaches_Records"]),
+            "records_display": _format_compact_count(data["Breaches_Records"]),
+            "breaches_display": str(int(data["Breaches_Count"])),
+            "passwords_display": _format_compact_count(data["Pastes_Records"]),
+            "last_breach_display": _format_breach_date(data.get("Last_Breach_Added")),
+        }
+    except Exception:  # pylint: disable=broad-except
+        return dict(LANDING_STATS_FALLBACK)
+
+
+@app.get("/", include_in_schema=False)
+async def index(request: Request):
+    """Returns default landing page."""
+    return templates.TemplateResponse(
+        request, "index.html", context=await _get_landing_stats()
+    )
+
+
+@app.get("/v1/help/", include_in_schema=False)
+@custom_rate_limiter(RATE_LIMIT_HELP)
+async def helper(request: Request):
+    """
+    Provides basic guidance to the API documentation page.
+    Returns an HTML response with the documentation landing page.
+    """
+    return templates.TemplateResponse(
+        request, "index.html", context=await _get_landing_stats()
+    )
+
+
+@app.get("/robots.txt", include_in_schema=False)
+async def serve_robots_txt(request: Request):  # pylint: disable=unused-argument
+    """Returns robots.txt file content."""
+    return HTMLResponse(content=open("static/robots.txt", encoding="utf-8").read())
+
+
+@app.get("/.well-known/security.txt", include_in_schema=False)
+async def serve_security_txt(request: Request):  # pylint: disable=unused-argument
+    """Returns security.txt file content."""
+    return PlainTextResponse(
+        content=open("static/.well-known/security.txt", encoding="utf-8").read()
+    )
+
+
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_ui_html(request: Request):
+    """Custom Swagger UI endpoint with enhanced styling."""
+    swagger_js_url = (
+        "https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/4.15.5/"
+        "swagger-ui-bundle.min.js"
+    )
+    swagger_css_url = (
+        "https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/4.15.5/" "swagger-ui.min.css"
+    )
+
+    return templates.TemplateResponse(
+        request,
+        "swagger/custom_swagger.html",
+        context={
+            "openapi_url": "/openapi.json",
+            "title": f"{API_TITLE} Documentation",
+            "swagger_js_url": swagger_js_url,
+            "swagger_css_url": swagger_css_url,
+        },
+    )
+
+
+@app.get("/openapi.json", include_in_schema=False)
+async def get_openapi_json():
+    """Custom OpenAPI JSON endpoint."""
+    return get_openapi(
+        title=API_TITLE,
+        version=API_VERSION,
+        description=API_DESCRIPTION,
+        routes=app.routes,
+    )
+
+
+@app.get("/v1/unblock_cf/{token}", include_in_schema=False)
+@custom_rate_limiter(RATE_LIMIT_UNBLOCK)
+async def unblock_cloudflare(
+    token: str, request: Request
+):  # pylint: disable=unused-argument
+    """
+    Returns status of unblock done at Cloudflare.
+
+    Args:
+        token: Authentication token for the unblock operation
+        request: FastAPI request object (used by rate limiter)
+    """
+    try:
+        if not token or token != CF_UNBLOCK_MAGIC:
+            raise HTTPException(status_code=404, detail="Not found")
+
+        result = await unblock()
+        return result
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=404, detail="An error occurred during processing"
+        ) from e
+
+
+def custom_openapi():
+    """
+    Generate custom OpenAPI schema for the API documentation.
+
+    Returns:
+        dict: The customized OpenAPI schema.
+    """
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=API_DESCRIPTION,
+        routes=app.routes,
+    )
+
+    openapi_schema["openapi"] = "3.0.0"
+
+    # Add server configurations
+    openapi_schema["servers"] = OPENAPI_SERVERS
+
+    if "components" in openapi_schema:
+        del openapi_schema["components"]
+
+    if "paths" in openapi_schema:
+
+        paths_to_keep = {
+            path: methods
+            for path, methods in openapi_schema["paths"].items()
+            if not any(
+                route in path
+                for route in [
+                    "/",
+                    "/v1/help",
+                    "/robots.txt",
+                    "/docs",
+                    "/openapi.json",
+                    "/v1/unblock_cf",
+                ]
+            )
+        }
+        openapi_schema["paths"] = paths_to_keep
+
+        for path in openapi_schema["paths"].values():
+            for method in path.values():
+                if "parameters" in method:
+                    method["parameters"] = [
+                        param
+                        for param in method["parameters"]
+                        if not (
+                            isinstance(param, dict)
+                            and "schema" in param
+                            and "$ref" in param["schema"]
+                        )
+                    ]
+
+                if "operationId" in method:
+                    del method["operationId"]
+                if "x-function-name" in method:
+                    del method["x-function-name"]
+
+    if "paths" not in openapi_schema:
+        openapi_schema["paths"] = {}
+
+    openapi_schema["paths"]["/v1/breaches"] = {
+        "get": {
+            "operationId": "getBreaches",
+            "summary": "Get List Of Breaches",
+            "description": (
+                "Retrieves a list of all known data breaches in the system. "
+                "This endpoint provides information about each breach including "
+                "its name, title, breach date, and when it was added to the "
+                "system."
+            ),
+            "tags": ["breaches"],
+            "parameters": [
+                {
+                    "name": "domain",
+                    "in": "query",
+                    "description": "Filter breaches by domain",
+                    "required": False,
+                    "schema": {"type": "string"},
+                },
+                {
+                    "name": "breach_id",
+                    "in": "query",
+                    "description": "Get specific breach by ID",
+                    "required": False,
+                    "schema": {"type": "string"},
+                },
+                {
+                    "name": "if-modified-since",
+                    "in": "header",
+                    "description": ("Return 304 if no changes since this date"),
+                    "required": False,
+                    "schema": {"type": "string", "format": "date-time"},
+                },
+            ],
+            "responses": {
+                "200": {
+                    "description": ("Successfully retrieved list of breaches"),
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "status": {
+                                        "type": "string",
+                                        "description": "Response status",
+                                    },
+                                    "exposedBreaches": {
+                                        "type": "array",
+                                        "description": ("List of breach objects"),
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "breachID": {
+                                                    "type": "string",
+                                                    "description": (
+                                                        "Unique identifier for the "
+                                                        "breach"
+                                                    ),
+                                                },
+                                                "breachedDate": {
+                                                    "type": "string",
+                                                    "description": (
+                                                        "Date when the breach "
+                                                        "occurred"
+                                                    ),
+                                                },
+                                                "domain": {
+                                                    "type": "string",
+                                                    "description": (
+                                                        "Domain associated with the "
+                                                        "breach"
+                                                    ),
+                                                },
+                                                "industry": {
+                                                    "type": "string",
+                                                    "description": (
+                                                        "Industry of the breached "
+                                                        "organization"
+                                                    ),
+                                                },
+                                                "logo": {
+                                                    "type": "string",
+                                                    "description": (
+                                                        "URL to organization logo"
+                                                    ),
+                                                },
+                                                "passwordRisk": {
+                                                    "type": "string",
+                                                    "description": (
+                                                        "Password risk level"
+                                                    ),
+                                                },
+                                                "searchable": {
+                                                    "type": "boolean",
+                                                    "description": (
+                                                        "Whether the breach is "
+                                                        "searchable"
+                                                    ),
+                                                },
+                                                "sensitive": {
+                                                    "type": "boolean",
+                                                    "description": (
+                                                        "Whether the breach contains "
+                                                        "sensitive data"
+                                                    ),
+                                                },
+                                                "verified": {
+                                                    "type": "boolean",
+                                                    "description": (
+                                                        "Whether the breach has been "
+                                                        "verified"
+                                                    ),
+                                                },
+                                                "exposedData": {
+                                                    "type": "array",
+                                                    "items": {"type": "string"},
+                                                    "description": (
+                                                        "Types of data exposed in "
+                                                        "the breach"
+                                                    ),
+                                                },
+                                                "exposedRecords": {
+                                                    "type": "integer",
+                                                    "description": (
+                                                        "Number of records affected"
+                                                    ),
+                                                },
+                                                "exposureDescription": {
+                                                    "type": "string",
+                                                    "description": (
+                                                        "Detailed description of the "
+                                                        "breach"
+                                                    ),
+                                                },
+                                                "referenceURL": {
+                                                    "type": "string",
+                                                    "description": (
+                                                        "URL to breach reference"
+                                                    ),
+                                                },
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+                "304": {
+                    "description": (
+                        "Not Modified - No changes since the specified date"
+                    )
+                },
+                "404": {
+                    "description": (
+                        "Not Found - No breaches found for the provided criteria"
+                    )
+                },
+            },
+        }
+    }
+
+    openapi_schema["paths"]["/v1/check-email/{email}"] = {
+        "get": {
+            "operationId": "checkEmailBreaches",
+            "summary": "Check Email For Breaches",
+            "description": (
+                "Searches for any data breaches containing the specified email "
+                "address. This endpoint provides information about breaches where "
+                "the email was found."
+            ),
+            "tags": ["breaches"],
+            "parameters": [
+                {
+                    "required": True,
+                    "schema": {"type": "string", "format": "email"},
+                    "name": "email",
+                    "in": "path",
+                    "description": ("Email address to check for breaches"),
+                },
+                {
+                    "name": "include_details",
+                    "in": "query",
+                    "description": (
+                        "Include detailed breach information in the response"
+                    ),
+                    "required": False,
+                    "schema": {"type": "boolean", "default": False},
+                },
+            ],
+            "responses": {
+                "200": {
+                    "description": (
+                        "Successfully retrieved breach information for the email"
+                    ),
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "breaches": {
+                                        "type": "array",
+                                        "description": (
+                                            "List of breaches containing the email"
+                                        ),
+                                        "items": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                    },
+                                    "email": {
+                                        "type": "string",
+                                        "description": (
+                                            "Email address that was checked"
+                                        ),
+                                    },
+                                },
+                            }
+                        }
+                    },
+                },
+                "404": {
+                    "description": ("Not Found - Email not found or invalid format"),
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "Error": {"type": "string"},
+                                    "email": {"type": "string"},
+                                },
+                            }
+                        }
+                    },
+                },
+            },
+        }
+    }
+
+    openapi_schema["paths"]["/v1/breach-analytics"] = {
+        "get": {
+            "operationId": "getBreachAnalytics",
+            "summary": "Get Breach Analytics",
+            "description": (
+                "Retrieves analytics and statistics about breaches for a specific "
+                "email address. This endpoint provides information about breaches "
+                "and associated paste data."
+            ),
+            "tags": ["analytics"],
+            "parameters": [
+                {
+                    "required": True,
+                    "schema": {"type": "string", "format": "email"},
+                    "name": "email",
+                    "in": "query",
+                    "description": ("Email address to get analytics for"),
+                },
+                {
+                    "name": "token",
+                    "in": "query",
+                    "description": ("Token for accessing sensitive data"),
+                    "required": False,
+                    "schema": {"type": "string"},
+                },
+            ],
+            "responses": {
+                "200": {
+                    "description": ("Successfully retrieved breach analytics"),
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "ExposedBreaches": {
+                                        "type": "array",
+                                        "description": (
+                                            "List of breaches containing the email"
+                                        ),
+                                        "items": {"type": "object"},
+                                    },
+                                    "BreachesSummary": {
+                                        "type": "object",
+                                        "description": ("Summary of breaches"),
+                                    },
+                                    "BreachMetrics": {
+                                        "type": "object",
+                                        "description": ("Metrics about breaches"),
+                                    },
+                                    "PastesSummary": {
+                                        "type": "object",
+                                        "description": ("Summary of pastes"),
+                                    },
+                                    "ExposedPastes": {
+                                        "type": "array",
+                                        "description": (
+                                            "List of pastes containing the email"
+                                        ),
+                                        "items": {"type": "object"},
+                                    },
+                                    "PasteMetrics": {
+                                        "type": "object",
+                                        "description": ("Metrics about pastes"),
+                                    },
+                                },
+                            }
+                        }
+                    },
+                },
+                "404": {
+                    "description": ("Not Found - Email not found or invalid format")
+                },
+            },
+        }
+    }
+
+    openapi_schema["paths"]["/v1/domain-breaches"] = {
+        "post": {
+            "operationId": "getDomainBreaches",
+            "summary": "Get Domain Breaches",
+            "description": (
+                "Retrieves information about data breaches associated with "
+                "verified domains for an API key. This endpoint provides "
+                "detailed metrics and statistics about breaches affecting the "
+                "domains."
+            ),
+            "tags": ["domain_breaches"],
+            "parameters": [
+                {
+                    "required": True,
+                    "schema": {"type": "string"},
+                    "name": "x-api-key",
+                    "in": "header",
+                    "description": ("API key for authentication"),
+                }
+            ],
+            "responses": {
+                "200": {
+                    "description": ("Successfully retrieved domain breaches"),
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "status": {
+                                        "type": "string",
+                                        "description": ("Response status"),
+                                    },
+                                    "metrics": {
+                                        "type": "object",
+                                        "description": (
+                                            "Detailed metrics about domain " "breaches"
+                                        ),
+                                        "properties": {
+                                            "Yearly_Metrics": {
+                                                "type": "object",
+                                                "description": (
+                                                    "Breach counts by year"
+                                                ),
+                                            },
+                                            "Domain_Summary": {
+                                                "type": "object",
+                                                "description": (
+                                                    "Summary of breaches by domain"
+                                                ),
+                                            },
+                                            "Breach_Summary": {
+                                                "type": "object",
+                                                "description": (
+                                                    "Summary of all breaches"
+                                                ),
+                                            },
+                                            "Breaches_Details": {
+                                                "type": "array",
+                                                "description": (
+                                                    "Detailed information about "
+                                                    "each breach"
+                                                ),
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "email": {"type": "string"},
+                                                        "domain": {"type": "string"},
+                                                        "breach": {"type": "string"},
+                                                    },
+                                                },
+                                            },
+                                            "Top10_Breaches": {
+                                                "type": "object",
+                                                "description": (
+                                                    "Top 10 largest breaches"
+                                                ),
+                                            },
+                                            "Detailed_Breach_Info": {
+                                                "type": "object",
+                                                "description": (
+                                                    "Detailed information about "
+                                                    "each breach"
+                                                ),
+                                            },
+                                        },
+                                    },
+                                },
+                            }
+                        }
+                    },
+                },
+                "401": {"description": ("Unauthorized - Invalid or missing API key")},
+                "500": {
+                    "description": (
+                        "Internal Server Error - An error occurred during " "processing"
+                    )
+                },
+            },
+        }
+    }
+
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
+
+
+# Add custom 404 handler for scanning protection
+@app.exception_handler(404)
+async def custom_404_handler(request: Request, exc: HTTPException):
+    """Custom 404 handler with scanning protection."""
+    return await handle_404_with_protection(request, exc)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup resources on application shutdown."""
+    try:
+
+        await asyncio.wait_for(redis_pool.close(), timeout=5.0)
+        print("Redis connection pool closed successfully")
+    except asyncio.TimeoutError:
+        print("Redis connection pool close timed out during shutdown")
+    except asyncio.CancelledError:
+        print("Redis connection pool close was cancelled during shutdown")
+    except Exception as e:
+        print(f"Error closing Redis connection pool: {e}")
+    try:
+        await asyncio.wait_for(aclose_http_client(), timeout=5.0)
+    except Exception as e:
+        print(f"Error closing shared HTTP client: {e}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=1806)  # nosec B104

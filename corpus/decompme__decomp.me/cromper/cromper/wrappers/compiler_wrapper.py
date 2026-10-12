@@ -1,0 +1,227 @@
+import logging
+import re
+import subprocess
+import time
+from dataclasses import dataclass
+
+from ..compilers import Compiler, CompilerType
+from ..config import CromperConfig
+from ..error import AssemblyError, CompilationError
+from ..flags import Language
+from ..libraries import Library
+from ..platforms import Platform
+from ..sandbox import Sandbox
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CompilationResult:
+    elf_object: bytes
+    errors: str
+
+
+@dataclass
+class AssemblyData:
+    """Simplified representation of assembly data."""
+
+    data: str
+    hash: str
+
+
+@dataclass
+class AssemblyResult:
+    """Result of assembly operation."""
+
+    hash: str
+    arch: str
+    elf_object: bytes
+
+
+class CompilerWrapper:
+    def __init__(self, config: CromperConfig):
+        self.config = config
+
+    @staticmethod
+    def filter_compile_errors(input: str) -> str:
+        filter_strings = [
+            r"### .*\.exe Driver Error:.*\n?",
+            r"#   Cannot find my executable .*\n?",
+            r"### MWCPPC\.exe Driver Error:.*\n?",
+        ]
+
+        for str in filter_strings:
+            input = re.sub(str, "", input)
+
+        return input.strip()
+
+    def compile_code(
+        self,
+        compiler: Compiler,
+        compiler_flags: str,
+        code: str,
+        context: str,
+        function: str = "",
+        libraries: list[Library] | None = None,
+    ) -> CompilationResult:
+        if libraries is None:
+            libraries = []
+        code = code.replace("\r\n", "\n")
+        context = context.replace("\r\n", "\n")
+
+        with Sandbox(self.config) as sandbox:
+            ext = compiler.get_language(compiler_flags).get_file_extension()
+            code_file = f"code.{ext}"
+            src_file = f"src.{ext}"
+            ctx_file = f"ctx.{ext}"
+
+            code_path = sandbox.path / code_file
+            object_path = sandbox.path / "object.o"
+            skip_line_directive = (
+                compiler.type == CompilerType.IDO
+                and compiler.language == Language.PASCAL
+            )
+            with code_path.open("w") as f:
+                if not skip_line_directive:
+                    f.write(f'#line 1 "{ctx_file}"\n')
+                f.write(context)
+                f.write("\n")
+
+                if not skip_line_directive:
+                    f.write(f'#line 1 "{src_file}"\n')
+                f.write(code)
+                f.write("\n")
+
+            cc_cmd = compiler.cc
+
+            # MWCC requires the file to exist for DWARF line numbers,
+            # and requires the file contents for error messages
+            if compiler.type == CompilerType.MWCC:
+                ctx_path = sandbox.path / ctx_file
+                ctx_path.touch()
+                with ctx_path.open("w") as f:
+                    f.write(context)
+                    f.write("\n")
+
+                src_path = sandbox.path / src_file
+                src_path.touch()
+                with src_path.open("w") as f:
+                    f.write(code)
+                    f.write("\n")
+
+            # IDO hack to support -KPIC
+            if compiler.type == CompilerType.IDO and "-KPIC" in compiler_flags:
+                cc_cmd = cc_cmd.replace("-non_shared", "")
+
+            # Run compiler
+            try:
+                st = round(time.time() * 1000)
+                libraries_compiler_flags = " ".join(
+                    compiler.library_include_flag
+                    + str(lib.get_include_path(compiler.platform.id, self.config))
+                    for lib in libraries
+                )
+                wibo_path = self.config.compiler_base_path / "common" / "wibo_dlls"
+                compile_proc = sandbox.run_subprocess(
+                    cc_cmd,
+                    mounts=([compiler.get_path(self.config.compiler_base_path)]),
+                    shell=True,
+                    env={
+                        "WIBO": "wibo",
+                        "WIBO_PATH": sandbox.rewrite_path(wibo_path),
+                        "INPUT": sandbox.rewrite_path(code_path),
+                        "OUTPUT": sandbox.rewrite_path(object_path),
+                        "COMPILER_DIR": sandbox.rewrite_path(
+                            compiler.get_path(self.config.compiler_base_path)
+                        ),
+                        "COMPILER_FLAGS": sandbox.quote_options(
+                            compiler_flags + " " + libraries_compiler_flags
+                        ),
+                        "FUNCTION": function,
+                        "MWCIncludes": "/tmp",
+                        "TMPDIR": "/tmp",
+                    },
+                    timeout=self.config.compilation_timeout_seconds,
+                )
+                et = round(time.time() * 1000)
+                logger.debug(f"Compilation finished in: {et - st} ms")
+            except subprocess.CalledProcessError as e:
+                # Compilation failed
+                msg = e.stdout
+
+                logger.debug("Compilation failed: %s", msg)
+                raise CompilationError(CompilerWrapper.filter_compile_errors(msg))
+            except ValueError as e:
+                # Shlex issue?
+                logger.debug("Compilation failed: %s", e)
+                raise CompilationError(str(e))
+            except subprocess.TimeoutExpired:
+                raise CompilationError("Compilation failed: timeout expired")
+
+            if not object_path.exists():
+                error_msg = (
+                    f"Compiler did not create an object file: {compile_proc.stdout}"
+                )
+                logger.debug(error_msg)
+                raise CompilationError(error_msg)
+
+            object_bytes = object_path.read_bytes()
+
+            if not object_bytes:
+                raise CompilationError("Compiler created an empty object file")
+
+            compile_errors = CompilerWrapper.filter_compile_errors(compile_proc.stdout)
+
+            return CompilationResult(object_bytes, compile_errors)
+
+    def assemble_asm(self, platform: Platform, asm: AssemblyData) -> AssemblyResult:
+        if not platform.assemble_cmd:
+            raise AssemblyError(
+                f"Assemble command for platform {platform.id} not found"
+            )
+
+        with Sandbox(self.config) as sandbox:
+            asm_prelude_path = sandbox.path / "prelude.s"
+            asm_prelude_path.write_text(platform.asm_prelude)
+
+            asm_path = sandbox.path / "asm.s"
+            data = asm.data.replace(".section .late_rodata", ".late_rodata")
+            asm_path.write_text(data + "\n")
+
+            object_path = sandbox.path / "object.o"
+
+            # Run assembler
+            try:
+                assemble_proc = sandbox.run_subprocess(
+                    platform.assemble_cmd,
+                    mounts=[],
+                    shell=True,
+                    env={
+                        "PRELUDE": sandbox.rewrite_path(asm_prelude_path),
+                        "INPUT": sandbox.rewrite_path(asm_path),
+                        "OUTPUT": sandbox.rewrite_path(object_path),
+                        "COMPILER_BASE_PATH": sandbox.rewrite_path(
+                            self.config.compiler_base_path
+                        ),
+                    },
+                    timeout=self.config.assembly_timeout_seconds,
+                )
+            except subprocess.CalledProcessError as e:
+                raise AssemblyError.from_process_error(e)
+            except subprocess.TimeoutExpired:
+                raise AssemblyError("Timeout expired")
+
+            # Assembly failed
+            if assemble_proc.returncode != 0:
+                raise AssemblyError(
+                    f"Assembler failed with error code {assemble_proc.returncode}"
+                )
+
+            if not object_path.exists():
+                raise AssemblyError("Assembler did not create an object file")
+
+            return AssemblyResult(
+                hash=asm.hash,
+                arch=platform.arch,
+                elf_object=object_path.read_bytes(),
+            )

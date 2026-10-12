@@ -1,0 +1,341 @@
+package state
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+
+	"github.com/datadog/stratus-red-team/v2/pkg/stratus/log"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/datadog/stratus-red-team/v2/pkg/stratus"
+	"github.com/datadog/stratus-red-team/v2/pkg/stratus/config"
+)
+
+// S3BackendConfig holds the configuration for storing state in an S3 bucket.
+type S3BackendConfig struct {
+	BucketName string
+	Region     string
+	AWSConfig  aws.Config
+	// KeyPrefix is prepended to all S3 object keys. Defaults to
+	// "stratus/" if empty.
+	KeyPrefix string
+}
+
+// S3StateManager stores technique state (lifecycle, outputs, variables) in S3 while keeping
+// Terraform source files on the local filesystem. It also injects a backend.tf that points
+// Terraform's own state at the same bucket.
+type S3StateManager struct {
+	config                S3BackendConfig
+	s3Client              *s3.Client
+	technique             *stratus.AttackTechnique
+	rootDirectory         string
+	fileSystem            FileSystem
+	executionSubdirectory string
+	readOnly              bool
+}
+
+func NewS3StateManager(technique *stratus.AttackTechnique, cfg S3BackendConfig, opts ...ManagerOption) *S3StateManager {
+	if cfg.KeyPrefix == "" {
+		cfg.KeyPrefix = "stratus/"
+	}
+
+	homeDirectory, _ := os.UserHomeDir()
+	settings := buildManagerSettings(opts)
+	sm := &S3StateManager{
+		config:                cfg,
+		s3Client:              s3.NewFromConfig(cfg.AWSConfig),
+		technique:             technique,
+		rootDirectory:         filepath.Join(homeDirectory, config.StratusBaseDirectoryName),
+		fileSystem:            &LocalFileSystem{},
+		executionSubdirectory: settings.executionSubdirectory,
+		readOnly:              settings.readOnly,
+	}
+	sm.Initialize()
+	return sm
+}
+
+func (m *S3StateManager) Initialize() {
+	if m.readOnly {
+		return
+	}
+
+	if !m.fileSystem.FileExists(m.rootDirectory) {
+		log.Println("Creating " + m.rootDirectory + " as it doesn't exist yet")
+		err := m.fileSystem.CreateDirectory(m.rootDirectory, 0744)
+		if err != nil {
+			panic("Unable to create persistent directory: " + err.Error())
+		}
+	}
+
+	m.migrateFlatState()
+}
+
+// ensureWorkingDirectory creates this execution's local Terraform working directory.
+func (m *S3StateManager) ensureWorkingDirectory() {
+	if m.fileSystem.FileExists(m.workingDirectory()) {
+		return
+	}
+	if err := m.fileSystem.CreateDirectory(m.workingDirectory(), 0744); err != nil {
+		panic("Unable to create persistent directory: " + err.Error())
+	}
+}
+
+// migrateFlatState adopts the S3 objects left in the flat layout by a Stratus version that did
+// not isolate executions. See FileSystemStateManager.migrateFlatState for the rationale.
+//
+// Only the objects are migrated: the local directory holds Terraform's working files, which have
+// to be regenerated anyway because backend.tf now points at a different key.
+func (m *S3StateManager) migrateFlatState() {
+	if m.executionSubdirectory == "" {
+		return
+	}
+	flatPrefix := m.config.KeyPrefix + m.technique.ID + "/"
+
+	// Read the flat variables first: it is the cheapest way to rule out a migration, which is
+	// the common case, and it keeps the no-migration path down to a single request.
+	flatVariables, err := m.getJSONMap(flatPrefix + terraformVariablesArtifact.S3Key)
+	if err != nil || !flatStateBelongsToExecution(m.executionSubdirectory, flatVariables) {
+		return
+	}
+	// The state object is copied last, so its presence means a previous attempt completed.
+	if m.objectExists(m.s3Key(techniqueStateArtifact.S3Key)) {
+		return
+	}
+
+	log.Infof("Migrating the existing state of %s to s3://%s/%s", m.technique.ID, m.config.BucketName, m.s3KeyPrefix())
+	for _, artifact := range stateArtifacts {
+		if artifact == techniqueStateArtifact {
+			continue
+		}
+		if err := m.copyObject(flatPrefix+artifact.S3Key, m.s3Key(artifact.S3Key)); err != nil {
+			log.Warnf("unable to migrate the previous state of %s: %v", m.technique.ID, err)
+			return
+		}
+	}
+	// Copying this last makes the migration resumable: until it lands, the flat state stays
+	// authoritative and the next run retries.
+	if err := m.copyObject(flatPrefix+techniqueStateArtifact.S3Key, m.s3Key(techniqueStateArtifact.S3Key)); err != nil {
+		log.Warnf("unable to migrate the previous state of %s: %v", m.technique.ID, err)
+		return
+	}
+
+	for _, artifact := range stateArtifacts {
+		key := flatPrefix + artifact.S3Key
+		if _, err := m.s3Client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+			Bucket: &m.config.BucketName,
+			Key:    aws.String(key),
+		}); err != nil {
+			log.Warnf("failed to delete the migrated s3://%s/%s: %v", m.config.BucketName, key, err)
+		}
+	}
+}
+
+// objectExists reports whether an object is present.
+func (m *S3StateManager) objectExists(key string) bool {
+	_, err := m.s3Client.HeadObject(context.Background(), &s3.HeadObjectInput{
+		Bucket: &m.config.BucketName,
+		Key:    aws.String(key),
+	})
+	// Only a definite 404 means absent: a throttled or denied request must not read as "not
+	// migrated yet" and copy stale state over state this execution has already advanced.
+	return err == nil || !isNotFound(err)
+}
+
+// isNotFound distinguishes a missing object from every other request failure. GetObject reports
+// NoSuchKey, HeadObject only a bare NotFound.
+func isNotFound(err error) bool {
+	var noSuchKey *types.NoSuchKey
+	var notFound *types.NotFound
+	return errors.As(err, &noSuchKey) || errors.As(err, &notFound)
+}
+
+// copyObject copies one object. An empty source is a no-op.
+func (m *S3StateManager) copyObject(sourceKey string, destinationKey string) error {
+	data, err := m.s3Get(sourceKey)
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	return m.s3Put(destinationKey, data)
+}
+
+func (m *S3StateManager) GetRootDirectory() string {
+	return m.rootDirectory
+}
+
+func (m *S3StateManager) GetWorkingDirectory() string {
+	return m.workingDirectory()
+}
+
+func (m *S3StateManager) ExtractTechnique() error {
+	m.ensureWorkingDirectory()
+	dir := m.workingDirectory()
+
+	// Write the shared scaffolding common to every backend.
+	if err := writeSharedTerraformFiles(m.fileSystem, dir, m.technique); err != nil {
+		return err
+	}
+
+	// Write backend.tf pointing Terraform state at the S3 bucket. Credentials are NOT written here,
+	// they are passed via -backend-config flags during terraform init.
+	backendTf := fmt.Sprintf(`terraform {
+  backend "s3" {
+    bucket = %q
+    key    = %q
+    region = %q
+  }
+}
+`, m.config.BucketName, m.s3Key(terraformStateArtifact.S3Key), m.config.Region)
+
+	backendFile := filepath.Join(dir, "backend.tf")
+	if err := m.fileSystem.WriteFile(backendFile, []byte(backendTf), 0644); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (m *S3StateManager) CleanupTechnique() error {
+	// Delete this execution's S3 objects.
+	for _, artifact := range stateArtifacts {
+		key := m.s3Key(artifact.S3Key)
+		_, err := m.s3Client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+			Bucket: &m.config.BucketName,
+			Key:    aws.String(key),
+		})
+		if err != nil {
+			log.Warnf("failed to delete s3://%s/%s: %v", m.config.BucketName, key, err)
+		}
+	}
+
+	// Remove the local working directory
+	return removeWorkingDirectory(m.fileSystem, m.techniqueDirectory(), m.executionSubdirectory)
+}
+
+func (m *S3StateManager) GetTechniqueState() stratus.AttackTechniqueState {
+	data, err := m.s3Get(m.s3Key(techniqueStateArtifact.S3Key))
+	if err != nil {
+		return ""
+	}
+	return stratus.AttackTechniqueState(data)
+}
+
+func (m *S3StateManager) SetTechniqueState(state stratus.AttackTechniqueState) error {
+	return m.s3Put(m.s3Key(techniqueStateArtifact.S3Key), []byte(state))
+}
+
+func (m *S3StateManager) GetTerraformOutputs() (map[string]string, error) {
+	return m.getJSONMap(m.s3Key(terraformOutputsArtifact.S3Key))
+}
+
+func (m *S3StateManager) WriteTerraformOutputs(outputs map[string]string) error {
+	return m.putJSONMap(m.s3Key(terraformOutputsArtifact.S3Key), outputs)
+}
+
+func (m *S3StateManager) GetTerraformVariables() (map[string]string, error) {
+	return m.getJSONMap(m.s3Key(terraformVariablesArtifact.S3Key))
+}
+
+func (m *S3StateManager) WriteTerraformVariables(variables map[string]string) error {
+	return m.putJSONMap(m.s3Key(terraformVariablesArtifact.S3Key), variables)
+}
+
+// BackendConfigs returns the -backend-config key=value pairs that the
+// TerraformManager should pass during terraform init, containing the
+// bucket credentials.
+func (m *S3StateManager) BackendConfigs() map[string]string {
+	creds, err := m.config.AWSConfig.Credentials.Retrieve(context.Background())
+	if err != nil {
+		log.Warnf("unable to retrieve S3 backend credentials: %v", err)
+		return nil
+	}
+
+	configs := map[string]string{
+		"access_key": creds.AccessKeyID,
+		"secret_key": creds.SecretAccessKey,
+	}
+	if creds.SessionToken != "" {
+		configs["token"] = creds.SessionToken
+	}
+	return configs
+}
+
+// s3Key builds the full S3 object key for a technique artifact.
+// Mirrors the local filesystem layout: {prefix}{technique-id}[/{execution}]/{artifact}
+func (m *S3StateManager) s3Key(artifact string) string {
+	return m.s3KeyPrefix() + artifact
+}
+
+// s3KeyPrefix is the key prefix holding this execution's artifacts, trailing slash included.
+func (m *S3StateManager) s3KeyPrefix() string {
+	prefix := m.config.KeyPrefix + m.technique.ID + "/"
+	if m.executionSubdirectory != "" {
+		prefix += m.executionSubdirectory + "/"
+	}
+	return prefix
+}
+
+// techniqueDirectory is the local directory shared by every execution of the technique.
+func (m *S3StateManager) techniqueDirectory() string {
+	return filepath.Join(m.rootDirectory, m.technique.ID)
+}
+
+func (m *S3StateManager) workingDirectory() string {
+	return filepath.Join(m.techniqueDirectory(), m.executionSubdirectory)
+}
+
+func (m *S3StateManager) s3Get(key string) ([]byte, error) {
+	result, err := m.s3Client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: &m.config.BucketName,
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer result.Body.Close()
+	return io.ReadAll(result.Body)
+}
+
+func (m *S3StateManager) s3Put(key string, data []byte) error {
+	_, err := m.s3Client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: &m.config.BucketName,
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(data),
+	})
+	return err
+}
+
+func (m *S3StateManager) getJSONMap(key string) (map[string]string, error) {
+	data, err := m.s3Get(key)
+	if err != nil && !isNotFound(err) {
+		return nil, err
+	}
+	if err != nil {
+		// Object doesn't exist yet — return empty map (same behavior
+		// as FileSystemStateManager when file doesn't exist)
+		return make(map[string]string), nil
+	}
+	result := make(map[string]string)
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (m *S3StateManager) putJSONMap(key string, data map[string]string) error {
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	return m.s3Put(key, encoded)
+}

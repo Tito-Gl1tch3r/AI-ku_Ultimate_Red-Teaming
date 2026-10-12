@@ -1,0 +1,739 @@
+import { v4 as uuidv4 } from "uuid";
+import { ipcMain, session as electronSession } from "electron";
+import type { WebContents, Session as ElectronSession } from "electron";
+import type { Session, ProxyConfig, RawInteractionData } from "@shared/types";
+import type { SessionsRepo } from "../db/repositories";
+import type { TabManager } from "../tab-manager";
+import { CdpManager } from "../cdp/cdp-manager";
+import { CaptureEngine } from "../capture/capture-engine";
+import { JsInjector } from "../capture/js-injector";
+import { StorageCollector } from "../capture/storage-collector";
+import { InteractionRecorder } from "../capture/interaction-recorder";
+import type { InteractionEventsRepo } from "../db/repositories";
+import type { ProfileStore } from '../fingerprint/profile-store';
+import { buildStealthScript } from '../../preload/stealth-script';
+import { applyHttpSpoofing, removeHttpSpoofing } from '../fingerprint/http-spoofing';
+
+/** Per-tab capture bundle: CDP + JS hooks + storage + stealth cleanup */
+interface TabCaptureBundle {
+  cdp: CdpManager;
+  injector: JsInjector;
+  storage: StorageCollector;
+  stealthCleanup?: () => void;
+}
+
+/**
+ * SessionManager — Manages the lifecycle of capture sessions.
+ * Coordinates per-tab CDP, JS injection, storage collection, and capture engine.
+ * Also provides standalone stealth (fingerprint) mode independent of capture.
+ */
+export class SessionManager {
+  private currentSessionId: string | null = null;
+  private tabManager: TabManager | null = null;
+  private tabCaptures = new Map<string, TabCaptureBundle>();
+
+  /** Cached Electron partition sessions keyed by app session ID */
+  private electronSessions = new Map<string, ElectronSession>();
+  /** The app session ID currently driving the browser partition */
+  private activePartitionSessionId: string | null = null;
+
+  /** Global hook IPC handler (registered once per session) */
+  private hookIpcHandler:
+    | ((event: Electron.IpcMainEvent, data: unknown) => void)
+    | null = null;
+  /** Interaction recording IPC handler */
+  private interactionIpcHandler:
+    | ((event: Electron.IpcMainEvent, data: unknown) => void)
+    | null = null;
+  /** Per-session interaction recorder instance */
+  private interactionRecorder: InteractionRecorder | null = null;
+  /** TabManager event listeners */
+  private tabCreatedHandler:
+    | ((tabInfo: { id: string; url: string; title: string }) => void)
+    | null = null;
+  private tabClosedHandler: ((data: { tabId: string }) => void) | null = null;
+
+  /** Standalone stealth mode — event-based fingerprint injection (no CDP) */
+  private stealthSessionId: string | null = null;
+  private stealthTabManager: TabManager | null = null;
+  private stealthCleanups = new Map<string, () => void>();
+  private stealthTabCreatedHandler:
+    | ((tabInfo: { id: string; url: string; title: string }) => void)
+    | null = null;
+  private stealthTabClosedHandler: ((data: { tabId: string }) => void) | null = null;
+
+  constructor(
+    private sessionsRepo: SessionsRepo,
+    private captureEngine: CaptureEngine,
+    private profileStore?: ProfileStore,
+    private interactionEventsRepo?: InteractionEventsRepo,
+  ) {}
+
+  // =============================================
+  // Partition Session Management
+  // =============================================
+
+  /** Get or create an isolated Electron session for the given app session. */
+  private getElectronSession(sessionId: string): ElectronSession {
+    if (!this.electronSessions.has(sessionId)) {
+      this.electronSessions.set(
+        sessionId,
+        electronSession.fromPartition(`persist:session-${sessionId}`),
+      );
+    }
+    return this.electronSessions.get(sessionId)!;
+  }
+
+  /** Return the Electron session for the currently active app session (capture or stealth). */
+  getActiveElectronSession(): ElectronSession | null {
+    const activeId = this.currentSessionId ?? this.stealthSessionId;
+    if (!activeId) return null;
+    return this.getElectronSession(activeId);
+  }
+
+  /** Apply proxy config to an Electron session. */
+  private async applyProxyToSession(
+    elSession: ElectronSession,
+    config: ProxyConfig | null,
+  ): Promise<void> {
+    if (!config || config.type === "none") {
+      await elSession.setProxy({ mode: "direct" });
+      return;
+    }
+
+    // Chromium proxyRules do NOT support inline credentials (user:pass@host)
+    // — that causes ERR_NO_SUPPORTED_PROXIES. Use plain host:port instead.
+    // Proxy auth is handled via app.on('login') in index.ts.
+    await elSession.setProxy({
+      proxyRules: `${config.type}://${config.host}:${config.port}`,
+    });
+  }
+
+  /**
+   * Switch the browser environment to a specific session's partition.
+   * Uses TabManager's session group to hide/restore tabs instead of destroying them.
+   */
+  private async switchBrowserToSession(
+    sessionId: string,
+    tabManager: TabManager,
+    proxyConfig?: ProxyConfig | null,
+  ): Promise<boolean> {
+    if (this.activePartitionSessionId === sessionId) return false;
+
+    const elSession = this.getElectronSession(sessionId);
+
+    // Apply upstream proxy to the new partition (before tabs open)
+    if (proxyConfig !== undefined) {
+      await this.applyProxyToSession(elSession, proxyConfig ?? null);
+    }
+
+    const createdNew = tabManager.switchSessionGroup(sessionId, elSession);
+    this.activePartitionSessionId = sessionId;
+    return createdNew;
+  }
+
+  /**
+   * Create a new session record.
+   */
+  createSession(name: string, targetUrl: string): Session {
+    const session: Session = {
+      id: uuidv4(),
+      name,
+      target_url: targetUrl,
+      status: "stopped",
+      created_at: Date.now(),
+      stopped_at: null,
+    };
+    this.sessionsRepo.insert(session);
+    // Auto-generate fingerprint profile for the new session
+    if (this.profileStore) {
+      this.profileStore.getOrCreate(session.id);
+    }
+    return session;
+  }
+
+  /**
+   * Start capturing on a session. Attaches capture pipelines to all existing tabs
+   * and auto-attaches to new tabs created during the session.
+   */
+  async startCapture(
+    sessionId: string,
+    tabManager: TabManager,
+    rendererWebContents: WebContents,
+    proxyConfig?: ProxyConfig | null,
+  ): Promise<void> {
+    const session = this.sessionsRepo.findById(sessionId);
+    if (!session) throw new Error(`Session ${sessionId} not found`);
+
+    // Stop any running capture first
+    if (this.currentSessionId) {
+      await this.stopCapture(this.currentSessionId);
+    }
+
+    // Suspend standalone stealth listeners — full capture pipeline includes stealth injection
+    if (this.stealthSessionId) {
+      this.suspendStealthListeners();
+    }
+
+    // Switch browser to this session's isolated partition
+    await this.switchBrowserToSession(sessionId, tabManager, proxyConfig);
+
+    this.currentSessionId = sessionId;
+    this.tabManager = tabManager;
+
+    // Publish the state transition before any optional capture setup. The renderer
+    // must never wait for a CDP debugger attach before enabling Pause/Stop.
+    this.sessionsRepo.updateStatus(sessionId, "running");
+
+    // Start capture engine
+    this.captureEngine.start(sessionId, rendererWebContents);
+
+    // Apply fingerprint HTTP spoofing to the session's partition
+    if (this.profileStore) {
+      const profile = this.profileStore.getOrCreate(sessionId);
+      applyHttpSpoofing(this.getElectronSession(sessionId), profile);
+    }
+
+    // Register global hook IPC listener (once for all tabs)
+    this.hookIpcHandler = (_event, data) => {
+      const hookData = data as {
+        type: string;
+        hookType: string;
+        functionName: string;
+        arguments: string;
+        result: string | null;
+        callStack: string | null;
+        timestamp: number;
+      };
+      if (hookData.type === "ar-hook") {
+        this.captureEngine.handleHookCaptured({
+          hookType: hookData.hookType,
+          functionName: hookData.functionName,
+          arguments: hookData.arguments,
+          result: hookData.result,
+          callStack: hookData.callStack,
+          timestamp: hookData.timestamp,
+        });
+      }
+    };
+    ipcMain.on("capture:hook-data", this.hookIpcHandler);
+
+    // Register interaction recording IPC handler
+    if (this.interactionEventsRepo) {
+      this.interactionRecorder = new InteractionRecorder(this.interactionEventsRepo);
+      this.interactionIpcHandler = (_event, data) => {
+        const msg = data as { type: string } & Record<string, unknown>;
+        if (msg.type === 'ar-interaction') {
+          this.interactionRecorder?.handleInteraction({
+            type: msg.interactionType as RawInteractionData['type'],
+            timestamp: msg.timestamp as number,
+            x: msg.x as number | undefined,
+            y: msg.y as number | undefined,
+            viewportX: msg.viewportX as number | undefined,
+            viewportY: msg.viewportY as number | undefined,
+            selector: msg.selector as string | undefined,
+            xpath: msg.xpath as string | undefined,
+            tagName: msg.tagName as string | undefined,
+            elementText: msg.elementText as string | undefined,
+            attributes: msg.attributes as Record<string, string> | undefined,
+            boundingRect: msg.boundingRect as RawInteractionData['boundingRect'],
+            inputValue: msg.inputValue as string | undefined,
+            key: msg.key as string | undefined,
+            scrollX: msg.scrollX as number | undefined,
+            scrollY: msg.scrollY as number | undefined,
+            scrollDX: msg.scrollDX as number | undefined,
+            scrollDY: msg.scrollDY as number | undefined,
+            url: msg.url as string,
+            pageTitle: msg.pageTitle as string | undefined,
+            path: msg.path as RawInteractionData['path'],
+          });
+        }
+      };
+      ipcMain.on("capture:hook-data", this.interactionIpcHandler);
+    }
+
+    // Start interaction recorder (before tab attachment so injectIntoWebContents works)
+    if (this.interactionRecorder) {
+      this.interactionRecorder.start(sessionId, rendererWebContents);
+    }
+
+    // Mark the session running BEFORE optional CDP/injection setup.  On Windows
+    // debugger attachment can take a long time (or be held by another debugger);
+    // keeping this update at the end made the renderer look like Start did
+    // nothing and left Pause/Stop disabled indefinitely.
+    this.sessionsRepo.updateStatus(sessionId, "running");
+
+    // Attach capture pipelines in the background.  A failing or slow tab must
+    // not block the capture state machine or make the control buttons inert;
+    // proxy capture remains available while a browser tab retries/gets skipped.
+    for (const tab of tabManager.getAllTabs()) {
+      if (!tab.view.webContents.isDestroyed()) {
+        void this.attachCaptureToTab(tab.id, tab.view.webContents).catch((err) => {
+          console.warn(`[SessionManager] Capture attach failed for tab ${tab.id}:`, (err as Error).message);
+        });
+      }
+    }
+
+    // Auto-attach to new tabs
+    this.tabCreatedHandler = async (tabInfo) => {
+      const tab = tabManager.getAllTabs().find((t) => t.id === tabInfo.id);
+      if (tab && !tab.view.webContents.isDestroyed()) {
+        await this.attachCaptureToTab(tab.id, tab.view.webContents);
+      }
+    };
+    this.tabClosedHandler = (data) => {
+      this.detachCaptureFromTab(data.tabId);
+    };
+    tabManager.on("tab-created", this.tabCreatedHandler);
+    tabManager.on("tab-closed", this.tabClosedHandler);
+
+    // Update session status
+    this.sessionsRepo.updateStatus(sessionId, "running");
+  }
+
+  /**
+   * Attach CDP, JS injector, and storage collector to a single tab.
+   * If CDP attachment fails (e.g. blank page, debugger conflict), the tab is
+   * silently skipped — proxy-based capture still works without CDP.
+   */
+  private async attachCaptureToTab(
+    tabId: string,
+    webContents: WebContents,
+  ): Promise<void> {
+    if (this.tabCaptures.has(tabId)) return;
+    if (webContents.isDestroyed()) return;
+
+    // Interaction recording does not require CDP. Attach it first so element
+    // actions remain available even when debugger attachment is unavailable.
+    if (this.interactionRecorder) {
+      await this.interactionRecorder.injectIntoWebContents(webContents);
+    }
+
+    const cdp = new CdpManager();
+    const injector = new JsInjector();
+    const storage = new StorageCollector();
+
+    // Start CDP manager — non-fatal if it fails
+    try {
+      await cdp.start(webContents);
+    } catch (err) {
+      console.warn(`[SessionManager] CDP attach failed for tab ${tabId}, skipping browser capture:`, (err as Error).message);
+      cdp.detach();
+      return;
+    }
+
+    cdp.on("response-captured", (data) => {
+      this.captureEngine.handleResponseCaptured(data);
+    });
+    cdp.on("frame-navigated", () => {
+      storage.triggerCollection();
+    });
+
+    // Start JS injector (injection only, no IPC listener)
+    injector.start(webContents);
+
+    // Inject stealth script via CDP — runs BEFORE any page JS (critical for WAF challenges)
+    let stealthCleanup: (() => void) | undefined;
+    if (this.profileStore) {
+      const profile = this.profileStore.getOrCreate(this.currentSessionId!);
+      const stealthJs = buildStealthScript(JSON.stringify(profile));
+
+      // Use Page.addScriptToEvaluateOnNewDocument for early injection
+      // This ensures stealth runs before any page JavaScript, including WAF challenge scripts
+      try {
+        await cdp.sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: stealthJs });
+      } catch (err) {
+        console.warn('[SessionManager] Failed to register stealth via CDP:', (err as Error).message);
+      }
+
+      // Also inject into current page immediately (for pages already loaded)
+      if (!webContents.isDestroyed()) {
+        webContents.executeJavaScript(stealthJs, true).catch(() => { /* page not ready */ });
+      }
+
+      stealthCleanup = () => {
+        // CDP scripts are automatically removed when debugger detaches — no manual cleanup needed
+      };
+    }
+
+    // Start storage collector
+    storage.start(this.currentSessionId!, webContents);
+    storage.on("storage-collected", (data) => {
+      this.captureEngine.handleStorageCollected(data);
+    });
+
+    this.tabCaptures.set(tabId, { cdp, injector, storage, stealthCleanup });
+  }
+
+  /**
+   * Detach and clean up capture pipeline for a tab.
+   */
+  private detachCaptureFromTab(tabId: string): void {
+    const bundle = this.tabCaptures.get(tabId);
+    if (!bundle) return;
+
+    // Stop storage FIRST — its stop() does a final collectAll() that needs the debugger alive
+    bundle.storage.stop();
+    bundle.injector.stop();
+    bundle.stealthCleanup?.();
+    bundle.cdp.stop();
+    bundle.cdp.detach();
+    this.tabCaptures.delete(tabId);
+  }
+
+  /**
+   * Pause capturing — stops interception on all tabs but keeps session open.
+   */
+  async pauseCapture(sessionId: string): Promise<void> {
+    if (this.currentSessionId !== sessionId) return;
+
+    for (const bundle of this.tabCaptures.values()) {
+      bundle.storage.stop();
+      bundle.injector.stop();
+      await bundle.cdp.stop();
+    }
+
+    // Pause interaction recorder
+    this.interactionRecorder?.pause();
+
+    this.sessionsRepo.updateStatus(sessionId, "paused");
+  }
+
+  /**
+   * Resume capturing after a pause — re-attaches capture pipelines to all tabs.
+   */
+  async resumeCapture(sessionId: string): Promise<void> {
+    if (this.currentSessionId !== sessionId) return;
+    const session = this.sessionsRepo.findById(sessionId);
+    if (!session || session.status !== "paused") return;
+
+    // Detach stale bundles then re-attach fresh ones
+    for (const tabId of Array.from(this.tabCaptures.keys())) {
+      this.detachCaptureFromTab(tabId);
+    }
+
+    if (this.tabManager) {
+      for (const tab of this.tabManager.getAllTabs()) {
+        if (!tab.view.webContents.isDestroyed()) {
+          await this.attachCaptureToTab(tab.id, tab.view.webContents);
+        }
+      }
+    }
+
+    // Resume interaction recorder
+    this.interactionRecorder?.resume();
+
+    this.sessionsRepo.updateStatus(sessionId, "running");
+  }
+
+  /**
+   * Stop capturing and finalize the session.
+   */
+  async stopCapture(sessionId: string): Promise<void> {
+    if (this.currentSessionId !== sessionId) return;
+
+    // Detach all tab capture pipelines
+    for (const tabId of Array.from(this.tabCaptures.keys())) {
+      this.detachCaptureFromTab(tabId);
+    }
+
+    // Remove TabManager event listeners
+    if (this.tabManager) {
+      if (this.tabCreatedHandler)
+        this.tabManager.removeListener("tab-created", this.tabCreatedHandler);
+      if (this.tabClosedHandler)
+        this.tabManager.removeListener("tab-closed", this.tabClosedHandler);
+    }
+    this.tabCreatedHandler = null;
+    this.tabClosedHandler = null;
+    this.tabManager = null;
+
+    // Remove global hook IPC listener
+    if (this.hookIpcHandler) {
+      ipcMain.removeListener("capture:hook-data", this.hookIpcHandler);
+      this.hookIpcHandler = null;
+    }
+
+    // Stop interaction recorder
+    if (this.interactionIpcHandler) {
+      ipcMain.removeListener("capture:hook-data", this.interactionIpcHandler);
+      this.interactionIpcHandler = null;
+    }
+    if (this.interactionRecorder) {
+      this.interactionRecorder.stop();
+      this.interactionRecorder = null;
+    }
+
+    this.captureEngine.stop();
+    // Remove HTTP spoofing from the session's partition
+    removeHttpSpoofing(this.getElectronSession(sessionId));
+    this.sessionsRepo.updateStatus(sessionId, "stopped", Date.now());
+    this.currentSessionId = null;
+
+    // Restore standalone stealth if it was active before capture started
+    if (this.stealthSessionId && this.stealthTabManager) {
+      const profile = this.profileStore?.getOrCreate(this.stealthSessionId);
+      if (profile) {
+        applyHttpSpoofing(this.getElectronSession(this.stealthSessionId), profile);
+      }
+      this.restoreStealthListeners();
+    }
+  }
+
+  // =============================================
+  // Standalone Stealth (Fingerprint-Only) Mode
+  // Uses webContents events + executeJavaScript (no CDP debugger).
+  // CDP is only used during capture mode for early injection.
+  // =============================================
+
+  /**
+   * Enable standalone stealth mode — applies fingerprint injection to all tabs
+   * WITHOUT starting capture. Uses webContents events (no CDP debugger attachment).
+   */
+  async enableStealth(
+    sessionId: string,
+    tabManager: TabManager,
+    proxyConfig?: ProxyConfig | null,
+  ): Promise<void> {
+    if (!this.profileStore) return;
+
+    // If capture is running, stealth is already handled by the capture pipeline
+    if (this.currentSessionId) return;
+
+    // Disable previous stealth if switching sessions
+    if (this.stealthSessionId && this.stealthSessionId !== sessionId) {
+      await this.disableStealth();
+    }
+
+    // Avoid re-enabling for the same session
+    if (this.stealthSessionId === sessionId) return;
+
+    this.stealthSessionId = sessionId;
+    this.stealthTabManager = tabManager;
+
+    // Switch browser to this session's isolated partition (hides old tabs, restores/creates new)
+    const createdNew = await this.switchBrowserToSession(sessionId, tabManager, proxyConfig);
+
+    // If this is the session's first visit (blank tab created), navigate to target URL
+    if (createdNew) {
+      const session = this.sessionsRepo.findById(sessionId);
+      if (session?.target_url) {
+        const wc = tabManager.getActiveWebContents();
+        if (wc && !wc.isDestroyed()) {
+          wc.loadURL(session.target_url).catch(() => {});
+        }
+      }
+    }
+
+    // Apply HTTP-level spoofing to the session's partition
+    const elSession = this.getElectronSession(sessionId);
+    const profile = this.profileStore.getOrCreate(sessionId);
+    applyHttpSpoofing(elSession, profile);
+
+    // Attach stealth to all existing tabs
+    for (const tab of tabManager.getAllTabs()) {
+      if (!tab.view.webContents.isDestroyed()) {
+        this.attachStealthListeners(tab.id, tab.view.webContents);
+      }
+    }
+
+    // Auto-attach/detach for new/closed tabs
+    this.stealthTabCreatedHandler = (tabInfo) => {
+      const tab = tabManager.getAllTabs().find((t) => t.id === tabInfo.id);
+      if (tab && !tab.view.webContents.isDestroyed()) {
+        this.attachStealthListeners(tab.id, tab.view.webContents);
+      }
+    };
+    this.stealthTabClosedHandler = (data) => {
+      this.detachStealthListeners(data.tabId);
+    };
+    tabManager.on("tab-created", this.stealthTabCreatedHandler);
+    tabManager.on("tab-closed", this.stealthTabClosedHandler);
+  }
+
+  /**
+   * Disable standalone stealth mode — removes fingerprint injection from all tabs.
+   */
+  async disableStealth(): Promise<void> {
+    // Detach all stealth listeners
+    for (const tabId of Array.from(this.stealthCleanups.keys())) {
+      this.detachStealthListeners(tabId);
+    }
+
+    // Remove tab event listeners
+    if (this.stealthTabManager) {
+      if (this.stealthTabCreatedHandler)
+        this.stealthTabManager.removeListener("tab-created", this.stealthTabCreatedHandler);
+      if (this.stealthTabClosedHandler)
+        this.stealthTabManager.removeListener("tab-closed", this.stealthTabClosedHandler);
+    }
+    this.stealthTabCreatedHandler = null;
+    this.stealthTabClosedHandler = null;
+    this.stealthTabManager = null;
+
+    // Remove HTTP spoofing from the session's partition
+    if (this.stealthSessionId) {
+      removeHttpSpoofing(this.getElectronSession(this.stealthSessionId));
+    }
+
+    this.stealthSessionId = null;
+  }
+
+  /**
+   * Attach stealth injection via webContents navigation events (no CDP).
+   * Injects the stealth script on every navigation.
+   */
+  private attachStealthListeners(
+    tabId: string,
+    webContents: WebContents,
+  ): void {
+    if (this.stealthCleanups.has(tabId)) return;
+    if (!this.profileStore || !this.stealthSessionId) return;
+
+    const profile = this.profileStore.getOrCreate(this.stealthSessionId);
+    const stealthJs = buildStealthScript(JSON.stringify(profile));
+
+    const onNavigate = () => {
+      if (webContents.isDestroyed()) return;
+      webContents.executeJavaScript(stealthJs, true).catch(() => { /* page not ready or destroyed */ });
+    };
+
+    webContents.on("did-navigate", onNavigate);
+    webContents.on("did-navigate-in-page", onNavigate);
+
+    // Also inject into the current page immediately
+    if (!webContents.isDestroyed()) {
+      webContents.executeJavaScript(stealthJs, true).catch(() => { /* page not ready */ });
+    }
+
+    this.stealthCleanups.set(tabId, () => {
+      webContents.removeListener("did-navigate", onNavigate);
+      webContents.removeListener("did-navigate-in-page", onNavigate);
+    });
+  }
+
+  /**
+   * Detach stealth listeners from a single tab.
+   */
+  private detachStealthListeners(tabId: string): void {
+    const cleanup = this.stealthCleanups.get(tabId);
+    if (cleanup) {
+      cleanup();
+      this.stealthCleanups.delete(tabId);
+    }
+  }
+
+  /**
+   * Temporarily suspend stealth listeners (before capture takes over).
+   */
+  private suspendStealthListeners(): void {
+    for (const tabId of Array.from(this.stealthCleanups.keys())) {
+      this.detachStealthListeners(tabId);
+    }
+    // Remove tab listeners — capture will manage its own
+    if (this.stealthTabManager) {
+      if (this.stealthTabCreatedHandler)
+        this.stealthTabManager.removeListener("tab-created", this.stealthTabCreatedHandler);
+      if (this.stealthTabClosedHandler)
+        this.stealthTabManager.removeListener("tab-closed", this.stealthTabClosedHandler);
+    }
+    this.stealthTabCreatedHandler = null;
+    this.stealthTabClosedHandler = null;
+  }
+
+  /**
+   * Restore stealth listeners after capture stops (if stealth was active).
+   */
+  private restoreStealthListeners(): void {
+    if (!this.stealthSessionId || !this.stealthTabManager) return;
+
+    const tabManager = this.stealthTabManager;
+
+    // Re-attach stealth to all tabs
+    for (const tab of tabManager.getAllTabs()) {
+      if (!tab.view.webContents.isDestroyed()) {
+        this.attachStealthListeners(tab.id, tab.view.webContents);
+      }
+    }
+
+    // Re-register tab listeners
+    this.stealthTabCreatedHandler = (tabInfo) => {
+      const tab = tabManager.getAllTabs().find((t) => t.id === tabInfo.id);
+      if (tab && !tab.view.webContents.isDestroyed()) {
+        this.attachStealthListeners(tab.id, tab.view.webContents);
+      }
+    };
+    this.stealthTabClosedHandler = (data) => {
+      this.detachStealthListeners(data.tabId);
+    };
+    tabManager.on("tab-created", this.stealthTabCreatedHandler);
+    tabManager.on("tab-closed", this.stealthTabClosedHandler);
+  }
+
+  getStealthSessionId(): string | null {
+    return this.stealthSessionId;
+  }
+
+  /**
+   * List all sessions.
+   */
+  listSessions(): Session[] {
+    return this.sessionsRepo.findAll();
+  }
+
+  /**
+   * Delete a session.
+   */
+  async deleteSession(sessionId: string, tabManager?: TabManager): Promise<void> {
+    if (this.currentSessionId === sessionId) {
+      await this.stopCapture(sessionId);
+    }
+    if (this.stealthSessionId === sessionId) {
+      await this.disableStealth();
+    }
+    // Destroy tabs belonging to this session
+    if (tabManager) {
+      tabManager.destroySessionGroup(sessionId);
+    }
+    // Clean up isolated browser data for this session's partition
+    const elSession = this.electronSessions.get(sessionId);
+    if (elSession) {
+      await elSession.clearStorageData().catch(() => {});
+      await elSession.clearCache().catch(() => {});
+      this.electronSessions.delete(sessionId);
+    }
+    if (this.activePartitionSessionId === sessionId) {
+      this.activePartitionSessionId = null;
+    }
+    this.sessionsRepo.delete(sessionId);
+  }
+
+  /**
+   * Recover from crash — mark any 'running' sessions as 'stopped'.
+   */
+  recoverFromCrash(): void {
+    const sessions = this.sessionsRepo.findAll();
+    for (const session of sessions) {
+      if (session.status === "running" || session.status === "paused") {
+        this.sessionsRepo.updateStatus(session.id, "stopped", Date.now());
+      }
+    }
+  }
+
+  getCurrentSessionId(): string | null {
+    return this.currentSessionId;
+  }
+
+  /**
+   * Send a raw CDP command to the active tab's debugger.
+   * Requires an active capture session with CDP attached.
+   */
+  async sendCdpCommand(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (!this.tabManager) throw new Error("No active capture session");
+    const activeTab = this.tabManager.getActiveTab();
+    if (!activeTab) throw new Error("No active tab");
+    const bundle = this.tabCaptures.get(activeTab.id);
+    if (!bundle) throw new Error("CDP not attached to active tab");
+    return bundle.cdp.sendCommand(method, params || {});
+  }
+}

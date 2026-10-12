@@ -1,0 +1,170 @@
+package ffffffff0x.beryenigma.App.View.Modules.Encryption.Modern.HMAC;
+
+import com.jfoenix.controls.JFXComboBox;
+import com.jfoenix.controls.JFXTextArea;
+import ffffffff0x.beryenigma.App.Beans.HistoryInfo;
+import ffffffff0x.beryenigma.App.View.Viewobj.PopupSettingDoubleColumnView;
+import ffffffff0x.beryenigma.App.View.Viewobj.PopupSettingNode;
+import ffffffff0x.beryenigma.App.View.Viewobj.ViewControllerFileMode;
+import ffffffff0x.beryenigma.Init.Init;
+import ffffffff0x.beryenigma.Init.ViewInit;
+import ffffffff0x.beryenigma.Kit.Utils.ViewNode;
+import ffffffff0x.beryenigma.Kit.Utils.ViewUtils;
+import javafx.fxml.FXML;
+import org.apache.commons.codec.binary.Base64;
+import org.apache.commons.codec.binary.Hex;
+
+import java.io.UnsupportedEncodingException;
+import java.security.InvalidKeyException;
+import java.security.NoSuchAlgorithmException;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Objects;
+import java.util.StringJoiner;
+
+@ViewNode(name = "HMAC",folderPath = "Root/Encryption/Modern/",fxmlName = "HMACView.fxml")
+public class HMACController extends ViewControllerFileMode {
+    /**
+     * JTA_dst1 :HEX result
+     * JTA_dst :base64 result
+     */
+
+    @FXML private JFXComboBox JCB_charset = new JFXComboBox();
+    @FXML private JFXComboBox<String> JCB_HMACMode;
+    @FXML private JFXTextArea JTA_HMACKey;
+
+    @Override
+    protected void initialize() {
+        super.initialize();
+        initComboBox();
+    }
+
+    @Override
+    public void ONClickConfirm() {
+        super.ONClickConfirm();
+        ViewUtils.setTextAreaTextRed(false, JTA_dst, JTA_dst1);
+        try{
+            String[] dst;
+            if(JTB_modeSelect.getText().equals(Init.getLanguage("TextMode"))){
+                try {
+                    dst = hmac(JTA_src.getText().getBytes(JCB_charset.getValue().toString()),
+                            JTA_HMACKey.getText().getBytes(JCB_charset.getValue().toString()));
+                    JTA_dst1.setText(dst[0]);
+                    JTA_dst.setText(dst[1]);
+                } catch (UnsupportedEncodingException e) {
+                    e.printStackTrace();
+                }
+            }else{
+                dst = hmac(byteFile, JTA_HMACKey.getText().getBytes(JCB_charset.getValue().toString()));
+                JTA_dst1.setText(dst[0]);
+                JTA_dst.setText(dst[1]);
+                actionLog();
+                fileEncodeEnd();
+            }
+        }catch (Exception e){
+            ViewUtils.setTextAreaTextRed(true, JTA_dst, JTA_dst1);
+            JTA_dst.setText(e.getMessage());
+            JTA_dst1.setText(e.getMessage());
+        }
+    }
+
+    private void initComboBox(){
+        ViewInit.comboBoxCharset(JCB_charset);
+        JCB_HMACMode.getItems().addAll(getInstanceNameList());
+        JCB_HMACMode.setValue("HMACMD5");
+        JCB_HMACMode.setVisibleRowCount(6);
+
+    }
+
+    private String[] hmac(byte[] data, byte[] key) throws NoSuchAlgorithmException, InvalidKeyException {
+        String[] out = new String[2];
+        out[0] = Hex.encodeHexString(Objects.requireNonNull(HMACImpl.encryptHMAC(data,
+                key, JCB_HMACMode.getValue())));
+        out[1] = Base64.encodeBase64String(Objects.requireNonNull(HMACImpl.encryptHMAC(data,
+                key, JCB_HMACMode.getValue())));
+        return out;
+    }
+    @Override
+    public void getFile(){
+        super.getFile();
+//        byteFile = FileUtils.getFilebyte(file);
+    }
+
+    @Override
+    protected void JTADSTContextMenu() {
+        super.JTADSTContextMenu();
+        ViewInit.textAreaContextMenu(JTA_dst1,JTA_src);
+    }
+
+    public List<String> getInstanceNameList() {
+        List<String> result = Arrays.asList("HMACMD2",
+                "HMACMD4",
+                "HMACMD5",
+                "HMACSM3",
+                "HMACSHA1",
+                "HMACSHA224",
+                "HMACSHA256",
+                "HMACSHA3-224",
+                "HMACSHA3-256",
+                "HMACSHA3-384",
+                "HMACSHA3-512",
+                "HMACSHA384",
+                "HMACSHA512",
+                "HMACSHA512/224",
+                "HMACSHA512/256",
+                "HMACRIPEMD128",
+                "HMACRIPEMD160",
+                "HMACRIPEMD256",
+                "HMACRIPEMD320",
+                "HMACSKEIN-1024-1024",
+                "HMACSKEIN-1024-384",
+                "HMACSKEIN-1024-512",
+                "HMACSKEIN-256-128",
+                "HMACSKEIN-256-160",
+                "HMACSKEIN-256-224",
+                "HMACSKEIN-256-256",
+                "HMACSKEIN-512-128",
+                "HMACSKEIN-512-160",
+                "HMACSKEIN-512-224",
+                "HMACSKEIN-512-256",
+                "HMACSKEIN-512-384",
+                "HMACSKEIN-512-512",
+                "HMACDSTU7564-256",
+                "HMACDSTU7564-384",
+                "HMACDSTU7564-512",
+                "HMACGOST3411",
+                "HMACGOST3411-2012-256",
+                "HMACGOST3411-2012-512",
+                "HMACKECCAK224",
+                "HMACKECCAK256",
+                "HMACKECCAK288",
+                "HMACKECCAK384",
+                "HMACKECCAK512",
+                "HMACTIGER",
+                "HMACWHIRLPOOL",
+                "OLDHMACSHA384",
+                "OLDHMACSHA512");
+        return result;
+    }
+
+    @Override
+    protected void LoadPopupSettingNode() {
+        super.LoadPopupSettingNode();
+
+        //弹出式控件框
+        PopupSettingDoubleColumnView popupSettingView = new PopupSettingDoubleColumnView(ACP_controllerAnchorPane);
+
+        //弹出式控件框中添加初始化的控件
+        popupSettingView.setSetting(new PopupSettingNode(Init.getLanguage("Charset"),JCB_charset,true));
+    }
+
+    @Override
+    protected HistoryInfo buildLogMessage() {
+        StringJoiner configMessage = new StringJoiner(" ; ");
+        configMessage.add(JCB_charset.getValue().toString());
+        configMessage.add(JCB_HMACMode.getValue());
+        configMessage.add( JTA_HMACKey.getText());
+
+        return new HistoryInfo(JTA_src.getText(), checkDstJTAText(), JLB_title.getText(), JLB_title.getText(), configMessage.toString());
+    }
+}

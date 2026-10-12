@@ -1,0 +1,234 @@
+import duckdb
+import pytest
+
+from openhound_github.lookup import GithubLookup
+from openhound_github.transforms import ensure_optional_input_tables
+
+
+def test_github_lookup_accepts_plain_schema_identifiers() -> None:
+    connection = duckdb.connect(":memory:")
+    connection.execute("CREATE SCHEMA github_test")
+    connection.execute(
+        "CREATE TABLE github_test.projected_enterprise_teams "
+        "(node_id VARCHAR, org_login VARCHAR, slug VARCHAR)"
+    )
+    connection.execute(
+        "INSERT INTO github_test.projected_enterprise_teams VALUES (?, ?, ?)",
+        ["TEAM_1", "acme", "ent:security"],
+    )
+
+    lookup = GithubLookup(connection, schema="github_test")
+
+    assert lookup.projected_enterprise_team_id("acme", "ent:security") == "TEAM_1"
+
+
+def test_github_lookup_rejects_untrusted_schema_identifiers() -> None:
+    connection = duckdb.connect(":memory:")
+
+    with pytest.raises(ValueError, match="Invalid DuckDB schema identifier"):
+        GithubLookup(connection, schema="github; DROP SCHEMA github")
+
+
+def test_canonical_scope_activation_requires_matching_target() -> None:
+    connection = duckdb.connect(":memory:")
+    connection.execute("CREATE SCHEMA github_test")
+    connection.execute(
+        "CREATE TABLE github_test.organization_secrets "
+        "(org_login VARCHAR, visibility VARCHAR)"
+    )
+    connection.execute(
+        "CREATE TABLE github_test.organization_variables "
+        "(org_login VARCHAR, visibility VARCHAR)"
+    )
+    connection.execute(
+        "CREATE TABLE github_test.org_runner_group_access "
+        "(org_login VARCHAR, runner_group_visibility VARCHAR, "
+        "allows_public_repositories BOOLEAN)"
+    )
+    connection.execute(
+        "INSERT INTO github_test.organization_secrets VALUES ('acme', 'all')"
+    )
+    connection.execute(
+        "INSERT INTO github_test.organization_variables VALUES ('acme', 'private')"
+    )
+    connection.execute(
+        "INSERT INTO github_test.org_runner_group_access VALUES "
+        "('acme', 'all', false)"
+    )
+    lookup = GithubLookup(connection, schema="github_test")
+
+    assert lookup.canonical_scope_has_targets("acme", "organization_secret", "all")
+    assert lookup.canonical_scope_target_count(
+        "acme", "organization_secret", "all"
+    ) == 1
+    assert not lookup.canonical_scope_has_targets(
+        "acme", "organization_secret", "private_or_internal"
+    )
+    assert lookup.canonical_scope_has_targets(
+        "acme", "organization_variable", "private_or_internal"
+    )
+    assert not lookup.canonical_scope_has_targets("acme", "runner_group", "all")
+    assert lookup.canonical_scope_has_targets(
+        "acme", "runner_group", "private_or_internal"
+    )
+
+
+def test_external_group_for_team_is_scoped_to_org_login() -> None:
+    connection = duckdb.connect(":memory:")
+    connection.execute("CREATE SCHEMA github_test")
+    connection.execute(
+        "CREATE TABLE github_test.team_external_groups "
+        "(org_login VARCHAR, team_database_id BIGINT, "
+        "external_group_id BIGINT, external_group_name VARCHAR)"
+    )
+    connection.execute(
+        "INSERT INTO github_test.team_external_groups VALUES "
+        "('acme', 7, 100, 'Acme Engineering'), "
+        "('other', 7, 200, 'Other Engineering')"
+    )
+
+    lookup = GithubLookup(connection, schema="github_test")
+
+    assert lookup.external_group_for_team("acme", 7) == (100, "Acme Engineering")
+    assert lookup.external_group_for_team("other", 7) == (200, "Other Engineering")
+
+
+def test_scim_group_id_for_team_external_group_is_scoped_to_enterprise_org() -> None:
+    connection = duckdb.connect(":memory:")
+    connection.execute("CREATE SCHEMA github_test")
+    connection.execute(
+        "CREATE TABLE github_test.enterprise_organizations "
+        "(login VARCHAR, enterprise_node_id VARCHAR)"
+    )
+    connection.execute(
+        "CREATE TABLE github_test.enterprise_scim_groups "
+        "(id VARCHAR, display_name VARCHAR, enterprise_node_id VARCHAR)"
+    )
+    connection.execute(
+        "INSERT INTO github_test.enterprise_organizations VALUES "
+        "('acme', 'ENT_1'), ('other', 'ENT_2')"
+    )
+    connection.execute(
+        "INSERT INTO github_test.enterprise_scim_groups VALUES "
+        "('SCIM_1', 'Engineering', 'ENT_1'), "
+        "('SCIM_2', 'Engineering', 'ENT_2')"
+    )
+
+    lookup = GithubLookup(connection, schema="github_test")
+
+    assert (
+        lookup.scim_group_id_for_team_external_group("acme", "Engineering")
+        == "SCIM_1"
+    )
+    assert (
+        lookup.scim_group_id_for_team_external_group("other", "Engineering")
+        == "SCIM_2"
+    )
+
+
+def test_scim_group_id_for_team_external_group_skips_ambiguous_names() -> None:
+    connection = duckdb.connect(":memory:")
+    connection.execute("CREATE SCHEMA github_test")
+    connection.execute(
+        "CREATE TABLE github_test.enterprise_organizations "
+        "(login VARCHAR, enterprise_node_id VARCHAR)"
+    )
+    connection.execute(
+        "CREATE TABLE github_test.enterprise_scim_groups "
+        "(id VARCHAR, display_name VARCHAR, enterprise_node_id VARCHAR)"
+    )
+    connection.execute(
+        "INSERT INTO github_test.enterprise_organizations VALUES ('acme', 'ENT_1')"
+    )
+    connection.execute(
+        "INSERT INTO github_test.enterprise_scim_groups VALUES "
+        "('SCIM_1', 'Engineering', 'ENT_1'), "
+        "('SCIM_2', 'Engineering', 'ENT_1')"
+    )
+
+    lookup = GithubLookup(connection, schema="github_test")
+
+    assert lookup.scim_group_id_for_team_external_group("acme", "Engineering") is None
+
+
+def test_scim_group_id_for_team_external_group_skips_org_only_context() -> None:
+    connection = duckdb.connect(":memory:")
+    connection.execute("CREATE SCHEMA github_test")
+    ensure_optional_input_tables(connection, schema="github_test")
+
+    lookup = GithubLookup(connection, schema="github_test")
+
+    assert lookup.scim_group_id_for_team_external_group("acme", "Engineering") is None
+
+
+def test_user_node_id_for_login_is_case_insensitive_and_scoped_to_org() -> None:
+    connection = duckdb.connect(":memory:")
+    connection.execute("CREATE SCHEMA github_test")
+    connection.execute(
+        "CREATE TABLE github_test.users (id VARCHAR, login VARCHAR, org_login VARCHAR)"
+    )
+    connection.execute(
+        "CREATE TABLE github_test.enterprise (id VARCHAR, slug VARCHAR)"
+    )
+    connection.execute(
+        "CREATE TABLE github_test.enterprise_organizations "
+        "(login VARCHAR, enterprise_node_id VARCHAR)"
+    )
+    connection.execute(
+        "CREATE TABLE github_test.enterprise_users "
+        "(id VARCHAR, login VARCHAR, enterprise_slug VARCHAR)"
+    )
+    connection.execute(
+        "INSERT INTO github_test.users VALUES "
+        "('USER_1', 'Alice', 'Acme'), "
+        "('USER_2', 'Alice', 'Other')"
+    )
+
+    lookup = GithubLookup(connection, schema="github_test")
+
+    assert lookup.user_node_id_for_login("acme", "alice") == "USER_1"
+    assert lookup.user_node_id_for_login("other", "ALICE") == "USER_2"
+
+
+def test_user_node_id_for_login_falls_back_to_enterprise_user_for_org() -> None:
+    connection = duckdb.connect(":memory:")
+    connection.execute("CREATE SCHEMA github_test")
+    ensure_optional_input_tables(connection, schema="github_test")
+    connection.execute("INSERT INTO github_test.enterprise VALUES ('ENT_1', 'acme-ent')")
+    connection.execute(
+        "INSERT INTO github_test.enterprise_organizations "
+        "(login, enterprise_node_id) VALUES "
+        "('acme', 'ENT_1'), ('other', 'ENT_2')"
+    )
+    connection.execute(
+        "INSERT INTO github_test.enterprise_users VALUES "
+        "('USER_1', 'Alice', 'acme-ent'), "
+        "('USER_2', 'Alice', 'other-ent')"
+    )
+
+    lookup = GithubLookup(connection, schema="github_test")
+
+    assert lookup.user_node_id_for_login("acme", "alice") == "USER_1"
+    assert lookup.user_node_id_for_login("other", "alice") is None
+
+
+def test_workflow_step_secret_reference_names_deduplicates_across_steps() -> None:
+    connection = duckdb.connect(":memory:")
+    connection.execute("CREATE SCHEMA github_test")
+    connection.execute(
+        "CREATE TABLE github_test.workflow_steps "
+        "(job_node_id VARCHAR, secret_references JSON)"
+    )
+    connection.execute(
+        "INSERT INTO github_test.workflow_steps VALUES "
+        "('JOB_1', '[{\"name\":\"DEPLOY_TOKEN\",\"context\":\"run\"}]'), "
+        "('JOB_1', '[{\"name\":\"deploy_token\",\"context\":\"env\"}, {\"name\":\"API_KEY\",\"context\":\"with\"}]'), "
+        "('JOB_2', '[{\"name\":\"OTHER_TOKEN\",\"context\":\"run\"}]')"
+    )
+
+    lookup = GithubLookup(connection, schema="github_test")
+
+    assert lookup.workflow_step_secret_reference_names("JOB_1") == [
+        "DEPLOY_TOKEN",
+        "API_KEY",
+    ]
