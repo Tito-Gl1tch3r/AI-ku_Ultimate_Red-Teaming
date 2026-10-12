@@ -1,0 +1,936 @@
+import { resolveFirstPublicationMode, readFirstPublicationOperation, assertFirstPublicationServingAuthority } from "./lib/reader-summary-first-publication";
+import { createDailyJevCaptureQualification } from "./lib/reader-summary-daily-jev-qualification";
+import { PrismaMonitoringConnection } from "@social-monitor/monitoring/adapters/persistence/prisma/prisma-monitoring-connection";
+import { PrismaInterestRepository } from "@social-monitor/monitoring/adapters/persistence/prisma/prisma-interest.repository";
+import { MonitoringConfiguredInterestReader } from "@social-monitor/relevance/adapters/monitoring/monitoring-configured-interest.reader";
+import { createHash } from "node:crypto";
+
+import { PrismaFeedConnection } from "@social-monitor/feed/adapters/persistence/prisma/prisma-feed-connection";
+import { InMemoryMetricsRecorder } from "@social-monitor/platform-metrics";
+import { resolvePostgresRuntimePoolConfig } from "@social-monitor/platform-persistence";
+import { PrismaFeedItemReadRepository } from "@social-monitor/feed/adapters/persistence/prisma/prisma-feed-item-read.repository";
+import { PrismaSummaryConnection } from "@social-monitor/summary/adapters/persistence/prisma/prisma-summary-connection";
+import { PrismaReaderSummaryPublication } from "@social-monitor/summary/adapters/persistence/prisma/prisma-reader-summary-publication";
+import {
+  AgentRuntimeReaderSummaryModelAdapter,
+  resolveAgentRuntimeReaderSummaryModelOptions,
+} from "@social-monitor/summary/adapters/model/agent-runtime-reader-summary-model.adapter";
+import {
+  AgentRuntimeReaderSummaryTopicLabeler,
+  resolveAgentRuntimeReaderSummaryTopicLabelerOptions,
+} from "@social-monitor/summary/adapters/model/agent-runtime-reader-summary-topic-labeler.adapter";
+import {
+  AgentRuntimeReaderSummaryTopicRelationVerifier,
+  resolveAgentRuntimeReaderSummaryTopicRelationVerifierOptions,
+} from "@social-monitor/summary/adapters/model/agent-runtime-reader-summary-topic-relation-verifier.adapter";
+import { DeterministicReaderSummaryModelAdapter } from "@social-monitor/summary/adapters/model/deterministic-reader-summary-model.adapter";
+import { ReaderSummaryPromotionMetricsRecorder } from "@social-monitor/summary/adapters/metrics/reader-summary-promotion-metrics.recorder";
+import { GrpcAgentRuntimeClient } from "@social-monitor/summary/adapters/model/grpc-agent-runtime-client";
+import {
+  OpenAiResponsesReaderSummaryModelAdapter,
+  resolveOpenAiResponsesReaderSummaryModelOptions,
+} from "@social-monitor/summary/adapters/model/openai-responses-reader-summary-model.adapter";
+import { PrismaReaderSummaryArtifactRepository } from "@social-monitor/summary/adapters/persistence/prisma/prisma-reader-summary-artifact.repository";
+import { PrismaReaderSummaryJobRepository } from "@social-monitor/summary/adapters/persistence/prisma/prisma-reader-summary-job.repository";
+import { PrismaReaderSummaryPolicyRepository } from "@social-monitor/summary/adapters/persistence/prisma/prisma-reader-summary-policy.repository";
+import { buildReaderSummaryPeriod } from "@social-monitor/summary/domain";
+import { createReaderSummaryCaptureExecution } from "./lib/reader-summary-capture-execution";
+import { readerSummaryPromotionControl } from "@social-monitor/summary/features/execute-reader-summary-job/reader-summary-promotion-control";
+import { BuildReaderSummaryTopicMapUseCase } from "@social-monitor/summary/features/build-reader-summary-topic-map/build-reader-summary-topic-map.use-case";
+import { presentReaderSummaryArtifact } from "@social-monitor/summary/features/shared/reader-summary-artifact-presenter";
+import { RequestReaderSummaryUseCase } from "@social-monitor/summary/features/request-reader-summary/request-reader-summary.use-case";
+import type {
+  ReaderSummaryTimestampPolicy,
+  ReaderSummaryModelPort,
+  ReaderSummaryTopicMapPublicationAuditPort,
+  ReaderSummaryTopicMapPublicationRejection,
+} from "@social-monitor/summary/ports";
+import {
+  CryptoIdGenerator,
+  SystemClock,
+  tenantId,
+  workspaceId,
+} from "@social-monitor/shared-kernel";
+
+import { loadDotenvIfPresent } from "./lib/env-file";
+import { writeLiveEvidenceArtifactAtomically } from "./lib/live-evidence-artifact";
+import { DurableReaderSummaryExecutionAttestationCapture } from "./lib/reader-summary-execution-attestation-capture";
+import {
+  HistoricalGitHubOmissionEvidenceSelector,
+  resolveHistoricalGitHubOmission,
+} from "./lib/reader-summary-historical-github-omission";
+import {
+  DatasetGuardedReaderSummaryEvidenceSelector,
+} from "./lib/reader-summary-day-dataset-guard";
+import { buildDatasetGuard, CapturingReaderSummaryJobQueue, AllowingSummaryQuota } from "./lib/reader-summary-durable-capture-support";
+import { canonicalJsonSha256 } from "@social-monitor/contracts/grpc/agent_runtime/v1/execution-attestation";
+import {
+  createReaderSummaryDailyCaptureContext,
+} from "./lib/reader-summary-daily-publication-finalizer";
+import { createReaderSummaryDailyCapturePublicationWiring } from
+  "./lib/reader-summary-daily-story-relation-verifier";
+import {
+  readerSummaryProductionDayAttemptIdentity,
+  readerSummaryProductionDayIdempotencyKey,
+} from "./lib/reader-summary-production-day-attempt-identity";
+import {
+  readerSummaryServingAuthorityRequiresAgentRuntime,
+  resolveReaderSummaryServingAuthority,
+} from "./lib/reader-summary-serving-authority";
+import {
+  addUtcDays,
+  liveObservationCutoffEnv,
+  resolveRecoveryTimestampPolicy,
+  startOfUtcDay,
+} from "./lib/reader-summary-capture-period-policy";
+import {
+  assertReaderSummaryDbPublicationFailpointInactive,
+  createRecoverableReaderSummaryPublication,
+} from "./lib/reader-summary-db-publication-reconciliation";
+import {
+  assertProductionDayPromotionRetrySafe,
+} from "./lib/reader-summary-production-day-promotion-rebuild";
+import { ensureReaderSummaryProductionDayPolicy } from
+  "./lib/reader-summary-production-day-policy-bootstrap";
+import {
+  resolveProductionDayPromotionInput,
+  revalidateProductionDayPromotionInput,
+} from
+  "./lib/reader-summary-production-day-promotion-input";
+import { historicalPromotionRevalidationFailurePathEnv } from
+  "./lib/reader-summary-promotion-v2-input-guard";
+import {
+  historicalPromotionGenerationAuthorityJsonEnv,
+  historicalPromotionGenerationAuthoritySha256Env,
+  parseHistoricalPromotionGenerationAuthority,
+} from "./lib/reader-summary-promotion-v2-historical-generation-authority";
+import {
+  HistoricalPromotionPolicyGuard,
+  HistoricalPromotionPolicyGuardedEvidenceSelector,
+} from
+  "./lib/reader-summary-promotion-v2-policy-guard";
+
+const databaseUrlEnv = "DATABASE_URL";
+const evidencePathEnv = "DURABLE_READER_SUMMARY_EVIDENCE_PATH";
+const frontendFixturePathEnv = "DURABLE_READER_SUMMARY_FRONTEND_FIXTURE_PATH";
+const rejectedTopicMapPathEnv =
+  "DURABLE_READER_SUMMARY_REJECTED_TOPIC_MAP_PATH";
+const defaultTenantId = "11111111-1111-4111-8111-111111111111";
+const defaultWorkspaceId = "22222222-2222-4222-8222-222222222222";
+const periodStartedAtEnv = "DURABLE_READER_SUMMARY_PERIOD_STARTED_AT";
+const periodEndedAtEnv = "DURABLE_READER_SUMMARY_PERIOD_ENDED_AT";
+const cadenceEnv = "DURABLE_READER_SUMMARY_CADENCE";
+const historicalGitHubOmissionReasonEnv =
+  "DURABLE_READER_SUMMARY_HISTORICAL_GITHUB_OMISSION_REASON";
+const recoveryTimestampPolicyEnv =
+  "DURABLE_READER_SUMMARY_RECOVERY_TIMESTAMP_POLICY";
+const publicationRecoveryDirectoryEnv =
+  "DURABLE_READER_SUMMARY_PUBLICATION_RECOVERY_DIR";
+loadDotenvIfPresent(".env");
+type DurableReaderSummaryModelMode =
+  "deterministic" | "openai-responses" | "agent-runtime";
+type DurableReaderSummaryTopicLabelerMode = "deterministic" | "agent-runtime";
+type DurableReaderSummaryCadence = "daily" | "weekly" | "monthly" | "custom";
+
+type FeedInventoryRow = {
+  readonly providerKey: string;
+  readonly itemCount: number;
+  readonly newestObservedAt: string | null;
+};
+
+async function main(): Promise<void> {
+  const databaseUrl = requiredEnv(databaseUrlEnv);
+  const { dailyReplay, operationalClock: clock } =
+    createReaderSummaryDailyCaptureContext({
+      env: process.env,
+      operationalClock: new SystemClock(),
+    });
+  const now = clock.now();
+  const tenant = tenantId(
+    readEnv("DURABLE_READER_SUMMARY_TENANT_ID") ?? defaultTenantId,
+  );
+  const workspace = workspaceId(
+    readEnv("DURABLE_READER_SUMMARY_WORKSPACE_ID") ?? defaultWorkspaceId,
+  );
+  const timezone = readEnv("DURABLE_READER_SUMMARY_TIMEZONE") ?? "UTC";
+  const cadence = readCadence();
+  const periodStartedAt = readDateEnv(periodStartedAtEnv) ?? startOfUtcDay(now);
+  const periodEndedAt =
+    readDateEnv(periodEndedAtEnv) ??
+    (cadence === "daily" ? addUtcDays(periodStartedAt, 1) : now);
+  const period = buildReaderSummaryPeriod({
+    cadence,
+    startedAt: periodStartedAt,
+    endedAt: periodEndedAt,
+    timezone,
+  });
+  const recoveryTimestampPolicy = resolveRecoveryTimestampPolicy({
+    argv: process.argv.slice(2),
+    envValue: readEnv(recoveryTimestampPolicyEnv),
+    cadence,
+    timezone,
+    periodStartedAt,
+    periodEndedAt,
+    now,
+  });
+  const firstPublicationActive = resolveFirstPublicationMode({ argv: process.argv.slice(2), environment: process.env,
+    cadence, timezone, startedAt: periodStartedAt, endedAt: periodEndedAt, now,
+    replayActive: dailyReplay !== null, recoveryActive: recoveryTimestampPolicy.active });
+  const historicalGitHubOmission = resolveHistoricalGitHubOmission({
+    argv: process.argv.slice(2),
+    reason: readEnv(historicalGitHubOmissionReasonEnv),
+    cadence,
+    timezone,
+    periodStartedAt,
+    periodEndedAt,
+    now,
+  });
+  if (
+    historicalGitHubOmission !== undefined &&
+    !recoveryTimestampPolicy.active
+  ) {
+    throw new Error(
+      "Historical GitHub omission requires explicit historical recovery mode",
+    );
+  }
+  const captureExecution = createReaderSummaryCaptureExecution({
+    value: readDateEnv(liveObservationCutoffEnv),
+    dailyReplayActive: dailyReplay !== null,
+    recoveryActive: recoveryTimestampPolicy.active,
+    cadence,
+    timezone,
+    periodStartedAt,
+    periodEndedAt,
+    now,
+  });
+  const { liveObservationCutoff } = captureExecution;
+  const { promotionRebuild, sourceProvenance } =
+    firstPublicationActive ? { promotionRebuild: undefined, sourceProvenance: undefined } : resolveProductionDayPromotionInput({
+      environment: process.env,
+      recoveryActive: recoveryTimestampPolicy.active,
+      date: periodStartedAt.toISOString().slice(0, 10),
+      timestampPolicy: recoveryTimestampPolicy.policy,
+      historicalGitHubOmissionReason: historicalGitHubOmission?.reason,
+      liveObservationCutoff: liveObservationCutoff?.toISOString(),
+      dailyReplay,
+    });
+  const maxEvidenceItems = readIntegerEnv(
+    "DURABLE_READER_SUMMARY_MAX_EVIDENCE_ITEMS",
+    200,
+    1,
+    200,
+  );
+  const maxStories = readIntegerEnv(
+    "DURABLE_READER_SUMMARY_MAX_STORIES",
+    15,
+    1,
+    20,
+  );
+  const modelMode = readModelMode();
+  const topicLabelerMode = readTopicLabelerMode();
+  const agentRuntimeClient =
+    readerSummaryServingAuthorityRequiresAgentRuntime({
+      summaryModelMode: modelMode,
+      topicLabelerMode,
+    })
+      ? buildAgentRuntimeClient()
+      : null;
+  const executionAttestations =
+    new DurableReaderSummaryExecutionAttestationCapture();
+
+  const runtimePoolConfig = resolvePostgresRuntimePoolConfig({
+    ...process.env,
+    DATABASE_URL: databaseUrl,
+    POSTGRES_RUNTIME_PROCESS: "daily-runner",
+    POSTGRES_RUNTIME_POOL_MIN: process.env.POSTGRES_RUNTIME_POOL_MIN ?? "0",
+    POSTGRES_RUNTIME_POOL_MAX: process.env.POSTGRES_RUNTIME_POOL_MAX ?? "2",
+  });
+  const feedConnection = await PrismaFeedConnection.create(runtimePoolConfig);
+  const summaryConnection =
+    await PrismaSummaryConnection.create(runtimePoolConfig);
+
+  let monitoringConnection: PrismaMonitoringConnection | undefined;
+  try {
+    monitoringConnection = dailyReplay === null
+      ? await PrismaMonitoringConnection.create(runtimePoolConfig) : undefined;
+    const firstPublication = firstPublicationActive ? readFirstPublicationOperation({
+      client: summaryConnection, clock, tenantId: tenant, workspaceId: workspace,
+      startedAt: periodStartedAt, endedAt: periodEndedAt,
+      manifestPath: requiredEnv("DURABLE_READER_SUMMARY_DATASET_MANIFEST_PATH"),
+      manifestSha256: requiredEnv("DURABLE_READER_SUMMARY_DATASET_MANIFEST_SHA256"),
+      privateRoot: requiredEnv("DURABLE_READER_SUMMARY_RECOVERY_ROOT"),
+      forbiddenOutputPaths: [readEnv(evidencePathEnv), readEnv(frontendFixturePathEnv), readEnv(rejectedTopicMapPathEnv)]
+        .filter((path): path is string => path !== undefined),
+    }) : undefined;
+    const datasetGuard = firstPublication?.guard ?? (recoveryTimestampPolicy.active
+      ? buildDatasetGuard({
+          client: summaryConnection,
+          clock,
+          tenantId: tenant,
+          workspaceId: workspace,
+          periodStartedAt,
+          periodEndedAt,
+          now,
+          timestampPolicy: recoveryTimestampPolicy.policy,
+        })
+      : null);
+    // Serving health/configuration and canonical identity are read-only. Pin
+    // them before consuming the finite day; keep policy writes and dataset
+    // revalidation behind reservation. Other modes retain their original timing.
+    const resolveServingPreflight = async () => {
+      const servingAuthority = await resolveReaderSummaryServingAuthority({
+        summaryModelMode: modelMode,
+        topicLabelerMode,
+        env: process.env,
+        agentRuntimeClient,
+        checkedAt: clock.now().toISOString(),
+      });
+      if (firstPublication !== undefined) assertFirstPublicationServingAuthority(servingAuthority);
+      const attemptIdentity = readerSummaryProductionDayAttemptIdentity({
+        tenantId: tenant,
+        workspaceId: workspace,
+        periodKey: period.periodKey,
+        servingAuthority,
+        sourceProvenance: firstPublication?.sourceProvenance ?? sourceProvenance!,
+      });
+      return { servingAuthority, attemptIdentity };
+    };
+    const firstPublicationPreflight = firstPublication === undefined
+      ? undefined : await resolveServingPreflight();
+    await firstPublication?.reserve();
+    await revalidateProductionDayPromotionInput({
+      promotionRebuild,
+      datasetGuard,
+      client: summaryConnection,
+      tenantId: tenant,
+      workspaceId: workspace,
+      date: periodStartedAt.toISOString().slice(0, 10),
+      failureMarkerPath: readEnv(
+        historicalPromotionRevalidationFailurePathEnv,
+      ),
+    });
+    const feedItems = new PrismaFeedItemReadRepository(feedConnection);
+    const readerSummaryJobs = new PrismaReaderSummaryJobRepository(
+      summaryConnection,
+    );
+    const readerSummaryArtifacts = new PrismaReaderSummaryArtifactRepository(
+      summaryConnection,
+    );
+    const baseReaderSummaryPolicies = new PrismaReaderSummaryPolicyRepository(
+      summaryConnection,
+    );
+    const promotionGenerationAuthority = promotionRebuild === undefined
+      ? null
+      : parseHistoricalPromotionGenerationAuthority(
+            readEnv(historicalPromotionGenerationAuthorityJsonEnv),
+            readEnv(historicalPromotionGenerationAuthoritySha256Env),
+          );
+    const promotionPolicyGuard = promotionGenerationAuthority === null
+      ? null
+      : new HistoricalPromotionPolicyGuard(
+          baseReaderSummaryPolicies,
+          promotionGenerationAuthority.policy,
+        );
+    const readerSummaryPolicies = promotionPolicyGuard ??
+      baseReaderSummaryPolicies;
+    const configuredInterests = monitoringConnection === undefined ? undefined
+      : new MonitoringConfiguredInterestReader(new PrismaInterestRepository(monitoringConnection));
+    const qualification = createDailyJevCaptureQualification({
+      fresh: dailyReplay === null, mode: process.env.READER_VALUE_MODE,
+      client: summaryConnection, interests: configuredInterests, clock,
+    });
+    const publicationWiring =
+      createReaderSummaryDailyCapturePublicationWiring({
+        replay: dailyReplay,
+        configuredInterests,
+        candidateQualification: qualification.selector,
+        feedItems,
+        summaryClient: summaryConnection,
+        clock,
+        attestationSink: executionAttestations,
+        summaryModelMode: modelMode,
+        env: process.env,
+        agentRuntimeClient,
+      });
+    const queue = new CapturingReaderSummaryJobQueue();
+    const ids = new CryptoIdGenerator();
+    const scope = { type: "workspace" } as const;
+
+    if (promotionRebuild === undefined) {
+      await ensureReaderSummaryProductionDayPolicy({
+        repository: baseReaderSummaryPolicies,
+        tenantId: tenant,
+        workspaceId: workspace,
+        maxStories,
+        now,
+      });
+    }
+
+    const inventoryBefore = dailyReplay === null
+      ? await loadFeedInventory(summaryConnection, {
+          tenantId: tenant,
+          workspaceId: workspace,
+          startedAt: periodStartedAt,
+          endedAt: periodEndedAt,
+          timestampPolicy: recoveryTimestampPolicy.policy,
+        })
+      : publicationWiring.inventory!;
+
+    const { servingAuthority, attemptIdentity } = firstPublicationPreflight ??
+      await resolveServingPreflight();
+
+    const requestReaderSummary = new RequestReaderSummaryUseCase(
+      readerSummaryJobs,
+      queue,
+      new AllowingSummaryQuota(clock),
+      ids,
+      clock,
+    );
+    const request = await requestReaderSummary.execute({
+      tenantId: tenant,
+      workspaceId: workspace,
+      scope,
+      cadence,
+      period: {
+        startedAt: periodStartedAt,
+        endedAt: periodEndedAt,
+        timezone,
+      },
+      idempotencyKey: firstPublication?.idempotencyKey ?? readerSummaryProductionDayIdempotencyKey(
+        attemptIdentity,
+        promotionRebuild?.rebuildIdentity,
+      ),
+      correlationId: `corr-durable-reader-summary-${now.getTime()}`,
+    });
+    if (!request.ok) {
+      throw request.error;
+    }
+    if (promotionRebuild !== undefined) {
+      assertProductionDayPromotionRetrySafe(request.value);
+    }
+
+    const relevanceEvidenceSelector = publicationWiring.evidenceSelector;
+    const omissionAwareEvidenceSelector =
+      historicalGitHubOmission === undefined
+        ? relevanceEvidenceSelector
+        : new HistoricalGitHubOmissionEvidenceSelector(
+            relevanceEvidenceSelector,
+          );
+    const baseEvidenceSelector =
+      datasetGuard === null
+        ? omissionAwareEvidenceSelector
+        : new DatasetGuardedReaderSummaryEvidenceSelector(
+            omissionAwareEvidenceSelector,
+            datasetGuard,
+            promotionRebuild !== undefined,
+          );
+    const evidenceSelector = promotionPolicyGuard === null
+      ? baseEvidenceSelector
+        : new HistoricalPromotionPolicyGuardedEvidenceSelector(
+            baseEvidenceSelector,
+            promotionPolicyGuard,
+            promotionGenerationAuthority!.execution.rankingPolicyVersion,
+          );
+    const durablePublication = new PrismaReaderSummaryPublication(
+      summaryConnection,
+      datasetGuard === null
+        ? undefined
+        : (transactionClient) =>
+            datasetGuard.assertCurrentForPublicationTransaction(
+              transactionClient,
+            ),
+      firstPublication === undefined ? undefined : "first_publication_sep29",
+    );
+    const { publication, recovery: publicationRecovery } =
+      createRecoverableReaderSummaryPublication({
+        delegate: durablePublication,
+        recoveryDirectory: readEnv(publicationRecoveryDirectoryEnv),
+        attemptIdentity,
+        attestations: () => executionAttestations.all(),
+      });
+    const metrics = new InMemoryMetricsRecorder();
+    const execution = await captureExecution.execute([
+      readerSummaryJobs,
+      readerSummaryArtifacts,
+      readerSummaryPolicies,
+      evidenceSelector,
+      publicationWiring.model ?? buildReaderSummaryModel(
+        modelMode,
+        agentRuntimeClient,
+        executionAttestations,
+      ),
+      publication,
+      ids,
+      clock,
+      readerSummaryPromotionControl(
+        new ReaderSummaryPromotionMetricsRecorder(metrics),
+      ),
+      undefined,
+      undefined,
+      publicationWiring.topicMapBuilder ?? buildTopicMapBuilder(
+        topicLabelerMode,
+        agentRuntimeClient,
+        executionAttestations,
+      ),
+      undefined,
+      publicationWiring.githubProjectionReader,
+      historicalGitHubOmission,
+      undefined, undefined, undefined, undefined, undefined, firstPublication,
+    ], {
+      tenantId: tenant,
+      workspaceId: workspace,
+      readerSummaryJobId: request.value.readerSummaryJobId,
+      maxEvidenceItems,
+    });
+    if (!execution.ok) {
+      throw execution.error;
+    }
+    if (execution.value.readerSummaryId === undefined) {
+      throw new Error(
+        "Durable reader summary execution did not produce an artifact id",
+      );
+    }
+    assertReaderSummaryDbPublicationFailpointInactive(
+      readEnv("READER_SUMMARY_DAILY_RUN_FAILPOINT"),
+    );
+
+    const persistedJob = await readerSummaryJobs.findById({
+      tenantId: tenant,
+      workspaceId: workspace,
+      readerSummaryJobId: execution.value.readerSummaryJobId,
+    });
+    if (persistedJob === null) {
+      throw new Error("Durable reader summary job was not persisted");
+    }
+    const persistedJobSnapshot = persistedJob.toSnapshot();
+    if (
+      persistedJobSnapshot.status !== execution.value.status ||
+      persistedJobSnapshot.readerSummaryId !== execution.value.readerSummaryId
+    ) {
+      throw new Error(
+        "Durable reader summary job and execution result are inconsistent",
+      );
+    }
+    if (execution.value.status === "quality_rejected") {
+      const rejectedArtifact =
+        await readerSummaryArtifacts.findRejectedDebugById({
+          tenantId: tenant,
+          workspaceId: workspace,
+          readerSummaryId: execution.value.readerSummaryId,
+        });
+      if (rejectedArtifact === null) {
+        throw new Error(
+          "Durable reader summary quality-rejected artifact was not persisted",
+        );
+      }
+      throw new Error(
+        `Durable reader summary failed publication quality: ${persistedJobSnapshot.failureReason ?? "unknown quality rejection"}`,
+      );
+    }
+
+    const artifact = await readerSummaryArtifacts.findById({
+      tenantId: tenant,
+      workspaceId: workspace,
+      readerSummaryId: execution.value.readerSummaryId,
+    });
+    if (artifact === null) {
+      throw new Error("Durable reader summary artifact was not persisted");
+    }
+
+    const frontendArtifact = presentReaderSummaryArtifact(artifact, {
+      status: "fresh",
+      checkedAt: clock.now(),
+    });
+    const executionAttestationRecords =
+      publicationRecovery === null
+        ? executionAttestations.all()
+        : publicationRecovery.load({
+            tenantId: tenant,
+            workspaceId: workspace,
+            periodKey: period.periodKey,
+            readerSummaryJobId: execution.value.readerSummaryJobId,
+            readerSummaryArtifactId: execution.value.readerSummaryId,
+          });
+    const durableReadback = {
+      ...(qualification.audit() === undefined ? {} : {
+        jevCaptureQualification: qualification.audit(),
+        jevCaptureQualificationSha256: canonicalJsonSha256(qualification.audit()),
+      }),
+      summaryContentSha256: canonicalJsonSha256(frontendArtifact.content),
+      topicMapSha256: canonicalJsonSha256(frontendArtifact.content.topicMap),
+      executionAttestationSetSha256: canonicalJsonSha256(
+        executionAttestationRecords,
+      ),
+    };
+    const evidence = {
+      schemaVersion: 1,
+      artifactId: "durable-reader-summary-postgres-evidence-v1",
+      format: "durable-reader-summary-postgres-evidence-v1",
+      generatedAt: clock.now().toISOString(),
+      provenance: {
+        runner: "scripts/capture-durable-reader-summary-from-postgres.ts",
+        fixtureOnly: false,
+        database: "postgres",
+        modelMode,
+        servingAuthority,
+        productionDayAttempt: {
+          schemaVersion: 1,
+          identity: attemptIdentity,
+          requestCreated: request.value.created,
+          reconciledFromDbPublication: !request.value.created,
+          ...(promotionRebuild === undefined
+            ? {}
+            : {
+                promotionRebuildIdentity: promotionRebuild.rebuildIdentity,
+                authoritativeInputDigest:
+                  promotionRebuild.authoritativeInputDigest,
+                promotionPolicyVersion: promotionRebuild.policyVersion,
+              }),
+        },
+        historicalGitHubOmission:
+          historicalGitHubOmission === undefined
+            ? undefined
+            : {
+                mode: "github_projection_unavailable_historical",
+                reason: historicalGitHubOmission.reason,
+                authorizedAt:
+                  historicalGitHubOmission.authorizedAt.toISOString(),
+              },
+        datasetManifest: datasetGuard?.evidence(),
+        historicalFirstPublication: firstPublication?.evidence(),
+        dailySourceAuthority:
+          dailyReplay === null
+            ? undefined
+            : {
+                schemaVersion: 1,
+                canonicalSha256: dailyReplay.authoritySha256,
+                modelJobIdentity: dailyReplay.modelJobIdentity,
+                receiptSha256: sha256Bytes(dailyReplay.receiptBytes),
+                modelExecution: dailyReplay.modelTelemetry,
+              },
+      },
+      scope: {
+        tenantId: tenant,
+        workspaceId: workspace,
+        summaryScope: "workspace",
+      },
+      period: frontendArtifact.period,
+      inputInventory: inventoryBefore,
+      inputInventoryTimestampPolicy: recoveryTimestampPolicy.policy,
+      queue: {
+        capturedCommandCount: queue.all().length,
+      },
+      result: {
+        readerSummaryJobId: execution.value.readerSummaryJobId,
+        readerSummaryId: execution.value.readerSummaryId,
+        status: execution.value.status,
+        headline: frontendArtifact.headline,
+        selectedFeedItemCount: frontendArtifact.coverage.selectedFeedItemCount,
+        topReadCount: frontendArtifact.coverage.topReadCount,
+        citationCount: frontendArtifact.coverage.citationCount,
+        providerCount: frontendArtifact.coverage.providerCount,
+        topProviderKeys: frontendArtifact.coverage.topProviderKeys,
+        qualityFlags: frontendArtifact.qualityFlags,
+      },
+      executionAttestations: executionAttestationRecords,
+      durableReadback,
+      redaction: {
+        secretsIncluded: false,
+        rawProviderPayloadIncluded: false,
+        tokenValuesIncluded: false,
+      },
+    };
+
+    writeOptionalJsonArtifact(evidencePathEnv, evidence);
+    writeOptionalJsonArtifact(frontendFixturePathEnv, {
+      schemaVersion: 1,
+      format: "frontend-reader-summary-live-fixture-v1",
+      generatedAt: clock.now().toISOString(),
+      tenantId: tenant,
+      workspaceId: workspace,
+      userId: "durable-reader-summary-live-user",
+      readerSummaryArtifact: frontendArtifact,
+      evidence: evidence.result,
+      redaction: evidence.redaction,
+    });
+
+    console.log(
+      [
+        "Durable reader summary capture OK",
+        `job=${execution.value.readerSummaryJobId}`,
+        `artifact=${execution.value.readerSummaryId}`,
+        `status=${execution.value.status}`,
+        `selected=${frontendArtifact.coverage.selectedFeedItemCount}`,
+        `topReads=${frontendArtifact.coverage.topReadCount}`,
+        `providers=${frontendArtifact.coverage.topProviderKeys.join(",")}`,
+        `headline=${frontendArtifact.headline}`,
+      ].join("\n"),
+    );
+  } finally {
+    await Promise.all([feedConnection.close(), summaryConnection.close(), monitoringConnection?.close()]);
+  }
+}
+
+const buildReaderSummaryModel = (
+  mode: DurableReaderSummaryModelMode,
+  agentRuntimeClient: GrpcAgentRuntimeClient | null,
+  executionAttestations: DurableReaderSummaryExecutionAttestationCapture,
+): ReaderSummaryModelPort => {
+  if (mode === "deterministic") {
+    return new DeterministicReaderSummaryModelAdapter();
+  }
+
+  if (mode === "agent-runtime") {
+    return new AgentRuntimeReaderSummaryModelAdapter({
+      ...resolveAgentRuntimeReaderSummaryModelOptions(
+        process.env,
+        requireAgentRuntimeClient(agentRuntimeClient),
+      ),
+      verifiedAttestationSink: executionAttestations,
+    });
+  }
+
+  return new OpenAiResponsesReaderSummaryModelAdapter(
+    resolveOpenAiResponsesReaderSummaryModelOptions(process.env, {
+      requireApiKey: true,
+    }),
+  );
+};
+
+const buildTopicMapBuilder = (
+  mode: DurableReaderSummaryTopicLabelerMode,
+  agentRuntimeClient: GrpcAgentRuntimeClient | null,
+  executionAttestations: DurableReaderSummaryExecutionAttestationCapture,
+): BuildReaderSummaryTopicMapUseCase => {
+  const publicationAudit = buildTopicMapPublicationAudit();
+
+  return mode === "agent-runtime"
+    ? new BuildReaderSummaryTopicMapUseCase({
+        mode: "agent-runtime",
+        publicationAudit,
+        labeler: new AgentRuntimeReaderSummaryTopicLabeler({
+          ...resolveAgentRuntimeReaderSummaryTopicLabelerOptions(
+            process.env,
+            requireAgentRuntimeClient(agentRuntimeClient),
+          ),
+          verifiedAttestationSink: executionAttestations,
+        }),
+        relationVerifier: new AgentRuntimeReaderSummaryTopicRelationVerifier({
+          ...resolveAgentRuntimeReaderSummaryTopicRelationVerifierOptions(
+            process.env,
+            requireAgentRuntimeClient(agentRuntimeClient),
+          ),
+          verifiedAttestationSink: executionAttestations,
+        }),
+      })
+    : new BuildReaderSummaryTopicMapUseCase({ publicationAudit });
+};
+
+const buildTopicMapPublicationAudit =
+  (): ReaderSummaryTopicMapPublicationAuditPort | null => {
+    const path = readEnv(rejectedTopicMapPathEnv);
+
+    return path === undefined ? null : new FileTopicMapPublicationAudit(path);
+  };
+
+class FileTopicMapPublicationAudit implements ReaderSummaryTopicMapPublicationAuditPort {
+  constructor(private readonly path: string) {}
+
+  async recordRejectedCandidate(
+    rejection: ReaderSummaryTopicMapPublicationRejection,
+  ): Promise<void> {
+    writeLiveEvidenceArtifactAtomically(
+      this.path,
+      `${JSON.stringify(
+        {
+          schemaVersion: 1,
+          format: "reader-summary-topic-map-publication-rejection-v1",
+          generatedAt: new Date().toISOString(),
+          minimumGroupedCoverage: rejection.minimumGroupedCoverage,
+          attemptNumber: rejection.attemptNumber,
+          totalAttempts: rejection.totalAttempts,
+          willRetry: rejection.willRetry,
+          retryReason: rejection.retryReason,
+          structureQuality: rejection.structureQuality,
+          topicMap: rejection.topicMap,
+          redaction: {
+            secretsIncluded: false,
+            rawProviderPayloadIncluded: false,
+            tokenValuesIncluded: false,
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      rejectedTopicMapPathEnv,
+    );
+  }
+}
+
+const buildAgentRuntimeClient = (): GrpcAgentRuntimeClient =>
+  GrpcAgentRuntimeClient.connect({
+    address: requiredEnv("AGENT_RUNTIME_GRPC_ADDRESS"),
+    clock: new SystemClock(),
+    options: {
+      timeoutMs: readIntegerEnv(
+        "AGENT_RUNTIME_GRPC_TIMEOUT_MS",
+        5_000,
+        1,
+        600_000,
+      ),
+      serviceToken: readEnv("AGENT_RUNTIME_SERVICE_TOKEN"),
+    },
+  });
+
+const requireAgentRuntimeClient = (
+  client: GrpcAgentRuntimeClient | null,
+): GrpcAgentRuntimeClient => {
+  if (client === null) {
+    throw new Error("AGENT_RUNTIME_GRPC_ADDRESS is required for agent-runtime");
+  }
+
+  return client;
+};
+
+const loadFeedInventory = async (
+  prisma: PrismaSummaryConnection,
+  params: {
+    readonly tenantId: string;
+    readonly workspaceId: string;
+    readonly startedAt: Date;
+    readonly endedAt: Date;
+    readonly timestampPolicy: ReaderSummaryTimestampPolicy;
+  },
+): Promise<readonly FeedInventoryRow[]> => {
+  const rows = await prisma.$queryRaw<
+    {
+      provider_key: string;
+      item_count: bigint;
+      newest_observed_at: Date | null;
+    }[]
+  >`
+    select provider_key, count(*) as item_count, max(observed_at) as newest_observed_at
+    from feed_items
+    where tenant_id = ${params.tenantId}
+      and workspace_id = ${params.workspaceId}
+      and status = 'VISIBLE'
+      and case ${params.timestampPolicy}
+        when 'published_at' then published_at
+        when 'observed_at' then observed_at
+        else null
+      end >= ${params.startedAt}
+      and case ${params.timestampPolicy}
+        when 'published_at' then published_at
+        when 'observed_at' then observed_at
+        else null
+      end < ${params.endedAt}
+    group by provider_key
+    order by provider_key asc
+  `;
+
+  return rows.map((row) => ({
+    providerKey: row.provider_key,
+    itemCount: Number(row.item_count),
+    newestObservedAt: row.newest_observed_at?.toISOString() ?? null,
+  }));
+};
+
+const writeOptionalJsonArtifact = (envName: string, value: unknown): void => {
+  const path = readEnv(envName);
+  if (path !== undefined) writeLiveEvidenceArtifactAtomically(path, `${JSON.stringify(value, null, 2)}\n`, envName);
+};
+
+const readCadence = (): DurableReaderSummaryCadence => {
+  const value = readEnv(cadenceEnv) ?? "custom";
+  if (
+    value === "daily" ||
+    value === "weekly" ||
+    value === "monthly" ||
+    value === "custom"
+  ) {
+    return value;
+  }
+
+  throw new Error(`${cadenceEnv} must be daily, weekly, monthly or custom`);
+};
+
+const readDateEnv = (name: string): Date | undefined => {
+  const value = readEnv(name);
+  if (value === undefined) {
+    return undefined;
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`${name} must be an ISO date-time`);
+  }
+
+  return date;
+};
+
+const readModelMode = (): DurableReaderSummaryModelMode => {
+  const value = readEnv("DURABLE_READER_SUMMARY_MODEL") ?? "agent-runtime";
+  if (
+    value === "deterministic" ||
+    value === "openai-responses" ||
+    value === "agent-runtime"
+  ) {
+    return value;
+  }
+
+  throw new Error(
+    "DURABLE_READER_SUMMARY_MODEL must be deterministic, openai-responses or agent-runtime",
+  );
+};
+
+const readTopicLabelerMode = (): DurableReaderSummaryTopicLabelerMode => {
+  const value =
+    readEnv("DURABLE_READER_SUMMARY_TOPIC_LABELER") ?? "agent-runtime";
+  if (value === "deterministic" || value === "agent-runtime") {
+    return value;
+  }
+
+  throw new Error(
+    "DURABLE_READER_SUMMARY_TOPIC_LABELER must be deterministic or agent-runtime",
+  );
+};
+
+const readIntegerEnv = (
+  name: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number => {
+  const raw = readEnv(name);
+  if (raw === undefined) {
+    return fallback;
+  }
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}`);
+  }
+
+  return parsed;
+};
+
+const requiredEnv = (name: string): string => {
+  const value = readEnv(name);
+  if (value === undefined) {
+    throw new Error(`${name} is required`);
+  }
+
+  return value;
+};
+
+const readEnv = (name: string): string | undefined => {
+  const value = process.env[name]?.trim();
+  return value === undefined || value.length === 0 ? undefined : value;
+};
+
+const sha256Bytes = (value: Buffer): string =>
+  createHash("sha256").update(value).digest("hex");
+
+void main().catch((error) => {
+  const message = error instanceof Error ? (error.stack || error.message) : String(error);
+  console.error(`Durable reader summary capture failed: ${message}`);
+  process.exitCode = 1;
+});

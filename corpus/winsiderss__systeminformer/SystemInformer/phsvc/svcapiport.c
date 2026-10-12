@@ -1,0 +1,466 @@
+/*
+ * Copyright (c) 2022 Winsider Seminars & Solutions, Inc.  All rights reserved.
+ *
+ * This file is part of System Informer.
+ *
+ * Authors:
+ *
+ *     wj32    2011-2015
+ *     dmex    2017-2023
+ *
+ */
+
+#include <phapp.h>
+#include <phsvc.h>
+#include <verify.h>
+
+_Function_class_(USER_THREAD_START_ROUTINE)
+NTSTATUS PhSvcApiRequestThreadStart(
+    _In_ PVOID Parameter
+    );
+
+extern HANDLE PhSvcTimeoutStandbyEventHandle;
+extern HANDLE PhSvcTimeoutCancelEventHandle;
+
+ULONG PhSvcApiThreadContextTlsIndex;
+HANDLE PhSvcApiPortHandle;
+volatile LONG PhSvcApiNumberOfClients = 0;
+
+NTSTATUS PhSvcApiPortInitialization(
+    _In_ PUNICODE_STRING PortName
+    )
+{
+    NTSTATUS status;
+    OBJECT_ATTRIBUTES objectAttributes;
+    PSECURITY_DESCRIPTOR securityDescriptor;
+    ULONG sdAllocationLength;
+    PSID administratorsSid;
+    PACL dacl;
+    ULONG i;
+
+    // Create the API port.
+
+    administratorsSid = PhSeAdministratorsSid();
+
+    sdAllocationLength = SECURITY_DESCRIPTOR_MIN_LENGTH +
+        (ULONG)sizeof(ACL) +
+        (ULONG)sizeof(ACCESS_ALLOWED_ACE) +
+        PhLengthSid(administratorsSid) +
+        (ULONG)sizeof(ACCESS_ALLOWED_ACE) +
+        PhLengthSid((PSID)&PhSeEveryoneSid);
+
+    securityDescriptor = PhAllocateZero(sdAllocationLength);
+    dacl = (PACL)PTR_ADD_OFFSET(securityDescriptor, SECURITY_DESCRIPTOR_MIN_LENGTH);
+
+    PhCreateSecurityDescriptor(securityDescriptor, SECURITY_DESCRIPTOR_REVISION);
+    PhCreateAcl(dacl, sdAllocationLength - SECURITY_DESCRIPTOR_MIN_LENGTH, ACL_REVISION);
+    PhAddAccessAllowedAce(dacl, ACL_REVISION, PORT_ALL_ACCESS, administratorsSid);
+    PhAddAccessAllowedAce(dacl, ACL_REVISION, PORT_CONNECT, (PSID)&PhSeEveryoneSid);
+    PhSetDaclSecurityDescriptor(securityDescriptor, TRUE, dacl, FALSE);
+    assert(RtlValidSecurityDescriptor(securityDescriptor));
+
+    InitializeObjectAttributes(
+        &objectAttributes,
+        PortName,
+        OBJ_CASE_INSENSITIVE,
+        NULL,
+        securityDescriptor
+        );
+
+    status = NtCreatePort(
+        &PhSvcApiPortHandle,
+        &objectAttributes,
+        sizeof(PHSVC_API_CONNECTINFO),
+        PhIsExecutingInWow64() ? sizeof(PHSVC_API_MSG64) : sizeof(PHSVC_API_MSG),
+        0
+        );
+    PhFree(securityDescriptor);
+
+    if (!NT_SUCCESS(status))
+        return status;
+
+    // Start the API threads.
+
+    PhSvcApiThreadContextTlsIndex = PhTlsAlloc();
+
+    if (PhSvcApiThreadContextTlsIndex == TLS_OUT_OF_INDEXES)
+        return STATUS_NO_MEMORY;
+
+    for (i = 0; i < 2; i++)
+    {
+        PhCreateThread2(PhSvcApiRequestThreadStart, NULL);
+    }
+
+    return status;
+}
+
+PPHSVC_THREAD_CONTEXT PhSvcGetCurrentThreadContext(
+    VOID
+    )
+{
+    return (PPHSVC_THREAD_CONTEXT)PhTlsGetValue(PhSvcApiThreadContextTlsIndex);
+}
+
+_Function_class_(USER_THREAD_START_ROUTINE)
+NTSTATUS PhSvcApiRequestThreadStart(
+    _In_ PVOID Parameter
+    )
+{
+    PH_AUTO_POOL autoPool;
+    NTSTATUS status;
+    PHSVC_THREAD_CONTEXT threadContext;
+    HANDLE portHandle;
+    PVOID portContext;
+    SIZE_T messageSize;
+    PPORT_MESSAGE receiveMessage;
+    PPORT_MESSAGE replyMessage;
+    CSHORT messageType;
+    PPHSVC_CLIENT client;
+    PPHSVC_API_PAYLOAD payload;
+
+    PhInitializeAutoPool(&autoPool);
+
+    threadContext.CurrentClient = NULL;
+    threadContext.OldClient = NULL;
+
+    status = PhTlsSetValue(PhSvcApiThreadContextTlsIndex, &threadContext);
+
+    if (!NT_SUCCESS(status))
+    {
+        PhDeleteAutoPool(&autoPool);
+        return status;
+    }
+
+    portHandle = PhSvcApiPortHandle;
+    messageSize = PhIsExecutingInWow64() ? sizeof(PHSVC_API_MSG64) : sizeof(PHSVC_API_MSG);
+    receiveMessage = PhAllocatePageZero(messageSize);
+    replyMessage = NULL;
+
+    if (!receiveMessage)
+    {
+        PhDeleteAutoPool(&autoPool);
+        return STATUS_NO_MEMORY;
+    }
+
+    while (TRUE)
+    {
+        status = NtReplyWaitReceivePort(
+            portHandle,
+            &portContext,
+            replyMessage,
+            receiveMessage
+            );
+
+        portHandle = PhSvcApiPortHandle;
+        replyMessage = NULL;
+
+        if (!NT_SUCCESS(status))
+        {
+            // Client probably died.
+            continue;
+        }
+
+        messageType = receiveMessage->u2.s2.Type;
+
+        if (messageType == LPC_CONNECTION_REQUEST)
+        {
+            PhSvcHandleConnectionRequest(receiveMessage);
+            continue;
+        }
+
+        if (!portContext)
+            continue;
+
+        client = portContext;
+        threadContext.CurrentClient = client;
+        PhWaitForEvent(&client->ReadyEvent, NULL);
+
+        if (messageType == LPC_REQUEST)
+        {
+            if (PhIsExecutingInWow64())
+                payload = &((PPHSVC_API_MSG64)receiveMessage)->p;
+            else
+                payload = &((PPHSVC_API_MSG)receiveMessage)->p;
+
+            PhSvcDispatchApiCall(client, payload, &portHandle);
+            replyMessage = receiveMessage;
+        }
+        else if (messageType == LPC_PORT_CLOSED)
+        {
+            PhDereferenceObject(client);
+
+            if (_InterlockedDecrement(&PhSvcApiNumberOfClients) == 0)
+            {
+                NtSetEvent(PhSvcTimeoutStandbyEventHandle, NULL);
+            }
+        }
+
+        assert(!threadContext.OldClient);
+        PhDrainAutoPool(&autoPool);
+    }
+
+    PhDeleteAutoPool(&autoPool);
+}
+
+BOOLEAN PhSvcHandleClientIntegrity(
+    _In_ HANDLE ProcessHandle
+    )
+{
+    NTSTATUS status;
+    HANDLE tokenHandle;
+    MANDATORY_LEVEL_RID integrityLevelRID;
+
+    tokenHandle = NULL;
+    integrityLevelRID = SECURITY_MANDATORY_UNTRUSTED_RID;
+
+    status = PhOpenProcessToken(
+        ProcessHandle,
+        TOKEN_QUERY,
+        &tokenHandle
+        );
+
+    if (!NT_SUCCESS(status))
+        return FALSE;
+
+    status = PhGetTokenIntegrityLevelRID(tokenHandle, &integrityLevelRID, NULL);
+    NtClose(tokenHandle);
+
+    if (!NT_SUCCESS(status))
+        return FALSE;
+
+    return integrityLevelRID >= SECURITY_MANDATORY_MEDIUM_RID;
+}
+
+BOOLEAN PhSvcHandleClientFileName(
+    _In_ HANDLE ProcessHandle,
+    _In_ BOOLEAN IsWow64Client,
+    _Out_ PPH_STRING *RemoteFileName
+    )
+{
+    BOOLEAN status;
+    PPH_STRING referenceFileName;
+    PPH_STRING referenceDirectory;
+    PPH_STRING remoteFileName;
+
+    status = FALSE;
+    referenceFileName = NULL;
+    referenceDirectory = NULL;
+    remoteFileName = NULL;
+    *RemoteFileName = NULL;
+
+    PhGetProcessImageFileName(NtCurrentProcess(), &referenceFileName);
+    PH_AUTO(referenceFileName);
+
+    PhGetProcessImageFileName(ProcessHandle, &remoteFileName);
+    PH_AUTO(remoteFileName);
+
+    if (IsWow64Client)
+    {
+        static CONST PH_STRINGREF wow64DirectoryName = PH_STRINGREF_INIT(L"\\x86\\");
+        PPH_STRING referenceBaseName;
+
+        if (!PhIsNullOrEmptyString(referenceFileName) &&
+            !PhIsNullOrEmptyString(remoteFileName))
+        {
+            referenceDirectory = PhGetBaseDirectory(referenceFileName);
+            PH_AUTO(referenceDirectory);
+            referenceBaseName = PhGetBaseName(referenceFileName);
+            PH_AUTO(referenceBaseName);
+
+            if (referenceDirectory && referenceBaseName)
+            {
+                PPH_STRING expectedFileName;
+
+                expectedFileName = PhConcatStringRef3(
+                    &referenceDirectory->sr,
+                    &wow64DirectoryName,
+                    &referenceBaseName->sr
+                    );
+                PH_AUTO(expectedFileName);
+
+                if (PhEqualString(remoteFileName, expectedFileName, TRUE))
+                {
+                    status = TRUE;
+                }
+            }
+        }
+    }
+    else
+    {
+        if (!PhIsNullOrEmptyString(referenceFileName) &&
+            !PhIsNullOrEmptyString(remoteFileName) &&
+            PhEqualString(referenceFileName, remoteFileName, FALSE))
+        {
+            status = TRUE;
+        }
+    }
+
+    if (!status)
+        return FALSE;
+
+    *RemoteFileName = PhReferenceObject(remoteFileName);
+    return TRUE;
+}
+
+VOID PhSvcHandleConnectionRequest(
+    _In_ PPORT_MESSAGE PortMessage
+    )
+{
+    NTSTATUS status;
+    BOOLEAN isWow64Client;
+    PPHSVC_API_MSG message;
+    PPHSVC_API_MSG64 message64;
+    CLIENT_ID clientId;
+    PPHSVC_CLIENT client;
+    HANDLE portHandle;
+    HANDLE processHandle = NULL;
+    PPH_STRING remoteFileName;
+    REMOTE_PORT_VIEW clientView;
+    REMOTE_PORT_VIEW64 clientView64;
+    PREMOTE_PORT_VIEW actualClientView;
+
+    isWow64Client = PhIsExecutingInWow64();
+    message = (PPHSVC_API_MSG)PortMessage;
+    message64 = (PPHSVC_API_MSG64)PortMessage;
+    remoteFileName = NULL;
+
+    if (isWow64Client)
+    {
+        clientId.UniqueProcess = (HANDLE)message64->h.ClientId.UniqueProcess;
+        clientId.UniqueThread = (HANDLE)message64->h.ClientId.UniqueThread;
+
+        if (!NT_SUCCESS(PhOpenProcessClientId(&processHandle, PROCESS_QUERY_LIMITED_INFORMATION, &clientId)))
+        {
+            NtAcceptConnectPort(&portHandle, NULL, PortMessage, FALSE, NULL, NULL);
+            return;
+        }
+
+        if (!PhSvcHandleClientIntegrity(processHandle))
+        {
+            NtClose(processHandle);
+            NtAcceptConnectPort(&portHandle, NULL, PortMessage, FALSE, NULL, NULL);
+            return;
+        }
+
+        if (!PhSvcHandleClientFileName(processHandle, isWow64Client, &remoteFileName))
+        {
+            NtClose(processHandle);
+            NtAcceptConnectPort(&portHandle, NULL, PortMessage, FALSE, NULL, NULL);
+            return;
+        }
+
+        PH_AUTO(remoteFileName);
+
+        if (!PhVerifyFileIsSystemInformer(&remoteFileName->sr, TRUE))
+        {
+            NtClose(processHandle);
+            NtAcceptConnectPort(&portHandle, NULL, PortMessage, FALSE, NULL, NULL);
+            return;
+        }
+    }
+    else
+    {
+        clientId = message->h.ClientId;
+
+        // Make sure that the remote process is System Informer and not some other program.
+
+        if (!NT_SUCCESS(PhOpenProcessClientId(&processHandle, PROCESS_QUERY_LIMITED_INFORMATION, &clientId)))
+        {
+            NtAcceptConnectPort(&portHandle, NULL, PortMessage, FALSE, NULL, NULL);
+            return;
+        }
+
+        if (!PhSvcHandleClientIntegrity(processHandle))
+        {
+            NtClose(processHandle);
+            NtAcceptConnectPort(&portHandle, NULL, PortMessage, FALSE, NULL, NULL);
+            return;
+        }
+
+        if (!PhSvcHandleClientFileName(processHandle, isWow64Client, &remoteFileName))
+        {
+            NtClose(processHandle);
+            NtAcceptConnectPort(&portHandle, NULL, PortMessage, FALSE, NULL, NULL);
+            return;
+        }
+
+        PH_AUTO(remoteFileName);
+
+        if (!PhVerifyFileIsSystemInformer(&remoteFileName->sr, TRUE))
+        {
+            NtClose(processHandle);
+            NtAcceptConnectPort(&portHandle, NULL, PortMessage, FALSE, NULL, NULL);
+            return;
+        }
+    }
+
+    client = PhSvcCreateClient(&clientId, processHandle);
+
+    if (!client)
+    {
+        NtClose(processHandle);
+        NtAcceptConnectPort(&portHandle, NULL, PortMessage, FALSE, NULL, NULL);
+        return;
+    }
+
+    if (PhIsExecutingInWow64())
+    {
+        message64->p.ConnectInfo.ServerProcessId = HandleToUlong(NtCurrentProcessId());
+
+        memset(&clientView64, 0, sizeof(REMOTE_PORT_VIEW64));
+        clientView64.Length = sizeof(REMOTE_PORT_VIEW64);
+        clientView64.ViewSize = 0;
+        clientView64.ViewBase = 0;
+        actualClientView = (PREMOTE_PORT_VIEW)&clientView64;
+    }
+    else
+    {
+        message->p.ConnectInfo.ServerProcessId = HandleToUlong(NtCurrentProcessId());
+
+        memset(&clientView, 0, sizeof(REMOTE_PORT_VIEW));
+        clientView.Length = sizeof(REMOTE_PORT_VIEW);
+        clientView.ViewSize = 0;
+        clientView.ViewBase = NULL;
+        actualClientView = &clientView;
+    }
+
+    status = NtAcceptConnectPort(
+        &portHandle,
+        client,
+        PortMessage,
+        TRUE,
+        NULL,
+        actualClientView
+        );
+
+    if (!NT_SUCCESS(status))
+    {
+        PhDereferenceObject(client);
+        return;
+    }
+
+    // IMPORTANT: Since Vista, NtCompleteConnectPort does not do anything and simply returns STATUS_SUCCESS.
+    // We will call it anyway (for completeness), but we need to use an event to ensure that other threads don't try
+    // to process requests before we have finished setting up the client object.
+
+    client->PortHandle = portHandle;
+
+    if (PhIsExecutingInWow64())
+    {
+        client->ClientViewBase = (PVOID)clientView64.ViewBase;
+        client->ClientViewLimit = PTR_ADD_OFFSET(clientView64.ViewBase, clientView64.ViewSize);
+    }
+    else
+    {
+        client->ClientViewBase = clientView.ViewBase;
+        client->ClientViewLimit = PTR_ADD_OFFSET(clientView.ViewBase, clientView.ViewSize);
+    }
+
+    //NtCompleteConnectPort(portHandle); // (dmex)
+    PhSetEvent(&client->ReadyEvent);
+
+    if (_InterlockedIncrement(&PhSvcApiNumberOfClients) == 1)
+    {
+        NtSetEvent(PhSvcTimeoutCancelEventHandle, NULL);
+    }
+}

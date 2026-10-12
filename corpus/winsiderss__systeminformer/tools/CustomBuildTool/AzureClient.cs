@@ -1,0 +1,1141 @@
+﻿/*
+ * Copyright (c) 2022 Winsider Seminars & Solutions, Inc.  All rights reserved.
+ *
+ * This file is part of System Informer.
+ *
+ * Authors:
+ *
+ *     dmex
+ *
+ */
+
+namespace CustomBuildTool
+{
+    /// <summary>
+    /// Provides Azure Key Vault integration for certificate retrieval and code signing operations.
+    /// Supports both client secret and certificate-based authentication.
+    /// </summary>
+    internal static class AzureClient
+    {
+        /// <summary>
+        /// The Azure Key Vault REST API version used for all vault requests.
+        /// </summary>
+        internal const string ApiVersion = "2025-07-01";
+
+        /// <summary>
+        /// Provides a thread-safe cache for storing Azure client certificates indexed by their identifier.
+        /// </summary>
+        /// <remarks>This dictionary enables efficient retrieval and storage of X509 certificates in
+        /// concurrent scenarios, such as when multiple threads access or update the cache. The cache is intended for
+        /// use in Azure authentication workflows where client certificates are reused.</remarks>
+        private static readonly ConcurrentDictionary<string, X509Certificate2> AzureClientCertificateCache = new();
+
+        /// <summary>
+        /// Creates a cache key for storing certificates based on vault and authentication parameters.
+        /// </summary>
+        /// <param name="VaultName">The name of the Azure Key Vault.</param>
+        /// <param name="CertName">The name of the certificate in the vault.</param>
+        /// <param name="TenantId">The Azure tenant ID.</param>
+        /// <param name="ClientId">The Azure client (application) ID.</param>
+        /// <returns>A string combining all parameters to create a unique cache key.</returns>
+        private static string MakeCacheKey(string VaultName, string CertName, string TenantId, string ClientId)
+            => $"{VaultName}|{CertName}|{TenantId}|{ClientId}";
+
+        /// <summary>
+        /// Retrieves a certificate from Azure Key Vault.
+        /// </summary>
+        /// <param name="HttpClient">The HTTP client for making requests.</param>
+        /// <param name="VaultName">The name of the Azure Key Vault.</param>
+        /// <param name="CertName">The name of the certificate to retrieve.</param>
+        /// <param name="AccessToken">The access token for authenticating with Key Vault.</param>
+        /// <param name="CancellationToken">Cancellation token to cancel the operation.</param>
+        /// <returns>A KeyVaultCertificate containing the certificate data and key ID, or null if retrieval fails.</returns>
+        private static async Task<KeyVaultCertificate> GetKeyVaultCertificate(HttpClient HttpClient, string VaultName, string CertName, string AccessToken, CancellationToken CancellationToken)
+        {
+            try
+            {
+                using HttpRequestMessage requestMessage = new HttpRequestMessage(HttpMethod.Get, $"https://{VaultName}.vault.azure.net/certificates/{CertName}?api-version={ApiVersion}");
+                requestMessage.Headers.Authorization = new AuthenticationHeaderValue("Bearer", AccessToken);
+
+                using var responseMessage = await BuildHttpClient.SendWithRetry(HttpClient, requestMessage, CancellationToken);
+                if (!responseMessage.IsSuccessStatusCode)
+                {
+                    Program.PrintColorMessage($"Failed to fetch certificate from Key Vault: {(int)responseMessage.StatusCode} {responseMessage.ReasonPhrase}", ConsoleColor.Red);
+                    return null;
+                }
+
+                var jsonResponseStream = await responseMessage.Content.ReadAsStreamAsync(CancellationToken);
+                var keyVaultCertificateResponse = await JsonSerializer.DeserializeAsync(jsonResponseStream, AzureJsonContext.Default.KeyVaultCertificateResponse, CancellationToken);
+                var keyVaultCertificate = new KeyVaultCertificate();
+
+                if (!string.IsNullOrWhiteSpace(keyVaultCertificateResponse?.CertificateString))
+                {
+                    keyVaultCertificate.CertificateBuffer = Convert.FromBase64String(keyVaultCertificateResponse.CertificateString);
+                }
+
+                //
+                // KeyId may be in 'kid' or 'key.kid' depending on response shape
+                //
+
+                if (!string.IsNullOrWhiteSpace(keyVaultCertificateResponse?.Kid))
+                {
+                    keyVaultCertificate.KeyId = keyVaultCertificateResponse.Kid;
+                }
+                else if (!string.IsNullOrWhiteSpace(keyVaultCertificateResponse?.Key?.Kid))
+                {
+                    keyVaultCertificate.KeyId = keyVaultCertificateResponse.Key.Kid;
+                }
+
+                return keyVaultCertificate;
+            }
+            catch (Exception exception)
+            {
+                Program.PrintColorMessage($"Failed to parse Key Vault certificate response: {exception.Message}", ConsoleColor.Red);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Initializes the Azure client by retrieving authentication credentials and fetching the signing certificate.
+        /// </summary>
+        /// <param name="CancellationToken">Cancellation token to cancel the operation.</param>
+        /// <returns>True if initialization succeeds, false otherwise.</returns>
+        /// <remarks>
+        /// This method reads environment variables for authentication:
+        /// - AZURE_TENANT_ID: Azure tenant ID
+        /// - AZURE_CLIENT_ID: Application client ID
+        /// - AZURE_CLIENT_SECRET: Client secret (for secret-based auth)
+        /// - AZURE_CLIENT_CERTIFICATE_PATH: Path to a certificate file (for cert-based auth)
+        /// - KEYVAULT_NAME: Name of the Key Vault
+        /// - CERT_NAME: Name of the certificate in the vault. Certificates are cached to avoid repeated Key Vault requests.
+        /// </remarks>
+        public static async Task<bool> StartAzureClient(CancellationToken CancellationToken = default)
+        {
+            string tenantId = Environment.GetEnvironmentVariable("AZURE_TENANT_ID");
+            string clientId = Environment.GetEnvironmentVariable("AZURE_CLIENT_ID");
+            string clientCertPath = Environment.GetEnvironmentVariable("AZURE_CLIENT_CERTIFICATE_PATH");
+            string vaultName = Environment.GetEnvironmentVariable("KEYVAULT_NAME");
+            string certName = Environment.GetEnvironmentVariable("CERT_NAME");
+            string cacheKey = MakeCacheKey(vaultName, certName, tenantId, clientId);
+
+            if (AzureClientCertificateCache.TryGetValue(cacheKey, out var cachedCertificate) && cachedCertificate != null)
+            {
+                Program.PrintColorMessage($"Loaded certificate from cache: {cachedCertificate.Subject} | Thumbprint: {cachedCertificate.Thumbprint} | HasPrivateKey: {cachedCertificate.HasPrivateKey}", ConsoleColor.Green);
+                return true;
+            }
+
+            bool hasClientSecret = Win32.GetEnvironmentVariableSecure("AZURE_CLIENT_SECRET", out SecureBuffer clientSecret);
+
+            if (!hasClientSecret && string.IsNullOrWhiteSpace(clientCertPath))
+            {
+                Program.PrintColorMessage("Neither AZURE_CLIENT_SECRET nor AZURE_CLIENT_CERTIFICATE_PATH is set.", ConsoleColor.Red);
+                return false;
+            }
+            
+            using (clientSecret)
+            {
+                using var httpClient = BuildHttpClient.CreateHttpClient();
+                ReadOnlySpan<char> clientSecretSpan = hasClientSecret ? clientSecret.Span : ReadOnlySpan<char>.Empty;
+
+                var accessToken = GetAccessTokenWithRetry(
+                    httpClient,
+                    tenantId,
+                    clientId,
+                    clientSecretSpan,
+                    clientCertPath,
+                    CancellationToken
+                    );
+
+                if (string.IsNullOrWhiteSpace(accessToken))
+                {
+                    Program.PrintColorMessage("Failed to acquire access token.", ConsoleColor.Red);
+                    return false;
+                }
+
+                using HttpRequestMessage requestMessage = new HttpRequestMessage(HttpMethod.Get, $"https://{vaultName}.vault.azure.net/secrets/{certName}?api-version={ApiVersion}");
+                requestMessage.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+                using HttpResponseMessage responseMessage = await BuildHttpClient.SendWithRetry(httpClient, requestMessage, CancellationToken);
+
+                if (!responseMessage.IsSuccessStatusCode)
+                {
+                    Program.PrintErrorMessage($"Key Vault request failed: {(int)responseMessage.StatusCode} {responseMessage.ReasonPhrase}");
+                    return false;
+                }
+
+                var jsonResponseStream = await responseMessage.Content.ReadAsStreamAsync(CancellationToken);
+                var secretResponse = await JsonSerializer.DeserializeAsync(jsonResponseStream, AzureJsonContext.Default.SecretResponse, CancellationToken);
+
+                if (string.IsNullOrWhiteSpace(secretResponse.Value))
+                {
+                    Console.WriteLine("Secret response is null or missing 'value'.");
+                    return false;
+                }
+
+                var secretValue = secretResponse.Value;
+
+                if (string.IsNullOrWhiteSpace(secretValue))
+                {
+                    Console.WriteLine("Secret response missing 'value'.");
+                    return false;
+                }
+
+                X509Certificate2 inMemoryCertificate;
+
+                if (secretValue.TrimStart().StartsWith("-----BEGIN", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        inMemoryCertificate = CreateCertificateFromPem(secretValue);
+                    }
+                    catch (Exception exception)
+                    {
+                        Program.PrintColorMessage($"Failed to parse PEM secret: {exception.Message}", ConsoleColor.Red);
+                        return false;
+                    }
+                }
+                else
+                {
+                    try
+                    {
+                        byte[] certificateBytes = Convert.FromBase64String(secretValue);
+
+                        inMemoryCertificate = X509CertificateLoader.LoadCertificate(certificateBytes);
+                    }
+                    catch (Exception exception)
+                    {
+                        Program.PrintColorMessage($"Failed to parse PFX secret: {exception.Message}", ConsoleColor.Red);
+                        return false;
+                    }
+                }
+
+                if (inMemoryCertificate == null)
+                {
+                    Program.PrintColorMessage("Certificate could not be created in memory.", ConsoleColor.Red);
+                    return false;
+                }
+
+                AzureClientCertificateCache[cacheKey] = inMemoryCertificate;
+
+                Program.PrintColorMessage($"Loaded certificate in-memory: {inMemoryCertificate.Subject} | Thumbprint: {inMemoryCertificate.Thumbprint} | HasPrivateKey: {inMemoryCertificate.HasPrivateKey}", ConsoleColor.Green);
+
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Signs files using Azure Key Vault certificates with Authenticode signatures.
+        /// </summary>
+        /// <param name="TargetPath">Path to the file or directory to sign.</param>
+        /// <param name="TimeStampServer">URL of the timestamp server for RFC3161 timestamps.</param>
+        /// <param name="AzureCertName">Name of the certificate in Azure Key Vault.</param>
+        /// <param name="AzureVaultName">Name of the Azure Key Vault.</param>
+        /// <param name="TenantGuid">Azure tenant ID.</param>
+        /// <param name="ClientGuid">Azure client (application) ID.</param>
+        /// <param name="ClientSecret">Client secret for authentication.</param>
+        /// <param name="SignatureDescription">Optional description embedded in the signature.</param>
+        /// <param name="SignatureDescriptionUrl">Optional URL embedded in the signature.</param>
+        /// <param name="CancellationToken">Cancellation token to cancel the operation.</param>
+        /// <returns>True if signing succeeds, false otherwise.</returns>
+        /// <remarks>
+        /// When TargetPath is a directory, signs all .exe and .dll files (excluding ksi.dll).
+        /// Uses SHA256 hash algorithm and RSA signatures.
+        /// Requires a valid cached certificate from StartAzureClient().
+        /// </remarks>
+        public static bool SignFiles(
+            string TargetPath,
+            string TimeStampServer,
+            string AzureCertName,
+            string AzureVaultName,
+            string TenantGuid,
+            string ClientGuid,
+            ReadOnlySpan<char> ClientSecret,
+            string SignatureDescription = null,
+            string SignatureDescriptionUrl = null,
+            CancellationToken CancellationToken = default
+            )
+        {
+            try
+            {
+                string cacheKey = MakeCacheKey(AzureVaultName, AzureCertName, TenantGuid, ClientGuid);
+
+                if (!AzureClientCertificateCache.TryGetValue(cacheKey, out X509Certificate2 azureCertificatePublic) || azureCertificatePublic == null)
+                {
+                    Program.PrintColorMessage($"Azure Client Failed.", ConsoleColor.Red);
+                    return false;
+                }
+
+                var certificateAzureVaultServer = new Uri($"https://{AzureVaultName}.vault.azure.net/");
+                var certificateTimeStampServer = new TimeStampConfiguration(TimeStampServer, TimeStampType.RFC3161);
+                using var httpClientForKeyVault = BuildHttpClient.CreateHttpClient();
+                X509Certificate2 vaultPublicCert;
+                Uri keyIdUri;
+
+                string vaultAccessToken = GetAccessTokenWithRetry(
+                    httpClientForKeyVault,
+                    TenantGuid,
+                    ClientGuid,
+                    ClientSecret,
+                    null,  // No certificate path in this context
+                    CancellationToken: CancellationToken
+                    );
+
+                if (string.IsNullOrWhiteSpace(vaultAccessToken))
+                {
+                    Program.PrintColorMessage("Failed to acquire access token for Key Vault.", ConsoleColor.Red);
+                    return false;
+                }
+
+                var keyVaultCertificateResponse = GetKeyVaultCertificate(
+                    httpClientForKeyVault,
+                    AzureVaultName,
+                    AzureCertName,
+                    vaultAccessToken,
+                    CancellationToken
+                    ).GetAwaiter().GetResult();
+
+                if (keyVaultCertificateResponse?.CertificateBuffer != null && keyVaultCertificateResponse.CertificateBuffer.Length > 0)
+                {
+                    // Cer is DER-encoded certificate bytes returned by Key Vault
+                    vaultPublicCert = X509CertificateLoader.LoadCertificate(keyVaultCertificateResponse.CertificateBuffer);
+                }
+                else
+                {
+                    // fallback to cached public cert (older behavior)
+                    vaultPublicCert = azureCertificatePublic;
+                }
+
+                // We will pass the raw access token into RSAFactory (no Azure.Core dependency)
+                var accessTokenForKeyVault = vaultAccessToken;
+
+                // Determine key id Uri; fall back to a best-effort keys path if not present
+                if (!string.IsNullOrWhiteSpace(keyVaultCertificateResponse?.KeyId))
+                {
+                    keyIdUri = new Uri(keyVaultCertificateResponse.KeyId);
+                }
+                else
+                {
+                    try
+                    {
+                        keyIdUri = new Uri(certificateAzureVaultServer, $"keys/{AzureCertName}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Program.PrintColorMessage($"Failed to construct key URI: {ex.Message}", ConsoleColor.Yellow);
+                        keyIdUri = null;
+                    }
+                }
+
+                using (var azureCertificateRsa = RSAFactory.Create(accessTokenForKeyVault, keyIdUri, vaultPublicCert))
+                using (var authenticodeKeyVaultSigner = new AuthenticodeKeyVaultSigner(
+                    azureCertificateRsa,
+                    vaultPublicCert,
+                    HashAlgorithmName.SHA256,
+                    certificateTimeStampServer
+                    ))
+                {
+                    if (Directory.Exists(TargetPath))
+                    {
+                        var fileList = Utils.EnumerateDirectory(TargetPath, [".exe", ".dll"], ["ksi.dll"]).ToList();
+
+                        if (fileList.Count == 0)
+                        {
+                            Program.PrintColorMessage($"No files found to sign.", ConsoleColor.Red);
+                        }
+                        else
+                        {
+                            int successCount = 0;
+                            foreach (var fileName in fileList)
+                            {
+                                CancellationToken.ThrowIfCancellationRequested();
+
+                                try
+                                {
+                                    var result = authenticodeKeyVaultSigner.SignFile(
+                                        fileName,
+                                        SignatureDescription,
+                                        SignatureDescriptionUrl);
+
+                                    if (result == HRESULT.S_OK)
+                                    {
+                                        successCount++;
+                                        Program.PrintColorMessage($"Signed: {fileName}", ConsoleColor.Green);
+                                    }
+                                    else
+                                    {
+                                        Program.PrintColorMessage($"Failed: ({result}) {fileName}", ConsoleColor.Red);
+                                    }
+                                }
+                                catch (Exception exception)
+                                {
+                                    Program.PrintErrorMessage($"Signing '{fileName}': {exception.Message}");
+                                }
+                            }
+
+                            Program.PrintColorMessage($"Signing complete. {successCount}/{fileList.Count} files signed.", ConsoleColor.DarkGray);
+                        }
+                    }
+                    else if (File.Exists(TargetPath))
+                    {
+                        var result = authenticodeKeyVaultSigner.SignFile(
+                            TargetPath,
+                            SignatureDescription,
+                            SignatureDescriptionUrl);
+
+                        if (result == HRESULT.COR_E_BADIMAGEFORMAT)
+                        {
+                            Program.PrintErrorMessage($"The AppxManifest.xml publisher CN does not match the certificate: ({result}) {TargetPath}");
+                            return false;
+                        }
+                        else if (result == HRESULT.TRUST_E_SUBJECT_FORM_UNKNOWN)
+                        {
+                            Program.PrintErrorMessage($"File content not supported: ({result}) {TargetPath}");
+                            return false;
+                        }
+                        else if (result != HRESULT.S_OK)
+                        {
+                            Program.PrintErrorMessage($"({result}) {TargetPath}");
+                            return false;
+                        }
+
+                        Program.PrintColorMessage($"Success: {TargetPath}", ConsoleColor.Green);
+                    }
+                    else
+                    {
+                        Program.PrintColorMessage($"Path not found: {TargetPath}", ConsoleColor.Red);
+                        return false;
+                    }
+                }
+            }
+            catch (Exception exception)
+            {
+                Program.PrintErrorMessage(exception);
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Retrieves an Azure access token with automatic retry logic.
+        /// Supports both client secret and certificate-based authentication.
+        /// </summary>
+        /// <param name="HttpClient">The HTTP client for making requests.</param>
+        /// <param name="TenantId">The Azure tenant ID.</param>
+        /// <param name="ClientId">The Azure client (application) ID.</param>
+        /// <param name="ClientSecret">The client secret for secret-based authentication (optional).</param>
+        /// <param name="ClientCertificatePath">Path to the certificate file for certificate-based authentication (optional).</param>
+        /// <param name="CancellationToken">Cancellation token to cancel the operation.</param>
+        /// <returns>The access token string, or empty string if authentication fails.</returns>
+        /// <remarks>
+        /// Certificate-based authentication takes priority if both ClientSecret and ClientCertificatePath are provided.
+        /// At least one authentication method must be specified.
+        /// </remarks>
+        private static string GetAccessTokenWithRetry(
+            HttpClient HttpClient,
+            string TenantId,
+            string ClientId,
+            ReadOnlySpan<char> ClientSecret,
+            string ClientCertificatePath,
+            CancellationToken CancellationToken = default)
+        {
+            // Determine authentication method
+            bool useCertificate = !string.IsNullOrWhiteSpace(ClientCertificatePath);
+            bool useSecret = !ClientSecret.IsEmpty;
+
+            if (!useCertificate && !useSecret)
+            {
+                Program.PrintColorMessage("Neither AZURE_CLIENT_SECRET nor AZURE_CLIENT_CERTIFICATE_PATH is set.", ConsoleColor.Red);
+                return string.Empty;
+            }
+
+            if (useCertificate && useSecret)
+            {
+                Program.PrintColorMessage("Both AZURE_CLIENT_SECRET and AZURE_CLIENT_CERTIFICATE_PATH are set. Using certificate authentication.", ConsoleColor.Yellow);
+            }
+
+            if (useCertificate)
+            {
+                return GetAccessTokenWithCertificate(
+                    HttpClient,
+                    TenantId,
+                    ClientId,
+                    ClientCertificatePath,
+                    CancellationToken
+                    ).GetAwaiter().GetResult();
+            }
+            else
+            {
+                return GetAccessTokenWithSecret(
+                    HttpClient,
+                    TenantId,
+                    ClientId,
+                    ClientSecret,
+                    CancellationToken
+                    );
+            }
+        }
+
+        /// <summary>
+        /// Retrieves an Azure access token using client secret authentication with retry logic.
+        /// </summary>
+        /// <param name="HttpClient">The HTTP client for making requests.</param>
+        /// <param name="TenantId">The Azure tenant ID.</param>
+        /// <param name="ClientId">The Azure client (application) ID.</param>
+        /// <param name="ClientSecret">The client secret for authentication.</param>
+        /// <param name="CancellationToken">Cancellation token to cancel the operation.</param>
+        /// <returns>The access token string, or empty string if authentication fails.</returns>
+        /// <remarks>
+        /// Uses OAuth 2.0 client credentials flow with client_secret.
+        /// Implements exponential backoff with jitter for retries.
+        /// Securely handles the client secret by zeroing memory after use.
+        /// </remarks>
+        private static string GetAccessTokenWithSecret(
+            HttpClient HttpClient,
+            string TenantId,
+            string ClientId,
+            ReadOnlySpan<char> ClientSecret,
+            CancellationToken CancellationToken = default)
+        {
+            byte[] bodyBytes = null;
+            try
+            {
+                // Build body directly as bytes to minimize secret exposure in string form
+                int maxLen = checked(
+                    Utils.GetFormUrlEncodedMaxByteCount(ClientId.Length) +
+                    Utils.GetFormUrlEncodedMaxByteCount(ClientSecret.Length) +
+                    128
+                    );
+                byte[] buffer = ArrayPool<byte>.Shared.Rent(maxLen);
+                try
+                {
+                    int written = 0;
+                    Span<byte> span = buffer;
+
+                    ReadOnlySpan<byte> clientIdPrefix = "client_id="u8;
+                    clientIdPrefix.CopyTo(span[written..]);
+                    written += clientIdPrefix.Length;
+                    written += Utils.WriteFormUrlEncoded(ClientId, span[written..]);
+                    span[written++] = (byte)'&';
+
+                    ReadOnlySpan<byte> scopePrefix = "scope=https%3A%2F%2Fvault.azure.net%2F.default&client_secret="u8;
+                    scopePrefix.CopyTo(span[written..]);
+                    written += scopePrefix.Length;
+                    written += Utils.WriteFormUrlEncoded(ClientSecret, span[written..]);
+                    span[written++] = (byte)'&';
+
+                    ReadOnlySpan<byte> grantPrefix = "grant_type=client_credentials"u8;
+                    grantPrefix.CopyTo(span[written..]);
+                    written += grantPrefix.Length;
+
+                    bodyBytes = span[..written].ToArray();
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer, clearArray: true);
+                }
+
+                using var tokenBody = new ByteArrayContent(bodyBytes);
+                tokenBody.Headers.ContentType = new MediaTypeHeaderValue("application/x-www-form-urlencoded");
+                
+                using var request = new HttpRequestMessage(HttpMethod.Post, $"https://login.microsoftonline.com/{TenantId}/oauth2/v2.0/token");
+                request.Content = tokenBody;
+
+                using var responseMessage = BuildHttpClient.SendWithRetry(HttpClient, request, CancellationToken).GetAwaiter().GetResult();
+                using var jsonResponseStream = responseMessage.Content.ReadAsStreamAsync(CancellationToken).GetAwaiter().GetResult();
+                var tokenResponse = JsonSerializer.DeserializeAsync(jsonResponseStream, AzureJsonContext.Default.TokenResponse, CancellationToken).GetAwaiter().GetResult();
+
+                return tokenResponse.AccessToken ?? string.Empty;
+            }
+            finally
+            {
+                if (bodyBytes != null)
+                {
+                    CryptographicOperations.ZeroMemory(bodyBytes);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Retrieves an Azure access token using certificate-based authentication with retry logic.
+        /// </summary>
+        /// <param name="HttpClient">The HTTP client for making requests.</param>
+        /// <param name="TenantId">The Azure tenant ID.</param>
+        /// <param name="ClientId">The Azure client (application) ID.</param>
+        /// <param name="ClientCertificatePath">Path to the certificate file (.pem, .pfx, or .p12).</param>
+        /// <param name="CancellationToken">Cancellation token to cancel the operation.</param>
+        /// <returns>The access token string, or empty string if authentication fails.</returns>
+        /// <remarks>
+        /// Uses OAuth 2.0 client credentials flow with JWT bearer assertion (client_assertion).
+        /// Supports PEM (.pem) and PFX/PKCS#12 (.pfx, .p12) certificate formats.
+        /// For password-protected PFX files, set AZURE_CLIENT_CERTIFICATE_PASSWORD environment variable.
+        /// The certificate must have a private key and be registered with the Azure AD application.
+        /// Creates a signed JWT using RS256 algorithm for authentication.
+        /// </remarks>
+        private static async Task<string> GetAccessTokenWithCertificate(
+            HttpClient HttpClient,
+            string TenantId,
+            string ClientId,
+            string ClientCertificatePath,
+            CancellationToken CancellationToken = default)
+        {
+            X509Certificate2 clientCertificate = null;
+
+            try
+            {
+                // Load the certificate from file
+                if (!File.Exists(ClientCertificatePath))
+                {
+                    Program.PrintColorMessage($"Certificate file not found: {ClientCertificatePath}", ConsoleColor.Red);
+                    return string.Empty;
+                }
+
+                try
+                {
+                    string fileExtension = Path.GetExtension(ClientCertificatePath).ToLowerInvariant();
+
+                    if (fileExtension.Equals(".pem", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string pemContent = await File.ReadAllTextAsync(ClientCertificatePath, CancellationToken);
+                        clientCertificate = CreateCertificateFromPem(pemContent);
+                    }
+                    else if (
+                        fileExtension.Equals(".pfx", StringComparison.OrdinalIgnoreCase) ||
+                        fileExtension.Equals(".p12", StringComparison.OrdinalIgnoreCase)
+                        )
+                    {
+                        // For PFX, you may need a password. Check environment variable.
+                        Win32.GetEnvironmentVariableSecure("AZURE_CLIENT_CERTIFICATE_PASSWORD", out SecureBuffer certPassword);
+
+                        using (certPassword)
+                        {
+                            if (certPassword != null)
+                            {
+                                clientCertificate = X509CertificateLoader.LoadPkcs12FromFile(ClientCertificatePath, certPassword.Span);
+                            }
+                            else
+                            {
+                                clientCertificate = X509CertificateLoader.LoadPkcs12FromFile(ClientCertificatePath, (string)null);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        Program.PrintColorMessage($"Unsupported certificate format: {fileExtension}. Supported formats: .pem, .pfx, .p12", ConsoleColor.Red);
+                        return string.Empty;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Program.PrintColorMessage($"Failed to load certificate: {ex.Message}", ConsoleColor.Red);
+                    return string.Empty;
+                }
+
+                if (clientCertificate == null || !clientCertificate.HasPrivateKey)
+                {
+                    Program.PrintColorMessage("Certificate must have a private key for authentication.", ConsoleColor.Red);
+                    return string.Empty;
+                }
+
+                Program.PrintColorMessage($"Loaded client certificate: {clientCertificate.Subject} | Thumbprint: {clientCertificate.Thumbprint}", ConsoleColor.Green);
+
+                // Create JWT assertion
+                string jwtAssertion = CreateClientAssertion(TenantId, ClientId, clientCertificate);
+
+                if (string.IsNullOrWhiteSpace(jwtAssertion))
+                {
+                    Program.PrintColorMessage("Failed to create JWT assertion.", ConsoleColor.Red);
+                    return string.Empty;
+                }
+
+                // Request token using client_assertion.
+                var tokenRequestData = new Dictionary<string, string>
+                {
+                    { "client_id", ClientId },
+                    { "client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer" },
+                    { "client_assertion", jwtAssertion },
+                    { "scope", "https://vault.azure.net/.default" },
+                    { "grant_type", "client_credentials" }
+                };
+
+                using var tokenBody = new FormUrlEncodedContent(tokenRequestData);
+                using var request = new HttpRequestMessage(HttpMethod.Post,
+                    $"https://login.microsoftonline.com/{TenantId}/oauth2/v2.0/token");
+                request.Content = tokenBody;
+                using var responseMessage = await BuildHttpClient.SendWithRetry(HttpClient, request, CancellationToken);
+                await using var jsonResponseStream = await responseMessage.Content.ReadAsStreamAsync(CancellationToken);
+                var tokenResponse = await JsonSerializer.DeserializeAsync(
+                    jsonResponseStream, AzureJsonContext.Default.TokenResponse, CancellationToken);
+                return tokenResponse.AccessToken ?? string.Empty;
+            }
+            finally
+            {
+                clientCertificate?.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Creates a JWT (JSON Web Token) assertion signed with a certificate for Azure authentication.
+        /// </summary>
+        /// <param name="TenantId">The Azure tenant ID.</param>
+        /// <param name="ClientId">The Azure client (application) ID.</param>
+        /// <param name="Certificate">The X.509 certificate with a private key for signing.</param>
+        /// <returns>A signed JWT assertion string in the format "header.payload.signature", or null if creation fails.</returns>
+        /// <remarks>
+        /// Creates a self-signed JWT using RS256 algorithm with the following claims:
+        /// - aud: Token endpoint URL
+        /// - exp: Expiration time (10 minutes from now)
+        /// - iss: Client ID (issuer)
+        /// - jti: Unique JWT ID (GUID)
+        /// - nbf: Not before time (current time)
+        /// - sub: Client ID (subject)
+        ///
+        /// The JWT header includes x5t (certificate thumbprint) for key identification.
+        /// </remarks>
+        private static string CreateClientAssertion(string TenantId, string ClientId, X509Certificate2 Certificate)
+        {
+            try
+            {
+                var now = DateTimeOffset.UtcNow;
+                var header = new JwtHeader
+                {
+                    Alg = "RS256",
+                    Typ = "JWT",
+                    X5T = Base64UrlEncode(Certificate.GetCertHash())
+                };
+                var payload = new JwtPayload
+                {
+                    Aud = $"https://login.microsoftonline.com/{TenantId}/oauth2/v2.0/token",
+                    Exp = now.AddMinutes(10).ToUnixTimeSeconds(),
+                    Iss = ClientId,
+                    Jti = Guid.NewGuid().ToString(),
+                    Nbf = now.ToUnixTimeSeconds(),
+                    Sub = ClientId
+                };
+
+                var writer = new ArrayBufferWriter<byte>(1024);
+
+                // Serialize Header
+                using (var jsonWriter = new Utf8JsonWriter(writer))
+                {
+                    JsonSerializer.Serialize(jsonWriter, header, AzureJsonContext.Default.JwtHeader);
+                }
+                string headerBase64 = Base64UrlEncode(writer.WrittenSpan);
+                writer.Clear();
+
+                // Serialize Payload
+                using (var jsonWriter = new Utf8JsonWriter(writer))
+                {
+                    JsonSerializer.Serialize(jsonWriter, payload, AzureJsonContext.Default.JwtPayload);
+                }
+                string payloadBase64 = Base64UrlEncode(writer.WrittenSpan);
+                writer.Clear();
+
+                string dataToSign = $"{headerBase64}.{payloadBase64}";
+                byte[] dataBytes = Encoding.UTF8.GetBytes(dataToSign);
+
+                // Sign with certificate's private key
+                using RSA rsa = Certificate.GetRSAPrivateKey();
+                if (rsa == null)
+                {
+                    Program.PrintColorMessage("Certificate does not have an RSA private key.", ConsoleColor.Red);
+                    return null;
+                }
+
+                byte[] signature = rsa.SignData(dataBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+                string signatureBase64 = Base64UrlEncode(signature);
+
+                return $"{dataToSign}.{signatureBase64}";
+            }
+            catch (Exception ex)
+            {
+                Program.PrintColorMessage($"Failed to create client assertion: {ex.Message}", ConsoleColor.Red);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Encodes binary data to Base64URL format as specified in RFC 4648.
+        /// </summary>
+        /// <param name="Input">The read-only byte span to encode.</param>
+        /// <returns>A Base64URL-encoded string with padding removed.</returns>
+        /// <remarks>
+        /// Base64URL encoding replaces '+' with '-', '/' with '_', and removes trailing '=' padding.
+        /// This encoding is used in JWT tokens and other web-safe applications.
+        /// </remarks>
+        private static string Base64UrlEncode(ReadOnlySpan<byte> Input)
+        {
+            string base64 = Convert.ToBase64String(Input);
+            // Convert base64 to base64url
+            return base64.Replace('+', '-').Replace('/', '_').TrimEnd('=');
+        }
+
+        /// <summary>
+        /// Creates an X509Certificate2 from PEM-encoded certificate and private key data.
+        /// </summary>
+        /// <param name="PemContent">The PEM-encoded content containing a certificate and optionally a private key.</param>
+        /// <returns>An X509Certificate2 with the certificate and private key (if present).</returns>
+        /// <exception cref="System.Security.Cryptography.CryptographicException">Thrown if the PEM content is invalid or the key type is unsupported.</exception>
+        /// <remarks>
+        /// Supports the following PEM blocks:
+        /// - CERTIFICATE (required)
+        /// - PRIVATE KEY, RSA PRIVATE KEY, EC PRIVATE KEY, ENCRYPTED PRIVATE KEY (optional)
+        ///
+        /// If no private key is found, returns a public-only certificate.
+        /// Attempts RSA first, then ECDSA for private key import.
+        /// </remarks>
+        private static X509Certificate2 CreateCertificateFromPem(string PemContent)
+        {
+            // Try to split certs and key; attach the first cert with the private key
+            string certificatePem = ExtractPemBlock(PemContent, "CERTIFICATE");
+            if (certificatePem is null)
+                throw new System.Security.Cryptography.CryptographicException("No CERTIFICATE block found in PEM.");
+
+            string privateKeyPem = ExtractPemBlock(PemContent, "ENCRYPTED PRIVATE KEY")
+                         ?? ExtractPemBlock(PemContent, "PRIVATE KEY")
+                         ?? ExtractPemBlock(PemContent, "RSA PRIVATE KEY")
+                         ?? ExtractPemBlock(PemContent, "EC PRIVATE KEY");
+
+            // Build X509 from cert only first
+            X509Certificate2 certificate = X509Certificate2.CreateFromPem(certificatePem);
+
+            if (privateKeyPem is null)
+            {
+                // Public-only
+                return certificate;
+            }
+
+            // Try RSA first
+            try
+            {
+                using RSA rsa = RSA.Create();
+                rsa.ImportFromPem(privateKeyPem);
+                return certificate.CopyWithPrivateKey(rsa);
+            }
+            catch { }
+
+            // Then ECDSA
+            try
+            {
+                using ECDsa ecdsa = ECDsa.Create();
+                ecdsa.ImportFromPem(privateKeyPem);
+                return certificate.CopyWithPrivateKey(ecdsa);
+            }
+            catch { }
+
+            throw new System.Security.Cryptography.CryptographicException("Unsupported or invalid private key in PEM.");
+        }
+
+        /// <summary>
+        /// Extracts a specific PEM block from text content.
+        /// </summary>
+        /// <param name="TextContent">The text containing PEM-encoded data.</param>
+        /// <param name="Label">The label identifying the PEM block (e.g., "CERTIFICATE", "PRIVATE KEY").</param>
+        /// <returns>The extracted PEM block including begin/end markers, or null if not found.</returns>
+        /// <remarks>
+        /// Searches for blocks in the format:
+        /// -----BEGIN {Label}-----
+        /// [base64 data]
+        /// -----END {Label}-----
+        ///
+        /// The search is case-insensitive.
+        /// </remarks>
+        private static string ExtractPemBlock(string TextContent, string Label)
+        {
+            if (string.IsNullOrWhiteSpace(TextContent))
+                return null;
+
+            ReadOnlySpan<char> text = TextContent.AsSpan();
+
+            // Build markers. String interpolation is fine here as labels are short.
+            string beginMarker = $"-----BEGIN {Label}-----";
+            string endMarker = $"-----END {Label}-----";
+
+            int startIndex = text.IndexOf(beginMarker.AsSpan(), StringComparison.OrdinalIgnoreCase);
+            if (startIndex < 0)
+                return null;
+
+            ReadOnlySpan<char> remaining = text[(startIndex + beginMarker.Length)..];
+            int endIndex = remaining.IndexOf(endMarker.AsSpan(), StringComparison.OrdinalIgnoreCase);
+            if (endIndex < 0)
+                return null;
+
+            // Materialize the final string once including markers
+            return text.Slice(startIndex, beginMarker.Length + endIndex + endMarker.Length).ToString();
+        }
+    }
+
+    /// <summary>
+    /// Represents a certificate retrieved from Azure Key Vault.
+    /// </summary>
+    internal class KeyVaultCertificate
+    {
+        /// <summary>
+        /// Gets or sets the certificate data in DER-encoded format.
+        /// </summary>
+        public byte[] CertificateBuffer { get; set; }
+
+        /// <summary>
+        /// Gets or sets the Key Vault key identifier URL for the certificate's private key.
+        /// </summary>
+        public string KeyId { get; set; }
+    }
+
+    /// <summary>
+    /// Represents the JSON response from Azure Key Vault certificate operations.
+    /// </summary>
+    internal class KeyVaultCertificateResponse
+    {
+        /// <summary>
+        /// Gets or sets the Base64-encoded DER certificate data.
+        /// </summary>
+        [JsonPropertyName("cer")]
+        public string CertificateString { get; set; }
+
+        /// <summary>
+        /// Gets or sets the key identifier URL.
+        /// </summary>
+        [JsonPropertyName("kid")]
+        public string Kid { get; set; }
+
+        /// <summary>
+        /// Gets or sets the certificate identifier URL.
+        /// </summary>
+        [JsonPropertyName("id")]
+        public string Id { get; set; }
+
+        /// <summary>
+        /// Gets or sets the key information containing the key identifier.
+        /// </summary>
+        [JsonPropertyName("key")]
+        public KeyInfo Key { get; set; }
+    }
+
+    /// <summary>
+    /// Represents key information from Azure Key Vault responses.
+    /// </summary>
+    internal class KeyInfo
+    {
+        /// <summary>
+        /// Gets or sets the key identifier URL.
+        /// </summary>
+        [JsonPropertyName("kid")]
+        public string Kid { get; set; }
+    }
+
+    /// <summary>
+    /// Represents responses from Azure Key Vault cryptographic operations.
+    /// </summary>
+    internal class KeyVaultOperationResponse : IKeyVaultSensitiveData
+    {
+        /// <summary>
+        /// Gets or sets the operation result value.
+        /// </summary>
+        // Keep char[] buffers instead of string so callers can clear sensitive values.
+        [JsonPropertyName("value")]
+        [JsonConverter(typeof(KeyVaultBase64UrlCharArrayJsonConverter))]
+        public char[] Value { get; set; }
+
+        /// <summary>
+        /// Gets or sets the signature result from sign operations.
+        /// </summary>
+        // Keep char[] buffers instead of string so callers can clear sensitive values.
+        [JsonPropertyName("signature")]
+        [JsonConverter(typeof(KeyVaultBase64UrlCharArrayJsonConverter))]
+        public char[] Signature { get; set; }
+
+        /// <summary>
+        /// Gets or sets the plaintext result from decrypt operations.
+        /// </summary>
+        // Keep char[] buffers instead of string so callers can clear sensitive values.
+        [JsonPropertyName("plaintext")]
+        [JsonConverter(typeof(KeyVaultBase64UrlCharArrayJsonConverter))]
+        public char[] Plaintext { get; set; }
+
+        /// <summary>
+        /// Gets or sets the additional authenticated data used by authenticated encryption operations.
+        /// </summary>
+        // Keep char[] buffers instead of string so callers can clear sensitive values.
+        [JsonPropertyName("aad")]
+        [JsonConverter(typeof(KeyVaultBase64UrlCharArrayJsonConverter))]
+        public char[] AdditionalAuthenticatedData { get; set; }
+
+        /// <summary>
+        /// Gets or sets the initialization vector used by authenticated encryption operations.
+        /// </summary>
+        // Keep char[] buffers instead of string so callers can clear sensitive values.
+        [JsonPropertyName("iv")]
+        [JsonConverter(typeof(KeyVaultBase64UrlCharArrayJsonConverter))]
+        public char[] InitializationVector { get; set; }
+
+        /// <summary>
+        /// Gets or sets the authentication tag returned by authenticated encryption operations.
+        /// </summary>
+        // Keep char[] buffers instead of string so callers can clear sensitive values.
+        [JsonPropertyName("tag")]
+        [JsonConverter(typeof(KeyVaultBase64UrlCharArrayJsonConverter))]
+        public char[] AuthenticationTag { get; set; }
+
+        public void ClearSensitiveData()
+        {
+            CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(this.Value.AsSpan()));
+            CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(this.Signature.AsSpan()));
+            CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(this.Plaintext.AsSpan()));
+            CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(this.AdditionalAuthenticatedData.AsSpan()));
+            CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(this.InitializationVector.AsSpan()));
+            CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(this.AuthenticationTag.AsSpan()));
+        }
+    }
+
+    /// <summary>
+    /// Represents an OAuth 2.0 token response from Azure AD.
+    /// </summary>
+    internal readonly struct TokenResponse
+    {
+        /// <summary>
+        /// Gets the access token for authenticating API requests.
+        /// </summary>
+        [JsonPropertyName("access_token")]
+        public string AccessToken { get; init; }
+
+        /// <summary>
+        /// Gets the type of token (typically "Bearer").
+        /// </summary>
+        [JsonPropertyName("token_type")]
+        public string TokenType { get; init; }
+
+        /// <summary>
+        /// Gets the token lifetime in seconds.
+        /// </summary>
+        [JsonPropertyName("expires_in")]
+        public int ExpiresIn { get; init; }
+
+        /// <summary>
+        /// Gets the scope of the access token.
+        /// </summary>
+        [JsonPropertyName("scope")]
+        public string Scope { get; init; }
+    }
+
+    /// <summary>
+    /// Represents a secret response from Azure Key Vault.
+    /// </summary>
+    internal readonly struct SecretResponse
+    {
+        /// <summary>
+        /// Gets the secret value.
+        /// </summary>
+        [JsonPropertyName("value")]
+        public string Value { get; init; }
+
+        /// <summary>
+        /// Gets the secret identifier URL.
+        /// </summary>
+        [JsonPropertyName("id")]
+        public string Id { get; init; }
+
+        /// <summary>
+        /// Gets the secret name.
+        /// </summary>
+        [JsonPropertyName("name")]
+        public string Name { get; init; }
+    }
+
+    /// <summary>
+    /// Represents a JWT header for client assertion.
+    /// </summary>
+    internal class JwtHeader
+    {
+        /// <summary>
+        /// Gets or sets the signing algorithm (RS256).
+        /// </summary>
+        [JsonPropertyName("alg")]
+        public string Alg { get; set; }
+
+        /// <summary>
+        /// Gets or sets the token type (JWT).
+        /// </summary>
+        [JsonPropertyName("typ")]
+        public string Typ { get; set; }
+
+        /// <summary>
+        /// Gets or sets the X.509 certificate thumbprint (Base64URL-encoded).
+        /// </summary>
+        [JsonPropertyName("x5t")]
+        public string X5T { get; set; }
+    }
+
+    /// <summary>
+    /// Represents a JWT payload for client assertion.
+    /// </summary>
+    internal class JwtPayload
+    {
+        /// <summary>
+        /// Gets or sets the audience (token endpoint URL).
+        /// </summary>
+        [JsonPropertyName("aud")]
+        public string Aud { get; set; }
+
+        /// <summary>
+        /// Gets or sets the expiration time (Unix timestamp).
+        /// </summary>
+        [JsonPropertyName("exp")]
+        public long Exp { get; set; }
+
+        /// <summary>
+        /// Gets or sets the issuer (client ID).
+        /// </summary>
+        [JsonPropertyName("iss")]
+        public string Iss { get; set; }
+
+        /// <summary>
+        /// Gets or sets the JWT ID (unique identifier).
+        /// </summary>
+        [JsonPropertyName("jti")]
+        public string Jti { get; set; }
+
+        /// <summary>
+        /// Gets or sets the not-before time (Unix timestamp).
+        /// </summary>
+        [JsonPropertyName("nbf")]
+        public long Nbf { get; set; }
+
+        /// <summary>
+        /// Gets or sets the subject (client ID).
+        /// </summary>
+        [JsonPropertyName("sub")]
+        public string Sub { get; set; }
+    }
+
+    /// <summary>
+    /// JSON serialization context for Azure API data transfer objects.
+    /// Provides source-generated serialization for improved performance.
+    /// </summary>
+    [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull, WriteIndented = false, GenerationMode = JsonSourceGenerationMode.Default)]
+    [JsonSerializable(typeof(TokenResponse))]
+    [JsonSerializable(typeof(SecretResponse))]
+    [JsonSerializable(typeof(KeyVaultCertificateResponse))]
+    [JsonSerializable(typeof(KeyVaultOperationRequest))]
+    [JsonSerializable(typeof(KeyVaultOperationResponse))]
+    [JsonSerializable(typeof(KeyVaultVerifyRequest))]
+    [JsonSerializable(typeof(KeyVaultVerifyResponse))]
+    [JsonSerializable(typeof(KeyVaultKeyResponse))]
+    [JsonSerializable(typeof(KeyVaultKeyListResponse))]
+    [JsonSerializable(typeof(KeyVaultJsonWebKey))]
+    [JsonSerializable(typeof(KeyVaultKeyAttributes))]
+    [JsonSerializable(typeof(KeyVaultKeyCreateRequest))]
+    [JsonSerializable(typeof(KeyVaultKeyImportRequest))]
+    [JsonSerializable(typeof(KeyVaultKeyUpdateRequest))]
+    [JsonSerializable(typeof(KeyVaultKeyReleasePolicy))]
+    [JsonSerializable(typeof(KeyVaultBackupResponse))]
+    [JsonSerializable(typeof(KeyVaultRestoreRequest))]
+    [JsonSerializable(typeof(KeyVaultKeyReleaseRequest))]
+    [JsonSerializable(typeof(KeyVaultKeyReleaseResponse))]
+    [JsonSerializable(typeof(KeyVaultKeyRotationPolicy))]
+    [JsonSerializable(typeof(KeyVaultKeyRotationPolicyAttributes))]
+    [JsonSerializable(typeof(KeyVaultKeyLifetimeAction))]
+    [JsonSerializable(typeof(KeyVaultKeyLifetimeActionTrigger))]
+    [JsonSerializable(typeof(KeyVaultKeyLifetimeActionType))]
+    [JsonSerializable(typeof(JwtHeader))]
+    [JsonSerializable(typeof(JwtPayload))]
+    internal partial class AzureJsonContext : JsonSerializerContext;
+}
