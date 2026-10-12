@@ -1,0 +1,18 @@
+import 'package:drift3_preview/drift.dart';
+import 'package:drift_sqlite/drift_sqlite.dart';
+import 'package:sqlite3/sqlite3.dart';
+
+import '../generated/todos.dart';
+
+void main() {
+  TodoDb(
+    DriftConnection(
+      dialect: SqliteDialect.new,
+      openConnection: (_) async => SqliteConnection(sqlite3.openInMemory()),
+    ),
+  );
+  print('database created');
+
+  // Keep the process alive
+  Stream<void>.periodic(const Duration(seconds: 10)).listen(null);
+}

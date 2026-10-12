@@ -1,0 +1,551 @@
+package policyhandler
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+
+	"github.com/armosec/armoapi-go/armotypes"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/cautils/getter"
+	"github.com/kubescape/kubescape/v4/core/mocks"
+	apisv1 "github.com/kubescape/opa-utils/httpserver/apis/v1"
+	"github.com/kubescape/opa-utils/reporthandling"
+	reporthandlingv2 "github.com/kubescape/opa-utils/reporthandling/v2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const (
+	FrameworkName = "framework-0006-0013"
+)
+
+var (
+	CachedControlInputs = map[string][]string{
+		"control1": {"input1", "input2"},
+		"control2": {"input3", "input4"},
+	}
+	CachedExceptions = []armotypes.PostureExceptionPolicy{*mocks.MockExceptionAllKinds(&armotypes.PosturePolicy{FrameworkName: "nsa"})}
+)
+
+type ExceptionsGetterMock struct{}
+type ControlsInputsGetterMock struct{}
+type PolicyGetterMock struct{}
+type nonPersistentPolicyGetterMock struct{ PolicyGetterMock }
+
+func (mock *nonPersistentPolicyGetterMock) ShouldPersistPolicyArtifacts() bool {
+	return false
+}
+
+func (mock *nonPersistentPolicyGetterMock) GetControl(name string) (*reporthandling.Control, error) {
+	return &reporthandling.Control{ControlID: name}, nil
+}
+
+func (mock *ExceptionsGetterMock) GetExceptions(ctx context.Context, clusterName string) ([]armotypes.PostureExceptionPolicy, error) {
+	return CachedExceptions, nil
+}
+func (mock *ControlsInputsGetterMock) GetControlsInputs(ctx context.Context, clusterName string) (map[string][]string, error) {
+	return CachedControlInputs, nil
+}
+func (mock *PolicyGetterMock) GetControl(name string) (*reporthandling.Control, error) {
+	return &reporthandling.Control{}, nil
+}
+func (mock *PolicyGetterMock) GetFramework(name string) (*reporthandling.Framework, error) {
+	return mocks.MockFramework_0006_0013(), nil
+}
+func (mock *PolicyGetterMock) GetFrameworks() ([]reporthandling.Framework, error) {
+	return []reporthandling.Framework{}, nil
+}
+func (mock *PolicyGetterMock) ListControls() ([]string, error) {
+	return []string{}, nil
+}
+func (mock *PolicyGetterMock) ListFrameworks() ([]string, error) {
+	return []string{}, nil
+}
+
+// Returns a PolicyHandler instance with the given clusterName.
+func TestNewPolicyHandler_ClusterNameNotEmpty(t *testing.T) {
+	clusterName := "test-cluster"
+	policyHandler := NewPolicyHandler(clusterName)
+	assert.NotNil(t, policyHandler)
+	assert.Equal(t, clusterName, policyHandler.clusterName)
+}
+
+// Returns the same PolicyHandler instance if called multiple times.
+func TestNewPolicyHandler_MultiplePoliciesWithSameClusterName(t *testing.T) {
+	clusterName := "test-cluster"
+	policyHandler1 := NewPolicyHandler(clusterName)
+	policyHandler2 := NewPolicyHandler(clusterName)
+	assert.Equal(t, policyHandler1, policyHandler2)
+}
+
+// TestNewPolicyHandler_DifferentClusterNameGetsFreshInstance guards against a
+// regression where the process-wide singleton was reused unconditionally,
+// regardless of the requested clusterName. getExceptions/getControlInputs
+// fetch data scoped by policyHandler.clusterName, so a long-running caller
+// that serves requests for more than one cluster/account in the same process
+// (the httphandler HTTP service, via core/core/scan.go) would silently keep
+// using whichever cluster's exceptions/control-inputs the *first* request
+// happened to warm the cache with, for every later request regardless of
+// what clusterName it actually asked for.
+func TestNewPolicyHandler_DifferentClusterNameGetsFreshInstance(t *testing.T) {
+	first := NewPolicyHandler("cluster-a")
+	require.Equal(t, "cluster-a", first.clusterName)
+
+	second := NewPolicyHandler("cluster-b")
+	assert.Equal(t, "cluster-b", second.clusterName,
+		"a different clusterName must produce an instance scoped to that cluster, not reuse the previous cluster's instance")
+	assert.NotSame(t, first, second, "a different clusterName must not reuse the previous cluster's PolicyHandler")
+
+	// Same clusterName as the most recent call must still reuse the
+	// instance (the caching behavior this singleton exists to provide).
+	third := NewPolicyHandler("cluster-b")
+	assert.Same(t, second, third)
+}
+
+func TestCollectPolicies(t *testing.T) {
+	testCases := []struct {
+		name          string
+		policyHandler *PolicyHandler
+		policyIdent   []cautils.PolicyIdentifier
+		scanInfo      *cautils.ScanInfo
+		expectedError error
+	}{
+		{
+			name:          "Unknown policy",
+			policyHandler: NewPolicyHandler("test-cluster"),
+			policyIdent:   []cautils.PolicyIdentifier{{Identifier: "NotExistingPolicy"}},
+			scanInfo:      &cautils.ScanInfo{},
+			expectedError: fmt.Errorf("unknown policy kind"),
+		},
+		{
+			name:          "Collect Framework policy",
+			policyHandler: NewPolicyHandler("test-cluster"),
+			policyIdent:   []cautils.PolicyIdentifier{{Identifier: FrameworkName, Kind: "Framework"}},
+			scanInfo:      &cautils.ScanInfo{},
+			expectedError: nil,
+		},
+		{
+			name:          "Collect Control policy",
+			policyHandler: NewPolicyHandler("test-cluster"),
+			policyIdent:   []cautils.PolicyIdentifier{{Identifier: "", Kind: "Control"}},
+			scanInfo:      &cautils.ScanInfo{},
+			expectedError: nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			getters := &cautils.Getters{
+				PolicyGetter:         &PolicyGetterMock{},
+				ExceptionsGetter:     &ExceptionsGetterMock{},
+				ControlsInputsGetter: &ControlsInputsGetterMock{},
+			}
+
+			opaSessionObj, err := tc.policyHandler.CollectPolicies(ctx, tc.policyIdent, tc.scanInfo, getters)
+
+			assert.Equal(t, tc.expectedError, err)
+			assert.NotNil(t, opaSessionObj)
+		})
+	}
+}
+
+// Should return a deep copy of the input slice of reporthandling.Framework structs
+func TestDeepCopyPolicies_ShouldReturnDeepCopyOfInputSlice(t *testing.T) {
+	src := []reporthandling.Framework{
+		{
+			Controls: []reporthandling.Control{
+				{
+					ControlID: "c-0001",
+				},
+			},
+		},
+		{
+			Controls: []reporthandling.Control{},
+		},
+	}
+
+	// Act
+	dst, err := deepCopyPolicies(src)
+
+	// Assert
+	assert.NoError(t, err)
+	assert.NotNil(t, dst)
+}
+
+func TestDownloadScanPolicies(t *testing.T) {
+	testCases := []struct {
+		name           string
+		policyHandler  *PolicyHandler
+		policyIdent    []cautils.PolicyIdentifier
+		scanInfo       *cautils.ScanInfo
+		expectedError  error
+		expectedResult []reporthandling.Framework
+	}{
+		{
+			name:           "Unknown kind",
+			policyHandler:  NewPolicyHandler("test-cluster"),
+			policyIdent:    []cautils.PolicyIdentifier{{Identifier: "framework-0006-0013", Kind: "NotExistingKind"}},
+			scanInfo:       &cautils.ScanInfo{},
+			expectedError:  fmt.Errorf("unknown policy kind"),
+			expectedResult: []reporthandling.Framework{},
+		},
+		{
+			name:          "Kind Framework",
+			policyHandler: NewPolicyHandler("test-cluster"),
+			policyIdent:   []cautils.PolicyIdentifier{{Identifier: "framework-0006-0013", Kind: "Framework"}},
+			scanInfo:      &cautils.ScanInfo{},
+			expectedError: nil,
+			expectedResult: []reporthandling.Framework{
+				*mocks.MockFramework_0006_0013(),
+			},
+		},
+		{
+			name:          "Kind Control",
+			policyHandler: NewPolicyHandler("test-cluster"),
+			policyIdent:   []cautils.PolicyIdentifier{{Identifier: "control1", Kind: "Control"}},
+			scanInfo:      &cautils.ScanInfo{},
+			expectedError: nil,
+			expectedResult: []reporthandling.Framework{
+				{
+					Controls: []reporthandling.Control{
+						{
+							ControlID: "",
+						},
+					},
+				},
+			},
+		},
+		{
+			// Regression test: a ScanAll request appends all frameworks followed by all
+			// controls into the same []PolicyIdentifier (see core/core/scan.go). Before the
+			// fix, downloadScanPolicies used the *first* identifier's Kind for the whole
+			// batch, so with Framework first it tried to download every control identifier
+			// via GetFramework and failed with "framework '<control-id>' not found".
+			name:          "Mixed Framework and Control identifiers",
+			policyHandler: NewPolicyHandler("test-cluster"),
+			policyIdent: []cautils.PolicyIdentifier{
+				{Identifier: "framework-0006-0013", Kind: "Framework"},
+				{Identifier: "control1", Kind: "Control"},
+			},
+			scanInfo:      &cautils.ScanInfo{},
+			expectedError: nil,
+			expectedResult: []reporthandling.Framework{
+				*mocks.MockFramework_0006_0013(),
+				{
+					Controls: []reporthandling.Control{
+						{
+							ControlID: "",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			getters := &cautils.Getters{
+				PolicyGetter:         &PolicyGetterMock{},
+				ExceptionsGetter:     &ExceptionsGetterMock{},
+				ControlsInputsGetter: &ControlsInputsGetterMock{},
+			}
+
+			frameworks, err := tc.policyHandler.downloadScanPolicies(ctx, tc.policyIdent, getters)
+
+			assert.Equal(t, tc.expectedError, err)
+			assert.Equal(t, tc.expectedResult, frameworks)
+		})
+	}
+}
+
+func TestGetExceptions(t *testing.T) {
+	cachedExceptions := CachedExceptions
+	policyHandler := NewPolicyHandler("test-cluster")
+	getters := &cautils.Getters{
+		ExceptionsGetter: &ExceptionsGetterMock{},
+	}
+	exceptions, err := policyHandler.getExceptions(context.TODO(), nil, getters)
+
+	assert.NoError(t, err)
+	assert.Equal(t, cachedExceptions, exceptions)
+}
+
+func TestGetControlInputs(t *testing.T) {
+	cachedControlInputs := CachedControlInputs
+	policyHandler := NewPolicyHandler("test-cluster")
+	getters := &cautils.Getters{
+		ControlsInputsGetter: &ControlsInputsGetterMock{},
+	}
+
+	controlInputs, err := policyHandler.getControlInputs(context.TODO(), nil, getters)
+
+	assert.NoError(t, err)
+	assert.Equal(t, cachedControlInputs, controlInputs)
+}
+
+func TestCollectPolicies_ReplaysRunnerInputProvenanceFromCache(t *testing.T) {
+	t.Setenv(PoliciesCacheTtlEnvVar, "1m")
+	handler := NewRequestScopedPolicyHandler("test-cluster")
+	defer handler.Close()
+
+	newScanInfo := func() *cautils.ScanInfo {
+		return &cautils.ScanInfo{ScanContract: &reporthandlingv2.ScanContractMetadata{
+			APIVersion:     "config.kubescape.io/v1alpha1",
+			Contract:       "ci",
+			DigestSchema:   "kubescape-scan-contract:v1",
+			ContractDigest: "sha256:contract",
+		}}
+	}
+	newGetters := func() *cautils.Getters {
+		testdata := filepath.Join("..", "..", "cautils", "getter", "testdata")
+		return &cautils.Getters{
+			PolicyGetter:         &nonPersistentPolicyGetterMock{},
+			ExceptionsGetter:     getter.NewLoadPolicy([]string{filepath.Join(testdata, "exceptions.json")}),
+			ControlsInputsGetter: getter.NewLoadPolicy([]string{filepath.Join(testdata, "controls-inputs.json")}),
+		}
+	}
+	identifiers := []cautils.PolicyIdentifier{{Identifier: FrameworkName, Kind: apisv1.KindFramework}}
+
+	first, err := handler.CollectPolicies(context.Background(), identifiers, newScanInfo(), newGetters())
+	require.NoError(t, err)
+	firstContract := first.Metadata.ScanMetadata.ScanContract
+	require.NotNil(t, firstContract)
+	require.Len(t, firstContract.RunnerInputs, 2)
+
+	secondGetters := newGetters()
+	second, err := handler.CollectPolicies(context.Background(), identifiers, newScanInfo(), secondGetters)
+	require.NoError(t, err)
+	secondContract := second.Metadata.ScanMetadata.ScanContract
+	require.NotNil(t, secondContract)
+
+	assert.Equal(t, firstContract.RunnerInputs, secondContract.RunnerInputs,
+		"a cache hit must replay the file digests captured when the cached values were first consumed")
+	assert.Equal(t, firstContract.EffectiveRunDigest, secondContract.EffectiveRunDigest)
+	_, _, consumed := secondGetters.ExceptionsGetter.(getter.ConsumedFileDigester).ConsumedFileDigest()
+	assert.False(t, consumed, "the second scan should receive exceptions from PolicyHandler's cache")
+	_, _, consumed = secondGetters.ControlsInputsGetter.(getter.ConsumedFileDigester).ConsumedFileDigest()
+	assert.False(t, consumed, "the second scan should receive control inputs from PolicyHandler's cache")
+}
+
+func TestDownloadScanPolicies_LocalCacheBypass(t *testing.T) {
+	// Create a dummy control file
+	tempFile := filepath.Join(t.TempDir(), "control1.json")
+	err := os.WriteFile(tempFile, []byte(`{"controlID": "control1", "name": "mock-control"}`), 0600)
+	assert.NoError(t, err)
+
+	lp := getter.NewLoadPolicy([]string{tempFile})
+
+	policyHandler := NewPolicyHandler("test-cluster-bypass")
+	getters := &cautils.Getters{
+		PolicyGetter: lp,
+	}
+	policyIdent := []cautils.PolicyIdentifier{{Identifier: "control1", Kind: "Control"}}
+
+	// Mock the local cache directory
+	cacheDir := t.TempDir()
+	originalLocalStore := getter.DefaultLocalStore
+	getter.DefaultLocalStore = cacheDir
+	defer func() { getter.DefaultLocalStore = originalLocalStore }()
+
+	_, err = policyHandler.downloadScanPolicies(context.Background(), policyIdent, getters)
+	assert.NoError(t, err)
+
+	// Verify that the cache dir is empty (cache bypassed)
+	files, err := os.ReadDir(cacheDir)
+	assert.NoError(t, err)
+	assert.Empty(t, files)
+}
+
+func TestGetScanPolicies_LocalSourceBypassesSharedCache(t *testing.T) {
+	t.Setenv(PoliciesCacheTtlEnvVar, "1h")
+	policyHandler := NewRequestScopedPolicyHandler("local-source-cluster")
+	defer policyHandler.Close()
+
+	policyIdent := []cautils.PolicyIdentifier{{Identifier: FrameworkName, Kind: "Framework"}}
+	remoteGetters := &cautils.Getters{PolicyGetter: &PolicyGetterMock{}}
+
+	remotePolicies, err := policyHandler.getScanPolicies(context.Background(), policyIdent, remoteGetters)
+	require.NoError(t, err)
+	require.NotEmpty(t, remotePolicies)
+
+	localFramework := reporthandling.Framework{
+		PortalBase: armotypes.PortalBase{Name: FrameworkName},
+		Controls: []reporthandling.Control{
+			{
+				PortalBase: armotypes.PortalBase{Name: "local override"},
+				ControlID:  "local-control",
+			},
+		},
+	}
+	localBytes, err := json.Marshal(localFramework)
+	require.NoError(t, err)
+	localPath := filepath.Join(t.TempDir(), "framework.json")
+	require.NoError(t, os.WriteFile(localPath, localBytes, 0o600))
+
+	localGetters := &cautils.Getters{PolicyGetter: getter.NewLoadPolicy([]string{localPath})}
+	localPolicies, err := policyHandler.getScanPolicies(context.Background(), policyIdent, localGetters)
+	require.NoError(t, err)
+	require.Len(t, localPolicies, 1)
+	require.Len(t, localPolicies[0].Controls, 1)
+	assert.Equal(t, "local-control", localPolicies[0].Controls[0].ControlID,
+		"an explicit local source must not be shadowed by a warm shared cache entry")
+
+	remotePoliciesAgain, err := policyHandler.getScanPolicies(context.Background(), policyIdent, remoteGetters)
+	require.NoError(t, err)
+	require.Len(t, remotePoliciesAgain, len(remotePolicies))
+	require.NotEmpty(t, remotePoliciesAgain[0].Controls)
+	assert.Equal(t, remotePolicies[0].Controls[0].ControlID, remotePoliciesAgain[0].Controls[0].ControlID,
+		"a local request must not replace the shared remote-policy cache")
+	assert.NotEqual(t, "local-control", remotePoliciesAgain[0].Controls[0].ControlID)
+}
+
+func TestDownloadScanPolicies_NonPersistentSourcePreservesSharedFallback(t *testing.T) {
+	cacheDir := t.TempDir()
+	originalLocalStore := getter.DefaultLocalStore
+	getter.DefaultLocalStore = cacheDir
+	t.Cleanup(func() { getter.DefaultLocalStore = originalLocalStore })
+
+	cachePath, err := getter.PolicyCachePath(FrameworkName)
+	require.NoError(t, err)
+	rollingFallback := []byte(`{"name":"rolling-fallback","controls":[{"controlID":"rolling-control"}]}`)
+	require.NoError(t, os.WriteFile(cachePath, rollingFallback, 0o600))
+
+	policyHandler := NewRequestScopedPolicyHandler("non-persistent-policy-source")
+	t.Cleanup(policyHandler.Close)
+	getters := &cautils.Getters{PolicyGetter: &nonPersistentPolicyGetterMock{}}
+	policyIdent := []cautils.PolicyIdentifier{{Identifier: FrameworkName, Kind: "Framework"}}
+
+	frameworks, err := policyHandler.downloadScanPolicies(context.Background(), policyIdent, getters)
+	require.NoError(t, err)
+	require.NotEmpty(t, frameworks, "the requested policy must still be returned to the current scan")
+
+	after, err := os.ReadFile(cachePath)
+	require.NoError(t, err)
+	require.Equal(t, rollingFallback, after,
+		"a source without cache provenance must not replace the shared rolling fallback")
+
+	const controlID = "control-from-non-persistent-source"
+	controlCachePath, err := getter.PolicyCachePath(controlID)
+	require.NoError(t, err)
+	rollingControlFallback := []byte(`{"controlID":"rolling-control"}`)
+	require.NoError(t, os.WriteFile(controlCachePath, rollingControlFallback, 0o600))
+
+	controlIdentifiers := []cautils.PolicyIdentifier{{Identifier: controlID, Kind: "Control"}}
+	controlFrameworks, err := policyHandler.downloadScanPolicies(context.Background(), controlIdentifiers, getters)
+	require.NoError(t, err)
+	require.Len(t, controlFrameworks, 1)
+	require.Len(t, controlFrameworks[0].Controls, 1)
+	require.Equal(t, controlID, controlFrameworks[0].Controls[0].ControlID,
+		"the requested control must still be returned to the current scan")
+
+	controlAfter, err := os.ReadFile(controlCachePath)
+	require.NoError(t, err)
+	require.Equal(t, rollingControlFallback, controlAfter,
+		"a non-persistent control source must not replace the shared rolling fallback")
+}
+
+type ControlsInputsGetterEmptyMock struct{}
+
+func (mock *ControlsInputsGetterEmptyMock) GetControlsInputs(ctx context.Context, clusterName string) (map[string][]string, error) {
+	return nil, nil
+}
+
+func TestGetControlInputs_EmptyReturnsErrorNotCached(t *testing.T) {
+	t.Setenv("POLICIES_CACHE_TTL", "10")
+	policyHandler := NewRequestScopedPolicyHandler("test-cluster")
+	defer policyHandler.Close()
+	getters := &cautils.Getters{
+		ControlsInputsGetter: &ControlsInputsGetterEmptyMock{},
+	}
+
+	controlInputs, err := policyHandler.getControlInputs(context.TODO(), nil, getters)
+
+	assert.Error(t, err)
+	assert.Nil(t, controlInputs)
+
+	_, cacheHit := policyHandler.cachedControlInputs.Get()
+	assert.False(t, cacheHit, "empty control inputs should not be cached")
+}
+
+func TestGetControlInputs_NonNilResultIsCached(t *testing.T) {
+	t.Setenv("POLICIES_CACHE_TTL", "10")
+	policyHandler := NewRequestScopedPolicyHandler("test-cluster")
+	defer policyHandler.Close()
+	getters := &cautils.Getters{
+		ControlsInputsGetter: &ControlsInputsGetterMock{},
+	}
+
+	controlInputs, err := policyHandler.getControlInputs(context.TODO(), nil, getters)
+
+	assert.NoError(t, err)
+	assert.Equal(t, CachedControlInputs, controlInputs)
+
+	_, cacheHit := policyHandler.cachedControlInputs.Get()
+	assert.True(t, cacheHit, "non-nil control inputs should be cached")
+}
+
+type DynamicPolicyGetterMock struct{}
+
+func (mock *DynamicPolicyGetterMock) GetControl(name string) (*reporthandling.Control, error) {
+	return &reporthandling.Control{}, nil
+}
+
+func (mock *DynamicPolicyGetterMock) GetFramework(name string) (*reporthandling.Framework, error) {
+	return &reporthandling.Framework{
+		PortalBase: armotypes.PortalBase{
+			Name: name,
+		},
+		Controls: []reporthandling.Control{{
+			PortalBase: armotypes.PortalBase{
+				Name: "control-mock",
+			},
+		}},
+	}, nil
+}
+
+func (mock *DynamicPolicyGetterMock) GetFrameworks() ([]reporthandling.Framework, error) {
+	return nil, nil
+}
+
+func (mock *DynamicPolicyGetterMock) ListControls() ([]string, error) {
+	return nil, nil
+}
+
+func (mock *DynamicPolicyGetterMock) ListFrameworks() ([]string, error) {
+	return nil, nil
+}
+
+func TestGetScanPolicies_ConcurrentDifferentFrameworksAtomicCache(t *testing.T) {
+	policyHandler := NewRequestScopedPolicyHandler("test-cluster-atomic")
+	defer policyHandler.Close()
+
+	getters := &cautils.Getters{
+		PolicyGetter: &DynamicPolicyGetterMock{},
+	}
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	goroutines := 20
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			frameworkName := fmt.Sprintf("framework-%d", idx%3)
+			policyIdent := []cautils.PolicyIdentifier{{Identifier: frameworkName, Kind: "Framework"}}
+			res, err := policyHandler.getScanPolicies(ctx, policyIdent, getters)
+			assert.NoError(t, err)
+			require.NotEmpty(t, res)
+			assert.Equal(t, frameworkName, res[0].Name)
+		}(i)
+	}
+
+	wg.Wait()
+}

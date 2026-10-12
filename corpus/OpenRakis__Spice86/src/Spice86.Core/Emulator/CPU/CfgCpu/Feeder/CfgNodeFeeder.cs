@@ -1,0 +1,124 @@
+namespace Spice86.Core.Emulator.CPU.CfgCpu.Feeder;
+
+using Spice86.Core.Emulator.CPU.CfgCpu.ControlFlowGraph;
+using Spice86.Core.Emulator.CPU.CfgCpu.Exceptions;
+using Spice86.Core.Emulator.CPU.CfgCpu.InstructionExecutor.Expressions;
+using Spice86.Core.Emulator.CPU.CfgCpu.Linker;
+using Spice86.Core.Emulator.CPU.CfgCpu.ParsedInstruction;
+using Spice86.Core.Emulator.Memory;
+using Spice86.Core.Emulator.VM.Breakpoint;
+
+using Spice86.Shared.Emulator.Memory;
+
+using SequentialIdAllocator = Spice86.Shared.Utils.SequentialIdAllocator;
+
+/// <summary>
+/// Handles coherency between the memory and the graph of instructions executed by the CPU.
+/// Next node to execute is normally the next node from the graph but several checks are done to make sure it is really it:
+///  - The node is not null (otherwise it is taken from memory)
+///  - If the node is an assembly node, it is the same as what is currently in memory, otherwise it means self modifying code is being detected
+///  - If self modifying code is being detected, Selector node is being injected instead.
+/// Once the node to execute is determined, it is linked to the previously executed node in the execution context if possible.
+/// </summary>
+public class CfgNodeFeeder {
+    private readonly State _state;
+    private readonly NodeLinker _nodeLinker;
+
+    public CfgNodeFeeder(IMemory memory, State state, EmulatorBreakpointsManager emulatorBreakpointsManager,
+        InstructionReplacerRegistry replacerRegistry, CfgNodeExecutionCompiler executionCompiler, SequentialIdAllocator idAllocator,
+        bool enableSpeculativeExploration) {
+        _state = state;
+        _nodeLinker = new(replacerRegistry, executionCompiler, idAllocator);
+        InstructionsFeeder = new(emulatorBreakpointsManager, memory, state, replacerRegistry, executionCompiler, idAllocator,
+            enableSpeculativeExploration ? _nodeLinker : null);
+    }
+
+    public InstructionsFeeder InstructionsFeeder { get; }
+
+    /// <summary>Persistent graph index spanning all nodes (observed + speculative).</summary>
+    public CfgNodeIndex NodeIndex => InstructionsFeeder.NodeIndex;
+
+    /// <summary>
+    /// Seeds known-safe interrupt handler entry points for speculative exploration.
+    /// No-op when speculative exploration is disabled.
+    /// </summary>
+    public void SeedKnownSafeHandlers(IReadOnlyList<SegmentedAddress> handlerAddresses) =>
+        InstructionsFeeder.SeedKnownSafeHandlers(handlerAddresses);
+
+    /// <summary>
+    /// Parses or retrieves from cache the instruction at the current IP from memory.
+    /// May trigger SignatureReducer and InstructionReplacerRegistry side effects.
+    /// </summary>
+    public CfgInstruction GetInstructionFromMemoryAtIp() =>
+        InstructionsFeeder.GetInstructionFromMemory(_state.IpSegmentedAddress);
+
+    public ICfgNode GetLinkedCfgNodeToExecute(ExecutionContext executionContext) {
+        ICfgNode toExecute = DetermineToExecute(executionContext);
+        ICfgNode? lastExecuted = executionContext.LastExecuted;
+        if (lastExecuted is not { CanHaveMoreSuccessors: true }) {
+            return toExecute;
+        }
+
+        // Node can still have successors, try to register the link in the graph
+        InstructionSuccessorType type = executionContext.CpuFault
+            ? InstructionSuccessorType.CpuFault
+            : InstructionSuccessorType.Normal;
+        // Reset it
+        executionContext.CpuFault = false;
+
+        return _nodeLinker.Link(type, lastExecuted, toExecute);
+    }
+
+    private ICfgNode DetermineToExecute(ExecutionContext executionContext) {
+        ICfgNode? currentFromGraph = executionContext.NodeToExecuteNextAccordingToGraph;
+        if (currentFromGraph == null) {
+            return GetInstructionFromMemoryAtIp();
+        }
+        if (currentFromGraph.IsLive) {
+            // Instruction is up to date. No need to do anything.
+            return currentFromGraph;
+        }
+        return ReconcileGraphWithMemory(executionContext, currentFromGraph);
+    }
+
+    /// <summary>
+    /// The graph node is stale (memory changed since it was parsed).
+    /// Parsing the current memory instruction may trigger SignatureReducer if it is reducible with
+    /// the stale graph node (same opcode, different non-final fields). The reduction propagates via
+    /// InstructionReplacerRegistry -> ExecutionContextManager, updating
+    /// executionContext.NodeToExecuteNextAccordingToGraph from staleGraphNode to the merged instruction.
+    /// If after that the graph still disagrees with memory, a SelectorNode is injected.
+    /// </summary>
+    private ICfgNode ReconcileGraphWithMemory(ExecutionContext executionContext, ICfgNode staleGraphNode) {
+        CfgInstruction fromMemory = GetInstructionFromMemoryAtIp();
+        ICfgNode? graphNodeAfterReconciliation = executionContext.NodeToExecuteNextAccordingToGraph;
+
+        // If the replacer merged the stale node into fromMemory, the graph reference
+        // now points to fromMemory. Reconciliation succeeded.
+        if (fromMemory.Equals(graphNodeAfterReconciliation)) {
+            return fromMemory;
+        }
+
+        if (graphNodeAfterReconciliation == null || fromMemory.Address != graphNodeAfterReconciliation.Address) {
+            throw new UnhandledCfgDiscrepancyException(
+                "Nodes from memory and from graph don't have the same address. This should never happen. " +
+                $"From memory: {fromMemory} " +
+                $"From graph: {graphNodeAfterReconciliation}");
+        }
+
+        // Provenance-gated path: when the stale graph node is speculative, either promote it
+        // (memory match) or discard-and-replace (mismatch). This must run BEFORE the generic
+        // SelectorNode path so that speculative nodes never enter a SelectorNode. Reconciliation is
+        // owned entirely by InstructionsFeeder (which holds the reconciler); we only ask it to
+        // resolve this specific graph node.
+        if (graphNodeAfterReconciliation is CfgInstruction speculativeInGraph && speculativeInGraph.IsSpeculative) {
+            if (InstructionsFeeder.TryPromoteStaleSpeculativeNode(speculativeInGraph, fromMemory)) {
+                return speculativeInGraph;
+            }
+            return fromMemory;
+        }
+
+        // Genuinely different instructions at the same address. Inject a SelectorNode
+        return _nodeLinker.CreateSelectorNodeBetween(fromMemory, (CfgInstruction)graphNodeAfterReconciliation);
+    }
+}

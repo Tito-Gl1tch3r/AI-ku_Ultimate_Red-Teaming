@@ -1,0 +1,1189 @@
+//go:generate go run go.uber.org/mock/mockgen -source datastore.go -destination ./mocks/mock_datastore.go -package mocks Datastore
+package datastore
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"iter"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/rs/zerolog"
+	"google.golang.org/protobuf/types/known/structpb"
+
+	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+
+	"github.com/authzed/spicedb/pkg/datastore/options"
+	core "github.com/authzed/spicedb/pkg/proto/core/v1"
+	"github.com/authzed/spicedb/pkg/tuple"
+)
+
+var Engines []string
+
+// SortedEngineIDs returns the full set of engine IDs, sorted.
+func SortedEngineIDs() []string {
+	engines := append([]string{}, Engines...)
+	sort.Strings(engines)
+	return engines
+}
+
+// EngineOptions returns the full set of engine IDs, sorted and quoted into a string.
+func EngineOptions() string {
+	ids := SortedEngineIDs()
+	quoted := make([]string, 0, len(ids))
+	for _, id := range ids {
+		quoted = append(quoted, `"`+id+`"`)
+	}
+	return strings.Join(quoted, ", ")
+}
+
+// Ellipsis is a special relation that is assumed to be valid on the right
+// hand side of a tuple.
+const Ellipsis = "..."
+
+// RevisionChanges represents the changes in a single revision.
+type RevisionChanges struct {
+	Revision Revision
+
+	// RelationshipChanges are any relationships that were changed at this revision.
+	RelationshipChanges []tuple.RelationshipUpdate
+
+	// ChangedDefinitions are any definitions that were added or changed at this revision.
+	ChangedDefinitions []SchemaDefinition
+
+	// DeletedNamespaces are any namespaces that were deleted.
+	DeletedNamespaces []string
+
+	// DeletedCaveats are any caveats that were deleted.
+	DeletedCaveats []string
+
+	// IsCheckpoint, if true, indicates that the datastore has reported all changes
+	// up until and including the Revision and that no additional schema updates can
+	// have occurred before this point.
+	IsCheckpoint bool
+
+	// Metadatas is the list of metadata associated with the revision, if any.
+	Metadatas []*structpb.Struct
+}
+
+func (rc RevisionChanges) DebugString() string {
+	if rc.IsCheckpoint {
+		return "[checkpoint]"
+	}
+
+	var debugString strings.Builder
+
+	for _, relChange := range rc.RelationshipChanges {
+		debugString.WriteString(relChange.DebugString() + "\n")
+	}
+
+	for _, def := range rc.ChangedDefinitions {
+		fmt.Fprintf(&debugString, "Definition: %T:%s\n", def, def.GetName())
+	}
+
+	for _, ns := range rc.DeletedNamespaces {
+		fmt.Fprintf(&debugString, "DeletedNamespace: %s\n", ns)
+	}
+
+	for _, caveat := range rc.DeletedCaveats {
+		fmt.Fprintf(&debugString, "DeletedCaveat: %s\n", caveat)
+	}
+
+	return debugString.String()
+}
+
+func (rc RevisionChanges) MarshalZerologObject(e *zerolog.Event) {
+	e.Str("revision", rc.Revision.String())
+	e.Bool("is-checkpoint", rc.IsCheckpoint)
+	e.Array("deleted-namespaces", strArray(rc.DeletedNamespaces))
+	e.Array("deleted-caveats", strArray(rc.DeletedCaveats))
+
+	changedNames := make([]string, 0, len(rc.ChangedDefinitions))
+	for _, cd := range rc.ChangedDefinitions {
+		changedNames = append(changedNames, fmt.Sprintf("%T:%s", cd, cd.GetName()))
+	}
+
+	e.Array("changed-definitions", strArray(changedNames))
+	e.Int("num-changed-relationships", len(rc.RelationshipChanges))
+}
+
+// ExpirationFilterOption is the filter option for the expiration field on relationships.
+type ExpirationFilterOption int
+
+const (
+	// ExpirationFilterOptionNone indicates that the expiration filter should not be used:
+	// relationships both with and without expiration will be returned.
+	ExpirationFilterOptionNone ExpirationFilterOption = iota
+
+	// ExpirationFilterOptionHasExpiration indicates that the expiration filter should only
+	// return relationships with an expiration.
+	ExpirationFilterOptionHasExpiration
+
+	// ExpirationFilterOptionNoExpiration indicates that the expiration filter should only
+	// return relationships without an expiration.
+	ExpirationFilterOptionNoExpiration
+)
+
+// CaveatFilterOption is the filter option for the caveat name field on relationships.
+type CaveatFilterOption int
+
+const (
+	// CaveatFilterOptionNone indicates that the caveat filter should not be used:
+	// relationships both with and without caveats will be returned.
+	CaveatFilterOptionNone CaveatFilterOption = iota
+
+	// CaveatFilterOptionHasMatchingCaveat indicates that the caveat filter should only
+	// return relationships with the matching caveat.
+	CaveatFilterOptionHasMatchingCaveat
+
+	// CaveatFilterOptionNoCaveat indicates that the caveat filter should only
+	// return relationships without a caveat.
+	CaveatFilterOptionNoCaveat
+)
+
+// RelationshipsFilter is a filter for relationships.
+type RelationshipsFilter struct {
+	// OptionalResourceType is the namespace/type for the resources to be found.
+	OptionalResourceType string
+
+	// OptionalResourceIds are the IDs of the resources to find. If nil empty, any resource ID will be allowed.
+	// Cannot be used with OptionalResourceIDPrefix.
+	OptionalResourceIds []string
+
+	// OptionalResourceIDPrefix is the prefix to use for resource IDs. If empty, any prefix is allowed.
+	// Cannot be used with OptionalResourceIds.
+	OptionalResourceIDPrefix string
+
+	// OptionalResourceRelation is the relation of the resource to find. If empty, any relation is allowed.
+	OptionalResourceRelation string
+
+	// OptionalSubjectsSelectors is the selectors to use for subjects of the relationship. If nil, all subjects are allowed.
+	// If specified, relationships matching *any* selector will be returned.
+	OptionalSubjectsSelectors []SubjectsSelector
+
+	// OptionalCaveatNameFilter is the filter to use for caveated relationships, filtering by a specific caveat name.
+	// By default, no caveat filtered is done (one direction or the other).
+	OptionalCaveatNameFilter CaveatNameFilter
+
+	// OptionalExpirationOption is the filter to use for relationships with or without an expiration.
+	OptionalExpirationOption ExpirationFilterOption
+}
+
+// Test returns true iff the given relationship is matched by this filter.
+func (rf RelationshipsFilter) Test(relationship tuple.Relationship) bool {
+	if rf.OptionalResourceType != "" && rf.OptionalResourceType != relationship.Resource.ObjectType {
+		return false
+	}
+
+	if len(rf.OptionalResourceIds) > 0 && !slices.Contains(rf.OptionalResourceIds, relationship.Resource.ObjectID) {
+		return false
+	}
+
+	if rf.OptionalResourceIDPrefix != "" && !strings.HasPrefix(relationship.Resource.ObjectID, rf.OptionalResourceIDPrefix) {
+		return false
+	}
+
+	if rf.OptionalResourceRelation != "" && rf.OptionalResourceRelation != relationship.Resource.Relation {
+		return false
+	}
+
+	if len(rf.OptionalSubjectsSelectors) > 0 {
+		for _, selector := range rf.OptionalSubjectsSelectors {
+			if selector.Test(relationship.Subject) {
+				return true
+			}
+		}
+		return false
+	}
+
+	switch rf.OptionalCaveatNameFilter.Option {
+	case CaveatFilterOptionNone:
+		// No caveat filter, so no need to check.
+
+	case CaveatFilterOptionHasMatchingCaveat:
+		if relationship.OptionalCaveat == nil || relationship.OptionalCaveat.CaveatName != rf.OptionalCaveatNameFilter.CaveatName {
+			return false
+		}
+
+	case CaveatFilterOptionNoCaveat:
+		if relationship.OptionalCaveat != nil && relationship.OptionalCaveat.CaveatName != "" {
+			return false
+		}
+	}
+
+	if rf.OptionalExpirationOption == ExpirationFilterOptionHasExpiration && relationship.OptionalExpiration == nil {
+		return false
+	}
+
+	if rf.OptionalExpirationOption == ExpirationFilterOptionNoExpiration && relationship.OptionalExpiration != nil {
+		return false
+	}
+
+	return true
+}
+
+// CaveatNameFilter is a filter for caveat names.
+type CaveatNameFilter struct {
+	// Option is the filter option to use for the caveat name.
+	Option CaveatFilterOption
+
+	// CaveatName is the name of the caveat to filter by. Must be specified if option is
+	// CaveatFilterOptionHasCaveat.
+	CaveatName string
+}
+
+func WithCaveatName(caveatName string) CaveatNameFilter {
+	return CaveatNameFilter{
+		Option:     CaveatFilterOptionHasMatchingCaveat,
+		CaveatName: caveatName,
+	}
+}
+
+func WithNoCaveat() CaveatNameFilter {
+	return CaveatNameFilter{
+		Option: CaveatFilterOptionNoCaveat,
+	}
+}
+
+// CoreFilterFromRelationshipFilter constructs a core RelationshipFilter from a V1 RelationshipsFilter.
+func CoreFilterFromRelationshipFilter(filter *v1.RelationshipFilter) *core.RelationshipFilter {
+	return &core.RelationshipFilter{
+		ResourceType:             filter.ResourceType,
+		OptionalResourceId:       filter.OptionalResourceId,
+		OptionalResourceIdPrefix: filter.OptionalResourceIdPrefix,
+		OptionalRelation:         filter.OptionalRelation,
+		OptionalSubjectFilter:    coreFilterFromSubjectsFilter(filter.OptionalSubjectFilter),
+	}
+}
+
+func coreFilterFromSubjectsFilter(filter *v1.SubjectFilter) *core.SubjectFilter {
+	if filter == nil {
+		return nil
+	}
+
+	return &core.SubjectFilter{
+		SubjectType:       filter.SubjectType,
+		OptionalSubjectId: filter.OptionalSubjectId,
+		OptionalRelation:  coreFilterFromSubjectRelationFilter(filter.OptionalRelation),
+	}
+}
+
+func coreFilterFromSubjectRelationFilter(filter *v1.SubjectFilter_RelationFilter) *core.SubjectFilter_RelationFilter {
+	if filter == nil {
+		return nil
+	}
+
+	return &core.SubjectFilter_RelationFilter{
+		Relation: filter.Relation,
+	}
+}
+
+// RelationshipsFilterFromCoreFilter constructs a datastore RelationshipsFilter from a core RelationshipFilter.
+func RelationshipsFilterFromCoreFilter(filter *core.RelationshipFilter) (RelationshipsFilter, error) {
+	var resourceIds []string
+	if filter.OptionalResourceId != "" {
+		resourceIds = []string{filter.OptionalResourceId}
+	}
+
+	var subjectsSelectors []SubjectsSelector
+	if filter.OptionalSubjectFilter != nil {
+		var subjectIds []string
+		if filter.OptionalSubjectFilter.OptionalSubjectId != "" {
+			subjectIds = []string{filter.OptionalSubjectFilter.OptionalSubjectId}
+		}
+
+		relationFilter := SubjectRelationFilter{}
+
+		if filter.OptionalSubjectFilter.OptionalRelation != nil {
+			relation := filter.OptionalSubjectFilter.OptionalRelation.GetRelation()
+			if relation != "" {
+				relationFilter = relationFilter.WithNonEllipsisRelation(relation)
+			} else {
+				relationFilter = relationFilter.WithEllipsisRelation()
+			}
+		}
+
+		subjectsSelectors = append(subjectsSelectors, SubjectsSelector{
+			OptionalSubjectType: filter.OptionalSubjectFilter.SubjectType,
+			OptionalSubjectIds:  subjectIds,
+			RelationFilter:      relationFilter,
+		})
+	}
+
+	if filter.OptionalResourceId != "" && filter.OptionalResourceIdPrefix != "" {
+		return RelationshipsFilter{}, errors.New("cannot specify both OptionalResourceId and OptionalResourceIDPrefix")
+	}
+
+	if filter.ResourceType == "" && filter.OptionalRelation == "" && len(resourceIds) == 0 && filter.OptionalResourceIdPrefix == "" && len(subjectsSelectors) == 0 {
+		return RelationshipsFilter{}, errors.New("at least one filter field must be set")
+	}
+
+	return RelationshipsFilter{
+		OptionalResourceType:      filter.ResourceType,
+		OptionalResourceIds:       resourceIds,
+		OptionalResourceIDPrefix:  filter.OptionalResourceIdPrefix,
+		OptionalResourceRelation:  filter.OptionalRelation,
+		OptionalSubjectsSelectors: subjectsSelectors,
+	}, nil
+}
+
+// RelationshipsFilterFromPublicFilter constructs a datastore RelationshipsFilter from an API-defined RelationshipFilter.
+func RelationshipsFilterFromPublicFilter(filter *v1.RelationshipFilter) (RelationshipsFilter, error) {
+	var resourceIds []string
+	if filter.OptionalResourceId != "" {
+		resourceIds = []string{filter.OptionalResourceId}
+	}
+
+	var subjectsSelectors []SubjectsSelector
+	if filter.OptionalSubjectFilter != nil {
+		var subjectIds []string
+		if filter.OptionalSubjectFilter.OptionalSubjectId != "" {
+			subjectIds = []string{filter.OptionalSubjectFilter.OptionalSubjectId}
+		}
+
+		relationFilter := SubjectRelationFilter{}
+
+		if filter.OptionalSubjectFilter.OptionalRelation != nil {
+			relation := filter.OptionalSubjectFilter.OptionalRelation.GetRelation()
+			if relation != "" {
+				relationFilter = relationFilter.WithNonEllipsisRelation(relation)
+			} else {
+				relationFilter = relationFilter.WithEllipsisRelation()
+			}
+		}
+
+		subjectsSelectors = append(subjectsSelectors, SubjectsSelector{
+			OptionalSubjectType: filter.OptionalSubjectFilter.SubjectType,
+			OptionalSubjectIds:  subjectIds,
+			RelationFilter:      relationFilter,
+		})
+	}
+
+	if filter.OptionalResourceId != "" && filter.OptionalResourceIdPrefix != "" {
+		return RelationshipsFilter{}, errors.New("cannot specify both OptionalResourceId and OptionalResourceIDPrefix")
+	}
+
+	if filter.ResourceType == "" && filter.OptionalRelation == "" && len(resourceIds) == 0 && filter.OptionalResourceIdPrefix == "" && len(subjectsSelectors) == 0 {
+		return RelationshipsFilter{}, errors.New("at least one filter field must be set")
+	}
+
+	return RelationshipsFilter{
+		OptionalResourceType:      filter.ResourceType,
+		OptionalResourceIds:       resourceIds,
+		OptionalResourceIDPrefix:  filter.OptionalResourceIdPrefix,
+		OptionalResourceRelation:  filter.OptionalRelation,
+		OptionalSubjectsSelectors: subjectsSelectors,
+	}, nil
+}
+
+// SubjectsSelector is a selector for subjects.
+type SubjectsSelector struct {
+	// OptionalSubjectType is the namespace/type for the subjects to be found, if any.
+	OptionalSubjectType string
+
+	// OptionalSubjectIds are the IDs of the subjects to find. If nil or empty, any subject ID will be allowed.
+	OptionalSubjectIds []string
+
+	// RelationFilter is the filter to use for the relation(s) of the subjects. If neither field
+	// is set, any relation is allowed.
+	RelationFilter SubjectRelationFilter
+}
+
+// Test returns true iff the given subject is matched by this filter.
+func (ss SubjectsSelector) Test(subject tuple.ObjectAndRelation) bool {
+	if ss.OptionalSubjectType != "" && ss.OptionalSubjectType != subject.ObjectType {
+		return false
+	}
+
+	if len(ss.OptionalSubjectIds) > 0 && !slices.Contains(ss.OptionalSubjectIds, subject.ObjectID) {
+		return false
+	}
+
+	if ss.RelationFilter.OnlyNonEllipsisRelations {
+		return subject.Relation != tuple.Ellipsis
+	}
+
+	if ss.RelationFilter.IsEmpty() {
+		return true
+	}
+
+	if ss.RelationFilter.IncludeEllipsisRelation && subject.Relation == tuple.Ellipsis {
+		return true
+	}
+
+	return ss.RelationFilter.NonEllipsisRelation != "" && ss.RelationFilter.NonEllipsisRelation == subject.Relation
+}
+
+// SubjectRelationFilter is the filter to use for relation(s) of subjects being queried.
+type SubjectRelationFilter struct {
+	// NonEllipsisRelation is the relation of the subject type to find. If empty,
+	// IncludeEllipsisRelation must be true.
+	NonEllipsisRelation string
+
+	// IncludeEllipsisRelation, if true, indicates that the ellipsis relation
+	// should be included as an option.
+	IncludeEllipsisRelation bool
+
+	// OnlyNonEllipsisRelations, if true, indicates that only non-ellipsis relations
+	// should be included.
+	OnlyNonEllipsisRelations bool
+}
+
+// WithOnlyNonEllipsisRelations indicates that only non-ellipsis relations should be included.
+func (sf SubjectRelationFilter) WithOnlyNonEllipsisRelations() SubjectRelationFilter {
+	sf.OnlyNonEllipsisRelations = true
+	sf.NonEllipsisRelation = ""
+	sf.IncludeEllipsisRelation = false
+	return sf
+}
+
+// WithEllipsisRelation indicates that the subject filter should include the ellipsis relation
+// as an option for the subjects' relation.
+func (sf SubjectRelationFilter) WithEllipsisRelation() SubjectRelationFilter {
+	sf.IncludeEllipsisRelation = true
+	sf.OnlyNonEllipsisRelations = false
+	return sf
+}
+
+// WithNonEllipsisRelation indicates that the specified non-ellipsis relation should be included as an
+// option for the subjects' relation.
+func (sf SubjectRelationFilter) WithNonEllipsisRelation(relation string) SubjectRelationFilter {
+	sf.NonEllipsisRelation = relation
+	sf.OnlyNonEllipsisRelations = false
+	return sf
+}
+
+// WithRelation indicates that the specified relation should be included as an
+// option for the subjects' relation.
+func (sf SubjectRelationFilter) WithRelation(relation string) SubjectRelationFilter {
+	if relation == tuple.Ellipsis {
+		return sf.WithEllipsisRelation()
+	}
+	return sf.WithNonEllipsisRelation(relation)
+}
+
+// IsEmpty returns true if the subject relation filter is empty.
+func (sf SubjectRelationFilter) IsEmpty() bool {
+	return !sf.IncludeEllipsisRelation && sf.NonEllipsisRelation == "" && !sf.OnlyNonEllipsisRelations
+}
+
+// SubjectsFilter is a filter for subjects.
+type SubjectsFilter struct {
+	// SubjectType is the namespace/type for the subjects to be found.
+	SubjectType string
+
+	// OptionalSubjectIds are the IDs of the subjects to find. If nil or empty, any subject ID will be allowed.
+	OptionalSubjectIds []string
+
+	// RelationFilter is the filter to use for the relation(s) of the subjects. If neither field
+	// is set, any relation is allowed.
+	RelationFilter SubjectRelationFilter
+}
+
+func (sf SubjectsFilter) AsSelector() SubjectsSelector {
+	return SubjectsSelector{
+		OptionalSubjectType: sf.SubjectType,
+		OptionalSubjectIds:  sf.OptionalSubjectIds,
+		RelationFilter:      sf.RelationFilter,
+	}
+}
+
+// SchemaDefinition represents a namespace or caveat definition under a schema.
+type SchemaDefinition interface {
+	GetName() string
+	SizeVT() int
+}
+
+// RevisionedDefinition holds a schema definition and its last updated revision.
+type RevisionedDefinition[T SchemaDefinition] struct {
+	// Definition is the namespace or caveat definition.
+	Definition T
+
+	// LastWrittenRevision is the revision at which the namespace or caveat was last updated.
+	LastWrittenRevision Revision
+}
+
+func (rd RevisionedDefinition[T]) GetLastWrittenRevision() Revision {
+	return rd.LastWrittenRevision
+}
+
+// RevisionedNamespace is a revisioned version of a namespace definition.
+type RevisionedNamespace = RevisionedDefinition[*core.NamespaceDefinition]
+
+// ReadOnlyStoredSchema wraps a *core.StoredSchema to indicate it is read-only
+// and must not be modified, as it may be shared across multiple callers via caching.
+//
+// A ReadOnlyStoredSchema also hosts lazily-built, schema-derived caches (for example
+// compiled caveats; see LoadOrStoreDerived). Because a single instance is shared across
+// callers for a given schema version via the stored-schema cache, those derived caches
+// live exactly as long as the schema version they belong to and are discarded, together,
+// when the schema changes. The underlying schema itself remains immutable; only the
+// concurrency-safe derived caches are populated on demand.
+type ReadOnlyStoredSchema struct {
+	schema     *core.StoredSchema
+	schemaSize int64    // rough byte size of the schema, used as a cache-cost base (see EstimatedSize)
+	derived    sync.Map // derived-cache kinds keyed by DerivedCacheKey id; see LoadOrStoreDerived
+}
+
+// NewReadOnlyStoredSchema wraps a StoredSchema as read-only. Returns nil if the provided
+// schema is nil. The schema's byte size is estimated cheaply from its schema text; callers
+// that have the exact serialized size on hand (e.g. datastore readers that just unmarshaled
+// it) should prefer NewReadOnlyStoredSchemaWithSize.
+func NewReadOnlyStoredSchema(schema *core.StoredSchema) *ReadOnlyStoredSchema {
+	if schema == nil {
+		return nil
+	}
+	return NewReadOnlyStoredSchemaWithSize(schema, len(schema.GetV1().GetSchemaText()))
+}
+
+// NewReadOnlyStoredSchemaWithSize wraps a StoredSchema as read-only, recording sizeBytes as a
+// rough byte size of the schema for cache-cost accounting (see EstimatedSize). Returns nil if
+// the provided schema is nil. sizeBytes need not be exact; the serialized length the schema
+// was read from is a good value.
+func NewReadOnlyStoredSchemaWithSize(schema *core.StoredSchema, sizeBytes int) *ReadOnlyStoredSchema {
+	if schema == nil {
+		return nil
+	}
+	return &ReadOnlyStoredSchema{schema: schema, schemaSize: int64(sizeBytes)}
+}
+
+// Get returns the underlying StoredSchema. Callers must not modify the returned value.
+func (r *ReadOnlyStoredSchema) Get() *core.StoredSchema {
+	return r.schema
+}
+
+// Reader is an interface for reading relationships from the datastore.
+type Reader interface {
+	LegacySchemaReader
+	CounterReader
+
+	// ReadStoredSchema reads the unified stored schema from the datastore.
+	// The returned ReadOnlyStoredSchema must not be modified, as it may be shared
+	// across callers via caching.
+	ReadStoredSchema(ctx context.Context) (*ReadOnlyStoredSchema, error)
+
+	// QueryRelationships reads relationships, starting from the resource side.
+	QueryRelationships(
+		ctx context.Context,
+		filter RelationshipsFilter,
+		options ...options.QueryOptionsOption,
+	) (RelationshipIterator, error)
+
+	// ReverseQueryRelationships reads relationships, starting from the subject.
+	ReverseQueryRelationships(
+		ctx context.Context,
+		subjectsFilter SubjectsFilter,
+		options ...options.ReverseQueryOptionsOption,
+	) (RelationshipIterator, error)
+}
+
+// DeleteRelationshipsResult is the result of a call to DeleteRelationships.
+type DeleteRelationshipsResult struct {
+	// NumDeleted is the number of relationships deleted by the call.
+	NumDeleted uint64
+
+	// LimitReached is true if a delete limit was supplied and was reached.
+	LimitReached bool
+
+	// Cursor is the last relationship deleted, in the order in which the
+	// datastore performed the deletion. It may be supplied to a subsequent
+	// call via options.WithDeleteAfter to resume where this call stopped.
+	//
+	// Cursor is nil unless a cursored delete was requested via
+	// options.WithCursoredDelete, and is nil when nothing was deleted.
+	Cursor options.Cursor
+}
+
+// ReadWriteTransaction is an interface for reading and writing relationships in a transaction.
+type ReadWriteTransaction interface {
+	Reader
+	LegacySchemaWriter
+	CounterRegisterer
+
+	// WriteRelationships takes a list of tuple mutations and applies them to the datastore.
+	WriteRelationships(ctx context.Context, mutations []tuple.RelationshipUpdate) error
+
+	// DeleteRelationships deletes relationships that match the provided filter,
+	// with the optional limit. See DeleteRelationshipsResult for the meaning of
+	// the returned values.
+	DeleteRelationships(ctx context.Context, filter *v1.RelationshipFilter,
+		options ...options.DeleteOptionsOption,
+	) (DeleteRelationshipsResult, error)
+
+	// WriteStoredSchema writes the unified stored schema to the datastore.
+	WriteStoredSchema(ctx context.Context, schema *core.StoredSchema) error
+
+	// BulkLoad takes a relationship source iterator, and writes all of the
+	// relationships to the backing datastore in an optimized fashion. This
+	// method can and will omit checks and otherwise cut corners in the
+	// interest of performance, and should not be relied upon for OLTP-style
+	// workloads.
+	BulkLoad(ctx context.Context, iter BulkWriteRelationshipSource) (uint64, error)
+}
+
+// TxUserFunc is a type for the function that users supply when they invoke a read-write transaction.
+type TxUserFunc func(context.Context, ReadWriteTransaction) error
+
+// ReadyState represents the ready state of the datastore.
+type ReadyState struct {
+	// Message is a human-readable status message for the current state.
+	Message string
+
+	// IsReady indicates whether the datastore is ready.
+	IsReady bool
+}
+
+// BulkWriteRelationshipSource is an interface for transferring relationships
+// to a backing datastore with a zero-copy methodology.
+type BulkWriteRelationshipSource interface {
+	// Next Returns a pointer to a relation tuple if one is available, or nil if
+	// there are no more or there was an error.
+	//
+	// Note: sources may re-use the same memory address for every tuple, data
+	// may change on every call to next even if the pointer has not changed.
+	Next(ctx context.Context) (*tuple.Relationship, error)
+}
+
+type WatchContent int
+
+const (
+	WatchRelationships WatchContent = 1 << 0
+	WatchSchema        WatchContent = 1 << 1
+	WatchCheckpoints   WatchContent = 1 << 2
+)
+
+// WatchOptions are options for a Watch call.
+type WatchOptions struct {
+	// Content is the content to watch.
+	Content WatchContent
+
+	// CheckpointInterval is the interval to use for checkpointing in the watch.
+	// If given the zero value, the datastore's default will be used. If smaller
+	// than the datastore's minimum, the minimum will be used.
+	CheckpointInterval time.Duration
+
+	// WatchBufferLength is the length of the buffer for the watch channel. If
+	// given the zero value, the datastore's default will be used.
+	WatchBufferLength uint16
+
+	// WatchBufferWriteTimeout is the timeout for writing to the watch channel.
+	// If given the zero value, the datastore's default will be used.
+	WatchBufferWriteTimeout time.Duration
+
+	// WatchConnectTimeout is the timeout for connecting to the watch channel.
+	// If given the zero value, the datastore's default will be used.
+	// May not be supported by the datastore.
+	WatchConnectTimeout time.Duration
+
+	// MaximumBufferedChangesByteSize is the maximum byte size of the buffered changes struct.
+	// If unspecified, no maximum will be enforced. If the maximum is reached before
+	// the changes can be sent, the watch will be closed with an error.
+	MaximumBufferedChangesByteSize uint64
+
+	// EmissionStrategy defines when are changes streamed to the client. If unspecified, changes will be buffered until
+	// they can be checkpointed, which is the default behavior.
+	EmissionStrategy EmissionStrategy
+}
+
+// EmissionStrategy describes when changes are emitted to the client.
+type EmissionStrategy int
+
+const (
+	// EmitWhenCheckpointedStrategy will buffer changes until a checkpoint is reached. This also means that
+	// changes will be deduplicated and revisions will be sorted before emission as soon as they can be checkpointed.
+	EmitWhenCheckpointedStrategy = iota
+
+	// EmitImmediatelyStrategy emits changes as soon as they are available. This means changes will not be buffered,
+	// and thus will be emitted as soon as they are available, but clients are responsible for buffering, deduplication,
+	// and sorting revisions. In practical terms that can only happens if Checkpoints have been requested, so enabling
+	// EmitImmediatelyStrategy without Checkpoints will return an error.
+	EmitImmediatelyStrategy
+)
+
+// WatchJustRelationships returns watch options for just relationships.
+func WatchJustRelationships() WatchOptions {
+	return WatchOptions{
+		Content: WatchRelationships,
+	}
+}
+
+// WatchJustSchema returns watch options for just schema.
+func WatchJustSchema() WatchOptions {
+	return WatchOptions{
+		Content: WatchSchema,
+	}
+}
+
+// WithCheckpointInterval sets the checkpoint interval on a watch options, returning
+// an updated options struct.
+func (wo WatchOptions) WithCheckpointInterval(interval time.Duration) WatchOptions {
+	return WatchOptions{
+		Content:            wo.Content,
+		CheckpointInterval: interval,
+	}
+}
+
+// ReadOnlyDatastore is an interface for reading relationships from the datastore.
+type ReadOnlyDatastore interface {
+	// MetricsID returns an identifier for the datastore for use in metrics.
+	// This identifier is typically the hostname of the datastore (where applicable)
+	// and may not be unique; callers should not rely on uniqueness.
+	MetricsID() (string, error)
+
+	// UniqueID returns a unique identifier for the datastore. This identifier
+	// must be stable across restarts of the datastore if the datastore is
+	// persistent.
+	UniqueID(context.Context) (string, error)
+
+	// SnapshotReader creates a read-only handle that reads the datastore at the specified revision.
+	// Any errors establishing the reader will be returned by subsequent calls.
+	//
+	// Reads through the handle behave like a snapshot: they are repeatable, and
+	// they never observe a write committed after the given revision.
+	// Each engine reaches that guarantee differently:
+	//
+	//   - Postgres and MySQL treat the revision as a transaction snapshot and
+	//     filter each row against it, keeping only rows created at or before
+	//     the revision and not yet deleted as of it. Postgres in strict read
+	//     mode additionally asserts that the revision is present on the
+	//     instance being read, so a lagging replica fails the query with a
+	//     RevisionUnavailableError instead of answering from older data.
+	//   - CockroachDB and Spanner treat the revision as an MVCC timestamp and
+	//     leave the filtering to the database, in both cases pinned to exactly
+	//     that timestamp rather than to the nearest one at or after it:
+	//     CockroachDB appends AS OF SYSTEM TIME <revision> to each query, and
+	//     Spanner bounds a read-only transaction with ReadTimestamp. A
+	//     revision the database no longer retains, or one in the future, fails
+	//     at query time rather than when the handle is created.
+	//   - memdb keeps one in-memory snapshot per write and reads from the most
+	//     recent snapshot at or before the revision, falling back to its
+	//     oldest snapshot for a revision that predates the datastore itself.
+	//     It is also the only implementation that validates the revision when
+	//     the handle is created, rather than when it is first read.
+	SnapshotReader(Revision) Reader
+
+	// OptimizedRevision gets a revision that will likely already be replicated
+	// and will likely be shared amongst many queries.
+	//
+	// Implementations return the *uncached* answer: one datastore round-trip per
+	// call, yielding the revision, how long it remains valid, and the schema hash
+	// visible at that revision (or "" if not provided on this path). Caching,
+	// deduplication, and jitter are layered on by proxy.NewOptimizedRevisionProxy.
+	OptimizedRevision(ctx context.Context) (RevisionWithSchemaHashAndValidity, error)
+
+	// HeadRevision gets a revision that is guaranteed to be at least as fresh as
+	// right now.
+	HeadRevision(ctx context.Context) (RevisionWithSchemaHash, error)
+
+	// CheckRevision checks the specified revision to make sure it's valid and
+	// hasn't been garbage collected.
+	CheckRevision(ctx context.Context, revision Revision) error
+
+	// RevisionFromString will parse the revision text and return the specific type of Revision
+	// used by the specific datastore implementation.
+	RevisionFromString(serialized string) (Revision, error)
+
+	// Watch notifies the caller about changes to the datastore, based on the specified options.
+	//
+	// All events following afterRevision will be sent to the caller. Changes made *in* afterRevision will not be included.
+	//
+	// When the changes channel is closed, callers MUST discard any changes received (they will be the zero value).
+	//
+	// Errors returned will fall into a few classes:
+	// - WatchDisconnectedError - the watch has fallen too far behind and has been disconnected.
+	// - WatchCanceledError     - the watch was canceled by the caller.
+	// - WatchDisabledError     - the watch is disabled by being unsupported by the datastore.
+	// - WatchRetryableError    - the watch is retryable, and the caller may retry after some backoff time.
+	// - InvalidRevisionError   - the revision specified has passed the datastore's watch history window and
+	//                            the watch cannot be retried.
+	// - Other errors 			- the watch should not be retried due to a fatal error.
+	Watch(ctx context.Context, afterRevision Revision, options WatchOptions) (<-chan RevisionChanges, <-chan error)
+
+	// ReadyState returns a state indicating whether the datastore is ready to accept data.
+	// Datastores that require database schema creation will return not-ready until the migrations
+	// have been run to create the necessary tables.
+	// This call must respect context cancellation and deadlines.
+	ReadyState(ctx context.Context) (ReadyState, error)
+
+	// Features returns an object representing what features this
+	// datastore can support. Can make calls to the database, so should
+	// only be used when a connection is allowed.
+	Features(ctx context.Context) (*Features, error)
+
+	// OfflineFeatures returns an object representing what features this
+	// datastore supports code-wise, without making any calls to the database.
+	OfflineFeatures() (*Features, error)
+
+	// Statistics returns relevant values about the data contained in this cluster.
+	Statistics(ctx context.Context) (Stats, error)
+
+	// Close closes the data store.
+	Close() error
+}
+
+// Datastore represents tuple access for a single namespace.
+type Datastore interface {
+	ReadOnlyDatastore
+
+	// ReadWriteTx starts a read/write transaction, which will be committed if no error is
+	// returned and rolled back if an error is returned.
+	ReadWriteTx(context.Context, TxUserFunc, ...options.RWTOptionsOption) (Revision, error)
+}
+
+// PartitionRange represents a non-overlapping portion of the relationship table
+// for parallel partitioned bulk export.
+type PartitionRange struct {
+	LowerBound options.Cursor // nil = start of table (exclusive)
+	UpperBound options.Cursor // nil = end of table (inclusive)
+}
+
+// BulkExportPartitioner is an optional interface that datastores can implement
+// to support parallel partitioned bulk export. PlanPartitions splits the
+// relationship table into non-overlapping ranges that can be exported in parallel.
+// The implementation may return fewer partitions than desiredCount if the
+// underlying data distribution does not support the requested number.
+type BulkExportPartitioner interface {
+	PlanPartitions(ctx context.Context, desiredCount uint32) ([]PartitionRange, error)
+}
+
+// ParsedExplain represents the parsed output of an EXPLAIN statement.
+type ParsedExplain struct {
+	// IndexesUsed is the list of indexes used in the query.
+	IndexesUsed []string
+}
+
+// Explainable is an interface for datastores that support EXPLAIN statements.
+type Explainable interface {
+	// BuildExplainQuery builds an EXPLAIN statement for the given SQL and arguments.
+	BuildExplainQuery(sql string, args []any) (string, []any, error)
+
+	// ParseExplain parses the output of an EXPLAIN statement.
+	ParseExplain(explain string) (ParsedExplain, error)
+
+	// PreExplainStatements returns any statements that should be run before the EXPLAIN statement.
+	PreExplainStatements() []string
+}
+
+// SQLDatastore is an interface for datastores that support SQL-based operations.
+type SQLDatastore interface {
+	Datastore
+	Explainable
+}
+
+// StrictReadDatastore is an interface for datastores that support strict read mode.
+type StrictReadDatastore interface {
+	Datastore
+
+	// IsStrictReadModeEnabled returns whether the datastore is in strict read mode.
+	IsStrictReadModeEnabled() bool
+}
+
+// CursoredDeleteDatastore is optionally implemented by datastores whose
+// ReadWriteTransactions support cursored, batched relationship deletion via
+// options.WithCursoredDelete. Use UnwrapAs to find it behind wrapping proxies.
+type CursoredDeleteDatastore interface {
+	Datastore
+
+	// SupportsCursoredDelete returns whether cursored deletion is available
+	// for this datastore instance.
+	SupportsCursoredDelete() bool
+}
+
+type strArray []string
+
+// MarshalZerologArray implements zerolog array marshalling.
+func (strs strArray) MarshalZerologArray(a *zerolog.Array) {
+	for _, val := range strs {
+		a.Str(val)
+	}
+}
+
+// StartableDatastore is an optional extension to the datastore interface that, when implemented,
+// provides the ability for callers to start background operations on the datastore.
+type StartableDatastore interface {
+	Datastore
+
+	// Start starts any background operations on the datastore. The context provided, if canceled, will
+	// also cancel the background operation(s) on the datastore.
+	Start(ctx context.Context) error
+}
+
+// RepairOperation represents a single kind of repair operation that can be run in a repairable
+// datastore.
+type RepairOperation struct {
+	// Name is the command-line name for the repair operation.
+	Name string
+
+	// Description is the human-readable description for the repair operation.
+	Description string
+}
+
+// RepairableDatastore is an optional extension to the datastore interface that, when implemented,
+// provides the ability for callers to repair the datastore's data in some fashion.
+type RepairableDatastore interface {
+	Datastore
+
+	// Repair runs the repair operation on the datastore.
+	Repair(ctx context.Context, operationName string, outputProgress bool) error
+
+	// RepairOperations returns the available repair operations for the datastore.
+	RepairOperations() []RepairOperation
+}
+
+// UnwrappableDatastore represents a datastore that can be unwrapped into the underlying
+// datastore.
+type UnwrappableDatastore interface {
+	// Unwrap returns the wrapped datastore.
+	Unwrap() Datastore
+}
+
+// EngineIdentifiable is optionally implemented by datastores that can report
+// the name of the engine that backs them. Use UnwrapAs to find it behind
+// wrapping proxies.
+type EngineIdentifiable interface {
+	// EngineName returns the datastore engine name, e.g. "postgres".
+	EngineName() string
+}
+
+// UnwrapAs recursively attempts to unwrap the datastore into the specified type
+// In none of the layers of the datastore implement the specified type, nil is returned.
+func UnwrapAs[T any](datastore Datastore) T {
+	var ds T
+	uwds := datastore
+
+	for {
+		var ok bool
+		ds, ok = uwds.(T)
+		if ok {
+			break
+		}
+
+		wds, ok := uwds.(UnwrappableDatastore)
+		if !ok {
+			break
+		}
+
+		uwds = wds.Unwrap()
+	}
+
+	return ds
+}
+
+// FeatureStatus are the possible statuses for a feature in the datastore.
+type FeatureStatus int
+
+const (
+	// FeatureStatusUnknown indicates that the status of the feature is unknown.
+	// This can be returned, for example, when a call is made to OfflineFeatures
+	// but the feature requires a call to the database to determine its status.
+	FeatureStatusUnknown FeatureStatus = iota
+
+	// FeatureSupported indicates that the feature is supported by the datastore.
+	FeatureSupported
+
+	// FeatureUnsupported indicates that the feature is not supported by the datastore.
+	FeatureUnsupported
+)
+
+// Feature represents a capability that a datastore can support, plus an
+// optional message explaining the feature is available (or not).
+type Feature struct {
+	Status FeatureStatus
+	Reason string
+}
+
+// Features holds values that represent what features a database can support.
+type Features struct {
+	// Watch is enabled if the underlying datastore can support the Watch api.
+	Watch Feature
+
+	// ContinuousCheckpointing is enabled if the underlying datastore supports continuous checkpointing
+	// via the Watch API. If not supported, clients of the Watch API may expect checkpoints only when
+	// new transactions are committed.
+	ContinuousCheckpointing Feature
+
+	// WatchEmitsImmediately indicates if the datastore supports the EmitImmediatelyStrategy EmissionStrategy.
+	// If not supported, clients of the Watch API will receive an error when calling Watch API with
+	// EmitImmediatelyStrategy option.
+	WatchEmitsImmediately Feature
+
+	// IntegrityData is enabled if the underlying datastore supports retrieving and storing
+	// integrity information.
+	IntegrityData Feature
+}
+
+// ObjectTypeStat represents statistics for a single object type (namespace).
+type ObjectTypeStat struct {
+	// NumRelations is the number of relations defined in a single object type.
+	NumRelations uint32
+
+	// NumPermissions is the number of permissions defined in a single object type.
+	NumPermissions uint32
+}
+
+// Stats represents statistics for the entire datastore.
+type Stats struct {
+	// UniqueID is a unique string for a single datastore.
+	UniqueID string
+
+	// EstimatedRelationshipCount is a best-guess estimate of the number of relationships
+	// in the datastore. Computing it should use a lightweight method such as reading
+	// table statistics.
+	EstimatedRelationshipCount uint64
+
+	// ObjectTypeStatistics returns a slice element for each object type (namespace)
+	// stored in the datastore.
+	ObjectTypeStatistics []ObjectTypeStat
+}
+
+// RelationshipIterator is an iterator over matched tuples. It is a single use
+// iterator.
+type RelationshipIterator iter.Seq2[tuple.Relationship, error]
+
+func IteratorToSlice(iter RelationshipIterator) ([]tuple.Relationship, error) {
+	results := make([]tuple.Relationship, 0)
+	for rel, err := range iter {
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, rel)
+	}
+	return results, nil
+}
+
+// FirstRelationshipIn returns the first relationship found via the iterator, if any.
+func FirstRelationshipIn(iter RelationshipIterator) (tuple.Relationship, bool, error) {
+	for rel, err := range iter {
+		if err != nil {
+			return tuple.Relationship{}, false, err
+		}
+
+		return rel, true, nil
+	}
+
+	return tuple.Relationship{}, false, nil
+}
+
+// Revision is an interface for a comparable revision type that can be different for
+// each datastore implementation.
+type Revision interface {
+	fmt.Stringer
+
+	// Equal returns whether the revisions should be considered equal.
+	Equal(Revision) bool
+
+	// GreaterThan returns whether the receiver is probably greater than the right hand side.
+	GreaterThan(Revision) bool
+
+	// LessThan returns whether the receiver is probably less than the right hand side.
+	LessThan(Revision) bool
+
+	// ByteSortable reports whether this kind of revision is totally ordered, and so could be
+	// written as bytes that sort in revision order. It is a property of the type: every revision
+	// of a given type answers the same way. Postgres revisions are transaction snapshots and are
+	// only partially ordered, so they report false - they have no order for bytes to preserve.
+	//
+	// It says nothing about String(). For every revision type SpiceDB ships, String() is a
+	// decimal that does not sort: "9" sorts above "10".
+	//
+	// SortKeyRevision supersedes this method, answering the same question and handing back the
+	// bytes as well.
+	ByteSortable() bool
+}
+
+// SortKeyRevision is an optional extension to the Revision interface that, when implemented, turns
+// a revision into bytes that sort in revision order, for use as a key - or part of a key - in an
+// ordered key/value store.
+//
+//	skr, ok := rev.(datastore.SortKeyRevision)
+//	if !ok {
+//		return fmt.Errorf("revision of type %T cannot be used as a key", rev)
+//	}
+//	key = skr.AppendSortKey(key)
+//
+// This supersedes Revision.ByteSortable, which asks the same question and answers it with a bool.
+// Here the answer is the encoding itself, so a type cannot claim the capability without also
+// supplying the means to use it, and the claim cannot drift away from what the type actually does.
+//
+// Partially ordered revisions must not implement this interface, for the same reason they report
+// false from ByteSortable: they have no order for bytes to preserve.
+type SortKeyRevision interface {
+	Revision
+
+	// AppendSortKey appends this revision's sort key to dst and returns the extended buffer, like
+	// the builtin append. Pass a nil dst to get a key on its own.
+	//
+	// For any two revisions a and b from the same datastore, the keys guarantee:
+	//
+	//   - They sort in revision order. bytes.Compare of a's key and b's key is negative when
+	//     a.LessThan(b), zero when a.Equal(b), positive when a.GreaterThan(b).
+	//   - Neither key is a prefix of the other, so appending more bytes to each cannot reorder
+	//     them. A sort key can therefore be one field of a longer key.
+	//
+	// String() gives neither: "9" sorts above "10", and "100" is a prefix of "1000", so a longer
+	// key built from "100" can outsort one built from "1000".
+	//
+	// Keys are comparable only between revisions of the same type from the same datastore - the
+	// same scope in which Equal, LessThan and GreaterThan mean anything.
+	//
+	// The bytes are stable across SpiceDB versions, so keys may be stored durably. An
+	// implementation must never change its encoding once released.
+	//
+	// AppendSortKey allocates only to grow dst. Implementations keep no state, so calls may be
+	// made concurrently, but dst belongs to the caller: concurrent calls must not share a dst
+	// backing array, and - as with the builtin append - a later call that reuses an earlier
+	// call's buffer may overwrite the earlier key.
+	AppendSortKey(dst []byte) []byte
+}
+
+type nilRevision struct{}
+
+func (nilRevision) ByteSortable() bool {
+	return false
+}
+
+func (nilRevision) Equal(rhs Revision) bool {
+	return rhs == NoRevision
+}
+
+func (nilRevision) GreaterThan(_ Revision) bool {
+	return false
+}
+
+func (nilRevision) LessThan(_ Revision) bool {
+	return true
+}
+
+func (nilRevision) String() string {
+	return "nil"
+}
+
+// RevisionWithSchemaHash is a revision paired with the schema hash that was
+// active at that revision. The schema hash is returned as a raw string from
+// the datastore layer; the datalayer converts it to a typed SchemaHash.
+type RevisionWithSchemaHash struct {
+	Revision   Revision
+	SchemaHash string
+}
+
+// RevisionWithSchemaHashAndValidity is an optimized revision, the schema hash
+// active at it, and how long the revision remains a valid choice for new reads.
+type RevisionWithSchemaHashAndValidity struct {
+	Revision Revision
+
+	// ValidFor is a duration, not an absolute time, because the window is
+	// measured on the datastore's clock, which may be skewed from this process.
+	// Callers anchor it to their own clock, sampled before the call.
+	ValidFor time.Duration
+
+	SchemaHash string
+}
+
+// NoRevision is a zero type for the revision that will make changing the
+// revision type in the future a bit easier if necessary. Implementations
+// should use any time they want to signal an empty/error revision.
+var NoRevision Revision = nilRevision{}

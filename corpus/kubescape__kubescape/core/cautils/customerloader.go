@@ -1,0 +1,636 @@
+package cautils
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+
+	"github.com/google/uuid"
+	v1 "github.com/kubescape/backend/pkg/client/v1"
+	"github.com/kubescape/backend/pkg/servicediscovery"
+	servicediscoveryv1 "github.com/kubescape/backend/pkg/servicediscovery/v1"
+	servicediscoveryv2 "github.com/kubescape/backend/pkg/servicediscovery/v2"
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	"github.com/kubescape/k8s-interface/k8sinterface"
+	"github.com/kubescape/kubescape/v4/core/cautils/getter"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// cloudConfigMapLabelSelector is the label selector used to locate the Kubescape
+// config ConfigMap in the cluster. It is a kubernetes label selector, not a
+// credential; gosec's G101 rule over-matches the key=value form and is suppressed
+// via the G101 entry in .gosec.json.
+const cloudConfigMapLabelSelector = "kubescape.io/infra=config" // #nosec G101 -- kubernetes label selector, not a credential
+
+const (
+	configFileName     string = "config"
+	kubescapeNamespace string = "kubescape"
+
+	kubescapeConfigMapName string = "kubescape-config" // deprecated - for backward compatibility
+
+	credsLabelSelectors string = "kubescape.io/infra=credentials" //nolint:gosec
+
+	// env vars
+	defaultConfigMapNamespaceEnvVar string = "KS_DEFAULT_CONFIGMAP_NAMESPACE"
+	accountIdEnvVar                 string = "KS_ACCOUNT_ID"
+	accessKeyEnvVar                 string = "KS_ACCESS_KEY"
+	cloudApiUrlEnvVar               string = "KS_CLOUD_API_URL"
+	cloudReportUrlEnvVar            string = "KS_CLOUD_REPORT_URL"
+)
+
+func ConfigFileFullPath() string { return getter.GetDefaultPath(configFileName + ".json") }
+
+// ======================================================================================
+// =============================== Config structure =====================================
+// ======================================================================================
+
+type ConfigObj struct {
+	AccountID      string `json:"accountID,omitempty"`
+	ClusterName    string `json:"clusterName,omitempty"`
+	CloudReportURL string `json:"cloudReportURL,omitempty"`
+	CloudAPIURL    string `json:"cloudAPIURL,omitempty"`
+	AccessKey      string `json:"accessKey,omitempty"`
+}
+
+// Config - convert ConfigObj to config file
+func (co *ConfigObj) Config() []byte {
+	b, err := marshalConfigObj(co)
+	if err == nil {
+		return b
+	}
+
+	return []byte{}
+}
+
+func (co *ConfigObj) updateEmptyFields(inCO *ConfigObj) error {
+	if inCO == nil {
+		return nil
+	}
+
+	// Cluster data is a fallback source. Values already loaded from the local
+	// cache or the in-cluster service discovery file have higher precedence and
+	// must not be replaced merely because the ConfigMap also contains them.
+	if co.AccountID == "" && inCO.AccountID != "" {
+		co.AccountID = inCO.AccountID
+	}
+	if co.CloudAPIURL == "" && inCO.CloudAPIURL != "" {
+		co.CloudAPIURL = inCO.CloudAPIURL
+	}
+	if co.CloudReportURL == "" && inCO.CloudReportURL != "" {
+		co.CloudReportURL = inCO.CloudReportURL
+	}
+	if co.ClusterName == "" && inCO.ClusterName != "" {
+		co.ClusterName = inCO.ClusterName
+	}
+
+	return nil
+}
+
+// ======================================================================================
+// =============================== interface ============================================
+// ======================================================================================
+type ITenantConfig interface {
+	UpdateCachedConfig() error
+	DeleteCachedConfig(ctx context.Context) error
+	GenerateAccountID() (string, error)
+	DeleteCredentials() error
+
+	// getters
+	GetContextName() string
+	GetAccountID() string
+	GetAccessKey() string
+	GetConfigObj() *ConfigObj
+	GetCloudReportURL() string
+	GetCloudAPIURL() string
+}
+
+// ======================================================================================
+// ============================ Local Config ============================================
+// ======================================================================================
+// Config when scanning YAML files or URL but not a Kubernetes cluster
+
+var _ ITenantConfig = &LocalConfig{}
+
+type LocalConfig struct {
+	configObj *ConfigObj
+}
+
+func NewLocalConfig(accountID, accessKey, clusterName, customClusterName string) *LocalConfig {
+	lc := &LocalConfig{
+		configObj: &ConfigObj{},
+	}
+	// get from configMap
+	if existsConfigFile() { // get from file
+		if err := loadConfigFromFile(lc.configObj); err != nil {
+			logger.L().Debug("failed to load cached config file", helpers.Error(err))
+		}
+	}
+
+	updateCredentials(lc.configObj, accountID, accessKey)
+	updateCloudURLs(lc.configObj)
+
+	// If a custom cluster name is provided then set that name, else use the cluster's original name
+	if customClusterName != "" {
+		lc.configObj.ClusterName = AdoptClusterName(customClusterName)
+	} else if clusterName != "" {
+		lc.configObj.ClusterName = AdoptClusterName(clusterName) // override config clusterName
+	}
+
+	initializeCloudAPI(lc)
+
+	return lc
+}
+
+func (lc *LocalConfig) GetConfigObj() *ConfigObj  { return lc.configObj }
+func (lc *LocalConfig) GetAccountID() string      { return lc.configObj.AccountID }
+func (lc *LocalConfig) GetContextName() string    { return lc.configObj.ClusterName }
+func (lc *LocalConfig) GetCloudReportURL() string { return lc.configObj.CloudReportURL }
+func (lc *LocalConfig) GetCloudAPIURL() string    { return lc.configObj.CloudAPIURL }
+func (lc *LocalConfig) GetAccessKey() string      { return lc.configObj.AccessKey }
+
+func (lc *LocalConfig) GenerateAccountID() (string, error) {
+	lc.configObj.AccountID = uuid.NewString()
+	err := lc.UpdateCachedConfig()
+	return lc.configObj.AccountID, err
+}
+
+func (lc *LocalConfig) DeleteCredentials() error {
+	lc.configObj.AccessKey = ""
+	lc.configObj.AccountID = ""
+	return lc.UpdateCachedConfig()
+}
+
+func (lc *LocalConfig) UpdateCachedConfig() error {
+	logger.L().Debug("updating cached config", helpers.Interface("configObj", lc.configObj))
+	return updateConfigFile(lc.configObj)
+}
+
+func (lc *LocalConfig) DeleteCachedConfig(ctx context.Context) error {
+	if err := DeleteConfigFile(); err != nil {
+		logger.L().Ctx(ctx).Warning("failed to delete cached config", helpers.Error(err))
+	}
+	return nil
+}
+
+// ======================================================================================
+// ========================== Cluster Config ============================================
+// ======================================================================================
+
+// ClusterConfig configuration of specific cluster
+/*
+
+Supported environments variables:
+KS_DEFAULT_CONFIGMAP_NAME  // name of configmap, if not set default is 'kubescape'
+KS_DEFAULT_CONFIGMAP_NAMESPACE   // configmap namespace, if not set default is 'default'
+
+KS_ACCOUNT_ID
+
+The cache directory (where this config file is stored, see ConfigFileFullPath) is
+configurable via the --cache-dir flag or the KS_CACHE_DIR environment variable; see
+initCacheDir in cmd/rootutils.go. It defaults to getter.DefaultLocalStore ($HOME/.kubescape).
+*/
+var _ ITenantConfig = &ClusterConfig{}
+
+type ClusterConfig struct {
+	k8s                *k8sinterface.KubernetesApi
+	configObj          *ConfigObj
+	configMapNamespace string
+}
+
+func NewClusterConfig(ctx context.Context, k8s *k8sinterface.KubernetesApi, accountID, accessKey, clusterName, customClusterName string) *ClusterConfig {
+	c := &ClusterConfig{
+		k8s:                k8s,
+		configObj:          &ConfigObj{},
+		configMapNamespace: GetConfigMapNamespace(),
+	}
+
+	// first, load from file
+	if existsConfigFile() { // get from file
+		if err := loadConfigFromFile(c.configObj); err != nil {
+			logger.L().Debug("failed to load cached config file", helpers.Error(err))
+		}
+	}
+
+	if err := loadUrlsFromFile(c.configObj); err != nil {
+		logger.L().Debug("failed to load urls from config file", helpers.Error(err))
+	}
+
+	// second, load urls from config map
+	if err := c.updateConfigEmptyFieldsFromKubescapeConfigMap(ctx); err != nil {
+		logger.L().Debug("failed to load config from Kubescape ConfigMap in cluster",
+			helpers.String("namespace", c.configMapNamespace), helpers.Error(err))
+	}
+
+	// third, credentials from secret
+	if err := c.updateConfigEmptyFieldsFromCredentialsSecret(ctx); err != nil {
+		logger.L().Debug("failed to load credentials from Kubescape Secret in cluster",
+			helpers.String("namespace", c.configMapNamespace), helpers.Error(err))
+	}
+
+	updateCredentials(c.configObj, accountID, accessKey)
+	updateCloudURLs(c.configObj)
+
+	// If a custom cluster name is provided then set that name, else use the cluster's original name
+	if customClusterName != "" {
+		c.configObj.ClusterName = AdoptClusterName(customClusterName)
+	} else if clusterName != "" {
+		c.configObj.ClusterName = AdoptClusterName(clusterName) // override config clusterName
+	}
+
+	if c.configObj.ClusterName == "" {
+		c.configObj.ClusterName = AdoptClusterName(k8sinterface.GetContextName())
+	} else { // override the cluster name if it has unwanted characters
+		c.configObj.ClusterName = AdoptClusterName(c.configObj.ClusterName)
+	}
+	initializeCloudAPI(c)
+	return c
+}
+
+func (c *ClusterConfig) GetConfigObj() *ConfigObj  { return c.configObj }
+func (c *ClusterConfig) GetDefaultNS() string      { return c.configMapNamespace }
+func (c *ClusterConfig) GetAccountID() string      { return c.configObj.AccountID }
+func (c *ClusterConfig) GetCloudReportURL() string { return c.configObj.CloudReportURL }
+func (c *ClusterConfig) GetCloudAPIURL() string    { return c.configObj.CloudAPIURL }
+func (c *ClusterConfig) GetAccessKey() string      { return c.configObj.AccessKey }
+
+func (c *ClusterConfig) UpdateCachedConfig() error {
+	logger.L().Debug("updating cached config", helpers.Interface("configObj", c.configObj))
+	return updateConfigFile(c.configObj)
+}
+
+func (c *ClusterConfig) DeleteCachedConfig(ctx context.Context) error {
+	if err := DeleteConfigFile(); err != nil {
+		logger.L().Ctx(ctx).Warning("failed to delete cached config", helpers.Error(err))
+	}
+	return nil
+}
+func (c *ClusterConfig) GetContextName() string {
+	return c.configObj.ClusterName
+}
+
+func (c *ClusterConfig) ToMapString() map[string]any {
+	m := map[string]any{}
+	if bc, err := json.Marshal(c.configObj); err == nil { // #nosec G117 -- config persists the cloud access key by design; secret handled as a credential
+		if err := json.Unmarshal(bc, &m); err != nil {
+			logger.L().Error("failed to unmarshal config", helpers.Error(err))
+		}
+	}
+	return m
+}
+
+func (c *ClusterConfig) updateConfigEmptyFieldsFromKubescapeConfigMap(ctx context.Context) error {
+	configMaps, err := c.k8s.KubernetesClient.CoreV1().ConfigMaps(c.configMapNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: cloudConfigMapLabelSelector,
+	})
+	if err != nil {
+		return err
+	}
+	var ksConfigMap *corev1.ConfigMap
+	if len(configMaps.Items) == 0 {
+		// try to find configmaps by name (for backward compatibility)
+		var getErr error
+		ksConfigMap, getErr = c.k8s.KubernetesClient.CoreV1().ConfigMaps(c.configMapNamespace).Get(ctx, kubescapeConfigMapName, metav1.GetOptions{})
+		if getErr != nil && !apierrors.IsNotFound(getErr) {
+			return getErr
+		}
+	} else {
+		// use the first configmap with the label
+		ksConfigMap = &configMaps.Items[0]
+	}
+
+	if ksConfigMap != nil {
+		if jsonConf, ok := ksConfigMap.Data["clusterData"]; ok {
+			tempCO := ConfigObj{}
+			if err = json.Unmarshal([]byte(jsonConf), &tempCO); err != nil {
+				return err
+			}
+			if err := c.configObj.updateEmptyFields(&tempCO); err != nil {
+				return err
+			}
+		}
+	}
+
+	return err
+}
+
+func (c *ClusterConfig) updateConfigEmptyFieldsFromCredentialsSecret(ctx context.Context) error {
+	secrets, err := c.k8s.KubernetesClient.CoreV1().Secrets(c.configMapNamespace).List(ctx,
+		metav1.ListOptions{LabelSelector: credsLabelSelectors})
+	if err != nil {
+		return err
+	}
+
+	if len(secrets.Items) == 0 {
+		return nil
+	}
+
+	if jsonConf, ok := secrets.Items[0].Data["account"]; ok {
+		if account := string(jsonConf); account != "" {
+			c.configObj.AccountID = account
+		}
+	}
+
+	if jsonConf, ok := secrets.Items[0].Data["accessKey"]; ok {
+		if accessKey := string(jsonConf); accessKey != "" {
+			c.configObj.AccessKey = accessKey
+		}
+	}
+
+	return nil
+}
+
+func existsConfigFile() bool {
+	_, err := os.ReadFile(ConfigFileFullPath())
+	return err == nil
+}
+
+// chmod is a package-level indirection so tests can simulate a chmod failure
+// (e.g. EPERM on a restrictive mount) without needing real filesystem
+// permission tricks, which don't reliably fail for the owning user.
+var chmod = os.Chmod
+
+// configMarshal is a package-level indirection so tests can simulate a
+// marshal failure without needing a struct whose MarshalJSON returns an error.
+// It mirrors the chmod seam used for directory-permission testing.
+var configMarshal = func(v any) ([]byte, error) {
+	return json.MarshalIndent(v, "", "  ") //nolint:gosec,nolintlint // G117: AccessKey is intentionally persisted to the local config file
+}
+
+// marshalConfigObj serializes co for persistence, stripping ClusterName from a
+// snapshot because it is runtime-only and must not be saved. Serializing the
+// snapshot keeps the shared runtime config unchanged for concurrent readers.
+func marshalConfigObj(co *ConfigObj) ([]byte, error) {
+	snapshot := *co
+	snapshot.ClusterName = ""
+	return configMarshal(&snapshot)
+}
+
+func updateConfigFile(configObj *ConfigObj) error {
+	fullPath := ConfigFileFullPath()
+	dir := filepath.Dir(fullPath)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	// Tighten permissions on a pre-existing directory in case it was
+	// created with broader permissions by an older version. This is a
+	// best-effort hardening step: MkdirAll above already applies 0700 to
+	// directories it creates, so a failure here (e.g. chmod is rejected on
+	// some mounted volumes such as an emptyDir mounted as non-root) must
+	// not prevent the config from being persisted.
+	if err := chmod(dir, 0700); err != nil {
+		mode := "unknown"
+		if fi, statErr := os.Stat(dir); statErr == nil {
+			mode = fi.Mode().Perm().String()
+		}
+		logger.L().Warning("failed to tighten permissions on config directory", helpers.String("dir", dir), helpers.String("currentMode", mode), helpers.Error(err))
+	}
+
+	// Write via a temp file in the same directory, then rename it over the
+	// target. os.CreateTemp always creates the file at mode 0600, and rename
+	// replaces the destination's inode outright - so the final file always
+	// ends up at the correct permissions on a fresh inode, regardless of
+	// whatever mode a pre-existing config.json (e.g. from an older kubescape
+	// version) had, and without needing a chmod on the target path at all.
+	tmpFile, err := os.CreateTemp(dir, ".config-*.json.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	data, err := marshalConfigObj(configObj)
+	if err != nil {
+		tmpFile.Close() // #nosec G104 -- best-effort close on the error path; the original error is already returned
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close() // #nosec G104 -- best-effort close on the error path; the original error is already returned
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, fullPath); err != nil {
+		return err
+	}
+	removeTmp = false
+	return nil
+}
+
+func (c *ClusterConfig) GenerateAccountID() (string, error) {
+	c.configObj.AccountID = uuid.NewString()
+	err := c.UpdateCachedConfig()
+	return c.configObj.AccountID, err
+}
+
+func (c *ClusterConfig) DeleteCredentials() error {
+	c.configObj.AccountID = ""
+	c.configObj.AccessKey = ""
+	return c.UpdateCachedConfig()
+}
+
+func (c *ClusterConfig) updateConfigData(configMap *corev1.ConfigMap) {
+	if len(configMap.Data) == 0 {
+		configMap.Data = make(map[string]string)
+	}
+	m := c.ToMapString()
+	for k, v := range m {
+		if s, ok := v.(string); ok {
+			configMap.Data[k] = s
+		}
+	}
+}
+func loadConfigFromFile(configObj *ConfigObj) error {
+	dat, err := os.ReadFile(ConfigFileFullPath())
+	if err != nil {
+		return nil // no config file
+	}
+	return readConfig(dat, configObj)
+}
+func readConfig(dat []byte, configObj *ConfigObj) error {
+
+	if len(dat) == 0 {
+		return nil
+	}
+
+	if err := json.Unmarshal(dat, configObj); err != nil {
+		return err
+	}
+	return nil
+}
+
+// servicesConfigPath is the path to the services discovery config file mounted
+// in-cluster. It is a var (not a const) so tests can point it at a temp file.
+var servicesConfigPath = "/etc/config/services.json"
+
+func loadUrlsFromFile(obj *ConfigObj) error {
+	dat, err := os.ReadFile(servicesConfigPath)
+	if err != nil {
+		return nil // no config file
+	}
+	services, err := servicediscovery.GetServices(
+		servicediscoveryv2.NewServiceDiscoveryStreamV2(dat),
+	)
+	if err != nil {
+		// try to parse as v1
+		services, err = servicediscovery.GetServices(
+			servicediscoveryv1.NewServiceDiscoveryStreamV1(dat),
+		)
+		if err != nil {
+			return err
+		}
+	}
+	if services.GetApiServerUrl() != "" {
+		obj.CloudAPIURL = services.GetApiServerUrl()
+	}
+	if services.GetReportReceiverHttpUrl() != "" {
+		obj.CloudReportURL = services.GetReportReceiverHttpUrl()
+	}
+	return nil
+}
+
+func DeleteConfigFile() error {
+	return os.Remove(ConfigFileFullPath())
+}
+
+func AdoptClusterName(clusterName string) string {
+	re, err := regexp.Compile(`[^\w]+`)
+	if err != nil {
+		return clusterName
+	}
+	return re.ReplaceAllString(clusterName, "-")
+}
+
+// GetConfigMapNamespace returns the namespace of the cluster config, which is the same for all in-cluster components
+func GetConfigMapNamespace() string {
+	if n := os.Getenv(defaultConfigMapNamespaceEnvVar); n != "" {
+		return n
+	}
+	return kubescapeNamespace
+}
+
+func updateCredentials(configObj *ConfigObj, accountID, accessKey string) {
+	// Explicit flags take precedence over env vars; env vars are only applied as fallback.
+	if accessKey != "" {
+		configObj.AccessKey = accessKey
+	} else if envAccessKey := os.Getenv(accessKeyEnvVar); envAccessKey != "" {
+		configObj.AccessKey = envAccessKey
+	}
+
+	if accountID != "" {
+		configObj.AccountID = accountID
+	} else if envAccountID := os.Getenv(accountIdEnvVar); envAccountID != "" {
+		configObj.AccountID = envAccountID
+	}
+}
+
+func getCloudURLsFromEnv(cloudURLs *CloudURLs) {
+	// load from env
+	if cloudAPIURL := os.Getenv(cloudApiUrlEnvVar); cloudAPIURL != "" {
+		logger.L().Debug("cloud API URL updated from env var", helpers.Interface(cloudApiUrlEnvVar, cloudAPIURL))
+		cloudURLs.CloudAPIURL = cloudAPIURL
+	}
+	if cloudReportURL := os.Getenv(cloudReportUrlEnvVar); cloudReportURL != "" {
+		logger.L().Debug("cloud Report URL updated from env var", helpers.Interface(cloudReportUrlEnvVar, cloudReportURL))
+		cloudURLs.CloudReportURL = cloudReportURL
+	}
+}
+
+func updateCloudURLs(configObj *ConfigObj) {
+	cloudURLs := &CloudURLs{}
+
+	getCloudURLsFromEnv(cloudURLs)
+
+	if cloudURLs.CloudAPIURL != "" {
+		configObj.CloudAPIURL = cloudURLs.CloudAPIURL // override config CloudAPIURL
+	}
+	if cloudURLs.CloudReportURL != "" {
+		configObj.CloudReportURL = cloudURLs.CloudReportURL // override config CloudReportURL
+	}
+
+}
+
+func initializeCloudAPI(c ITenantConfig) *v1.KSCloudAPI {
+	if ksCloud := getter.GetKSCloudAPIConnector(); ksCloud != nil {
+
+		if val := c.GetCloudAPIURL(); val != "" && val != ksCloud.GetCloudAPIURL() {
+			logger.L().Debug("updating KS Cloud API from config", helpers.String("old", ksCloud.GetCloudAPIURL()), helpers.String("new", val))
+			if err := ksCloud.SetCloudAPIURL(val); err != nil {
+				logger.L().Warning("failed to apply KS Cloud API URL from config", helpers.Error(err))
+			}
+		}
+		if val := c.GetCloudReportURL(); val != "" && val != ksCloud.GetCloudReportURL() {
+			logger.L().Debug("updating KS Cloud Report from config", helpers.String("old", ksCloud.GetCloudReportURL()), helpers.String("new", val))
+			if err := ksCloud.SetCloudReportURL(val); err != nil {
+				logger.L().Warning("failed to apply KS Cloud Report URL from config", helpers.Error(err))
+			}
+		}
+		// Identity is taken from the config as-is, empty included. The connector
+		// is a process global and --kube-contexts scans several clusters in one
+		// process, each reaching here through NewClusterConfig; guarded on
+		// non-empty like the URLs above, an unconfigured cluster kept whatever
+		// tenant the previous cluster left behind and, with --submit, reported
+		// under it (#3773). An empty account ID or access key means "not
+		// onboarded", not "same as last time". The URLs keep their guard on
+		// purpose: they name the backend rather than the tenant, and
+		// initializeSaaSEnv seeds them on the connector before any config
+		// exists — which is what the back-propagation block below relies on.
+		if val := c.GetAccountID(); val != ksCloud.GetAccountID() {
+			logger.L().Debug("updating Account ID from config", helpers.String("old", ksCloud.GetAccountID()), helpers.String("new", val))
+			ksCloud.SetAccountID(val)
+		}
+		if val := c.GetAccessKey(); val != ksCloud.GetAccessKey() {
+			logger.L().Debug("updating Access Key from config", helpers.Int("old (len)", len(ksCloud.GetAccessKey())), helpers.Int("new (len)", len(val)))
+			ksCloud.SetAccessKey(val)
+		}
+
+		// Back-propagate URLs from connector to configObj when configObj has no URL but connector does.
+		// This handles the API_URL-based live service discovery path where initializeSaaSEnv sets URLs
+		// on the global connector before any scan runs, but configObj.CloudReportURL is never populated
+		// (e.g. when running without services.json and without KS_CLOUD_REPORT_URL env var).
+		if co := c.GetConfigObj(); co != nil {
+			if co.CloudReportURL == "" && ksCloud.GetCloudReportURL() != "" {
+				logger.L().Debug("updating Cloud Report URL in config from connector", helpers.String("cloudReportURL", ksCloud.GetCloudReportURL()))
+				co.CloudReportURL = ksCloud.GetCloudReportURL()
+			}
+			if co.CloudAPIURL == "" && ksCloud.GetCloudAPIURL() != "" {
+				logger.L().Debug("updating Cloud API URL in config from connector", helpers.String("cloudAPIURL", ksCloud.GetCloudAPIURL()))
+				co.CloudAPIURL = ksCloud.GetCloudAPIURL()
+			}
+		}
+
+		getter.SetKSCloudAPIConnector(ksCloud)
+	} else {
+		logger.L().Debug("initializing KS Cloud API from config", helpers.String("accountID", c.GetAccountID()), helpers.String("cloudAPIURL", c.GetCloudAPIURL()), helpers.String("cloudReportURL", c.GetCloudReportURL()))
+		cloud, err := v1.NewKSCloudAPI(
+			c.GetCloudAPIURL(),
+			c.GetCloudReportURL(),
+			c.GetAccountID(),
+			c.GetAccessKey())
+		if err != nil {
+			logger.L().Error("failed to create KS Cloud client", helpers.Error(err))
+			return nil
+		}
+		getter.SetKSCloudAPIConnector(cloud)
+	}
+
+	return getter.GetKSCloudAPIConnector()
+}
+
+func GetTenantConfig(ctx context.Context, accountID, accessKey, clusterName, customClusterName string, k8s *k8sinterface.KubernetesApi) ITenantConfig {
+	if !k8sinterface.IsConnectedToCluster() || k8s == nil {
+		return NewLocalConfig(accountID, accessKey, clusterName, customClusterName)
+	}
+	return NewClusterConfig(ctx, k8s, accountID, accessKey, clusterName, customClusterName)
+}

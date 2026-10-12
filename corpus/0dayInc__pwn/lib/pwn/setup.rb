@@ -1,0 +1,1199 @@
+# frozen_string_literal: true
+
+require 'rbconfig'
+require 'English'
+require 'shellwords'
+
+module PWN
+  # PWN::Setup — post-install "doctor" and capability provisioner.
+  #
+  # PWN ships as a **single gem** whose runtime is 100 % `autoload`ed
+  # (`lib/pwn.rb`) — a plugin whose native gem or OS binary is missing
+  # costs nothing until you touch that constant.  `PWN::Setup` is the
+  # piece that grows a bare `gem install pwn` into a fully-armed host
+  # **after** the gem is installed, instead of **before** via a chain
+  # of bash scripts that assume `/opt/pwn`, `rvmsudo`, `screen`, and
+  # MacPorts.
+  #
+  # It is the Ruby-native, versioned-with-the-gem replacement for the
+  # `case $os` blocks previously buried in `install.sh` and
+  # `packer/provisioners/pwn.sh`.
+  #
+  #   pwn setup                       # doctor (read-only)
+  #   pwn setup --check               # same
+  #   pwn setup --deps                # install OS headers for EVERY native gem
+  #   pwn setup --profile web         # install just what TransparentBrowser/Burp need
+  #   pwn setup --profile sdr --yes   # non-interactive
+  #   pwn setup --list-profiles
+  #
+  # Also exposed as `pwn_setup` (driver) and `pwn --setup[=PROFILE]`.
+  module Setup
+    # ------------------------------------------------------------------
+    # DATA — the single source of truth for "what OS packages does this
+    # capability need". Straight port of packer/provisioners/pwn.sh, but
+    # now it is **data**, versioned with the gem, testable, and identical
+    # on every install path (gem, git checkout, docker, packer, vagrant).
+    # ------------------------------------------------------------------
+
+    # Native-extension Ruby gems → OS headers/libs required to compile them,
+    # per package manager, plus the PWN:: constants they unlock.
+    NATIVE_GEMS = {
+      'pg' => {
+        apt: %w[postgresql-server-dev-all], dnf: %w[postgresql-devel],
+        pacman: %w[postgresql-libs], brew: %w[postgresql], port: %w[postgresql16-server],
+        plugins: %w[PWN::Plugins::DAOPostgres]
+      },
+      'sqlite3' => {
+        apt: %w[libsqlite3-dev], dnf: %w[sqlite-devel],
+        pacman: %w[sqlite], brew: %w[sqlite], port: %w[sqlite3],
+        plugins: %w[PWN::Plugins::DAOSqlite3]
+      },
+      'pcaprub' => {
+        apt: %w[libpcap-dev], dnf: %w[libpcap-devel],
+        pacman: %w[libpcap], brew: %w[libpcap], port: %w[libpcap],
+        plugins: %w[PWN::Plugins::Packet extro_packet]
+      },
+      'packetfu' => {
+        # Transitively requires pcaprub (native, libpcap headers) — moved to
+        # setup-managed so `gem install pwn` succeeds on a bare host and
+        # `pwn setup --profile net` installs libpcap + this + pcaprub together.
+        apt: %w[libpcap-dev], dnf: %w[libpcap-devel],
+        pacman: %w[libpcap], brew: %w[libpcap], port: %w[libpcap],
+        plugins: %w[PWN::Plugins::Packet extro_packet]
+      },
+      'packetgen' => {
+        # Same rationale as packetfu — hard-depends on pcaprub.
+        apt: %w[libpcap-dev], dnf: %w[libpcap-devel],
+        pacman: %w[libpcap], brew: %w[libpcap], port: %w[libpcap],
+        plugins: %w[PWN::Plugins::Packet extro_packet]
+      },
+      'rmagick' => {
+        apt: %w[imagemagick libmagickwand-dev], dnf: %w[ImageMagick-devel],
+        pacman: %w[imagemagick], brew: %w[imagemagick], port: %w[imagemagick],
+        plugins: %w[PWN::Plugins::OCR PWN::Reports]
+      },
+      'rtesseract' => {
+        apt: %w[tesseract-ocr tesseract-ocr-all], dnf: %w[tesseract],
+        pacman: %w[tesseract tesseract-data-eng], brew: %w[tesseract], port: %w[tesseract],
+        plugins: %w[PWN::Plugins::OCR extro_vision]
+      },
+      'ruby-audio' => {
+        apt: %w[libsndfile1-dev], dnf: %w[libsndfile-devel],
+        pacman: %w[libsndfile], brew: %w[libsndfile], port: %w[libsndfile],
+        plugins: %w[PWN::Plugins::Voice PWN::SDR extro_voice]
+      },
+      'curses' => {
+        apt: %w[libncurses-dev], dnf: %w[ncurses-devel],
+        pacman: %w[ncurses], brew: %w[ncurses], port: %w[ncurses],
+        plugins: %w[PWN::Plugins::REPL]
+      },
+      'libusb' => {
+        apt: %w[libusb-1.0-0-dev], dnf: %w[libusbx-devel],
+        pacman: %w[libusb], brew: %w[libusb], port: %w[libusb],
+        plugins: %w[PWN::SDR PWN::Plugins::BusPirate]
+      },
+      'ffi' => {
+        apt: %w[libffi-dev], dnf: %w[libffi-devel],
+        pacman: %w[libffi], brew: %w[libffi], port: %w[libffi],
+        plugins: %w[PWN::FFI]
+      },
+      'nokogiri' => {
+        apt: %w[libxml2-dev libxslt1-dev], dnf: %w[libxml2-devel libxslt-devel],
+        pacman: %w[libxml2 libxslt], brew: %w[libxml2], port: %w[libxml2 libxslt],
+        plugins: %w[PWN::Plugins::TransparentBrowser PWN::WWW]
+      },
+      'oily_png' => {
+        apt: %w[build-essential], dnf: %w[gcc make],
+        pacman: %w[base-devel], brew: %w[gcc], port: %w[gcc12],
+        plugins: %w[PWN::Plugins::ScannableCodes]
+      },
+      'eventmachine' => {
+        apt: %w[libssl-dev], dnf: %w[openssl-devel],
+        pacman: %w[openssl], brew: %w[openssl], port: %w[openssl],
+        plugins: %w[PWN::Plugins::Sock PWN::Plugins::IRC]
+      },
+      'gruff' => {
+        apt: %w[imagemagick libmagickwand-dev], dnf: %w[ImageMagick-devel],
+        pacman: %w[imagemagick], brew: %w[imagemagick], port: %w[imagemagick],
+        plugins: %w[PWN::Reports]
+      },
+      # Not a native extension, but gated by required_ruby_version >= 4.0 on
+      # rubygems.org — so it cannot be a hard runtime dependency of pwn while
+      # pwn.gemspec advertises `>= 3.3`. Managed here instead so
+      # `gem install pwn` succeeds on distro rubies (3.3/3.4) and `pwn setup`
+      # installs it post-hoc where possible. See install-matrix.yml.
+      'meshtastic' => {
+        apt: %w[], dnf: %w[], pacman: %w[], brew: %w[], port: %w[],
+        min_ruby: '4.0.0',
+        plugins: %w[PWN::Plugins::REPL#pwn-mesh]
+      }
+    }.freeze
+
+    # External binaries PWN wraps → OS packages that provide them.
+    # (Extrospection.probe_toolchain already knows how to *detect* these;
+    #  this table knows how to *install* them.)
+    TOOLCHAIN = {
+      'nmap' => {
+        apt: %w[nmap], dnf: %w[nmap], pacman: %w[nmap], brew: %w[nmap], port: %w[nmap],
+        plugins: %w[PWN::Plugins::NmapIt]
+      },
+      'chromium' => {
+        apt: %w[chromium], dnf: %w[chromium], pacman: %w[chromium], brew: %w[chromium], port: %w[chromium],
+        plugins: %w[PWN::Plugins::TransparentBrowser extro_verify extro_watch]
+      },
+      'geckodriver' => {
+        apt: %w[firefox-esr], dnf: %w[firefox], pacman: %w[geckodriver], brew: %w[geckodriver], port: %w[geckodriver],
+        plugins: %w[PWN::Plugins::TransparentBrowser]
+      },
+      'msfconsole' => {
+        apt: %w[metasploit-framework], dnf: %w[metasploit-framework], pacman: %w[metasploit],
+        brew: %w[metasploit], port: %w[],
+        plugins: %w[PWN::Plugins::Metasploit]
+      },
+      'burpsuite' => {
+        apt: %w[burpsuite], dnf: %w[], pacman: %w[burpsuite], brew: %w[burp-suite], port: %w[],
+        plugins: %w[PWN::Plugins::BurpSuite]
+      },
+      'zaproxy' => {
+        apt: %w[zaproxy], dnf: %w[], pacman: %w[zaproxy], brew: %w[zap], port: %w[],
+        plugins: %w[PWN::Plugins::Zaproxy]
+      },
+      'sqlmap' => {
+        apt: %w[sqlmap], dnf: %w[sqlmap], pacman: %w[sqlmap], brew: %w[sqlmap], port: %w[],
+        plugins: %w[PWN::Plugins::Sqlmap PWN::Plugins::Fuzz]
+      },
+      'tor' => {
+        apt: %w[tor], dnf: %w[tor], pacman: %w[tor], brew: %w[tor], port: %w[tor],
+        plugins: %w[PWN::Plugins::Tor]
+      },
+      'tshark' => {
+        apt: %w[tshark], dnf: %w[wireshark-cli], pacman: %w[wireshark-cli],
+        brew: %w[wireshark], port: %w[wireshark],
+        plugins: %w[PWN::Plugins::Packet extro_packet]
+      },
+      'tcpdump' => {
+        apt: %w[tcpdump], dnf: %w[tcpdump], pacman: %w[tcpdump], brew: %w[tcpdump], port: %w[tcpdump],
+        plugins: %w[PWN::Plugins::Packet extro_packet]
+      },
+      'tesseract' => {
+        apt: %w[tesseract-ocr], dnf: %w[tesseract], pacman: %w[tesseract],
+        brew: %w[tesseract], port: %w[tesseract],
+        plugins: %w[PWN::Plugins::OCR extro_vision]
+      },
+      'zbarimg' => {
+        apt: %w[zbar-tools], dnf: %w[zbar], pacman: %w[zbar], brew: %w[zbar], port: %w[zbar],
+        plugins: %w[PWN::Plugins::ScannableCodes extro_vision]
+      },
+      'espeak-ng' => {
+        apt: %w[espeak-ng], dnf: %w[espeak-ng], pacman: %w[espeak-ng],
+        brew: %w[espeak-ng], port: %w[espeak-ng],
+        plugins: %w[PWN::Plugins::Voice extro_voice]
+      },
+      'sox' => {
+        apt: %w[sox], dnf: %w[sox], pacman: %w[sox], brew: %w[sox], port: %w[sox],
+        plugins: %w[PWN::Plugins::Voice PWN::SDR]
+      },
+      'gqrx' => {
+        apt: %w[gqrx-sdr], dnf: %w[gqrx], pacman: %w[gqrx], brew: %w[gqrx], port: %w[gqrx],
+        plugins: %w[PWN::SDR extro_rf_tune]
+      },
+      'rtl_sdr' => {
+        apt: %w[rtl-sdr], dnf: %w[rtl-sdr], pacman: %w[rtl-sdr], brew: %w[librtlsdr], port: %w[rtl-sdr],
+        plugins: %w[PWN::SDR PWN::FFI::RTLSdr]
+      },
+      'hackrf_info' => {
+        apt: %w[hackrf], dnf: %w[hackrf], pacman: %w[hackrf], brew: %w[hackrf], port: %w[hackrf],
+        plugins: %w[PWN::SDR PWN::FFI::HackRF]
+      },
+      'SoapySDRUtil' => {
+        apt: %w[soapysdr-tools], dnf: %w[SoapySDR], pacman: %w[soapysdr],
+        brew: %w[soapysdr], port: %w[SoapySDR],
+        plugins: %w[PWN::SDR PWN::FFI::SoapySDR]
+      },
+      'multimon-ng' => {
+        apt: %w[multimon-ng], dnf: %w[multimon-ng], pacman: %w[multimon-ng],
+        brew: %w[multimon-ng], port: %w[],
+        plugins: %w[PWN::SDR::Decoder]
+      },
+      'dot' => {
+        apt: %w[graphviz], dnf: %w[graphviz], pacman: %w[graphviz],
+        brew: %w[graphviz], port: %w[graphviz],
+        plugins: %w[documentation/diagrams]
+      },
+      'adb' => {
+        apt: %w[adb], dnf: %w[android-tools], pacman: %w[android-tools],
+        brew: %w[android-platform-tools], port: %w[],
+        plugins: %w[PWN::Plugins::Android]
+      },
+      'baresip' => {
+        apt: %w[baresip], dnf: %w[baresip], pacman: %w[baresip], brew: %w[baresip], port: %w[],
+        plugins: %w[PWN::Plugins::BareSIP extro_telecomm]
+      },
+      'whois' => {
+        apt: %w[whois], dnf: %w[whois], pacman: %w[whois], brew: %w[whois], port: %w[whois],
+        plugins: %w[extro_osint]
+      },
+      'jq' => {
+        apt: %w[jq], dnf: %w[jq], pacman: %w[jq], brew: %w[jq], port: %w[jq],
+        plugins: %w[extro_osint]
+      },
+      'gdb' => {
+        apt: %w[gdb], dnf: %w[gdb], pacman: %w[gdb], brew: %w[gdb], port: %w[gdb],
+        plugins: %w[PWN::Plugins::GDB]
+      },
+      'r2' => {
+        apt: %w[radare2], dnf: %w[radare2], pacman: %w[radare2], brew: %w[radare2], port: %w[radare2],
+        plugins: %w[PWN::Plugins::Radare2]
+      },
+      'objdump' => {
+        apt: %w[binutils], dnf: %w[binutils], pacman: %w[binutils], brew: %w[binutils], port: %w[binutils],
+        plugins: %w[PWN::Plugins::ROP PWN::Plugins::BinaryAnalysis]
+      },
+      'checksec' => {
+        apt: %w[], dnf: %w[], pacman: %w[checksec], brew: %w[], port: %w[],
+        pip: 'checksec.py',
+        plugins: %w[PWN::Plugins::GDB PWN::Plugins::ExploitDev]
+      },
+      'ROPgadget' => {
+        apt: %w[], dnf: %w[], pacman: %w[], brew: %w[], port: %w[],
+        pip: 'ROPGadget',
+        plugins: %w[PWN::Plugins::ExploitDev]
+      },
+      'one_gadget' => {
+        apt: %w[], dnf: %w[], pacman: %w[], brew: %w[], port: %w[],
+        gem: 'one_gadget',
+        plugins: %w[PWN::Plugins::ExploitDev]
+      },
+      'pwndbg' => {
+        apt: %w[pwndbg], dnf: %w[], pacman: %w[pwndbg], brew: %w[], port: %w[],
+        script: "curl --proto '=https' --tlsv1.2 -LsSf 'https://install.pwndbg.re' | sh -s -- -t pwndbg-gdb",
+        plugins: %w[PWN::Plugins::GDB]
+      },
+      'analyzeHeadless' => {
+        apt: %w[], dnf: %w[], pacman: %w[], brew: %w[], port: %w[],
+        script: 'echo install Ghidra from https://ghidra-sre.org so analyzeHeadless is on PATH',
+        plugins: %w[PWN::Plugins::Ghidra]
+      },
+      'ropper' => {
+        apt: %w[], dnf: %w[], pacman: %w[], brew: %w[], port: %w[],
+        pip: 'ropper',
+        plugins: %w[PWN::Plugins::ExploitDev]
+      },
+      'rizin' => {
+        apt: %w[rizin], dnf: %w[], pacman: %w[rizin], brew: %w[], port: %w[],
+        plugins: %w[PWN::Plugins::Radare2]
+      },
+      'qemu-x86_64' => {
+        apt: %w[qemu-user-static], dnf: %w[qemu-user-static], pacman: %w[qemu-user-static],
+        brew: %w[], port: %w[],
+        plugins: %w[PWN::Plugins::GDB]
+      },
+      'yara' => {
+        apt: %w[yara], dnf: %w[yara], pacman: %w[yara], brew: %w[yara], port: %w[yara],
+        plugins: %w[PWN::Plugins::Volatility]
+      },
+      'frida' => {
+        apt: %w[], dnf: %w[], pacman: %w[], brew: %w[], port: %w[],
+        pip: 'frida-tools',
+        plugins: %w[PWN::Plugins::Frida]
+      },
+      'apktool' => {
+        apt: %w[apktool], dnf: %w[], pacman: %w[apktool], brew: %w[apktool], port: %w[],
+        plugins: %w[PWN::Plugins::Android]
+      },
+      'jadx' => {
+        apt: %w[jadx], dnf: %w[], pacman: %w[jadx], brew: %w[], port: %w[],
+        plugins: %w[PWN::Plugins::Android]
+      },
+      'nuclei' => {
+        apt: %w[nuclei], dnf: %w[], pacman: %w[nuclei], brew: %w[nuclei], port: %w[],
+        plugins: %w[PWN::Plugins::Nuclei]
+      },
+      'hydra' => {
+        apt: %w[hydra], dnf: %w[hydra], pacman: %w[hydra], brew: %w[thc-hydra], port: %w[],
+        plugins: %w[PWN::Plugins::CredentialAttack]
+      },
+      'afl-fuzz' => {
+        apt: %w[afl++], dnf: %w[afl++], pacman: %w[afl++], brew: %w[afl++], port: %w[],
+        plugins: %w[PWN::Plugins::AFLplusplus]
+      },
+      'searchsploit' => {
+        apt: %w[exploitdb], dnf: %w[], pacman: %w[exploitdb], brew: %w[], port: %w[],
+        plugins: %w[PWN::Plugins::ExploitDB]
+      },
+      'trivy' => {
+        apt: %w[trivy], dnf: %w[trivy], pacman: %w[trivy], brew: %w[trivy], port: %w[],
+        plugins: %w[PWN::Plugins::K8s]
+      },
+      'kube-hunter' => {
+        apt: %w[], dnf: %w[], pacman: %w[], brew: %w[], port: %w[],
+        pip: 'kube-hunter',
+        plugins: %w[PWN::Plugins::K8s]
+      },
+      'semgrep' => {
+        apt: %w[semgrep], dnf: %w[], pacman: %w[], brew: %w[semgrep], port: %w[],
+        pip: 'semgrep',
+        plugins: %w[PWN::Plugins::Semgrep]
+      },
+      'vol' => {
+        apt: %w[volatility3], dnf: %w[], pacman: %w[volatility3], brew: %w[], port: %w[],
+        pip: 'volatility3',
+        plugins: %w[PWN::Plugins::Volatility]
+      },
+      'subfinder' => {
+        apt: %w[subfinder], dnf: %w[], pacman: %w[], brew: %w[], port: %w[],
+        plugins: %w[PWN::Plugins::Recon]
+      },
+      'httpx' => {
+        apt: %w[httpx-toolkit], dnf: %w[], pacman: %w[], brew: %w[], port: %w[],
+        plugins: %w[PWN::Plugins::Recon]
+      },
+      'masscan' => {
+        apt: %w[masscan], dnf: %w[masscan], pacman: %w[masscan], brew: %w[masscan], port: %w[],
+        plugins: %w[PWN::Plugins::Recon]
+      },
+      'naabu' => {
+        apt: %w[naabu], dnf: %w[], pacman: %w[], brew: %w[], port: %w[],
+        plugins: %w[PWN::Plugins::Recon]
+      },
+      'amass' => {
+        apt: %w[amass], dnf: %w[], pacman: %w[], brew: %w[amass], port: %w[],
+        plugins: %w[PWN::Plugins::Recon]
+      },
+      'john' => {
+        apt: %w[john], dnf: %w[john], pacman: %w[john], brew: %w[john], port: %w[john],
+        plugins: %w[PWN::Plugins::CredentialAttack]
+      },
+      'hashcat' => {
+        apt: %w[hashcat], dnf: %w[hashcat], pacman: %w[hashcat], brew: %w[hashcat], port: %w[],
+        plugins: %w[PWN::Plugins::CredentialAttack]
+      },
+      'medusa' => {
+        apt: %w[medusa], dnf: %w[medusa], pacman: %w[medusa], brew: %w[], port: %w[],
+        plugins: %w[PWN::Plugins::CredentialAttack]
+      },
+      'hashid' => {
+        apt: %w[hashid], dnf: %w[], pacman: %w[], brew: %w[], port: %w[],
+        pip: 'hashid',
+        plugins: %w[PWN::Plugins::CredentialAttack]
+      }
+    }.tap do |t|
+      %w[burpsuite zaproxy msfconsole nuclei searchsploit httpx subfinder naabu amass apktool jadx rizin pwndbg trivy semgrep vol hashid].each do |bin|
+        next unless t[bin]
+
+        t[bin] = t[bin].merge(ubuntu: [], debian: [])
+      end
+      {
+        'checksec' => %w[checksec],
+        'ROPgadget' => %w[python3-ropgadget],
+        'ropper' => %w[ropper],
+        'pwndbg' => [],
+        'semgrep' => [],
+        'vol' => []
+      }.each do |bin, pkgs|
+        next unless t[bin]
+
+        t[bin] = t[bin].merge(kali: pkgs)
+      end
+    end.freeze
+
+    # Capability profiles — how you get the ergonomics of `pwn-full`
+    # without shipping a second gem. `pwn setup --profile <name>`.
+    PROFILES = {
+      core: {
+        desc: '~/.pwn bootstrap + vault + REPL (always runs on bare `pwn setup --deps`)',
+        gems: %w[ffi nokogiri curses eventmachine],
+        bins: %w[]
+      },
+      ai: {
+        desc: 'verify at least one AI engine key/oauth in ~/.pwn/pwn.yaml',
+        gems: %w[],
+        bins: %w[jq]
+      },
+      web: {
+        desc: 'TransparentBrowser · BurpSuite · Zaproxy · extro_verify · extro_watch',
+        gems: %w[nokogiri eventmachine],
+        bins: %w[chromium geckodriver burpsuite zaproxy sqlmap tor]
+      },
+      net: {
+        desc: 'NmapIt · Packet · extro_packet · extro_osint',
+        gems: %w[pcaprub packetfu packetgen],
+        bins: %w[nmap tshark tcpdump whois jq]
+      },
+      db: {
+        desc: 'DAOPostgres · DAOSqlite3 · DAOMongo',
+        gems: %w[pg sqlite3],
+        bins: %w[]
+      },
+      sdr: {
+        desc: 'PWN::SDR · GQRX · FFI DSP backends · extro_rf_tune',
+        gems: %w[ruby-audio libusb ffi],
+        bins: %w[gqrx rtl_sdr hackrf_info SoapySDRUtil multimon-ng sox]
+      },
+      vision: {
+        desc: 'OCR · ScannableCodes · Reports · extro_vision',
+        gems: %w[rmagick rtesseract oily_png gruff],
+        bins: %w[tesseract zbarimg dot]
+      },
+      voice: {
+        desc: 'PWN::Plugins::Voice · extro_voice',
+        gems: %w[ruby-audio],
+        bins: %w[espeak-ng sox]
+      },
+      exploit: {
+        desc: 'Metasploit · sqlmap',
+        gems: %w[],
+        bins: %w[msfconsole sqlmap]
+      },
+      hardware: {
+        desc: 'Serial · BusPirate · Android · BareSIP · extro_serial · extro_telecomm',
+        gems: %w[libusb],
+        bins: %w[adb baresip]
+      },
+      re: {
+        desc: 'Radare2 · GDB · ExploitDev · Frida · Android RE tier',
+        gems: %w[],
+        bins: %w[gdb r2 checksec ROPgadget one_gadget qemu-x86_64 yara frida apktool jadx pwndbg ropper rizin]
+      },
+      full: {
+        desc: 'everything above',
+        gems: NATIVE_GEMS.keys,
+        bins: TOOLCHAIN.keys
+      }
+    }.freeze
+
+    OK   = "\e[32mok\e[0m"
+    MISS = "\e[31mMISSING\e[0m"
+
+    # Supported Method Parameters::
+    # PWN::Setup.packages_for(
+    #   bin: 'required - TOOLCHAIN key (e.g. nmap or burpsuite)',
+    #   distro: 'optional - DetectOS.distro symbol (defaults to live detect)',
+    #   version: 'optional - DetectOS.version string (defaults to live detect)',
+    #   pm_key: 'optional - package-manager family (:apt :dnf :pacman :brew :port :pkg …)'
+    # )
+
+    public_class_method def self.packages_for(opts = {})
+      bin = opts[:bin].to_s
+      meta = TOOLCHAIN[bin] || {}
+      distro = (opts[:distro] || PWN::Plugins::DetectOS.distro).to_s.to_sym
+      version = (opts[:version] || PWN::Plugins::DetectOS.version).to_s
+      pm_key = opts[:pm_key] || pkg_manager[:key]
+      ver_key = :"#{distro}/#{version}"
+      return Array(meta[ver_key]) if meta.key?(ver_key)
+      return Array(meta[distro]) if meta.key?(distro)
+
+      pkgs = Array(meta[pm_key])
+      return pkgs unless pkgs.empty?
+      return [bin] if %i[pkg pkg_add pkgin apk].include?(pm_key) && !bin.empty?
+
+      []
+    end
+
+    # Supported Method Parameters::
+    # PWN::Setup.pkg_manager
+
+    public_class_method def self.pkg_manager
+      return @pkg_manager if defined?(@pkg_manager) && @pkg_manager
+
+      # Drop the `sudo` prefix when we are already root (Docker / CI
+      # containers, `sudo -i`, root shells) or when `sudo` is not
+      # installed — otherwise `pwn setup --profile x --yes` dies with
+      # `sh: sudo: not found` on stock debian:* / fedora:* images.
+      root = begin
+        Process.uid.zero?
+      rescue StandardError
+        false
+      end
+      priv =
+        if !root && bin?(name: 'doas')
+          'doas '
+        elsif !root && bin?(name: 'sudo')
+          'sudo '
+        else
+          ''
+        end
+
+      distro = begin
+        PWN::Plugins::DetectOS.distro
+      rescue StandardError
+        nil
+      end
+
+      @pkg_manager =
+        if distro == :freebsd
+          cmd = which(name: 'pkg')
+          cmd = '/usr/sbin/pkg' if cmd.empty?
+          { key: :pkg, install: "#{priv}#{cmd} install -y", sudo: !priv.empty? }
+        elsif distro == :openbsd
+          cmd = which(name: 'pkg_add')
+          cmd = '/usr/sbin/pkg_add' if cmd.empty?
+          { key: :pkg_add, install: "#{priv}#{cmd}", sudo: !priv.empty? }
+        elsif distro == :netbsd
+          cmd = which(name: 'pkgin')
+          cmd = '/usr/pkg/bin/pkgin' if cmd.empty?
+          { key: :pkgin, install: "#{priv}#{cmd} -y install", sudo: !priv.empty? }
+        elsif distro == :alpine && bin?(name: 'apk')
+          { key: :apk, install: "#{priv}apk add", sudo: !priv.empty? }
+        elsif distro == :android && bin?(name: 'pkg')
+          { key: :pkg, install: 'pkg install -y', sudo: false }
+        elsif distro == :windows && bin?(name: 'winget')
+          { key: :winget, install: 'winget install -e --accept-package-agreements --accept-source-agreements', sudo: false }
+        elsif distro == :windows && bin?(name: 'choco')
+          { key: :choco, install: 'choco install -y', sudo: false }
+        elsif bin?(name: 'apt-get')
+          { key: :apt, install: "#{priv}apt-get install -y", sudo: !priv.empty? }
+        elsif bin?(name: 'dnf')
+          { key: :dnf, install: "#{priv}dnf install -y", sudo: !priv.empty? }
+        elsif bin?(name: 'pacman')
+          { key: :pacman, install: "#{priv}pacman -S --noconfirm", sudo: !priv.empty? }
+        elsif bin?(name: 'brew')
+          { key: :brew, install: 'brew install', sudo: false }
+        elsif bin?(name: 'port')
+          { key: :port, install: "#{priv}port -N install", sudo: !priv.empty? }
+        else
+          { key: :unknown, install: nil, sudo: false }
+        end
+    end
+
+    # Supported Method Parameters::
+    # PWN::Setup.check(
+    #   io: 'optional - IO to write the report to (default $stdout)'
+    # )
+
+    public_class_method def self.check(opts = {})
+      io      = opts[:io] || $stdout
+      profile = opts[:profile]&.to_sym
+      pm      = pkg_manager
+      os = detect_os_attr(attr: :type, fallback: RbConfig::CONFIG['host_os'])
+      arch = detect_os_attr(attr: :arch, fallback: RbConfig::CONFIG['host_cpu'])
+
+      io.puts "PWN v#{PWN::VERSION} · ruby #{RUBY_VERSION} · #{os} #{arch} · pkg-manager: #{pm[:key]}"
+      io.puts
+
+      # ~/.pwn -----------------------------------------------------------
+      pwn_root  = File.join(Dir.home, '.pwn')
+      pwn_yaml  = File.join(pwn_root, 'pwn.yaml')
+      pwn_dec   = File.join(pwn_root, 'pwn.yaml.decryptor')
+      root_ok   = File.directory?(pwn_root)
+      root_note = root_ok ? "(#{Dir.children(pwn_root).length} entries)" : '(will be created on first `pwn` launch)'
+      io.puts "#{'~/.pwn/'.ljust(26)} #{root_ok ? OK : MISS}   #{root_note}"
+      yaml_ok   = File.file?(pwn_yaml)
+      dec_state = File.file?(pwn_dec) ? 'present' : 'MISSING'
+      yaml_note = yaml_ok ? "(encrypted, decryptor #{dec_state})" : '(run `pwn` once, then `pwn-vault` to configure)'
+      io.puts "#{'~/.pwn/pwn.yaml'.ljust(26)} #{yaml_ok ? OK : MISS}   #{yaml_note}"
+      engine = ai_active_engine
+      key_ok = ai_key_configured?(engine: engine)
+      engine_note = if engine
+                      "#{engine} #{key_ok ? '(key set)' : '(no key — set via `pwn-vault`)'}"
+                    else
+                      '(no ai.active in pwn.yaml)'
+                    end
+      io.puts "#{'AI engine'.ljust(26)} #{key_ok ? OK : MISS}   #{engine_note}"
+      io.puts
+
+      # Native gems ------------------------------------------------------
+      io.puts 'Ruby extensions'
+      gem_missing = []
+      NATIVE_GEMS.each do |gem_name, meta|
+        ok = gem_loadable?(name: gem_name)
+        gem_missing << gem_name unless ok
+        need = ok ? '' : "(needs: #{Array(meta[pm[:key]]).join(' ')})"
+        io.puts "  #{gem_name.to_s.ljust(14)} #{ok ? OK : MISS}  #{need.ljust(42)} → #{Array(meta[:plugins]).join(', ')}"
+      end
+      io.puts
+
+      # Toolchain --------------------------------------------------------
+      io.puts "#{'External toolchain'.ljust(46)} used by"
+      bin_missing = []
+      TOOLCHAIN.each do |bin, meta|
+        path = which(name: bin)
+        bin_missing << bin if path.empty?
+        shown_path = path.empty? ? '' : path[0, 24]
+        io.puts "  #{bin.to_s.ljust(16)} #{path.empty? ? MISS : OK}   #{shown_path.ljust(24)} #{Array(meta[:plugins]).join(', ')}"
+      end
+      io.puts
+
+      # ~/.pwn state ----------------------------------------------------
+      migrate = nil
+      if defined?(PWN::Migrate)
+        migrate = PWN::Migrate.check(io: io)
+        io.puts
+      end
+
+      total   = NATIVE_GEMS.size + TOOLCHAIN.size
+      missing = gem_missing.size + bin_missing.size
+      io.puts "#{total - missing} / #{total} capabilities usable · #{missing} degraded"
+      io.puts
+      unless missing.zero?
+        io.puts 'Run `pwn setup --deps` to install missing OS headers/tools, or'
+        io.puts '    `pwn setup --profile <name>` for a subset. See `pwn setup --list-profiles`.'
+      end
+
+      # When a profile is given (`pwn setup --check --profile core`), :ok is
+      # gated ONLY on that profile's gems/bins so a partially-provisioned host
+      # can still pass its own doctor gate. `packer/provisioners/pwn.sh` and
+      # spec/integration/fresh_install_spec.rb rely on this — a `core` leg of
+      # install-matrix must not fail because gqrx/burpsuite/etc. are absent.
+      gate_gems = gem_missing
+      gate_bins = bin_missing
+      if profile && PROFILES.key?(profile)
+        prof      = PROFILES[profile]
+        gate_gems = gem_missing & Array(prof[:gems])
+        gate_bins = bin_missing & Array(prof[:bins])
+        io.puts
+        io.puts "Profile '#{profile}' gate: " \
+                "#{gate_gems.empty? && gate_bins.empty? ? OK : MISS} " \
+                "(gems: #{gate_gems.empty? ? '—' : gate_gems.join(' ')}, " \
+                "bins: #{gate_bins.empty? ? '—' : gate_bins.join(' ')})"
+      end
+
+      { ok: gate_gems.empty? && gate_bins.empty? && Array(migrate && migrate[:incompatible]).empty?,
+        native_gems_missing: gem_missing, toolchain_missing: bin_missing,
+        state: migrate, pkg_manager: pm[:key], os: os, arch: arch }
+    rescue StandardError => e
+      raise e
+    end
+
+    # Supported Method Parameters::
+    # PWN::Setup.deps(
+    #   profile: 'optional - one of PROFILES.keys (default :full)',
+    #   yes:     'optional - non-interactive; assume yes to prompts (default false)',
+    #   dry_run: 'optional - print commands only, do not execute (default false)',
+    #   io:      'optional - IO to write to (default $stdout)'
+    # )
+
+    public_class_method def self.deps(opts = {})
+      profile = (opts[:profile] || :full).to_sym
+      yes     = opts[:yes] ? true : false
+      dry_run = opts[:dry_run] ? true : false
+      distro  = opts[:distro] || PWN::Plugins::DetectOS.distro
+      version = opts[:version] || PWN::Plugins::DetectOS.version
+      io      = opts[:io] || $stdout
+
+      raise "Unknown profile '#{profile}'. Known: #{PROFILES.keys.join(', ')}" unless PROFILES.key?(profile)
+
+      pm = pkg_manager
+      raise 'No supported package manager found (apt / dnf / pacman / brew / port / pkg_add / pkg / winget).' if pm[:key] == :unknown
+
+      prof     = PROFILES[profile]
+      gems     = Array(prof[:gems])
+      # Drop setup-managed gems whose upstream required_ruby_version excludes
+      # THIS ruby (e.g. meshtastic >= 4.0 on a distro ruby 3.3) — otherwise
+      # `gem install` in the loop below fails and takes the whole profile with it.
+      gems = gems.reject do |g|
+        floor = NATIVE_GEMS.dig(g, :min_ruby)
+        skip  = floor && Gem::Version.new(RUBY_VERSION) < Gem::Version.new(floor)
+        io.puts "  \e[33mskip\e[0m #{g} — requires ruby >= #{floor} (running #{RUBY_VERSION})" if skip
+        skip
+      end
+      bins     = Array(prof[:bins])
+      os_pkgs  = []
+      gems.each { |g| os_pkgs.concat(Array(NATIVE_GEMS.dig(g, pm[:key]))) }
+      bins.each { |b| os_pkgs.concat(packages_for(bin: b, distro: distro, version: version, pm_key: pm[:key])) }
+      os_pkgs = os_pkgs.reject(&:empty?).uniq
+      alts = alt_install_cmds(bins: bins, pm_key: pm[:key], distro: distro, version: version)
+      os_pkgs = (['pipx'] + os_pkgs).uniq if pm[:key] == :apt && alts.any? { |c| c.include?('pipx install') }
+
+      io.puts "Profile   : #{profile} — #{prof[:desc]}"
+      io.puts "Distro    : #{distro} #{version}"
+      io.puts "Pkg mgr   : #{pm[:key]}"
+      io.puts "OS pkgs   : #{os_pkgs.empty? ? '(none)' : os_pkgs.join(' ')}"
+      io.puts "Ruby exts : #{gems.empty? ? '(none)' : gems.join(' ')}"
+      io.puts
+
+      cmds = os_pkgs.map { |pkg| "#{pm[:install]} #{Shellwords.escape(pkg)}" }
+      unless gems.empty?
+        broken = gems.reject { |g| gem_loadable?(name: g) }
+        cmds << "gem pristine #{broken.map { |g| Shellwords.escape(g) }.join(' ')}" unless broken.empty?
+        cmds << "gem install #{broken.map { |g| Shellwords.escape(g) }.join(' ')}"  unless broken.empty?
+      end
+      cmds.concat(alts)
+
+      if cmds.empty?
+        io.puts "Nothing to do — profile '#{profile}' is already satisfied."
+        return { profile: profile, ran: [], skipped: true }
+      end
+
+      io.puts 'Will run:'
+      cmds.each { |c| io.puts "  $ #{c}" }
+      io.puts
+
+      unless yes || dry_run
+        io.print 'Proceed? [y/N] '
+        ans = $stdin.gets.to_s.strip.downcase
+        return { profile: profile, ran: [], aborted: true } unless %w[y yes].include?(ans)
+      end
+
+      ran = []
+      cmds.each do |c|
+        io.puts "→ #{c}"
+        if dry_run
+          ran << { cmd: c, exit: 0, dry_run: true }
+        else
+          ok = system(c)
+          ran << { cmd: c, exit: $CHILD_STATUS && $CHILD_STATUS.exitstatus, ok: ok }
+          io.puts "  (exit #{ran.last[:exit]})" unless ok
+        end
+      end
+
+      io.puts
+      io.puts 'Re-checking…'
+      io.puts
+      result = check(io: io)
+      { profile: profile, ran: ran, check: result }
+    rescue StandardError => e
+      raise e
+    end
+
+    # Supported Method Parameters::
+    # PWN::Setup.terminal(
+    #   yes:     'optional - assume yes; non-interactive (default false)',
+    #   dry_run: 'optional - print what WOULD happen (default false)',
+    #   io:      'optional - IO to write to (default $stdout)'
+    # )
+    #
+    # Opt-in installer for SHIFT+ENTER multi-line support in the pwn-ai /
+    # pwn-asm REPL. Never runs implicitly — the user invokes it with
+    # `pwn setup --terminal` after PWNMultiLineInput#ensure_vte_shift_enter
+    # tells them their emulator can't distinguish Shift+Enter from Enter.
+    #
+    # What it does:
+    #   1. Prints the two `~/.tmux.conf` lines that persist the runtime
+    #      `tmux set -s` calls PWNMultiLineInput already makes.
+    #   2. If running under Terminator (a VTE host), copies
+    #      third_party/terminator/pwn_shift_enter.py to
+    #      ~/.config/terminator/plugins/ and enables the PWNShiftEnter
+    #      plugin in ~/.config/terminator/config — WITH confirmation and
+    #      a .pwnbak backup. This is the only VTE emulator we can fix at
+    #      the GTK layer without patching libvte itself.
+    #
+    # Everything here is host-config mutation, which is why it lives in
+    # `pwn setup` and NOT in the REPL's runtime path. See GNOME/vte
+    # issues #2601 / #2607 for why VTE can't be fixed with escape
+    # sequences alone.
+
+    public_class_method def self.terminal(opts = {})
+      require 'fileutils'
+      io      = opts[:io] || $stdout
+      yes     = opts[:yes]
+      dry_run = opts[:dry_run]
+
+      io.puts "\n─── pwn setup --terminal ── SHIFT+ENTER multi-line support ───\n\n"
+
+      # ---- tmux persistence hint (always shown) --------------------
+      io.puts 'tmux users — persist extended-keys (pwn already sets these at runtime,'
+      io.puts 'but they are lost when the tmux server exits). Add to ~/.tmux.conf:'
+      io.puts
+      io.puts '    set -s  extended-keys on'
+      io.puts "    set -as terminal-features 'xterm*:extkeys'"
+      io.puts "    set -as terminal-features 'tmux*:extkeys'"
+      io.puts "    set -as terminal-features 'screen*:extkeys'"
+      io.puts
+
+      # ---- VTE / Terminator plugin (opt-in, mutating) --------------
+      vte_ver       = ENV['VTE_VERSION'].to_s
+      in_terminator = !ENV['TERMINATOR_UUID'].to_s.empty? || !ENV['TERMINATOR_DBUS_NAME'].to_s.empty?
+
+      unless in_terminator
+        if vte_ver.empty?
+          io.puts "This terminal already encodes SHIFT+ENTER distinctly (or isn't VTE-based)."
+          io.puts 'No further action needed — SHIFT+ENTER should work in pwn-ai / pwn-asm.'
+        else
+          io.puts "Detected a VTE-#{vte_ver} terminal that is NOT Terminator."
+          io.puts 'libvte cannot distinguish SHIFT+ENTER from ENTER (GNOME/vte #2601, #2607)'
+          io.puts 'and pwn only ships a GTK-level shim for Terminator. Use ALT+ENTER or a'
+          io.puts 'trailing `\` for multi-line, or switch to kitty / wezterm / foot /'
+          io.puts 'alacritty / xterm / Konsole / iTerm2 / Terminator for native SHIFT+ENTER.'
+        end
+        return { installed: false, reason: if in_terminator
+                                             nil
+                                           else
+                                             (vte_ver.empty? ? :not_vte : :vte_not_terminator)
+                                           end }
+      end
+
+      gem_root   = File.expand_path('../..', __dir__)
+      plugin_src = File.join(gem_root, 'third_party', 'terminator', 'pwn_shift_enter.py')
+      plugin_dir = File.join(Dir.home, '.config', 'terminator', 'plugins')
+      plugin_dst = File.join(plugin_dir, 'pwn_shift_enter.py')
+      cfg_path   = File.join(Dir.home, '.config', 'terminator', 'config')
+
+      unless File.exist?(plugin_src)
+        io.puts "ERROR: plugin source not found: #{plugin_src}"
+        io.puts '       (was pwn installed from a git checkout with third_party/ present?)'
+        return { installed: false, reason: :missing_source }
+      end
+
+      io.puts 'Terminator detected. pwn ships a GTK plugin that intercepts <Shift>Return'
+      io.puts 'BEFORE libvte encodes it and injects `\e[27;2;13~` into the pty, so pwn-ai'
+      io.puts 'and pwn-asm see a real SHIFT+ENTER. Installing it will:'
+      io.puts
+      io.puts "    write   #{plugin_dst}"
+      io.puts "    edit    #{cfg_path}   (add PWNShiftEnter to enabled_plugins)"
+      io.puts "    backup  #{cfg_path}.pwnbak"
+      io.puts
+
+      unless yes
+        io.print 'Proceed? [y/N] '
+        io.flush
+        ans = $stdin.gets.to_s.strip.downcase
+        unless %w[y yes].include?(ans)
+          io.puts 'aborted.'
+          return { installed: false, reason: :declined }
+        end
+      end
+
+      if dry_run
+        io.puts '[dry-run] would mkdir -p, cp, and edit the files above.'
+        return { installed: false, reason: :dry_run }
+      end
+
+      FileUtils.mkdir_p(plugin_dir)
+      FileUtils.cp(plugin_src, plugin_dst)
+      io.puts "  #{OK} installed #{plugin_dst}"
+
+      if File.exist?(cfg_path)
+        cfg = File.read(cfg_path)
+        if cfg.include?('PWNShiftEnter')
+          io.puts "  #{OK} PWNShiftEnter already enabled in #{cfg_path}"
+        else
+          FileUtils.cp(cfg_path, "#{cfg_path}.pwnbak") unless File.exist?("#{cfg_path}.pwnbak")
+          new_cfg =
+            if cfg =~ /^\s*enabled_plugins\s*=\s*(.*)$/
+              cfg.sub(/^(\s*enabled_plugins\s*=\s*)(.*)$/) do
+                lead = Regexp.last_match(1)
+                rest = Regexp.last_match(2).strip
+                rest.empty? ? "#{lead}PWNShiftEnter" : "#{lead}#{rest}, PWNShiftEnter"
+              end
+            elsif cfg =~ /^\[global_config\]\s*$/
+              cfg.sub(/^\[global_config\]\s*$/) { |m| "#{m}\n  enabled_plugins = PWNShiftEnter" }
+            else
+              "[global_config]\n  enabled_plugins = PWNShiftEnter\n#{cfg}"
+            end
+          File.write(cfg_path, new_cfg)
+          io.puts "  #{OK} enabled PWNShiftEnter in #{cfg_path} (backup: config.pwnbak)"
+        end
+      else
+        FileUtils.mkdir_p(File.dirname(cfg_path))
+        File.write(cfg_path, "[global_config]\n  enabled_plugins = PWNShiftEnter\n[plugins]\n")
+        io.puts "  #{OK} wrote #{cfg_path}"
+      end
+
+      io.puts
+      io.puts '>>> RESTART Terminator (close ALL its windows) for SHIFT+ENTER to take effect. <<<'
+      { installed: true, plugin: plugin_dst, config: cfg_path }
+    rescue StandardError => e
+      raise e
+    end
+
+    # Supported Method Parameters::
+    # PWN::Setup.list_profiles(
+    #   io: 'optional - IO to write to (default $stdout)'
+    # )
+
+    public_class_method def self.list_profiles(opts = {})
+      io = opts[:io] || $stdout
+      io.puts 'Available capability profiles (`pwn setup --profile <name>`):'
+      io.puts
+      PROFILES.each do |name, meta|
+        io.puts "  #{name.to_s.ljust(10)} #{meta[:desc]}"
+        io.puts "  #{''.ljust(10)}   gems: #{meta[:gems].join(' ')}" unless meta[:gems].empty?
+        io.puts "  #{''.ljust(10)}   bins: #{meta[:bins].join(' ')}" unless meta[:bins].empty?
+        io.puts
+      end
+      PROFILES.keys
+    rescue StandardError => e
+      raise e
+    end
+
+    # Supported Method Parameters::
+    # PWN::Setup.migrate(
+    #   fix:     'optional - also autofix incompatible ~/.pwn files (default false)',
+    #   dry_run: 'optional - print what WOULD happen (default false)',
+    #   yes:     'optional - alias for fix:true (CI-friendly)',
+    #   io:      'optional - IO to write to (default $stdout)'
+    # )
+    #
+    # Delegate to PWN::Migrate.run — verify every ~/.pwn state file is
+    # compatible with THIS pwn release and (optionally) autofix it.  A
+    # timestamped backup of ~/.pwn is taken first.  See `PWN::Migrate.help`.
+
+    public_class_method def self.migrate(opts = {})
+      PWN::Migrate.run(
+        fix: opts[:fix] || opts[:yes],
+        dry_run: opts[:dry_run],
+        io: opts[:io] || $stdout
+      )
+    rescue StandardError => e
+      raise e
+    end
+
+    # ------------------------------------------------------------------
+
+    private_class_method def self.detect_os_attr(opts = {})
+      PWN::Plugins::DetectOS.public_send(opts[:attr])
+    rescue StandardError
+      opts[:fallback]
+    end
+
+    private_class_method def self.ai_active_engine
+      PWN::Env.dig(:ai, :active)
+    rescue StandardError
+      nil
+    end
+
+    private_class_method def self.ai_key_configured?(opts = {})
+      engine = opts[:engine]
+      return false unless engine
+
+      PWN::Env.dig(:ai, engine.to_sym, :key).to_s !~ /\A(required|optional|)\z/i
+    rescue StandardError
+      false
+    end
+
+    private_class_method def self.alt_install_cmds(opts = {})
+      bins = Array(opts[:bins])
+      pm_key = opts[:pm_key]
+      distro = opts[:distro]
+      version = opts[:version]
+      bins.filter_map do |b|
+        meta = TOOLCHAIN[b] || {}
+        next if packages_for(bin: b, pm_key: pm_key, distro: distro, version: version).any?
+
+        if meta[:pip].to_s != ''
+          pip_install_cmd(pkg: meta[:pip], distro: distro)
+        elsif meta[:gem].to_s != ''
+          "gem install #{Shellwords.escape(meta[:gem])}"
+        elsif meta[:script].to_s != ''
+          meta[:script].to_s
+        end
+      end
+    end
+
+    private_class_method def self.pip_install_cmd(opts = {})
+      pkg = opts[:pkg].to_s
+      distro = opts[:distro].to_s.to_sym
+      if %i[kali debian ubuntu mint pop chromeos].include?(distro)
+        "pipx install #{Shellwords.escape(pkg)}"
+      else
+        "python3 -m pip install --user #{Shellwords.escape(pkg)}"
+      end
+    end
+
+    private_class_method def self.bin?(opts = {})
+      !which(name: opts[:name]).empty?
+    end
+
+    private_class_method def self.which(opts = {})
+      name = opts[:name].to_s
+      return '' if name.empty?
+
+      dirs = ENV.fetch('PATH', '').split(File::PATH_SEPARATOR)
+      dirs |= %w[/usr/bin /bin /usr/sbin /sbin /usr/local/bin /usr/local/sbin /usr/pkg/bin]
+      dirs.each do |dir|
+        path = File.join(dir, name)
+        return path if File.executable?(path) && !File.directory?(path)
+      end
+      ''
+    end
+
+    private_class_method def self.gem_loadable?(opts = {})
+      name = opts[:name].to_s
+      Gem::Specification.find_by_name(name)
+      true
+    rescue LoadError, StandardError
+      # Gem::MissingSpecError < Gem::LoadError < LoadError < ScriptError —
+      # NOT a StandardError. Rescuing StandardError alone let a missing
+      # setup-managed gem crash `pwn setup --dry-run` on a fresh host
+      # (install-matrix macOS leg). Fall back to a real `require` in case
+      # the spec index is stale but the extension is present.
+      begin
+        require name.tr('-', '/')
+        true
+      rescue LoadError, StandardError
+        false
+      end
+    end
+
+    # Supported Method Parameters::
+    # PWN::Setup.ensure_cron(
+    #   restart: 'optional - replace a live worker (default false = reuse)',
+    #   dry_run: 'optional - do not spawn (default false)',
+    #   interval: 'optional - worker poll seconds (default PWN::Cron::DEFAULT_INTERVAL)',
+    #   io:      'optional - IO to write the status line to (default $stdout)'
+    # )
+    #
+    # Seed default pwn-ai jobs (idempotent) and start the background
+    # scheduler that actually ticks last_run. `pwn setup` calls this
+    # after every action except --list-profiles / --terminal / --dry-run
+    # so YAML-only jobs fire without a system crontab entry.
+    public_class_method def self.ensure_cron(opts = {})
+      io      = opts[:io] || $stdout
+      dry_run = opts[:dry_run] ? true : false
+      restart = opts.fetch(:restart, false)
+      interval = opts[:interval]
+      enabled = if opts.key?(:enabled)
+                  opts[:enabled] ? true : false
+                elsif defined?(PWN::Cron)
+                  PWN::Cron.cron_enabled?
+                else
+                  true
+                end
+
+      unless defined?(PWN::Cron)
+        io.puts "#{'cron worker'.ljust(26)} #{MISS}   (PWN::Cron not loaded)"
+        return { ok: false, reason: :no_cron }
+      end
+
+      if dry_run
+        st = PWN::Cron.scheduler_status(apply: false)
+        io.puts "#{'cron worker'.ljust(26)} #{st.dig(:worker, :running) ? OK : MISS}   (dry-run, backend=#{st[:backend]}, enabled=#{enabled})"
+        return { ok: true, dry_run: true, worker: st[:worker], backend: st[:backend], enabled: enabled }
+      end
+
+      unless enabled
+        native = begin
+          PWN::Cron.uninstall_scheduler(apply: opts.fetch(:apply, PWN::Cron.apply_native?))
+        rescue StandardError => e
+          io.puts "#{'cron scheduler'.ljust(26)} #{MISS}   #{e.class}: #{e.message}"
+          { ok: false, error: "#{e.class}: #{e.message}" }
+        end
+        io.puts "#{'cron scheduler'.ljust(26)} #{OK}   disabled (#{native[:backend] || 'none'})"
+        return { ok: true, enabled: false, native: native, seeded: [] }
+      end
+
+      seeded = begin
+        PWN::Cron.install_defaults
+      rescue StandardError => e
+        io.puts "#{'cron defaults'.ljust(26)} #{MISS}   #{e.class}: #{e.message}"
+        []
+      end
+
+      live = PWN::Cron.worker_status
+      if live[:running] && !restart
+        io.puts "#{'cron worker'.ljust(26)} #{OK}   already running pid=#{live[:pid]}"
+        return {
+          ok: true,
+          seeded: seeded,
+          worker: live.merge(already_running: true),
+          skipped_spawn: true,
+          enabled: true
+        }
+      end
+
+      worker = PWN::Cron.ensure_worker(
+        restart: restart,
+        interval: interval
+      )
+      st = PWN::Cron.worker_status
+      label = if worker[:already_running]
+                'already running'
+              elsif worker[:started] && st[:running]
+                'started'
+              else
+                'FAILED'
+              end
+      mark = st[:running] ? OK : MISS
+      io.puts "#{'cron worker'.ljust(26)} #{mark}   #{label} pid=#{st[:pid] || worker[:pid] || 'none'}"
+
+      native = begin
+        PWN::Cron.install_scheduler(
+          enabled: true,
+          apply: opts.fetch(:apply, PWN::Cron.apply_native?)
+        )
+      rescue StandardError => e
+        io.puts "#{'cron scheduler'.ljust(26)} #{MISS}   #{e.class}: #{e.message}"
+        { ok: false, error: "#{e.class}: #{e.message}" }
+      end
+      backend = native.is_a?(Hash) ? native[:backend] : nil
+      io.puts "#{'cron scheduler'.ljust(26)} #{native[:ok] == false ? MISS : OK}   backend=#{backend || 'none'}"
+
+      {
+        ok: st[:running] ? true : false,
+        seeded: seeded,
+        worker: worker.merge(st),
+        backend: backend,
+        native: native,
+        enabled: true
+      }
+    rescue StandardError => e
+      io.puts "#{'cron worker'.ljust(26)} #{MISS}   #{e.class}: #{e.message}"
+      { ok: false, error: "#{e.class}: #{e.message}" }
+    end
+
+    # Author(s):: 0day Inc. <support@0dayinc.com>
+
+    public_class_method def self.authors
+      "AUTHOR(S):
+        0day Inc. <support@0dayinc.com>
+      "
+    end
+
+    # Display Usage for this Module
+
+    public_class_method def self.help
+      puts "USAGE:
+        # Detect this host's package manager (apt, dnf, pacman, brew, pkg, winget, …).
+        #{self}.pkg_manager
+
+        # Resolve OS package names for a TOOLCHAIN binary on this distro/version.
+        #{self}.packages_for(
+          bin: 'required - TOOLCHAIN key (e.g. nmap or burpsuite)',
+          distro: 'optional - DetectOS.distro symbol (defaults to live detect)',
+          version: 'optional - DetectOS.version string (defaults to live detect)',
+          pm_key: 'optional - package-manager family (:apt :dnf :pacman :brew :port :pkg)'
+        )
+
+        # Run check and return its result
+        #{self}.check(
+          io: 'optional - IO to write the report to (default $stdout)',
+          profile: 'optional - profile value consumed by #check'
+        )
+
+        # Install OS packages + native gems for a capability profile.
+        #{self}.deps(
+          profile: 'optional - one of PROFILES.keys (default :full)',
+          yes: 'optional - non-interactive; assume yes to prompts (default false)',
+          dry_run: 'optional - print commands only, do not execute (default false)',
+          io: 'optional - IO to write to (default $stdout)',
+          distro: 'optional - DetectOS.distro override (e.g. :kali :ubuntu :macos)',
+          version: 'optional - DetectOS.version override (e.g. 2026.3 or 24.04)'
+        )
+
+        # Opt-in installer for SHIFT+ENTER multi-line support in the pwn-ai /
+        #{self}.terminal(
+          yes: 'optional - assume yes; non-interactive (default false)',
+          dry_run: 'optional - print what WOULD happen (default false)',
+          io: 'optional - IO to write to (default $stdout)'
+        )
+
+        # Run list profiles and return its result
+        #{self}.list_profiles(
+          io: 'optional - IO to write to (default $stdout)'
+        )
+
+        # Delegate to PWN::Migrate.run — verify every ~/.pwn state file is
+        #{self}.migrate(
+          fix: 'optional - also autofix incompatible ~/.pwn files (default false)',
+          dry_run: 'optional - print what WOULD happen (default false)',
+          yes: 'optional - alias for fix:true (CI-friendly)',
+          io: 'optional - IO to write to (default $stdout)'
+        )
+
+        # Seed default pwn-ai jobs (idempotent) and start the background
+        #{self}.ensure_cron(
+          restart: 'optional - replace a live worker (default false = reuse)',
+          dry_run: 'optional - do not spawn (default false)',
+          interval: 'optional - worker poll seconds (default PWN::Cron::DEFAULT_INTERVAL)',
+          io: 'optional - IO to write the status line to (default $stdout)',
+          enabled: 'optional - enabled value consumed by #ensure_cron'
+        )
+
+        # Print the AUTHOR(S) string for this module.
+        #{self}.authors
+      "
+      constants.sort
+    end
+  end
+end

@@ -1,0 +1,1308 @@
+//! Windows-thread, stack-frame, register, and vCPU handles.
+
+use std::collections::HashMap;
+
+use indexmap::IndexMap;
+
+use pyo3::exceptions::{PyAttributeError, PyIndexError, PyKeyError, PyTypeError, PyValueError};
+use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyInt};
+
+use super::context::{Context, Space};
+use super::handle::{Owner, require_halted};
+use super::hypervisor::HypercallCaller;
+use super::iter::{CpuIterator, NameIterator, ThreadIterator};
+use super::memory::Memory;
+use super::process::Process;
+use super::record::PlainDict;
+use super::types::{Struct, enum_value};
+use super::{err, view_dict};
+use crate::dbg_backend::processor_index_from_backend_thread_id;
+use crate::guest::ProcessInfo;
+use crate::session::context::windows_thread_on_backend_thread;
+use crate::session::{Session, VcpuInfo};
+use crate::symbols::CodeFrame;
+use crate::target::sched::ApcSelector;
+use crate::target::{SelectedFrame, Target, ThreadInfo, cpu};
+use crate::trapframe::{read_ktrap_frame_at_or_current, trap_frame_rip_symbol};
+use crate::types::VirtAddr;
+use crate::unwind::{RecoveredFrame, StackFrame, halted_in_windows_hypervisor};
+use crate::view;
+use crate::view::shape::Typed;
+
+/// A collection of threads: `dbg.threads` (all threads) or `proc.threads`.
+#[pyclass(module = "ntoseye")]
+pub struct Threads {
+    pub owner: Owner,
+    pub process: Option<ProcessInfo>,
+}
+
+impl Threads {
+    pub fn all(owner: Owner) -> Threads {
+        Threads {
+            owner,
+            process: None,
+        }
+    }
+
+    /// `owner` should be the process handle's (stamped) owner.
+    pub fn of_process(owner: Owner, info: ProcessInfo) -> Threads {
+        Threads {
+            owner,
+            process: Some(info),
+        }
+    }
+
+    fn snapshot(&self, py: Python<'_>) -> PyResult<Vec<ThreadInfo>> {
+        let context = self
+            .process
+            .clone()
+            .map_or_else(Context::default, Context::process);
+        self.owner
+            .with_in(py, &context, |session| match &self.process {
+                Some(process) => session
+                    .target
+                    .enumerate_threads_for_process_info(process)
+                    .map_err(err),
+                None => session
+                    .windows_threads()
+                    .map(|(threads, _)| threads)
+                    .map_err(err),
+            })
+    }
+
+    fn by_tid(&self, py: Python<'_>, tid: u64) -> PyResult<Option<Thread>> {
+        let Some(info) = self
+            .snapshot(py)?
+            .into_iter()
+            .find(|thread| thread.tid == Some(tid))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Thread::from_owner(self.owner.derive(py), info)))
+    }
+
+    fn handles(&self, py: Python<'_>) -> PyResult<Vec<Py<Thread>>> {
+        let infos = self.snapshot(py)?;
+        let owner = self.owner.derive(py);
+        infos
+            .into_iter()
+            .map(|info| Py::new(py, Thread::from_owner(owner.clone_ref(py), info)))
+            .collect()
+    }
+}
+
+#[pymethods]
+impl Threads {
+    /// Get the thread with a TID, or raise `KeyError` if no thread has that
+    /// TID.
+    fn __getitem__(&self, py: Python<'_>, tid: u64) -> PyResult<Thread> {
+        self.by_tid(py, tid)?
+            .ok_or_else(|| PyKeyError::new_err(tid))
+    }
+
+    /// Get the thread with a TID, or `None` if no thread has that TID.
+    fn get(&self, py: Python<'_>, tid: u64) -> PyResult<Option<Thread>> {
+        self.by_tid(py, tid)
+    }
+
+    /// Get the thread at an ETHREAD or KTHREAD address.
+    fn at(&self, py: Python<'_>, address: u64) -> PyResult<Thread> {
+        let info = self
+            .snapshot(py)?
+            .into_iter()
+            .find(|thread| thread.ethread.0 == address || thread.kthread.0 == address)
+            .ok_or_else(|| PyKeyError::new_err(format!("{address:#x}")))?;
+        Ok(Thread::from_owner(self.owner.derive(py), info))
+    }
+
+    fn __contains__(&self, py: Python<'_>, tid: u64) -> PyResult<bool> {
+        Ok(self.by_tid(py, tid)?.is_some())
+    }
+
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.snapshot(py)?.len())
+    }
+
+    fn __iter__(&self, py: Python<'_>) -> PyResult<ThreadIterator> {
+        Ok(ThreadIterator::new(self.handles(py)?))
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let count = self.snapshot(py)?.len();
+        Ok(match &self.process {
+            Some(process) => format!("Threads(pid={}, len={count})", process.pid),
+            None => format!("Threads(len={count})"),
+        })
+    }
+}
+
+/// One Windows thread, identified in a debugger by its ETHREAD address.
+#[pyclass(module = "ntoseye")]
+pub struct Thread {
+    pub owner: Owner,
+    pub info: ThreadInfo,
+}
+
+impl Thread {
+    /// A handle for `info` under an already stamped `owner`.
+    pub fn from_owner(owner: Owner, info: ThreadInfo) -> Thread {
+        Thread { owner, info }
+    }
+
+    fn cpu_id(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        self.owner.with(py, |session| {
+            Ok(session
+                .active_thread_map()
+                .get(&self.info.ethread.0)
+                .map(|(vcpu, _)| vcpu.clone()))
+        })
+    }
+
+    fn process_info(&self, py: Python<'_>) -> PyResult<Option<ProcessInfo>> {
+        self.owner
+            .with(py, |session| process_for_thread(session, &self.info))
+    }
+
+    fn context(&self, process: Option<ProcessInfo>) -> Context {
+        Context {
+            process,
+            thread: Some(self.info.clone()),
+            ..Context::default()
+        }
+    }
+}
+
+#[pymethods]
+impl Thread {
+    /// The thread ID, or `None` if the thread has no ID (for example, an idle
+    /// thread).
+    #[getter]
+    fn tid(&self, py: Python<'_>) -> PyResult<Option<u64>> {
+        self.owner.check(py)?;
+        Ok(self.info.tid)
+    }
+
+    /// The ID of the process that owns the thread.
+    #[getter]
+    fn pid(&self, py: Python<'_>) -> PyResult<Option<u64>> {
+        self.owner.check(py)?;
+        Ok(self.info.pid)
+    }
+
+    /// The `_ETHREAD` address, which identifies the thread.
+    #[getter]
+    fn ethread(&self, py: Python<'_>) -> PyResult<u64> {
+        self.owner.check(py)?;
+        Ok(self.info.ethread.0)
+    }
+
+    /// The `_KTHREAD` address.
+    #[getter]
+    fn kthread(&self, py: Python<'_>) -> PyResult<u64> {
+        self.owner.check(py)?;
+        Ok(self.info.kthread.0)
+    }
+
+    /// The process that owns the thread.
+    #[getter]
+    fn process(&self, py: Python<'_>) -> PyResult<Option<Process>> {
+        let Some(info) = self.process_info(py)? else {
+            return Ok(None);
+        };
+        Ok(Some(Process::from_owner(self.owner.derive(py), info)))
+    }
+
+    /// The scheduler state, as a `_KTHREAD_STATE` member (`IntEnum`).
+    #[getter]
+    fn state<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyInt>>> {
+        self.owner.check(py)?;
+        optional_enum(py, &self.owner, "_KTHREAD_STATE", self.info.state)
+    }
+
+    /// The reason the thread waits, as a `_KWAIT_REASON` member (`IntEnum`).
+    #[getter]
+    fn wait_reason<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyInt>>> {
+        self.owner.check(py)?;
+        optional_enum(py, &self.owner, "_KWAIT_REASON", self.info.wait_reason)
+    }
+
+    /// The processor that runs the thread, or `None` if the thread is not running.
+    #[getter]
+    fn cpu(&self, py: Python<'_>) -> PyResult<Option<Cpu>> {
+        let Some(id) = self.cpu_id(py)? else {
+            return Ok(None);
+        };
+        Ok(Some(Cpu::from_owner(self.owner.derive(py), id)))
+    }
+
+    /// The typed `_ETHREAD` object.
+    #[getter]
+    fn object(&self, py: Python<'_>) -> PyResult<Struct> {
+        self.owner.check(py)?;
+        Struct::new(
+            py,
+            &self.owner,
+            Space::Kernel,
+            "_ETHREAD",
+            self.info.ethread.0,
+        )
+    }
+
+    /// The `_TEB`, bound to the process, or `None` for kernel threads.
+    #[getter]
+    fn teb(&self, py: Python<'_>) -> PyResult<Option<Struct>> {
+        let Some(address) = self.info.teb else {
+            self.owner.check(py)?;
+            return Ok(None);
+        };
+        let Some(process) = self.process_info(py)? else {
+            return Ok(None);
+        };
+        Struct::new(py, &self.owner, Space::Process(process), "_TEB", address.0).map(Some)
+    }
+
+    /// Recover the stack of this thread from live registers or its parked context.
+    /// If the processor of the thread is halted in the Windows hypervisor, the
+    /// unwind starts from the VTL0 state that the hypervisor saved, where NT stopped.
+    #[pyo3(signature = (limit=64))]
+    fn backtrace(&self, py: Python<'_>, limit: usize) -> PyResult<Vec<Frame>> {
+        let process = self.process_info(py)?;
+        let context = self.context(process.clone());
+        let (frames, live_thread) = self.owner.with_in(py, &context, |session| {
+            let (trace, _, live) = session
+                .recovered_backtrace(limit.clamp(1, 4096))
+                .map_err(err)?;
+            Ok((trace.frames, live))
+        })?;
+        let owner = self.owner.derive(py);
+        Ok(frames
+            .into_iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                Frame::from_recovered(
+                    owner.clone_ref(py),
+                    Some(self.info.clone()),
+                    process.clone(),
+                    None,
+                    index,
+                    frame,
+                    live_thread,
+                )
+            })
+            .collect())
+    }
+
+    /// Decode the APC lists of this thread (`!apc`).
+    fn apcs<'py>(&self, py: Python<'py>) -> PyResult<Typed<'py, view::sched::ApcQueues>> {
+        let context = self.context(self.process_info(py)?);
+        let detail = self.owner.with_in(py, &context, |session| {
+            session
+                .inspect_apcs(ApcSelector::Thread(self.info.ethread))
+                .map_err(err)
+        })?;
+        Typed::new(py, view::sched::apcs(&detail))
+    }
+
+    /// Decode the saved `_KTRAP_FRAME` (`!trap`).
+    fn trap_frame<'py>(&self, py: Python<'py>) -> PyResult<Typed<'py, view::bugcheck::TrapFrame>> {
+        let context = self.context(self.process_info(py)?);
+        let view = self.owner.with_in(py, &context, |session| {
+            trap_frame_view(&session.target, self.info.trap_frame)
+        })?;
+        Typed::new(py, view)
+    }
+
+    /// Decode the Win32 last-error and NTSTATUS values of the thread (`!gle`).
+    fn last_error<'py>(&self, py: Python<'py>) -> PyResult<Typed<'py, view::usermode::LastError>> {
+        let context = self.context(self.process_info(py)?);
+        let view = self.owner.with_in(py, &context, |session| {
+            let detail = session.target.last_error().map_err(err)?;
+            Ok(view::usermode::last_error(&detail))
+        })?;
+        Typed::new(py, view)
+    }
+
+    /// Get the thread summary and the saved scheduling details (`!thread`).
+    fn inspect<'py>(&self, py: Python<'py>) -> PyResult<Typed<'py, view::process::ThreadSummary>> {
+        let active = self.cpu_id(py)?;
+        Typed::new(
+            py,
+            view::process::thread_summary(&self.info, active.as_deref()),
+        )
+    }
+
+    /// The thread as a plain `dict`.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<PlainDict<'py>> {
+        let active = self.cpu_id(py)?;
+        view_dict(
+            py,
+            view::process::thread_summary(&self.info, active.as_deref()),
+        )
+    }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        other.extract::<PyRef<'_, Thread>>().is_ok_and(|other| {
+            self.owner.same_debugger(&other.owner) && self.info.ethread == other.info.ethread
+        })
+    }
+
+    fn __hash__(&self) -> isize {
+        self.owner.identity_hash(self.info.ethread)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Thread(tid={}, ethread={:#x})",
+            self.info
+                .tid
+                .map_or_else(|| "None".to_string(), |tid| tid.to_string()),
+            self.info.ethread.0
+        )
+    }
+}
+
+/// One recovered stack frame with the register context used for locals.
+#[pyclass(module = "ntoseye")]
+pub struct Frame {
+    owner: Owner,
+    thread_info: Option<ThreadInfo>,
+    process_info: Option<ProcessInfo>,
+    /// The backend context (a user dump's thread) the walk was seeded from,
+    /// for a frame that has no Windows thread object.
+    vcpu: Option<String>,
+    index: usize,
+    ip: u64,
+    sp: u64,
+    code: CodeFrame,
+    inline: bool,
+    symbol: Option<String>,
+    source: Option<String>,
+    registers: HashMap<String, u64>,
+    frame_base: Option<u64>,
+    live_thread: bool,
+    writable: bool,
+}
+
+impl Frame {
+    /// Construct a frame-like register context (used for decoded CONTEXTs).
+    pub fn new(
+        py: Python<'_>,
+        owner: Owner,
+        thread: Option<ThreadInfo>,
+        index: usize,
+        ip: u64,
+        sp: u64,
+        symbol: Option<String>,
+        source: Option<String>,
+        registers: HashMap<String, u64>,
+    ) -> PyResult<Frame> {
+        owner.check(py)?;
+        Ok(Frame {
+            owner,
+            thread_info: thread,
+            process_info: None,
+            vcpu: None,
+            index,
+            ip,
+            sp,
+            code: CodeFrame::at(VirtAddr(ip)),
+            inline: false,
+            symbol,
+            source,
+            registers,
+            frame_base: None,
+            live_thread: false,
+            writable: false,
+        })
+    }
+
+    pub fn from_recovered(
+        owner: Owner,
+        thread_info: Option<ThreadInfo>,
+        process_info: Option<ProcessInfo>,
+        vcpu: Option<String>,
+        index: usize,
+        recovered: RecoveredFrame,
+        live_thread: bool,
+    ) -> Frame {
+        let frame: StackFrame = recovered.frame;
+        Frame {
+            owner,
+            thread_info,
+            process_info,
+            vcpu,
+            index,
+            ip: frame.ip,
+            sp: frame.sp,
+            code: frame.code,
+            inline: frame.inline,
+            symbol: (!frame.symbol.is_empty()).then_some(frame.symbol),
+            source: Some(frame.source.as_str().to_string()),
+            registers: recovered.registers,
+            frame_base: recovered.frame_base,
+            live_thread,
+            writable: live_thread && frame.code.in_first_frame(index),
+        }
+    }
+
+    fn ethread(&self) -> Option<VirtAddr> {
+        self.thread_info.as_ref().map(|thread| thread.ethread)
+    }
+
+    fn context(&self) -> Context {
+        let selectable = self.thread_info.is_some() || self.vcpu.is_some();
+        Context {
+            process: self.process_info.clone(),
+            secure: None,
+            root: None,
+            vcpu: self.vcpu.clone(),
+            thread: self.thread_info.clone(),
+            frame: (self.live_thread && selectable).then_some(self.index),
+        }
+    }
+
+    fn selected_frame(&self) -> SelectedFrame {
+        SelectedFrame {
+            index: self.index,
+            ip: self.ip,
+            sp: self.sp,
+            code: self.code,
+            frame_base: self.frame_base,
+            registers: self.registers.clone(),
+            seed_registers: self.registers.clone(),
+            seed_live: self.writable,
+            dtb: None,
+            thread: None,
+        }
+    }
+}
+
+#[pymethods]
+impl Frame {
+    /// The position of the frame. The innermost frame is 0.
+    #[getter]
+    fn index(&self, py: Python<'_>) -> PyResult<usize> {
+        self.owner.check(py)?;
+        Ok(self.index)
+    }
+
+    /// The instruction pointer of the frame.
+    #[getter]
+    fn ip(&self, py: Python<'_>) -> PyResult<u64> {
+        self.owner.check(py)?;
+        Ok(self.ip)
+    }
+
+    /// The stack pointer of the frame.
+    #[getter]
+    fn sp(&self, py: Python<'_>) -> PyResult<u64> {
+        self.owner.check(py)?;
+        Ok(self.sp)
+    }
+
+    /// The symbol at `ip`, if it resolves to one. For an inline frame, the
+    /// function that the compiler inlined.
+    #[getter]
+    fn symbol(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        self.owner.check(py)?;
+        Ok(self.symbol.clone())
+    }
+
+    /// Whether the frame is a call that the compiler inlined into the physical
+    /// frame after it. The two frames share the `ip`, `sp`, and registers.
+    #[getter]
+    fn inline(&self, py: Python<'_>) -> PyResult<bool> {
+        self.owner.check(py)?;
+        Ok(self.inline)
+    }
+
+    /// How ntoseye recovered the frame (unwind data, frame pointer, ...).
+    #[getter]
+    fn source(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        self.owner.check(py)?;
+        Ok(self.source.clone())
+    }
+
+    /// The thread that owns this stack.
+    #[getter]
+    fn thread(&self, py: Python<'_>) -> PyResult<Option<Thread>> {
+        self.owner.check(py)?;
+        Ok(self
+            .thread_info
+            .clone()
+            .map(|info| Thread::from_owner(self.owner.derive(py), info)))
+    }
+
+    /// The registers of the frame: the live register file (writable) for the
+    /// innermost frame of a running thread, and the recovered subset
+    /// (read-only) for other frames.
+    #[getter]
+    fn registers(&self, py: Python<'_>) -> PyResult<Registers> {
+        self.owner.check(py)?;
+        Ok(Registers {
+            owner: self.owner.derive(py),
+            context: self.context(),
+            values: (!self.writable).then(|| self.registers.clone()),
+        })
+    }
+
+    /// The local variables, evaluated in the recovered context of this frame.
+    #[getter]
+    fn locals(&self, py: Python<'_>) -> PyResult<IndexMap<String, Option<u64>>> {
+        self.owner.check(py)?;
+        if self.thread_info.is_none() && self.vcpu.is_none() {
+            return Ok(IndexMap::new());
+        }
+        let context = self.context();
+        self.owner.with_in(py, &context, |session| {
+            // Parked stacks have recovered registers but no selectable live
+            // frame; install that plain Rust context only for this operation.
+            if !self.live_thread {
+                session.select_frame(self.selected_frame());
+            }
+            let locals = session.target.frame_locals(self.code).map_err(err)?;
+            Ok(locals
+                .iter()
+                .flat_map(|locals| locals.iter())
+                .map(|local| {
+                    let value = session
+                        .target
+                        .resolve_procedure_local_value(VirtAddr(self.ip), local);
+                    (local.name.clone(), value)
+                })
+                .collect())
+        })
+    }
+
+    /// Get a local variable by name.
+    fn __getitem__(&self, py: Python<'_>, name: &str) -> PyResult<Option<u64>> {
+        self.locals(py)?
+            .swap_remove(name)
+            .ok_or_else(|| PyKeyError::new_err(name.to_string()))
+    }
+
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<PlainDict<'py>> {
+        self.owner.check(py)?;
+        let dict = PyDict::new(py);
+        dict.set_item("index", self.index)?;
+        dict.set_item("ip", self.ip)?;
+        dict.set_item("sp", self.sp)?;
+        dict.set_item("symbol", self.symbol.as_deref())?;
+        dict.set_item("inline", self.inline)?;
+        dict.set_item("source", self.source.as_deref())?;
+        dict.set_item(
+            "thread",
+            self.thread_info.as_ref().map(|thread| thread.ethread.0),
+        )?;
+        dict.set_item("registers", register_map(&self.registers))?;
+        Ok(PlainDict(dict))
+    }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        other.extract::<PyRef<'_, Frame>>().is_ok_and(|other| {
+            self.owner.same_debugger(&other.owner)
+                && self.ethread() == other.ethread()
+                && self.vcpu == other.vcpu
+                && self.index == other.index
+                && self.ip == other.ip
+        })
+    }
+
+    fn __hash__(&self) -> isize {
+        self.owner
+            .identity_hash((self.ethread(), &self.vcpu, self.index, self.ip))
+    }
+
+    fn __repr__(&self) -> String {
+        match &self.symbol {
+            Some(symbol) => format!(
+                "Frame(index={}, ip={:#x}, symbol={symbol:?})",
+                self.index, self.ip
+            ),
+            None => format!("Frame(index={}, ip={:#x})", self.index, self.ip),
+        }
+    }
+}
+
+/// A register file that is bound to a vCPU or to a recovered frame context.
+#[pyclass(module = "ntoseye")]
+pub struct Registers {
+    owner: Owner,
+    context: Context,
+    values: Option<HashMap<String, u64>>,
+}
+
+impl Registers {
+    /// The register file of the backend context `context` selects, read when
+    /// asked (`values` `None`), or a fixed read-only snapshot.
+    pub fn new(owner: Owner, context: Context, values: Option<HashMap<String, u64>>) -> Self {
+        Registers {
+            owner,
+            context,
+            values,
+        }
+    }
+
+    /// Register values by name. A live file adds 128-bit registers at full
+    /// width (`xmm0`, `v0`) beside their 64-bit halves; a recovered frame
+    /// holds only what unwinding recovered.
+    fn values(&self, py: Python<'_>) -> PyResult<HashMap<String, u128>> {
+        self.owner.check(py)?;
+        if let Some(values) = &self.values {
+            return Ok(values
+                .iter()
+                .map(|(name, value)| (name.clone(), u128::from(*value)))
+                .collect());
+        }
+        self.owner.with_in(py, &self.context, |session| {
+            require_halted(session, "registers")?;
+            let bytes = session.read_registers().map_err(err)?;
+            let map = &session.register_map;
+            Ok(map
+                .to_hashmap(&bytes)
+                .into_iter()
+                .map(|(name, value)| (name, u128::from(value)))
+                .chain(map.wide_values(&bytes))
+                .collect())
+        })
+    }
+
+    fn value(&self, py: Python<'_>, name: &str) -> PyResult<u128> {
+        let values = self.values(py)?;
+        register_value(&values, name).ok_or_else(|| PyKeyError::new_err(name.to_string()))
+    }
+
+    fn set_value(&self, py: Python<'_>, name: &str, value: u64) -> PyResult<()> {
+        self.owner.check(py)?;
+        if self.values.is_some() {
+            return Err(PyTypeError::new_err("this register file is read-only"));
+        }
+        self.owner.with_in(py, &self.context, |session| {
+            require_halted(session, "register write")?;
+            session.write_register(name, value).map_err(err)
+        })?;
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl Registers {
+    fn __getattr__(&self, py: Python<'_>, name: &str) -> PyResult<u128> {
+        let values = self.values(py)?;
+        register_value(&values, name)
+            .ok_or_else(|| PyAttributeError::new_err(format!("register '{name}' is not available")))
+    }
+
+    fn __setattr__(&self, py: Python<'_>, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.set_value(py, name, value.extract()?)
+    }
+
+    fn __getitem__(&self, py: Python<'_>, name: &str) -> PyResult<u128> {
+        self.value(py, name)
+    }
+
+    fn __setitem__(&self, py: Python<'_>, name: &str, value: u64) -> PyResult<()> {
+        self.set_value(py, name, value)
+    }
+
+    fn __contains__(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
+        Ok(self
+            .values(py)?
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case(name)))
+    }
+
+    fn __iter__(&self, py: Python<'_>) -> PyResult<NameIterator> {
+        let names = sorted_registers(&self.values(py)?)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        Ok(NameIterator::new(names))
+    }
+
+    /// The register names, sorted.
+    fn keys(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        Ok(sorted_registers(&self.values(py)?)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
+    }
+
+    /// `(name, value)` pairs, sorted by name.
+    fn items(&self, py: Python<'_>) -> PyResult<Vec<(String, u128)>> {
+        Ok(sorted_registers(&self.values(py)?))
+    }
+
+    /// The value of register `name`, or `default` when this file has no such
+    /// register (a recovered frame holds only what unwinding recovered).
+    #[pyo3(signature = (name, default = None))]
+    fn get(&self, py: Python<'_>, name: &str, default: Option<u128>) -> PyResult<Option<u128>> {
+        Ok(register_value(&self.values(py)?, name).or(default))
+    }
+
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.values(py)?.len())
+    }
+
+    /// The registers as a plain `dict`, sorted by name.
+    fn to_dict(&self, py: Python<'_>) -> PyResult<IndexMap<String, u128>> {
+        Ok(register_map(&self.values(py)?))
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!("Registers({})", self.values(py)?.len()))
+    }
+}
+
+/// The processors of the target, in backend vCPU order (`dbg.cpus`). The target
+/// must be halted to list them.
+#[pyclass(module = "ntoseye")]
+pub struct Cpus {
+    pub owner: Owner,
+}
+
+impl Cpus {
+    pub fn new(owner: Owner) -> Cpus {
+        Cpus { owner }
+    }
+
+    fn ids(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        self.owner.with(py, |session| {
+            // A user dump's backend contexts are its threads, not processors.
+            session.target.require_kernel().map_err(err)?;
+            require_halted(session, "vcpus")?;
+            Ok(session
+                .vcpus()
+                .map_err(err)?
+                .into_iter()
+                .map(|cpu| cpu.id)
+                .collect())
+        })
+    }
+
+    fn handles(&self, py: Python<'_>) -> PyResult<Vec<Py<Cpu>>> {
+        let ids = self.ids(py)?;
+        let owner = self.owner.derive(py);
+        ids.into_iter()
+            .map(|id| Py::new(py, Cpu::from_owner(owner.clone_ref(py), id)))
+            .collect()
+    }
+}
+
+#[pymethods]
+impl Cpus {
+    fn __getitem__(&self, py: Python<'_>, index: isize) -> PyResult<Cpu> {
+        self.get(py, index)?
+            .ok_or_else(|| PyIndexError::new_err(index))
+    }
+
+    fn get(&self, py: Python<'_>, index: isize) -> PyResult<Option<Cpu>> {
+        let mut ids = self.ids(py)?;
+        let Some(index) = sequence_index(index, ids.len()) else {
+            return Ok(None);
+        };
+        let id = ids.swap_remove(index);
+        Ok(Some(Cpu::from_owner(self.owner.derive(py), id)))
+    }
+
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.ids(py)?.len())
+    }
+
+    fn __iter__(&self, py: Python<'_>) -> PyResult<CpuIterator> {
+        Ok(CpuIterator::new(self.handles(py)?))
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!("Cpus(len={})", self.ids(py)?.len()))
+    }
+}
+
+/// One processor, identified by its backend vCPU ID (for example, `"p1.1"`).
+#[pyclass(module = "ntoseye")]
+pub struct Cpu {
+    pub owner: Owner,
+    pub id: String,
+}
+
+impl Cpu {
+    /// A handle for vCPU `id` under an already stamped `owner`.
+    pub fn from_owner(owner: Owner, id: String) -> Cpu {
+        Cpu { owner, id }
+    }
+
+    pub fn processor(&self) -> PyResult<u16> {
+        processor_index_from_backend_thread_id(&self.id)
+            .ok_or_else(|| PyValueError::new_err(format!("invalid vCPU id: {}", self.id)))
+    }
+
+    fn context(&self) -> Context {
+        Context::vcpu(self.id.clone())
+    }
+
+    fn current_info(&self, py: Python<'_>) -> PyResult<VcpuInfo> {
+        self.owner.with(py, |session| {
+            session.target.require_kernel().map_err(err)?;
+            require_halted(session, "vcpus")?;
+            session
+                .vcpus()
+                .map_err(err)?
+                .into_iter()
+                .find(|cpu| cpu.id == self.id)
+                .ok_or_else(|| PyKeyError::new_err(self.id.clone()))
+        })
+    }
+}
+
+#[pymethods]
+impl Cpu {
+    /// The backend vCPU ID.
+    #[getter]
+    fn id(&self, py: Python<'_>) -> PyResult<String> {
+        self.owner.check(py)?;
+        Ok(self.id.clone())
+    }
+
+    /// The instruction pointer, which needs a halted target.
+    #[getter]
+    fn rip(&self, py: Python<'_>) -> PyResult<Option<u64>> {
+        Ok(self.current_info(py)?.rip)
+    }
+
+    /// The symbol at `rip`, if it resolves to one.
+    #[getter]
+    fn symbol(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        Ok(self.current_info(py)?.symbol)
+    }
+
+    /// The VTL states that the hypervisor saved for this virtual processor
+    /// (`.vtlcxr`), for a vCPU halted in the Windows hypervisor (VBS). VTL0
+    /// comes first, and each state has the point where the VTL stopped, its
+    /// control and segment registers, and the last exit that it took. This
+    /// needs `hv-evmcs` on the VM, and the list is empty without it or if the
+    /// saved state does not pass validation.
+    #[getter]
+    fn saved_vtl<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Typed<'py, Vec<view::execution::SavedVtlState>>> {
+        let info = self.current_info(py)?;
+        Typed::new(
+            py,
+            info.saved_vtl
+                .iter()
+                .map(view::execution::saved_vtl_state)
+                .collect(),
+        )
+    }
+
+    /// The guest partition's virtual processor that this processor serves,
+    /// for a vCPU halted in the Windows hypervisor: the VP whose exit it
+    /// handles or that it is about to enter, with its partition ID, VP index,
+    /// VTL, where it left off, its last exit, and the hypercall it made.
+    /// None when the processor runs one of the root partition's VPs, or the
+    /// hypervisor's partitions cannot be walked (no `hv-evmcs`).
+    #[getter]
+    fn serving<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Typed<'py, Option<view::hypervisor::ServedVp>>> {
+        let info = self.current_info(py)?;
+        Typed::new(py, info.serving.as_ref().map(view::hypervisor::served_vp))
+    }
+
+    /// The virtual processor whose hypercall this processor handles, for a
+    /// vCPU halted in the Windows hypervisor, as `!hvcall` finds it: the
+    /// guest partition's VP that it serves, else the root partition's VP on
+    /// this processor. A `when=` callback of `breakpoints.add_hypercall()`
+    /// reads the caller's registers and memory through it
+    /// (`stop.cpu.hypercall_caller()`), as the breakpoint's condition does.
+    /// `None` when the vCPU is not halted in the hypervisor, or the caller is
+    /// unknown: the partitions cannot be walked, or no saved state of a VP
+    /// that the processor runs is current.
+    fn hypercall_caller(&self, py: Python<'_>) -> PyResult<Option<HypercallCaller>> {
+        let processor = self.processor()?;
+        let context = self.context();
+        let caller = self.owner.with_in(py, &context, |session| {
+            require_halted(session, "cpu.hypercall_caller")?;
+            let registers = session.read_registers().map_err(err)?;
+            let map = &session.register_map;
+            let cr3 = map
+                .read_u64(session.target.arch().dtb_register(), &registers)
+                .map_err(err)?;
+            let rip = map.read_u64("rip", &registers).map_err(err)?;
+            Ok(halted_in_windows_hypervisor(&session.target, cr3, rip)
+                .then(|| session.target.hypercall_caller(cr3, rip, processor))
+                .flatten())
+        })?;
+        Ok(caller.map(|info| HypercallCaller::new(self.owner.derive(py), info)))
+    }
+
+    /// Walk this processor's stack from its own registers, whatever `.thread`,
+    /// `.cxr` or `.frame` selected. Halted in the Windows hypervisor, the
+    /// frames are the hypervisor's (`hv+...`), as `.cxr` then `k` shows them;
+    /// elsewhere they are the code it runs. With `vtl`, the walk starts where
+    /// that VTL left off, as the hypervisor saved it (`.vtlcxr`): NT's stack
+    /// for 0, the secure kernel's for 1. A `vtl` needs the processor halted
+    /// in the hypervisor. Frames outside NT's address spaces have no locals.
+    /// `thread.backtrace()` walks a Windows thread instead, from where NT left
+    /// off when its processor is in the hypervisor.
+    #[pyo3(signature = (limit=64, vtl=None))]
+    fn backtrace(&self, py: Python<'_>, limit: usize, vtl: Option<u8>) -> PyResult<Vec<Frame>> {
+        let context = self.context();
+        let (frames, thread, process) = self.owner.with_in(py, &context, |session| {
+            require_halted(session, "cpu.backtrace")?;
+            let trace = session
+                .vcpu_backtrace(&self.id, vtl, limit.clamp(1, 4096))
+                .map_err(err)?;
+            // A walk in NT's address spaces is the stack of the thread the
+            // processor runs, which a frame's locals are read for.
+            let (nt, process) = match Space::for_root(&session.target, trace.dtb) {
+                Space::Kernel => (true, None),
+                Space::Process(process) => (true, Some(process)),
+                _ => (false, None),
+            };
+            let thread = nt
+                .then(|| windows_thread_on_backend_thread(&session.target, &self.id))
+                .flatten();
+            Ok((trace.frames, thread, process))
+        })?;
+        let owner = self.owner.derive(py);
+        Ok(frames
+            .into_iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                Frame::from_recovered(
+                    owner.clone_ref(py),
+                    thread.clone(),
+                    process.clone(),
+                    None,
+                    index,
+                    frame,
+                    false,
+                )
+            })
+            .collect())
+    }
+
+    /// Memory through the page tables that this processor has loaded (its CR3)
+    /// at the time of the read. These are the kernel's or a process's tables, a
+    /// VTL1 root (read-only), or a root outside NT (read-only), such as the
+    /// hypervisor's root on a vCPU halted in the Windows hypervisor.
+    #[getter]
+    fn memory(&self, py: Python<'_>) -> PyResult<Memory> {
+        let context = self.context();
+        let space = self.owner.with_in(py, &context, |session| {
+            require_halted(session, "cpu.memory")?;
+            let registers = session.read_registers().map_err(err)?;
+            let name = session.target.arch().dtb_register();
+            let dtb = session
+                .register_map
+                .read_u64(name, &registers)
+                .map_err(err)?;
+            Ok(Space::for_root(&session.target, dtb))
+        })?;
+        Ok(Memory::new(self.owner.derive(py), space))
+    }
+
+    /// The process whose page tables are loaded on this processor.
+    #[getter]
+    fn process(&self, py: Python<'_>) -> PyResult<Option<Process>> {
+        let context = self.context();
+        let info = self.owner.with_in(py, &context, |session| {
+            require_halted(session, "cpu.process")?;
+            let registers = session.read_registers().map_err(err)?;
+            let name = session.target.arch().dtb_register();
+            let dtb = session
+                .register_map
+                .read_u64(name, &registers)
+                .map_err(err)?;
+            Ok(session
+                .target
+                .process_for_cr3(dtb & session.target.arch().dtb_page_mask()))
+        })?;
+        Ok(info.map(|info| Process::from_owner(self.owner.derive(py), info)))
+    }
+
+    /// The Windows thread that runs on this processor.
+    #[getter]
+    fn thread(&self, py: Python<'_>) -> PyResult<Option<Thread>> {
+        let info = self.owner.with(py, |session| {
+            Ok(session
+                .active_thread_map()
+                .into_values()
+                .find(|(vcpu, _)| vcpu == &self.id)
+                .map(|(_, thread)| thread))
+        })?;
+        Ok(info.map(|info| Thread::from_owner(self.owner.derive(py), info)))
+    }
+
+    /// The live register file of this processor. It is writable while the
+    /// processor is halted in NT, and read-only at a recognized VTL1 stop.
+    #[getter]
+    fn registers(&self, py: Python<'_>) -> PyResult<Registers> {
+        self.owner.check(py)?;
+        Ok(Registers {
+            owner: self.owner.derive(py),
+            context: self.context(),
+            values: None,
+        })
+    }
+
+    /// Model-specific registers: `cpu.msr[0xC0000082]`, `cpu.msr["IA32_LSTAR"]`.
+    #[getter]
+    fn msr(&self, py: Python<'_>) -> PyResult<Msrs> {
+        self.owner.check(py)?;
+        Ok(Msrs {
+            owner: self.owner.derive(py),
+            vcpu: self.id.clone(),
+            processor: self.processor()?,
+        })
+    }
+
+    /// Decode the essential KPCR and KPRCB fields of this processor (`!pcr`).
+    fn pcr<'py>(&self, py: Python<'py>) -> PyResult<Typed<'py, view::cpu::Pcr>> {
+        let processor = self.processor()?;
+        let context = self.context();
+        let detail = self.owner.with_in(py, &context, |session| {
+            session.inspect_pcr(processor).map_err(err)
+        })?;
+        Typed::new(py, view::cpu::pcr(&detail))
+    }
+
+    /// Decode the `_KPRCB` of this processor (`!prcb`).
+    fn prcb<'py>(&self, py: Python<'py>) -> PyResult<Typed<'py, view::cpu::Prcb>> {
+        let processor = self.processor()?;
+        let context = self.context();
+        let detail = self.owner.with_in(py, &context, |session| {
+            session.target.inspect_prcb(processor).map_err(err)
+        })?;
+        Typed::new(py, view::cpu::prcb(&detail))
+    }
+
+    /// Read the current IRQL of this processor (`!irql`).
+    fn irql<'py>(&self, py: Python<'py>) -> PyResult<Typed<'py, view::cpu::Irql>> {
+        let processor = self.processor()?;
+        let context = self.context();
+        let detail = self.owner.with_in(py, &context, |session| {
+            session.target.inspect_irql(processor).map_err(err)
+        })?;
+        Typed::new(py, view::cpu::irql(&detail))
+    }
+
+    /// Decode one IDT vector, or the full table up to a limit (`!idt`).
+    #[pyo3(signature = (vector=None))]
+    fn idt<'py>(
+        &self,
+        py: Python<'py>,
+        vector: Option<u16>,
+    ) -> PyResult<Typed<'py, view::cpu::Idt>> {
+        let processor = self.processor()?;
+        let context = self.context();
+        let detail = self.owner.with_in(py, &context, |session| {
+            session.inspect_idt(processor, vector).map_err(err)
+        })?;
+        Typed::new(py, view::cpu::idt(&detail))
+    }
+
+    /// Decode the GDT of this processor (`!gdt`).
+    fn gdt<'py>(&self, py: Python<'py>) -> PyResult<Typed<'py, view::cpu::Gdt>> {
+        let processor = self.processor()?;
+        let context = self.context();
+        let detail = self.owner.with_in(py, &context, |session| {
+            session.inspect_gdt(processor).map_err(err)
+        })?;
+        Typed::new(py, view::cpu::gdt(&detail))
+    }
+
+    /// Read this processor's local APIC (`!apic`): through its x2APIC MSRs,
+    /// or its xAPIC registers. Needs the kd or kdnet backend, which
+    /// switches the target to this processor for the reads.
+    fn apic<'py>(&self, py: Python<'py>) -> PyResult<Typed<'py, view::machine::LocalApic>> {
+        let processor = self.processor()?;
+        let context = self.context();
+        let detail = self.owner.with_in(py, &context, |session| {
+            session.local_apic(processor).map_err(err)
+        })?;
+        Typed::new(py, view::machine::local_apic(&detail))
+    }
+
+    /// Read the processor vendor, family, model, speed, and feature bits (`!cpuinfo`).
+    fn info<'py>(&self, py: Python<'py>) -> PyResult<Typed<'py, view::cpu::CpuInfo>> {
+        let processor = self.processor()?;
+        let context = self.context();
+        let detail = self.owner.with_in(py, &context, |session| {
+            session.target.inspect_cpuinfo(processor).map_err(err)
+        })?;
+        Typed::new(py, view::cpu::cpuinfo(&detail))
+    }
+
+    /// The processor as a plain `dict`.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<PlainDict<'py>> {
+        view_dict(py, view::execution::vcpu(&self.current_info(py)?))
+    }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        other
+            .extract::<PyRef<'_, Cpu>>()
+            .is_ok_and(|other| self.owner.same_debugger(&other.owner) && self.id == other.id)
+    }
+
+    fn __hash__(&self) -> isize {
+        self.owner.identity_hash(&self.id)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Cpu(id={:?})", self.id)
+    }
+}
+
+/// Model-specific registers on one processor (`rdmsr`/`wrmsr`, KD only).
+#[pyclass(module = "ntoseye")]
+pub struct Msrs {
+    owner: Owner,
+    vcpu: String,
+    processor: u16,
+}
+
+impl Msrs {
+    fn context(&self) -> Context {
+        Context::vcpu(self.vcpu.clone())
+    }
+}
+
+#[pymethods]
+impl Msrs {
+    fn __getitem__(&self, py: Python<'_>, key: MsrKey) -> PyResult<u64> {
+        let context = self.context();
+        let processor = self.processor;
+        self.owner.with_in(py, &context, move |session| {
+            require_halted(session, "msr read")?;
+            let msr = key.index()?;
+            session.read_msr(processor, msr).map_err(err)
+        })
+    }
+
+    fn __setitem__(&self, py: Python<'_>, key: MsrKey, value: u64) -> PyResult<()> {
+        let context = self.context();
+        let processor = self.processor;
+        self.owner.with_in(py, &context, move |session| {
+            require_halted(session, "msr write")?;
+            let msr = key.index()?;
+            session.write_msr(processor, msr, value).map_err(err)
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Msrs(cpu={:?})", self.vcpu)
+    }
+}
+
+pub fn process_for_thread(session: &Session, thread: &ThreadInfo) -> PyResult<Option<ProcessInfo>> {
+    let Some(guest) = session.target.guest.as_ref() else {
+        return Ok(None);
+    };
+    if let Some(eprocess) = thread.eprocess
+        && let Ok(process) = guest.process_at(eprocess)
+    {
+        return Ok(Some(process));
+    }
+    let Some(pid) = thread.pid else {
+        return Ok(None);
+    };
+    Ok(guest
+        .enumerate_processes()
+        .map_err(err)?
+        .into_iter()
+        .find(|process| process.pid == pid))
+}
+
+pub fn trap_frame_view(
+    target: &Target,
+    address: Option<VirtAddr>,
+) -> PyResult<view::bugcheck::TrapFrame> {
+    let frame = read_ktrap_frame_at_or_current(target, address).map_err(err)?;
+    Ok(view::bugcheck::trap_frame(
+        &frame,
+        trap_frame_rip_symbol(target, &frame),
+    ))
+}
+
+/// A `u8` enum field as its PDB `IntEnum` member (an `int`), or `None`.
+fn optional_enum<'py>(
+    py: Python<'py>,
+    owner: &Owner,
+    name: &str,
+    value: Option<u8>,
+) -> PyResult<Option<Bound<'py, PyInt>>> {
+    value
+        .map(|value| {
+            let member = enum_value(py, owner, &Space::Kernel, name, u64::from(value))?;
+            Ok(member.into_bound(py).cast_into::<PyInt>()?)
+        })
+        .transpose()
+}
+
+fn register_map<V: Copy>(values: &HashMap<String, V>) -> IndexMap<String, V> {
+    sorted_registers(values).into_iter().collect()
+}
+
+fn register_value<V: Copy>(values: &HashMap<String, V>, name: &str) -> Option<V> {
+    values
+        .iter()
+        .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(*value))
+}
+
+fn sorted_registers<V: Copy>(values: &HashMap<String, V>) -> Vec<(String, V)> {
+    let mut values: Vec<_> = values
+        .iter()
+        .map(|(name, value)| (name.clone(), *value))
+        .collect();
+    values.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    values
+}
+
+/// An MSR by number or by `IA32_*` name.
+#[derive(FromPyObject)]
+pub enum MsrKey {
+    Index(u32),
+    Name(String),
+}
+
+impl MsrKey {
+    fn index(self) -> PyResult<u32> {
+        match self {
+            MsrKey::Index(index) => Ok(index),
+            MsrKey::Name(name) => {
+                cpu::parse_msr_name(&name).ok_or_else(|| PyKeyError::new_err(name))
+            }
+        }
+    }
+}
+
+/// A Python sequence index (negative counts from the end) into `len` items.
+fn sequence_index(index: isize, len: usize) -> Option<usize> {
+    let index = if index < 0 {
+        len.checked_sub(index.unsigned_abs())?
+    } else {
+        index.unsigned_abs()
+    };
+    (index < len).then_some(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sequence_index;
+
+    #[test]
+    fn sequence_index_counts_negative_indexes_from_the_end() {
+        assert_eq!(sequence_index(0, 4), Some(0));
+        assert_eq!(sequence_index(3, 4), Some(3));
+        assert_eq!(sequence_index(-1, 4), Some(3));
+        assert_eq!(sequence_index(-4, 4), Some(0));
+        assert_eq!(sequence_index(4, 4), None);
+        assert_eq!(sequence_index(-5, 4), None);
+        assert_eq!(sequence_index(0, 0), None);
+    }
+}

@@ -1,0 +1,637 @@
+"""
+Projects Shard - FastAPI Routes
+
+REST API endpoints for project workspace management.
+"""
+
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, Field
+
+from .models import ProjectRole, ProjectStatus
+
+router = APIRouter(prefix="/api/projects", tags=["projects"])
+
+# === Pydantic Request/Response Models ===
+
+
+class ProjectCreate(BaseModel):
+    """Request model for creating a project."""
+    name: str = Field(..., description="Project name")
+    description: str = Field(default="", description="Project description")
+    owner_id: str = Field(default="system", description="Project owner")
+    status: ProjectStatus = Field(default=ProjectStatus.ACTIVE)
+    settings: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
+    embedding_model: Optional[str] = Field(
+        default=None,
+        description="Embedding model for this project (default: all-MiniLM-L6-v2)"
+    )
+    create_collections: bool = Field(
+        default=True,
+        description="Whether to create vector collections for this project"
+    )
+
+
+class ProjectUpdate(BaseModel):
+    """Request model for updating a project."""
+    name: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[ProjectStatus] = None
+    settings: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class ProjectResponse(BaseModel):
+    """Response model for a project."""
+    id: str
+    name: str
+    description: str
+    status: str
+    owner_id: str
+    created_at: str
+    updated_at: str
+    settings: Dict[str, Any]
+    metadata: Dict[str, Any]
+    member_count: int
+    document_count: int
+
+
+class ProjectListResponse(BaseModel):
+    """Response model for listing projects."""
+    projects: List[ProjectResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class MemberAdd(BaseModel):
+    """Request model for adding a member."""
+    user_id: str
+    role: ProjectRole = ProjectRole.VIEWER
+
+
+class MemberResponse(BaseModel):
+    """Response model for a project member."""
+    id: str
+    project_id: str
+    user_id: str
+    role: str
+    added_at: str
+    added_by: str
+
+
+class DocumentAdd(BaseModel):
+    """Request model for adding a document."""
+    document_id: str
+    added_by: str = "system"
+
+
+class DocumentResponse(BaseModel):
+    """Response model for a project document."""
+    id: str
+    project_id: str
+    document_id: str
+    added_at: str
+    added_by: str
+
+
+class ActivityResponse(BaseModel):
+    """Response model for project activity."""
+    id: str
+    project_id: str
+    action: str
+    actor_id: str
+    target_type: str
+    target_id: str
+    timestamp: str
+    details: Dict[str, Any]
+
+
+class CountResponse(BaseModel):
+    """Response model for count endpoint."""
+    count: int
+
+
+class HealthResponse(BaseModel):
+    """Response model for health check."""
+    status: str
+    version: str
+
+
+# === Helper Functions ===
+
+
+def _get_shard(request: Request):
+    """Get the projects shard instance from app state."""
+    shard = getattr(request.app.state, "projects_shard", None)
+    if not shard:
+        raise HTTPException(status_code=503, detail="Projects shard not available")
+    return shard
+
+
+def _project_to_response(project) -> ProjectResponse:
+    """Convert Project object to response model."""
+    return ProjectResponse(
+        id=project.id,
+        name=project.name,
+        description=project.description,
+        status=project.status.value,
+        owner_id=project.owner_id,
+        created_at=project.created_at.isoformat(),
+        updated_at=project.updated_at.isoformat(),
+        settings=project.settings,
+        metadata=project.metadata,
+        member_count=project.member_count,
+        document_count=project.document_count,
+    )
+
+
+def _member_to_response(member) -> MemberResponse:
+    """Convert ProjectMember object to response model."""
+    return MemberResponse(
+        id=member.id,
+        project_id=member.project_id,
+        user_id=member.user_id,
+        role=member.role.value,
+        added_at=member.added_at.isoformat(),
+        added_by=member.added_by,
+    )
+
+
+def _document_to_response(doc) -> DocumentResponse:
+    """Convert ProjectDocument object to response model."""
+    return DocumentResponse(
+        id=doc.id,
+        project_id=doc.project_id,
+        document_id=doc.document_id,
+        added_at=doc.added_at.isoformat(),
+        added_by=doc.added_by,
+    )
+
+
+def _activity_to_response(activity) -> ActivityResponse:
+    """Convert ProjectActivity object to response model."""
+    return ActivityResponse(
+        id=activity.id,
+        project_id=activity.project_id,
+        action=activity.action,
+        actor_id=activity.actor_id,
+        target_type=activity.target_type,
+        target_id=activity.target_id,
+        timestamp=activity.timestamp.isoformat(),
+        details=activity.details,
+    )
+
+
+# === Endpoints ===
+
+
+@router.get("/health", response_model=HealthResponse)
+async def health_check(request: Request):
+    """Health check endpoint."""
+    shard = _get_shard(request)
+    return HealthResponse(status="healthy", version=shard.version)
+
+
+@router.get("/count", response_model=CountResponse)
+async def get_projects_count(
+    request: Request,
+    status: Optional[str] = Query(None, description="Filter by status"),
+):
+    """Get count of projects (used for badge)."""
+    shard = _get_shard(request)
+    count = await shard.get_count(status=status)
+    return CountResponse(count=count)
+
+
+@router.get("/", response_model=ProjectListResponse)
+async def list_projects(
+    request: Request,
+    status: Optional[ProjectStatus] = Query(None),
+    owner_id: Optional[str] = Query(None),
+    search: Optional[str] = Query(None, description="Search in name/description"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """List projects with optional filtering."""
+    from .models import ProjectFilter
+
+    shard = _get_shard(request)
+
+    filter = ProjectFilter(
+        status=status,
+        owner_id=owner_id,
+        search_text=search,
+    )
+
+    projects = await shard.list_projects(filter=filter, limit=limit, offset=offset)
+    total = await shard.get_count(status=status.value if status else None)
+
+    return ProjectListResponse(
+        projects=[_project_to_response(p) for p in projects],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+# === Embedding Model Endpoints (must be before /{project_id} routes) ===
+
+
+class EmbeddingModelInfo(BaseModel):
+    """Information about an embedding model."""
+    name: str
+    dimensions: int
+    description: str
+
+
+@router.get("/embedding-models", response_model=List[EmbeddingModelInfo])
+def list_embedding_models():
+    """List available embedding models."""
+    from .shard import KNOWN_EMBEDDING_MODELS
+
+    models = [
+        EmbeddingModelInfo(
+            name=name,
+            dimensions=info["dimensions"],
+            description=info["description"],
+        )
+        for name, info in KNOWN_EMBEDDING_MODELS.items()
+    ]
+    return models
+
+
+# === Project CRUD Endpoints ===
+
+
+@router.post("/", response_model=ProjectResponse, status_code=201)
+async def create_project(req: Request, request: ProjectCreate):
+    """Create a new project with optional embedding model and vector collections."""
+    shard = _get_shard(req)
+
+    project = await shard.create_project(
+        name=request.name,
+        description=request.description,
+        owner_id=request.owner_id,
+        status=request.status,
+        settings=request.settings,
+        metadata=request.metadata,
+        embedding_model=request.embedding_model,
+        create_collections=request.create_collections,
+    )
+
+    return _project_to_response(project)
+
+
+@router.get("/{project_id}", response_model=ProjectResponse)
+async def get_project(request: Request, project_id: str):
+    """Get a specific project by ID."""
+    shard = _get_shard(request)
+    project = await shard.get_project(project_id)
+
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    return _project_to_response(project)
+
+
+@router.put("/{project_id}", response_model=ProjectResponse)
+async def update_project(req: Request, project_id: str, request: ProjectUpdate):
+    """Update a project."""
+    shard = _get_shard(req)
+
+    project = await shard.update_project(
+        project_id=project_id,
+        name=request.name,
+        description=request.description,
+        status=request.status,
+        settings=request.settings,
+        metadata=request.metadata,
+    )
+
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    return _project_to_response(project)
+
+
+@router.delete("/{project_id}", status_code=204)
+async def delete_project(request: Request, project_id: str):
+    """Delete a project."""
+    shard = _get_shard(request)
+
+    success = await shard.delete_project(project_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+
+@router.post("/{project_id}/archive", response_model=ProjectResponse)
+async def archive_project(request: Request, project_id: str):
+    """Archive a project."""
+    shard = _get_shard(request)
+
+    project = await shard.update_project(
+        project_id=project_id,
+        status=ProjectStatus.ARCHIVED,
+    )
+
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    return _project_to_response(project)
+
+
+@router.post("/{project_id}/restore", response_model=ProjectResponse)
+async def restore_project(request: Request, project_id: str):
+    """Restore an archived project."""
+    shard = _get_shard(request)
+
+    project = await shard.update_project(
+        project_id=project_id,
+        status=ProjectStatus.ACTIVE,
+    )
+
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    return _project_to_response(project)
+
+
+# === Document Endpoints ===
+
+
+@router.get("/{project_id}/documents", response_model=List[DocumentResponse])
+async def get_project_documents(request: Request, project_id: str):
+    """Get all documents in a project."""
+    shard = _get_shard(request)
+
+    # Verify project exists
+    project = await shard.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    # Stub: return empty list
+    return []
+
+
+@router.post("/{project_id}/documents", response_model=DocumentResponse, status_code=201)
+async def add_project_document(req: Request, project_id: str, request: DocumentAdd):
+    """Add a document to a project."""
+    shard = _get_shard(req)
+
+    # Verify project exists
+    project = await shard.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    doc = await shard.add_document(
+        project_id=project_id,
+        document_id=request.document_id,
+        added_by=request.added_by,
+    )
+
+    return _document_to_response(doc)
+
+
+@router.delete("/{project_id}/documents/{document_id}", status_code=204)
+async def remove_project_document(request: Request, project_id: str, document_id: str):
+    """Remove a document from a project."""
+    shard = _get_shard(request)
+
+    success = await shard.remove_document(project_id, document_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Document association not found")
+
+
+# === Member Endpoints ===
+
+
+@router.get("/{project_id}/members", response_model=List[MemberResponse])
+async def get_project_members(request: Request, project_id: str):
+    """Get all members of a project."""
+    shard = _get_shard(request)
+
+    # Verify project exists
+    project = await shard.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    # Stub: return empty list
+    return []
+
+
+@router.post("/{project_id}/members", response_model=MemberResponse, status_code=201)
+async def add_project_member(req: Request, project_id: str, request: MemberAdd):
+    """Add a member to a project."""
+    shard = _get_shard(req)
+
+    # Verify project exists
+    project = await shard.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    member = await shard.add_member(
+        project_id=project_id,
+        user_id=request.user_id,
+        role=request.role,
+    )
+
+    return _member_to_response(member)
+
+
+@router.delete("/{project_id}/members/{user_id}", status_code=204)
+async def remove_project_member(request: Request, project_id: str, user_id: str):
+    """Remove a member from a project."""
+    shard = _get_shard(request)
+
+    success = await shard.remove_member(project_id, user_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+
+# === Activity Endpoint ===
+
+
+@router.get("/{project_id}/activity", response_model=List[ActivityResponse])
+async def get_project_activity(
+    request: Request,
+    project_id: str,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """Get activity log for a project."""
+    shard = _get_shard(request)
+
+    # Verify project exists
+    project = await shard.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    activities = await shard.get_activity(project_id, limit=limit, offset=offset)
+    return [_activity_to_response(a) for a in activities]
+
+
+# === Embedding Model Request/Response Models ===
+
+
+class EmbeddingModelUpdate(BaseModel):
+    """Request to update embedding model."""
+    model: str
+    wipe_collections: bool = Field(
+        default=False,
+        description="If True and dimensions differ, wipe and recreate collections"
+    )
+
+
+class EmbeddingModelResponse(BaseModel):
+    """Response for embedding model operations."""
+    success: bool
+    message: str = ""
+    current_model: Optional[str] = None
+    current_dimensions: Optional[int] = None
+    requires_wipe: bool = False
+    previous_model: Optional[str] = None
+    new_model: Optional[str] = None
+    wiped: bool = False
+
+
+class CollectionStatsResponse(BaseModel):
+    """Response for collection statistics."""
+    available: bool
+    collections: Dict[str, Any]
+
+
+@router.get("/{project_id}/embedding-model")
+async def get_project_embedding_model(request: Request, project_id: str):
+    """Get the embedding model configuration for a project."""
+    shard = _get_shard(request)
+
+    project = await shard.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    from .shard import KNOWN_EMBEDDING_MODELS, DEFAULT_EMBEDDING_MODEL
+
+    model = project.settings.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
+    dimensions = project.settings.get(
+        "embedding_dimensions",
+        KNOWN_EMBEDDING_MODELS.get(model, {}).get("dimensions", 384)
+    )
+
+    return {
+        "project_id": project_id,
+        "embedding_model": model,
+        "embedding_dimensions": dimensions,
+        "description": KNOWN_EMBEDDING_MODELS.get(model, {}).get("description", ""),
+    }
+
+
+@router.put("/{project_id}/embedding-model", response_model=EmbeddingModelResponse)
+async def update_project_embedding_model(
+    req: Request,
+    project_id: str,
+    request: EmbeddingModelUpdate,
+):
+    """
+    Update the embedding model for a project.
+
+    If the new model has different dimensions, you must set wipe_collections=True
+    to confirm deletion of existing vectors.
+    """
+    shard = _get_shard(req)
+
+    project = await shard.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    result = await shard.update_project_embedding_model(
+        project_id=project_id,
+        new_model=request.model,
+        wipe_collections=request.wipe_collections,
+    )
+
+    if not result.get("success") and result.get("requires_wipe"):
+        return EmbeddingModelResponse(
+            success=False,
+            message=result.get("message", "Model change requires wiping collections"),
+            current_model=result.get("current_model"),
+            current_dimensions=result.get("current_dimensions"),
+            requires_wipe=True,
+        )
+
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=400,
+            detail=result.get("error", "Failed to update embedding model")
+        )
+
+    return EmbeddingModelResponse(
+        success=True,
+        message="Embedding model updated successfully",
+        previous_model=result.get("previous_model"),
+        new_model=result.get("new_model"),
+        wiped=result.get("wiped", False),
+    )
+
+
+# === Collection Endpoints ===
+
+
+@router.get("/{project_id}/collections", response_model=CollectionStatsResponse)
+async def get_project_collections(request: Request, project_id: str):
+    """Get vector collection statistics for a project."""
+    shard = _get_shard(request)
+
+    project = await shard.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    stats = await shard.get_project_collection_stats(project_id)
+
+    return CollectionStatsResponse(
+        available=stats.get("available", False),
+        collections=stats.get("collections", {}),
+    )
+
+
+@router.post("/{project_id}/collections/create")
+async def create_project_collections(request: Request, project_id: str):
+    """Create vector collections for a project (if not already created)."""
+    shard = _get_shard(request)
+
+    project = await shard.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    from .shard import DEFAULT_EMBEDDING_MODEL
+    model = project.settings.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
+
+    results = await shard.create_project_collections(project_id, model)
+
+    return {
+        "project_id": project_id,
+        "created": results,
+        "embedding_model": model,
+    }
+
+
+@router.delete("/{project_id}/collections")
+async def delete_project_collections(request: Request, project_id: str):
+    """Delete all vector collections for a project."""
+    shard = _get_shard(request)
+
+    project = await shard.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    results = await shard.delete_project_collections(project_id)
+
+    return {
+        "project_id": project_id,
+        "deleted": results,
+    }

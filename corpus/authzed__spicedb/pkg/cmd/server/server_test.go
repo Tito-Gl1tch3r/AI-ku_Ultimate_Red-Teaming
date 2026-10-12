@@ -1,0 +1,927 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"reflect"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.uber.org/goleak"
+	"go.uber.org/mock/gomock"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
+
+	"github.com/authzed/authzed-go/pkg/requestmeta"
+	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+	"github.com/authzed/grpcutil"
+
+	"github.com/authzed/spicedb/internal/datastore/dsfortesting"
+	dispatchmocks "github.com/authzed/spicedb/internal/dispatch/mocks"
+	"github.com/authzed/spicedb/internal/logging"
+	"github.com/authzed/spicedb/internal/middleware/memoryprotection"
+	v1svc "github.com/authzed/spicedb/internal/services/v1"
+	"github.com/authzed/spicedb/pkg/cmd/datastore"
+	"github.com/authzed/spicedb/pkg/cmd/util"
+	dsmocks "github.com/authzed/spicedb/pkg/datastore/mocks"
+	"github.com/authzed/spicedb/pkg/middleware/consistency"
+	"github.com/authzed/spicedb/pkg/testutil"
+	"github.com/authzed/spicedb/pkg/tuple"
+)
+
+func TestServerGracefulTermination(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	ds, err := dsfortesting.NewMemDBDatastoreForTesting(t, 0, 1*time.Second, 10*time.Second)
+	require.NoError(t, err)
+
+	c := ConfigWithOptions(
+		&Config{},
+		WithPresharedSecureKey("psk"),
+		WithDatastore(ds),
+		WithGRPCServer(util.GRPCServerConfig{
+			Network: util.BufferedNetwork,
+			Enabled: true,
+		}),
+		WithNamespaceCacheConfig(CacheConfig{Enabled: true}),
+		WithDispatchCacheConfig(CacheConfig{Enabled: true}),
+		WithClusterDispatchCacheConfig(CacheConfig{Enabled: true}),
+		WithHTTPGateway(util.HTTPServerConfig{HTTPEnabled: true, HTTPAddress: ":"}),
+		WithMetricsAPI(util.HTTPServerConfig{HTTPEnabled: true, HTTPAddress: ":"}),
+		WithEnableMemoryProtectionMiddleware(false),
+	)
+	rs, err := c.Complete(ctx)
+	require.NoError(t, err)
+
+	ch := make(chan struct{}, 1)
+	st := make(chan struct{}, 1)
+	go func() {
+		st <- struct{}{}
+		_ = rs.Run(ctx)
+		ch <- struct{}{}
+	}()
+	<-st
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	<-ch
+}
+
+func TestServerDefaultOptions(t *testing.T) {
+	cfg := NewConfigWithOptionsAndDefaults()
+
+	require.Equal(t, 5*time.Second, cfg.ShutdownGracePeriod)
+	require.Equal(t, 4096, cfg.MaxCaveatContextSize)
+	require.Equal(t, 25_000, cfg.MaxRelationshipContextSize)
+	require.Equal(t, time.Second, cfg.SchemaWatchHeartbeat)
+	require.Equal(t, "read-legacy-write-legacy", cfg.ExperimentalSchemaMode)
+
+	require.Equal(t, uint32(50), cfg.DispatchMaxDepth)
+	require.Equal(t, uint16(50), cfg.GlobalDispatchConcurrencyLimit)
+	require.Equal(t, 60*time.Second, cfg.DispatchUpstreamTimeout)
+	require.Equal(t, uint16(100), cfg.DispatchHashringReplicationFactor)
+	require.Equal(t, uint8(1), cfg.DispatchHashringSpread)
+	require.Equal(t, uint16(100), cfg.DispatchChunkSize)
+
+	require.Equal(t, uint16(1000), cfg.MaximumUpdatesPerWrite)
+	require.Equal(t, uint16(1000), cfg.MaximumPreconditionCount)
+	require.Equal(t, uint64(1000), cfg.MaxDatastoreReadPageSize)
+	require.Equal(t, 30*time.Second, cfg.StreamingAPITimeout)
+	require.Equal(t, time.Second, cfg.WatchHeartbeat)
+	require.Equal(t, uint32(1000), cfg.MaxReadRelationshipsLimit)
+	require.Equal(t, uint32(1000), cfg.MaxDeleteRelationshipsLimit)
+	require.Equal(t, uint32(1000), cfg.MaxLookupResourcesLimit)
+	require.Equal(t, uint32(10_000), cfg.MaxBulkExportRelationshipsLimit)
+	require.True(t, cfg.EnableRelationshipExpiration)
+	require.True(t, cfg.EnableRevisionHeartbeat)
+	require.Equal(t, "full-consistency", cfg.MismatchZedTokenBehavior)
+	require.True(t, cfg.EnableMemoryProtectionMiddleware)
+
+	require.Equal(t, "https://telemetry.authzed.com", cfg.TelemetryEndpoint)
+	require.Equal(t, time.Hour, cfg.TelemetryInterval)
+
+	// Embedded gRPC servers: per-instance defaults from (*Config).SetDefaults
+	// plus shared field defaults from struct tags on util.GRPCServerConfig.
+	require.Equal(t, ":50051", cfg.GRPCServer.Address)
+	require.True(t, cfg.GRPCServer.Enabled)
+	require.Equal(t, "tcp", cfg.GRPCServer.Network)
+	require.Equal(t, 30*time.Second, cfg.GRPCServer.MaxConnAge)
+	require.Equal(t, ":50053", cfg.DispatchServer.Address)
+	require.False(t, cfg.DispatchServer.Enabled)
+	require.Equal(t, "tcp", cfg.DispatchServer.Network)
+
+	// Embedded HTTP servers.
+	require.Equal(t, ":8443", cfg.HTTPGateway.HTTPAddress)
+	require.False(t, cfg.HTTPGateway.HTTPEnabled)
+	require.Equal(t, []string{"*"}, cfg.HTTPGatewayCorsAllowedOrigins)
+	require.Equal(t, ":9090", cfg.MetricsAPI.HTTPAddress)
+	require.True(t, cfg.MetricsAPI.HTTPEnabled)
+
+	// CacheConfig: five sites with different names and sizes. NumCounters
+	// stays 0 in every site to match RegisterCacheFlags, which hardcodes the
+	// (deprecated) flag default to 0.
+	require.Equal(t, CacheConfig{Name: "namespace", Enabled: true, Metrics: true, MaxCost: "32MiB"}, cfg.NamespaceCacheConfig)
+	require.Equal(t, CacheConfig{Name: "dispatch", Enabled: true, Metrics: true, MaxCost: "30%"}, cfg.DispatchCacheConfig)
+	require.Equal(t, CacheConfig{Name: "cluster_dispatch", Enabled: true, Metrics: true, MaxCost: "70%"}, cfg.ClusterDispatchCacheConfig)
+	require.Equal(t, CacheConfig{Name: "lr3_chunk", Enabled: true, MaxCost: "50MiB"}, cfg.LR3ResourceChunkCacheConfig)
+	require.Equal(t, CacheConfig{Name: "stored_schema", Enabled: true, Metrics: true, MaxCost: "32MiB"}, cfg.StoredSchemaCacheConfig)
+	require.True(t, cfg.DispatchClusterMetricsEnabled)
+	require.True(t, cfg.DispatchClientMetricsEnabled)
+
+	// OTel.
+	require.Equal(t, "none", cfg.OTel.Provider)
+	require.Equal(t, "spicedb", cfg.OTel.ServiceName)
+	require.Equal(t, "w3c", cfg.OTel.TracePropagator)
+	require.InEpsilon(t, 0.01, cfg.OTel.SampleRatio, 1e-9)
+
+	// Datastore: every non-zero field from DefaultDatastoreConfig is now
+	// reachable via struct tags so library users get the same defaults as
+	// CLI users.
+	require.Equal(t, "memory", cfg.DatastoreConfig.Engine)
+	require.Equal(t, 24*time.Hour, cfg.DatastoreConfig.GCWindow)
+	require.Equal(t, 5*time.Second, cfg.DatastoreConfig.RevisionQuantization)
+	require.InEpsilon(t, 0.1, cfg.DatastoreConfig.MaxRevisionStalenessPercent, 1e-9)
+	require.Equal(t, uint16(100), cfg.DatastoreConfig.FilterMaximumIDCount)
+	require.True(t, cfg.DatastoreConfig.EnableDatastoreMetrics)
+	require.Equal(t, 10*time.Second, cfg.DatastoreConfig.BootstrapTimeout)
+	require.Equal(t, 4800*time.Millisecond, cfg.DatastoreConfig.FollowerReadDelay)
+	require.Equal(t, 10, cfg.DatastoreConfig.MaxRetries)
+	require.Equal(t, "key", cfg.DatastoreConfig.OverlapKey)
+	require.Equal(t, "static", cfg.DatastoreConfig.OverlapStrategy)
+	require.True(t, cfg.DatastoreConfig.EnableConnectionBalancing)
+	require.Equal(t, 100*time.Millisecond, cfg.DatastoreConfig.ConnectRate)
+	require.Equal(t, 30*time.Millisecond, cfg.DatastoreConfig.WriteAcquisitionTimeout)
+	require.Equal(t, 3*time.Minute, cfg.DatastoreConfig.GCInterval)
+	require.Equal(t, time.Minute, cfg.DatastoreConfig.GCMaxOperationTime)
+	require.Equal(t, uint16(1024), cfg.DatastoreConfig.WatchBufferLength)
+	require.Equal(t, "15%", cfg.DatastoreConfig.WatchChangeBufferMaximumSize)
+	require.Equal(t, time.Second, cfg.DatastoreConfig.WatchBufferWriteTimeout)
+	require.Equal(t, time.Second, cfg.DatastoreConfig.WatchConnectTimeout)
+	require.Equal(t, uint64(100), cfg.DatastoreConfig.SpannerMinSessions)
+	require.Equal(t, uint64(400), cfg.DatastoreConfig.SpannerMaxSessions)
+	require.Equal(t, "otel", cfg.DatastoreConfig.SpannerDatastoreMetricsOption)
+	require.True(t, cfg.DatastoreConfig.ExperimentalColumnOptimization)
+
+	// Connection pools: Read default 20/20, Write default 10/10, both with
+	// 30m lifetime/idle and 30s healthcheck. Slice fields default to empty
+	// (non-nil) to match the CLI's StringSliceVar/StringArrayVar defaults.
+	require.Equal(t, 20, cfg.DatastoreConfig.ReadConnPool.MaxOpenConns)
+	require.Equal(t, 20, cfg.DatastoreConfig.ReadConnPool.MinOpenConns)
+	require.Equal(t, 30*time.Minute, cfg.DatastoreConfig.ReadConnPool.MaxLifetime)
+	require.Equal(t, 30*time.Minute, cfg.DatastoreConfig.ReadConnPool.MaxIdleTime)
+	require.Equal(t, 30*time.Second, cfg.DatastoreConfig.ReadConnPool.HealthCheckInterval)
+	require.Equal(t, 10, cfg.DatastoreConfig.WriteConnPool.MaxOpenConns)
+	require.Equal(t, 10, cfg.DatastoreConfig.WriteConnPool.MinOpenConns)
+	require.Equal(t, []string{}, cfg.DatastoreConfig.BootstrapFiles)
+	require.Equal(t, []string{}, cfg.DatastoreConfig.ReadReplicaURIs)
+	require.Equal(t, []string{}, cfg.DatastoreConfig.AllowedMigrations)
+	require.Equal(t, []string{}, cfg.DatastoreConfig.RelationshipIntegrityExpiredKeys)
+}
+
+func TestExperimentalQueryPlanStringSliceMapping(t *testing.T) {
+	// These test cases mirror the slices.Contains logic in server.go's Complete(),
+	// ensuring every token maps to the correct ExperimentalQueryPlanConfig field.
+	cases := []struct {
+		name            string
+		tokens          []string
+		wantCheck       bool
+		wantLookupRes   bool
+		wantLookupSubjs bool
+	}{
+		{name: "empty", tokens: nil, wantCheck: false, wantLookupRes: false, wantLookupSubjs: false},
+		{name: "check only", tokens: []string{"check"}, wantCheck: true, wantLookupRes: false, wantLookupSubjs: false},
+		{name: "lr only", tokens: []string{"lr"}, wantCheck: false, wantLookupRes: true, wantLookupSubjs: false},
+		{name: "ls only", tokens: []string{"ls"}, wantCheck: false, wantLookupRes: false, wantLookupSubjs: true},
+		{name: "check and lr", tokens: []string{"check", "lr"}, wantCheck: true, wantLookupRes: true, wantLookupSubjs: false},
+		{name: "all three", tokens: []string{"check", "lr", "ls"}, wantCheck: true, wantLookupRes: true, wantLookupSubjs: true},
+		{name: "unknown token ignored", tokens: []string{"unknown"}, wantCheck: false, wantLookupRes: false, wantLookupSubjs: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{ExperimentalQueryPlan: tc.tokens}
+			got := v1svc.ExperimentalQueryPlanConfig{
+				Check:           slices.Contains(cfg.ExperimentalQueryPlan, "check"),
+				LookupResources: slices.Contains(cfg.ExperimentalQueryPlan, "lr"),
+				LookupSubjects:  slices.Contains(cfg.ExperimentalQueryPlan, "ls"),
+			}
+			require.Equal(t, tc.wantCheck, got.Check)
+			require.Equal(t, tc.wantLookupRes, got.LookupResources)
+			require.Equal(t, tc.wantLookupSubjs, got.LookupSubjects)
+		})
+	}
+}
+
+func TestWithExperimentalQueryPlanAppendsValues(t *testing.T) {
+	cfg := &Config{}
+
+	ConfigWithOptions(cfg, WithExperimentalQueryPlan("check"))
+	require.Equal(t, []string{"check"}, cfg.ExperimentalQueryPlan)
+
+	ConfigWithOptions(cfg, WithExperimentalQueryPlan("lr"))
+	require.Equal(t, []string{"check", "lr"}, cfg.ExperimentalQueryPlan)
+
+	ConfigWithOptions(cfg, WithExperimentalQueryPlan("ls"))
+	require.Equal(t, []string{"check", "lr", "ls"}, cfg.ExperimentalQueryPlan)
+}
+
+func TestSetExperimentalQueryPlanOverwritesValue(t *testing.T) {
+	cfg := &Config{}
+
+	ConfigWithOptions(cfg, WithExperimentalQueryPlan("check"))
+	require.Equal(t, []string{"check"}, cfg.ExperimentalQueryPlan)
+
+	// SetExperimentalQueryPlan replaces the whole slice
+	ConfigWithOptions(cfg, SetExperimentalQueryPlan([]string{"lr", "ls"}))
+	require.Equal(t, []string{"lr", "ls"}, cfg.ExperimentalQueryPlan)
+}
+
+func TestSetExperimentalQueryPlanWithNilClearsSlice(t *testing.T) {
+	cfg := &Config{}
+
+	ConfigWithOptions(cfg, WithExperimentalQueryPlan("check"))
+	require.Equal(t, []string{"check"}, cfg.ExperimentalQueryPlan)
+
+	ConfigWithOptions(cfg, SetExperimentalQueryPlan(nil))
+	require.Nil(t, cfg.ExperimentalQueryPlan)
+}
+
+func TestOTelReporting(t *testing.T) {
+	defer goleak.VerifyNone(t, append(testutil.GoLeakIgnores(), goleak.IgnoreCurrent())...)
+	spanrecorder, restoreOtel := setupSpanRecorder()
+	defer restoreOtel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	ds, err := datastore.NewDatastore(ctx,
+		datastore.DefaultDatastoreConfig().ToOption(),
+	)
+	require.NoError(t, err, "unable to start memdb datastore")
+	t.Cleanup(func() {
+		ds.Close()
+	})
+
+	configOpts := []ConfigOption{
+		WithGRPCServer(util.GRPCServerConfig{
+			Network: util.BufferedNetwork,
+			Enabled: true,
+		}),
+		WithGRPCAuthFunc(func(ctx context.Context) (context.Context, error) {
+			return ctx, nil
+		}),
+		WithHTTPGateway(util.HTTPServerConfig{HTTPEnabled: false}),
+		WithMetricsAPI(util.HTTPServerConfig{HTTPEnabled: false}),
+		WithDispatchCacheConfig(CacheConfig{Enabled: false, Metrics: false}),
+		WithNamespaceCacheConfig(CacheConfig{Enabled: false, Metrics: false}),
+		WithClusterDispatchCacheConfig(CacheConfig{Enabled: false, Metrics: false}),
+		WithSilentlyDisableTelemetry(true),
+		WithDatastore(ds),
+		WithEnableMemoryProtectionMiddleware(false),
+	}
+
+	srv, err := NewConfigWithOptionsAndDefaults(configOpts...).Complete(ctx)
+	require.NoError(t, err)
+
+	conn, err := srv.NewClient()
+	require.NoError(t, err)
+	defer conn.Close()
+
+	schemaSrv := v1.NewSchemaServiceClient(conn)
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		runErrCh <- srv.Run(ctx)
+	}()
+
+	// test unary OTel middleware
+	_, err = schemaSrv.WriteSchema(ctx, &v1.WriteSchemaRequest{
+		Schema: `definition user {}`,
+	})
+	require.NoError(t, err)
+	requireSpanExists(t, spanrecorder, "authzed.api.v1.SchemaService/WriteSchema")
+
+	// test streaming OTel middleware
+	permSrv := v1.NewPermissionsServiceClient(conn)
+	rrCli, err := permSrv.ReadRelationships(ctx, &v1.ReadRelationshipsRequest{})
+	require.NoError(t, err)
+
+	_, err = rrCli.Recv()
+	require.Error(t, err)
+	requireSpanExists(t, spanrecorder, "authzed.api.v1.PermissionsService/ReadRelationships")
+
+	lrCli, err := permSrv.LookupResources(ctx, &v1.LookupResourcesRequest{})
+	require.NoError(t, err)
+
+	_, err = lrCli.Recv()
+	require.Error(t, err)
+
+	requireSpanExists(t, spanrecorder, "authzed.api.v1.PermissionsService/LookupResources")
+	require.NoError(t, <-runErrCh)
+}
+
+func TestDisableHealthCheckTracing(t *testing.T) {
+	defer goleak.VerifyNone(t, append(testutil.GoLeakIgnores(), goleak.IgnoreCurrent())...)
+	spanrecorder, restoreOtel := setupSpanRecorder()
+	defer restoreOtel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	ds, err := datastore.NewDatastore(ctx,
+		datastore.DefaultDatastoreConfig().ToOption(),
+	)
+	require.NoError(t, err, "unable to start memdb datastore")
+	t.Cleanup(func() {
+		ds.Close()
+	})
+
+	configOpts := []ConfigOption{
+		WithGRPCServer(util.GRPCServerConfig{
+			Network: util.BufferedNetwork,
+			Enabled: true,
+		}),
+		WithGRPCAuthFunc(func(ctx context.Context) (context.Context, error) {
+			return ctx, nil
+		}),
+		WithHTTPGateway(util.HTTPServerConfig{HTTPEnabled: false}),
+		WithMetricsAPI(util.HTTPServerConfig{HTTPEnabled: false}),
+		WithDispatchCacheConfig(CacheConfig{Enabled: false, Metrics: false}),
+		WithNamespaceCacheConfig(CacheConfig{Enabled: false, Metrics: false}),
+		WithClusterDispatchCacheConfig(CacheConfig{Enabled: false, Metrics: false}),
+		WithSilentlyDisableTelemetry(true),
+		WithDatastore(ds),
+	}
+
+	srv, err := NewConfigWithOptionsAndDefaults(configOpts...).Complete(ctx)
+	require.NoError(t, err)
+
+	conn, err := srv.NewClient()
+	require.NoError(t, err)
+	defer conn.Close()
+
+	go func() {
+		assert.NoError(t, srv.Run(ctx))
+	}()
+
+	// Poll for gRPC server readiness instead of sleeping
+	healthClient := healthpb.NewHealthClient(conn)
+	require.Eventually(t, func() bool {
+		_, err := healthClient.Check(ctx, &healthpb.HealthCheckRequest{Service: ""})
+		return err == nil
+	}, 5*time.Second, 50*time.Millisecond, "gRPC server did not become ready")
+
+	// Call a regular API and verify it IS traced
+	schemaSrv := v1.NewSchemaServiceClient(conn)
+	_, err = schemaSrv.WriteSchema(ctx, &v1.WriteSchemaRequest{
+		Schema: `definition user {}`,
+	})
+	require.NoError(t, err)
+
+	// Verify the schema call was traced
+	requireSpanExists(t, spanrecorder, "authzed.api.v1.SchemaService/WriteSchema")
+
+	// Verify the gRPC health check was NOT traced
+	requireSpanDoesNotExist(t, spanrecorder, "/grpc.health.v1.Health/Check")
+
+	// Note: HTTP gateway health check (/healthz) filtering is verified by the gateway
+	// implementation itself. This test focuses on gRPC health check filtering since
+	// BufferedNetwork mode disables the HTTP gateway.
+}
+
+func requireSpanExists(t *testing.T, spanrecorder *tracetest.SpanRecorder, spanName string) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		for _, span := range spanrecorder.Ended() {
+			if span.Name() == spanName {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond, "missing span with name %q", spanName)
+}
+
+func requireSpanDoesNotExist(t *testing.T, spanrecorder *tracetest.SpanRecorder, spanName string) {
+	t.Helper()
+
+	// Actively verify that the span never appears over a short window
+	require.Never(t, func() bool {
+		for _, span := range spanrecorder.Ended() {
+			if span.Name() == spanName {
+				return true
+			}
+		}
+		return false
+	}, 500*time.Millisecond, 10*time.Millisecond, "span %q should not exist", spanName)
+}
+
+func setupSpanRecorder() (*tracetest.SpanRecorder, func()) {
+	defaultProvider := otel.GetTracerProvider()
+
+	provider := trace.NewTracerProvider(
+		trace.WithSampler(trace.AlwaysSample()),
+	)
+	spanrecorder := tracetest.NewSpanRecorder()
+	provider.RegisterSpanProcessor(spanrecorder)
+	otel.SetTracerProvider(provider)
+
+	return spanrecorder, func() {
+		otel.SetTracerProvider(defaultProvider)
+	}
+}
+
+type countingInterceptor struct {
+	val int
+}
+
+func (m *countingInterceptor) unaryIntercept(ctx context.Context, req any, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (resp any, err error) {
+	m.val++
+	return h(ctx, req)
+}
+
+// TestRetryPolicy tests that the retry policy specified in the grpc.WithDefaultServiceConfig is respected.
+// It does this by installing a unary interceptor that counts the number of calls, and then returning a
+// FAILED_PRECONDITION error from the WriteRelationships call.
+// This test is in place to make sure we don't regress this again by messing with grpc in our middlewares.
+func TestRetryPolicy(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
+	ds, err := datastore.NewDatastore(ctx,
+		datastore.DefaultDatastoreConfig().ToOption(),
+	)
+	require.NoError(t, err, "unable to start memdb datastore")
+	t.Cleanup(func() {
+		ds.Close()
+	})
+
+	var interceptor countingInterceptor
+	configOpts := []ConfigOption{
+		WithGRPCServer(util.GRPCServerConfig{
+			Network: util.BufferedNetwork,
+			Enabled: true,
+		}),
+		WithGRPCAuthFunc(func(ctx context.Context) (context.Context, error) {
+			return ctx, nil
+		}),
+		WithHTTPGateway(util.HTTPServerConfig{HTTPEnabled: false}),
+		WithMetricsAPI(util.HTTPServerConfig{HTTPEnabled: false}),
+		WithDispatchCacheConfig(CacheConfig{Enabled: false, Metrics: false}),
+		WithNamespaceCacheConfig(CacheConfig{Enabled: false, Metrics: false}),
+		WithClusterDispatchCacheConfig(CacheConfig{Enabled: false, Metrics: false}),
+		WithSilentlyDisableTelemetry(true),
+		WithDatastore(ds),
+		WithEnableMemoryProtectionMiddleware(false),
+		SetUnaryMiddlewareModification([]MiddlewareModification[grpc.UnaryServerInterceptor]{
+			{
+				Operation:                OperationAppend,
+				DependencyMiddlewareName: DefaultMiddlewareRequestID,
+				Middlewares: []ReferenceableMiddleware[grpc.UnaryServerInterceptor]{
+					NewUnaryMiddleware().
+						WithName("foobar").
+						WithInterceptor(interceptor.unaryIntercept).
+						EnsureAlreadyExecuted(DefaultMiddlewareRequestID). // make sure requestID is executed because before we fixed it, it broke retry policies
+						Done(),
+				},
+			},
+		}),
+	}
+
+	srv, err := NewConfigWithOptionsAndDefaults(configOpts...).Complete(ctx)
+	require.NoError(t, err)
+
+	conn, err := srv.NewClient(
+		grpc.WithDefaultServiceConfig(`{
+                  "methodConfig": [
+                    {
+                      "name": [
+                        {
+                          "service": "authzed.api.v1.PermissionsService",
+                          "method": "WriteRelationships"
+                        }
+                      ],
+                      "retryPolicy": {
+                        "maxAttempts": 5,
+                        "initialBackoff": "0.01s",
+                        "maxBackoff": "0.1s",
+                        "backoffMultiplier": 2,
+                        "retryableStatusCodes": [
+                          "FAILED_PRECONDITION"
+                        ]
+                      }
+                    }
+                  ]
+                }`),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = conn.Close()
+	})
+	schemaSrv := v1.NewSchemaServiceClient(conn)
+
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- srv.Run(ctx)
+	}()
+
+	_, err = schemaSrv.WriteSchema(ctx, &v1.WriteSchemaRequest{
+		Schema: `definition user {}`,
+	})
+	require.NoError(t, err)
+
+	interceptor.val = 0
+	permSrv := v1.NewPermissionsServiceClient(conn)
+	var trailer metadata.MD
+	ctxWithRequestID := requestmeta.WithRequestID(ctx, "foobar")
+	ctxWithServerVersion := metadata.AppendToOutgoingContext(ctxWithRequestID, string(requestmeta.RequestServerVersion), "t")
+	_, err = permSrv.WriteRelationships(ctxWithServerVersion, &v1.WriteRelationshipsRequest{
+		Updates: []*v1.RelationshipUpdate{
+			tuple.MustUpdateToV1RelationshipUpdate(tuple.Touch(tuple.MustParse("resource:resource#reader@user:user#..."))),
+		},
+	}, grpc.Trailer(&trailer))
+	grpcutil.RequireStatus(t, codes.FailedPrecondition, err)
+
+	// validate that requestID was used, as it used to break retry policies before
+	require.Equal(t, 5, interceptor.val)
+	requestIDs := trailer.Get("x-request-id")
+	require.NotEmpty(t, requestIDs)
+	require.Contains(t, requestIDs, "foobar")
+
+	cancel()
+	require.NoError(t, <-errChan)
+}
+
+func TestServerGracefulTerminationOnError(t *testing.T) {
+	defer goleak.VerifyNone(t, append(testutil.GoLeakIgnores(), goleak.IgnoreCurrent())...)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	ds, err := dsfortesting.NewMemDBDatastoreForTesting(t, 0, 1*time.Second, 10*time.Second)
+	require.NoError(t, err)
+
+	c := ConfigWithOptions(&Config{
+		GRPCServer: util.GRPCServerConfig{
+			Network: util.BufferedNetwork,
+		},
+	}, WithPresharedSecureKey("psk"), WithDatastore(ds), WithEnableMemoryProtectionMiddleware(false))
+	cancel()
+	_, err = c.Complete(ctx)
+	require.NoError(t, err)
+}
+
+func TestReplaceUnaryMiddleware(t *testing.T) {
+	c := Config{UnaryMiddlewareModification: []MiddlewareModification[grpc.UnaryServerInterceptor]{
+		{
+			Operation: OperationReplaceAllUnsafe,
+			Middlewares: []ReferenceableMiddleware[grpc.UnaryServerInterceptor]{
+				{
+					Name:       "foobar",
+					Middleware: mockUnaryInterceptor{val: 1}.unaryIntercept,
+				},
+			},
+		},
+	}}
+	unary, err := c.buildUnaryMiddleware(nil)
+	require.NoError(t, err)
+	require.Len(t, unary, 1)
+
+	val, _ := unary[0](t.Context(), nil, nil, nil)
+	require.Equal(t, 1, val)
+}
+
+func TestReplaceStreamingMiddleware(t *testing.T) {
+	c := Config{StreamingMiddlewareModification: []MiddlewareModification[grpc.StreamServerInterceptor]{
+		{
+			Operation: OperationReplaceAllUnsafe,
+			Middlewares: []ReferenceableMiddleware[grpc.StreamServerInterceptor]{
+				{
+					Name:       "foobar",
+					Middleware: mockStreamInterceptor{val: errors.New("hi")}.streamIntercept,
+				},
+			},
+		},
+	}}
+	streaming, err := c.buildStreamingMiddleware(nil)
+	require.NoError(t, err)
+	require.Len(t, streaming, 1)
+
+	err = streaming[0](t.Context(), nil, nil, nil)
+	require.ErrorContains(t, err, "hi")
+}
+
+func TestModifyUnaryMiddleware(t *testing.T) {
+	c := Config{UnaryMiddlewareModification: []MiddlewareModification[grpc.UnaryServerInterceptor]{
+		{
+			Operation:                OperationPrepend,
+			DependencyMiddlewareName: DefaultMiddlewareLog,
+			Middlewares: []ReferenceableMiddleware[grpc.UnaryServerInterceptor]{
+				{
+					Name:       "foobar",
+					Middleware: mockUnaryInterceptor{val: 1}.unaryIntercept,
+				},
+			},
+		},
+	}}
+
+	opt := MiddlewareOption{logging.Logger, nil, false, nil, false, false, false, "testing", consistency.TreatMismatchingTokensAsFullConsistency, memoryprotection.NewNoopMemoryUsageProvider(), nil, nil}
+	opt = opt.WithDatastore(nil)
+
+	defaultMw, err := DefaultUnaryMiddleware(opt)
+	require.NoError(t, err)
+
+	unary, err := c.buildUnaryMiddleware(defaultMw)
+	require.NoError(t, err)
+	require.Len(t, unary, len(defaultMw.chain)+1)
+
+	val, _ := unary[1](t.Context(), nil, nil, nil)
+	require.Equal(t, 1, val)
+}
+
+func TestModifyStreamingMiddleware(t *testing.T) {
+	c := Config{StreamingMiddlewareModification: []MiddlewareModification[grpc.StreamServerInterceptor]{
+		{
+			Operation:                OperationPrepend,
+			DependencyMiddlewareName: DefaultMiddlewareLog,
+			Middlewares: []ReferenceableMiddleware[grpc.StreamServerInterceptor]{
+				{
+					Name:       "foobar",
+					Middleware: mockStreamInterceptor{val: errors.New("hi")}.streamIntercept,
+				},
+			},
+		},
+	}}
+
+	opt := MiddlewareOption{logging.Logger, nil, false, nil, false, false, false, "testing", consistency.TreatMismatchingTokensAsFullConsistency, memoryprotection.NewNoopMemoryUsageProvider(), nil, nil}
+	opt = opt.WithDatastore(nil)
+
+	defaultMw, err := DefaultStreamingMiddleware(opt)
+	require.NoError(t, err)
+
+	streaming, err := c.buildStreamingMiddleware(defaultMw)
+	require.NoError(t, err)
+	require.Len(t, streaming, len(defaultMw.chain)+1)
+
+	err = streaming[1](t.Context(), nil, nil, nil)
+	require.ErrorContains(t, err, "hi")
+}
+
+func TestSupportOldAndNewReadReplicaConnectionPoolFlags(t *testing.T) {
+	tests := []struct {
+		name     string
+		opts     Config
+		expected datastore.ConnPoolConfig
+	}{
+		{
+			name: "no flags set",
+			opts: Config{
+				DatastoreConfig: datastore.Config{
+					ReadReplicaConnPool:    *datastore.DefaultReadConnPool(),
+					OldReadReplicaConnPool: *datastore.DefaultReadConnPool(),
+				},
+			},
+			expected: *datastore.DefaultReadConnPool(),
+		},
+		{
+			name: "new flags set",
+			opts: Config{
+				DatastoreConfig: datastore.Config{
+					ReadReplicaConnPool: datastore.ConnPoolConfig{
+						MaxLifetime:         1 * time.Minute,
+						MaxIdleTime:         1 * time.Minute,
+						MaxOpenConns:        1,
+						MinOpenConns:        1,
+						HealthCheckInterval: 1 * time.Second,
+					},
+					OldReadReplicaConnPool: *datastore.DefaultReadConnPool(),
+				},
+			},
+			expected: datastore.ConnPoolConfig{
+				MaxLifetime:         1 * time.Minute,
+				MaxIdleTime:         1 * time.Minute,
+				MaxOpenConns:        1,
+				MinOpenConns:        1,
+				HealthCheckInterval: 1 * time.Second,
+			},
+		},
+		{
+			name: "old flags set",
+			opts: Config{
+				DatastoreConfig: datastore.Config{
+					ReadReplicaConnPool: *datastore.DefaultReadConnPool(),
+					OldReadReplicaConnPool: datastore.ConnPoolConfig{
+						MaxLifetime:         2 * time.Minute,
+						MaxIdleTime:         2 * time.Minute,
+						MaxOpenConns:        2,
+						MinOpenConns:        2,
+						HealthCheckInterval: 2 * time.Second,
+					},
+				},
+			},
+			expected: datastore.ConnPoolConfig{
+				MaxLifetime:         2 * time.Minute,
+				MaxIdleTime:         2 * time.Minute,
+				MaxOpenConns:        2,
+				MinOpenConns:        2,
+				HealthCheckInterval: 2 * time.Second,
+			},
+		},
+		{
+			name: "prefers new flags if both are set",
+			opts: Config{
+				DatastoreConfig: datastore.Config{
+					ReadReplicaConnPool: datastore.ConnPoolConfig{
+						MaxLifetime:         1 * time.Minute,
+						MaxIdleTime:         1 * time.Minute,
+						MaxOpenConns:        1,
+						MinOpenConns:        2,
+						HealthCheckInterval: 2 * time.Second,
+					},
+					OldReadReplicaConnPool: datastore.ConnPoolConfig{
+						MaxLifetime:         2 * time.Minute,
+						MaxIdleTime:         2 * time.Minute,
+						MaxOpenConns:        2,
+						MinOpenConns:        2,
+						HealthCheckInterval: 2 * time.Second,
+					},
+				},
+			},
+			expected: datastore.ConnPoolConfig{
+				MaxLifetime:         1 * time.Minute,
+				MaxIdleTime:         1 * time.Minute,
+				MaxOpenConns:        1,
+				MinOpenConns:        2,
+				HealthCheckInterval: 2 * time.Second,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.opts.supportOldAndNewReadReplicaConnectionPoolFlags()
+			require.Equal(t, tt.expected, tt.opts.DatastoreConfig.ReadReplicaConnPool)
+		})
+	}
+}
+
+func TestBuildDispatchServer(t *testing.T) {
+	testcases := map[string]struct {
+		config                              *Config
+		expectedDispatchUnnaryMiddleware    int
+		expectedDispatchStreamingMiddleware int
+	}{
+		`auth:preshared key`: {
+			config: &Config{
+				PresharedSecureKey: []string{"securekey"},
+			},
+			expectedDispatchUnnaryMiddleware:    8,
+			expectedDispatchStreamingMiddleware: 6,
+		},
+		`auth:custom`: {
+			config: &Config{
+				GRPCAuthFunc: func(ctx context.Context) (context.Context, error) {
+					return ctx, nil
+				},
+			},
+			expectedDispatchUnnaryMiddleware:    8,
+			expectedDispatchStreamingMiddleware: 6,
+		},
+	}
+
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			mockDatastore := dsmocks.NewMockDatastore(ctrl)
+			mockDispatcher := dispatchmocks.NewMockDispatcher(ctrl)
+
+			sampler := memoryprotection.NewNoopMemoryUsageProvider()
+
+			srv, err := tc.config.buildDispatchServer(sampler, mockDatastore, mockDispatcher, nil, nil)
+			require.NoError(t, err)
+			require.NotNil(t, srv)
+			require.Len(t, tc.config.DispatchUnaryMiddleware, tc.expectedDispatchUnnaryMiddleware)
+			require.Len(t, tc.config.DispatchStreamingMiddleware, tc.expectedDispatchStreamingMiddleware)
+		})
+	}
+}
+
+func TestDebugMapRedactsURI(t *testing.T) {
+	c := &Config{
+		DatastoreConfig: datastore.Config{
+			URI: "postgresql://root@localhost:26257/defaultdb",
+		},
+	}
+	out := fmt.Sprintln(c.FlatDebugMap())
+	require.NotContains(t, out, "postgresql://root@localhost:26257/defaultdb")
+}
+
+func TestHandleGRPCAuthn(t *testing.T) {
+	t.Run("empty configuration errors", func(t *testing.T) {
+		require.ErrorContains(t, (&Config{}).handleGrpcAuthn(t.Context()), "a preshared key must be provided")
+	})
+	t.Run("preshared key list with empty key errors", func(t *testing.T) {
+		require.ErrorContains(t, (&Config{PresharedSecureKey: []string{"foo", ""}}).handleGrpcAuthn(t.Context()), "is empty")
+	})
+	t.Run("if auth fn is provided it is used", func(t *testing.T) {
+		authFn := func(ctx context.Context) (context.Context, error) {
+			return ctx, nil
+		}
+		config := &Config{GRPCAuthFunc: authFn}
+		require.NoError(t, config.handleGrpcAuthn(t.Context()))
+		// Assert that the function objects are the same. this hackaround is necessary
+		// because of the way that golang treats function values.
+		require.Equal(t,
+			reflect.ValueOf(authFn).Pointer(),
+			reflect.ValueOf(config.GRPCAuthFunc).Pointer(),
+		)
+	})
+	t.Run("if auth fn is not provided, one is created", func(t *testing.T) {
+		config := &Config{PresharedSecureKey: []string{"foo"}}
+		require.NoError(t, config.handleGrpcAuthn(t.Context()))
+		require.NotNil(t, config.GRPCAuthFunc)
+	})
+}
+
+// A shutting-down server must report NOT_SERVING while its listeners are still
+// open, so load balancers stop routing to it before connections are refused.
+func TestShutdownReportsNotServingBeforeClosingListeners(t *testing.T) {
+	defer goleak.VerifyNone(t, append(testutil.GoLeakIgnores(), goleak.IgnoreCurrent())...)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	// A real TCP listener: in-memory listeners skip the drain delay.
+	probe, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+	addr := probe.Addr().String()
+	require.NoError(t, probe.Close())
+
+	ds, err := datastore.NewDatastore(ctx, datastore.DefaultDatastoreConfig().ToOption())
+	require.NoError(t, err, "unable to start memdb datastore")
+	t.Cleanup(func() { ds.Close() })
+
+	shutdownDrainDelay := 2 * time.Second
+
+	srv, err := NewConfigWithOptionsAndDefaults(
+		WithGRPCServer(util.GRPCServerConfig{Network: "tcp", Address: addr, Enabled: true}),
+		WithGRPCAuthFunc(func(ctx context.Context) (context.Context, error) { return ctx, nil }),
+		WithHTTPGateway(util.HTTPServerConfig{HTTPEnabled: false}),
+		WithMetricsAPI(util.HTTPServerConfig{HTTPEnabled: false}),
+		WithDispatchCacheConfig(CacheConfig{Enabled: false, Metrics: false}),
+		WithNamespaceCacheConfig(CacheConfig{Enabled: false, Metrics: false}),
+		WithClusterDispatchCacheConfig(CacheConfig{Enabled: false, Metrics: false}),
+		WithSilentlyDisableTelemetry(true),
+		WithDatastore(ds),
+		WithShutdownDrainDelay(shutdownDrainDelay),
+	).Complete(ctx)
+	require.NoError(t, err)
+
+	conn, err := srv.NewClient(grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	defer conn.Close()
+
+	runCtx, stopServer := context.WithCancel(ctx)
+	runDone := make(chan error, 1)
+	go func() { runDone <- srv.Run(runCtx) }()
+
+	healthClient := healthpb.NewHealthClient(conn)
+	status := func() (healthpb.HealthCheckResponse_ServingStatus, error) {
+		resp, err := healthClient.Check(ctx, &healthpb.HealthCheckRequest{Service: v1.PermissionsService_ServiceDesc.ServiceName})
+		if err != nil {
+			return healthpb.HealthCheckResponse_UNKNOWN, err
+		}
+		return resp.GetStatus(), nil
+	}
+	require.Eventually(t, func() bool {
+		s, err := status()
+		return err == nil && s == healthpb.HealthCheckResponse_SERVING
+	}, 5*time.Second, 50*time.Millisecond, "gRPC server did not become ready")
+
+	stoppedAt := time.Now()
+	stopServer()
+
+	// During the drain delay the listener still answers, and says NOT_SERVING.
+	require.Eventually(t, func() bool {
+		s, err := status()
+		return err == nil && s == healthpb.HealthCheckResponse_NOT_SERVING
+	}, shutdownDrainDelay/2, 20*time.Millisecond, "health did not flip to NOT_SERVING while listeners were open")
+
+	require.NoError(t, <-runDone)
+	require.GreaterOrEqual(t, time.Since(stoppedAt), shutdownDrainDelay, "listeners closed before the drain delay elapsed")
+}

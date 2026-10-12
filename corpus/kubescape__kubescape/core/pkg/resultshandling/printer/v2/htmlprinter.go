@@ -1,0 +1,288 @@
+package printer
+
+import (
+	"context"
+	_ "embed"
+	"encoding/base64"
+	"fmt"
+	"html/template"
+	"os"
+	"sort"
+	"strings"
+
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling/printer"
+	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling/printer/v2/prettyprinter/tableprinter/imageprinter"
+	"github.com/kubescape/opa-utils/reporthandling/apis"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/reportsummary"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/resourcesresults"
+)
+
+const (
+	htmlOutputFile = "report"
+)
+
+//go:embed html/report.gohtml
+var reportTemplate string
+
+// The HTML report previously loaded this logo from raw.githubusercontent.com
+// at view time, so the report only rendered correctly with network access
+// and leaked the viewer's IP/UA to GitHub every time an offline scan report
+// was opened. Embed the same logo the PDF printer already ships
+// (pdf/logo.png) and inline it as a data URI instead.
+//
+//go:embed pdf/logo.png
+var htmlLogoPNG []byte
+
+// logoDataURI returns the embedded Kubescape logo as a data: URI. It is
+// returned as template.URL, not a plain string, so html/template's URL
+// sanitizer (which rejects the data: scheme by default) doesn't replace it
+// with "#ZgotmplZ" when used as an <img src>.
+func logoDataURI() template.URL {
+	// #nosec G203 -- the input is our own go:embed'd logo.png, not
+	// attacker-controlled data, so bypassing the URL sanitizer here is safe.
+	return template.URL("data:image/png;base64," + base64.StdEncoding.EncodeToString(htmlLogoPNG))
+}
+
+var _ printer.IPrinter = &HtmlPrinter{}
+
+type HTMLSkippedControl struct {
+	ControlID string
+	Name      string
+	Reason    string
+}
+
+type HTMLCoverageData struct {
+	Score             int
+	EvaluatedControls int
+	TotalControls     int
+	Degraded          bool
+	SkippedControls   []HTMLSkippedControl
+}
+
+type HTMLReportingCtx struct {
+	OPASessionObj     *cautils.OPASessionObj
+	ResourceTableView ResourceTableView
+	// ImageScanSummary is set instead of the two fields above when this report
+	// is for an image scan rather than a posture scan (#2782).
+	ImageScanSummary *imageprinter.ImageScanSummary
+	// LogoDataURI is the embedded Kubescape logo, inlined so the report
+	// renders correctly without network access.
+	LogoDataURI  template.URL
+	CoverageData *HTMLCoverageData
+}
+
+type HtmlPrinter struct {
+	writer *os.File
+	// showSecrets controls whether sensitive field values (Secret.data,
+	// container env[].value, and other secret-shaped fields -- see
+	// isSensitivePath) are redacted in the resource table's fix-path
+	// evidence below, matching the terminal pretty-printer's default.
+	showSecrets bool
+}
+
+func NewHtmlPrinter(showSecrets bool) *HtmlPrinter {
+	return &HtmlPrinter{showSecrets: showSecrets}
+}
+
+func (hp *HtmlPrinter) SetWriter(ctx context.Context, outputFile string) error {
+	outputFile, explicitOutput := printer.ResolveOutputFile(printer.HtmlFormat, outputFile, htmlOutputFile)
+	if !explicitOutput {
+		// Raw HTML markup must never fall back to stdout on a TTY.
+		outputFile = printer.ResolveDefaultOutputFile(printer.HtmlFormat, htmlOutputFile)
+		logger.L().Info("no --output specified for html format; writing to default file",
+			helpers.String("filename", outputFile))
+	}
+	if explicitOutput {
+		var err error
+		hp.writer, err = printer.GetWriterNoFallback(outputFile)
+		return err
+	}
+	// Preserve the temp-file fallback for the implicit HTML destination.
+	hp.writer = printer.GetWriterNoStdoutFallback(ctx, outputFile, "kubescape-report-*"+printer.HtmlOutputExt)
+	return nil
+}
+
+func (hp *HtmlPrinter) PrintNextSteps() {
+
+}
+
+func (hp *HtmlPrinter) ActionPrint(ctx context.Context, opaSessionObj *cautils.OPASessionObj, imageScanData []cautils.ImageScanData) error {
+	if opaSessionObj == nil && len(imageScanData) == 0 {
+		return fmt.Errorf("failed to print results, missing data")
+	}
+
+	tplFuncMap := template.FuncMap{
+		"sum": func(nums ...int) int {
+			total := 0
+			for _, n := range nums {
+				total += n
+			}
+			return total
+		},
+		"riskScoreToInt": cautils.RiskScoreToInt,
+		"lower":          strings.ToLower,
+		"sortByNamespace": func(resourceTableView ResourceTableView) ResourceTableView {
+			sortedResourceTableView := make(ResourceTableView, len(resourceTableView))
+			copy(sortedResourceTableView, resourceTableView)
+
+			sort.SliceStable(
+				sortedResourceTableView,
+				func(i, j int) bool {
+					return sortedResourceTableView[i].Resource.GetNamespace() < sortedResourceTableView[j].Resource.GetNamespace()
+				},
+			)
+			return sortedResourceTableView
+		},
+		"controlSeverityToString": apis.ControlSeverityToString,
+		"sortBySeverityName": func(controlSummaries map[string]reportsummary.ControlSummary) []reportsummary.ControlSummary {
+			sortedSlice := make([]reportsummary.ControlSummary, 0, len(controlSummaries))
+			for _, val := range controlSummaries {
+				sortedSlice = append(sortedSlice, val)
+			}
+
+			sort.SliceStable(
+				sortedSlice,
+				func(i, j int) bool {
+					//First sort by Severity descending
+					iSeverity := apis.ControlSeverityToInt(sortedSlice[i].GetScoreFactor())
+					jSeverity := apis.ControlSeverityToInt(sortedSlice[j].GetScoreFactor())
+					if iSeverity > jSeverity {
+						return true
+					}
+					if iSeverity < jSeverity {
+						return false
+					}
+					//And then by Name ascending
+					return sortedSlice[i].GetName() < sortedSlice[j].GetName()
+				},
+			)
+
+			return sortedSlice
+		},
+	}
+	tpl := template.Must(
+		template.New("htmlReport").Funcs(tplFuncMap).Parse(reportTemplate),
+	)
+
+	var resourceTableView ResourceTableView
+	var imageScanSummary *imageprinter.ImageScanSummary
+	var coverageData *HTMLCoverageData
+	if opaSessionObj != nil {
+		resourceTableView = buildResourceTableView(opaSessionObj, hp.showSecrets)
+		coverageData = buildHTMLCoverageData(opaSessionObj)
+	}
+	if len(imageScanData) > 0 {
+		imageScanSummary = buildImageScanSummary(imageScanData)
+	}
+
+	reportingCtx := HTMLReportingCtx{
+		OPASessionObj:     opaSessionObj,
+		ResourceTableView: resourceTableView,
+		ImageScanSummary:  imageScanSummary,
+		LogoDataURI:       logoDataURI(),
+		CoverageData:      coverageData,
+	}
+	err := tpl.Execute(hp.writer, reportingCtx)
+	if err != nil {
+		logger.L().Ctx(ctx).Error("failed to render template", helpers.Error(err))
+		return fmt.Errorf("failed to render template: %w", err)
+	}
+	printer.LogOutputFile(hp.writer.Name())
+
+	return nil
+}
+
+func (hp *HtmlPrinter) Score(score float32) {
+}
+
+func buildResourceTableView(opaSessionObj *cautils.OPASessionObj, showSecrets bool) ResourceTableView {
+	resourceTableView := make(ResourceTableView, 0)
+	for resourceID, result := range opaSessionObj.ResourcesResult {
+		if result.GetStatus(nil).IsFailed() {
+			resource, ok := opaSessionObj.GetResource(resourceID)
+			if !ok || resource == nil {
+				logger.L().Debug("resource missing from AllResources, skipping",
+					helpers.String("resourceID", resourceID))
+				continue
+			}
+			ctlResults := buildResourceControlResultTable(result.AssociatedControls, &opaSessionObj.Report.SummaryDetails, resource, showSecrets)
+			resourceTableView = append(resourceTableView, ResourceResult{resource, ctlResults})
+		}
+	}
+
+	return resourceTableView
+}
+
+func buildResourceControlResult(resourceControl resourcesresults.ResourceAssociatedControl, control reportsummary.IControlSummary, resource workloadinterface.IMetadata, showSecrets bool) ResourceControlResult {
+	ctlSeverity := apis.ControlSeverityToString(control.GetScoreFactor())
+	ctlName := resourceControl.GetName()
+	ctlID := resourceControl.GetID()
+	ctlURL := cautils.GetControlLink(resourceControl.GetID())
+	failedPaths := AssistedRemediationPathsWithCurrentValuesFiltered(&resourceControl, resource, showSecrets)
+	addContainerNameToAssistedRemediation(resource, &failedPaths)
+
+	return ResourceControlResult{ctlSeverity, ctlName, ctlID, ctlURL, failedPaths}
+}
+
+func buildResourceControlResultTable(resourceControls []resourcesresults.ResourceAssociatedControl, summaryDetails *reportsummary.SummaryDetails, resource workloadinterface.IMetadata, showSecrets bool) []ResourceControlResult {
+	var ctlResults []ResourceControlResult
+	for _, resourceControl := range resourceControls {
+		if resourceControl.GetStatus(nil).IsFailed() {
+			control := summaryDetails.Controls.GetControl(reportsummary.EControlCriteriaID, resourceControl.GetID())
+			if control == nil {
+				continue
+			}
+			ctlResult := buildResourceControlResult(resourceControl, control, resource, showSecrets)
+
+			ctlResults = append(ctlResults, ctlResult)
+		}
+	}
+
+	return ctlResults
+}
+
+// CloseWriter closes the HTML output writer, returning any error from flushing or closing.
+func (p *HtmlPrinter) CloseWriter() error {
+	if p.writer != nil && p.writer != os.Stdout {
+		return p.writer.Close()
+	}
+	return nil
+}
+
+func buildHTMLCoverageData(opaSessionObj *cautils.OPASessionObj) *HTMLCoverageData {
+	if opaSessionObj == nil {
+		return nil
+	}
+	coverage := opaSessionObj.ScanCoverage
+	skipped := collectSkippedControls(opaSessionObj)
+	if !coverage.Degraded && len(skipped) == 0 && (coverage.CoverageScore >= 100 || coverage.TotalControls == 0) {
+		return nil
+	}
+	skippedList := make([]HTMLSkippedControl, 0, len(skipped))
+	for _, sc := range skipped {
+		name := sc.name
+		if name == "" {
+			name = sc.controlID
+		}
+		reason := sc.reason
+		if reason == "" {
+			reason = "not evaluated"
+		}
+		skippedList = append(skippedList, HTMLSkippedControl{
+			ControlID: sc.controlID,
+			Name:      name,
+			Reason:    reason,
+		})
+	}
+	return &HTMLCoverageData{
+		Score:             cautils.ComplianceScoreToInt(coverage.CoverageScore),
+		EvaluatedControls: coverage.EvaluatedControls,
+		TotalControls:     coverage.TotalControls,
+		Degraded:          coverage.Degraded,
+		SkippedControls:   skippedList,
+	}
+}

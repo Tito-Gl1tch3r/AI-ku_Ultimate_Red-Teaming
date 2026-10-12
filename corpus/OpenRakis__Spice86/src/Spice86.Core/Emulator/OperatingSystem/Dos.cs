@@ -1,0 +1,447 @@
+using Microsoft.Extensions.Logging;
+namespace Spice86.Core.Emulator.OperatingSystem;
+
+
+using Spice86.Core.CLI.RuntimeOptions;
+using Spice86.Core.Emulator.CPU;
+using Spice86.Core.Emulator.Devices.ExternalInput;
+using Spice86.Core.Emulator.Devices.Sound;
+using Spice86.Core.Emulator.Devices.Video;
+using Spice86.Core.Emulator.Function;
+using Spice86.Core.Emulator.InterruptHandlers.Bios.Structures;
+using Spice86.Core.Emulator.InterruptHandlers.Common.MemoryWriter;
+using Spice86.Core.Emulator.InterruptHandlers.Dos;
+using Spice86.Core.Emulator.InterruptHandlers.Dos.Ems;
+using Spice86.Core.Emulator.InterruptHandlers.Dos.Xms;
+using Spice86.Core.Emulator.InterruptHandlers.Input.Keyboard;
+using Spice86.Core.Emulator.InterruptHandlers.Mscdex;
+using Spice86.Core.Emulator.IOPorts;
+using Spice86.Core.Emulator.Memory;
+using Spice86.Core.Emulator.OperatingSystem.Batch;
+using Spice86.Core.Emulator.OperatingSystem.Devices;
+using Spice86.Core.Emulator.OperatingSystem.Enums;
+using Spice86.Core.Emulator.OperatingSystem.Structures;
+using Spice86.Shared.Emulator.Memory;
+using Spice86.Shared.Emulator.Storage;
+using Spice86.Shared.Interfaces;
+using Spice86.Shared.Utils;
+
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+
+/// <summary>
+/// Represents the DOS kernel.
+/// </summary>
+public sealed class Dos : IDriveStatusProvider, IDiscSwapper, IDriveMountService, IDriveContentMapProvider, IDriveFileListProvider {
+    private readonly BiosDataArea _biosDataArea;
+    private readonly IVgaFunctionality _vgaFunctionality;
+    private readonly BiosKeyboardBuffer _biosKeyboardBuffer;
+    private readonly IMemory _memory;
+    private readonly ILogger _loggerService;
+    private readonly DosDriveStatusProvider _driveStatusProvider;
+    private readonly Mscdex _mscdex;
+    private readonly IDriveActivityNotifier _activityNotifier;
+
+    /// <summary>
+    /// Gets the INT 20h DOS services.
+    /// </summary>
+    public DosInt20Handler DosInt20Handler { get; }
+
+    /// <summary>
+    /// Gets the INT 21h DOS services.
+    /// </summary>
+    public DosInt21Handler DosInt21Handler { get; }
+
+    /// <summary>
+    /// Gets the INT 22h DOS terminate address handler.
+    /// </summary>
+    public DosInt22Handler DosInt22Handler { get; }
+
+    /// <summary>
+    /// Gets the INT 23h DOS Control-Break handler.
+    /// </summary>
+    public DosInt23Handler DosInt23Handler { get; }
+
+    /// <summary>
+    /// Gets the INT 24h DOS Critical Error handler.
+    /// </summary>
+    public DosInt24Handler DosInt24Handler { get; }
+
+    /// <summary>
+    /// Gets the INT 2Fh DOS services.
+    /// </summary>
+    public DosInt2fHandler DosInt2FHandler { get; }
+
+    /// <summary>
+    /// Gets the INT 2Ah DOS services (minimal stub).
+    /// </summary>
+    public DosInt2aHandler DosInt2aHandler { get; }
+
+    /// <summary>
+    /// Gets the INT 25H DOS Disk services.
+    /// </summary>
+    public DosDiskInt25Handler DosInt25Handler { get; }
+
+    /// <summary>
+    /// Gets the INT26H DOS Disk services stub.
+    /// </summary>
+    public DosDiskInt26Handler DosInt26Handler { get; }
+
+    /// <summary>
+    /// Gets the INT 28h DOS services.
+    /// </summary>
+    public DosInt28Handler DosInt28Handler { get; }
+
+    /// <summary>
+    /// The class that handles DOS drives, as a sorted dictionary.
+    /// </summary>
+    public DosDriveManager DosDriveManager { get; }
+
+    /// <summary>
+    /// The class that handles DOS FCB (File Control Block) operations.
+    /// </summary>
+    public DosFcbManager FcbManager { get; }
+
+    /// <summary>
+    /// Gets the list of virtual devices.
+    /// </summary>
+    public readonly List<IVirtualDevice> Devices = new();
+
+    /// <summary>
+    /// Gets or sets the current clock device.
+    /// </summary>
+    public CharacterDevice CurrentClockDevice { get; set; } = null!;
+
+    /// <summary>
+    /// Gets or sets the current console device.
+    /// </summary>
+    public CharacterDevice CurrentConsoleDevice { get; set; } = null!;
+
+    /// <summary>
+    /// Gets the DOS memory manager.
+    /// </summary>
+    public DosMemoryManager MemoryManager { get; }
+
+    /// <summary>
+    /// Gets the DOS file manager.
+    /// </summary>
+    public DosFileManager FileManager { get; }
+
+    /// <summary>
+    /// Gets the DOS process manager.
+    /// </summary>
+    public DosProcessManager ProcessManager { get; }
+
+    /// <summary>
+    /// Gets the global DOS region settings structure.
+    /// </summary>
+    public CountryInfo CountryInfo { get; }
+
+    /// <summary>
+    /// The movable data transfer area for DOS applications.
+    /// </summary>
+    public DosSwappableDataArea DosSwappableDataArea { get; }
+
+    /// <summary>
+    /// The DOS System information. Read by DOSINFO.
+    /// </summary>
+    /// <remarks>
+    /// AKA the 'List of lists'
+    /// </remarks>
+    public DosSysVars DosSysVars { get; }
+
+    /// <summary>
+    /// The DOS tables including CDS and DBCS structures.
+    /// </summary>
+    public DosTables DosTables { get; }
+
+    /// <summary>
+    /// The EMS device driver.
+    /// </summary>
+    public ExpandedMemoryManager? Ems { get; private set; }
+
+    /// <summary>
+    /// The XMS device driver.
+    /// </summary>
+    public ExtendedMemoryManager? Xms { get; private set; }
+
+    /// <summary>
+    /// Initializes a new instance.
+    /// </summary>
+    /// <param name="options">DOS runtime options projected from the command-line configuration.</param>
+    /// <param name="memory">The emulator memory.</param>
+    /// <param name="functionHandlerProvider">Provides current call flow handler to peek call stack.</param>
+    /// <param name="stack">The CPU stack.</param>
+    /// <param name="state">The CPU state.</param>
+    /// <param name="biosKeyboardBuffer">The BIOS keyboard buffer structure in emulated memory.</param>
+    /// <param name="keyboardInt16Handler">The BIOS interrupt handler that writes/reads the BIOS Keyboard Buffer.</param>
+    /// <param name="biosDataArea">The memory mapped BIOS values and settings.</param>
+    /// <param name="vgaFunctionality">The high-level VGA functions.</param>
+    /// <param name="envVars">The DOS environment variables.</param>
+    /// <param name="ioPortDispatcher">The I/O port dispatcher for accessing hardware ports.</param>
+    /// <param name="loggerService">The logger service implementation.</param>
+    /// <param name="floppyDiskTimingService">Floppy I/O timing service used by absolute floppy image reads and writes.</param>
+    /// <param name="options">DOS runtime options projected from the command-line configuration.</param>
+    /// <param name="memory">The emulator memory.</param>
+    /// <param name="functionHandlerProvider">Provides current call flow handler to peek call stack.</param>
+    /// <param name="stack">The CPU stack.</param>
+    /// <param name="state">The CPU state.</param>
+    /// <param name="biosKeyboardBuffer">The BIOS keyboard buffer structure in emulated memory.</param>
+    /// <param name="keyboardInt16Handler">The BIOS interrupt handler that writes/reads the BIOS Keyboard Buffer.</param>
+    /// <param name="biosDataArea">The memory mapped BIOS values and settings.</param>
+    /// <param name="vgaFunctionality">The high-level VGA functions.</param>
+    /// <param name="envVars">The DOS environment variables.</param>
+    /// <param name="ioPortDispatcher">The I/O port dispatcher for accessing hardware ports.</param>
+    /// <param name="loggerService">The logger service implementation.</param>
+    /// <param name="channelCreator">The sound channel creator, used to stream CD audio when an image is mounted.</param>
+    /// <param name="activityNotifier">Notifier that surfaces per-drive read/write activity to the UI.</param>
+    /// <param name="a20Gate">The A20 gate used by XMS.</param>
+    /// <param name="memoryAsmWriter">Writes the XMS callback into emulated memory.</param>
+    /// <param name="emsManager">The EMS manager shared with emulator services.</param>
+    public Dos(DosOptions options, IMemory memory,
+        IFunctionHandlerProvider functionHandlerProvider, Stack stack, State state,
+        BiosKeyboardBuffer biosKeyboardBuffer, KeyboardInt16Handler keyboardInt16Handler,
+        BiosDataArea biosDataArea, IVgaFunctionality vgaFunctionality,
+        IDictionary<string, string> envVars, IOPortDispatcher ioPortDispatcher, ILogger loggerService,
+        FloppyDiskTimingService floppyDiskTimingService,
+        ISoundChannelCreator channelCreator,
+        IDriveActivityNotifier activityNotifier,
+        A20Gate a20Gate,
+        MemoryAsmWriter memoryAsmWriter,
+        ExpandedMemoryManager? emsManager) {
+        _loggerService = loggerService;
+        _biosKeyboardBuffer = biosKeyboardBuffer;
+        _memory = memory;
+        _biosDataArea = biosDataArea;
+        _vgaFunctionality = vgaFunctionality;
+        _activityNotifier = activityNotifier;
+        Ems = emsManager;
+
+        DosTables = new DosTables(memory);
+        ushort mediaIdSegment = DosTables.ReserveDosPrivateSegment((ushort)DosMediaIdTable.TableSizeInParagraphs);
+        DosMediaIdTable mediaIdTable = new(memory,
+            MemoryUtils.ToPhysicalAddress(mediaIdSegment, DosMediaIdTable.EntryBaseOffsetInSegment), mediaIdSegment);
+        _mscdex = new Mscdex(state, memory, _loggerService, _activityNotifier);
+        DosDriveManager = new(_mscdex, channelCreator, activityNotifier, options.CDrive, options.Exe, mediaIdTable, _loggerService);
+
+        VirtualFileBase[] dosDevices = AddDefaultDevices(state, keyboardInt16Handler);
+        DosSysVars = new DosSysVars(options, (NullDevice)dosDevices[0], memory,
+            MemoryUtils.ToPhysicalAddress(DosSysVars.Segment, 0x0));
+
+        // Item 1 of devices array
+        DosSysVars.ConsoleDeviceHeaderPointer = new SegmentedAddress(MemoryMap.DeviceDriversSegment, (ushort)(1 * DosDeviceHeader.HeaderLength));
+        SegmentedAddress cdsAddress = DosTables.CdsSegmentedAddress;
+        DosSysVars.CurrentDirectoryStructureListPointer = cdsAddress;
+        DosSysVars.CurrentDirectoryStructureCount = 26;
+
+        DosSwappableDataArea = new(_memory,
+            MemoryUtils.ToPhysicalAddress(DosSwappableDataArea.BaseSegment, 0));
+
+        CountryInfo = new();
+        DosCodePageState dosCodePageState = DosCodePageState.CreateForCurrentCulture();
+        DosStringDecoder dosStringDecoder = new(memory, state, dosCodePageState);
+        FileManager = new DosFileManager(_memory, dosStringDecoder, DosDriveManager,
+            _loggerService, Devices);
+
+        // Calculate initial PSP segment from configuration (PSP is 16 paragraphs before entry point)
+        ushort initialPspSegment = (ushort)(options.ProgramEntryPointSegment - 0x10);
+
+        // Initialize the SDA with the initial PSP segment
+        DosSwappableDataArea.CurrentProgramSegmentPrefix = initialPspSegment;
+
+        // Initialize memory manager first - it must know about the root COMMAND.COM reserved space
+        // Root PSP is at 0x60, environment at 0x68, so MCB chain starts after 0x6F
+        // This matches FreeDOS where DOS_PSP + 16 paragraphs is reserved
+        bool umbEnabled = options.Umb && options.Xms is not false;
+        MemoryManager = new DosMemoryManager(_memory, initialPspSegment, loggerService,
+            DosSysVars, umbEnabled, options.Ems is not false);
+        if (options.Xms is not false) {
+            // XMS uses the DOS memory manager to allocate upper memory blocks.
+            Xms = new ExtendedMemoryManager(memory, state, a20Gate, memoryAsmWriter,
+                DosTables, MemoryManager, loggerService);
+        }
+
+        FcbManager = new(_memory, FileManager, DosDriveManager, _loggerService);
+        IBatchDisplayCommandHandler batchDisplayCommandHandler = new DosBatchDisplayCommandHandler(_vgaFunctionality);
+        _driveStatusProvider = new DosDriveStatusProvider(DosDriveManager, _mscdex);
+        ProcessManager = new(_memory, stack, state, MemoryManager, DosTables, FileManager, DosDriveManager, _driveStatusProvider, _mscdex, channelCreator, _activityNotifier, batchDisplayCommandHandler, envVars, _loggerService);
+        DosInt22Handler = new DosInt22Handler(_memory, functionHandlerProvider, stack, state, ProcessManager, _loggerService);
+        DosInt21Handler = new DosInt21Handler(_memory, functionHandlerProvider, stack, state,
+            keyboardInt16Handler, CountryInfo, dosCodePageState, dosStringDecoder,
+            MemoryManager, FileManager, DosDriveManager, ProcessManager,
+            ioPortDispatcher, DosTables, DosSysVars, _loggerService, FcbManager);
+        DosInt23Handler = new DosInt23Handler(_memory, functionHandlerProvider, stack, state, ProcessManager, _loggerService);
+        DosInt24Handler = new DosInt24Handler(_memory, functionHandlerProvider, stack, state, _loggerService);
+        DosInt20Handler = new DosInt20Handler(_memory, functionHandlerProvider, stack, state, DosInt21Handler, _loggerService);
+        DosInt2aHandler = new DosInt2aHandler(_memory, functionHandlerProvider, stack, state, _loggerService);
+        DosInt2FHandler = new DosInt2fHandler(_memory,
+            functionHandlerProvider, stack, state, _loggerService, _mscdex, Xms);
+        DosInt25Handler = new DosDiskInt25Handler(_memory, DosDriveManager,
+            functionHandlerProvider, stack, state, floppyDiskTimingService, _loggerService);
+        DosInt26Handler = new DosDiskInt26Handler(_memory, DosDriveManager,
+            functionHandlerProvider, stack, state, floppyDiskTimingService, _loggerService);
+        DosInt28Handler = new DosInt28Handler(_memory, functionHandlerProvider,
+            stack, state, _loggerService);
+
+        DosDriveManager.InitializeBootstrapZDrive();
+
+        if (options.DosRuntimeState.InstallDosServices is false) {
+            return;
+        }
+        if (_loggerService.IsEnabled(LogLevel.Trace)) {
+            _loggerService.LogTrace("Initializing DOS");
+        }
+        OpenDefaultFileHandles(dosDevices);
+
+        if (options.Xms is not false && Xms is not null) {
+            AddDevice(Xms, ExtendedMemoryManager.DosDeviceSegment, 0);
+        }
+
+        if (options.Ems is not false && Ems is not null) {
+            AddDevice(Ems.AsCharacterDevice(), ExpandedMemoryManager.DosDeviceSegment, 0);
+        }
+    }
+
+    private void OpenDefaultFileHandles(VirtualFileBase[] fileDevices) {
+        // Ensure DOS standard handles map to fixed indices
+        // as defined in DosStandardHandle enum.
+
+        // Find devices by name from the Devices list (which contains all added devices)
+        VirtualFileBase? console = Devices.OfType<VirtualFileBase>().FirstOrDefault(d => string.Equals(d.Name, "CON", StringComparison.OrdinalIgnoreCase));
+        VirtualFileBase? aux = Devices.OfType<VirtualFileBase>().FirstOrDefault(d => string.Equals(d.Name, "AUX", StringComparison.OrdinalIgnoreCase));
+        VirtualFileBase? prn = Devices.OfType<VirtualFileBase>().FirstOrDefault(d => string.Equals(d.Name, "LPT1", StringComparison.OrdinalIgnoreCase));
+
+        var opened = new HashSet<VirtualFileBase>();
+
+        // Open console for Stdin/Stdout/Stderr
+        if (console != null) {
+            FileManager.OpenDevice(console); // DosStandardHandle.Stdin
+            opened.Add(console);
+            FileManager.OpenDevice(console); // DosStandardHandle.Stdout
+            FileManager.OpenDevice(console); // DosStandardHandle.Stderr
+        }
+
+        // DosStandardHandle.StdAux -> AUX device
+        if (aux != null) {
+            FileManager.OpenDevice(aux);
+            opened.Add(aux);
+        }
+
+        // DosStandardHandle.StdPrn -> LPT1
+        if (prn != null) {
+            FileManager.OpenDevice(prn);
+            opened.Add(prn);
+        }
+
+        // Finally open any remaining devices passed in fileDevices that haven't been opened yet
+        foreach (VirtualFileBase fileDevice in fileDevices) {
+            if (fileDevice == null) {
+                continue;
+            }
+            if (opened.Contains(fileDevice)) {
+                continue;
+            }
+            FileManager.OpenDevice(fileDevice);
+        }
+    }
+
+    private uint GetDefaultNewDeviceBaseAddress()
+        => new SegmentedAddress(MemoryMap.DeviceDriversSegment, (ushort)(Devices.Count * DosDeviceHeader.HeaderLength)).Linear;
+
+    private VirtualFileBase[] AddDefaultDevices(State state, KeyboardInt16Handler keyboardInt16Handler) {
+        var nulDevice = new NullDevice(_loggerService, _memory, GetDefaultNewDeviceBaseAddress());
+        AddDevice(nulDevice);
+        var consoleDevice = new ConsoleDevice(_memory, GetDefaultNewDeviceBaseAddress(),
+            _loggerService, state,
+            _biosDataArea, keyboardInt16Handler, _vgaFunctionality,
+            _biosKeyboardBuffer);
+        AddDevice(consoleDevice);
+        var printerDevice = new PrinterDevice(_loggerService, _memory, GetDefaultNewDeviceBaseAddress());
+        AddDevice(printerDevice);
+        var auxDevice = new AuxDevice(_loggerService, _memory, GetDefaultNewDeviceBaseAddress());
+        AddDevice(auxDevice);
+        for (int i = 0; i < DosDriveManager.Count; i++) {
+            AddDevice(new BlockDevice(_memory, GetDefaultNewDeviceBaseAddress(),
+                DeviceAttributes.FatDevice, 1));
+        }
+        return [nulDevice, consoleDevice, printerDevice];
+    }
+
+    /// <summary>
+    /// Add a device to memory so that the information can be read by both DOS and programs.
+    /// </summary>
+    /// <param name="device">The DOS Device driver to add.</param>
+    /// <param name="segment">The segment part of the segmented address for the DOS device header.</param>
+    /// <param name="offset">The offset part of the segmented address for the DOS device header.</param>
+    private void AddDevice(IVirtualDevice device, ushort? segment = null, ushort? offset = null) {
+        DosDeviceHeader header = device.Header;
+        // Store the location of the header
+        segment ??= MemoryMap.DeviceDriversSegment;
+        offset ??= (ushort)(Devices.Count * DosDeviceHeader.HeaderLength);
+        // Write the DOS device driver header to memory
+        ushort index = (ushort)(offset.Value + 10); //10 bytes in our DosDeviceHeader structure.
+        if (header.Attributes.HasFlag(DeviceAttributes.Character)) {
+            _memory.LoadData(MemoryUtils.ToPhysicalAddress(segment.Value, index),
+                Encoding.ASCII.GetBytes($"{device.Name,-8}"));
+        } else if (device is BlockDevice blockDevice) {
+            _memory.UInt8[segment.Value, index] = blockDevice.UnitCount;
+            index++;
+            _memory.LoadData(MemoryUtils.ToPhysicalAddress(segment.Value, index),
+                Encoding.ASCII.GetBytes($"{blockDevice.Signature,-7}"));
+        }
+
+        // Make the previous device point to this one
+        if (Devices.Count > 0) {
+            IVirtualDevice previousDevice = Devices[^1];
+            _memory.SegmentedAddress16[previousDevice.Header.BaseAddress] =
+                new SegmentedAddress(segment.Value, offset.Value);
+        }
+
+        // Handle changing of current input, output or clock devices.
+        if (header.Attributes.HasFlag(DeviceAttributes.CurrentStdin) ||
+            header.Attributes.HasFlag(DeviceAttributes.CurrentStdout)) {
+            CurrentConsoleDevice = (CharacterDevice)device;
+        }
+        if (header.Attributes.HasFlag(DeviceAttributes.CurrentClock)) {
+            CurrentClockDevice = (CharacterDevice)device;
+        }
+        Devices.Add(device);
+    }
+
+    public IReadOnlyList<DosVirtualDriveStatus> GetDriveStatuses() {
+        return _driveStatusProvider.GetDriveStatuses();
+    }
+
+    public void SwapDiscImages() {
+        ((IDiscSwapper)DosDriveManager).SwapDiscImages();
+    }
+
+    public void SwapToImageIndex(char driveLetter, int imageIndex) {
+        ((IDiscSwapper)DosDriveManager).SwapToImageIndex(driveLetter, imageIndex);
+    }
+
+    public void MountFolderAsFloppy(char driveLetter, string hostPath) {
+        ((IDriveMountService)DosDriveManager).MountFolderAsFloppy(driveLetter, hostPath);
+    }
+
+    public void MountImageAsFloppy(char driveLetter, string imagePath) {
+        ((IDriveMountService)DosDriveManager).MountImageAsFloppy(driveLetter, imagePath);
+    }
+
+    public void MountFolderAsCdRom(char driveLetter, string hostPath) {
+        ((IDriveMountService)DosDriveManager).MountFolderAsCdRom(driveLetter, hostPath);
+    }
+
+    public void MountImageAsCdRom(char driveLetter, string imagePath) {
+        ((IDriveMountService)DosDriveManager).MountImageAsCdRom(driveLetter, imagePath);
+    }
+
+    public DriveContentMap GetContentMap(char driveLetter) {
+        return ((IDriveContentMapProvider)DosDriveManager).GetContentMap(driveLetter);
+    }
+
+    public IReadOnlyList<DriveFileEntry> GetFileList(char driveLetter) {
+        return ((IDriveFileListProvider)DosDriveManager).GetFileList(driveLetter);
+    }
+}

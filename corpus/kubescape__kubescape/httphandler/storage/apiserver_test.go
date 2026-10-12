@@ -1,0 +1,1730 @@
+package storage
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/armosec/armoapi-go/armotypes"
+	"github.com/kubescape/k8s-interface/names"
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	"github.com/kubescape/opa-utils/objectsenvelopes"
+	"github.com/kubescape/opa-utils/reporthandling"
+	"github.com/kubescape/opa-utils/reporthandling/apis"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/reportsummary"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/resourcesresults"
+	v2 "github.com/kubescape/opa-utils/reporthandling/v2"
+	"github.com/kubescape/storage/pkg/apis/softwarecomposition/v1beta1"
+	"github.com/kubescape/storage/pkg/generated/clientset/versioned/fake"
+	"github.com/stretchr/testify/assert"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	k8stesting "k8s.io/client-go/testing"
+)
+
+func NewFakeAPIServerStorage(namespace string) *APIServerStore {
+	return &APIServerStore{
+		StorageClient: fake.NewSimpleClientset().SpdxV1beta1(),
+		namespace:     namespace,
+	}
+}
+
+func TestBuildWorkloadConfigurationScan_UsesReportGenerationTime(t *testing.T) {
+	const resourceID = "v1/default/Pod/test-pod"
+	generatedAt := time.Date(2026, time.September, 18, 12, 34, 56, 123456789, time.UTC)
+	report := &v2.PostureReport{
+		ReportGenerationTime: generatedAt,
+		Resources: []reporthandling.Resource{{
+			ResourceID: resourceID,
+			Object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"metadata": map[string]any{
+					"name":      "test-pod",
+					"namespace": "default",
+				},
+			},
+		}},
+	}
+
+	scan, err := NewFakeAPIServerStorage("kubescape").BuildWorkloadConfigurationScan(
+		context.Background(), report, &resourcesresults.Result{ResourceID: resourceID})
+
+	assert.NoError(t, err)
+	if assert.NotNil(t, scan) && assert.NotNil(t, scan.Spec.Metadata) {
+		assert.True(t, scan.Spec.Metadata.Report.CreatedAt.Time.Equal(generatedAt))
+	}
+}
+
+func TestBuildWorkloadConfigurationScan_LeavesMetadataUnsetWithoutReportGenerationTime(t *testing.T) {
+	const resourceID = "v1/default/Pod/test-pod"
+	report := &v2.PostureReport{
+		Resources: []reporthandling.Resource{{
+			ResourceID: resourceID,
+			Object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"metadata": map[string]any{
+					"name":      "test-pod",
+					"namespace": "default",
+				},
+			},
+		}},
+	}
+
+	scan, err := NewFakeAPIServerStorage("kubescape").BuildWorkloadConfigurationScan(
+		context.Background(), report, &resourcesresults.Result{ResourceID: resourceID})
+
+	assert.NoError(t, err)
+	if assert.NotNil(t, scan) {
+		assert.Nil(t, scan.Spec.Metadata)
+	}
+}
+
+func TestStoreWorkloadConfigurationScanResult_PropagatesUpdateError(t *testing.T) {
+	ctx := context.Background()
+	existing := &v1beta1.WorkloadConfigurationScan{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-scan", Namespace: "default"},
+	}
+	client := fake.NewSimpleClientset(existing)
+	updateErr := errors.New("update failed")
+	client.PrependReactor("update", "workloadconfigurationscans", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, updateErr
+	})
+	store := &APIServerStore{StorageClient: client.SpdxV1beta1()}
+
+	err := store.StoreWorkloadConfigurationScanResult(ctx, &v1beta1.WorkloadConfigurationScan{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-scan", Namespace: "default"},
+	})
+
+	assert.ErrorIs(t, err, updateErr)
+}
+
+func TestStoreWorkloadConfigurationScanResultSummary_PropagatesUpdateError(t *testing.T) {
+	ctx := context.Background()
+	existing := &v1beta1.WorkloadConfigurationScanSummary{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-scan", Namespace: "default"},
+	}
+	client := fake.NewSimpleClientset(existing)
+	updateErr := errors.New("update failed")
+	client.PrependReactor("update", "workloadconfigurationscansummaries", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, updateErr
+	})
+	store := &APIServerStore{StorageClient: client.SpdxV1beta1()}
+
+	_, err := store.StoreWorkloadConfigurationScanResultSummary(ctx, &v1beta1.WorkloadConfigurationScan{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-scan", Namespace: "default"},
+	})
+
+	assert.ErrorIs(t, err, updateErr)
+}
+
+func Test_getControlsMapFromResult(t *testing.T) {
+
+	controlSummaries := map[string]reportsummary.ControlSummary{
+		"C-001": {
+			ControlID: "C-001", Name: "Control 1", ScoreFactor: 2.0,
+		},
+		"C-002": {
+			ControlID: "C-002", Name: "Control 2", ScoreFactor: 4.0,
+		},
+		"C-003": {
+			ControlID: "C-003", Name: "Control 3", ScoreFactor: 5.0,
+		},
+		"C-004": {
+			ControlID: "C-004", Name: "Control 4", ScoreFactor: 6.0,
+		},
+		"C-005": {
+			ControlID: "C-005", Name: "Control 5", ScoreFactor: 8.0,
+		},
+		"C-006": {
+			ControlID: "C-006", Name: "Control 6", ScoreFactor: 10.0,
+		},
+	}
+	scanResult := resourcesresults.Result{
+		AssociatedControls: []resourcesresults.ResourceAssociatedControl{
+			{
+				ControlID: "C-001", Name: "XXX", Status: apis.StatusInfo{
+					InnerStatus: apis.StatusFailed,
+					InnerInfo:   "test",
+				},
+			},
+			{
+				ControlID: "C-002", Name: "XXX", Status: apis.StatusInfo{
+					InnerStatus: apis.StatusPassed,
+					SubStatus:   apis.SubStatusException,
+					InnerInfo:   "",
+				},
+				ResourceAssociatedRules: []resourcesresults.ResourceAssociatedRule{
+					{
+						ControlConfigurations: nil,
+						Name:                  "rule-1",
+						Status:                apis.StatusFailed,
+						Paths: []armotypes.PosturePaths{
+							{
+								ResourceID: "resource-1",
+							},
+						},
+						Exception: []armotypes.PostureExceptionPolicy{
+							{
+								PortalBase: armotypes.PortalBase{
+									Name: "exception-1",
+								},
+							},
+						},
+						RelatedResourcesIDs: []string{"resource-1"},
+					},
+				},
+			},
+		},
+	}
+
+	actual := getControlsMapFromResult(context.Background(), &scanResult, controlSummaries)
+	assert.Len(t, actual, len(scanResult.AssociatedControls))
+	if assert.Len(t, actual["C-002"].Rules, 1) {
+		assert.Equal(t, []string{"resource-1"}, actual["C-002"].Rules[0].RelatedResourcesIDs)
+	}
+}
+
+func TestParseControlSeverity_Nil(t *testing.T) {
+	assert.NotPanics(t, func() {
+		result := parseControlSeverity(nil)
+		assert.Equal(t, v1beta1.ControlSeverity{}, result)
+	})
+}
+
+func TestGetControlsMapFromResult_MissingControl(t *testing.T) {
+	scanResult := resourcesresults.Result{
+		AssociatedControls: []resourcesresults.ResourceAssociatedControl{
+			{
+				ControlID: "C-MISSING",
+				Status:    apis.StatusInfo{InnerStatus: apis.StatusFailed},
+			},
+		},
+	}
+
+	assert.NotPanics(t, func() {
+		actual := getControlsMapFromResult(context.Background(), &scanResult, reportsummary.ControlSummaries{})
+		assert.Contains(t, actual, "C-MISSING")
+		assert.Equal(t, v1beta1.ControlSeverity{}, actual["C-MISSING"].Severity)
+	})
+}
+
+func TestGetControlsMapFromResult_RecoversMissingAssociationsFromSummary(t *testing.T) {
+	const resourceID = "v1/default/Pod/test-pod"
+
+	failedControl := reportsummary.ControlSummary{
+		ControlID:   "C-001",
+		Name:        "Control 1",
+		ScoreFactor: 7,
+	}
+	failedControl.Append(&apis.StatusInfo{InnerStatus: apis.StatusFailed}, resourceID)
+
+	otherControl := reportsummary.ControlSummary{
+		ControlID:   "C-002",
+		Name:        "Control 2",
+		ScoreFactor: 4,
+	}
+	otherControl.Append(&apis.StatusInfo{InnerStatus: apis.StatusPassed}, "v1/default/Pod/other-pod")
+
+	actual := getControlsMapFromResult(context.Background(), &resourcesresults.Result{
+		ResourceID: resourceID,
+	}, reportsummary.ControlSummaries{
+		"C-001": failedControl,
+		"C-002": otherControl,
+	})
+
+	if assert.Len(t, actual, 1) {
+		control := actual["C-001"]
+		assert.Equal(t, "C-001", control.ControlID)
+		assert.Equal(t, "Control 1", control.Name)
+		assert.Equal(t, string(apis.StatusFailed), control.Status.Status)
+		assert.Equal(t, "High", control.Severity.Severity)
+		assert.Equal(t, float32(7), control.Severity.ScoreFactor)
+		assert.Empty(t, control.Rules)
+	}
+}
+
+func TestGetControlsMapFromResult_PrefersDetailedAssociationOverSummaryFallback(t *testing.T) {
+	const resourceID = "v1/default/Pod/test-pod"
+
+	controlSummary := reportsummary.ControlSummary{
+		ControlID:   "C-001",
+		Name:        "Summary name",
+		ScoreFactor: 7,
+	}
+	controlSummary.Append(&apis.StatusInfo{InnerStatus: apis.StatusFailed}, resourceID)
+
+	actual := getControlsMapFromResult(context.Background(), &resourcesresults.Result{
+		ResourceID: resourceID,
+		AssociatedControls: []resourcesresults.ResourceAssociatedControl{{
+			ControlID: "C-001",
+			Name:      "Detailed name",
+			Status:    apis.StatusInfo{InnerStatus: apis.StatusPassed},
+			ResourceAssociatedRules: []resourcesresults.ResourceAssociatedRule{{
+				Name:   "detailed-rule",
+				Status: apis.StatusPassed,
+			}},
+		}},
+	}, reportsummary.ControlSummaries{"C-001": controlSummary})
+
+	if assert.Contains(t, actual, "C-001") {
+		control := actual["C-001"]
+		assert.Equal(t, "Detailed name", control.Name)
+		assert.Equal(t, string(apis.StatusPassed), control.Status.Status)
+		if assert.Len(t, control.Rules, 1) {
+			assert.Equal(t, "detailed-rule", control.Rules[0].Name)
+		}
+	}
+}
+
+type FakeMetadata struct {
+	workloadinterface.IMetadata
+
+	Namespace  string
+	ApiVersion string
+	Kind       string
+	Name       string
+	ID         string
+}
+
+func (f *FakeMetadata) GetID() string {
+	return f.ID
+}
+
+func (f *FakeMetadata) GetNamespace() string {
+	return f.Namespace
+}
+
+func (f *FakeMetadata) GetApiVersion() string {
+	return f.ApiVersion
+}
+
+func (f *FakeMetadata) GetKind() string {
+	return f.Kind
+}
+
+func (f *FakeMetadata) GetName() string {
+	return f.Name
+}
+
+func TestParseWorkloadScanRelatedObjectList(t *testing.T) {
+	// Mock input data
+	relatedObjects := []workloadinterface.IMetadata{
+		&FakeMetadata{
+			Namespace:  "test-namespace",
+			ApiVersion: "v1",
+			Kind:       "Pod",
+			Name:       "test-pod",
+		},
+		&FakeMetadata{
+			Namespace:  "",
+			ApiVersion: "apps/v1",
+			Kind:       "Deployment",
+			Name:       "test-deploy",
+		},
+	}
+
+	result := parseWorkloadScanRelatedObjectList(relatedObjects)
+
+	expected := []v1beta1.WorkloadScanRelatedObject{
+		{
+			Namespace:  "test-namespace",
+			APIGroup:   "",
+			APIVersion: "v1",
+			Kind:       "Pod",
+			Name:       "test-pod",
+		},
+		{
+			Namespace:  "",
+			APIGroup:   "apps",
+			APIVersion: "v1",
+			Kind:       "Deployment",
+			Name:       "test-deploy",
+		},
+	}
+	assert.Equal(t, expected, result)
+
+	result = parseWorkloadScanRelatedObjectList(nil)
+	assert.Equal(t, []v1beta1.WorkloadScanRelatedObject{}, result)
+}
+
+func TestCalculateSeveritiesSummaryFromControls(t *testing.T) {
+	fakeControl := func(status apis.ScanningStatus, scoreFactor float32) v1beta1.ScannedControlSummary {
+		return v1beta1.ScannedControlSummary{
+			Status: v1beta1.ScannedControlStatus{
+				Status: string(status),
+			},
+			Severity: v1beta1.ControlSeverity{
+				ScoreFactor: scoreFactor,
+			},
+		}
+	}
+	controls := map[string]v1beta1.ScannedControlSummary{
+		"control1": fakeControl(apis.StatusFailed, 1.0),  // failed, low
+		"control2": fakeControl(apis.StatusFailed, 4.0),  // failed, medium
+		"control3": fakeControl(apis.StatusFailed, 7.0),  // failed, high
+		"control4": fakeControl(apis.StatusFailed, 9.0),  // failed, critical
+		"control5": fakeControl(apis.StatusFailed, 0),    // failed, unknown
+		"control6": fakeControl(apis.StatusFailed, 4.0),  // failed, medium
+		"control7": fakeControl(apis.StatusPassed, 4.0),  // passed, medium
+		"control8": fakeControl(apis.StatusPassed, 10.0), // passed, critical
+		"control9": fakeControl(apis.StatusPassed, 10.0), // passed, critical
+	}
+
+	expected := v1beta1.WorkloadConfigurationScanSeveritiesSummary{
+		Critical: 1,
+		High:     1,
+		Medium:   2,
+		Low:      1,
+		Unknown:  1,
+	}
+
+	got := calculateSeveritiesSummaryFromControls(controls)
+	if got != expected {
+		t.Errorf("Expected %+v, but got %+v", expected, got)
+	}
+
+}
+
+func TestGetWorkloadScanK8sResourceName(t *testing.T) {
+	testCases := []struct {
+		name           string
+		resource       workloadinterface.IMetadata
+		relatedObjects []workloadinterface.IMetadata
+		expected       string
+	}{
+		{
+			name: "",
+			resource: &FakeMetadata{
+				ApiVersion: "v1",
+				Kind:       "Pod",
+				Namespace:  "default",
+				Name:       "mypod",
+			},
+			relatedObjects: nil,
+			expected:       "pod-mypod",
+		},
+		{
+			resource: &FakeMetadata{
+				ApiVersion: "",
+				Kind:       "Pod",
+				Namespace:  "",
+				Name:       "mypod",
+			},
+			relatedObjects: nil,
+			expected:       "pod-mypod",
+		},
+		{
+			name: "with related objects (role, rolebinding)",
+			resource: &FakeMetadata{
+				Kind:      "ServiceAccount",
+				Name:      "sa-2",
+				Namespace: "kubescape",
+			},
+			relatedObjects: []workloadinterface.IMetadata{
+				&FakeMetadata{
+					Kind:      "Role",
+					Name:      "myrole",
+					Namespace: "namespace-1",
+				},
+				&FakeMetadata{
+					Kind:      "RoleBinding",
+					Name:      "myrolebinding",
+					Namespace: "namespace-2",
+				},
+			},
+			expected: "serviceaccount-sa-2-role-myrole-rolebinding-myrolebinding",
+		},
+		{
+			name: "with related objects (cluster role, cluster rolebinding)",
+			resource: &FakeMetadata{
+				Kind:      "ServiceAccount",
+				Name:      "sa-1",
+				Namespace: "kubescape",
+			},
+			relatedObjects: []workloadinterface.IMetadata{
+				&FakeMetadata{
+					Kind: "ClusterRole",
+					Name: "myrole",
+				},
+				&FakeMetadata{
+					Kind: "ClusterRoleBinding",
+					Name: "myrolebinding",
+				},
+			},
+			expected: "serviceaccount-sa-1-clusterrole-myrole-clusterrolebinding-myrolebinding",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := GetWorkloadScanK8sResourceName(context.Background(), tc.resource, tc.relatedObjects)
+			if result != tc.expected {
+				t.Errorf("Expected %s, but got %s", tc.expected, result)
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
+func TestGetManifestObjectLabelsAndAnnotations(t *testing.T) {
+	tests := []struct {
+		name                string
+		resource            *FakeMetadata
+		relatedObjects      []workloadinterface.IMetadata
+		expectedLabels      map[string]string
+		expectedAnnotations map[string]string
+	}{
+		{
+			name: "resource without related objects",
+			resource: &FakeMetadata{
+				Namespace:  "test-namespace",
+				ApiVersion: "v1",
+				Kind:       "Pod",
+				Name:       "test-pod",
+			},
+			relatedObjects: []workloadinterface.IMetadata{},
+			expectedLabels: map[string]string{
+				"kubescape.io/workload-api-group":   "",
+				"kubescape.io/workload-api-version": "v1",
+				"kubescape.io/workload-kind":        "Pod",
+				"kubescape.io/workload-name":        "test-pod",
+				"kubescape.io/workload-namespace":   "test-namespace",
+			},
+			expectedAnnotations: map[string]string{
+				"kubescape.io/wlid": "wlid://cluster-minikube/namespace-test-namespace/pod-test-pod",
+			},
+		},
+		{
+			name: "with related objects (role, rolebinding)",
+			resource: &FakeMetadata{
+				Namespace:  "test-namespace",
+				ApiVersion: "v1",
+				Kind:       "Pod",
+				Name:       "test-pod",
+			},
+			relatedObjects: []workloadinterface.IMetadata{
+				&FakeMetadata{
+					Namespace:  "test-namespace",
+					ApiVersion: "rbac.authorization.k8s.io/v1",
+					Kind:       "Role",
+					Name:       "test-role",
+				},
+				&FakeMetadata{
+					Namespace:  "test-namespace",
+					ApiVersion: "rbac.authorization.k8s.io/v1",
+					Kind:       "RoleBinding",
+					Name:       "test-role-binding",
+				},
+			},
+			expectedLabels: map[string]string{
+				"kubescape.io/workload-api-group":    "",
+				"kubescape.io/workload-api-version":  "v1",
+				"kubescape.io/workload-kind":         "Pod",
+				"kubescape.io/workload-name":         "test-pod",
+				"kubescape.io/workload-namespace":    "test-namespace",
+				"kubescape.io/rbac-resource":         "true",
+				"kubescape.io/role-name":             "test-role",
+				"kubescape.io/role-namespace":        "test-namespace",
+				"kubescape.io/rolebinding-name":      "test-role-binding",
+				"kubescape.io/rolebinding-namespace": "test-namespace",
+			},
+			expectedAnnotations: map[string]string{
+				"kubescape.io/wlid": "wlid://cluster-minikube/namespace-test-namespace/rolebinding-test-role-binding",
+			},
+		},
+		{
+			name: "with related objects (clusterrole, clusterrolebinding)",
+			resource: &FakeMetadata{
+				Namespace:  "test-namespace",
+				ApiVersion: "v1",
+				Kind:       "Pod",
+				Name:       "test-pod",
+			},
+			relatedObjects: []workloadinterface.IMetadata{
+				&FakeMetadata{
+					ApiVersion: "rbac.authorization.k8s.io/v1",
+					Kind:       "ClusterRole",
+					Name:       "test-role",
+				},
+				&FakeMetadata{
+					ApiVersion: "rbac.authorization.k8s.io/v1",
+					Kind:       "ClusterRoleBinding",
+					Name:       "test-role-binding",
+				},
+			},
+			expectedLabels: map[string]string{
+				"kubescape.io/workload-api-group":      "",
+				"kubescape.io/workload-api-version":    "v1",
+				"kubescape.io/workload-kind":           "Pod",
+				"kubescape.io/workload-name":           "test-pod",
+				"kubescape.io/workload-namespace":      "test-namespace",
+				"kubescape.io/rbac-resource":           "true",
+				"kubescape.io/clusterrole-name":        "test-role",
+				"kubescape.io/clusterrolebinding-name": "test-role-binding",
+			},
+			expectedAnnotations: map[string]string{
+				"kubescape.io/wlid": "wlid://cluster-minikube/namespace-/clusterrolebinding-test-role-binding",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			labels, annotations, err := getManifestObjectLabelsAndAnnotations("minikube", tt.resource, tt.relatedObjects)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expectedLabels, labels)
+			assert.Equal(t, tt.expectedAnnotations, annotations)
+		})
+	}
+}
+
+func Test_RoleBindingResourceTripletToSlug(t *testing.T) {
+	tests := []struct {
+		name          string
+		role          string
+		roleBinding   string
+		expectedSlugs []string
+	}{
+		{
+			name:        "clusterrolebinding with clusterrole, subject with apigroup",
+			role:        "testdata/role_1.json",
+			roleBinding: "testdata/rolebinding_1.json",
+			expectedSlugs: []string{
+				"group-system-serviceaccounts-clusterrole-system-service-account-issuer-discovery-clusterrolebinding-system-service-account-issuer-discovery",
+			},
+		},
+		{
+			name:        "clusterrolebinding with clusterrole, subject without apigroup",
+			role:        "testdata/role_2.json",
+			roleBinding: "testdata/rolebinding_2.json",
+			expectedSlugs: []string{
+				"serviceaccount-expand-controller-clusterrole-system-controller-expand-controller-clusterrolebinding-system-controller-expand-controller",
+			},
+		},
+		{
+			name:        "rolebinding with role, multiple subjects",
+			role:        "testdata/role_3.json",
+			roleBinding: "testdata/rolebinding_3.json",
+			expectedSlugs: []string{
+				"user-system-kube-scheduler-role-system--leader-locking-kube-scheduler-rolebinding-system--leader-locking-kube-scheduler",
+				"serviceaccount-kube-scheduler-role-system--leader-locking-kube-scheduler-rolebinding-system--leader-locking-kube-scheduler",
+			},
+		},
+	}
+
+	readTestFile := func(fileName string) []byte {
+		file, err := os.Open(fileName)
+		if err != nil {
+			panic(err)
+		}
+		defer file.Close()
+
+		fileContents, err := io.ReadAll(file)
+		if err != nil {
+			panic(err)
+		}
+
+		return fileContents
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			var obj1 map[string]any
+			_ = json.Unmarshal(readTestFile(tt.role), &obj1)
+			clusterRole := objectsenvelopes.NewObject(obj1)
+
+			var obj2 map[string]any
+			_ = json.Unmarshal(readTestFile(tt.roleBinding), &obj2)
+			clusterRoleBinding := objectsenvelopes.NewObject(obj2)
+
+			slugs := []string{}
+
+			subjects, _ := workloadinterface.InspectMap(clusterRoleBinding.GetObject(), "subjects")
+			if val, ok := subjects.([]any); ok {
+				for _, s := range val {
+					subject := workloadinterface.NewBaseObject(map[string]any{})
+
+					if subjectObj, ok := s.(map[string]any); ok {
+						if name, ok := subjectObj["name"]; ok {
+							subject.SetName(name.(string))
+						}
+						if kind, ok := subjectObj["kind"]; ok {
+							subject.SetKind(kind.(string))
+						}
+						if ns, ok := subjectObj["namespace"]; ok {
+							subject.SetNamespace(ns.(string))
+						}
+						if apiGroup, ok := subjectObj["apiGroup"]; ok {
+							subject.SetApiVersion(apiGroup.(string))
+						}
+
+						slug, err := names.RoleBindingResourceToSlug(subject, clusterRole, clusterRoleBinding)
+						assert.NoError(t, err)
+						slugs = append(slugs, slug)
+					}
+				}
+			}
+
+			assert.ElementsMatch(t, tt.expectedSlugs, slugs)
+		})
+	}
+}
+
+func TestStorePostureReportResults_SkipsOrphanedRoleBinding(t *testing.T) {
+	store := NewFakeAPIServerStorage("kubescape")
+	ctx := context.Background()
+
+	// RegoResponseVector with only 1 related object (RoleBinding, no Role) — simulates an
+	// orphaned binding whose referenced Role/ClusterRole has been deleted.
+	orphanObj := map[string]any{
+		"kind":      "ServiceAccount",
+		"name":      "my-sa",
+		"namespace": "default",
+		"relatedObjects": []any{
+			map[string]any{
+				"kind":       "RoleBinding",
+				"name":       "orphan-binding",
+				"namespace":  "default",
+				"apiVersion": "rbac.authorization.k8s.io/v1",
+			},
+		},
+	}
+
+	// Normal Pod resource — should be persisted regardless of the orphaned binding above.
+	podObj := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Pod",
+		"metadata": map[string]any{
+			"name":      "test-pod",
+			"namespace": "default",
+		},
+	}
+
+	pr := &v2.PostureReport{
+		Resources: []reporthandling.Resource{
+			{ResourceID: "orphan-resource-id", Object: orphanObj},
+			{ResourceID: "pod-resource-id", Object: podObj},
+		},
+		Results: []resourcesresults.Result{
+			{ResourceID: "orphan-resource-id"},
+			{ResourceID: "pod-resource-id"},
+		},
+	}
+
+	err := store.StorePostureReportResults(ctx, pr)
+	assert.NoError(t, err)
+
+	// The Pod summary must be stored; the orphaned binding must be skipped, not abort the run.
+	summaries, listErr := store.StorageClient.WorkloadConfigurationScanSummaries("default").List(ctx, metav1.ListOptions{})
+	assert.NoError(t, listErr)
+	assert.Len(t, summaries.Items, 1)
+	assert.Equal(t, "pod-test-pod", summaries.Items[0].Name)
+}
+
+func TestStorePostureReportResults_ContinuesAfterUnstorableResult(t *testing.T) {
+	ctx := context.Background()
+
+	// An object the storage backend refuses. The real case is a name at the
+	// 253-byte limit, which the file backend cannot write.
+	//nolint:staticcheck // The pinned storage client lacks the summary apply schema required by NewClientset.
+	client := fake.NewSimpleClientset()
+	storeErr := errors.New("open payload file: file name too long")
+	client.PrependReactor("create", "workloadconfigurationscansummaries", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		summary, ok := action.(k8stesting.CreateAction).GetObject().(*v1beta1.WorkloadConfigurationScanSummary)
+		if ok && summary.Name == "pod-unstorable" {
+			return true, nil, storeErr
+		}
+		return false, nil, nil
+	})
+	store := &APIServerStore{StorageClient: client.SpdxV1beta1(), namespace: "kubescape"}
+
+	pod := func(name string) map[string]any {
+		return map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Pod",
+			"metadata":   map[string]any{"name": name, "namespace": "default"},
+		}
+	}
+	pr := &v2.PostureReport{
+		Resources: []reporthandling.Resource{
+			{ResourceID: "unstorable-id", Object: pod("unstorable")},
+			{ResourceID: "storable-id", Object: pod("storable")},
+		},
+		Results: []resourcesresults.Result{
+			{ResourceID: "unstorable-id"},
+			{ResourceID: "storable-id"},
+		},
+	}
+
+	err := store.StorePostureReportResults(ctx, pr)
+
+	// The failure is still reported, and with the backend cause: the storage
+	// helpers log theirs at Warning, which KS_LOGGER_LEVEL=error filters out.
+	assert.ErrorContains(t, err, "failed to store 1 of 2 posture scan results")
+	assert.ErrorIs(t, err, storeErr)
+
+	// ...and the result that came after it was still stored.
+	summaries, listErr := store.StorageClient.WorkloadConfigurationScanSummaries("default").List(ctx, metav1.ListOptions{})
+	assert.NoError(t, listErr)
+	assert.Len(t, summaries.Items, 1)
+	assert.Equal(t, "pod-storable", summaries.Items[0].Name)
+}
+
+func TestStorePostureReportResults_ContinuesAfterUnstorableScan(t *testing.T) {
+	ctx := context.Background()
+
+	// The full scan and its summary are separate objects. A scan that cannot be
+	// written must not stop the summary for the same result.
+	//nolint:staticcheck // The pinned storage client lacks the summary apply schema required by NewClientset.
+	client := fake.NewSimpleClientset()
+	storeErr := errors.New("open payload file: file name too long")
+	client.PrependReactor("create", "workloadconfigurationscans", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		scan, ok := action.(k8stesting.CreateAction).GetObject().(*v1beta1.WorkloadConfigurationScan)
+		if ok && scan.Name == "pod-unstorable" {
+			return true, nil, storeErr
+		}
+		return false, nil, nil
+	})
+	store := &APIServerStore{StorageClient: client.SpdxV1beta1(), namespace: "kubescape", continuousPostureScan: true}
+
+	pod := func(name string) map[string]any {
+		return map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Pod",
+			"metadata":   map[string]any{"name": name, "namespace": "default"},
+		}
+	}
+	pr := &v2.PostureReport{
+		Resources: []reporthandling.Resource{
+			{ResourceID: "unstorable-id", Object: pod("unstorable")},
+			{ResourceID: "storable-id", Object: pod("storable")},
+		},
+		Results: []resourcesresults.Result{
+			{ResourceID: "unstorable-id"},
+			{ResourceID: "storable-id"},
+		},
+	}
+
+	err := store.StorePostureReportResults(ctx, pr)
+
+	assert.ErrorContains(t, err, "failed to store 1 of 2 posture scan results")
+	assert.ErrorIs(t, err, storeErr)
+
+	// Both summaries land, including the one whose full scan was refused.
+	summaries, listErr := store.StorageClient.WorkloadConfigurationScanSummaries("default").List(ctx, metav1.ListOptions{})
+	assert.NoError(t, listErr)
+	assert.Len(t, summaries.Items, 2)
+
+	// Only the refused scan is missing.
+	scans, listErr := store.StorageClient.WorkloadConfigurationScans("default").List(ctx, metav1.ListOptions{})
+	assert.NoError(t, listErr)
+	assert.Len(t, scans.Items, 1)
+	assert.Equal(t, "pod-storable", scans.Items[0].Name)
+}
+
+// TestStorePostureReportResults_ReportsTheFirstFailureForAResult covers a result
+// whose scan and summary both fail. The aggregate must carry the scan error,
+// which came first, rather than the summary error that followed it.
+func TestStorePostureReportResults_ReportsTheFirstFailureForAResult(t *testing.T) {
+	ctx := context.Background()
+
+	//nolint:staticcheck // The pinned storage client lacks the summary apply schema required by NewClientset.
+	client := fake.NewSimpleClientset()
+	scanErr := errors.New("scan refused")
+	summaryErr := errors.New("summary refused")
+	client.PrependReactor("create", "workloadconfigurationscans", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, scanErr
+	})
+	client.PrependReactor("create", "workloadconfigurationscansummaries", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, summaryErr
+	})
+	store := &APIServerStore{StorageClient: client.SpdxV1beta1(), namespace: "kubescape", continuousPostureScan: true}
+
+	pr := &v2.PostureReport{
+		Resources: []reporthandling.Resource{{ResourceID: "pod-id", Object: map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Pod",
+			"metadata":   map[string]any{"name": "unstorable", "namespace": "default"},
+		}}},
+		Results: []resourcesresults.Result{{ResourceID: "pod-id"}},
+	}
+
+	err := store.StorePostureReportResults(ctx, pr)
+
+	assert.ErrorContains(t, err, "failed to store 1 of 1 posture scan results")
+	assert.ErrorIs(t, err, scanErr)
+	assert.NotErrorIs(t, err, summaryErr)
+}
+
+func TestStorePostureReportResults_NonRecoverableError(t *testing.T) {
+	store := NewFakeAPIServerStorage("kubescape")
+	ctx := context.Background()
+
+	// Result whose ResourceID has no matching entry in Resources — this is a non-recoverable
+	// build error (findResourceInReport fails) and must not be silently skipped.
+	pr := &v2.PostureReport{
+		Resources: []reporthandling.Resource{},
+		Results: []resourcesresults.Result{
+			{ResourceID: "missing-resource-id"},
+		},
+	}
+
+	err := store.StorePostureReportResults(ctx, pr)
+	assert.Error(t, err)
+}
+
+func TestStorePostureReportResults_PersistsControlsFromSummaryWhenAssociationsAreMissing(t *testing.T) {
+	const resourceID = "v1/default/Pod/test-pod"
+
+	controlSummary := reportsummary.ControlSummary{
+		ControlID:   "C-001",
+		Name:        "Control 1",
+		ScoreFactor: 7,
+	}
+	controlSummary.Append(&apis.StatusInfo{InnerStatus: apis.StatusFailed}, resourceID)
+
+	report := &v2.PostureReport{
+		SummaryDetails: reportsummary.SummaryDetails{
+			Controls: reportsummary.ControlSummaries{"C-001": controlSummary},
+		},
+		Resources: []reporthandling.Resource{{
+			ResourceID: resourceID,
+			Object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"metadata": map[string]any{
+					"name":      "test-pod",
+					"namespace": "default",
+				},
+			},
+		}},
+		// This is the inconsistent shape reported in #3494: the aggregate
+		// summary contains the failed resource, while the per-resource control
+		// slice consumed by in-cluster storage is empty.
+		Results: []resourcesresults.Result{{ResourceID: resourceID}},
+	}
+
+	tests := []struct {
+		name     string
+		existing []runtime.Object
+	}{
+		{name: "creates a populated summary"},
+		{
+			name: "replaces an existing false-clean summary",
+			existing: []runtime.Object{&v1beta1.WorkloadConfigurationScanSummary{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-test-pod", Namespace: "default"},
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := fake.NewSimpleClientset(tt.existing...)
+			store := &APIServerStore{
+				StorageClient: client.SpdxV1beta1(),
+				namespace:     "kubescape",
+			}
+			ctx := context.Background()
+			assert.NoError(t, store.StorePostureReportResults(ctx, report))
+
+			summaries, err := store.StorageClient.WorkloadConfigurationScanSummaries("default").List(ctx, metav1.ListOptions{})
+			if assert.NoError(t, err) && assert.Len(t, summaries.Items, 1) {
+				summary := summaries.Items[0]
+				if assert.Len(t, summary.Spec.Controls, 1) && assert.Contains(t, summary.Spec.Controls, "C-001") {
+					control := summary.Spec.Controls["C-001"]
+					assert.Equal(t, "C-001", control.ControlID)
+					assert.Equal(t, string(apis.StatusFailed), control.Status.Status)
+					assert.Equal(t, "High", control.Severity.Severity)
+					assert.Equal(t, float32(7), control.Severity.ScoreFactor)
+				}
+				assert.Equal(t, int64(1), summary.Spec.Severities.High)
+				assert.Zero(t, summary.Spec.Severities.Critical)
+				assert.Zero(t, summary.Spec.Severities.Medium)
+				assert.Zero(t, summary.Spec.Severities.Low)
+				assert.Zero(t, summary.Spec.Severities.Unknown)
+			}
+
+			// Detail objects remain opt-in through continuousPostureScan. Recovering
+			// summary payloads must not change that storage-volume contract.
+			details, err := store.StorageClient.WorkloadConfigurationScans("default").List(ctx, metav1.ListOptions{})
+			assert.NoError(t, err)
+			assert.Empty(t, details.Items)
+		})
+	}
+}
+
+func TestMergeMaps(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing map[string]string
+		new      map[string]string
+		expected map[string]string
+	}{
+		{
+			name:     "merge with no conflicts",
+			existing: map[string]string{"key1": "value1"},
+			new:      map[string]string{"key2": "value2"},
+			expected: map[string]string{"key1": "value1", "key2": "value2"},
+		},
+		{
+			name:     "merge with conflicts",
+			existing: map[string]string{"key1": "value1"},
+			new:      map[string]string{"key1": "newValue1", "key2": "value2"},
+			expected: map[string]string{"key1": "newValue1", "key2": "value2"},
+		},
+		{
+			name:     "merge with empty new map",
+			existing: map[string]string{"key1": "value1"},
+			new:      map[string]string{},
+			expected: map[string]string{"key1": "value1"},
+		},
+		{
+			name:     "merge with empty existing map",
+			existing: map[string]string{},
+			new:      map[string]string{"key1": "value1"},
+			expected: map[string]string{"key1": "value1"},
+		},
+		{
+			name:     "merge with both maps empty",
+			existing: map[string]string{},
+			new:      map[string]string{},
+			expected: map[string]string{},
+		},
+		{
+			name:     "merge with nil existing map",
+			existing: nil,
+			new:      map[string]string{"key1": "value1"},
+			expected: map[string]string{"key1": "value1"},
+		},
+		{
+			name:     "merge with both maps nil",
+			existing: nil,
+			new:      nil,
+			expected: map[string]string{},
+		},
+		{
+			name:     "merge with nil new map preserves existing",
+			existing: map[string]string{"key1": "value1", "key2": "value2"},
+			new:      nil,
+			expected: map[string]string{"key1": "value1", "key2": "value2"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := mergeMaps(tt.existing, tt.new)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestGetRoleAndRoleBindingFromRelatedObjects_SameCategory(t *testing.T) {
+	testCases := []struct {
+		name           string
+		relatedObjects []workloadinterface.IMetadata
+	}{
+		{
+			name: "two Role objects",
+			relatedObjects: []workloadinterface.IMetadata{
+				&FakeMetadata{Kind: "Role", Name: "role-a", Namespace: "ns"},
+				&FakeMetadata{Kind: "Role", Name: "role-b", Namespace: "ns"},
+			},
+		},
+		{
+			name: "two RoleBinding objects",
+			relatedObjects: []workloadinterface.IMetadata{
+				&FakeMetadata{Kind: "RoleBinding", Name: "rb-a", Namespace: "ns"},
+				&FakeMetadata{Kind: "RoleBinding", Name: "rb-b", Namespace: "ns"},
+			},
+		},
+		{
+			name: "two ClusterRole objects",
+			relatedObjects: []workloadinterface.IMetadata{
+				&FakeMetadata{Kind: "ClusterRole", Name: "cr-a"},
+				&FakeMetadata{Kind: "ClusterRole", Name: "cr-b"},
+			},
+		},
+		{
+			name: "two ClusterRoleBinding objects",
+			relatedObjects: []workloadinterface.IMetadata{
+				&FakeMetadata{Kind: "ClusterRoleBinding", Name: "crb-a"},
+				&FakeMetadata{Kind: "ClusterRoleBinding", Name: "crb-b"},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			role, roleBinding, err := getRoleAndRoleBindingFromRelatedObjects(tc.relatedObjects)
+			assert.True(t, errors.Is(err, ErrIncompleteRelatedObjects))
+			assert.Nil(t, role)
+			assert.Nil(t, roleBinding)
+		})
+	}
+}
+
+func TestStorePostureReportResults_SkipsSameCategoryRBACObjects(t *testing.T) {
+	store := NewFakeAPIServerStorage("kubescape")
+	ctx := context.Background()
+
+	sameCategoryObj := map[string]any{
+		"kind":      "ServiceAccount",
+		"name":      "my-sa",
+		"namespace": "default",
+		"relatedObjects": []any{
+			map[string]any{
+				"kind":       "Role",
+				"name":       "role-a",
+				"namespace":  "default",
+				"apiVersion": "rbac.authorization.k8s.io/v1",
+			},
+			map[string]any{
+				"kind":       "Role",
+				"name":       "role-b",
+				"namespace":  "default",
+				"apiVersion": "rbac.authorization.k8s.io/v1",
+			},
+		},
+	}
+
+	podObj := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Pod",
+		"metadata": map[string]any{
+			"name":      "test-pod",
+			"namespace": "default",
+		},
+	}
+
+	pr := &v2.PostureReport{
+		Resources: []reporthandling.Resource{
+			{ResourceID: "same-category-resource-id", Object: sameCategoryObj},
+			{ResourceID: "pod-resource-id", Object: podObj},
+		},
+		Results: []resourcesresults.Result{
+			{ResourceID: "same-category-resource-id"},
+			{ResourceID: "pod-resource-id"},
+		},
+	}
+
+	err := store.StorePostureReportResults(ctx, pr)
+	assert.NoError(t, err)
+
+	summaries, listErr := store.StorageClient.WorkloadConfigurationScanSummaries("default").List(ctx, metav1.ListOptions{})
+	assert.NoError(t, listErr)
+	assert.Len(t, summaries.Items, 1)
+	assert.Equal(t, "pod-test-pod", summaries.Items[0].Name)
+}
+
+func TestMergeWorkloadConfigurationScanSpec(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing v1beta1.WorkloadConfigurationScanSpec
+		new      v1beta1.WorkloadConfigurationScanSpec
+		expected map[string]v1beta1.ScannedControl
+	}{
+		{
+			name:     "new control added",
+			existing: v1beta1.WorkloadConfigurationScanSpec{},
+			new: v1beta1.WorkloadConfigurationScanSpec{
+				Controls: map[string]v1beta1.ScannedControl{
+					"C-001": {ControlID: "C-001", Name: "Control 1", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)}},
+				},
+			},
+			expected: map[string]v1beta1.ScannedControl{
+				"C-001": {ControlID: "C-001", Name: "Control 1", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)}},
+			},
+		},
+		{
+			name: "existing failed wins over new passed, rules replaced by new scan",
+			existing: v1beta1.WorkloadConfigurationScanSpec{
+				Controls: map[string]v1beta1.ScannedControl{
+					"C-001": {ControlID: "C-001", Name: "Control 1", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusFailed), Info: "old"}, Rules: []v1beta1.ScannedControlRule{{Name: "rule-1"}}},
+				},
+			},
+			new: v1beta1.WorkloadConfigurationScanSpec{
+				Controls: map[string]v1beta1.ScannedControl{
+					"C-001": {ControlID: "C-001", Name: "Control 1", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed), Info: "new"}, Rules: []v1beta1.ScannedControlRule{{Name: "rule-2"}}},
+				},
+			},
+			expected: map[string]v1beta1.ScannedControl{
+				"C-001": {ControlID: "C-001", Name: "Control 1", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusFailed), Info: "new"}, Rules: []v1beta1.ScannedControlRule{{Name: "rule-2"}}},
+			},
+		},
+		{
+			name: "tied status takes latest non-empty info",
+			existing: v1beta1.WorkloadConfigurationScanSpec{
+				Controls: map[string]v1beta1.ScannedControl{
+					"C-001": {ControlID: "C-001", Name: "Control 1", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed), Info: "old"}},
+				},
+			},
+			new: v1beta1.WorkloadConfigurationScanSpec{
+				Controls: map[string]v1beta1.ScannedControl{
+					"C-001": {ControlID: "C-001", Name: "Control 1", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed), Info: "new"}},
+				},
+			},
+			expected: map[string]v1beta1.ScannedControl{
+				"C-001": {ControlID: "C-001", Name: "Control 1", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed), Info: "new"}},
+			},
+		},
+		{
+			name: "tied status falls back to existing info when new is empty",
+			existing: v1beta1.WorkloadConfigurationScanSpec{
+				Controls: map[string]v1beta1.ScannedControl{
+					"C-001": {ControlID: "C-001", Name: "Control 1", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed), Info: "old"}},
+				},
+			},
+			new: v1beta1.WorkloadConfigurationScanSpec{
+				Controls: map[string]v1beta1.ScannedControl{
+					"C-001": {ControlID: "C-001", Name: "Control 1", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)}},
+				},
+			},
+			expected: map[string]v1beta1.ScannedControl{
+				"C-001": {ControlID: "C-001", Name: "Control 1", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed), Info: "old"}},
+			},
+		},
+		{
+			name: "new failed wins over existing passed",
+			existing: v1beta1.WorkloadConfigurationScanSpec{
+				Controls: map[string]v1beta1.ScannedControl{
+					"C-001": {ControlID: "C-001", Name: "Control 1", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed), Info: "old"}},
+				},
+			},
+			new: v1beta1.WorkloadConfigurationScanSpec{
+				Controls: map[string]v1beta1.ScannedControl{
+					"C-001": {ControlID: "C-001", Name: "Control 1", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusFailed), Info: "new"}},
+				},
+			},
+			expected: map[string]v1beta1.ScannedControl{
+				"C-001": {ControlID: "C-001", Name: "Control 1", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusFailed), Info: "new"}},
+			},
+		},
+		{
+			name: "stale controls removed",
+			existing: v1beta1.WorkloadConfigurationScanSpec{
+				Controls: map[string]v1beta1.ScannedControl{
+					"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)}},
+					"C-002": {ControlID: "C-002", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)}},
+				},
+			},
+			new: v1beta1.WorkloadConfigurationScanSpec{
+				Controls: map[string]v1beta1.ScannedControl{
+					"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)}},
+				},
+			},
+			expected: map[string]v1beta1.ScannedControl{
+				"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mergeWorkloadConfigurationScanSpec(tt.existing, tt.new)
+			assert.Equal(t, tt.expected, got.Controls)
+		})
+	}
+
+	// Regression guard: repeated merges (simulating continuous-scan cycles) must not
+	// duplicate rule entries. See reviewer feedback on unbounded Rules growth.
+	t.Run("repeated merges do not duplicate rules", func(t *testing.T) {
+		newScan := v1beta1.WorkloadConfigurationScanSpec{
+			Controls: map[string]v1beta1.ScannedControl{
+				"C-001": {
+					ControlID: "C-001",
+					Name:      "Control 1",
+					Status:    v1beta1.ScannedControlStatus{Status: string(apis.StatusFailed)},
+					Rules:     []v1beta1.ScannedControlRule{{Name: "rule-1"}},
+				},
+			},
+		}
+		spec := v1beta1.WorkloadConfigurationScanSpec{}
+		for i := 0; i < 10; i++ {
+			spec = mergeWorkloadConfigurationScanSpec(spec, newScan)
+		}
+		assert.Len(t, spec.Controls["C-001"].Rules, 1)
+	})
+}
+
+func TestMergeWorkloadConfigurationScanSpec_RefreshesReportTimestamp(t *testing.T) {
+	initialCreatedAt := metav1.NewTime(time.Date(2026, time.September, 1, 8, 0, 0, 0, time.UTC))
+	refreshedCreatedAt := metav1.NewTime(time.Date(2026, time.September, 18, 12, 34, 56, 123456789, time.UTC))
+	existing := v1beta1.WorkloadConfigurationScanSpec{
+		Metadata: &v1beta1.WorkloadConfigurationScanMeta{Report: v1beta1.ReportMeta{CreatedAt: initialCreatedAt}},
+	}
+	newSpec := v1beta1.WorkloadConfigurationScanSpec{
+		Metadata: &v1beta1.WorkloadConfigurationScanMeta{Report: v1beta1.ReportMeta{CreatedAt: refreshedCreatedAt}},
+	}
+
+	merged := mergeWorkloadConfigurationScanSpec(existing, newSpec)
+
+	if assert.NotNil(t, merged.Metadata) {
+		assert.True(t, merged.Metadata.Report.CreatedAt.Time.Equal(refreshedCreatedAt.Time))
+	}
+}
+
+func TestMergeWorkloadConfigurationScanSpec_PreservesReportTimestampWhenNewMetadataIsMissing(t *testing.T) {
+	initialCreatedAt := metav1.NewTime(time.Date(2026, time.September, 1, 8, 0, 0, 0, time.UTC))
+	existing := v1beta1.WorkloadConfigurationScanSpec{
+		Metadata: &v1beta1.WorkloadConfigurationScanMeta{Report: v1beta1.ReportMeta{CreatedAt: initialCreatedAt}},
+	}
+
+	merged := mergeWorkloadConfigurationScanSpec(existing, v1beta1.WorkloadConfigurationScanSpec{})
+
+	if assert.NotNil(t, merged.Metadata) {
+		assert.True(t, merged.Metadata.Report.CreatedAt.Time.Equal(initialCreatedAt.Time))
+	}
+}
+
+func TestMergeWorkloadConfigurationScanSpec_AddsReportTimestampToLegacyScan(t *testing.T) {
+	newCreatedAt := metav1.NewTime(time.Date(2026, time.September, 18, 12, 34, 56, 123456789, time.UTC))
+	newSpec := v1beta1.WorkloadConfigurationScanSpec{
+		Metadata: &v1beta1.WorkloadConfigurationScanMeta{Report: v1beta1.ReportMeta{CreatedAt: newCreatedAt}},
+	}
+
+	merged := mergeWorkloadConfigurationScanSpec(v1beta1.WorkloadConfigurationScanSpec{}, newSpec)
+
+	if assert.NotNil(t, merged.Metadata) {
+		assert.True(t, merged.Metadata.Report.CreatedAt.Time.Equal(newCreatedAt.Time))
+	}
+}
+
+func TestStoreWorkloadScans_RepairsFailedStatusOnNextReport(t *testing.T) {
+	ctx := context.Background()
+	store := NewFakeAPIServerStorage("kubescape")
+	first := time.Date(2026, time.October, 1, 10, 0, 0, 0, time.UTC)
+	second := first.Add(time.Hour)
+	makeScan := func(at time.Time, status apis.ScanningStatus) *v1beta1.WorkloadConfigurationScan {
+		return &v1beta1.WorkloadConfigurationScan{
+			ObjectMeta: metav1.ObjectMeta{Name: "deployment-web", Namespace: "default"},
+			Spec: v1beta1.WorkloadConfigurationScanSpec{
+				Metadata: &v1beta1.WorkloadConfigurationScanMeta{Report: v1beta1.ReportMeta{CreatedAt: metav1.NewTime(at)}},
+				Controls: map[string]v1beta1.ScannedControl{
+					"C-0016": {
+						ControlID: "C-0016",
+						Status:    v1beta1.ScannedControlStatus{Status: string(status)},
+					},
+				},
+			},
+		}
+	}
+	readStatuses := func() (string, string) {
+		t.Helper()
+		scan, err := store.StorageClient.WorkloadConfigurationScans("default").Get(ctx, "deployment-web", metav1.GetOptions{})
+		assert.NoError(t, err)
+		summary, err := store.StorageClient.WorkloadConfigurationScanSummaries("default").Get(ctx, "deployment-web", metav1.GetOptions{})
+		assert.NoError(t, err)
+		return scan.Spec.Controls["C-0016"].Status.Status, summary.Spec.Controls["C-0016"].Status.Status
+	}
+
+	failed := makeScan(first, apis.StatusFailed)
+	failed.Labels = map[string]string{"scan": "first"}
+	assert.NoError(t, store.StoreWorkloadConfigurationScanResult(ctx, failed))
+	_, err := store.StoreWorkloadConfigurationScanResultSummary(ctx, failed)
+	assert.NoError(t, err)
+	full, summary := readStatuses()
+	assert.Equal(t, string(apis.StatusFailed), full)
+	assert.Equal(t, string(apis.StatusFailed), summary)
+
+	passed := makeScan(second, apis.StatusPassed)
+	passed.Labels = map[string]string{"scan": "second"}
+	passed.Annotations = map[string]string{"owner": "posture-team"}
+	assert.NoError(t, store.StoreWorkloadConfigurationScanResult(ctx, passed))
+	_, err = store.StoreWorkloadConfigurationScanResultSummary(ctx, passed)
+	assert.NoError(t, err)
+	assert.NotContains(t, passed.Annotations, reportCreatedAtAnnotation,
+		"creating a summary must not mutate the source scan annotations")
+	full, summary = readStatuses()
+	assert.Equal(t, string(apis.StatusPassed), full, "the latest report must clear the stale failure")
+	assert.Equal(t, string(apis.StatusPassed), summary, "summary metrics must reflect remediation")
+	storedSummary, err := store.StorageClient.WorkloadConfigurationScanSummaries("default").Get(ctx, passed.Name, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, second, summaryReportTime(storedSummary.Annotations))
+
+	// A delayed write from the older report cannot resurrect the failure.
+	assert.NoError(t, store.StoreWorkloadConfigurationScanResult(ctx, failed))
+	_, err = store.StoreWorkloadConfigurationScanResultSummary(ctx, failed)
+	assert.NoError(t, err)
+	full, summary = readStatuses()
+	assert.Equal(t, string(apis.StatusPassed), full)
+	assert.Equal(t, string(apis.StatusPassed), summary)
+	storedScan, err := store.StorageClient.WorkloadConfigurationScans("default").Get(ctx, passed.Name, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, "second", storedScan.Labels["scan"], "a delayed report must not replace current object metadata")
+}
+
+func TestStoreWorkloadScans_MergePartialResultsWithinOneReport(t *testing.T) {
+	ctx := context.Background()
+	store := NewFakeAPIServerStorage("kubescape")
+	at := time.Date(2026, time.October, 1, 10, 0, 0, 0, time.UTC)
+	base := &v1beta1.WorkloadConfigurationScan{
+		ObjectMeta: metav1.ObjectMeta{Name: "deployment-web", Namespace: "default"},
+		Spec: v1beta1.WorkloadConfigurationScanSpec{
+			Metadata: &v1beta1.WorkloadConfigurationScanMeta{Report: v1beta1.ReportMeta{CreatedAt: metav1.NewTime(at)}},
+			Controls: map[string]v1beta1.ScannedControl{
+				"C-0016": {ControlID: "C-0016", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusFailed)}},
+			},
+		},
+	}
+	assert.NoError(t, store.StoreWorkloadConfigurationScanResult(ctx, base))
+	_, err := store.StoreWorkloadConfigurationScanResultSummary(ctx, base)
+	assert.NoError(t, err)
+
+	partial := base.DeepCopy()
+	partial.Spec.Controls["C-0016"] = v1beta1.ScannedControl{
+		ControlID: "C-0016", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)},
+	}
+	assert.NoError(t, store.StoreWorkloadConfigurationScanResult(ctx, partial))
+	_, err = store.StoreWorkloadConfigurationScanResultSummary(ctx, partial)
+	assert.NoError(t, err)
+
+	scan, err := store.StorageClient.WorkloadConfigurationScans("default").Get(ctx, base.Name, metav1.GetOptions{})
+	assert.NoError(t, err)
+	summary, err := store.StorageClient.WorkloadConfigurationScanSummaries("default").Get(ctx, base.Name, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, string(apis.StatusFailed), scan.Spec.Controls["C-0016"].Status.Status)
+	assert.Equal(t, string(apis.StatusFailed), summary.Spec.Controls["C-0016"].Status.Status)
+}
+
+func TestStoreWorkloadScans_PreservesReportIdentityAcrossJSONRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	store := NewFakeAPIServerStorage("kubescape")
+	reportTime := time.Date(2026, time.October, 1, 10, 0, 0, 123456789, time.UTC)
+	makeScan := func(status apis.ScanningStatus) *v1beta1.WorkloadConfigurationScan {
+		return &v1beta1.WorkloadConfigurationScan{
+			ObjectMeta: metav1.ObjectMeta{Name: "deployment-web", Namespace: "default"},
+			Spec: v1beta1.WorkloadConfigurationScanSpec{
+				Metadata: &v1beta1.WorkloadConfigurationScanMeta{Report: v1beta1.ReportMeta{CreatedAt: metav1.NewTime(reportTime)}},
+				Controls: map[string]v1beta1.ScannedControl{
+					"C-0016": {ControlID: "C-0016", Status: v1beta1.ScannedControlStatus{Status: string(status)}},
+				},
+			},
+		}
+	}
+
+	failed := makeScan(apis.StatusFailed)
+	assert.NoError(t, store.StoreWorkloadConfigurationScanResult(ctx, failed))
+	_, err := store.StoreWorkloadConfigurationScanResultSummary(ctx, failed)
+	assert.NoError(t, err)
+
+	stored, err := store.StorageClient.WorkloadConfigurationScans("default").Get(ctx, failed.Name, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, reportTime, workloadScanReportTime(stored))
+
+	// The Kubernetes API representation of metav1.Time has only second
+	// precision. Simulate that boundary while retaining the exact annotation.
+	raw, err := json.Marshal(stored)
+	assert.NoError(t, err)
+	roundTripped := &v1beta1.WorkloadConfigurationScan{}
+	assert.NoError(t, json.Unmarshal(raw, roundTripped))
+	assert.True(t, reportTime.Truncate(time.Second).Equal(scanReportTime(roundTripped.Spec)))
+	assert.Equal(t, reportTime, workloadScanReportTime(roundTripped))
+	_, err = store.StorageClient.WorkloadConfigurationScans("default").Update(ctx, roundTripped, metav1.UpdateOptions{})
+	assert.NoError(t, err)
+
+	passedPartial := makeScan(apis.StatusPassed)
+	assert.NoError(t, store.StoreWorkloadConfigurationScanResult(ctx, passedPartial))
+	_, err = store.StoreWorkloadConfigurationScanResultSummary(ctx, passedPartial)
+	assert.NoError(t, err)
+
+	stored, err = store.StorageClient.WorkloadConfigurationScans("default").Get(ctx, failed.Name, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, string(apis.StatusFailed), stored.Spec.Controls["C-0016"].Status.Status,
+		"partial results from one report must keep worst-status merging after serialization")
+	storedSummary, err := store.StorageClient.WorkloadConfigurationScanSummaries("default").Get(ctx, failed.Name, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, string(apis.StatusFailed), storedSummary.Spec.Controls["C-0016"].Status.Status)
+}
+
+func TestStoreWorkloadScanSummary_FirstTimestampedReportReplacesLegacyFailure(t *testing.T) {
+	ctx := context.Background()
+	legacy := &v1beta1.WorkloadConfigurationScanSummary{
+		ObjectMeta: metav1.ObjectMeta{Name: "deployment-web", Namespace: "default"},
+		Spec: v1beta1.WorkloadConfigurationScanSummarySpec{
+			Controls: map[string]v1beta1.ScannedControlSummary{
+				"C-0016": {ControlID: "C-0016", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusFailed)}},
+			},
+		},
+	}
+	//nolint:staticcheck // The pinned storage client lacks the summary apply schema required by NewClientset.
+	client := fake.NewSimpleClientset(legacy)
+	store := &APIServerStore{StorageClient: client.SpdxV1beta1()}
+	reportTime := time.Date(2026, time.October, 1, 11, 0, 0, 123456789, time.UTC)
+	passed := &v1beta1.WorkloadConfigurationScan{
+		ObjectMeta: metav1.ObjectMeta{Name: legacy.Name, Namespace: legacy.Namespace},
+		Spec: v1beta1.WorkloadConfigurationScanSpec{
+			Metadata: &v1beta1.WorkloadConfigurationScanMeta{Report: v1beta1.ReportMeta{CreatedAt: metav1.NewTime(reportTime)}},
+			Controls: map[string]v1beta1.ScannedControl{
+				"C-0016": {ControlID: "C-0016", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)}},
+			},
+		},
+	}
+
+	_, err := store.StoreWorkloadConfigurationScanResultSummary(ctx, passed)
+	assert.NoError(t, err)
+	stored, err := store.StorageClient.WorkloadConfigurationScanSummaries("default").Get(ctx, legacy.Name, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, string(apis.StatusPassed), stored.Spec.Controls["C-0016"].Status.Status)
+	assert.Equal(t, reportTime, summaryReportTime(stored.Annotations))
+}
+
+func TestMergeWorkloadConfigurationScanSpec_ReportBoundaries(t *testing.T) {
+	first := time.Date(2026, time.October, 1, 10, 0, 0, 0, time.UTC)
+	second := first.Add(time.Minute)
+	spec := func(at time.Time, controls map[string]v1beta1.ScannedControl) v1beta1.WorkloadConfigurationScanSpec {
+		return v1beta1.WorkloadConfigurationScanSpec{
+			Metadata: &v1beta1.WorkloadConfigurationScanMeta{Report: v1beta1.ReportMeta{CreatedAt: metav1.NewTime(at)}},
+			Controls: controls,
+		}
+	}
+	failed := v1beta1.ScannedControl{ControlID: "C-0016", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusFailed)}}
+	passed := v1beta1.ScannedControl{ControlID: "C-0016", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)}}
+	old := spec(first, map[string]v1beta1.ScannedControl{
+		"C-0016": failed,
+		"C-OLD":  {ControlID: "C-OLD", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusFailed)}},
+	})
+	fresh := spec(second, map[string]v1beta1.ScannedControl{"C-0016": passed})
+
+	merged := mergeWorkloadConfigurationScanSpec(old, fresh)
+	assert.Equal(t, fresh.Controls, merged.Controls, "a new report replaces old controls and their failures")
+	assert.Equal(t, second, scanReportTime(merged))
+	assert.NotContains(t, merged.Controls, "C-OLD")
+
+	stale := mergeWorkloadConfigurationScanSpec(merged, old)
+	assert.Equal(t, fresh.Controls, stale.Controls, "late results cannot roll back the latest report")
+	assert.Equal(t, second, scanReportTime(stale))
+
+	sameReport := spec(second, map[string]v1beta1.ScannedControl{"C-0016": failed})
+	combined := mergeWorkloadConfigurationScanSpec(merged, sameReport)
+	assert.Equal(t, string(apis.StatusFailed), combined.Controls["C-0016"].Status.Status,
+		"partial results from the same report still use worst-status merging")
+}
+
+func TestSummaryReportTime_HandlesLegacyAndMalformedAnnotations(t *testing.T) {
+	assert.True(t, summaryReportTime(nil).IsZero())
+	assert.True(t, summaryReportTime(map[string]string{reportCreatedAtAnnotation: "invalid"}).IsZero())
+	stamp := time.Date(2026, time.October, 1, 10, 0, 0, 123456789, time.UTC)
+	encoded := stamp.Format(time.RFC3339Nano)
+	assert.Equal(t, stamp, summaryReportTime(map[string]string{reportCreatedAtAnnotation: encoded}))
+	assert.Equal(t, 1, compareReportTimes(time.Time{}, stamp), "the first timestamped scan supersedes legacy state")
+	assert.Equal(t, 0, compareReportTimes(stamp, time.Time{}))
+	assert.Equal(t, 0, compareReportTimes(stamp, stamp))
+	assert.Equal(t, 1, compareReportTimes(stamp, stamp.Add(time.Nanosecond)))
+	assert.Equal(t, -1, compareReportTimes(stamp, stamp.Add(-time.Nanosecond)))
+}
+
+func TestStorePostureReportResults_RefreshesPersistedReportTimestamp(t *testing.T) {
+	const resourceID = "v1/default/Pod/test-pod"
+	initialGeneratedAt := time.Date(2026, time.September, 1, 8, 0, 0, 0, time.UTC)
+	refreshedGeneratedAt := time.Date(2026, time.September, 18, 12, 34, 56, 123456789, time.UTC)
+	report := &v2.PostureReport{
+		ReportGenerationTime: initialGeneratedAt,
+		Resources: []reporthandling.Resource{{
+			ResourceID: resourceID,
+			Object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"metadata": map[string]any{
+					"name":      "test-pod",
+					"namespace": "default",
+				},
+			},
+		}},
+		Results: []resourcesresults.Result{{ResourceID: resourceID}},
+	}
+	//nolint:staticcheck // The pinned storage client lacks the summary apply schema required by NewClientset.
+	client := fake.NewSimpleClientset()
+	store := &APIServerStore{
+		StorageClient:         client.SpdxV1beta1(),
+		namespace:             "kubescape",
+		continuousPostureScan: true,
+	}
+	ctx := context.Background()
+
+	assert.NoError(t, store.StorePostureReportResults(ctx, report))
+	stored, err := store.StorageClient.WorkloadConfigurationScans("default").Get(
+		ctx, "pod-test-pod", metav1.GetOptions{})
+	assert.NoError(t, err)
+	if assert.NotNil(t, stored.Spec.Metadata) {
+		assert.True(t, stored.Spec.Metadata.Report.CreatedAt.Time.Equal(initialGeneratedAt))
+	}
+
+	report.ReportGenerationTime = refreshedGeneratedAt
+	assert.NoError(t, store.StorePostureReportResults(ctx, report))
+	stored, err = store.StorageClient.WorkloadConfigurationScans("default").Get(
+		ctx, "pod-test-pod", metav1.GetOptions{})
+	assert.NoError(t, err)
+	if assert.NotNil(t, stored.Spec.Metadata) {
+		assert.True(t, stored.Spec.Metadata.Report.CreatedAt.Time.Equal(refreshedGeneratedAt))
+	}
+}
+
+func TestMergeWorkloadConfigurationScanSummarySpec(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing v1beta1.WorkloadConfigurationScanSummarySpec
+		new      v1beta1.WorkloadConfigurationScanSummarySpec
+		expected map[string]v1beta1.ScannedControlSummary
+	}{
+		{
+			name:     "new control added",
+			existing: v1beta1.WorkloadConfigurationScanSummarySpec{},
+			new: v1beta1.WorkloadConfigurationScanSummarySpec{
+				Controls: map[string]v1beta1.ScannedControlSummary{
+					"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)}},
+				},
+			},
+			expected: map[string]v1beta1.ScannedControlSummary{
+				"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)}},
+			},
+		},
+		{
+			name: "existing failed wins over new passed",
+			existing: v1beta1.WorkloadConfigurationScanSummarySpec{
+				Controls: map[string]v1beta1.ScannedControlSummary{
+					"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusFailed), Info: "old"}},
+				},
+			},
+			new: v1beta1.WorkloadConfigurationScanSummarySpec{
+				Controls: map[string]v1beta1.ScannedControlSummary{
+					"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed), Info: "new"}},
+				},
+			},
+			expected: map[string]v1beta1.ScannedControlSummary{
+				"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusFailed), Info: "new"}},
+			},
+		},
+		{
+			name: "tied status takes latest non-empty info",
+			existing: v1beta1.WorkloadConfigurationScanSummarySpec{
+				Controls: map[string]v1beta1.ScannedControlSummary{
+					"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed), Info: "old"}},
+				},
+			},
+			new: v1beta1.WorkloadConfigurationScanSummarySpec{
+				Controls: map[string]v1beta1.ScannedControlSummary{
+					"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed), Info: "new"}},
+				},
+			},
+			expected: map[string]v1beta1.ScannedControlSummary{
+				"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed), Info: "new"}},
+			},
+		},
+		{
+			name: "tied status falls back to existing info when new is empty",
+			existing: v1beta1.WorkloadConfigurationScanSummarySpec{
+				Controls: map[string]v1beta1.ScannedControlSummary{
+					"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed), Info: "old"}},
+				},
+			},
+			new: v1beta1.WorkloadConfigurationScanSummarySpec{
+				Controls: map[string]v1beta1.ScannedControlSummary{
+					"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)}},
+				},
+			},
+			expected: map[string]v1beta1.ScannedControlSummary{
+				"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed), Info: "old"}},
+			},
+		},
+		{
+			name: "new failed wins over existing passed",
+			existing: v1beta1.WorkloadConfigurationScanSummarySpec{
+				Controls: map[string]v1beta1.ScannedControlSummary{
+					"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed), Info: "old"}},
+				},
+			},
+			new: v1beta1.WorkloadConfigurationScanSummarySpec{
+				Controls: map[string]v1beta1.ScannedControlSummary{
+					"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusFailed), Info: "new"}},
+				},
+			},
+			expected: map[string]v1beta1.ScannedControlSummary{
+				"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusFailed), Info: "new"}},
+			},
+		},
+		{
+			name: "stale controls removed",
+			existing: v1beta1.WorkloadConfigurationScanSummarySpec{
+				Controls: map[string]v1beta1.ScannedControlSummary{
+					"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)}},
+					"C-002": {ControlID: "C-002", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)}},
+				},
+			},
+			new: v1beta1.WorkloadConfigurationScanSummarySpec{
+				Controls: map[string]v1beta1.ScannedControlSummary{
+					"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)}},
+				},
+			},
+			expected: map[string]v1beta1.ScannedControlSummary{
+				"C-001": {ControlID: "C-001", Status: v1beta1.ScannedControlStatus{Status: string(apis.StatusPassed)}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mergeWorkloadConfigurationScanSummarySpec(tt.existing, tt.new)
+			assert.Equal(t, tt.expected, got.Controls)
+		})
+	}
+}
+
+func TestStorePostureReportResults_ContinuesAfterNonRBACRelatedObject(t *testing.T) {
+	store := NewFakeAPIServerStorage("kubescape")
+	ctx := context.Background()
+
+	// RegoResponseVector whose related objects are Services, as produced by C-0021.
+	svcObj := map[string]any{
+		"kind":      "Deployment",
+		"name":      "unifi-deployment",
+		"namespace": "default",
+		"relatedObjects": []any{
+			map[string]any{
+				"kind":       "Service",
+				"name":       "unifi",
+				"namespace":  "default",
+				"apiVersion": "v1",
+			},
+			map[string]any{
+				"kind":       "Service",
+				"name":       "unifi-admin",
+				"namespace":  "default",
+				"apiVersion": "v1",
+			},
+		},
+	}
+	podObj := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Pod",
+		"metadata": map[string]any{
+			"name":      "test-pod",
+			"namespace": "default",
+		},
+	}
+
+	pr := &v2.PostureReport{
+		Resources: []reporthandling.Resource{
+			{ResourceID: "svc-resource-id", Object: svcObj},
+			{ResourceID: "pod-resource-id", Object: podObj},
+		},
+		Results: []resourcesresults.Result{
+			{ResourceID: "svc-resource-id"},
+			{ResourceID: "pod-resource-id"},
+		},
+	}
+
+	assert.NoError(t, store.StorePostureReportResults(ctx, pr))
+
+	summaries, listErr := store.StorageClient.WorkloadConfigurationScanSummaries("default").List(ctx, metav1.ListOptions{})
+	assert.NoError(t, listErr)
+	names := []string{}
+	for _, s := range summaries.Items {
+		names = append(names, s.Name)
+	}
+	assert.Contains(t, names, "pod-test-pod")
+}

@@ -1,0 +1,97 @@
+import 'package:drift3_preview/drift.dart';
+import 'package:test/test.dart';
+
+import 'database.dart';
+
+void main() {
+  late TestDatabase db;
+
+  setUp(() {
+    db = TestDatabase.inMemory();
+  });
+
+  tearDown(() => db.close());
+
+  test('processed manager', () async {
+    await db.managers.tableWithEveryColumnType.create(
+      (o) => o(
+        id: Value(1),
+        aText: Value("Get that math homework done"),
+        anIntEnum: Value(TodoStatus.open),
+        aReal: Value(5.0),
+        aDateTime: Value(DateTime.now().add(Duration(days: 1))),
+      ),
+    );
+    await db.managers.tableWithEveryColumnType.create(
+      (o) => o(
+        aText: Value("Get that math homework done"),
+        anIntEnum: Value(TodoStatus.open),
+        aDateTime: Value(DateTime.now().add(Duration(days: 2))),
+      ),
+    );
+    await db.managers.tableWithEveryColumnType.create(
+      (o) => o(
+        aText: Value("Get that math homework done"),
+        anIntEnum: Value(TodoStatus.open),
+        aReal: Value(3.0),
+        aDateTime: Value(DateTime.now().add(Duration(days: 3))),
+      ),
+    );
+    // Test count
+    expect(await db.managers.tableWithEveryColumnType.count(), 3);
+    // Test get
+    expect(await db.managers.tableWithEveryColumnType.get(), hasLength(3));
+    // Test getSingle with limit
+    expect(
+      await db.managers.tableWithEveryColumnType
+          .limit(1, offset: 1)
+          .getSingle()
+          .then((value) => value.id),
+      2,
+    );
+    // Test filtered delete
+    expect(
+      await db.managers.tableWithEveryColumnType
+          .filter((f) => f.id(2))
+          .delete(),
+      1,
+    );
+
+    // Test filtered update
+    expect(
+      await db.managers.tableWithEveryColumnType
+          .filter((f) => f.id(1))
+          .update((o) => o(aReal: Value(10.0))),
+      1,
+    );
+    expect(
+      await db.managers.tableWithEveryColumnType
+          .filter((f) => f.id(1))
+          .getSingle()
+          .then((value) => value.aReal),
+      10.0,
+    );
+    // Test filtered exists
+    expect(
+      await db.managers.tableWithEveryColumnType
+          .filter((f) => f.id(1))
+          .exists(),
+      true,
+    );
+
+    // Test filtered count
+    expect(
+      await db.managers.tableWithEveryColumnType.filter((f) => f.id(1)).count(),
+      1,
+    );
+    // Test delete all
+    expect(await db.managers.tableWithEveryColumnType.delete(), 2);
+    // Test exists - false
+    expect(
+      await db.managers.tableWithEveryColumnType
+          .filter((f) => f.id(1))
+          .exists(),
+      false,
+    );
+  });
+}

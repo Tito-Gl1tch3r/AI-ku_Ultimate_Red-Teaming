@@ -1,0 +1,93 @@
+namespace Spice86.Core.Emulator.StateSerialization;
+
+using Microsoft.Extensions.Logging;
+
+/// <summary>
+/// An abstract class that provides a base implementation for recording execution data.
+/// </summary>
+public abstract class EmulationStateDataIoHandler {
+    private readonly EmulatorStateSerializationFolder _emulatorStateSerializationFolder;
+
+    protected ILogger LoggerService { get; }
+
+    /// <summary>
+    /// The directory where data will be saved.
+    /// </summary>
+    protected string DataDirectory => _emulatorStateSerializationFolder.Folder;
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="EmulationStateDataIoHandler"/> class with the specified dump directory.
+    /// </summary>
+    /// <param name="emulatorStateSerializationFolder">Where data will be saved / loaded.</param>
+    /// <param name="loggerService">The logger service implementation.</param>
+    protected EmulationStateDataIoHandler(EmulatorStateSerializationFolder emulatorStateSerializationFolder, ILogger loggerService) {
+        LoggerService = loggerService;
+        _emulatorStateSerializationFolder = emulatorStateSerializationFolder;
+    }
+
+    /// <summary>
+    /// Gets name of the file the execution flow dump.
+    /// </summary>
+    protected string ExecutionFlowFile => GenerateDumpFileName("ExecutionFlow.json");
+
+    /// <summary>
+    /// Gets name of the file the Ghidra symbols dump.
+    /// </summary>
+    protected string SymbolsFile => GenerateDumpFileName("GhidraSymbols.txt");
+
+    /// <summary>
+    /// Gets name of the file the Cpu registers dump.
+    /// </summary>
+    protected string CpuRegistersFile => GenerateDumpFileName($"CpuRegisters.json");
+
+    /// <summary>
+    /// Gets name of the file the memory dump.
+    /// </summary>
+    protected string MemoryFile => GenerateDumpFileName($"MemoryDump.bin");
+
+    /// <summary>
+    /// Gets name of the file the ASM listing dump.
+    /// </summary>
+    protected string ListingFile => GenerateDumpFileName($"Listing.asm");
+
+    /// <summary>
+    /// Gets name of the file the ASM listing dump.
+    /// </summary>
+    protected string BreakpointsFile => $"{DataDirectory}/Breakpoints.json";
+
+    /// <summary>
+    /// Gets name of the file the CFG blocks JSON dump.
+    /// </summary>
+    protected string CfgBlocksFile => GenerateDumpFileName("CfgBlocks.json");
+
+    /// <summary>
+    /// Gets name of the file the CFG partition overlay JSON dump (partitions and inter-partition transfers
+    /// derived from the block graph). Kept separate from <see cref="CfgBlocksFile"/> so a partitioning failure
+    /// never prevents the block graph from being written.
+    /// </summary>
+    protected string CfgPartitionsFile => GenerateDumpFileName("CfgPartitions.json");
+
+    /// <summary>
+    /// Gets name of the file the machine-oriented CFG reload dump (used to reload the graph on restart).
+    /// </summary>
+    protected string CfgReloadFile => GenerateDumpFileName("CfgReload.json");
+
+    /// <summary>
+    /// Gets name of the generated CFG C# override dump.
+    /// </summary>
+    protected string CfgGeneratedCSharpFile => GenerateDumpFileName("CfgGeneratedOverrides.cs");
+
+    /// <summary>
+    /// Gets the directory of the self-contained, runnable generated project (csproj + Program.cs + overrides).
+    /// </summary>
+    protected string GeneratedProjectDirectory => $"{DataDirectory}/GeneratedProject";
+
+    /// <summary>
+    /// Generates a dump file name with the specified suffix.
+    /// </summary>
+    /// <param name="suffix">The suffix to add to the dump file name.</param>
+    /// <returns>A dump file name with the specified suffix.</returns>
+    protected string GenerateDumpFileName(string suffix) {
+        return $"{DataDirectory}/spice86dump{suffix}";
+    }
+}

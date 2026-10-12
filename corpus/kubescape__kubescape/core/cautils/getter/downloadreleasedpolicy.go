@@ -1,0 +1,205 @@
+package getter
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/armosec/armoapi-go/armotypes"
+	"github.com/kubescape/opa-utils/reporthandling"
+	"github.com/kubescape/opa-utils/reporthandling/attacktrack/v1alpha1"
+	"github.com/kubescape/regolibrary/v2/gitregostore"
+)
+
+// =======================================================================================================================
+// ======================================== DownloadReleasedPolicy =======================================================
+// =======================================================================================================================
+var (
+	_ IPolicyGetter         = &DownloadReleasedPolicy{}
+	_ IExceptionsGetter     = &DownloadReleasedPolicy{}
+	_ IAttackTracksGetter   = &DownloadReleasedPolicy{}
+	_ IControlsInputsGetter = &DownloadReleasedPolicy{}
+)
+
+// Use gitregostore to get policies from github release
+type DownloadReleasedPolicy struct {
+	gs      *gitregostore.GitRegoStore
+	version string
+}
+
+func NewDownloadReleasedPolicy() *DownloadReleasedPolicy {
+	return &DownloadReleasedPolicy{
+		gs: gitregostore.NewGitRegoStoreV2(-1),
+	}
+}
+
+// NewDownloadReleasedPolicyWithVersion returns a DownloadReleasedPolicy pinned
+// to a specific regolibrary release tag (e.g. "v2.0.301"). An empty version
+// falls back to the latest release, matching NewDownloadReleasedPolicy.
+func NewDownloadReleasedPolicyWithVersion(version string) *DownloadReleasedPolicy {
+	if version == "" {
+		return NewDownloadReleasedPolicy()
+	}
+	return &DownloadReleasedPolicy{
+		gs:      gitregostore.NewGitRegoStore("https://github.com", "kubescape", "regolibrary", "releases", "download/"+version, "", -1),
+		version: version,
+	}
+}
+
+// IsVersionPinned reports whether this getter targets a specific, user-selected
+// regolibrary release tag rather than the latest release.
+func (drp *DownloadReleasedPolicy) IsVersionPinned() bool {
+	if drp == nil {
+		return false
+	}
+	return drp.version != ""
+}
+
+// ShouldPersistPolicyArtifacts reports whether policies fetched by this getter
+// may be published to Kubescape's shared, unversioned disk fallback. A pinned
+// release must not replace that fallback because the flat cache path does not
+// record release provenance; doing so would let a later unpinned fallback
+// silently evaluate the pinned release.
+func (drp *DownloadReleasedPolicy) ShouldPersistPolicyArtifacts() bool {
+	if drp == nil {
+		return false
+	}
+	return !drp.IsVersionPinned()
+}
+
+// SetRegoObjectsWithFallback downloads the policy objects and reports whether
+// the caller should fall back to the bundled cache on failure.
+//
+// When a version is pinned, a download failure is a hard error (fallback=false,
+// err!=nil): the user explicitly asked for a specific release, so silently
+// serving a different, cached policy set would be misleading. When no version
+// is pinned, a download failure is not an error but requests a fallback
+// (fallback=true, err=nil), preserving the existing latest-release behavior.
+func (drp *DownloadReleasedPolicy) SetRegoObjectsWithFallback() (fallback bool, err error) {
+	if err := drp.SetRegoObjects(); err != nil {
+		if drp.version != "" {
+			return false, err
+		}
+		if errors.Is(err, gitregostore.ErrChecksumVerification) {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func (drp *DownloadReleasedPolicy) GetControl(ID string) (*reporthandling.Control, error) {
+	var control *reporthandling.Control
+	var err error
+
+	control, err = drp.gs.GetOPAControlByID(ID)
+	if err != nil {
+		return nil, err
+	}
+	return control, nil
+}
+
+func (drp *DownloadReleasedPolicy) GetFramework(name string) (*reporthandling.Framework, error) {
+	framework, err := drp.gs.GetOPAFrameworkByName(name)
+	if err != nil {
+		return nil, err
+	}
+	if framework != nil && strings.EqualFold(framework.Name, "allcontrols") {
+		controls, err := drp.gs.GetOPAControls()
+		if err != nil {
+			return nil, err
+		}
+		framework.Controls = controls
+	}
+	return framework, nil
+}
+
+func (drp *DownloadReleasedPolicy) GetFrameworks() ([]reporthandling.Framework, error) {
+	frameworks, err := drp.gs.GetOPAFrameworks()
+	if err != nil {
+		return nil, err
+	}
+	for i := range frameworks {
+		if strings.EqualFold(frameworks[i].Name, "allcontrols") {
+			controls, err := drp.gs.GetOPAControls()
+			if err != nil {
+				return nil, err
+			}
+			frameworks[i].Controls = controls
+		}
+	}
+	return frameworks, nil
+}
+
+func (drp *DownloadReleasedPolicy) ListFrameworks() ([]string, error) {
+	return drp.gs.GetOPAFrameworksNamesList()
+}
+
+func (drp *DownloadReleasedPolicy) ListControls() ([]string, error) {
+	controlsIDsList, err := drp.gs.GetOPAControlsIDsList()
+	if err != nil {
+		return []string{}, err
+	}
+	controlsNamesList, err := drp.gs.GetOPAControlsNamesList()
+	if err != nil {
+		return []string{}, err
+	}
+	controls, err := drp.gs.GetOPAControls()
+	if err != nil {
+		return []string{}, err
+	}
+	var controlsFrameworksList [][]string
+	for _, control := range controls {
+		controlsFrameworksList = append(controlsFrameworksList, drp.gs.GetOpaFrameworkListByControlID(control.ControlID))
+	}
+	controlsNamesWithIDsandFrameworksList := make([]string, len(controlsIDsList))
+	// by design all slices have the same lengt
+	for i := range controlsIDsList {
+		controlsNamesWithIDsandFrameworksList[i] = fmt.Sprintf("%v|%v|%v", controlsIDsList[i], controlsNamesList[i], strings.Join(controlsFrameworksList[i], ", "))
+	}
+	return controlsNamesWithIDsandFrameworksList, nil
+}
+
+func (drp *DownloadReleasedPolicy) GetControlsInputs(ctx context.Context, clusterName string) (map[string][]string, error) {
+	defaultConfigInputs, err := drp.gs.GetDefaultConfigInputs()
+	if err != nil {
+		return nil, err
+	}
+	if defaultConfigInputs.Settings.PostureControlInputs == nil {
+		// the rego store failed to load, so no control inputs are available;
+		// report it as an error instead of silently returning empty inputs
+		return nil, fmt.Errorf("no control configuration inputs available")
+	}
+	return defaultConfigInputs.Settings.PostureControlInputs, err
+}
+
+func (drp *DownloadReleasedPolicy) GetAttackTracks() ([]v1alpha1.AttackTrack, error) {
+	attackTracks, err := drp.gs.GetAttackTracks()
+	if err != nil {
+		return nil, err
+	}
+	return attackTracks, err
+}
+
+func (drp *DownloadReleasedPolicy) SetRegoObjects() error {
+	fwNames, err := drp.gs.GetOPAFrameworksNamesList()
+	if len(fwNames) != 0 && err == nil {
+		return nil
+	}
+	if err := drp.gs.SetRegoObjects(); err != nil {
+		if drp.version != "" {
+			return fmt.Errorf("failed to download controls for pinned version %q: %w", drp.version, err)
+		}
+		return err
+	}
+	return nil
+}
+
+func (drp *DownloadReleasedPolicy) GetExceptions(ctx context.Context, clusterName string) ([]armotypes.PostureExceptionPolicy, error) {
+	exceptions, err := drp.gs.GetSystemPostureExceptionPolicies()
+	if err != nil {
+		return nil, err
+	}
+	return exceptions, nil
+}

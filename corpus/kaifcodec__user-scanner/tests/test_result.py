@@ -1,0 +1,325 @@
+import pytest
+from colorama import Fore
+
+from user_scanner.core.helpers import ScanConfig
+from user_scanner.core.result import Result, Status, _neutralize_csv_cell, indent_text
+
+
+def test_status_labels():
+    assert Status.TAKEN.to_label(is_email=False) == "Found"
+    assert Status.AVAILABLE.to_label(is_email=False) == "Not Found"
+    assert Status.ERROR.to_label() == "Error"
+
+    assert Status.TAKEN.to_label(is_email=True) == "Registered"
+    assert Status.AVAILABLE.to_label(is_email=True) == "Not Registered"
+
+    assert str(Status.TAKEN) == "Found"
+    assert str(Status.AVAILABLE) == "Not Found"
+
+
+def test_equality():
+    taken = Result.taken()
+    assert taken == taken
+    assert taken == Result.taken()
+    assert taken == Status.TAKEN
+    assert taken == 0
+    assert taken.__eq__("string_type") == NotImplemented
+
+    available = Result.available()
+    assert available == Result.available()
+    assert available == Status.AVAILABLE
+    assert available == 1
+
+    error = Result.error()
+    assert error == Status.ERROR
+    assert error == 2
+
+    skipped = Result.skipped()
+    assert skipped == Status.SKIPPED
+    assert skipped == 3
+
+
+def test_get_reason_and_humanize():
+    assert Result.available().get_reason() == ""
+    assert Result.available("manual reason").get_reason() == "manual reason"
+
+    assert (
+        "Could not resolve hostname"
+        in Result.error(Exception("Error 11001")).get_reason()
+    )
+    assert (
+        "Connection closed by remote server"
+        in Result.error(Exception("Error 10054")).get_reason()
+    )
+
+    assert (
+        Result.available(Exception("some error")).get_reason()
+        == "Exception: Some error"
+    )
+
+
+def test_has_reason():
+    assert not Result.available().has_reason()
+    assert Result.available("Has reason").has_reason()
+    assert not Result.taken().has_reason()
+    assert Result.taken("Has reason").has_reason()
+    assert not Result.error().has_reason()
+    assert Result.error("Has reason").has_reason()
+
+def test_to_number():
+    assert Result.error().to_number() == 2
+    assert Result.available().to_number() == 1
+    assert Result.taken().to_number() == 0
+
+
+def test_from_number():
+    assert Result.from_number(0) == Status.TAKEN
+    assert Result.from_number(1) == Status.AVAILABLE
+    assert Result.from_number(2) == Status.ERROR
+    assert Result.from_number(3) == Status.SKIPPED
+
+    for i in [-2, -1, 4, 5, 6, 7, 8, 9, 10]:
+        assert Result.from_number(i) == Status.ERROR
+
+
+def test_number_roundtrip():
+    a = Result.available()
+    assert Result.from_number(a.to_number()) == a
+    b = Result.taken()
+    assert Result.from_number(b.to_number()) == b
+    c = Result.error()
+    assert Result.from_number(c.to_number()) == c
+
+
+def test_result_update_empty_values():
+    result = Result(Status.TAKEN)
+    result.update(username="test", site_name="", category=None, url="  ", extra={"key": "  "})
+    assert result.username == "test"
+    assert result.site_name == ""
+    assert result.category is None
+    assert result.url == "  "
+    assert "key" not in result.extra
+
+
+def test_result_media():
+    result = Result.taken(media={"avatar": "https://example.com/a.png", " banner ": "https://example.com/b.png "})
+    assert result.media == {"avatar": "https://example.com/a.png", "banner": "https://example.com/b.png"}
+
+    # Test fallback ignores empty media values
+    result.update(media={"empty": "   ", "none": None})
+    assert "empty" not in result.media
+    assert "none" not in result.media
+
+
+def test_update_and_fields():
+    res = Result.available()
+    assert res.username is None
+    assert res.url == ""
+    assert res.extra == {}
+
+    res.update(
+        username="alice",
+        site_name="GitHub",
+        category="Social",
+        url="https://github.com/alice",
+        extra={"status": "Verified"},
+        is_email=False,
+    )
+
+    assert res.username == "alice"
+    assert res.site_name == "GitHub"
+    assert res.category == "Social"
+    assert res.url == "https://github.com/alice"
+    assert res.extra.get("status") == "Verified"
+
+
+def test_output_formats():
+    res = Result.taken(
+        username="testuser",
+        site_name="Example",
+        category="Tech",
+        url="https://example.com/user",
+        extra={"Additional info:": "smth"},
+        media={"avatar": "https://example.com/a.png"},
+    )
+
+    d = res.as_dict()
+    assert d["url"] == "https://example.com/user"
+    assert d["extra"] == {"additional_info": "smth"}
+    assert d["media"] == {"avatar": "https://example.com/a.png"}
+    assert d["status"] == "Found"
+
+    assert (
+        res.to_csv()
+        == "testuser,Tech,Example,Found,https://example.com/user,additional_info: smth,avatar: https://example.com/a.png,"
+    )
+
+    json_std = res.to_json()
+    assert '"username": "testuser"' in json_std
+    assert '"url": "https://example.com/user"' in json_std
+    assert '"extra":{\n"additional_info":"smth"\n}' in json_std.replace(" ", "")
+    assert '"media":{\n"avatar":"https://example.com/a.png"\n}' in json_std.replace(" ", "")
+
+    res.update(is_email=True)
+    json_email = res.to_json()
+    assert '"email": "testuser"' in json_email
+    assert '"username":' not in json_email
+
+
+def test_console_output_and_show_url():
+    conf = ScanConfig()
+    v_conf = ScanConfig(verbose=True)
+
+    res = Result.taken(
+        site_name="MySite", url="https://mysite.com/u", extra={"info": "smth"}
+    )
+
+    out_hidden = res.get_console_output(conf)
+    assert "[✔]" in out_hidden
+    assert "Found" in out_hidden
+    assert "info: smth" in out_hidden
+    assert "https://mysite.com" not in out_hidden
+
+    out_visible = res.get_console_output(v_conf)
+    assert "[https://mysite.com/u]" in out_visible
+    assert "info: smth" in out_visible
+
+    res_skip = Result.skipped(site_name="PrivacySite")
+    output = res_skip.get_console_output(conf)
+    assert "[~]" in output
+    assert "Skipped" in output
+
+
+def test_debug_string():
+    res = Result.available(
+        username="dev", url="http://dev.link", extra={"mode": "Debug info"}
+    )
+    debug_str = res.debug()
+    assert 'url: "http://dev.link"' in debug_str
+    assert "extra: \"{'mode': 'Debug info'}\"" in debug_str
+    assert "status: Not Found" in debug_str
+
+
+def test_show(capsys):
+    conf = ScanConfig()
+    res = Result.taken(site_name="ShowSite")
+    res.show(conf)
+    captured = capsys.readouterr()
+    assert "ShowSite" in captured.out
+    assert "Found" in captured.out
+
+
+def test_indentate():
+    assert indent_text(".", -1) == "."
+    assert indent_text(".", 0) == "."
+    assert indent_text(".", 2) == 2 * " " + "."
+
+    msg = (
+        "This is a test message\n"
+        "made to test the indentation\n"
+        "and shouldn't be changed."
+    )
+
+    for i in range(0, 6):
+        new = indent_text(msg, i, False)
+        for line in new.splitlines():
+            assert line.startswith(" " * i)
+
+        new = indent_text(msg, i, True)
+        for j, line in enumerate(new.splitlines()):
+            if j == 0:
+                assert not line.startswith(" ")
+            else:
+                assert line.startswith(" " * i)
+
+
+@pytest.mark.parametrize(
+    "raw", ["=1+1", "+1+1", "-1+1", "@SUM(A1)", "\t=cmd", "\r=cmd"]
+)
+def test_csv_cell_neutralizes_formula_triggers(raw):
+    neutralized = _neutralize_csv_cell(raw)
+    assert neutralized
+    assert neutralized.startswith("'")
+
+
+def test_to_csv_neutralizes_username_field():
+    result = Result.available(username='=HYPERLINK("http://evil")', site_name="smth")
+    csv_text = result.to_csv()
+    assert "'=HYPERLINK" in csv_text
+    assert csv_text.count("=HYPERLINK") == 1
+
+
+def test_to_csv_neutralizes_extra_value_with_dangerous_key():
+    result = Result.taken(
+        username="x", platform="tumblr", extra={"command": "=cmd|/c calc"}
+    )
+    csv_text = result.to_csv()
+    assert not csv_text.startswith("=cmd")
+    assert not csv_text.lstrip('"').startswith("=cmd")
+
+def test_humanize_exception_dns_and_network_branches():
+    assert (
+        "No internet connection or dns failure"
+        in Result.error(Exception("[Errno 7] no address associated with hostname")).get_reason()
+    )
+    assert (
+        "Network unreachable"
+        in Result.error(Exception("[Errno 101] Network is unreachable")).get_reason()
+    )
+
+
+def test_get_reason_skipped_default_message():
+    skipped = Result.skipped()
+    assert skipped.get_reason() == "Notifies the target by forgot password email or similar"
+
+    skipped_with_reason = Result.skipped("custom skip reason")
+    assert skipped_with_reason.get_reason() == "custom skip reason"
+
+
+def test_get_output_color_and_icon_per_status():
+    assert Result.taken().get_output_color() == Fore.GREEN
+    assert Result.taken().get_output_icon() == "[✔]"
+
+    assert Result.available().get_output_color() == Fore.RED
+    assert Result.available().get_output_icon() == "[✘]"
+
+    assert Result.error().get_output_color() == Fore.YELLOW
+    assert Result.error().get_output_icon() == "[!]"
+
+    assert Result.skipped().get_output_color() == Fore.WHITE
+    assert Result.skipped().get_output_icon() == "[~]"
+
+
+def test_show_default_filters_non_taken(capsys):
+    conf = ScanConfig()
+
+    Result.available(site_name="HiddenSite").show(conf)
+    assert capsys.readouterr().out == ""
+
+    Result.skipped(site_name="SkippedSite").show(conf)
+    assert "SkippedSite" in capsys.readouterr().out
+
+    Result.taken(site_name="VisibleSite").show(conf)
+    assert "VisibleSite" in capsys.readouterr().out
+
+
+def test_show_all_displays_non_taken(capsys):
+    conf = ScanConfig(show_all=True)
+
+    Result.available(site_name="VisibleSite").show(conf)
+    assert "VisibleSite" in capsys.readouterr().out
+
+
+def test_extra_update_skips_none_and_blank_values():
+    res = Result.available()
+    res.update(extra={"empty_str": "   ", "none_val": None, "kept": "value"})
+    assert "empty_str" not in res.extra
+    assert "none_val" not in res.extra
+    assert res.extra["kept"] == "value"
+
+
+def test_extra_update_preserves_bool_and_int_values():
+    res = Result.available()
+    res.update(extra={"is_verified": True, "follower_count": 42})
+    assert res.extra["is_verified"] is True
+    assert res.extra["follower_count"] == 42

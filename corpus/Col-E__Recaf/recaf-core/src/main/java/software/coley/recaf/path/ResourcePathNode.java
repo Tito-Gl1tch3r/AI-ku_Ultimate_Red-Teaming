@@ -1,0 +1,193 @@
+package software.coley.recaf.path;
+
+import jakarta.annotation.Nonnull;
+import jakarta.annotation.Nullable;
+import software.coley.collections.Lists;
+import software.coley.collections.Maps;
+import software.coley.collections.Unchecked;
+import software.coley.recaf.info.Named;
+import software.coley.recaf.workspace.model.Workspace;
+import software.coley.recaf.workspace.model.bundle.Bundle;
+import software.coley.recaf.workspace.model.resource.WorkspaceFileResource;
+import software.coley.recaf.workspace.model.resource.WorkspaceResource;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+
+/**
+ * Path node for {@link WorkspaceResource} types.
+ *
+ * @author Matt Coley
+ */
+public class ResourcePathNode extends AbstractPathNode<Workspace, WorkspaceResource> {
+	/**
+	 * Type identifier for annotation nodes.
+	 */
+	public static final String TYPE_ID = "resource";
+
+	/**
+	 * Node without parent.
+	 *
+	 * @param resource
+	 * 		Resource value.
+	 */
+	public ResourcePathNode(@Nonnull WorkspaceResource resource) {
+		this((WorkspacePathNode) null, resource);
+	}
+
+	/**
+	 * Node with parent.
+	 *
+	 * @param parent
+	 * 		Parent node.
+	 * @param resource
+	 * 		Resource value.
+	 *
+	 * @see WorkspacePathNode#child(WorkspaceResource)
+	 */
+	public ResourcePathNode(@Nullable WorkspacePathNode parent, @Nonnull WorkspaceResource resource) {
+		super(TYPE_ID, parent, resource);
+	}
+
+	/**
+	 * Node with parent.
+	 *
+	 * @param parent
+	 * 		Parent node.
+	 * @param resource
+	 * 		Resource value.
+	 *
+	 * @see WorkspacePathNode#child(WorkspaceResource)
+	 */
+	public ResourcePathNode(@Nullable EmbeddedResourceContainerPathNode parent, @Nonnull WorkspaceResource resource) {
+		super(TYPE_ID, parent, resource);
+	}
+
+	/**
+	 * @param bundle
+	 * 		Bundle to wrap into node.
+	 *
+	 * @return Path node of bundle, with the current resource as parent.
+	 */
+	@Nonnull
+	public BundlePathNode child(@Nonnull Bundle<?> bundle) {
+		return new BundlePathNode(this, bundle);
+	}
+
+	/**
+	 * @return Path node for a container of multiple embedded resources.
+	 */
+	@Nonnull
+	public EmbeddedResourceContainerPathNode embeddedChildContainer() {
+		Workspace valueOfType = Objects.requireNonNull(getValueOfType(Workspace.class),
+				"Path did not contain workspace in parent");
+		return new EmbeddedResourceContainerPathNode(this, valueOfType);
+	}
+
+	/**
+	 * @return {@code true} when this resource node, wraps the primary resource of a workspace.
+	 */
+	public boolean isPrimary() {
+		PathNode<Workspace> parent = getParent();
+		if (parent == null)
+			return false;
+		return parent.getValue().getPrimaryResource() == getValue();
+	}
+
+	/**
+	 * @return {@code true} when this resource node, wraps the primary resource of a workspace or any resource embedded in the primary resource.
+	 */
+	public boolean isPrimaryOrEmbeddedInPrimary() {
+		PathNode<Workspace> parent = getParent();
+		if (parent == null)
+			return false;
+		Workspace workspace = parent.getValue();
+		WorkspaceResource primary = workspace.getPrimaryResource();
+		WorkspaceResource resource = getValue();
+		while (resource != null) {
+			if (primary == resource)
+				return true;
+			resource = resource.getContainingResource();
+		}
+		return false;
+	}
+
+	@Nonnull
+	@Override
+	public Set<String> directParentTypeIds() {
+		return Set.of(WorkspacePathNode.TYPE_ID, EmbeddedResourceContainerPathNode.TYPE_ID);
+	}
+
+	@Override
+	public int localCompare(PathNode<?> o) {
+		if (this == o) return 0;
+
+		if (o instanceof ResourcePathNode resourcePathNode) {
+			PathNode<Workspace> parent = getParent();
+			Workspace workspace = parentValue();
+			WorkspaceResource resource = getValue();
+			WorkspaceResource otherResource = resourcePathNode.getValue();
+
+			if (parent instanceof EmbeddedResourceContainerPathNode) {
+				PathNode<WorkspaceResource> parentOfParent = Unchecked.cast(parent.getParent());
+				WorkspaceResource containingResource = parentOfParent.getValue();
+				String ourKey = embeddedResourceKey(containingResource, resource);
+				String otherKey = embeddedResourceKey(containingResource, otherResource);
+				return Named.STRING_PATH_COMPARATOR.compare(ourKey, otherKey);
+			} else {
+				if (workspace != null) {
+					if (resource == otherResource)
+						return 0;
+
+					// Show in order as in the workspace (unknown/supporting resources shown last).
+					List<WorkspaceResource> resources = workspace.getAllResources(false);
+					int thisIndex = Lists.identityIndexOf(resources, resource);
+					int otherIndex = Lists.identityIndexOf(resources, otherResource);
+					if (thisIndex == -1 && otherIndex >= 0)
+						return 1;
+					else if (thisIndex >= 0 && otherIndex == -1)
+						return -1;
+					else
+						return Integer.compare(thisIndex, otherIndex);
+				} else {
+					// Enforce some ordering. Not ideal but works.
+					return Named.STRING_COMPARATOR.compare(
+							resource.getClass().getSimpleName(),
+							otherResource.getClass().getSimpleName()
+					);
+				}
+			}
+		}
+		return 0;
+	}
+
+	@Nonnull
+	private static String embeddedResourceKey(@Nonnull WorkspaceResource containingResource,
+	                                          @Nonnull WorkspaceResource targetResource) {
+		// Get key of the target resource in the map of embedded resources.
+		Map<String, WorkspaceFileResource> embeddedResources = containingResource.getEmbeddedResources();
+		String directKey = Maps.identityKeyOf(embeddedResources, targetResource);
+		if (directKey != null)
+			return directKey;
+
+		// If it is not directly embedded, check if it's nested in any of the embedded resources.
+		for (Map.Entry<String, WorkspaceFileResource> entry : embeddedResources.entrySet()) {
+			String nestedKey = embeddedResourceKey(entry.getValue(), targetResource);
+			if (!"?".equals(nestedKey))
+				return entry.getKey() + "/" + nestedKey;
+		}
+
+		return "?";
+	}
+
+	@Override
+	public boolean equals(Object o) {
+		// Resource equality checks are abysmally slow because are checking if all the contained
+		// contents are also equal. Realistically we can get away with a reference check.
+		if (o instanceof ResourcePathNode otherPath)
+			return getValue() == otherPath.getValue() && Objects.equals(getParent(), otherPath.getParent());
+		return false;
+	}
+}

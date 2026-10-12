@@ -1,0 +1,659 @@
+//! Command-mediation runtime support.
+//!
+//! The profile resolver lives in `command_policy`; this module owns the
+//! Linux/macOS runtime pieces: private shim materialisation, outer exec gating,
+//! shim IPC, caller resolution, and brokered command launch.
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) struct PreparedToolSandboxRuntime;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl PreparedToolSandboxRuntime {
+    pub(crate) fn emitted_error_response(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn cleanup_runtime_dir(&self) {}
+
+    pub(crate) fn runtime_dir(&self) -> Option<&std::path::Path> {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn maybe_run_internal_tool_sandbox_entrypoint() -> bool {
+    false
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn record_main_start() {}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn log_main_total() {}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn signal_active_children_in_pgroup(
+    _pgid: nix::unistd::Pid,
+    _sig: nix::sys::signal::Signal,
+) {
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn stop_active_children_in_pgroup(_pgid: nix::unistd::Pid) -> Vec<u32> {
+    Vec::new()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn resume_mediated_children(_pids: &[u32]) {}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn signal_relay_write_fd() -> i32 {
+    -1
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn stop_signal_relay() {}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod audit_context;
+// Unconditional: readers of an event log classify decisions on every platform,
+// and both platforms' emitters type-check against the same vocabulary.
+pub(crate) mod command_policy_decision;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod credentials;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod dynamic_providers;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod env;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod launch;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod policy;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod protocol;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod shim;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod token_broker;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod url_shim;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct ToolSandboxPrepare<'a> {
+    pub(crate) config: &'a crate::command_policy::CommandPoliciesConfig,
+    #[cfg(target_os = "linux")]
+    pub(crate) initial_program: &'a std::path::Path,
+    /// Command binaries already resolved (canonicalized, stat'd, hashed)
+    /// while validating the profile. When present, plan construction reuses
+    /// this instead of resolving — and re-hashing — every controlled binary
+    /// a second time.
+    pub(crate) resolved_command_binaries:
+        Option<&'a crate::command_policy::ResolvedCommandBinaries>,
+    pub(crate) audit_context: ToolSandboxAuditContext,
+    pub(crate) allowed_commands: &'a [String],
+    pub(crate) blocked_commands: &'a [String],
+    pub(crate) outer_caps: &'a nono::CapabilitySet,
+    /// Resolved filesystem deny paths from the agent's sandbox. A mediated
+    /// command's live working directory is rejected if it falls under any of
+    /// these, so a command can't be steered into a directory the agent is denied.
+    pub(crate) deny_paths: &'a [std::path::PathBuf],
+    /// Resolved `filesystem.bypass_protection` paths from the agent's sandbox.
+    /// Paired with `deny_paths` these say which denies the agent actually
+    /// lifted, so a command policy cannot claim keychain authority the outer
+    /// sandbox was refused. Landlock has no deny-within-allow, so a Linux
+    /// child sandbox has no deny for a bypass to lift.
+    #[cfg(target_os = "macos")]
+    pub(crate) bypass_protection_paths: &'a [crate::policy::AppliedBypass],
+    pub(crate) policy_root: &'a std::path::Path,
+    pub(crate) proxy_credentials: &'a std::collections::BTreeSet<String>,
+    pub(crate) reserved_proxy_ports: &'a std::collections::BTreeSet<u16>,
+    /// Command-owned proxy variables. These carry a proxy credential whose
+    /// authority is restricted to that command sandbox's proxy policy.
+    pub(crate) scoped_proxy_env_vars: &'a std::collections::BTreeMap<String, Vec<(String, String)>>,
+    pub(crate) proxy_trust_bundle_paths: &'a [std::path::PathBuf],
+    /// Shared token broker for nonce-at-L7 resolution. When `None` a new
+    /// private broker is created for this session.
+    pub(crate) shared_broker: Option<crate::tool_sandbox::token_broker::SharedBroker>,
+}
+
+/// Stable identity for the proxy enforcing one effective command sandbox.
+/// Intercept indices refer to their position after profile inheritance/merge.
+pub(crate) fn proxy_scope_key(
+    command: &str,
+    caller: &str,
+    intercept_index: Option<usize>,
+) -> String {
+    match intercept_index {
+        Some(index) => format!("{command}::{caller}::intercept::{index}"),
+        None => format!("{command}::{caller}"),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn required_scoped_proxy_env<'a>(
+    envs: &'a std::collections::BTreeMap<String, Vec<(String, String)>>,
+    scope: &str,
+    command: &str,
+) -> nono::Result<&'a [(String, String)]> {
+    envs.get(scope).map(Vec::as_slice).ok_or_else(|| {
+        nono::NonoError::SandboxInit(format!(
+            "command sandbox for '{command}' has a proxy policy but no scoped proxy"
+        ))
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn policy_uses_proxy_route(
+    policy: &crate::command_policy::CommandSandboxConfig,
+    credentials: &std::collections::BTreeMap<String, self::credentials::ResolvedCredential>,
+) -> bool {
+    let uses_proxy_credential = self::policy::policy_credential_names(policy)
+        .iter()
+        .any(|name| {
+            matches!(
+                credentials.get(*name),
+                Some(self::credentials::ResolvedCredential::Proxy)
+            )
+        });
+    let uses_proxy_domain = policy
+        .network
+        .as_ref()
+        .is_some_and(|network| !network.allow_domain.is_empty());
+    uses_proxy_credential || uses_proxy_domain
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_scoped_proxy_network(
+    caps: &nono::CapabilitySet,
+    policy: &crate::command_policy::CommandSandboxConfig,
+    reserved_proxy_ports: &std::collections::BTreeSet<u16>,
+    command: &str,
+) -> nono::Result<()> {
+    if matches!(caps.network_mode(), nono::NetworkMode::AllowAll) {
+        return Err(nono::NonoError::SandboxInit(format!(
+            "command sandbox for '{command}' combines proxy policy with unrestricted direct network access"
+        )));
+    }
+    if policy.network.as_ref().is_some_and(|network| {
+        network
+            .tcp_connect_ports
+            .iter()
+            .any(|port| reserved_proxy_ports.contains(port))
+    }) {
+        return Err(nono::NonoError::SandboxInit(format!(
+            "command sandbox for '{command}' grants an active nono proxy port through direct network policy"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod proxy_scope_tests {
+    use super::{proxy_scope_key, validate_scoped_proxy_network};
+    use crate::command_policy::{CommandNetworkConfig, CommandSandboxConfig};
+    use nono::{CapabilitySet, NetworkMode};
+
+    #[test]
+    fn keys_distinguish_callers_and_intercepts() {
+        assert_eq!(proxy_scope_key("curl", "session", None), "curl::session");
+        assert_eq!(proxy_scope_key("curl", "git", None), "curl::git");
+        assert_eq!(
+            proxy_scope_key("curl", "git", Some(2)),
+            "curl::git::intercept::2"
+        );
+    }
+
+    #[test]
+    fn scoped_proxy_rejects_unrestricted_and_session_port_network() {
+        let allow_all = CapabilitySet::new().set_network_mode(NetworkMode::AllowAll);
+        assert!(
+            validate_scoped_proxy_network(
+                &allow_all,
+                &CommandSandboxConfig::default(),
+                &std::collections::BTreeSet::from([9000]),
+                "curl",
+            )
+            .is_err()
+        );
+
+        let mut restricted = CapabilitySet::new();
+        restricted.add_tcp_connect_port(9000);
+        let policy = CommandSandboxConfig {
+            network: Some(CommandNetworkConfig {
+                tcp_connect_ports: vec![9000],
+                ..CommandNetworkConfig::default()
+            }),
+            ..CommandSandboxConfig::default()
+        };
+        assert!(
+            validate_scoped_proxy_network(
+                &restricted,
+                &policy,
+                &std::collections::BTreeSet::from([8000, 9000]),
+                "curl"
+            )
+            .is_err()
+        );
+    }
+}
+
+/// Does `caps` grant `mode` access to `path`, via a directory subtree grant or
+/// an exact-file grant?
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn caps_grant(caps: &nono::CapabilitySet, path: &std::path::Path, mode: nono::AccessMode) -> bool {
+    caps.fs_capabilities().iter().any(|cap| {
+        cap.access.contains(mode)
+            && if cap.is_file {
+                cap.resolved == path
+            } else {
+                path.starts_with(&cap.resolved)
+            }
+    })
+}
+
+/// Admit a mediated command's live working directory, returning whether the
+/// agent can also *write* it.
+///
+/// A command may only run where the launching agent itself is granted access —
+/// inside the agent's effective read region (allow − deny). The agent always
+/// owns its `--workdir` (`policy_root`); any other `cwd` must be within the
+/// agent's read grants and not under any deny path (the agent's broad allow can
+/// otherwise cover a denied subtree). This keeps the live-cwd resolution of
+/// `.`/`@git:*` from ever handing a command filesystem reach the agent lacks —
+/// e.g. steering a network-capable command into a credential directory the
+/// agent is denied. Errors (rejecting the command) when the cwd is outside the
+/// agent's granted filesystem; the returned bool lets callers cap the command's
+/// cwd write access at the agent's own (write non-escalation).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn admit_command_cwd(
+    command: &str,
+    cwd: &std::path::Path,
+    policy_root: &std::path::Path,
+    outer_caps: &nono::CapabilitySet,
+    deny_paths: &[std::path::PathBuf],
+) -> nono::Result<bool> {
+    let cwd_denied = deny_paths.iter().any(|deny| cwd.starts_with(deny));
+    let cwd_under_workdir = cwd.starts_with(policy_root);
+    if cwd_denied || (!cwd_under_workdir && !caps_grant(outer_caps, cwd, nono::AccessMode::Read)) {
+        return Err(nono::NonoError::SandboxInit(format!(
+            "'{command}' was invoked in {}, which is outside the agent's granted filesystem. nono \
+             will not run a mediated command in a directory the agent itself cannot access. Grant \
+             this directory to the agent's sandbox if it should be usable.",
+            cwd.display()
+        )));
+    }
+    Ok(cwd_under_workdir || caps_grant(outer_caps, cwd, nono::AccessMode::Write))
+}
+
+/// Lexically resolve `.`/`..` components in `path` without touching the
+/// filesystem.
+///
+/// Callers compare a policy-resolved path against an already-canonical
+/// prefix via `starts_with` to decide whether a grant falls inside a
+/// directory (e.g. the command's live cwd). `starts_with` compares path
+/// *components*, not resolved locations, so an unnormalized `..` segment
+/// (e.g. `cwd.join("../out")`) lexically starts with `cwd` even though it
+/// actually resolves outside it. Normalizing first fixes that without
+/// requiring the path to exist (unlike `Path::canonicalize`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf {
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else {
+                    normalized.push(component);
+                }
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
+/// Restore owner-write on every directory in `dir`'s tree so a following
+/// `remove_dir_all` can unlink entries inside sealed subdirectories.
+///
+/// The shim directory is sealed to `0o500` while the sandbox runs so its
+/// private shim copies stay immutable. Unlinking a file needs write on its
+/// *parent* directory and `remove_dir_all` does not chmod as it descends, so
+/// without this the per-invocation runtime directory leaks on every exit.
+/// Best-effort and never follows or modifies symlinks; a real failure still
+/// surfaces from the subsequent `remove_dir_all`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn restore_dir_tree_writable(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return;
+    };
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return;
+    }
+    // Grant owner rwx before descending so we can traverse and unlink children.
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        restore_dir_tree_writable(&entry.path());
+    }
+}
+
+/// Whether the agent's own filesystem grants admit *writing* `path` directly.
+///
+/// True when `path` is (or is under) the agent's own `--workdir`
+/// (`policy_root`, always writable by the agent), or when the agent holds an
+/// explicit write grant covering `path` and no deny path covers it. Used to
+/// check each policy write-grant against the agent's actual capabilities
+/// individually, rather than a single verdict for the whole live cwd — a
+/// grant on a subdirectory the agent can write should stay writable even
+/// when the surrounding cwd itself is not agent-writable.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn agent_can_write(
+    path: &std::path::Path,
+    policy_root: &std::path::Path,
+    outer_caps: &nono::CapabilitySet,
+    deny_paths: &[std::path::PathBuf],
+) -> bool {
+    let denied = deny_paths.iter().any(|deny| path.starts_with(deny));
+    !denied
+        && (path.starts_with(policy_root) || caps_grant(outer_caps, path, nono::AccessMode::Write))
+}
+
+// A policy's fs_write_file entries are best-effort: not every candidate
+// path exists on every machine (e.g. a log file some other tool creates
+// lazily). Skip a missing one rather than denying the whole command —
+// mirrors add_optional_dir/add_optional_read_file in each platform module.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn add_optional_write_file(
+    caps: &mut nono::CapabilitySet,
+    path: std::path::PathBuf,
+) -> nono::Result<()> {
+    match nono::FsCapability::new_file(&path, nono::AccessMode::ReadWrite) {
+        Ok(capability) => {
+            caps.add_fs(capability);
+            Ok(())
+        }
+        Err(nono::NonoError::PathNotFound(_)) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(test)]
+mod add_optional_write_file_tests {
+    use super::add_optional_write_file;
+    use nono::CapabilitySet;
+    use std::path::PathBuf;
+
+    #[test]
+    fn missing_path_is_skipped_not_an_error() {
+        let mut caps = CapabilitySet::new();
+
+        let result = add_optional_write_file(&mut caps, PathBuf::from("/no/such/path.log"));
+
+        assert!(result.is_ok());
+        assert!(caps.fs_capabilities().is_empty());
+    }
+
+    #[test]
+    fn existing_path_is_granted() {
+        let mut caps = CapabilitySet::new();
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+
+        let result = add_optional_write_file(&mut caps, file.path().to_path_buf());
+
+        assert!(result.is_ok());
+        assert_eq!(caps.fs_capabilities().len(), 1);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(test)]
+mod agent_can_write_tests {
+    use super::agent_can_write;
+    use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability};
+    use std::path::PathBuf;
+
+    fn write_cap(resolved: &str) -> FsCapability {
+        FsCapability {
+            original: PathBuf::from(resolved),
+            resolved: PathBuf::from(resolved),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        }
+    }
+
+    #[test]
+    fn path_under_workdir_is_writable() {
+        let caps = CapabilitySet::new();
+        let policy_root = PathBuf::from("/work");
+
+        assert!(agent_can_write(
+            &PathBuf::from("/work/sub"),
+            &policy_root,
+            &caps,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn subdirectory_with_explicit_write_grant_is_writable_even_outside_workdir() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(write_cap("/data/repo/cache"));
+        let policy_root = PathBuf::from("/work");
+
+        assert!(agent_can_write(
+            &PathBuf::from("/data/repo/cache"),
+            &policy_root,
+            &caps,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn path_without_any_grant_is_not_writable() {
+        let caps = CapabilitySet::new();
+        let policy_root = PathBuf::from("/work");
+
+        assert!(!agent_can_write(
+            &PathBuf::from("/data/repo"),
+            &policy_root,
+            &caps,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn denied_path_is_not_writable_even_with_a_grant() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(write_cap("/data/repo"));
+        let policy_root = PathBuf::from("/work");
+        let deny_paths = vec![PathBuf::from("/data/repo/secret")];
+
+        assert!(!agent_can_write(
+            &PathBuf::from("/data/repo/secret"),
+            &policy_root,
+            &caps,
+            &deny_paths
+        ));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(test)]
+mod lexically_normalize_tests {
+    use super::lexically_normalize;
+    use std::path::PathBuf;
+
+    #[test]
+    fn parent_dir_walks_back_out_of_prefix() {
+        let normalized = lexically_normalize(&PathBuf::from("/work/sub/../out"));
+
+        assert_eq!(normalized, PathBuf::from("/work/out"));
+        assert!(!normalized.starts_with("/work/sub"));
+    }
+
+    #[test]
+    fn cur_dir_is_dropped() {
+        let normalized = lexically_normalize(&PathBuf::from("/work/./sub"));
+
+        assert_eq!(normalized, PathBuf::from("/work/sub"));
+    }
+
+    #[test]
+    fn path_with_no_dot_components_is_unchanged() {
+        let normalized = lexically_normalize(&PathBuf::from("/work/sub/dir"));
+
+        assert_eq!(normalized, PathBuf::from("/work/sub/dir"));
+    }
+
+    #[test]
+    fn parent_dir_past_root_is_kept_literal() {
+        let normalized = lexically_normalize(&PathBuf::from("/../escaped"));
+
+        assert_eq!(normalized, PathBuf::from("/../escaped"));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(test)]
+mod admit_command_cwd_tests {
+    use super::admit_command_cwd;
+    use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability};
+    use std::path::PathBuf;
+
+    fn read_cap(resolved: &str) -> FsCapability {
+        FsCapability {
+            original: PathBuf::from(resolved),
+            resolved: PathBuf::from(resolved),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::User,
+        }
+    }
+
+    fn read_write_cap(resolved: &str) -> FsCapability {
+        FsCapability {
+            original: PathBuf::from(resolved),
+            resolved: PathBuf::from(resolved),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::User,
+        }
+    }
+
+    #[test]
+    fn cwd_under_workdir_is_admitted_and_writable() {
+        let caps = CapabilitySet::new();
+        let policy_root = PathBuf::from("/work");
+        let cwd = PathBuf::from("/work/sub");
+
+        let writable = admit_command_cwd("cmd", &cwd, &policy_root, &caps, &[])
+            .expect("cwd should be admitted");
+
+        assert!(writable);
+    }
+
+    #[test]
+    fn cwd_in_read_grant_outside_workdir_is_admitted_but_not_writable() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(read_cap("/data"));
+        let policy_root = PathBuf::from("/work");
+        let cwd = PathBuf::from("/data/repo");
+
+        let writable = admit_command_cwd("cmd", &cwd, &policy_root, &caps, &[])
+            .expect("cwd should be admitted");
+
+        assert!(!writable);
+    }
+
+    #[test]
+    fn cwd_in_read_write_grant_outside_workdir_is_writable() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(read_write_cap("/data"));
+        let policy_root = PathBuf::from("/work");
+        let cwd = PathBuf::from("/data/repo");
+
+        let writable = admit_command_cwd("cmd", &cwd, &policy_root, &caps, &[])
+            .expect("cwd should be admitted");
+
+        assert!(writable);
+    }
+
+    #[test]
+    fn cwd_outside_all_grants_is_rejected() {
+        let caps = CapabilitySet::new();
+        let policy_root = PathBuf::from("/work");
+        let cwd = PathBuf::from("/etc/secrets");
+
+        let err = admit_command_cwd("cmd", &cwd, &policy_root, &caps, &[])
+            .expect_err("cwd should be rejected");
+
+        assert!(matches!(err, nono::NonoError::SandboxInit(_)));
+    }
+
+    #[test]
+    fn cwd_under_deny_path_inside_broad_allow_grant_is_rejected() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(read_write_cap("/data"));
+        let policy_root = PathBuf::from("/work");
+        let cwd = PathBuf::from("/data/secret");
+        let deny_paths = vec![PathBuf::from("/data/secret")];
+
+        let err = admit_command_cwd("cmd", &cwd, &policy_root, &caps, &deny_paths)
+            .expect_err("cwd should be rejected");
+
+        assert!(matches!(err, nono::NonoError::SandboxInit(_)));
+    }
+
+    #[test]
+    fn cwd_under_workdir_but_also_under_deny_path_is_rejected() {
+        let caps = CapabilitySet::new();
+        let policy_root = PathBuf::from("/work");
+        let cwd = PathBuf::from("/work/secret");
+        let deny_paths = vec![PathBuf::from("/work/secret")];
+
+        let err = admit_command_cwd("cmd", &cwd, &policy_root, &caps, &deny_paths)
+            .expect_err("cwd should be rejected");
+
+        assert!(matches!(err, nono::NonoError::SandboxInit(_)));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use self::audit_context::ToolSandboxAuditContext;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use self::policy::*;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use self::policy::{
+    InvocationPolicyOutcome, evaluate_invocation_policy, policy_credential_names,
+};
+
+#[cfg(target_os = "linux")]
+#[path = "platform/linux.rs"]
+mod linux;
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{
+    PreparedToolSandboxRuntime, TOOL_SANDBOX_PARENT_MONOTONIC_ENV, log_main_total,
+    maybe_run_internal_tool_sandbox_entrypoint, record_main_start,
+};
+
+#[cfg(target_os = "macos")]
+#[path = "platform/macos.rs"]
+mod macos;
+
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{
+    PreparedToolSandboxRuntime, log_main_total, maybe_run_internal_tool_sandbox_entrypoint,
+    record_main_start, resume_mediated_children, signal_active_children_in_pgroup,
+    signal_relay_write_fd, stop_active_children_in_pgroup, stop_signal_relay,
+};

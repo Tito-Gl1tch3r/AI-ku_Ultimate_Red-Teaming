@@ -1,0 +1,131 @@
+package resourcehandler
+
+import (
+	"context"
+	_ "embed"
+	"testing"
+
+	"github.com/kubescape/k8s-interface/k8sinterface"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/opa-utils/reporthandling/apis"
+	helpersv1 "github.com/kubescape/opa-utils/reporthandling/helpers/v1"
+	reportv2 "github.com/kubescape/opa-utils/reporthandling/v2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic/fake"
+	fakeclientset "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
+)
+
+func Test_getCloudMetadata(t *testing.T) {
+
+	tests := []struct {
+		want     apis.ICloudParser
+		provider string
+		name     string
+	}{
+		{
+			name:     "Test_getCloudMetadata - GitVersion: GKE",
+			provider: "gke",
+			want:     helpersv1.NewGKEMetadata(""),
+		},
+		{
+			name:     "Test_getCloudMetadata_context_EKS",
+			provider: "eks",
+			want:     helpersv1.NewEKSMetadata(""),
+		},
+		{
+			name:     "Test_getCloudMetadata_context_AKS",
+			provider: "aks",
+			want:     helpersv1.NewAKSMetadata(""),
+		},
+	}
+	k8sinterface.K8SConfig = &rest.Config{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			got := newCloudMetadata(tt.provider, "")
+			if got == nil {
+				t.Errorf("getCloudMetadata() = %v, want %v", got, tt.want.Provider())
+				return
+			}
+			if got.Provider() != tt.want.Provider() {
+				t.Errorf("getCloudMetadata() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSetCloudMetadataUsesSessionContext(t *testing.T) {
+	k8sinterface.SetClusterContextName("context-b")
+	t.Cleanup(func() { k8sinterface.SetClusterContextName("") })
+	session := &cautils.OPASessionObj{
+		Metadata: &reportv2.Metadata{ContextMetadata: reportv2.ContextMetadata{
+			ClusterContextMetadata: &reportv2.ClusterMetadata{ContextName: "context-a"},
+		}},
+		Report: &reportv2.PostureReport{},
+	}
+
+	setCloudMetadata(session, "aks")
+
+	require.NotNil(t, session.Metadata.ContextMetadata.ClusterContextMetadata.CloudMetadata)
+	assert.Equal(t, "context-a", session.Metadata.ContextMetadata.ClusterContextMetadata.CloudMetadata.GetFullName())
+}
+
+// vapTestScheme returns a runtime.Scheme with VAP and VAPBinding list types
+// registered so the fake dynamic client doesn't panic when vapreconcile.Collect
+// lists them during cluster scans.
+func vapTestScheme() *runtime.Scheme {
+	s := runtime.NewScheme()
+	s.AddKnownTypeWithName(
+		schema.GroupVersionKind{Group: "admissionregistration.k8s.io", Version: "v1", Kind: "ValidatingAdmissionPolicyList"},
+		&unstructured.UnstructuredList{},
+	)
+	s.AddKnownTypeWithName(
+		schema.GroupVersionKind{Group: "admissionregistration.k8s.io", Version: "v1", Kind: "ValidatingAdmissionPolicyBindingList"},
+		&unstructured.UnstructuredList{},
+	)
+	return s
+}
+
+// https://github.com/kubescape/kubescape/pull/1004
+// Cluster named .*eks.* config without a cloudconfig panics whereas we just want to scan a file
+func getResourceHandlerMock() *K8sResourceHandler {
+	client := fakeclientset.NewClientset()
+	fakeDiscovery := client.Discovery()
+
+	k8s := &k8sinterface.KubernetesApi{
+		KubernetesClient: client,
+		DynamicClient:    fake.NewSimpleDynamicClient(vapTestScheme()),
+		DiscoveryClient:  fakeDiscovery,
+		Context:          context.Background(),
+	}
+
+	return NewK8sResourceHandler(context.Background(), k8s, nil, nil, "test")
+}
+func Test_CollectResources(t *testing.T) {
+	resourceHandler := getResourceHandlerMock()
+	objSession := &cautils.OPASessionObj{
+		Metadata: &reportv2.Metadata{
+			ScanMetadata: reportv2.ScanMetadata{
+				ScanningTarget: reportv2.Cluster,
+			},
+		},
+		Report: &reportv2.PostureReport{
+			ClusterAPIServerInfo: nil,
+		},
+	}
+
+	assert.NotPanics(t, func() {
+		CollectResources(context.Background(), resourceHandler, objSession, &cautils.ScanInfo{})
+	}, "Cluster named .*eks.* without a cloud config panics on cluster scan !")
+
+	assert.NotPanics(t, func() {
+		objSession.Metadata.ScanMetadata.ScanningTarget = reportv2.File
+		CollectResources(context.Background(), resourceHandler, objSession, &cautils.ScanInfo{})
+	}, "Cluster named .*eks.* without a cloud config panics on non-cluster scan !")
+
+}

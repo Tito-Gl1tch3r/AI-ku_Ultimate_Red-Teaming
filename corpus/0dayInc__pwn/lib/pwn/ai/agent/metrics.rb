@@ -1,0 +1,1018 @@
+# frozen_string_literal: true
+
+require 'json'
+require 'fileutils'
+require 'time'
+
+module PWN
+  module AI
+    module Agent
+      # PWN::AI::Agent::Metrics is the telemetry layer of the pwn-ai
+      # learning loop. Every tool dispatch performed by
+      # PWN::AI::Agent::Loop is recorded here (name, success, duration,
+      # last error) and persisted to ~/.pwn/metrics.json.
+      #
+      # PromptBuilder re-injects a compact effectiveness summary into the
+      # system prompt on every turn, so the model gains awareness of which
+      # tools historically succeed vs. fail on THIS host and can adapt its
+      # tool selection accordingly. This is one half of the closed
+      # feedback loop that lets pwn-ai continuously make itself smarter
+      # (the other half is PWN::AI::Agent::Learning).
+      #
+      # PER-ENGINE SEGMENTATION
+      # -----------------------
+      # A local Ollama model and a frontier model do NOT have the same
+      # per-tool success rate — blending them mis-advises the local model
+      # about itself. Every record now also increments an :engines[<engine>]
+      # sub-bucket; summary/to_context accept engine: to surface only that
+      # engine's telemetry so the TOOL EFFECTIVENESS block becomes a
+      # genuine per-engine learned policy.
+      module Metrics
+        METRICS_FILE   = File.join(Dir.home, '.pwn', 'metrics.json')
+        HALF_LIFE_DAYS = 14.0
+        CUSUM_K        = 0.15
+        CUSUM_H        = 0.6
+        WINDOW         = 30
+
+        # Supported Method Parameters::
+        # metrics = PWN::AI::Agent::Metrics.load
+
+        public_class_method def self.load
+          FileUtils.mkdir_p(File.dirname(METRICS_FILE))
+          return { tools: {}, updated_at: nil } unless File.exist?(METRICS_FILE)
+
+          JSON.parse(File.read(METRICS_FILE), symbolize_names: true)
+        rescue StandardError
+          { tools: {}, updated_at: nil }
+        end
+
+        # Supported Method Parameters::
+        # PWN::AI::Agent::Metrics.save(
+        #   metrics: 'required - Hash returned by .load / mutated in place'
+        # )
+
+        public_class_method def self.save(opts = {})
+          metrics = opts[:metrics] ||= { tools: {} }
+          metrics[:updated_at] = Time.now.utc.iso8601
+          FileUtils.mkdir_p(File.dirname(METRICS_FILE))
+          # 4.4 — flock + atomic rename
+          path = METRICS_FILE
+          tmp  = File.join(File.dirname(path), ".#{File.basename(path)}.#{Process.pid}.tmp")
+          body = JSON.pretty_generate(metrics)
+          File.open(tmp, File::WRONLY | File::CREAT | File::TRUNC, 0o644) do |f|
+            f.flock(File::LOCK_EX)
+            f.write(body)
+            f.flush
+            f.fsync
+          end
+          File.rename(tmp, path)
+          metrics
+        ensure
+          FileUtils.rm_f(tmp) if defined?(tmp) && tmp && File.exist?(tmp)
+        end
+
+        # Supported Method Parameters::
+        # PWN::AI::Agent::Metrics.record(
+        #   name: 'required - tool name that was dispatched',
+        #   success: 'required - Boolean, did the handler complete without error',
+        #   duration: 'optional - Float seconds the dispatch took',
+        #   error: 'optional - String error message when success is false',
+        #   engine: 'optional - Symbol/String AI engine that chose this tool (segments telemetry)'
+        # )
+
+        public_class_method def self.record(opts = {})
+          name     = opts[:name].to_s
+          success  = opts[:success] ? true : false
+          duration = opts[:duration].to_f
+          error    = opts[:error]
+          engine   = opts[:engine].to_s
+          return if name.empty?
+
+          metrics = load
+          metrics[:tools] ||= {}
+          key = name.to_sym
+          t = metrics[:tools][key] ||= blank_bucket
+          bump(bucket: t, success: success, duration: duration, error: error)
+          unless engine.empty?
+            t[:engines] ||= {}
+            e = t[:engines][engine.to_sym] ||= blank_bucket
+            bump(bucket: e, success: success, duration: duration, error: error)
+          end
+          save(metrics: metrics)
+          append_jsonl(opts.merge(name: name, success: success, duration: duration, error: error, engine: engine))
+          t
+        end
+
+        public_class_method def self.append_jsonl(opts = {})
+          path = File.join(Dir.home, '.pwn', 'logs', 'tool_metrics.jsonl')
+          FileUtils.mkdir_p(File.dirname(path))
+          row = {
+            ts: Time.now.utc.iso8601,
+            session: Thread.current[:pwn_session_id],
+            tool: opts[:name],
+            latency_ms: (opts[:duration].to_f * 1000).round,
+            timeout_used: opts[:timeout],
+            outcome: opts[:success] ? 'ok' : 'err',
+            error_class: opts[:error].to_s.split(':').first,
+            bytes_out: opts[:bytes_out].to_i
+          }
+          File.open(path, 'a') do |f|
+            f.flock(File::LOCK_EX)
+            f.puts(JSON.generate(row))
+          end
+          row
+        rescue StandardError
+          nil
+        end
+
+        # Supported Method Parameters::
+        # rows = PWN::AI::Agent::Metrics.summary(
+        #   limit: 'optional - cap number of tools returned (default 25)',
+        #   engine: 'optional - only that engine\'s sub-bucket (falls back to global when absent)'
+        # )
+
+        public_class_method def self.summary(opts = {})
+          limit  = opts[:limit] || 25
+          engine = opts[:engine].to_s
+          tools  = load[:tools] || {}
+          rows = tools.map do |name, t|
+            b = engine.empty? ? t : (t.dig(:engines, engine.to_sym) || t)
+            calls = b[:calls].to_i
+            ok    = b[:ok].to_i
+            rate  = calls.positive? ? (ok.to_f / calls).round(3) : 0.0
+            avg   = calls.positive? ? (b[:total_duration].to_f / calls).round(3) : 0.0
+            {
+              name: name.to_s,
+              calls: calls,
+              success_rate: rate,
+              judge_rate: judge_rate(name: name),
+              effective_rate: effective_rate(name: name),
+              avg_duration: avg,
+              last_error: b[:last_error],
+              last_at: b[:last_at]
+            }
+          end
+          rows.reject { |r| r[:calls].zero? }
+              .sort_by { |r| [-r[:calls], -r[:success_rate]] }.first(limit)
+        end
+
+        public_class_method def self.snapshot(opts = {})
+          _day = opts[:day]
+          learn = defined?(Learning) ? Learning.stats : {}
+          {
+            success_rate: learn[:success_rate],
+            success_rate_orm: learn[:success_rate_orm],
+            success_rate_heur: learn[:success_rate_heur],
+            brier: (learn.dig(:calibration, :brier) if learn.is_a?(Hash)),
+            proxy_distrust: learn[:proxy_distrust],
+            tools: summary(limit: 8)
+          }
+        end
+
+        public_class_method def self.record_tokens(opts = {})
+          n = opts[:tokens].to_i
+          cost = opts[:cost].to_f
+          model = opts[:model].to_s
+          m = load
+          m[:usage] ||= { tokens: 0, cost: 0.0, calls: 0, by_model: {} }
+          m[:usage][:tokens] += n
+          m[:usage][:cost] += cost
+          m[:usage][:calls] += 1
+          m[:usage][:by_model][model] ||= { tokens: 0, cost: 0.0, calls: 0 }
+          m[:usage][:by_model][model][:tokens] += n
+          m[:usage][:by_model][model][:cost] += cost
+          m[:usage][:by_model][model][:calls] += 1
+          save(metrics: m)
+          m[:usage]
+        end
+
+        public_class_method def self.usage(opts = {})
+          _sid = opts[:session_id]
+          load[:usage] || { tokens: 0, cost: 0.0, calls: 0 }
+        end
+
+        public_class_method def self.routing(opts = {})
+          _n = opts[:n]
+          chain = (PWN::Env.dig(:ai, :routing) if defined?(PWN::Env))
+          Array(chain)
+        rescue StandardError
+          []
+        end
+
+        # Supported Method Parameters::
+        # ctx = PWN::AI::Agent::Metrics.to_context(
+        #   limit: 'optional - cap number of tools included (default 8)',
+        #   engine: 'optional - restrict to one engine\'s telemetry'
+        # )
+
+        public_class_method def self.to_context(opts = {})
+          limit  = opts[:limit] || 8
+          engine = opts[:engine]
+          rows   = summary(limit: limit, engine: engine)
+          rates = "ESR=#{esr[:rate] || '-'} ASR=#{asr[:rate] || '-'}\n"
+          return rates if rows.empty? && (esr[:n].to_i.positive? || asr[:n].to_i.positive?)
+
+          # P4 — when Reward.sentinel says proxy is hacked, haircut displayed
+          # success rates so the model does not trust the lie in the prompt.
+          distrust = defined?(Reward) && Reward.respond_to?(:proxy_distrust) ? Reward.proxy_distrust : 0.0
+          scope = engine.to_s.empty? ? 'historical' : "engine=#{engine}"
+          scope = "#{scope}, proxy_distrust=#{distrust.round(2)}" if distrust.positive?
+          lines = rows.map do |r|
+            # P20 — display effective_rate (judge-blended) when available;
+            # fall back to distrust haircut on raw proxy.
+            rate = r[:success_rate].to_f
+            eff  = r[:effective_rate]
+            adj  = if eff
+                     eff.to_f
+                   else
+                     rate - ((rate - 0.5) * distrust)
+                   end
+            err = r[:last_error] ? " last_err=#{r[:last_error][0, 60]}" : ''
+            jtag = r[:judge_rate] ? " judge=#{(r[:judge_rate].to_f * 100).round(1)}%" : ''
+            tag = distrust.positive? || r[:judge_rate] ? ' (adj)' : ''
+            "  - #{r[:name]}: calls=#{r[:calls]} success=#{(adj * 100).round(1)}%#{tag}#{jtag} avg=#{r[:avg_duration]}s#{err}"
+          end
+          warn_line = distrust.positive? ? "WARNING: reward proxy diverges from judge — success rates haircut by distrust=#{distrust.round(2)}; prefer judge-scored exemplars over raw rates.\n" : ''
+          # P0 ops — surface W1 generator_mix when diet is unhealthy so the
+          # online controller (and the model) prefer underfilled sources.
+          mix_line = ''
+          if defined?(Reward) && Reward.respond_to?(:generator_mix)
+            begin
+              m = Reward.generator_mix
+              unless m[:healthy]
+                mix_line = "W1 MIX: n=#{m[:n]} traj=#{m[:trajectory_fraction]} " \
+                           "urgent=#{Array(m[:urgent]).join(',')} " \
+                           "suppress=#{Array(m[:suppress]).join(',')} " \
+                           "rec=#{m[:recommendation]}\n"
+              end
+            rescue StandardError
+              mix_line = ''
+            end
+          end
+          health = health_line
+          "#{warn_line}#{mix_line}#{health}TOOL EFFECTIVENESS (#{scope}, adapt tool choice accordingly)\n#{lines.join("\n")}\n\n"
+        end
+
+        # P4 helper — Registry.rank calls this so β·advantage is scaled down
+        # when the proxy is untrustworthy.
+        public_class_method def self.proxy_trust
+          d = defined?(Reward) && Reward.respond_to?(:proxy_distrust) ? Reward.proxy_distrust : 0.0
+          (1.0 - d.to_f).clamp(0.0, 1.0)
+        rescue StandardError
+          1.0
+        end
+
+        public_class_method def self.ucb(opts = {})
+          name = opts[:name].to_s
+          c    = (opts[:c] || 1.4).to_f
+          data = load[:tools] || {}
+          t    = data[name.to_sym] || blank_bucket
+          n    = [t[:calls].to_f, 1.0].max
+          total = [data.values.sum { |v| v[:calls].to_f }, 1.0].max
+          # P20 — mean from effective_rate (judge-blended when distrust high)
+          mean  = effective_rate(name: name)
+          mean + (c * Math.sqrt(Math.log(total) / n))
+        rescue StandardError
+          1.0
+        end
+
+        # Supported Method Parameters::
+        # p = PWN::AI::Agent::Metrics.thompson(name: 'shell')
+        #
+        # C1 — Thompson sample from Beta(ok+1, fail+1). Naturally balances
+        # exploit/explore; used by Registry.rank as the tie-breaker.
+
+        public_class_method def self.thompson(opts = {})
+          t = (load[:tools] || {})[opts[:name].to_s.to_sym] || blank_bucket
+          # P20 — when judge samples exist and distrust > 0, tilt Beta toward
+          # judge_rate so Thompson explore/exploit tracks ORM not handler-ok.
+          ok = t[:ok].to_f
+          fail = t[:fail].to_f
+          jn = Array(t[:judge_window]).length
+          if jn >= 3 && proxy_trust < 0.95
+            jr = judge_rate(name: opts[:name]).to_f
+            # pseudo-counts from judge window, mixed by distrust
+            d = (1.0 - proxy_trust).clamp(0.0, 1.0)
+            jok = jr * jn
+            jfail = (1.0 - jr) * jn
+            ok = (ok * (1.0 - d)) + (jok * d)
+            fail = (fail * (1.0 - d)) + (jfail * d)
+          end
+          beta_sample(alpha: ok + 1.0, beta: fail + 1.0)
+        rescue StandardError
+          0.5
+        end
+
+        # Supported Method Parameters::
+        # a = PWN::AI::Agent::Metrics.advantage(name: 'shell')
+        #
+        # C1 — tool.success_rate − global_rate over the rolling window.
+
+        public_class_method def self.advantage(opts = {})
+          data = load[:tools] || {}
+          t    = data[opts[:name].to_s.to_sym]
+          return 0.0 unless t
+
+          # P20 — local/global from effective_rate so bandit tracks judge
+          # when the handler-ok proxy is hacked (proxy_distrust high).
+          local = effective_rate(name: opts[:name])
+          rates = data.keys.map { |k| effective_rate(name: k) }
+          global = rates.empty? ? 0.5 : (rates.sum / rates.length)
+          (local - global).round(3)
+        rescue StandardError
+          0.0
+        end
+
+        # P18/P2 — rolling mean step_reward advantage for a tool.
+        # Sample-efficiency gate: < PRM_MIN_N samples → 0 (no rank noise).
+        # Shrinkage: adv *= min(1, n/PRM_FULL_N) so sparse signal cannot
+        # dominate UCB. Zero-variance windows (all +1 or all -1 from a
+        # single session) damp to 0.5×.
+        PRM_MIN_N  = 5
+        PRM_FULL_N = 20
+
+        public_class_method def self.prm_advantage(opts = {})
+          data = load[:tools] || {}
+          t = data[opts[:name].to_s.to_sym]
+          return 0.0 unless t
+
+          win = Array(t[:prm_window])
+          n = win.length
+          return 0.0 if n < PRM_MIN_N
+
+          mean = win.sum.to_f / n
+          globals = data.values.map { |v| Array(v[:prm_window]) }.select { |w| w.length >= PRM_MIN_N }
+          gmean = if globals.empty?
+                    0.0
+                  else
+                    all = globals.flatten
+                    all.sum.to_f / all.length
+                  end
+          adv = mean - gmean
+          # shrinkage toward 0 until PRM_FULL_N
+          shrink = [n.to_f / PRM_FULL_N, 1.0].min
+          # variance damp: if all equal, halve influence
+          uniq = win.uniq
+          var_damp = uniq.length <= 1 ? 0.5 : 1.0
+          (adv * shrink * var_damp).round(3)
+        rescue StandardError
+          0.0
+        end
+
+        public_class_method def self.prm_n(opts = {})
+          t = (load[:tools] || {})[opts[:name].to_s.to_sym]
+          return 0 unless t
+
+          Array(t[:prm_window]).length
+        rescue StandardError
+          0
+        end
+
+        # P18 — called by Reward.prm after session annotate so live routing
+        # can bias toward tools that recently advanced goals (+1 step_reward).
+        public_class_method def self.record_step_reward(opts = {})
+          name = opts[:name].to_s
+          return if name.empty?
+
+          rew = opts[:reward].to_f.clamp(-1.0, 1.0)
+          m = load
+          m[:tools] ||= {}
+          t = m[:tools][name.to_sym] ||= blank_bucket
+          t[:prm_window] = (Array(t[:prm_window]) + [rew]).last(40)
+          t[:prm_sum] = t[:prm_window].sum
+          t[:prm_n] = t[:prm_window].length
+          save(metrics: m)
+          t
+        rescue StandardError
+          nil
+        end
+
+        # P20 — fold ORM judge (0..1) into per-tool telemetry so UCB /
+        # Thompson / advantage can prefer judge-grounded rates over the
+        # inflated handler-ok proxy when proxy_distrust is high.
+        public_class_method def self.record_judge(opts = {})
+          name = opts[:name].to_s
+          return if name.empty?
+
+          score = opts[:score].to_f.clamp(0.0, 1.0)
+          conf  = opts.key?(:confidence) ? opts[:confidence].to_f.clamp(0.0, 1.0) : 0.7
+          src   = opts[:source].to_s
+          src   = 'heuristic' if src.empty?
+          m = load
+          m[:tools] ||= {}
+          t = m[:tools][name.to_sym] ||= blank_bucket
+          t[:judge_window] = (Array(t[:judge_window]) + [score]).last(40)
+          t[:judge_conf_window] = (Array(t[:judge_conf_window]) + [conf]).last(40)
+          t[:judge_src_window] = (Array(t[:judge_src_window]) + [src]).last(40)
+          t[:judge_sum] = t[:judge_window].sum.to_f
+          t[:judge_n] = t[:judge_window].length
+          save(metrics: m)
+          t
+        rescue StandardError
+          nil
+        end
+
+        # P1 — mean judge confidence for a tool (nil when no samples).
+        public_class_method def self.judge_confidence(opts = {})
+          t = (load[:tools] || {})[opts[:name].to_s.to_sym]
+          return nil unless t
+
+          win = Array(t[:judge_conf_window])
+          return nil if win.empty?
+
+          (win.sum.to_f / win.length).round(3)
+        rescue StandardError
+          nil
+        end
+
+        # Mean judge score for a tool (nil when no ORM samples yet).
+        # When per-sample sources exist, LLM ORM outweighs heuristic overlap
+        # so the proxy haircut tracks the outcome model.
+        public_class_method def self.judge_rate(opts = {})
+          t = (load[:tools] || {})[opts[:name].to_s.to_sym]
+          return nil unless t
+
+          win = Array(t[:judge_window])
+          return nil if win.empty?
+
+          src = Array(t[:judge_src_window])
+          if src.length == win.length && defined?(Reward) && Reward.respond_to?(:judge_sample_weight)
+            num = 0.0
+            den = 0.0
+            win.each_with_index do |score, i|
+              wt = Reward.judge_sample_weight(source: src[i]).to_f
+              num += score.to_f * wt
+              den += wt
+            end
+            return (num / den).round(3) if den.positive?
+          end
+          (win.sum.to_f / win.length).round(3)
+        rescue StandardError
+          nil
+        end
+
+        # Blended success rate: when proxy_distrust > 0 and judge samples
+        # exist, mix judge_rate into the handler-ok rate. distrust=1 → pure
+        # judge (or 0.5 if no judge data). distrust=0 → pure proxy.
+        public_class_method def self.effective_rate(opts = {})
+          name = opts[:name].to_s
+          data = load[:tools] || {}
+          t = data[name.to_sym]
+          return 0.5 unless t
+
+          calls = [t[:calls].to_f, 1.0].max
+          proxy = t[:ok].to_f / calls
+          win = Array(t[:window])
+          proxy = win.sum.to_f / win.length if win.length >= 3
+          distrust = 1.0 - proxy_trust
+          jrate = judge_rate(name: name)
+          if distrust > 0.05 && !jrate.nil?
+            # P1 — scale judge weight by judge confidence so a thin local
+            # heuristic ORM cannot fully replace proxy when distrust is high.
+            # effective_distrust = distrust * mean(confidence), floor 0.15 when
+            # we do have judge samples so the signal still moves the needle.
+            jconf = judge_confidence(name: name)
+            jconf = 0.7 if jconf.nil?
+            eff_d = (distrust * jconf).clamp(0.0, 1.0)
+            eff_d = [eff_d, 0.15].max if jconf >= 0.3
+            ((proxy * (1.0 - eff_d)) + (jrate * eff_d)).clamp(0.0, 1.0).round(3)
+          else
+            proxy.round(3)
+          end
+        rescue StandardError
+          0.5
+        end
+
+        # Supported Method Parameters::
+        # cps = PWN::AI::Agent::Metrics.changepoints
+        #
+        # E1 — tools whose CUSUM tripped (success_rate regime change). The
+        # caller (Mistakes.record / Curriculum) triggers extro_snapshot +
+        # correlate on these so a Mistake caused by env drift is tagged
+        # cause: :env_drift and does NOT count toward [REPEATING].
+
+        public_class_method def self.changepoints(opts = {})
+          within = (opts[:within_secs] || 3_600).to_i
+          now = Time.now.utc
+          (load[:tools] || {}).filter_map do |name, t|
+            cp = t[:changepoint_at]
+            next unless cp && (now - Time.parse(cp)) < within
+
+            { name: name.to_s, at: cp, window_rate: Array(t[:window]).sum.to_f / [Array(t[:window]).length, 1].max }
+          end
+        rescue StandardError
+          []
+        end
+
+        # Supported Method Parameters::
+        # PWN::AI::Agent::Metrics.record_calibration(predicted:, actual:, brier:, engine:)
+        #
+        # W3 — plan_first emits p(success); Loop.run calls this with the
+        # realised outcome. Tracked per-engine so calibration of the local
+        # LoRA vs frontier is comparable.
+
+        public_class_method def self.record_calibration(opts = {})
+          m = load
+          m[:calibration] ||= {}
+          eng = (opts[:engine] || :global).to_s.to_sym
+          c = m[:calibration][eng] ||= { n: 0, brier_sum: 0.0, p_sum: 0.0, a_sum: 0.0 }
+          c[:n]         += 1
+          c[:brier_sum] += opts[:brier].to_f
+          c[:p_sum]     += opts[:predicted].to_f
+          c[:a_sum]     += opts[:actual].to_f
+          save(metrics: m)
+          c
+        end
+
+        # Supported Method Parameters::
+        # cal = PWN::AI::Agent::Metrics.calibration(engine: :ollama)
+
+        public_class_method def self.calibration(opts = {})
+          store = load[:calibration] || {}
+          buckets = if opts.key?(:engine) && !opts[:engine].to_s.empty?
+                      [store[opts[:engine].to_s.to_sym]].compact
+                    else
+                      store.values
+                    end
+          c = buckets.each_with_object({ n: 0, brier_sum: 0.0, p_sum: 0.0, a_sum: 0.0 }) do |b, acc|
+            next unless b.is_a?(Hash)
+
+            acc[:n] += b[:n].to_i
+            acc[:brier_sum] += b[:brier_sum].to_f
+            acc[:p_sum] += b[:p_sum].to_f
+            acc[:a_sum] += b[:a_sum].to_f
+          end
+          return { n: 0, brier: nil } unless c[:n].positive?
+
+          n = c[:n].to_f
+          { n: c[:n], brier: (c[:brier_sum] / n).round(4), mean_predicted: (c[:p_sum] / n).round(3), mean_actual: (c[:a_sum] / n).round(3), overconfidence: ((c[:p_sum] - c[:a_sum]) / n).round(3) }
+        end
+
+        # Supported Method Parameters::
+        # PWN::AI::Agent::Metrics.reset
+
+        public_class_method def self.calibration_green?(opts = {})
+          cal = calibration(engine: opts[:engine])
+          return false if cal[:n].to_i < 8
+          return false if cal[:overconfidence].nil?
+
+          cal[:overconfidence].to_f <= 0.08
+        rescue StandardError
+          false
+        end
+
+        public_class_method def self.scale_prediction(opts = {})
+          p = opts[:predicted].to_f.clamp(0.0, 1.0)
+          cal = calibration(engine: opts[:engine])
+          return p.round(3) if cal[:n].to_i < 8 || cal[:overconfidence].nil?
+
+          oc = cal[:overconfidence].to_f
+          return p.round(3) if oc <= 0.02
+
+          temp = (1.0 + (4.0 * oc.clamp(0.0, 1.0))).clamp(1.0, 8.0)
+          q = p.clamp(1.0e-6, 1.0 - 1.0e-6)
+          logit = Math.log(q / (1.0 - q))
+          scaled = 1.0 / (1.0 + Math.exp(-(logit / temp)))
+          scaled.round(3)
+        rescue StandardError
+          opts[:predicted].to_f.clamp(0.0, 1.0)
+        end
+
+        public_class_method def self.record_attempt(opts = {})
+          kind = opts[:kind].to_s
+          raise ArgumentError, 'kind must be exploit or attack' unless %w[exploit attack].include?(kind)
+
+          success = opts[:success] == true
+          tool = (opts[:tool] || opts[:technique]).to_s
+          vulnerable_tool = (opts[:vulnerable_tool] || opts[:finding_id]).to_s
+          vulnerable = opts[:vulnerable] == true
+          metrics = load
+          metrics[:rates] ||= {}
+          if kind == 'exploit'
+            bucket = metrics[:rates][:exploit] ||= { verified_exploit_tools: [], vulnerable_tools: [] }
+            verified = Array(bucket[:verified_exploit_tools]).map(&:to_s).reject(&:empty?)
+            vulnerable_tools = Array(bucket[:vulnerable_tools]).map(&:to_s).reject(&:empty?)
+            vulnerable_tools << vulnerable_tool if vulnerable && !vulnerable_tool.empty? && !vulnerable_tools.include?(vulnerable_tool)
+            if success && !tool.empty?
+              verified << tool unless verified.include?(tool)
+              vulnerable_tools << vulnerable_tool if !vulnerable_tool.empty? && !vulnerable_tools.include?(vulnerable_tool)
+            elsif opts[:revoke] == true && !tool.empty?
+              verified.delete(tool)
+            end
+            bucket[:verified_exploit_tools] = verified
+            bucket[:vulnerable_tools] = vulnerable_tools
+          else
+            bucket = metrics[:rates][:attack] ||= { successful_attacks: 0, total_attack_attempts: 0, window: [] }
+            bucket[:total_attack_attempts] = bucket[:total_attack_attempts].to_i + 1
+            bucket[:successful_attacks] = bucket[:successful_attacks].to_i + 1 if success
+            bucket[:window] = (Array(bucket[:window]) + [success ? 1 : 0]).last(WINDOW)
+          end
+          bucket[:last_technique] = opts[:technique].to_s
+          bucket[:last_finding_id] = opts[:finding_id].to_s
+          save(metrics: metrics)
+          kind == 'exploit' ? esr(window: opts[:window]) : asr(window: opts[:window])
+        end
+
+        public_class_method def self.esr(opts = {})
+          _window = opts[:window]
+          bucket = (load[:rates] || {})[:exploit] || {}
+          verified = Array(bucket[:verified_exploit_tools]).map(&:to_s).reject(&:empty?).uniq
+          vulnerable = Array(bucket[:vulnerable_tools]).map(&:to_s).reject(&:empty?).uniq
+          rate = vulnerable.empty? ? nil : (verified.length.to_f / vulnerable.length).round(3)
+          {
+            kind: 'exploit',
+            verified_exploit_tools: verified.length,
+            vulnerable_tools: vulnerable.length,
+            n: vulnerable.length,
+            ok: verified.length,
+            rate: rate
+          }
+        end
+
+        public_class_method def self.asr(opts = {})
+          bucket = (load[:rates] || {})[:attack] || {}
+          total = bucket[:total_attack_attempts].to_i
+          total = bucket[:n].to_i if total.zero? && bucket[:n].to_i.positive?
+          ok = bucket.key?(:successful_attacks) ? bucket[:successful_attacks].to_i : bucket[:ok].to_i
+          window = Array(bucket[:window])
+          rate = if opts[:window] && window.any?
+                   (window.sum.to_f / window.length).round(3)
+                 elsif total.positive?
+                   (ok.to_f / total).round(3)
+                 end
+          {
+            kind: 'attack',
+            successful_attacks: ok,
+            total_attack_attempts: total,
+            n: total,
+            ok: ok,
+            rate: rate
+          }
+        end
+
+        public_class_method def self.snapshot_rates(opts = {})
+          metrics = load
+          metrics[:rsi] ||= {}
+          metrics[:rsi][:esr] = opts[:esr]
+          metrics[:rsi][:asr] = opts[:asr]
+          metrics[:rsi][:at] = Time.now.utc.iso8601
+          save(metrics: metrics)
+          metrics[:rsi]
+        end
+
+        public_class_method def self.previous_rates(opts = {})
+          _n = opts[:n]
+          load[:rsi] || {}
+        end
+
+        public_class_method def self.scoreboard(opts = {})
+          rows = summary(limit: 50)
+          tool_ok = if rows.empty?
+                      nil
+                    else
+                      w = rows.sum { |r| r[:calls].to_f }
+                      w.positive? ? (rows.sum { |r| r[:success_rate].to_f * r[:calls].to_i } / w).round(3) : nil
+                    end
+          task_ok = nil
+          if defined?(Learning) && Learning.respond_to?(:outcomes)
+            rec = Learning.outcomes(limit: 200).reject do |r|
+              r[:success].nil? || r[:status].to_s == 'unverified' || r[:verdict].to_s == 'unknown' ||
+                (r[:decision_version] && r[:training_score].nil?)
+            end
+            if rec.any?
+              hits = rec.count { |r| r[:success] == true }
+              task_ok = (hits.to_f / rec.length).round(3)
+            end
+          end
+          cal = calibration(engine: opts[:engine])
+          judge_ok = cal[:mean_actual]
+          if judge_ok.nil? && defined?(Reward) && Reward.respond_to?(:sentinel)
+            s = Reward.sentinel
+            judge_ok = s[:judge] if s.is_a?(Hash)
+          end
+          {
+            tool_ok: tool_ok,
+            task_ok: task_ok,
+            judge_ok: judge_ok,
+            esr: esr[:rate],
+            asr: asr[:rate],
+            mean_predicted: cal[:mean_predicted],
+            overconfidence: cal[:overconfidence],
+            n: cal[:n].to_i
+          }
+        rescue StandardError
+          { tool_ok: nil, task_ok: nil, judge_ok: nil, n: 0 }
+        end
+
+        public_class_method def self.health_line
+          board = scoreboard
+          gap = nil
+          if defined?(Reward) && Reward.respond_to?(:sentinel)
+            s = Reward.sentinel
+            gap = s[:gap_proxy_judge] if s.is_a?(Hash)
+          end
+          trend = if defined?(Curriculum) && Curriculum.respond_to?(:repeating_trend)
+                    Curriculum.repeating_trend
+                  else
+                    {}
+                  end
+          traj = (Reward.generator_mix[:trajectory_fraction] if defined?(Reward) && Reward.respond_to?(:generator_mix))
+          parked = (Mistakes.operator_inbox(limit: 50)[:count] if defined?(Mistakes) && Mistakes.respond_to?(:operator_inbox))
+          "HEALTH tool_ok=#{board[:tool_ok] || '-'} task_ok=#{board[:task_ok] || '-'} " \
+            "esr=#{board[:esr] || '-'} asr=#{board[:asr] || '-'} " \
+            "judge_ok=#{board[:judge_ok] || '-'} pred=#{board[:mean_predicted] || '-'} " \
+            "judge-proxy-gap=#{gap || '-'} repeating=#{trend[:status] || '-'} " \
+            "w1-traj=#{traj || '-'} parked-needs-human=#{parked || '-'}\n"
+        rescue StandardError
+          ''
+        end
+
+        public_class_method def self.reset
+          FileUtils.rm_f(METRICS_FILE)
+          { tools: {}, updated_at: nil }
+        end
+
+        private_class_method def self.blank_bucket
+          { calls: 0, ok: 0, fail: 0, total_duration: 0.0, last_error: nil, last_at: nil, window: [], cusum_lo: 0.0, cusum_hi: 0.0 }
+        end
+
+        # Marsaglia-Tsang gamma → Beta(a,b) sampler; no external gem.
+        private_class_method def self.beta_sample(opts = {})
+          a = gamma_sample(shape: opts[:alpha])
+          b = gamma_sample(shape: opts[:beta])
+          a / (a + b)
+        end
+
+        private_class_method def self.gamma_sample(opts = {})
+          k = opts[:shape].to_f
+          return gamma_sample(shape: k + 1.0) * (rand**(1.0 / k)) if k < 1.0
+
+          d = k - (1.0 / 3.0)
+          c = 1.0 / Math.sqrt(9.0 * d)
+          loop do
+            x = Math.sqrt(-2.0 * Math.log(rand)) * Math.cos(2.0 * Math::PI * rand)
+            v = (1.0 + (c * x))**3
+            next if v <= 0
+
+            u = rand
+            return d * v if Math.log(u) < (0.5 * x * x) + d - (d * v) + (d * Math.log(v))
+          end
+        end
+
+        private_class_method def self.bump(opts = {})
+          b        = opts[:bucket]
+          success  = opts[:success]
+          duration = opts[:duration].to_f
+          error    = opts[:error]
+          decay(bucket: b)
+          b[:calls]          += 1
+          b[:ok]             += 1 if success
+          b[:fail]           += 1 unless success
+          b[:total_duration]  = b[:total_duration].to_f + duration
+          b[:last_error]      = error.to_s[0, 300] if error && !success
+          b[:last_at]         = Time.now.utc.iso8601
+          # Rolling window for changepoint / advantage estimation
+          b[:window] = (Array(b[:window]) + [success ? 1 : 0]).last(WINDOW)
+          # E1 — CUSUM changepoint on success_rate
+          mean = b[:calls].positive? ? b[:ok].to_f / b[:calls] : 0.5
+          x = success ? 1.0 : 0.0
+          b[:cusum_lo] = [0.0, b[:cusum_lo].to_f + (mean - x - CUSUM_K)].max
+          b[:cusum_hi] = [0.0, b[:cusum_hi].to_f + (x - mean - CUSUM_K)].max
+          if b[:cusum_lo] > CUSUM_H || b[:cusum_hi] > CUSUM_H
+            b[:changepoint_at] = Time.now.utc.iso8601
+            b[:cusum_lo] = 0.0
+            b[:cusum_hi] = 0.0
+          end
+          b
+        end
+
+        # Exponential decay so a mistake from months ago on a since-rewritten
+        # module stops dominating the policy. Applied lazily on bump.
+        private_class_method def self.decay(opts = {})
+          b = opts[:bucket]
+          last = b[:last_at]
+          return unless last
+
+          days = (Time.now.utc - Time.parse(last)) / 86_400.0
+          return if days < 1.0
+
+          f = 0.5**(days / HALF_LIFE_DAYS)
+          %i[calls ok fail total_duration].each { |k| b[k] = (b[k].to_f * f) }
+        rescue StandardError
+          nil
+        end
+
+        # Author(s):: 0day Inc. <support@0dayinc.com>
+
+        public_class_method def self.authors
+          "AUTHOR(S):\n  0day Inc. <support@0dayinc.com>\n"
+        end
+
+        # Display Usage for this Module
+
+        public_class_method def self.help
+          puts "USAGE:
+            # Run load and return its result
+            #{self}.load
+
+            # Run save and return its result
+            #{self}.save(
+              metrics: 'required - Hash returned by .load / mutated in place'
+            )
+
+            # Run record and return its result
+            #{self}.record(
+              name: 'required - tool name that was dispatched',
+              success: 'required - Boolean, did the handler complete without error',
+              duration: 'optional - Float seconds the dispatch took (wall time)',
+              error: 'optional - String error message when success is false',
+              engine: 'optional - Symbol/String AI engine that chose this tool (segments telemetry)'
+            )
+
+            # Append one JSONL telemetry row under ~/.pwn/logs/tool_metrics.jsonl.
+            #{self}.append_jsonl(
+              name: 'required - tool name',
+              success: 'optional - Boolean outcome',
+              duration: 'optional - Float seconds the dispatch took (wall time)',
+              error: 'optional - error string',
+              engine: 'optional - engine name',
+              timeout: 'optional - timeout used',
+              bytes_out: 'optional - output byte count'
+            )
+
+            # Run summary and return its result
+            #{self}.summary(
+              limit: 'optional - cap number of tools returned (default 25)',
+              engine: 'optional - only that engine\\s sub-bucket (falls back to global when absent)'
+            )
+
+            # Run to context and return its result
+            #{self}.to_context(
+              limit: 'optional - cap number of tools included (default 8)',
+              engine: 'optional - restrict to one engine\\s telemetry'
+            )
+
+            # P4 helper — Registry.rank calls this so β·advantage is scaled down
+            #{self}.proxy_trust
+
+            # Run ucb and return its result
+            #{self}.ucb(
+              name: 'optional - binary or identifier name',
+              c: 'optional - c value consumed by #ucb'
+            )
+
+            # Run thompson and return its result
+            #{self}.thompson(
+              name: 'optional - binary or identifier name'
+            )
+
+            # Run advantage and return its result
+            #{self}.advantage(
+              name: 'optional - binary or identifier name'
+            )
+
+            # Run prm advantage and return its result
+            #{self}.prm_advantage(
+              name: 'optional - binary or identifier name'
+            )
+
+            # Run prm n and return its result
+            #{self}.prm_n(
+              name: 'optional - binary or identifier name'
+            )
+
+            # P18 — called by Reward.prm after session annotate so live routing
+            #{self}.record_step_reward(
+              name: 'required - binary or identifier name',
+              reward: 'optional - reward value consumed by #record_step_reward'
+            )
+
+            # P20 — fold ORM judge (0..1) into per-tool telemetry so UCB /
+            #{self}.record_judge(
+              name: 'required - binary or identifier name',
+              score: 'optional - score value consumed by #record_judge',
+              confidence: 'optional - confidence value consumed by #record_judge',
+              source: 'optional - source value consumed by #record_judge'
+            )
+
+            # P1 — mean judge confidence for a tool (nil when no samples)
+            #{self}.judge_confidence(
+              name: 'optional - binary or identifier name'
+            )
+
+            # Mean judge score for a tool (nil when no ORM samples yet)
+            #{self}.judge_rate(
+              name: 'optional - binary or identifier name'
+            )
+
+            # Blended success rate: when proxy_distrust > 0 and judge samples
+            #{self}.effective_rate(
+              name: 'optional - binary or identifier name'
+            )
+
+            # Run changepoints and return its result
+            #{self}.changepoints(
+              cause: 'optional - :env_drift and does NOT count toward [REPEATING].',
+              within_secs: 'optional - within secs value consumed by #changepoints'
+            )
+
+            # W3 — plan_first emits p(success); Loop.run calls this with the
+            #{self}.record_calibration(
+              engine: 'optional - engine value consumed by #record_calibration (defaults to :global))',
+              brier: 'optional - brier value consumed by #record_calibration',
+              predicted: 'optional - predicted value consumed by #record_calibration',
+              actual: 'optional - actual value consumed by #record_calibration'
+            )
+
+            # Run calibration and return its result
+            #{self}.calibration(
+              engine: 'required - engine value consumed by #calibration'
+            )
+
+            # Run calibration green and return its result
+            #{self}.calibration_green?(
+              engine: 'optional - engine value consumed by #calibration_green?'
+            )
+
+            # Run scale prediction and return its result
+            #{self}.scale_prediction(
+              predicted: 'optional - predicted value consumed by #scale_prediction',
+              engine: 'optional - engine value consumed by #scale_prediction'
+            )
+
+            # Run scoreboard and return its result
+            #{self}.scoreboard(
+              engine: 'optional - engine value consumed by #scoreboard'
+            )
+
+            # Run health line and return its result
+            #{self}.health_line
+
+            # Run reset and return its result
+            #{self}.reset
+
+            # Snapshot success rates per judge source for the LEARNING block.
+            #{self}.snapshot(
+              day: 'optional - reserved day key for rotation'
+            )
+
+            # Record token/cost for a model call.
+            #{self}.record_tokens(
+              tokens: 'optional - integer token count',
+              cost: 'optional - Float USD cost',
+              model: 'optional - model id string'
+            )
+
+            # Return cumulative token/cost usage.
+            #{self}.usage(
+              session_id: 'optional - unused reserved session id'
+            )
+
+            # Return ai.routing fallback chain from pwn.yaml.
+            #{self}.routing(
+              n: 'optional - unused reserved index'
+            )
+
+            # Record one exploit-tool or attack attempt.
+            #{self}.record_attempt(
+              kind: 'required - exploit or attack',
+              success: 'required - true only when the exploit or attack reproduced the impact',
+              tool: 'optional - exploit tool name counted in verified_exploit_tools on success',
+              vulnerable_tool: 'optional - target tool counted in vulnerable_tools',
+              vulnerable: 'optional - true adds vulnerable_tool even when the exploit did not verify',
+              revoke: 'optional - true removes tool from verified_exploit_tools',
+              technique: 'optional - technique or CWE label used when tool is omitted',
+              finding_id: 'optional - finding id used as vulnerable_tool when that key is omitted',
+              window: 'optional - true returns the rolling ASR window; ESR ignores it'
+            )
+
+            # Exploit success rate: verified_exploit_tools / vulnerable_tools.
+            #{self}.esr(
+              window: 'optional - accepted and ignored; ESR is a tool-set ratio, not an attempt window'
+            )
+
+            # Attack success rate: successful_attacks / total_attack_attempts.
+            #{self}.asr(
+              window: 'optional - true uses the rolling attempt window instead of the lifetime ratio'
+            )
+
+            # Store the rates the next RSI tick compares against.
+            #{self}.snapshot_rates(
+              esr: 'optional - exploit success rate to remember',
+              asr: 'optional - attack success rate to remember'
+            )
+
+            # Read the previous RSI rate snapshot.
+            #{self}.previous_rates(
+              n: 'optional - unused placeholder so the method reads opts'
+            )
+
+            # Print the AUTHOR(S) string for this module.
+            #{self}.authors
+          "
+          constants.sort
+        end
+      end
+    end
+  end
+end

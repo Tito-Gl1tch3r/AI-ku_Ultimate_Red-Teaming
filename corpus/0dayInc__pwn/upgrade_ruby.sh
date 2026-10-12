@@ -1,0 +1,43 @@
+#!/bin/bash --login
+# USE THIS SCRIPT WHEN UPGRADING RUBY
+if [[ -d '/opt/pwn' ]]; then
+  pwn_root='/opt/pwn' 
+else
+  pwn_root="${PWN_ROOT}"
+fi
+
+function usage() {
+  echo $"Usage: $0 <new ruby version e.g. 2.4.4> <optional bool running from build_gem.sh>"
+  exit 1
+}
+
+source /etc/profile.d/rvm.sh
+
+new_ruby_version=$1
+if [[ $2 != '' ]]; then
+  old_ruby_version=$2
+else
+  old_ruby_version=`cat ${pwn_root}/.ruby-version`
+fi
+
+ruby_gemset=`cat ${pwn_root}/.ruby-gemset`
+
+if [[ $# < 1 ]]; then
+  usage
+fi
+
+# Upgrade RVM
+curl -sSL https://rvm.io/mpapis.asc | sudo gpg2 --import -
+curl -sSL https://rvm.io/pkuczynski.asc | sudo gpg2 --import -
+export rvmsudo_secure_path=1
+# Keep this command to pull master to avoid unknown ruby interpreter error when using latest version of Ruby.
+rvmsudo rvm get master
+rvm reload
+
+# Install New Version of RubyGems & Ruby
+cd $pwn_root && ./vagrant/provisioners/gem.sh
+rvmsudo rvm install ruby-$new_ruby_version
+echo $new_ruby_version > $pwn_root/.ruby-version
+
+cd / && cd $pwn_root && rvm use $new_ruby_version@$ruby_gemset && ./build_gem.sh
+rvmsudo gem pristine --all

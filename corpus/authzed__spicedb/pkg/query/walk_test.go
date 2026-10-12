@@ -1,0 +1,144 @@
+package query
+
+import (
+	"fmt"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestWalkBasic(t *testing.T) {
+	// Create a simple tree: union with two fixed iterators
+	path1 := MustPathFromString("document:doc1#view@user:alice")
+	fixedIter1 := NewFixedIterator(*path1)
+	fixedIter2 := NewEmptyFixedIterator()
+
+	union := NewUnionIterator(fixedIter1, fixedIter2)
+
+	// Walk the tree and count the nodes
+	nodeCount := 0
+	result, err := Walk(union, func(it Iterator) (Iterator, error) {
+		nodeCount++
+		return it, nil
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, 3, nodeCount) // 2 fixed iterators + 1 union
+}
+
+func TestWalkNilRoot(t *testing.T) {
+	// Walk with nil root should return nil
+	result, err := Walk(nil, func(it Iterator) (Iterator, error) {
+		t.Fatal("callback should not be called for nil root")
+		return it, nil
+	})
+
+	require.NoError(t, err)
+	require.Nil(t, result)
+}
+
+func TestWalkWithTransformation(t *testing.T) {
+	// Create a tree with sentinels
+	sentinel1 := NewRecursiveSentinelIterator("folder", "view", false)
+	sentinel2 := NewRecursiveSentinelIterator("document", "edit", false)
+
+	union := NewUnionIterator(sentinel1, sentinel2)
+
+	// Walk and replace all sentinels with empty fixed iterators
+	result, err := Walk(union, func(it Iterator) (Iterator, error) {
+		if _, isSentinel := it.(*RecursiveSentinelIterator); isSentinel {
+			return NewEmptyFixedIterator(), nil
+		}
+		return it, nil
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	// Verify sentinels were replaced
+	resultUnion := result.(*UnionIterator)
+	require.Len(t, resultUnion.Subiterators(), 2)
+
+	for _, sub := range resultUnion.Subiterators() {
+		require.IsType(t, &FixedIterator{}, sub, "All children should be FixedIterator")
+	}
+}
+
+func TestWalkCallbackError(t *testing.T) {
+	// Create a simple tree
+	fixedIter := NewEmptyFixedIterator()
+	union := NewUnionIterator(fixedIter)
+
+	// Walk with a callback that returns an error
+	expectedErr := fmt.Errorf("callback error")
+	result, err := Walk(union, func(it Iterator) (Iterator, error) {
+		if _, isUnion := it.(*UnionIterator); isUnion {
+			return nil, expectedErr
+		}
+		return it, nil
+	})
+
+	require.Error(t, err)
+	require.Equal(t, expectedErr, err)
+	require.Nil(t, result)
+}
+
+func TestWalkRecursiveCallbackError(t *testing.T) {
+	// Create a nested tree to test error propagation from recursive Walk calls
+	fixedIter1 := NewEmptyFixedIterator()
+	fixedIter2 := NewEmptyFixedIterator()
+
+	innerUnion := NewUnionIterator(fixedIter1)
+
+	outerUnion := NewUnionIterator(innerUnion, fixedIter2)
+
+	// Walk with a callback that errors on the inner fixed iterator
+	expectedErr := fmt.Errorf("recursive callback error")
+	callCount := 0
+	result, err := Walk(outerUnion, func(it Iterator) (Iterator, error) {
+		callCount++
+		// Error on the first fixed iterator we encounter
+		if _, isFixed := it.(*FixedIterator); isFixed && callCount == 1 {
+			return nil, expectedErr
+		}
+		return it, nil
+	})
+
+	require.Error(t, err)
+	require.Equal(t, expectedErr, err)
+	require.Nil(t, result)
+	require.Equal(t, 1, callCount) // Should stop after first error
+}
+
+func TestWalkDeepTree(t *testing.T) {
+	// Create a deeper tree: Arrow(Union(Fixed, Fixed), Fixed)
+	path1 := MustPathFromString("document:doc1#view@user:alice")
+	path2 := MustPathFromString("document:doc2#view@user:bob")
+
+	fixedIter1 := NewFixedIterator(*path1)
+	fixedIter2 := NewFixedIterator(*path2)
+	fixedIter3 := NewEmptyFixedIterator()
+
+	union := NewUnionIterator(fixedIter1, fixedIter2)
+
+	arrow := NewArrowIterator(union, fixedIter3)
+
+	// Walk and collect all iterator types
+	var iteratorTypes []string
+	result, err := Walk(arrow, func(it Iterator) (Iterator, error) {
+		iteratorTypes = append(iteratorTypes, it.Explain().Name)
+		return it, nil
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	// Should visit in bottom-up order: fixed1, fixed2, union, fixed3, arrow
+	require.Len(t, iteratorTypes, 5)
+	require.Equal(t, "Fixed", iteratorTypes[0])
+	require.Equal(t, "Fixed", iteratorTypes[1])
+	require.Equal(t, "Union", iteratorTypes[2])
+	require.Equal(t, "Fixed", iteratorTypes[3])
+	require.Equal(t, "Arrow", iteratorTypes[4])
+}

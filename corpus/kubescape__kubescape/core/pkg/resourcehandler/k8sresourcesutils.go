@@ -1,0 +1,202 @@
+package resourcehandler
+
+import (
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/kubescape/k8s-interface/k8sinterface"
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/opa-utils/objectsenvelopes"
+	"github.com/kubescape/opa-utils/reporthandling"
+)
+
+var (
+	ClusterDescribe              = "ClusterDescribe"
+	DescribeRepositories         = "DescribeRepositories"
+	ListEntitiesForPolicies      = "ListEntitiesForPolicies"
+	KubeletConfiguration         = "KubeletConfiguration"
+	OsReleaseFile                = "OsReleaseFile"
+	KernelVersion                = "KernelVersion"
+	LinuxSecurityHardeningStatus = "LinuxSecurityHardeningStatus"
+	OpenPortsList                = "OpenPortsList"
+	LinuxKernelVariables         = "LinuxKernelVariables"
+	KubeletCommandLine           = "KubeletCommandLine"
+	ImageVulnerabilities         = "ImageVulnerabilities"
+	KubeletInfo                  = "KubeletInfo"
+	KubeProxyInfo                = "KubeProxyInfo"
+	ControlPlaneInfo             = "ControlPlaneInfo"
+	CloudProviderInfo            = "CloudProviderInfo"
+	CNIInfo                      = "CNIInfo"
+
+	MapResourceToApiGroup = map[string]string{
+		KubeletConfiguration:         "hostdata.kubescape.cloud/v1beta0",
+		OsReleaseFile:                "hostdata.kubescape.cloud/v1beta0",
+		KubeletCommandLine:           "hostdata.kubescape.cloud/v1beta0",
+		KernelVersion:                "hostdata.kubescape.cloud/v1beta0",
+		LinuxSecurityHardeningStatus: "hostdata.kubescape.cloud/v1beta0",
+		OpenPortsList:                "hostdata.kubescape.cloud/v1beta0",
+		LinuxKernelVariables:         "hostdata.kubescape.cloud/v1beta0",
+		KubeletInfo:                  "hostdata.kubescape.cloud/v1beta0",
+		KubeProxyInfo:                "hostdata.kubescape.cloud/v1beta0",
+		ControlPlaneInfo:             "hostdata.kubescape.cloud/v1beta0",
+		CloudProviderInfo:            "hostdata.kubescape.cloud/v1beta0",
+		CNIInfo:                      "hostdata.kubescape.cloud/v1beta0",
+	}
+	MapResourceToApiGroupVuln = map[string][]string{
+		ImageVulnerabilities: {"armo.vuln.images/v1", "image.vulnscan.com/v1"}}
+	MapResourceToApiGroupCloud = map[string][]string{
+		ClusterDescribe:         {"container.googleapis.com/v1", "eks.amazonaws.com/v1", "management.azure.com/v1"},
+		DescribeRepositories:    {"container.googleapis.com/v1", "eks.amazonaws.com/v1"}, //TODO - add azure when ensure-image-scanning-enabled-cloud supports ACR
+		ListEntitiesForPolicies: {"container.googleapis.com/v1", "eks.amazonaws.com/v1", "management.azure.com/v1"},
+	}
+)
+
+func isEmptyImgVulns(externalResourcesMap cautils.ExternalResources) bool {
+	imgVulnResources := cautils.MapImageVulnResources(externalResourcesMap)
+	for _, resource := range imgVulnResources {
+		if val, ok := externalResourcesMap[resource]; ok {
+			if len(val) > 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func setKSResourceMap(frameworks []reporthandling.Framework, resourceToControl map[string][]string, resolver resourceResolver) cautils.ExternalResources {
+	externalResources := make(cautils.ExternalResources)
+	complexMap := setComplexKSResourceMap(frameworks, resourceToControl, resolver)
+	for group := range complexMap {
+		for version := range complexMap[group] {
+			for resource := range complexMap[group][version] {
+				for _, resolved := range resolver(group, version, resource) {
+					externalResources[resolved.groupVersionResourceTriplet] = nil
+				}
+			}
+		}
+	}
+	return externalResources
+}
+
+// [group][versionn][resource]
+func setComplexKSResourceMap(frameworks []reporthandling.Framework, resourceToControls map[string][]string, resolver resourceResolver) map[string]map[string]map[string]any {
+	k8sResources := make(map[string]map[string]map[string]any)
+	for _, framework := range frameworks {
+		for _, control := range framework.Controls {
+			for _, rule := range control.Rules {
+				for _, match := range rule.Match {
+					insertKSResourcesAndControls(k8sResources, match, resourceToControls, control)
+					for _, apiGroup := range match.APIGroups {
+						for _, apiVersion := range match.APIVersions {
+							for _, resource := range match.Resources {
+								for _, resolved := range resolver(apiGroup, apiVersion, resource) {
+									resourceGroup := resolved.groupVersionResourceTriplet
+									if !slices.Contains(resourceToControls[resourceGroup], control.ControlID) {
+										resourceToControls[resourceGroup] = append(resourceToControls[resourceGroup], control.ControlID)
+									}
+								}
+							}
+						}
+					}
+				}
+				for _, match := range rule.DynamicMatch {
+					insertKSResourcesAndControls(k8sResources, match, resourceToControls, control)
+				}
+			}
+		}
+	}
+	return k8sResources
+}
+
+func mapKSResourceToApiGroup(resource string) []string {
+	if val, ok := MapResourceToApiGroup[resource]; ok {
+		return []string{val}
+	}
+	if val, ok := MapResourceToApiGroupCloud[resource]; ok {
+		return val
+	}
+	if val, ok := MapResourceToApiGroupVuln[resource]; ok {
+		return val
+	}
+	return []string{}
+}
+
+// isExternalResource reports whether a resolved group/version/resource triplet
+// names a resource Kubescape serves itself - host sensor data, cloud provider
+// descriptions, image vulnerabilities. Their API groups belong to Kubescape, so
+// no cluster ever serves them and they are never collected with a LIST.
+func isExternalResource(triplet string) bool {
+	_, _, resource := k8sinterface.StringToResourceGroup(triplet)
+	return len(mapKSResourceToApiGroup(resource)) > 0
+}
+
+func insertControls(resource string, resourceToControl map[string][]string, control reporthandling.Control) {
+	ksResources := mapKSResourceToApiGroup(resource)
+	for _, ksResource := range ksResources {
+		group, version := k8sinterface.SplitApiVersion(ksResource)
+		r := k8sinterface.JoinResourceTriplets(group, version, resource)
+		if !slices.Contains(resourceToControl[r], control.ControlID) {
+			resourceToControl[r] = append(resourceToControl[r], control.ControlID)
+		}
+	}
+}
+
+func insertKSResourcesAndControls(k8sResources map[string]map[string]map[string]any, match reporthandling.RuleMatchObjects, resourceToControl map[string][]string, control reporthandling.Control) {
+	for _, apiGroup := range match.APIGroups {
+		if v, ok := k8sResources[apiGroup]; !ok || v == nil {
+			k8sResources[apiGroup] = make(map[string]map[string]any)
+		}
+		for _, apiVersions := range match.APIVersions {
+			if v, ok := k8sResources[apiGroup][apiVersions]; !ok || v == nil {
+				k8sResources[apiGroup][apiVersions] = make(map[string]any)
+			}
+			for _, resource := range match.Resources {
+				if _, ok := k8sResources[apiGroup][apiVersions][resource]; !ok {
+					k8sResources[apiGroup][apiVersions][resource] = nil
+				}
+				insertControls(resource, resourceToControl, control)
+			}
+		}
+	}
+}
+
+func getGroupNVersion(apiVersion string) (string, string) {
+	gv := strings.Split(apiVersion, "/")
+	group, version := "", ""
+	if len(gv) == 1 {
+		version = gv[0]
+	} else if len(gv) >= 2 {
+		group = gv[0]
+		version = gv[1]
+	}
+	return group, version
+}
+
+// getFieldSelectorFromScanInfo picks the namespace filter the collection queries
+// carry. A flag is honored only when its value actually names a namespace: a
+// value made of separators and whitespace ("," or " ") narrows nothing, which is
+// already how countNamespaces and the report metadata read it, and an include
+// selector built from one emits no query at all (see GetNamespacesSelectors).
+func getFieldSelectorFromScanInfo(scanInfo *cautils.ScanInfo) IFieldSelector {
+	if len(splitNamespaces(scanInfo.IncludeNamespaces)) > 0 {
+		return NewIncludeSelector(scanInfo.IncludeNamespaces)
+	}
+	if len(splitNamespaces(scanInfo.ExcludedNamespaces)) > 0 {
+		return NewExcludeSelector(scanInfo.ExcludedNamespaces)
+	}
+
+	return &EmptySelector{}
+}
+
+func getWorkloadFromScanObject(resource *objectsenvelopes.ScanObject) (workloadinterface.IWorkload, error) {
+	if resource == nil {
+		return nil, nil
+	}
+	obj := resource.GetObject()
+	if k8sinterface.IsTypeWorkload(obj) {
+		return workloadinterface.NewWorkloadObj(obj), nil
+	}
+	return nil, fmt.Errorf("resource %s is not a valid workload", k8sinterface.GetReadableID(resource))
+}

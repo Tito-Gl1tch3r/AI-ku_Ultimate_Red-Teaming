@@ -1,0 +1,60 @@
+package software.coley.recaf.services.deobfuscation.transform.generic;
+
+import jakarta.annotation.Nonnull;
+import jakarta.enterprise.context.Dependent;
+import jakarta.inject.Inject;
+import software.coley.recaf.info.JvmClassInfo;
+import software.coley.recaf.services.inheritance.InheritanceGraph;
+import software.coley.recaf.services.inheritance.InheritanceGraphService;
+import software.coley.recaf.services.inheritance.InheritanceVertex;
+import software.coley.recaf.services.transform.JvmClassTransformer;
+import software.coley.recaf.services.transform.JvmTransformerContext;
+import software.coley.recaf.services.transform.TransformationException;
+import software.coley.recaf.workspace.model.Workspace;
+import software.coley.recaf.workspace.model.bundle.JvmClassBundle;
+import software.coley.recaf.workspace.model.resource.WorkspaceResource;
+
+/**
+ * A transformer that removes any class with cyclic inheritance.
+ *
+ * @author Matt Coley
+ */
+@Dependent
+public class CycleClassRemovingTransformer implements JvmClassTransformer {
+	public static final String IDENTIFIER = "cleanup.cycle";
+
+	private final InheritanceGraphService graphService;
+	private InheritanceGraph inheritanceGraph;
+
+	@Inject
+	public CycleClassRemovingTransformer(@Nonnull InheritanceGraphService graphService) {
+		this.graphService = graphService;
+	}
+
+	@Override
+	public void setup(@Nonnull JvmTransformerContext context, @Nonnull Workspace workspace) {
+		inheritanceGraph = graphService.getOrCreateInheritanceGraph(workspace);
+	}
+
+	@Override
+	public void transform(@Nonnull JvmTransformerContext context, @Nonnull Workspace workspace,
+	                      @Nonnull WorkspaceResource resource, @Nonnull JvmClassBundle bundle,
+	                      @Nonnull JvmClassInfo initialClassState) throws TransformationException {
+		InheritanceVertex vertex = inheritanceGraph.getVertex(initialClassState.getName());
+		if (vertex != null && vertex.isLoop())
+			context.markClassForRemoval(initialClassState);
+	}
+
+	@Nonnull
+	@Override
+	public String identifier() {
+		return IDENTIFIER;
+	}
+
+	@Override
+	public boolean pruneAfterNoWork() {
+		// Other transformers should not introduce cyclic classes,
+		// so once the work is done there is no need to re-process classes on following passes.
+		return true;
+	}
+}

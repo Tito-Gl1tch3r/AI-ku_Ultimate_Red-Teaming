@@ -1,0 +1,132 @@
+# frozen_string_literal: true
+
+module PWN
+  # This file, using the autoload directive loads Plugins modules
+  # into memory only when they're needed. For more information, see:
+  # http://www.rubyinside.com/ruby-techniques-revealed-autoload-1652.html
+  module Plugins
+    autoload :Android, 'pwn/plugins/android'
+    autoload :AFLplusplus, 'pwn/plugins/aflplusplus'
+    autoload :AISandbox, 'pwn/plugins/ai_sandbox'
+    autoload :ArtifactRegistry, 'pwn/plugins/artifact_registry'
+    autoload :Assembly, 'pwn/plugins/assembly'
+    autoload :BinaryParser, 'pwn/plugins/binary_parser'
+    autoload :BinaryAnalysis, 'pwn/plugins/binary_analysis'
+    autoload :BinWorkspace, 'pwn/plugins/bin_workspace'
+    autoload :Capability, 'pwn/plugins/capability'
+    autoload :CapabilityBroker, 'pwn/plugins/capability_broker'
+    autoload :AuthenticationHelper, 'pwn/plugins/authentication_helper'
+    autoload :BareSIP, 'pwn/plugins/baresip'
+    autoload :BasicAuth, 'pwn/plugins/basic_auth'
+    autoload :BeEF, 'pwn/plugins/beef'
+    autoload :BlackDuckBinaryAnalysis, 'pwn/plugins/black_duck_binary_analysis'
+    autoload :BurpSuite, 'pwn/plugins/burp_suite'
+    autoload :BusPirate, 'pwn/plugins/bus_pirate'
+    autoload :Char, 'pwn/plugins/char'
+    autoload :CreditCard, 'pwn/plugins/credit_card'
+    autoload :CredentialAttack, 'pwn/plugins/credential_attack'
+    autoload :PreflightChecker, 'pwn/plugins/preflight_checker'
+    autoload :PWNLogger, 'pwn/plugins/pwn_logger'
+    autoload :DAOLDAP, 'pwn/plugins/dao_ldap'
+    autoload :Debugger, 'pwn/plugins/debugger'
+    autoload :DAOMongo, 'pwn/plugins/dao_mongo'
+    autoload :DAOPostgres, 'pwn/plugins/dao_postgres'
+    autoload :DAOSQLite3, 'pwn/plugins/dao_sqlite3'
+    autoload :DefectDojo, 'pwn/plugins/defect_dojo'
+    autoload :DetectOS, 'pwn/plugins/detect_os'
+    autoload :Detonate, 'pwn/plugins/detonate'
+    autoload :EIN, 'pwn/plugins/ein'
+    autoload :Emulator, 'pwn/plugins/emulator'
+    autoload :ExploitDB, 'pwn/plugins/exploit_db'
+    autoload :FileFu, 'pwn/plugins/file_fu'
+    autoload :Findings, 'pwn/plugins/findings'
+    autoload :Fuzz, 'pwn/plugins/fuzz'
+    autoload :Frida, 'pwn/plugins/frida'
+    autoload :ExploitDev, 'pwn/plugins/exploit_dev'
+    autoload :Git, 'pwn/plugins/git'
+    autoload :GDB, 'pwn/plugins/gdb'
+    autoload :GDBMI, 'pwn/plugins/gdbmi'
+    autoload :GDBMi, 'pwn/plugins/gdbmi'
+    autoload :Ghidra, 'pwn/plugins/ghidra'
+    autoload :GhidraHeadless, 'pwn/plugins/ghidra_headless'
+    autoload :Github, 'pwn/plugins/github'
+    autoload :GoogleWorkspace, 'pwn/plugins/google_workspace'
+    autoload :HackerOne, 'pwn/plugins/hacker_one'
+    autoload :Handler, 'pwn/plugins/handler'
+    autoload :Hunter, 'pwn/plugins/hunter'
+    autoload :Httpx, 'pwn/plugins/httpx'
+    autoload :IPInfo, 'pwn/plugins/ip_info'
+    autoload :IRC, 'pwn/plugins/irc'
+    autoload :Jenkins, 'pwn/plugins/jenkins'
+    autoload :K8s, 'pwn/plugins/k8s'
+    autoload :JiraDataCenter, 'pwn/plugins/jira_data_center'
+    autoload :Jobs, 'pwn/plugins/jobs'
+    autoload :JSONPathify, 'pwn/plugins/json_pathify'
+    autoload :Log, 'pwn/plugins/log'
+    autoload :MailAgent, 'pwn/plugins/mail_agent'
+    autoload :Metasploit, 'pwn/plugins/metasploit'
+    autoload :MethodCatalog, 'pwn/plugins/method_catalog'
+    autoload :MitmProxy, 'pwn/plugins/mitm_proxy'
+    autoload :MonkeyPatch, 'pwn/plugins/monkey_patch'
+    autoload :MSR206, 'pwn/plugins/msr206'
+    autoload :NessusCloud, 'pwn/plugins/nessus_cloud'
+    autoload :NexposeVulnScan, 'pwn/plugins/nexpose_vuln_scan'
+    autoload :NmapIt, 'pwn/plugins/nmap_it'
+    autoload :Nuclei, 'pwn/plugins/nuclei'
+    autoload :OAuth2, 'pwn/plugins/oauth2'
+    autoload :OCR, 'pwn/plugins/ocr'
+    autoload :OpenAPI, 'pwn/plugins/open_api'
+    autoload :OpenVAS, 'pwn/plugins/openvas'
+    autoload :Packet, 'pwn/plugins/packet'
+    autoload :PDFParse, 'pwn/plugins/pdf_parse'
+    autoload :Pony, 'pwn/plugins/pony'
+    autoload :PS, 'pwn/plugins/ps'
+    autoload :ProcessTube, 'pwn/plugins/process_tube'
+    autoload :RabbitMQ, 'pwn/plugins/rabbit_mq'
+    autoload :Radare2, 'pwn/plugins/radare2'
+    autoload :Recon, 'pwn/plugins/recon'
+    autoload :REDB, 'pwn/plugins/redb'
+    autoload :REPL, 'pwn/plugins/repl'
+    autoload :ROP, 'pwn/plugins/rop'
+    autoload :Sandbox, 'pwn/plugins/sandbox'
+    autoload :SBOM, 'pwn/plugins/sbom'
+    autoload :ScannableCodes, 'pwn/plugins/scannable_codes'
+    autoload :Semgrep, 'pwn/plugins/semgrep'
+    autoload :Serial, 'pwn/plugins/serial'
+    autoload :Shodan, 'pwn/plugins/shodan'
+    autoload :SlackClient, 'pwn/plugins/slack_client'
+    autoload :Sock, 'pwn/plugins/sock'
+    autoload :Spider, 'pwn/plugins/spider'
+    autoload :SSN, 'pwn/plugins/ssn'
+    autoload :Sqlmap, 'pwn/plugins/sqlmap'
+    autoload :ThreadPool, 'pwn/plugins/thread_pool'
+    autoload :Tor, 'pwn/plugins/tor'
+    autoload :TransparentBrowser, 'pwn/plugins/transparent_browser'
+    autoload :TTYSpinner, 'pwn/plugins/tty_spinner'
+    autoload :TwitterAPI, 'pwn/plugins/twitter_api'
+    autoload :URIScheme, 'pwn/plugins/uri_scheme'
+    autoload :Vault, 'pwn/plugins/vault'
+    autoload :VIN, 'pwn/plugins/vin'
+    autoload :Voice, 'pwn/plugins/voice'
+    autoload :Volatility, 'pwn/plugins/volatility'
+    autoload :Vsphere, 'pwn/plugins/vsphere'
+    autoload :XXD, 'pwn/plugins/xxd'
+    autoload :Zaproxy, 'pwn/plugins/zaproxy'
+
+    # Display a List of Every PWN::Plugins Module
+
+    # Author(s):: 0day Inc. <support@0dayinc.com>
+
+    public_class_method def self.authors
+      "AUTHOR(S):\n  0day Inc. <support@0dayinc.com>\n"
+    end
+
+    public_class_method def self.help
+      puts "USAGE:
+        # Display a List of Every PWN::Plugins Module
+        #{self}.authors
+      "
+      constants.sort
+    end
+  end
+end

@@ -1,0 +1,600 @@
+package core
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/anchore/clio"
+	grypejson "github.com/anchore/grype/grype/presenter/json"
+	"github.com/anchore/grype/grype/presenter/models"
+	copaGrype "github.com/anubhav06/copa-grype/grype"
+	"github.com/containerd/platforms"
+	"github.com/distribution/reference"
+	"github.com/docker/buildx/build"
+	"github.com/docker/cli/cli/config"
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	ksmetav1 "github.com/kubescape/kubescape/v4/core/meta/datastructures/v1"
+	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling"
+	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling/printer"
+	"github.com/kubescape/kubescape/v4/pkg/imagescan"
+	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/client/llb"
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
+	gwclient "github.com/moby/buildkit/frontend/gateway/client"
+	"github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/session/auth/authprovider"
+	"github.com/project-copacetic/copacetic/pkg/buildkit"
+	"github.com/project-copacetic/copacetic/pkg/pkgmgr"
+	"github.com/project-copacetic/copacetic/pkg/types/unversioned"
+	"github.com/project-copacetic/copacetic/pkg/utils"
+	"github.com/quay/claircore/osrelease"
+	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
+)
+
+const (
+	copaProduct = "copa"
+)
+
+func (ks *Kubescape) Patch(patchInfo *ksmetav1.PatchInfo, scanInfo *cautils.ScanInfo) (bool, error) {
+
+	// ===================== Scan the image =====================
+	logger.L().Start(fmt.Sprintf("Scanning image: %s", patchInfo.Image))
+
+	// Setup the scan service
+	// patch never exposes --skip-db-update; SkipDBUpdate is always false here, so the DB is always updated.
+	// patch never fails on staleness either: it must scan to build the patch
+	// document, so the strict update check stays disabled here even when
+	// requested elsewhere (e.g. via KS_FAIL_ON_STALE_DB) — a transient mirror
+	// failure must not abort patching when a usable cache exists. Only the
+	// warning threshold (maxDBAge) is resolved from flags/env.
+	_, maxDBAge := imagescan.ResolveDBAgeGate(false, true, scanInfo.MaxDBAge, scanInfo.MaxDBAgeSet)
+	distCfg, installCfg, shouldUpdate, err := imagescan.NewDefaultDBConfig(scanInfo.ListingURL, false, false)
+	if err != nil {
+		logger.L().StopError(fmt.Sprintf("Invalid Grype database URL '%s': %v", scanInfo.ListingURL, err))
+		return false, err
+	}
+	svc, err := imagescan.NewScanServiceWithMatchersAndSources(distCfg, installCfg, scanInfo.UseDefaultMatchers, nil, shouldUpdate)
+	if err != nil {
+		logger.L().StopError(fmt.Sprintf("Failed to initialize image scanner: %s", err))
+		return false, err
+	}
+	defer svc.Close()
+	// Warn on a stale vulnerability DB. Patch always updates (shouldUpdate=true)
+	// without the strict check, so this only ever warns when upstream itself
+	// is stale — it never fails.
+	_ = imagescan.EnforceDBAge(svc, shouldUpdate, false, maxDBAge)
+	creds := imagescan.RegistryCredentials{
+		Username: patchInfo.Username,
+		Password: patchInfo.Password,
+	}
+	// Scan the image
+	scanResults, err := svc.Scan(ks.Context(), patchInfo.Image, creds, nil, nil)
+	if err != nil {
+		return false, err
+	}
+
+	// svc.Scan is called above with no vulnerability/severity exceptions, so scanResults.Matches
+	// is currently the full unfiltered set copa patches against. If exceptions are ever wired into
+	// this flow, keep them out of scanResults.Matches here - the patch document must still see every
+	// CVE so copa can patch it, even ones excepted from the posture report.
+	model, err := models.NewDocument(clio.Identification{}, scanResults.Packages, scanResults.Context,
+		scanResults.Matches, scanResults.IgnoredMatches, scanResults.VulnerabilityProvider, nil, nil, models.DefaultSortStrategy, false)
+	if err != nil {
+		return false, fmt.Errorf("failed to create document: %w", err)
+	}
+
+	// If the scan results ID is empty, set it to "grype"
+	if model.Descriptor.Name == "" {
+		model.Descriptor.Name = "grype"
+	}
+	// Save the scan results to a file in json format
+	pres := grypejson.NewPresenter(models.PresenterConfig{Document: model, SBOM: scanResults.SBOM})
+
+	// The intermediate name must be filesystem-safe on every OS: image
+	// references legally contain ':' (tags, registry ports) and '@'
+	// (digests), which are reserved filename characters on Windows.
+	fileName := fmt.Sprintf("%s.json", sanitizeImageRefForFilename(patchInfo.Image))
+
+	writer, err := printer.GetWriterNoFallback(fileName)
+	if err != nil {
+		return false, fmt.Errorf("creating intermediate scan results file: %w", err)
+	}
+	defer func() {
+		if err := os.Remove(fileName); err != nil && !errors.Is(err, os.ErrNotExist) {
+			logger.L().Warning(fmt.Sprintf("failed to remove residual file: %v", fileName), helpers.Error(err))
+		}
+	}()
+
+	if err = pres.Present(writer); err != nil {
+		if closeErr := writer.Close(); closeErr != nil {
+			return false, errors.Join(err, fmt.Errorf("closing intermediate scan results file: %w", closeErr))
+		}
+		return false, err
+	}
+	if closeErr := writer.Close(); closeErr != nil {
+		return false, fmt.Errorf("closing intermediate scan results file: %w", closeErr)
+	}
+	logger.L().StopSuccess(fmt.Sprintf("Successfully scanned image: %s", patchInfo.Image))
+
+	// ===================== Patch the image using copacetic =====================
+	logger.L().Start("Patching image...")
+	patchedImageName, err := buildPatchedImageName(patchInfo.Image, patchInfo.PatchedImageTag)
+	if err != nil {
+		return false, err
+	}
+
+	err = runWithCopaLoggerMuted(logger.L().GetLevel() == "debug", func() error {
+		return copaPatch(ks.Context(), patchInfo.Timeout, patchInfo.BuildkitAddress, patchInfo.Image, fileName, patchedImageName, "", patchInfo.IgnoreError, patchInfo.OutputMode, patchInfo.OutputPath, patchInfo.BuildKitOpts)
+	})
+	if err != nil {
+		return false, err
+	}
+
+	switch patchInfo.OutputMode {
+	case "image":
+		logger.L().StopSuccess(fmt.Sprintf("Patched image successfully. Pushed: %s", patchedImageName))
+	case "docker":
+		logger.L().StopSuccess(fmt.Sprintf("Patched image successfully. Loaded locally: %s", patchedImageName))
+	case "oci", "local":
+		logger.L().StopSuccess(fmt.Sprintf("Patched image successfully. Exported to: %s", patchInfo.OutputPath))
+	}
+
+	// ===================== Early return for OCI/Local exports =====================
+	// Re-scan and vulnerability report are not applicable for these output modes.
+	// Skipping them avoids a nil-pointer panic in JSON/SARIF printers and prevents
+	// a misleading empty vulnerability report with default formatting.
+	if patchInfo.OutputMode == "oci" || patchInfo.OutputMode == "local" {
+		logger.L().Warning("Re-scan not applicable for OCI/Local exports; skipping vulnerability report")
+		return false, nil
+	}
+
+	// ===================== Re-scan the image =====================
+
+	logger.L().Start(fmt.Sprintf("Re-scanning image: %s", patchedImageName))
+	scanResultsPatched, err := svc.Scan(ks.Context(), patchedImageName, creds, nil, nil)
+	if err != nil {
+		return false, err
+	}
+	logger.L().StopSuccess(fmt.Sprintf("Successfully re-scanned image: %s", patchedImageName))
+
+	// ===================== Results Handling =====================
+
+	scanInfo.SetScanType(cautils.ScanTypeImage)
+	outputPrinters, err := GetOutputPrinters(scanInfo, ks.Context(), "")
+	if err != nil {
+		return false, err
+	}
+	uiPrinter := GetUIPrinter(ks.Context(), scanInfo, "")
+	resultsHandler := resultshandling.NewResultsHandler(nil, outputPrinters, uiPrinter)
+	resultsHandler.ImageScanData = []cautils.ImageScanData{*scanResultsPatched}
+
+	return svc.ExceedsSeverityThreshold(imagescan.ParseSeverity(scanInfo.FailThresholdSeverity), scanResultsPatched.Matches, scanInfo.OnlyFixable), resultsHandler.HandleResults(ks.Context(), scanInfo)
+}
+
+// buildPatchedImageName returns the canonical "<name>:<tag>" used as the buildkit
+// export name for the patched image. Using the canonical reference (e.g.
+// docker.io/library/nginx) ensures containerd registers the patched image under
+// the prefix docker's resolver and grype's docker-provider expect; without it,
+// the patched image is unresolvable locally — see kubescape/kubescape#2189.
+func buildPatchedImageName(image, patchedTag string) (string, error) {
+	ref, err := reference.ParseNormalizedNamed(image)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse image reference %q: %w", image, err)
+	}
+	return fmt.Sprintf("%s:%s", ref.Name(), patchedTag), nil
+}
+
+// sanitizeImageRefForFilename converts an image reference into a filename
+// component that is safe on every supported OS. Image references legally
+// contain ':' (tag separators, registry ports), '/' (repository paths) and '@'
+// (digests); ':' is a reserved character on Windows, where os.Create on such a
+// name fails outright.
+func sanitizeImageRefForFilename(image string) string {
+	replacer := strings.NewReplacer(":", "-", "/", "-", "@", "-", " ", "-")
+	return replacer.Replace(strings.TrimSpace(image))
+}
+
+// updatesCount reports how many package updates are targeted, tolerating the
+// update-all mode where no scanner report is provided and updates is nil.
+func updatesCount(updates *unversioned.UpdateManifest) int {
+	if updates == nil {
+		return 0
+	}
+	return len(updates.OSUpdates) + len(updates.LangUpdates)
+}
+
+// runWithCopaLoggerMuted mutes copa's logrus output for the duration of fn,
+// unless debug is set. It does not touch os.Stdout/os.Stderr at all: logrus
+// resolves os.Stderr once, by value, at package init, so reassigning the os
+// package variables has no effect on it anyway (only log.SetOutput does),
+// and copaPatch's buildkit/containerd goroutines can still be running after
+// a timeout, so mutating those process-wide globals here would be an
+// unsynchronized write racing with any concurrent reader. The previous
+// logrus writer - whatever it actually was, not assumed to be os.Stderr - is
+// captured and restored before this function returns.
+func runWithCopaLoggerMuted(debug bool, fn func() error) error {
+	if debug {
+		return fn()
+	}
+
+	prevOut := log.StandardLogger().Out
+	log.SetOutput(io.Discard)
+	defer log.SetOutput(prevOut)
+
+	return fn()
+}
+
+// copaPatch is a slightly modified copy of the Patch function from the original "project-copacetic/copacetic" repo
+// https://github.com/project-copacetic/copacetic/blob/main/pkg/patch/patch.go
+func copaPatch(ctx context.Context, timeout time.Duration, buildkitAddr, image, reportFile, patchedImageName, workingFolder string, ignoreError bool, outputMode, outputPath string, bkOpts buildkit.Opts) error {
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ch := make(chan error, 1)
+	go func() {
+		ch <- patchWithContext(timeoutCtx, buildkitAddr, image, reportFile, patchedImageName, workingFolder, ignoreError, outputMode, outputPath, bkOpts)
+	}()
+
+	select {
+	case err := <-ch:
+		return err
+	case <-timeoutCtx.Done():
+		// add a grace period for long running deferred cleanup functions to complete
+		<-time.After(1 * time.Second)
+
+		err := fmt.Errorf("patch exceeded timeout %v", timeout)
+		log.Error(err)
+		return err
+	}
+}
+
+// resolveBuildkitOpts fills Addr from the --address flag unless a caller
+// already set it directly; empty means let buildkit.NewClient auto-detect.
+func resolveBuildkitOpts(buildkitAddr string, bkOpts buildkit.Opts) buildkit.Opts {
+	if bkOpts.Addr == "" {
+		bkOpts.Addr = buildkitAddr
+	}
+	return bkOpts
+}
+
+func patchWithContext(ctx context.Context, buildkitAddr, image, reportFile, patchedImageName, workingFolder string, ignoreError bool, outputMode, outputPath string, bkOpts buildkit.Opts) error {
+	// Ensure working folder exists for call to InstallUpdates
+	if workingFolder == "" {
+		var err error
+		workingFolder, err = os.MkdirTemp("", "copa-*")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(workingFolder)
+		if err := os.Chmod(workingFolder, 0o700); err != nil { // #nosec G302 -- working directory needs owner-execute (0o700) for a private area
+			return err
+		}
+	} else {
+		if isNew, err := utils.EnsurePath(workingFolder, 0o700); err != nil {
+			log.Errorf("failed to create workingFolder %s", workingFolder)
+			return err
+		} else if isNew {
+			defer os.RemoveAll(workingFolder)
+		}
+	}
+
+	var updates *unversioned.UpdateManifest
+	// Parse report for update packages
+	updates, err := tryParseScanReport(reportFile)
+	if err != nil {
+		return err
+	}
+
+	bkOpts = resolveBuildkitOpts(buildkitAddr, bkOpts)
+
+	bkClient, err := buildkit.NewClient(ctx, bkOpts)
+	if err != nil {
+		return fmt.Errorf("copa: error creating buildkit client :: %w", err)
+	}
+	defer bkClient.Close()
+
+	dockerConfig := config.LoadDefaultConfigFile(os.Stderr)
+	cfg := authprovider.DockerAuthProviderConfig{AuthConfigProvider: authprovider.LoadAuthConfig(dockerConfig)}
+	attachable := []session.Attachable{authprovider.NewDockerAuthProvider(cfg)}
+
+	exportEntry, pipeR, err := buildPatchExport(outputMode, outputPath, patchedImageName)
+	if err != nil {
+		return err
+	}
+
+	solveOpt := client.SolveOpt{
+		Exports:  []client.ExportEntry{exportEntry},
+		Frontend: "",         // i.e. we are passing in the llb.Definition directly
+		Session:  attachable, // used for authprovider, sshagentprovider and secretprovider
+	}
+	solveOpt.SourcePolicy, err = build.ReadSourcePolicy()
+	if err != nil {
+		return fmt.Errorf("copa: error reading source policy :: %w", err)
+	}
+
+	buildFn := func(ctx context.Context, c gwclient.Client) (*gwclient.Result, error) {
+		platform := platforms.Normalize(platforms.DefaultSpec())
+		if platform.OS != "linux" {
+			platform.OS = "linux"
+		}
+
+		// Configure buildctl/client for use by package manager
+		config, err := buildkit.InitializeBuildkitConfig(ctx, c, image, &platform)
+		if err != nil {
+			return nil, fmt.Errorf("copa: error initializing buildkit config for image %s :: %w", image, err)
+		}
+
+		// Create package manager helper
+		var manager pkgmgr.PackageManager
+		if reportFile == "" {
+			// determine OS family
+			fileBytes, err := buildkit.ExtractFileFromState(ctx, c, &config.ImageState, "/etc/os-release")
+			if err != nil {
+				return nil, fmt.Errorf("unable to extract /etc/os-release file from state %w", err)
+			}
+
+			osType, err := getOSType(ctx, fileBytes)
+			if err != nil {
+				return nil, fmt.Errorf("copa: error getting os type :: %w", err)
+			}
+
+			osVersion, err := getOSVersion(ctx, fileBytes)
+			if err != nil {
+				return nil, fmt.Errorf("copa: error getting os version :: %w", err)
+			}
+
+			// get package manager based on os family type
+			manager, err = pkgmgr.GetPackageManager(osType, osVersion, config, workingFolder)
+			if err != nil {
+				return nil, fmt.Errorf("copa: error getting package manager for ostype=%s, version=%s :: %w", osType, osVersion, err)
+			}
+			// do not specify updates, will update all
+			updates = nil
+		} else {
+			// get package manager based on os family type
+			manager, err = pkgmgr.GetPackageManager(updates.Metadata.OS.Type, updates.Metadata.OS.Version, config, workingFolder)
+			if err != nil {
+				return nil, fmt.Errorf("copa: error getting package manager by family type: ostype=%s, osversion=%s :: %w", updates.Metadata.OS.Type, updates.Metadata.OS.Version, err)
+			}
+		}
+
+		log.Infof("Patching %d vulnerabilities", updatesCount(updates))
+		patchedImageState, errPkgs, err := manager.InstallUpdates(ctx, updates, ignoreError)
+		if err != nil {
+			return nil, fmt.Errorf("copa: error installing updates :: %w", err)
+		}
+
+		def, err := patchedImageState.Marshal(ctx, llb.Platform(platform))
+		if err != nil {
+			return nil, err
+		}
+
+		res, err := c.Solve(ctx, gwclient.SolveRequest{
+			Definition: def.ToPB(),
+			Evaluate:   true,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		res.AddMeta(exptypes.ExporterImageConfigKey, config.ConfigData)
+
+		// Currently can only validate updates if updating via scanner
+		if reportFile != "" {
+			// create a new manifest with the successfully patched packages
+			validatedManifest := &unversioned.UpdateManifest{
+				Metadata: unversioned.Metadata{
+					OS: unversioned.OS{
+						Type:    updates.Metadata.OS.Type,
+						Version: updates.Metadata.OS.Version,
+					},
+					Config: unversioned.Config{
+						Arch: updates.Metadata.Config.Arch,
+					},
+				},
+				OSUpdates:   []unversioned.UpdatePackage{},
+				LangUpdates: []unversioned.UpdatePackage{},
+			}
+			for _, update := range updates.OSUpdates {
+				if !slices.Contains(errPkgs, update.Name) {
+					validatedManifest.OSUpdates = append(validatedManifest.OSUpdates, update)
+				}
+			}
+			for _, update := range updates.LangUpdates {
+				if !slices.Contains(errPkgs, update.Name) {
+					validatedManifest.LangUpdates = append(validatedManifest.LangUpdates, update)
+				}
+			}
+			_ = validatedManifest
+		}
+		return res, nil
+	}
+
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.Go(func() error {
+		_, buildErr := bkClient.Build(egCtx, solveOpt, copaProduct, buildFn, nil)
+		// On error, unblock the docker-load reader so eg.Wait() can return.
+		// On success the writer has already been closed by buildkit and the
+		// pipe has been fully drained — closing pipeR here would race with
+		// the exec-copy goroutine still draining into `docker load`'s stdin.
+		if buildErr != nil && pipeR != nil {
+			_ = pipeR.CloseWithError(buildErr)
+		}
+		return buildErr
+	})
+	if pipeR != nil {
+		eg.Go(func() error {
+			return dockerLoad(egCtx, pipeR)
+		})
+	}
+	return eg.Wait()
+}
+
+// lookPath is exec.LookPath, indirected so the docker-CLI preflight in
+// buildPatchExport can be exercised in unit tests without depending on the
+// test host's PATH.
+var lookPath = exec.LookPath
+
+// buildPatchExport selects the buildkit export entry for the patched image
+// based on the requested outputMode:
+//
+//   - "image": pushes the patched image directly to the source registry via
+//     ExporterImage with the buildkit "push" attribute. pipeR is nil.
+//   - "oci": writes the patched image as an OCI tarball to outputPath via
+//     ExporterOCI. pipeR is nil.
+//   - "local": extracts the patched image filesystem to the directory at
+//     outputPath via ExporterLocal. pipeR is nil.
+//   - "docker" (default): streams the image through `docker load` via
+//     ExporterDocker so it lands in the user's docker image store. The caller
+//     is expected to read the returned pipeR concurrently (via dockerLoad).
+func buildPatchExport(outputMode, outputPath, patchedImageName string) (client.ExportEntry, *io.PipeReader, error) {
+	switch outputMode {
+	case "image":
+		return client.ExportEntry{
+			Type: client.ExporterImage,
+			Attrs: map[string]string{
+				"name": patchedImageName,
+				"push": "true",
+			},
+		}, nil, nil
+	case "oci":
+		if outputPath == "" {
+			return client.ExportEntry{}, nil, fmt.Errorf("output-path must be provided for oci export")
+		}
+		return client.ExportEntry{
+			Type: client.ExporterOCI,
+			Attrs: map[string]string{
+				"name": patchedImageName,
+			},
+			Output: func(_ map[string]string) (io.WriteCloser, error) {
+				if dir := filepath.Dir(outputPath); dir != "." {
+					if err := os.MkdirAll(dir, 0o750); err != nil {
+						return nil, fmt.Errorf("failed to create parent directory for output-path %q: %w", outputPath, err)
+					}
+				}
+				return os.Create(filepath.Clean(outputPath))
+			},
+		}, nil, nil
+	case "local":
+		if outputPath == "" {
+			return client.ExportEntry{}, nil, fmt.Errorf("output-path must be provided for local export")
+		}
+		return client.ExportEntry{
+			Type:      client.ExporterLocal,
+			OutputDir: outputPath,
+		}, nil, nil
+	case "docker":
+		fallthrough
+	default:
+		if _, err := lookPath("docker"); err != nil {
+			return client.ExportEntry{}, nil, fmt.Errorf(
+				"docker CLI not found on PATH: required to load the patched image locally; "+
+					"pass --push to push to a registry instead: %w", err)
+		}
+		pipeR, pipeW := io.Pipe()
+		return client.ExportEntry{
+			Type:  client.ExporterDocker,
+			Attrs: map[string]string{"name": patchedImageName},
+			Output: func(_ map[string]string) (io.WriteCloser, error) {
+				return pipeW, nil
+			},
+		}, pipeR, nil
+	}
+}
+
+// dockerLoad streams an OCI tarball from r into `docker load`. Used for the
+// default (non-push) export path so the patched image lands in the user's
+// docker image store and is resolvable by the post-patch re-scan.
+func dockerLoad(ctx context.Context, r io.Reader) error {
+	cmd := exec.CommandContext(ctx, "docker", "load")
+	cmd.Stdin = r
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker load failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func getOSType(ctx context.Context, osreleaseBytes []byte) (string, error) {
+	r := bytes.NewReader(osreleaseBytes)
+	osData, err := osrelease.Parse(ctx, r)
+	if err != nil {
+		return "", fmt.Errorf("unable to parse os-release data %w", err)
+	}
+
+	osType := strings.ToLower(osData["NAME"])
+	switch {
+	case strings.Contains(osType, "alpine"):
+		return "alpine", nil
+	case strings.Contains(osType, "debian"):
+		return "debian", nil
+	case strings.Contains(osType, "ubuntu"):
+		return "ubuntu", nil
+	case strings.Contains(osType, "amazon"):
+		return "amazon", nil
+	case strings.Contains(osType, "centos"):
+		return "centos", nil
+	case strings.Contains(osType, "mariner"):
+		return "cbl-mariner", nil
+	case strings.Contains(osType, "azure linux"):
+		return "azurelinux", nil
+	case strings.Contains(osType, "red hat"):
+		return "redhat", nil
+	case strings.Contains(osType, "rocky"):
+		return "rocky", nil
+	case strings.Contains(osType, "oracle"):
+		return "oracle", nil
+	case strings.Contains(osType, "alma"):
+		return "alma", nil
+	default:
+		log.Error("unsupported osType ", osType)
+		return "", errors.ErrUnsupported
+	}
+}
+
+func getOSVersion(ctx context.Context, osreleaseBytes []byte) (string, error) {
+	r := bytes.NewReader(osreleaseBytes)
+	osData, err := osrelease.Parse(ctx, r)
+	if err != nil {
+		return "", fmt.Errorf("unable to parse os-release data %w", err)
+	}
+
+	return osData["VERSION_ID"], nil
+}
+
+// This function adds support to copa for patching Kubescape produced results
+func tryParseScanReport(file string) (*unversioned.UpdateManifest, error) {
+
+	parser := copaGrype.GrypeParser{}
+	manifest, err := parser.Parse(file)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert from v1alpha1 to unversioned.UpdateManifest
+	var um unversioned.UpdateManifest
+	um.Metadata.OS.Type = manifest.Metadata.OS.Type
+	um.Metadata.OS.Version = manifest.Metadata.OS.Version
+	um.Metadata.Config.Arch = manifest.Metadata.Config.Arch
+	um.OSUpdates = make([]unversioned.UpdatePackage, len(manifest.Updates))
+	for i, update := range manifest.Updates {
+		um.OSUpdates[i].Name = update.Name
+		um.OSUpdates[i].InstalledVersion = update.InstalledVersion
+		um.OSUpdates[i].FixedVersion = update.FixedVersion
+		um.OSUpdates[i].VulnerabilityID = update.VulnerabilityID
+	}
+
+	return &um, nil
+}

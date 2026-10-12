@@ -1,0 +1,45 @@
+package software.coley.recaf.services.cell.icon;
+
+import jakarta.annotation.Nonnull;
+import jakarta.enterprise.context.ApplicationScoped;
+import javafx.scene.paint.Color;
+import org.kordamp.ikonli.carbonicons.CarbonIcons;
+import org.objectweb.asm.tree.AbstractInsnNode;
+import software.coley.recaf.info.ClassInfo;
+import software.coley.recaf.info.member.MethodMember;
+import software.coley.recaf.ui.control.FontIconView;
+import software.coley.recaf.workspace.model.Workspace;
+import software.coley.recaf.workspace.model.bundle.ClassBundle;
+import software.coley.recaf.workspace.model.resource.WorkspaceResource;
+
+/**
+ * Basic implementation for {@link InstructionIconProviderFactory}.
+ *
+ * @author Matt Coley
+ */
+@ApplicationScoped
+public class BasicInstructionIconProviderFactory implements InstructionIconProviderFactory {
+	private static final Color INSN_COLOR = Color.web("rgb(0, 175, 255)");
+
+	@Nonnull
+	@Override
+	public IconProvider getInstructionIconProvider(@Nonnull Workspace workspace,
+	                                               @Nonnull WorkspaceResource resource,
+	                                               @Nonnull ClassBundle<? extends ClassInfo> bundle,
+	                                               @Nonnull ClassInfo declaringClass,
+	                                               @Nonnull MethodMember declaringMethod,
+	                                               @Nonnull AbstractInsnNode instruction) {
+		return () -> new FontIconView(CarbonIcons.CODE, INSN_COLOR);
+	}
+
+	@Nonnull
+	@Override
+	public IconProvider getInstructionIconProvider(@Nonnull Workspace workspace,
+	                                               @Nonnull WorkspaceResource resource,
+	                                               @Nonnull ClassBundle<? extends ClassInfo> bundle,
+	                                               @Nonnull ClassInfo declaringClass,
+	                                               @Nonnull MethodMember declaringMethod,
+	                                               @Nonnull me.darknet.dex.tree.definitions.instructions.Instruction instruction) {
+		return () -> new FontIconView(CarbonIcons.CODE, INSN_COLOR);
+	}
+}

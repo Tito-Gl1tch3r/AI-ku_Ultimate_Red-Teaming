@@ -1,0 +1,167 @@
+package scan
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/kubescape/v4/cmd/shared"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/meta"
+	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling"
+	apisv1 "github.com/kubescape/opa-utils/httpserver/apis/v1"
+	"github.com/spf13/cobra"
+)
+
+var (
+	controlExample = fmt.Sprintf(`
+  # Scan the 'privileged container' control
+  %[1]s scan control "privileged container"
+	
+  # Scan list of controls separated with a comma
+  %[1]s scan control "privileged container","HostPath mount"
+  
+  # Scan list of controls using the control ID separated with a comma
+  %[1]s scan control C-0058,C-0057
+  
+  Run '%[1]s list controls' for the list of supported controls
+  
+  Control documentation:
+  https://kubescape.io/docs/controls/
+`, cautils.ExecName())
+)
+
+// controlCmd represents the control command
+func getControlCmd(ks meta.IKubescape, scanInfo *cautils.ScanInfo) *cobra.Command {
+	return &cobra.Command{
+		Use:     "control <control names list>/<control ids list>",
+		Short:   fmt.Sprintf("The controls you wish to use. Run '%[1]s list controls' for the list of supported controls", cautils.ExecName()),
+		Example: controlExample,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				controls := strings.Split(args[0], ",")
+				if len(controls) > 1 {
+					if slices.Contains(controls, "") {
+						return fmt.Errorf("usage: <control-0>,<control-1>")
+					}
+				}
+			} else {
+				return fmt.Errorf("requires at least one control name")
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := shared.ValidateCommonScanFlags(cmd, scanInfo, shared.ScanFormats); err != nil {
+				return err
+			}
+			if err := validateFrameworkScanInfo(scanInfo); err != nil {
+				return err
+			}
+
+			// flagValidationControl(scanInfo)
+			var policyIdentifiers []cautils.PolicyIdentifier
+
+			if len(args) == 0 {
+				scanInfo.ScanAll = true
+			} else { // expected control or list of control separated by ","
+
+				// Read controls from input args
+				policyIdentifiers = cautils.BuildPolicyIdentifiers(strings.Split(args[0], ","), apisv1.KindControl)
+
+				cleanup, err := prepareScanLocalInput(cmd.InOrStdin(), args, scanInfo, scanLocalInputOptions{
+					FirstInputArg:    1,
+					RejectMixedStdin: true,
+				})
+				if err != nil {
+					return err
+				}
+				defer cleanup()
+			}
+
+			scanInfo.FrameworkScan = false
+			scanInfo.SetScanType(cautils.ScanTypeControl)
+
+			if err := validateControlScanInfo(scanInfo); err != nil {
+				return err
+			}
+			if err := validateCombinedImageScanFlags(scanInfo); err != nil {
+				return err
+			}
+
+			if len(scanInfo.KubeContexts) > 0 {
+				if _, err := validateFleetScanInvocation(scanInfo); err != nil {
+					return err
+				}
+			}
+
+			// The invocation is valid from this point on. Runtime and result-gate
+			// failures should not print command usage.
+			cmd.SilenceUsage = true
+
+			if len(scanInfo.KubeContexts) > 0 {
+				return fleetScan(*scanInfo, ks, policyIdentifiers, runControlScan)
+			}
+
+			ctx, cancel := deriveTimeoutContext(scanInfo, ks)
+			defer cancel()
+			_, err := runControlScan(ctx, scanInfo, ks, policyIdentifiers)
+			return err
+		},
+	}
+}
+
+// runControlScan runs one cluster's control scan to completion: Scan,
+// HandleResults, then every threshold/drift enforcement the control command
+// performs for the single-context path. Factored out so fleetScan can run
+// the exact same per-cluster behavior once per --kube-contexts entry,
+// instead of a parallel, divergent copy of this logic.
+func runControlScan(ctx context.Context, scanInfo *cautils.ScanInfo, ks meta.IKubescape, policyIdentifiers []cautils.PolicyIdentifier) (*resultshandling.ResultsHandler, error) {
+	results, err := ks.ScanContext(ctx, scanInfo, policyIdentifiers)
+	if err != nil {
+		return nil, err
+	}
+	if err := results.HandleResults(ctx, scanInfo); err != nil {
+		return results, err
+	}
+	if !scanInfo.VerboseMode {
+		logger.L().Info("Run with '--verbose'/'-v' flag for detailed resources view\n")
+	}
+	if results.GetComplianceScore() < float32(scanInfo.ComplianceThreshold) {
+		return results, fmt.Errorf("scan compliance-score is below permitted threshold: %.2f (compliance-threshold: %.2f)", results.GetComplianceScore(), scanInfo.ComplianceThreshold)
+	}
+	if err := enforceSeverityThresholds(&results.GetResults().SummaryDetails, scanInfo); err != nil {
+		return results, err
+	}
+	if scanInfo.ScanImages {
+		if err := enforceImageSeverityThresholds(results.ImageScanData, scanInfo); err != nil {
+			return results, err
+		}
+	}
+	if err := enforceCoverageThreshold(results.GetData().ScanCoverage, len(results.GetResults().SummaryDetails.Controls), scanInfo); err != nil {
+		return results, err
+	}
+	if err := enforcePolicyDegradation(results.GetData().ScanCoverage, scanInfo); err != nil {
+		return results, err
+	}
+
+	return results, enforceBaselineDrift(ctx, results, scanInfo)
+}
+
+// validateControlScanInfo validates the ScanInfo struct for the `control` command
+func validateControlScanInfo(scanInfo *cautils.ScanInfo) error {
+	severity := scanInfo.FailThresholdSeverity
+
+	if err := validateControlTimeout(scanInfo); err != nil {
+		return err
+	}
+
+	if err := shared.ValidateSeverity(severity); severity != "" && err != nil {
+		return err
+	}
+	if err := validateThresholdsOnly(scanInfo); err != nil {
+		return err
+	}
+	return nil
+}

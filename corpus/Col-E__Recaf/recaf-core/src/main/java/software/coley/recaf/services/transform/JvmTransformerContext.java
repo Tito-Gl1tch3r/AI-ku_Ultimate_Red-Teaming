@@ -1,0 +1,637 @@
+package software.coley.recaf.services.transform;
+
+import jakarta.annotation.Nonnull;
+import jakarta.annotation.Nullable;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Type;
+import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.MethodInsnNode;
+import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.analysis.Frame;
+import org.slf4j.Logger;
+import software.coley.recaf.analytics.logging.Logging;
+import software.coley.recaf.info.JvmClassInfo;
+import software.coley.recaf.path.ClassPathNode;
+import software.coley.recaf.path.PathNodes;
+import software.coley.recaf.path.ResourcePathNode;
+import software.coley.recaf.services.deobfuscation.transform.generic.DeadCodeRemovingTransformer;
+import software.coley.recaf.services.deobfuscation.transform.generic.FrameRemovingTransformer;
+import software.coley.recaf.services.inheritance.InheritanceGraph;
+import software.coley.recaf.services.mapping.aggregate.AggregatedMappings;
+import software.coley.recaf.util.ClassMethodPair;
+import software.coley.recaf.util.Types;
+import software.coley.recaf.util.analysis.ReAnalyzer;
+import software.coley.recaf.util.analysis.ReInterpreter;
+import software.coley.recaf.util.analysis.lookup.BasicGetStaticLookup;
+import software.coley.recaf.util.analysis.lookup.BasicInvokeStaticLookup;
+import software.coley.recaf.util.analysis.lookup.BasicInvokeVirtualLookup;
+import software.coley.recaf.util.analysis.lookup.GetFieldLookup;
+import software.coley.recaf.util.analysis.lookup.GetStaticLookup;
+import software.coley.recaf.util.analysis.lookup.InvokeStaticLookup;
+import software.coley.recaf.util.analysis.lookup.InvokeVirtualLookup;
+import software.coley.recaf.util.analysis.value.ReValue;
+import software.coley.recaf.util.visitors.FrameSkippingVisitor;
+import software.coley.recaf.util.visitors.WorkspaceClassWriter;
+import software.coley.recaf.workspace.model.Workspace;
+import software.coley.recaf.workspace.model.bundle.JvmClassBundle;
+import software.coley.recaf.workspace.model.resource.WorkspaceResource;
+
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.IdentityHashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
+
+/**
+ * JVM-specific transformer-context implementation.
+ *
+ * @author Matt Coley
+ */
+public class JvmTransformerContext extends AbstractTransformerContext<JvmClassTransformer> {
+	private static final Logger logger = Logging.get(JvmTransformerContext.class);
+	private final AggregatedMappings mappings;
+	private final Map<String, JvmClassData> classData = new ConcurrentHashMap<>();
+	private final Set<String> recomputeFrameClasses = ConcurrentHashMap.newKeySet();
+	private Supplier<GetFieldLookup> getFieldLookupSupplier = () -> null;
+	private Supplier<GetStaticLookup> getStaticLookupSupplier = BasicGetStaticLookup::new;
+	private Supplier<InvokeVirtualLookup> invokeVirtualLookupSupplier = BasicInvokeVirtualLookup::new;
+	private Supplier<InvokeStaticLookup> invokeStaticLookupSupplier = BasicInvokeStaticLookup::new;
+	private boolean reuseConstantPool = true;
+	private boolean dropFaultyClasses;
+
+	/**
+	 * Constructs a new context from an array of transformers.
+	 *
+	 * @param workspace
+	 * 		Workspace containing the classes to transform.
+	 * @param resource
+	 * 		Resource in the workspace containing classes to transform. Should always be the {@link Workspace#getPrimaryResource()}.
+	 * @param transformers
+	 * 		Transformers to associate with this context.
+	 */
+	public JvmTransformerContext(@Nonnull Workspace workspace, @Nonnull WorkspaceResource resource, @Nonnull JvmClassTransformer... transformers) {
+		this(workspace, resource, Arrays.asList(transformers));
+	}
+
+	/**
+	 * Constructs a new context from a collection of transformers.
+	 *
+	 * @param workspace
+	 * 		Workspace containing the classes to transform.
+	 * @param resource
+	 * 		Resource in the workspace containing classes to transform. Should always be the {@link Workspace#getPrimaryResource()}.
+	 * @param transformers
+	 * 		Transformers to associate with this context.
+	 */
+	public JvmTransformerContext(@Nonnull Workspace workspace, @Nonnull WorkspaceResource resource, @Nonnull Collection<? extends JvmClassTransformer> transformers) {
+		this(workspace, resource, transformers, TransformationParameters.empty());
+	}
+
+	/**
+	 * Constructs a new context from a collection of transformers.
+	 *
+	 * @param workspace
+	 * 		Workspace containing the classes to transform.
+	 * @param resource
+	 * 		Resource in the workspace containing classes to transform. Should always be the {@link Workspace#getPrimaryResource()}.
+	 * @param transformers
+	 * 		Transformers to associate with this context.
+	 * @param parameters
+	 * 		Per-run parameters transformers can pull values from.
+	 */
+	public JvmTransformerContext(@Nonnull Workspace workspace, @Nonnull WorkspaceResource resource,
+	                             @Nonnull Collection<? extends JvmClassTransformer> transformers,
+	                             @Nonnull TransformationParameters parameters) {
+		super(workspace, resource, transformers, parameters);
+
+		// We will use aggregated mappings for the reverse-mapping utility it offers.
+		// Some transformers that aim to provide mappings will find this very handy.
+		mappings = new AggregatedMappings(workspace);
+	}
+
+	/**
+	 * @param dropFaultyClasses
+	 * 		When {@code true}, classes that fail to be written back to bytecode are logged and omitted from the
+	 * 		transformation results instead of aborting the whole run with a {@link TransformationException}.
+	 */
+	public void setDropFaultyClasses(boolean dropFaultyClasses) {
+		this.dropFaultyClasses = dropFaultyClasses;
+	}
+
+	/**
+	 * @return {@code true} when classes that fail to be written back are dropped instead of aborting the run.
+	 */
+	public boolean isDropFaultyClasses() {
+		return dropFaultyClasses;
+	}
+
+	/**
+	 * @return {@code true} when the constant pool of the original class is reused when writing back to bytecode.
+	 * {@code false} to always regenerate the constant pool when writing back to bytecode.
+	 */
+	public boolean isReuseConstantPool() {
+		return reuseConstantPool;
+	}
+
+	/**
+	 * Defaults to {@code true} to reuse, as most transformations should not be affected by the reused pool.
+	 * It's slightly faster to reuse the pool, but there are some side effects like some meta-data being copied
+	 * even if the transformer intentionally removed it.
+	 *
+	 * @param reuseConstantPool
+	 *        {@code true} when the constant pool of the original class is reused when writing back to bytecode.
+	 *        {@code false} to always regenerate the constant pool when writing back to bytecode.
+	 */
+	public void setReuseConstantPool(boolean reuseConstantPool) {
+		this.reuseConstantPool = reuseConstantPool;
+	}
+
+	/**
+	 * Builds the map of initial transformed class paths to their final transformed states.
+	 * <br>
+	 * The map keys are existing workspace paths the respective classes.
+	 * <br>
+	 * The map values are classes post-transformation, without any mappings applied.
+	 *
+	 * @param inheritanceGraph
+	 * 		Inheritance graph tied to the workspace the transformed classes belong to.
+	 *
+	 * @throws TransformationException
+	 * 		When the classes cannot be written back to {@code byte[]} likely due to frame computation problems.
+	 */
+	@Nonnull
+	protected Map<ClassPathNode, JvmClassInfo> buildChangeMap(@Nonnull InheritanceGraph inheritanceGraph) throws TransformationException {
+		ResourcePathNode resourcePath = PathNodes.resourcePath(workspace, resource);
+		Map<ClassPathNode, JvmClassInfo> map = new IdentityHashMap<>();
+		for (JvmClassData data : classData.values()) {
+			if (data.isDirty()) {
+				if (data.node != null) {
+					// Emit bytecode from the current node
+					boolean recompute = recomputeFrameClasses.contains(data.node.name);
+					int flags = recompute ? ClassWriter.COMPUTE_FRAMES : 0;
+					ClassReader reader = reuseConstantPool ? data.initialClass.getClassReader() : null;
+					ClassWriter writer = new WorkspaceClassWriter(inheritanceGraph, reader, flags);
+					try {
+						if (recompute)
+							data.node.accept(new FrameSkippingVisitor(writer));
+						else
+							data.node.accept(writer);
+
+						// Update output map
+						byte[] modifiedBytes = writer.toByteArray();
+						JvmClassInfo modifiedClass = data.initialClass.toJvmClassBuilder()
+								.adaptFrom(modifiedBytes)
+								.build();
+						ClassPathNode classPath = resourcePath.child(data.bundle)
+								.child(modifiedClass.getPackageName())
+								.child(modifiedClass);
+						map.put(classPath, modifiedClass);
+					} catch (Throwable t) {
+						if (dropFaultyClasses) {
+							logger.warn("Error writing class '{}', skipping", data.initialClass.getName(), t);
+							continue;
+						}
+						throw new TransformationException("ClassNode --> byte[] failed for class '" + data.node.name + "'", t);
+					}
+				} else {
+					// Update output map if the bytecode is not the same as the initial state
+					byte[] bytecode = data.getBytecode();
+					if (!Arrays.equals(bytecode, data.initialClass.getBytecode())) {
+						JvmClassInfo modifiedClass = data.initialClass.toJvmClassBuilder()
+								.adaptFrom(bytecode)
+								.build();
+						ClassPathNode classPath = resourcePath.child(data.bundle)
+								.child(modifiedClass.getPackageName())
+								.child(modifiedClass);
+						map.put(classPath, modifiedClass);
+					}
+				}
+			}
+		}
+		return map;
+	}
+
+	/**
+	 * @param inheritanceGraph
+	 * 		Inheritance graph of workspace.
+	 * @param targetType
+	 * 		Target type.
+	 * @param valueType
+	 * 		Value type.
+	 *
+	 * @return {@code true} when the value type is assignable to the target type.
+	 */
+	public boolean isAssignable(@Nonnull InheritanceGraph inheritanceGraph, @Nonnull Type targetType, @Nonnull Type valueType) {
+		// Base case, same type.
+		if (targetType.equals(valueType))
+			return true;
+
+		// Arrays can only be assigned to Object, and Object can be assigned from any array.
+		int targetSort = targetType.getSort();
+		int valueSort = valueType.getSort();
+		if (targetSort == Type.ARRAY || valueSort == Type.ARRAY)
+			return targetSort == Type.OBJECT && Types.OBJECT_TYPE.equals(targetType);
+
+		// For non-object types, these are not assignable between one another.
+		// This method is used strictly for checking casts and object type operations.
+		//
+		// If either type is not an object, then the cast is only valid if both types are the same primitive type,
+		// which is already handled by the equality check above.
+		if (targetSort != Type.OBJECT || valueSort != Type.OBJECT)
+			return false;
+
+		// Check inheritance graph for assignability of reference types.
+		return inheritanceGraph.isAssignableFrom(targetType.getInternalName(), valueType.getInternalName());
+	}
+
+	/**
+	 * @param inheritanceGraph
+	 * 		Inheritance graph of workspace.
+	 * @param cls
+	 * 		Name of class defining a method to analyze.
+	 * @param method
+	 * 		Method to analyze.
+	 *
+	 * @return Analyzed frames of the given method.
+	 *
+	 * @throws TransformationException
+	 * 		When the analyzer throws an exception when computing the frames of the given method.
+	 */
+	@Nonnull
+	public Frame<ReValue>[] analyze(@Nonnull InheritanceGraph inheritanceGraph,
+	                                @Nonnull ClassNode cls,
+	                                @Nonnull MethodNode method) throws TransformationException {
+		try {
+			ReAnalyzer analyzer = newAnalyzer(inheritanceGraph, cls, method);
+			return analyzer.analyze(cls.name, method);
+		} catch (Throwable t) {
+			throw new TransformationException("Error encountered when computing method frames", t);
+		}
+	}
+
+	/**
+	 * @param inheritanceGraph
+	 * 		Inheritance graph of workspace.
+	 * @param cls
+	 * 		Name of class defining a method to analyze.
+	 * @param method
+	 * 		Method to analyze.
+	 *
+	 * @return An analyzer for the given method.
+	 */
+	@Nonnull
+	public ReAnalyzer newAnalyzer(@Nonnull InheritanceGraph inheritanceGraph,
+	                              @Nonnull ClassNode cls,
+	                              @Nonnull MethodNode method) {
+		ReInterpreter interpreter = newInterpreter(inheritanceGraph);
+		return new ReAnalyzer(interpreter);
+	}
+
+	/**
+	 * @param inheritanceGraph
+	 * 		Inheritance graph of workspace.
+	 *
+	 * @return An interpreter for handling instruction execution.
+	 */
+	@Nonnull
+	public ReInterpreter newInterpreter(@Nonnull InheritanceGraph inheritanceGraph) {
+		ReInterpreter interpreter = new ReInterpreter(inheritanceGraph);
+		interpreter.setGetFieldLookup(getFieldLookupSupplier.get());
+		interpreter.setGetStaticLookup(getStaticLookupSupplier.get());
+		interpreter.setInvokeVirtualLookup(invokeVirtualLookupSupplier.get());
+		interpreter.setInvokeStaticLookup(invokeStaticLookupSupplier.get());
+		return interpreter;
+	}
+
+	/**
+	 * Utility to invoke {@link DeadCodeRemovingTransformer} for a given method.
+	 * Requires the transformer to be provided to this context.
+	 *
+	 * @param declaringClass
+	 * 		Class declaring the method to clean up.
+	 * @param method
+	 * 		Method with dead code to remove.
+	 *
+	 * @return {@code true} when there were changes as a result of dead code removal.
+	 * {@code false} for no changes being made to the passed method.
+	 *
+	 * @throws TransformationException
+	 * 		When the {@link DeadCodeRemovingTransformer} was not provided to this context,
+	 * 		or if dead code removal encountered an error.
+	 */
+	public boolean pruneDeadCode(@Nonnull ClassNode declaringClass, @Nonnull MethodNode method) throws TransformationException {
+		return getTransformer(DeadCodeRemovingTransformer.class).prune(declaringClass, method);
+	}
+
+	/**
+	 * @param bundle
+	 * 		Bundle containing the class.
+	 * @param info
+	 * 		The class's model in the workspace.
+	 *
+	 * @return {@code true} when the context currently has the class represented as a node <i>(vs raw {@code byte[]})</i.>
+	 */
+	public boolean isNode(@Nonnull JvmClassBundle bundle, @Nonnull JvmClassInfo info) {
+		JvmClassData data = getJvmClassData(bundle, info);
+		return data.node != null;
+	}
+
+	/**
+	 * Gets the current ASM node representation of the given class.
+	 * <p>
+	 * Transformers can update the <i>"current"</i> state of the node via
+	 * {@link #setBytecode(JvmClassBundle, JvmClassInfo, byte[])} or
+	 * {@link #setNode(JvmClassBundle, JvmClassInfo, ClassNode)}.
+	 *
+	 * @param bundle
+	 * 		Bundle containing the class.
+	 * @param info
+	 * 		The class's model in the workspace.
+	 *
+	 * @return The current tracked/transformed {@link ClassNode} for the associated class.
+	 *
+	 * @see #setNode(JvmClassBundle, JvmClassInfo, ClassNode)
+	 */
+	@Nonnull
+	public ClassNode getNode(@Nonnull JvmClassBundle bundle, @Nonnull JvmClassInfo info) {
+		return getJvmClassData(bundle, info).getOrCreateNode();
+	}
+
+	/**
+	 * Gets the current bytecode of the given class.
+	 * <p>
+	 * Transformers can update the <i>"current"</i> state of the bytecode via
+	 * {@link #setBytecode(JvmClassBundle, JvmClassInfo, byte[])} or
+	 * {@link #setNode(JvmClassBundle, JvmClassInfo, ClassNode)}.
+	 *
+	 * @param bundle
+	 * 		Bundle containing the class.
+	 * @param info
+	 * 		The class's model in the workspace.
+	 *
+	 * @return The current tracked/transformed bytecode for the associated class.
+	 *
+	 * @see #setBytecode(JvmClassBundle, JvmClassInfo, byte[])
+	 */
+	@Nonnull
+	public byte[] getBytecode(@Nonnull JvmClassBundle bundle, @Nonnull JvmClassInfo info) {
+		return getJvmClassData(bundle, info).getBytecode();
+	}
+
+	/**
+	 * Updates the transformed state of a class by recording an ASM node representation of the class.
+	 *
+	 * @param bundle
+	 * 		Bundle containing the class.
+	 * @param info
+	 * 		The class's model in the workspace.
+	 * @param node
+	 * 		ASM node representation of the class to store.
+	 *
+	 * @see #getNode(JvmClassBundle, JvmClassInfo)
+	 */
+	public void setNode(@Nonnull JvmClassBundle bundle, @Nonnull JvmClassInfo info, @Nonnull ClassNode node) {
+		recordDidWork();
+		getJvmClassData(bundle, info).setNode(node);
+	}
+
+	/**
+	 * Updates the transformed state of a class by recording new bytecode of the class.
+	 *
+	 * @param bundle
+	 * 		Bundle containing the class.
+	 * @param info
+	 * 		The class's model in the workspace.
+	 * 		This does not need to reflect the updated state of the bytecode, it is strictly used for keying/lookups.
+	 * @param bytecode
+	 * 		Bytecode of the class to store.
+	 *
+	 * @see #getBytecode(JvmClassBundle, JvmClassInfo)
+	 */
+	public void setBytecode(@Nonnull JvmClassBundle bundle, @Nonnull JvmClassInfo info, @Nonnull byte[] bytecode) {
+		recordDidWork();
+		getJvmClassData(bundle, info).setBytecode(bytecode);
+	}
+
+	/**
+	 * Resolves a method instruction to the class and method it is calling.
+	 *
+	 * @param min
+	 * 		Method instruction to resolve.
+	 *
+	 * @return The class and method being called, or {@code null} if the method cannot be resolved.
+	 */
+	@Nullable
+	public ClassMethodPair resolveMethod(@Nonnull MethodInsnNode min) {
+		String owner = min.owner;
+		String methodName = min.name;
+		String methodDesc = min.desc;
+
+		return resolveMethod(owner, methodName, methodDesc);
+	}
+
+	/**
+	 * Resolves a method call to the class and method it is calling.
+	 *
+	 * @param owner
+	 * 		Class name declaring the method.
+	 * @param methodName
+	 * 		Name of the method being called.
+	 * @param methodDesc
+	 * 		Descriptor of the method being called.
+	 *
+	 * @return The class and method being called, or {@code null} if the method cannot be resolved.
+	 */
+	@Nullable
+	public ClassMethodPair resolveMethod(@Nonnull String owner,
+	                                     @Nonnull String methodName,
+	                                     @Nonnull String methodDesc) {
+		// Look up class in the workspace.
+		ClassPathNode classPath = workspace.findJvmClass(owner);
+		if (classPath == null)
+			return null;
+
+		// Look up the bundle for the class.
+		JvmClassBundle bundle = classPath.getValueOfType(JvmClassBundle.class);
+		if (bundle == null)
+			return null;
+
+		// We really only looked up the class to get the containing bundle.
+		// Now that we have the bundle, we can look up the class node in its current form in this context
+		// and up-to-date method contents in that class.
+		JvmClassInfo classInfo = classPath.getValue().asJvmClass();
+		ClassNode classNode = getNode(bundle, classInfo);
+		for (MethodNode method : classNode.methods)
+			if (methodName.equals(method.name) && methodDesc.equals(method.desc))
+				return new ClassMethodPair(classNode, method);
+		return null;
+	}
+
+	/**
+	 * Clears any transformations applied to the given class.
+	 *
+	 * @param bundle
+	 * 		Bundle containing the class.
+	 * @param info
+	 * 		The class's model in the workspace.
+	 */
+	public void clear(@Nonnull JvmClassBundle bundle, @Nonnull JvmClassInfo info) {
+		JvmClassData data = getJvmClassData(bundle, info);
+		data.setBytecode(data.initialClass.getBytecode());
+		data.dirty = false;
+	}
+
+	/**
+	 * Called by transformers that have more thorough changes applied to classes that likely violate existing frames.
+	 *
+	 * @param className
+	 * 		Name of class to recompute frames for when building the change map.
+	 */
+	public void setRecomputeFrames(@Nonnull String className) {
+		recomputeFrameClasses.add(className);
+	}
+
+	/**
+	 * Transformers that aim to rename classes, fields, and methods should register the desired mappings
+	 * here, and they will be applied after all other transformations are applied.
+	 *
+	 * @return Mappings to apply upon transformation completion.
+	 */
+	@Nonnull
+	public AggregatedMappings getMappings() {
+		return mappings;
+	}
+
+	/**
+	 * @param supplier
+	 * 		Supplier for {@link GetFieldLookup} to be used with {@link #newAnalyzer(InheritanceGraph, ClassNode, MethodNode)}.
+	 */
+	public void setGetFieldLookupSupplier(@Nullable Supplier<GetFieldLookup> supplier) {
+		if (supplier == null)
+			supplier = () -> null;
+		getFieldLookupSupplier = supplier;
+	}
+
+	/**
+	 * @param supplier
+	 * 		Supplier for {@link GetStaticLookup} to be used with {@link #newAnalyzer(InheritanceGraph, ClassNode, MethodNode)}.
+	 */
+	public void setGetStaticLookupSupplier(@Nullable Supplier<GetStaticLookup> supplier) {
+		if (supplier == null)
+			supplier = () -> null;
+		getStaticLookupSupplier = supplier;
+	}
+
+	/**
+	 * @param supplier
+	 * 		Supplier for {@link InvokeVirtualLookup} to be used with {@link #newAnalyzer(InheritanceGraph, ClassNode, MethodNode)}.
+	 */
+	public void setInvokeVirtualLookupSupplier(@Nullable Supplier<InvokeVirtualLookup> supplier) {
+		if (supplier == null)
+			supplier = () -> null;
+		invokeVirtualLookupSupplier = supplier;
+	}
+
+	/**
+	 * @param supplier
+	 * 		Supplier for {@link InvokeStaticLookup} to be used with {@link #newAnalyzer(InheritanceGraph, ClassNode, MethodNode)}.
+	 */
+	public void setInvokeStaticLookupSupplier(@Nullable Supplier<InvokeStaticLookup> supplier) {
+		if (supplier == null)
+			supplier = () -> null;
+		invokeStaticLookupSupplier = supplier;
+	}
+
+	@Nonnull
+	private JvmClassData getJvmClassData(@Nonnull JvmClassBundle bundle, @Nonnull JvmClassInfo info) {
+		return classData.computeIfAbsent(info.getName(), ignored -> new JvmClassData(bundle, info));
+	}
+
+	/**
+	 * Container of per-class transformation state.
+	 * <p>
+	 * All operations are synchronized to ensure that the node and bytecode states are
+	 * consistent with each other even when multiple transformers are running in parallel.
+	 */
+	private class JvmClassData {
+		private final JvmClassBundle bundle;
+		private final JvmClassInfo initialClass;
+		private volatile byte[] bytecode;
+		private volatile ClassNode node;
+		private boolean dirty;
+
+		/**
+		 * @param bundle
+		 * 		Bundle containing the class.
+		 * @param initialClass
+		 * 		Initial state of the class before transformation.
+		 */
+		public JvmClassData(@Nonnull JvmClassBundle bundle, @Nonnull JvmClassInfo initialClass) {
+			this.initialClass = initialClass;
+			this.bundle = bundle;
+			bytecode = initialClass.getBytecode();
+		}
+
+		/**
+		 * @return Node representation of the {@link #getBytecode() current bytecode}.
+		 */
+		@Nonnull
+		public synchronized ClassNode getOrCreateNode() {
+			if (node == null) {
+				node = new ClassNode();
+				int readerFlags = getOptionalTransformer(FrameRemovingTransformer.class) == null ?
+						0 : ClassReader.SKIP_FRAMES; // Can bypass reading frames if this transformer is active.
+				new ClassReader(bytecode).accept(node, readerFlags);
+			}
+
+			// We always give back a copy so actions taken on this node are not affecting the cached instance
+			// unless a transformer explicitly commits the change.
+			ClassNode nodeCopy = new ClassNode();
+			node.accept(nodeCopy);
+			return nodeCopy;
+		}
+
+		/**
+		 * @return Current bytecode of the class.
+		 */
+		@Nonnull
+		public synchronized byte[] getBytecode() {
+			if (bytecode == null) {
+				ClassWriter writer = new ClassWriter(0);
+				node.accept(writer);
+				bytecode = writer.toByteArray();
+			}
+			return bytecode;
+		}
+
+		/**
+		 * @param node
+		 * 		Current node representation to set for this class.
+		 */
+		public synchronized void setNode(@Nonnull ClassNode node) {
+			this.node = node;
+			bytecode = null; // Invalidate bytecode state
+			dirty = true;
+		}
+
+		/**
+		 * @param bytecode
+		 * 		Current bytecode to set for this class.
+		 */
+		public synchronized void setBytecode(@Nonnull byte[] bytecode) {
+			this.bytecode = bytecode;
+			node = null; // Invalidate node state
+			dirty = true;
+		}
+
+		/**
+		 * @return {@code true} when changes have been applied to this class.
+		 */
+		public synchronized boolean isDirty() {
+			return dirty;
+		}
+	}
+}

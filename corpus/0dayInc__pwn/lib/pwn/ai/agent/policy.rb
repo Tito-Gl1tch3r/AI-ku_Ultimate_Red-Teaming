@@ -1,0 +1,1413 @@
+# frozen_string_literal: true
+
+require 'json'
+require 'fileutils'
+require 'time'
+require 'digest'
+
+module PWN
+  module AI
+    module Agent
+      # PWN::AI::Agent::Policy is the LIVE tabular RL controller that
+      # pwn-ai did not have before R5. Everything else in the harness is
+      # retrieval-plus-policy: scores are written to disk and re-injected
+      # as prose, or exported later for optional LoRA. This module is the
+      # missing MDP:
+      #
+      #   state  s  — discretized (kind, task, plan, completeness, usable, last, fail)
+      #   action a  — tool name, or "final"
+      #   reward r  — step: 0 (spam cost −0.01 after 8 tools); terminal: judge × confidence
+      #   next   s' — state after the tool result
+      #
+      # Each Loop turn is one episode. Trusted environment/prerequisite bins
+      # scope fallback history; independently evidenced terminal attribution
+      # uses isolated action targets, not future-return credit for busywork.
+      # Transitions land in
+      # ~/.pwn/policy_traj.jsonl. Q(s,a) and REINFORCE logits H(s,a) are
+      # updated from those tuples and persisted in ~/.pwn/policy.json.
+      #
+      # The learned Q values are an ADVISORY term in Registry.rank. They
+      # never replace TaskSummarizer planning, plan_first, or CORE_TOOLS.
+      # Disable with PWN::Env[:ai][:agent][:policy] = false.
+      module Policy
+        POLICY_FILE     = File.join(Dir.home, '.pwn', 'policy.json')
+        TRAJECTORY_FILE = File.join(Dir.home, '.pwn', 'policy_traj.jsonl')
+
+        ALPHA      = 0.15
+        ALPHA_PG   = 0.05
+        GAMMA      = 0.85
+        EPSILON    = 0.08
+        STEP_OK    = 0.0
+        STEP_FAIL  = 0.0
+        STEP_TASK  = 0.0
+        STEP_CLOSED = 0.0
+        STEP_GRIND = 0.0
+        STEP_COST  = -0.01
+        STEP_COST_AFTER = 8
+        MAX_TRAJ   = 2_000
+        GOLD_MIN   = 0.6
+        VISITS_MIN = 2
+        CONTEXT_VISITS_MIN = 3
+        COLD_EPISODES = 8
+        WARM_EPISODES = 40
+        TASK_MOD   = 16
+        ACTION_MOD = 16
+        EP_KEY     = :pwn_policy_episode
+        OPERATIONS = %w[read list search inspect write create update delete execute start stop status poll].freeze
+        RESULT_TYPES = %w[success failure timeout enoent eacces auth_required network syntax exit127 exit126 nonzero_exit handler_error invalid_payload].freeze
+        ENVIRONMENTS = %w[local remote container unknown].freeze
+        CAPABILITIES = %w[shell ruby python browser network filesystem credentials executable dependency service hardware].freeze
+        FAILURE_CATEGORIES = (%w[none unknown missing_prerequisite] + RESULT_TYPES).freeze
+        VERIFICATION_STATES = %w[unknown pending passed failed partial].freeze
+        ARGUMENT_ROLES = {
+          'action' => 'operation', 'operation' => 'operation', 'op' => 'operation',
+          'path' => 'path', 'file' => 'path', 'directory' => 'path',
+          'command' => 'program', 'code' => 'program', 'query' => 'query',
+          'url' => 'url', 'timeout' => 'control', 'limit' => 'control'
+        }.freeze
+
+        # ----------------------------------------------------------------
+        # Feature → discrete state
+        # ----------------------------------------------------------------
+
+        # Supported Method Parameters::
+        # key = PWN::AI::Agent::Policy.state(
+        #   kind: 'optional - statement|question|autonomous_goal|…',
+        #   request: 'optional - user text / active English task',
+        #   last_action: 'optional - previous tool name',
+        #   fails: 'optional - in-turn failure count',
+        #   engine: 'optional - active engine'
+        # )
+
+        public_class_method def self.state(opts = {})
+          kind = normalize_kind(raw: opts[:kind] || opts[:request_kind])
+          task = task_family(text: opts[:task] || opts[:request])
+          eng  = opts[:engine].to_s.empty? ? 'any' : opts[:engine].to_s.downcase
+          plan_q = plan_quality_bin(ts_state: opts[:ts_state])
+          comp = completeness_bin(final: opts[:final], score: opts[:score])
+          use = usable_bin(final: opts[:final], score: opts[:score])
+          # Three independent bins so Q can see plan quality, answer
+          # completeness, and whether the human actually got a usable result.
+          qual = "p#{plan_q}c#{comp}u#{use}"
+          key = if warm?
+                  last = action_bucket(name: opts[:last_action] || opts[:last] || 'start')
+                  fail = fail_bin(count: opts[:fails] || opts[:fail_n])
+                  "#{kind}|#{task}|a#{last}|f#{fail}|#{qual}|#{eng}"
+                elsif !cold?
+                  fail = fail_bin(count: opts[:fails] || opts[:fail_n])
+                  "#{kind}|#{task}|f#{fail}|#{qual}|#{eng}"
+                else
+                  "#{kind}|#{task}|#{qual}|#{eng}"
+                end
+          observed_state(state: key, trusted_context: opts[:trusted_context])
+        end
+
+        # Add observations without losing the live engine/task/plan bins.
+        public_class_method def self.observed_state(opts = {})
+          return opts[:state] unless opts[:trusted_context].is_a?(Hash)
+
+          parts = opts[:state].to_s.split('|')
+          engine = parts.pop
+          parts.reject! { |part| part.start_with?('env:', 'obs:') }
+          observed = observed_context(trusted_context: opts[:trusted_context])
+          environment = observed.slice(:environment, :capabilities, :missing_prerequisites)
+          "#{parts.join('|')}|env:#{JSON.generate(environment)}|obs:#{observed[:failure_category]}:#{observed[:verification_state]}|#{engine}"
+        end
+
+        # Caller-only observations, never model claims or raw probe output.
+        public_class_method def self.observed_context(opts = {})
+          raw = opts[:trusted_context].is_a?(Hash) ? opts[:trusted_context] : {}
+          environment = raw[:environment].to_s
+          environment = 'unknown' unless ENVIRONMENTS.include?(environment)
+          capabilities = raw[:capabilities].is_a?(Hash) ? raw[:capabilities] : {}
+          capabilities = CAPABILITIES.each_with_object({}) do |name, result|
+            value = capabilities.key?(name.to_sym) ? capabilities[name.to_sym] : capabilities[name]
+            result[name.to_sym] = value if [true, false].include?(value)
+          end
+          missing = Array(raw[:missing_prerequisites]).map(&:to_s).intersection(CAPABILITIES).sort
+          failure = raw[:failure_category].to_s
+          failure = 'unknown' unless FAILURE_CATEGORIES.include?(failure)
+          verification = raw[:verification_state].to_s
+          verification = 'unknown' unless VERIFICATION_STATES.include?(verification)
+          { environment: environment, capabilities: capabilities, missing_prerequisites: missing, failure_category: failure, verification_state: verification }
+        end
+
+        public_class_method def self.cold?
+          stats[:n_episodes].to_i < COLD_EPISODES
+        rescue StandardError
+          true
+        end
+
+        public_class_method def self.warm?
+          stats[:n_episodes].to_i >= WARM_EPISODES
+        rescue StandardError
+          false
+        end
+
+        # True once live returns, warmup-replayed trajectories, or a
+        # warmed Q table have enough mass to emit greedy suggestions.
+        # Cold? stays a coarser state-encoding gate; this is the banner.
+        public_class_method def self.episode_budget_met?
+          n = stats[:n_episodes].to_i
+          return true if n >= COLD_EPISODES
+
+          tab = load
+          warmed = !tab[:warmed_at].to_s.empty?
+          pairs = 0
+          tab[:q].each_value { |acts| pairs += acts.length if acts.is_a?(Hash) }
+          return true if warmed && pairs >= COLD_EPISODES
+
+          traj_n = trajectories(limit: COLD_EPISODES).count { |ep| !ep[:score].nil? }
+          warmed && traj_n >= COLD_EPISODES
+        rescue StandardError
+          false
+        end
+
+        # ----------------------------------------------------------------
+        # Episode / environment loop
+        # ----------------------------------------------------------------
+
+        # Supported Method Parameters::
+        # ep = PWN::AI::Agent::Policy.begin_episode(
+        #   session_id: 'optional - PWN::Sessions id',
+        #   request: 'optional - user request',
+        #   kind: 'optional - request kind',
+        #   intent: 'optional - Loop.request_intent',
+        #   engine: 'optional - active engine',
+        #   ts_state: 'optional - TaskSummarizer state hash'
+        # )
+
+        public_class_method def self.begin_episode(opts = {})
+          return { skipped: :disabled } unless enabled?
+
+          sid = (opts[:session_id] || "ep_#{Thread.current.object_id}").to_s
+          task = active_task_text(ts_state: opts[:ts_state], request: opts[:request])
+          s0 = state(
+            kind: opts[:kind],
+            request: task,
+            last_action: 'start',
+            fails: 0,
+            engine: opts[:engine],
+            ts_state: opts[:ts_state],
+            trusted_context: opts[:trusted_context]
+          )
+          ep = {
+            session_id: sid,
+            request: opts[:request].to_s.dup,
+            kind: normalize_kind(raw: opts[:kind]),
+            intent: opts[:intent].to_s,
+            engine: opts[:engine].to_s,
+            trusted_context: (observed_context(trusted_context: opts[:trusted_context]) if opts[:trusted_context].is_a?(Hash)),
+            started_at: Time.now.utc.iso8601,
+            state: s0,
+            last_action: 'start',
+            plan_idx: ts_idx(ts_state: opts[:ts_state]),
+            plan_open: ts_open?(ts_state: opts[:ts_state]),
+            fails: 0,
+            action_ids: {},
+            steps: []
+          }
+          Thread.current[EP_KEY] = ep
+          ep
+        rescue StandardError => e
+          warn "[pwn-ai/policy] begin_episode swallowed: #{e.class}: #{e.message}"
+          nil
+        end
+
+        # Supported Method Parameters::
+        # step = PWN::AI::Agent::Policy.observe_step(
+        #   session_id: 'optional - must match begin_episode when set',
+        #   action: 'required - tool name',
+        #   action_id: 'optional - trusted dispatch ID; mapped to a persisted episode-local ID',
+        #   trusted_context: 'optional - caller observations after this step; never model claims',
+        #   args: 'optional - arguments, reduced to fixed roles/types, never stored raw',
+        #   operation: 'optional - known operation override; otherwise derived from args',
+        #   result_type: 'optional - Reward.semantic_ok shape; fixed allowlist only',
+        #   ok: 'required - Boolean, Reward.semantic_ok',
+        #   duration: 'optional - Float seconds',
+        #   ts_state: 'optional - TaskSummarizer state',
+        #   request: 'optional - used if episode was not begun',
+        #   kind: 'optional',
+        #   engine: 'optional'
+        # )
+
+        public_class_method def self.observe_step(opts = {})
+          return { skipped: :disabled } unless enabled?
+
+          action = opts[:action].to_s
+          return { skipped: :no_action } if action.empty?
+
+          ep = Thread.current[EP_KEY]
+          if ep.nil? || (opts[:session_id] && ep[:session_id] && opts[:session_id].to_s != ep[:session_id].to_s)
+            begin_episode(
+              session_id: opts[:session_id],
+              request: opts[:request],
+              kind: opts[:kind],
+              engine: opts[:engine],
+              ts_state: opts[:ts_state],
+              trusted_context: opts[:trusted_context]
+            )
+            ep = Thread.current[EP_KEY]
+          end
+          return { skipped: :no_episode } unless ep.is_a?(Hash)
+
+          ok = opts[:ok] ? true : false
+          ep[:fails] = ep[:fails].to_i + 1 unless ok
+          reward = 0.0
+          reward = STEP_COST if ep[:steps].length >= STEP_COST_AFTER
+          ep[:plan_idx] = ts_idx(ts_state: opts[:ts_state])
+          ep[:plan_open] = ts_open?(ts_state: opts[:ts_state])
+          s = ep[:state]
+          task = active_task_text(ts_state: opts[:ts_state], request: ep[:request])
+          if opts[:trusted_context].is_a?(Hash)
+            previous = ep[:trusted_context] || {}
+            observed = previous.merge(opts[:trusted_context])
+            observed[:capabilities] = (previous[:capabilities] || {}).merge(opts[:trusted_context][:capabilities] || {})
+            ep[:trusted_context] = observed_context(trusted_context: observed)
+          end
+          s2 = state(
+            kind: ep[:kind],
+            request: task,
+            last_action: action,
+            fails: ep[:fails],
+            engine: ep[:engine],
+            ts_state: opts[:ts_state],
+            trusted_context: ep[:trusted_context]
+          )
+          context = action_context(opts)
+          context_s2 = contextual_state(state: s2, action: action, context: context)
+          trans = {
+            state: s,
+            action: action,
+            action_id: "a#{ep[:steps].length + 1}",
+            action_context: context,
+            context_state: ep[:context_state],
+            next_context_state: context_s2,
+            reward: reward,
+            next_state: s2,
+            ok: ok,
+            duration: opts[:duration].to_f,
+            terminal: false
+          }
+          external_id = (opts[:action_id] || trans[:action_id]).to_s
+          ep[:action_ids] ||= {}
+          ep[:action_ids][external_id] ||= []
+          ep[:action_ids][external_id] << trans[:action_id]
+          ep[:steps] << trans
+          ep[:state] = s2
+          ep[:context_state] = context_s2
+          ep[:last_action] = action
+          trans
+        rescue StandardError => e
+          warn "[pwn-ai/policy] observe_step swallowed: #{e.class}: #{e.message}"
+          nil
+        end
+
+        # Supported Method Parameters::
+        # report = PWN::AI::Agent::Policy.finish(
+        #   session_id: 'optional - active episode id',
+        #   score: 'optional - Reward.judge 0..1 (training target)',
+        #   attribution: 'optional - trusted {source: independent_verifier|controlled_comparison, verified_action_ids: []}',
+        #   verdict: 'optional - solved|partial|wrong|refused',
+        #   proxy_ok: 'optional - Boolean fallback when no judge score'
+        # )
+
+        public_class_method def self.finish(opts = {})
+          return { skipped: :disabled } unless enabled?
+
+          ep = Thread.current[EP_KEY]
+          return { skipped: :no_episode } unless ep.is_a?(Hash)
+
+          return { skipped: :session_mismatch } if opts[:session_id] && ep[:session_id] && opts[:session_id].to_s != ep[:session_id].to_s
+
+          unless ep[:steps].empty?
+            last = ep[:steps].last
+            last[:next_state] = state(
+              kind: ep[:kind],
+              request: ep[:request],
+              last_action: last[:action] || ep[:last_action],
+              fails: ep[:fails],
+              engine: ep[:engine],
+              ts_state: opts[:ts_state],
+              final: opts[:final],
+              score: opts[:score],
+              trusted_context: ep[:trusted_context]
+            )
+          end
+          terminal = terminal_reward(
+            score: opts[:score],
+            proxy_ok: opts[:proxy_ok],
+            confidence: opts[:confidence]
+          )
+          attribute_terminal!(episode: ep, reward: terminal, attribution: opts[:attribution])
+          ep[:steps].last[:terminal] = true
+          ep[:score] = opts[:score]
+          ep[:verdict] = opts[:verdict]
+          ep[:return] = opts[:score].nil? ? nil : discounted_return(steps: ep[:steps])
+          ep[:ended_at] = Time.now.utc.iso8601
+
+          n_td = 0
+          n_pg = 0
+          ep[:steps].each_with_index do |tr, idx|
+            next if opts[:score].nil?
+
+            g = tr[:credit_mode] ? tr[:reward].to_f : discounted_return(steps: ep[:steps][idx..])
+            transition_variants(transition: tr).each do |variant|
+              n_td += 1 if update_q!(transition: variant)
+              advantage = g - value(state: variant[:state])
+              advantage = [advantage, 0.0].min unless g.positive?
+              n_pg += 1 if update_pg!(state: variant[:state], action: variant[:action], advantage: advantage)
+            end
+          end
+
+          persist_episode!(episode: ep)
+          Thread.current[EP_KEY] = nil
+          {
+            session_id: ep[:session_id],
+            steps: ep[:steps].length,
+            return: ep[:return],
+            score: opts[:score],
+            terminal_reward: terminal,
+            attribution: ep[:attribution],
+            td_updates: n_td,
+            pg_updates: n_pg
+          }
+        rescue StandardError => e
+          warn "[pwn-ai/policy] finish swallowed: #{e.class}: #{e.message}"
+          Thread.current[EP_KEY] = nil
+          { error: "#{e.class}: #{e.message}" }
+        end
+
+        # ----------------------------------------------------------------
+        # Value-based update (Q-learning) + policy-gradient (REINFORCE)
+        # ----------------------------------------------------------------
+
+        # Supported Method Parameters::
+        # q = PWN::AI::Agent::Policy.update_q!(
+        #   transition: 'required - Hash with :state :action :reward :next_state :terminal'
+        # )
+
+        public_class_method def self.update_q!(opts = {})
+          return nil unless enabled?
+
+          tr = opts[:transition] || opts
+          s  = tr[:state].to_s
+          a  = tr[:action].to_s
+          return nil if s.empty? || a.empty?
+
+          r  = tr[:reward].to_f
+          s2 = tr[:next_state].to_s
+          term = tr[:terminal] ? true : false
+          tab = load
+          qsa = read_q(table: tab, state: s, action: a)
+          max_n = term ? 0.0 : max_q(table: tab, state: s2)
+          target = r + (GAMMA * max_n)
+          td = target - qsa
+          new_q = qsa + (ALPHA * td)
+          write_q!(table: tab, state: s, action: a, value: new_q)
+          bump_visit!(table: tab, state: s, action: a)
+          tab[:n_updates] = tab[:n_updates].to_i + 1
+          tab[:td_abs_sum] = tab[:td_abs_sum].to_f + td.abs
+          save(table: tab)
+          new_q.round(5)
+        rescue StandardError => e
+          warn "[pwn-ai/policy] update_q! swallowed: #{e.class}: #{e.message}"
+          nil
+        end
+
+        # Supported Method Parameters::
+        # h = PWN::AI::Agent::Policy.update_pg!(
+        #   state: 'required',
+        #   action: 'required',
+        #   advantage: 'required - scalar G_t − V(s)'
+        # )
+
+        public_class_method def self.update_pg!(opts = {})
+          return nil unless enabled?
+
+          s = opts[:state].to_s
+          a = opts[:action].to_s
+          adv = opts[:advantage].to_f
+          return nil if s.empty? || a.empty?
+          return 0.0 if adv.abs < 1e-9
+
+          tab = load
+          logits = (tab[:h][s.to_sym] || {}).dup
+          logits[a.to_sym] = logits[a.to_sym].to_f
+          pi = softmax(logits: logits)
+          logits.each_key do |act|
+            grad = act.to_s == a ? (1.0 - pi[act].to_f) : -pi[act].to_f
+            logits[act] = logits[act].to_f + (ALPHA_PG * adv * grad)
+          end
+          tab[:h][s.to_sym] = logits
+          save(table: tab)
+          logits[a.to_sym].to_f.round(5)
+        rescue StandardError => e
+          warn "[pwn-ai/policy] update_pg! swallowed: #{e.class}: #{e.message}"
+          nil
+        end
+
+        # ----------------------------------------------------------------
+        # Query — used by Registry.rank (advisory only)
+        # ----------------------------------------------------------------
+
+        public_class_method def self.q(opts = {})
+          read_q(table: load, state: opts[:state], action: opts[:action])
+        rescue StandardError
+          0.0
+        end
+
+        public_class_method def self.value(opts = {})
+          max_q(table: load, state: opts[:state])
+        rescue StandardError
+          0.0
+        end
+
+        # Q(s,a) − V(s). Unknown / cold-start pairs return 0 so rank is unchanged.
+
+        public_class_method def self.advantage(opts = {})
+          return 0.0 unless enabled?
+
+          s = opts[:state] || current_state
+          a = opts[:action].to_s
+          return 0.0 if s.to_s.empty? || a.empty?
+
+          tab = load
+          visits = read_visit(table: tab, state: s, action: a)
+          context = opts[:context_state]
+          context = nil unless context.to_s.start_with?("#{s}~ctx:")
+          contextual_visits = read_visit(table: tab, state: context, action: a)
+          qsa = routing_q(table: tab, state: s, context_state: context, action: a)
+          actions = ((tab[:q][s.to_s.to_sym] || {}).keys + (tab[:q][context.to_s.to_sym] || {}).keys).uniq
+          baseline = actions.map { |act| routing_q(table: tab, state: s, context_state: context, action: act) }.max || 0.0
+          # Unknown candidates must not tie an established successful action.
+          return 0.0 if contextual_visits < CONTEXT_VISITS_MIN && visits < VISITS_MIN && [qsa.abs, baseline.abs].max < 0.08
+
+          (qsa - baseline).clamp(-1.0, 1.0).round(4)
+        rescue StandardError
+          0.0
+        end
+
+        # Supported Method Parameters::
+        # pick = PWN::AI::Agent::Policy.recommend(
+        #   state: 'optional - default current episode state',
+        #   actions: 'required - Array of tool names',
+        #   epsilon: 'optional - explore probability (default EPSILON)'
+        # )
+
+        public_class_method def self.recommend(opts = {})
+          actions = Array(opts[:actions]).map(&:to_s).reject(&:empty?)
+          actions = actions.select { |action| Registry.available?(name: action, trusted_context: opts[:trusted_context]) } if defined?(Registry)
+          return { action: nil, reason: :empty } if actions.empty?
+
+          s = opts[:state] || current_state || 'unknown'
+          eps = if opts.key?(:epsilon)
+                  opts[:epsilon].to_f
+                else
+                  oc = 0.0
+                  oc = Metrics.calibration[:overconfidence].to_f if defined?(Metrics) && Metrics.respond_to?(:calibration)
+                  (EPSILON + [oc, 0.0].max).clamp(EPSILON, 0.45)
+                end
+          return { action: actions.sample, reason: :explore, state: s, epsilon: eps } if rand < eps
+
+          tab = load
+          context = opts.key?(:context_state) ? opts[:context_state] : (current_context_state if s == current_state)
+          scored = actions.map { |a| [a, routing_q(table: tab, state: s, context_state: context, action: a)] }
+          best = scored.max_by { |_, v| v }
+          { action: best[0], q: best[1].round(4), reason: :greedy, state: s, ranked: scored.sort_by { |_, v| -v } }
+        rescue StandardError => e
+          { action: Array(opts[:actions]).first, reason: :error, error: e.message }
+        end
+
+        public_class_method def self.current_state
+          ep = Thread.current[EP_KEY]
+          ep.is_a?(Hash) ? ep[:state] : nil
+        end
+
+        public_class_method def self.current_episode
+          Thread.current[EP_KEY]
+        end
+
+        # Previous action features are available BEFORE the next tool choice;
+        # the candidate's own result must never leak into its decision state.
+        public_class_method def self.current_context_state
+          ep = current_episode
+          ep.is_a?(Hash) ? ep[:context_state] : nil
+        end
+
+        # Hermes split: snapshot + clear the live episode so Loop.maybe_finish_policy
+        # is a no-op on the user-visible path while TurnFinalizer re-attaches it
+        # on the background review thread.
+
+        public_class_method def self.detach_episode!
+          ep = Thread.current[EP_KEY]
+          Thread.current[EP_KEY] = nil
+          ep
+        end
+
+        public_class_method def self.attach_episode!(opts = {})
+          Thread.current[EP_KEY] = opts[:episode]
+          opts[:episode]
+        end
+
+        # ----------------------------------------------------------------
+        # Persistence / eval
+        # ----------------------------------------------------------------
+
+        public_class_method def self.load
+          FileUtils.mkdir_p(File.dirname(POLICY_FILE))
+          return blank_table unless File.exist?(POLICY_FILE)
+
+          data = JSON.parse(File.read(POLICY_FILE), symbolize_names: true)
+          data[:q] = {} unless data[:q].is_a?(Hash)
+          data[:h] = {} unless data[:h].is_a?(Hash)
+          data[:visits] = {} unless data[:visits].is_a?(Hash)
+          data[:returns] = Array(data[:returns])
+          data
+        rescue StandardError
+          blank_table
+        end
+
+        public_class_method def self.save(opts = {})
+          table = opts[:table] || load
+          table[:updated_at] = Time.now.utc.iso8601
+          FileUtils.mkdir_p(File.dirname(POLICY_FILE))
+          path = POLICY_FILE
+          tmp = File.join(File.dirname(path), ".#{File.basename(path)}.#{Process.pid}.tmp")
+          File.open(tmp, File::WRONLY | File::CREAT | File::TRUNC, 0o644) do |f|
+            f.flock(File::LOCK_EX)
+            f.write(JSON.pretty_generate(table))
+            f.flush
+            f.fsync
+          end
+          File.rename(tmp, path)
+          table
+        ensure
+          FileUtils.rm_f(tmp) if defined?(tmp) && tmp && File.exist?(tmp)
+        end
+
+        public_class_method def self.trajectories(opts = {})
+          limit = (opts[:limit] || 50).to_i
+          return [] unless File.exist?(TRAJECTORY_FILE)
+
+          File.readlines(TRAJECTORY_FILE).last(limit).filter_map do |line|
+            JSON.parse(line, symbolize_names: true)
+          rescue StandardError
+            nil
+          end.reverse
+        rescue StandardError
+          []
+        end
+
+        public_class_method def self.stats
+          tab = load
+          q_pairs = 0
+          tab[:q].each_value { |acts| q_pairs += acts.length if acts.is_a?(Hash) }
+          rets = Array(tab[:returns])
+          mean_r = rets.empty? ? nil : (rets.sum.to_f / rets.length).round(4)
+          n_up = tab[:n_updates].to_i
+          td_mean = n_up.positive? ? (tab[:td_abs_sum].to_f / n_up).round(4) : nil
+          {
+            enabled: enabled?,
+            n_updates: n_up,
+            n_states: tab[:q].length,
+            n_pairs: q_pairs,
+            n_episodes: rets.length,
+            mean_return: mean_r,
+            mean_abs_td: td_mean,
+            alpha: ALPHA,
+            gamma: GAMMA,
+            epsilon: EPSILON
+          }
+        end
+
+        # Replay stored trajectories under the current Q table.
+        # Does not write. Used by task 7 (evaluate policy quality).
+
+        public_class_method def self.evaluate(opts = {})
+          rows = trajectories(limit: opts[:limit] || 200).reject { |ep| ep[:score].nil? }
+          return { n: 0, mean_return: nil, greedy_match: nil, mean_abs_td: nil } if rows.empty?
+
+          tab = load
+          abs_td = []
+          greedy_hits = 0
+          greedy_n = 0
+          rows.each do |ep|
+            Array(ep[:steps]).flat_map { |tr| transition_variants(transition: tr) }.each do |tr|
+              s = tr[:state].to_s
+              a = tr[:action].to_s
+              next if s.empty? || a.empty?
+
+              qsa = read_q(table: tab, state: s, action: a)
+              max_n = tr[:terminal] ? 0.0 : max_q(table: tab, state: tr[:next_state])
+              abs_td << (tr[:reward].to_f + (GAMMA * max_n) - qsa).abs
+              acts = (tab[:q][s.to_sym] || {}).keys.map(&:to_s)
+              next if acts.empty?
+
+              greedy_n += 1
+              best = acts.max_by { |act| read_q(table: tab, state: s, action: act) }
+              greedy_hits += 1 if best == a
+            end
+          end
+          rets = rows.map { |r| r[:return].to_f }
+          {
+            n: rows.length,
+            mean_return: (rets.sum / rets.length).round(4),
+            mean_abs_td: abs_td.empty? ? nil : (abs_td.sum / abs_td.length).round(4),
+            greedy_match: greedy_n.positive? ? (greedy_hits.to_f / greedy_n).round(3) : nil
+          }
+        rescue StandardError => e
+          { n: 0, error: "#{e.class}: #{e.message}" }
+        end
+
+        public_class_method def self.to_context(opts = {})
+          return '' unless enabled?
+
+          maybe_warmup! unless episode_budget_met?
+          s = stats
+          lines = []
+          unless episode_budget_met?
+            lines << 'POLICY (R5 tabular Q / REINFORCE — advisory only, does not replace planning)'
+            lines << "  policy cold episodes=#{s[:n_episodes]}/#{COLD_EPISODES} — omit greedy suggestion"
+            return "#{lines.join("\n")}\n"
+          end
+
+          ev = evaluate(limit: opts[:limit] || 40)
+          fallback = PWN::AI::Agent::Registry::DEFAULT_PREFERENCE
+          pref = begin
+            PWN::AI::Agent::Registry.preference_order
+          rescue StandardError
+            []
+          end
+          actions = pref.empty? ? fallback : pref
+          rec = begin
+            recommend(actions: actions, epsilon: 0.0)[:action]
+          rescue StandardError
+            nil
+          end
+          lines << 'POLICY (R5 tabular Q / REINFORCE — advisory only, does not replace planning)'
+          lines << "  episodes=#{s[:n_episodes]} states=#{s[:n_states]} pairs=#{s[:n_pairs]} updates=#{s[:n_updates]}"
+          lines << "  mean_return=#{s[:mean_return] || '-'} mean|TD|=#{s[:mean_abs_td] || '-'} greedy_match=#{ev[:greedy_match] || '-'}"
+          lines << "  current_state=#{current_state || '(none)'} suggest=#{rec || '-'} tool_preference=#{actions.join(',')}"
+          "#{lines.join("\n")}\n"
+        rescue StandardError
+          ''
+        end
+
+        public_class_method def self.lean!(opts = {})
+          dry = opts[:dry_run] ? true : false
+          return { skipped: true } unless File.exist?(TRAJECTORY_FILE)
+
+          rows = File.readlines(TRAJECTORY_FILE)
+          keep = []
+          rows.each do |line|
+            ep = JSON.parse(line, symbolize_names: true)
+            gold = ep[:return].to_f >= GOLD_MIN || ep[:score].to_f >= GOLD_MIN
+            keep << [ep, line, gold]
+          rescue StandardError
+            next
+          end
+          gold = keep.select { |_, _, g| g }.map { |_, line, _| line }
+          rest = keep.reject { |_, _, g| g }.last([MAX_TRAJ - gold.length, 0].max).map { |_, line, _| line }
+          out = gold + rest
+          unless dry
+            tmp = "#{TRAJECTORY_FILE}.#{Process.pid}.tmp"
+            File.write(tmp, out.join)
+            File.rename(tmp, TRAJECTORY_FILE)
+          end
+          { removed: rows.length - out.length, remaining: out.length, dry_run: dry }
+        rescue StandardError => e
+          { error: "#{e.class}: #{e.message}" }
+        end
+
+        public_class_method def self.reset
+          FileUtils.rm_f(POLICY_FILE)
+          FileUtils.rm_f(TRAJECTORY_FILE)
+          Thread.current[EP_KEY] = nil
+          blank_table
+        end
+
+        public_class_method def self.enabled?
+          return false unless defined?(PWN::Env) && PWN::Env.is_a?(Hash)
+
+          v = begin
+            PWN::Env.dig(:ai, :agent, :policy)
+          rescue StandardError
+            nil
+          end
+          return false if v == false
+
+          if defined?(Metrics) && Metrics.respond_to?(:calibration)
+            cal = Metrics.calibration
+            return false if cal[:n].to_i >= 8 && !Metrics.calibration_green?
+          end
+
+          true
+        rescue StandardError
+          false
+        end
+
+        public_class_method def self.authors
+          "AUTHOR(S):\n  0day Inc. <support@0dayinc.com>\n"
+        end
+
+        public_class_method def self.help
+          puts "USAGE:
+            # Feature → discrete state
+            #{self}.state(
+              kind: 'optional - statement|question|autonomous_goal|…',
+              request: 'optional - user text / active English task',
+              last_action: 'optional - previous tool name',
+              fails: 'optional - in-turn failure count',
+              engine: 'optional - active engine',
+              request_kind: 'optional - request kind value consumed by #state',
+              task: 'optional - task value consumed by #state',
+              ts_state: 'optional - ts state value consumed by #state',
+              final: 'optional - final value consumed by #state',
+              score: 'optional - score value consumed by #state',
+              last: 'optional - last value consumed by #state',
+              fail_n: 'optional - fail n value consumed by #state',
+              trusted_context: 'optional - trusted environment, capability booleans, missing prerequisite categories, failure category and verification state'
+            )
+
+            # Sanitize caller-only observations to fixed allowlisted categories.
+            #{self}.observed_context(
+              trusted_context: 'optional - environment: local|remote|container|unknown; capabilities: Hash of booleans; missing_prerequisites: capability names; failure_category; verification_state: unknown|pending|passed|failed|partial'
+            )
+
+            # Scope a live state without discarding task/engine/plan bins.
+            #{self}.observed_state(
+              state: 'required - existing decision state',
+              trusted_context: 'optional - observations accepted by observed_context'
+            )
+
+            # Run cold and return its result
+            #{self}.cold?
+
+            # Run warm and return its result
+            #{self}.warm?
+
+            # True once live returns, warmup-replayed trajectories, or a
+            #{self}.episode_budget_met?
+
+            # Episode / environment loop
+            #{self}.begin_episode(
+              session_id: 'optional - PWN::Sessions id (defaults to ep_)',
+              request: 'optional - user request',
+              kind: 'optional - request kind',
+              intent: 'optional - Loop.request_intent',
+              engine: 'optional - active engine',
+              ts_state: 'optional - TaskSummarizer state hash',
+              trusted_context: 'optional - trusted observations accepted by observed_context'
+            )
+
+            # Run observe step and return its result
+            #{self}.observe_step(
+              session_id: 'optional - must match begin_episode when set',
+              action: 'required - tool name',
+              action_id: 'optional - trusted dispatch ID, stored only as an episode-local ordinal',
+              trusted_context: 'optional - observations after this step; partial updates retain earlier categories',
+              args: 'optional - arguments reduced to fixed roles/types only',
+              operation: 'optional - allowlisted operation override',
+              result_type: 'optional - allowlisted semantic result shape',
+              ok: 'required - Boolean, Reward.semantic_ok',
+              duration: 'optional - Float seconds',
+              ts_state: 'optional - TaskSummarizer state',
+              request: 'optional - used if episode was not begun',
+              kind: 'optional - kind value consumed by #observe_step',
+              engine: 'optional - engine value consumed by #observe_step'
+            )
+
+            # Run finish and return its result
+            #{self}.finish(
+              session_id: 'optional - active episode id',
+              score: 'optional - Reward.judge 0..1 (training target)',
+              verdict: 'optional - solved|partial|wrong|refused',
+              proxy_ok: 'optional - Boolean fallback when no judge score',
+              ts_state: 'optional - ts state value consumed by #finish',
+              final: 'optional - final value consumed by #finish',
+              confidence: 'optional - confidence value consumed by #finish',
+              attribution: 'optional - caller-only {source: independent_verifier|controlled_comparison, verified_action_ids: dispatch IDs}; missing or ambiguous IDs earn no tool credit; nil score never trains'
+            )
+
+            # Value-based update (Q-learning) + policy-gradient (REINFORCE)
+            #{self}.update_q!(
+              transition: 'required - Hash with :state :action :reward :next_state :terminal (defaults to opts)'
+            )
+
+            # Run update pg and return its result
+            #{self}.update_pg!(
+              state: 'required - state value consumed by #update_pg!',
+              action: 'required - action value consumed by #update_pg!',
+              advantage: 'required - scalar G_t − V(s)'
+            )
+
+            # Run q and return its result
+            #{self}.q(
+              state: 'optional - state value consumed by #q',
+              action: 'optional - action value consumed by #q'
+            )
+
+            # Run value and return its result
+            #{self}.value(
+              state: 'optional - state value consumed by #value'
+            )
+
+            # Q(s,a) − V(s). Unknown / cold-start pairs return 0 so rank is unchanged
+            #{self}.advantage(
+              state: 'optional - state value consumed by #advantage (defaults to current_state)',
+              action: 'optional - action value consumed by #advantage',
+              context_state: 'optional - previous action context supplied by Registry'
+            )
+
+            # Run recommend and return its result
+            #{self}.recommend(
+              state: 'optional - default current episode state',
+              actions: 'required - Array of tool names',
+              context_state: 'optional - previous action context (default live context)',
+              trusted_context: 'optional - observed prerequisites used to exclude unavailable actions',
+              epsilon: 'optional - explore probability (default EPSILON)'
+            )
+
+            # Run current state and return its result
+            #{self}.current_state
+
+            # Run current episode and return its result
+            #{self}.current_episode
+
+            # Sanitized previous-action state used for advisory routing
+            #{self}.current_context_state
+
+            # Hermes split: snapshot + clear the live episode so Loop.maybe_finish_policy
+            #{self}.detach_episode!
+
+            # Run attach episode and return its result
+            #{self}.attach_episode!(
+              episode: 'optional - episode value consumed by #attach_episode!'
+            )
+
+            # Persistence / eval
+            #{self}.load
+
+            # Run save and return its result
+            #{self}.save(
+              table: 'optional - table value consumed by #save (defaults to load)'
+            )
+
+            # Run trajectories and return its result
+            #{self}.trajectories(
+              limit: 'optional - limit value consumed by #trajectories'
+            )
+
+            # Run stats and return its result
+            #{self}.stats
+
+            # Replay stored trajectories under the current Q table
+            #{self}.evaluate(
+              limit: 'optional - limit value consumed by #evaluate'
+            )
+
+            # Run to context and return its result
+            #{self}.to_context(
+              limit: 'optional - limit value consumed by #to_context'
+            )
+
+            # Run lean and return its result
+            #{self}.lean!(
+              dry_run: 'optional - dry run value consumed by #lean!'
+            )
+
+            # Run reset and return its result
+            #{self}.reset
+
+            # Run enabled and return its result
+            #{self}.enabled?
+
+            # Print the AUTHOR(S) string for this module.
+            #{self}.authors
+
+            # Replay stored trajectories into Q so a cold table is not empty advice
+            #{self}.warmup!(
+              limit: 'optional - limit value consumed by #warmup!'
+            )
+
+            # Run maybe warmup and return its result
+            #{self}.maybe_warmup!
+          "
+          constants.sort
+        end
+
+        # ----------------------------------------------------------------
+        private
+
+        private_class_method def self.blank_table
+          { q: {}, h: {}, visits: {}, returns: [], n_updates: 0, td_abs_sum: 0.0, updated_at: nil }
+        end
+
+        private_class_method def self.contextual_state(opts = {})
+          "#{opts[:state]}~ctx:a#{action_bucket(name: opts[:action])}:#{JSON.generate(opts[:context])}"
+        end
+
+        private_class_method def self.transition_variants(opts = {})
+          tr = opts[:transition]
+          return [] unless tr[:credit_mode] == 'terminal_attribution' && tr[:credit_eligible]
+
+          # Reward is an attributed terminal target, not a temporal promise
+          # that can bootstrap positive credit back through unrelated calls.
+          # Legacy trajectories lack this provenance and are not replayed.
+          tr = tr.merge(terminal: true)
+          return [tr] if tr[:context_state].to_s.empty?
+
+          [tr, tr.merge(state: tr[:context_state], next_state: tr[:next_context_state])]
+        end
+
+        # Shrink sparse contextual values toward the existing broad Q table.
+        # A strict sample floor prevents a single unusual call moving rank.
+        private_class_method def self.routing_q(opts = {})
+          broad = smoothed_q(table: opts[:table], state: opts[:state], action: opts[:action])
+          context = opts[:context_state]
+          return broad unless context.to_s.start_with?("#{opts[:state]}~ctx:")
+
+          n = read_visit(table: opts[:table], state: context, action: opts[:action])
+          return broad if n < CONTEXT_VISITS_MIN
+
+          specific = read_q(table: opts[:table], state: context, action: opts[:action])
+          weight = n.to_f / (n + CONTEXT_VISITS_MIN)
+          ((weight * specific) + ((1.0 - weight) * broad)).round(5)
+        end
+
+        # No arbitrary keys, values, lengths, hashes, paths, or class names.
+        # Nested containers are represented by type only, not traversed.
+        private_class_method def self.action_context(opts = {})
+          args = opts[:args]
+          operation = opts[:operation]
+          operation = args[:operation] || args['operation'] || args[:action] || args['action'] || args[:op] || args['op'] if operation.nil? && args.is_a?(Hash)
+          operation ||= 'execute' if %w[shell pwn_eval].include?(opts[:action].to_s)
+          operation = operation.to_s.downcase
+          operation = 'other' unless OPERATIONS.include?(operation)
+          arguments = { shape: feature_type(value: args) }
+          if args.is_a?(Hash)
+            size = if args.empty?
+                     'empty'
+                   elsif args.length <= 4
+                     'few'
+                   else
+                     'many'
+                   end
+            features = args.map do |key, value|
+              role = ARGUMENT_ROLES.fetch(key.to_s, 'other')
+              "#{role}:#{feature_type(value: value)}"
+            end.uniq.sort
+            arguments.merge!(size: size, features: features)
+          end
+          result = opts[:result_type].to_s
+          result = opts[:ok] ? 'success' : 'failure' if result.empty?
+          result = 'other' unless RESULT_TYPES.include?(result)
+          { operation: operation, arguments: arguments, result_type: result }
+        end
+
+        private_class_method def self.feature_type(opts = {})
+          case opts[:value]
+          when Hash then 'object'
+          when Array then 'array'
+          when String, Symbol then 'string'
+          when Numeric then 'number'
+          when true, false then 'boolean'
+          when nil then 'null'
+          else 'other'
+          end
+        end
+
+        private_class_method def self.normalize_kind(opts = {})
+          raw = opts[:raw].to_s.downcase
+          return 'goal' if raw.empty?
+          return raw if %w[statement question autonomous_goal goal howto recall greeting recon_act].include?(raw)
+          return 'goal' if raw.include?('goal') || raw.include?('act')
+
+          raw[0, 16]
+        end
+
+        private_class_method def self.task_family(opts = {})
+          t = opts[:text].to_s.downcase
+          return 'howto' if t.match?(/\b(how\s+to|syntax|usage|flags?)\b/)
+          return 'recon' if t.match?(/\b(scan|nmap|hping|recon|sweep|osint)\b/)
+          return 'code' if t.match?(/\b(rubocop|rake|rspec|fix|patch|implement|refactor)\b/)
+          return 'recall' if t.match?(/\b(what did i|remind|previous turn|last request)\b/)
+          return 'ops' if t.match?(/\b(cron|swarm|session|memory|skill)\b/)
+
+          'misc'
+        end
+
+        private_class_method def self.task_bucket(opts = {})
+          tokens = opts[:text].to_s.downcase.scan(/[a-z0-9_]{3,}/).first(6)
+          return 0 if tokens.empty?
+
+          Digest::SHA256.hexdigest(tokens.join('|'))[0, 8].to_i(16) % TASK_MOD
+        end
+
+        private_class_method def self.action_bucket(opts = {})
+          name = opts[:name].to_s
+          return 0 if name.empty? || name == 'start'
+          return 1 if %w[shell pwn_eval].include?(name)
+          return 2 if %w[memory_recall session_recall skills_recall].include?(name)
+          return 3 if name == 'final' || name.include?('report')
+
+          Digest::SHA256.hexdigest(name)[0, 8].to_i(16) % ACTION_MOD
+        end
+
+        private_class_method def self.fail_bin(opts = {})
+          n = opts[:count].to_i
+          return 0 if n <= 0
+          return 1 if n <= 2
+
+          2
+        end
+
+        private_class_method def self.active_task_text(opts = {})
+          ts = opts[:ts_state]
+          if ts.is_a?(Hash) && defined?(TaskSummarizer) && TaskSummarizer.respond_to?(:active_task)
+            info = TaskSummarizer.active_task(state: ts)
+            return info[:item].to_s if info.is_a?(Hash) && !info[:item].to_s.empty?
+          end
+          opts[:request].to_s
+        rescue StandardError
+          opts[:request].to_s
+        end
+
+        private_class_method def self.ts_idx(opts = {})
+          ts = opts[:ts_state]
+          ts.is_a?(Hash) ? ts[:plan_idx].to_i : 0
+        end
+
+        private_class_method def self.ts_open?(opts = {})
+          ts = opts[:ts_state]
+          return true unless ts.is_a?(Hash)
+          return true unless defined?(TaskSummarizer) && TaskSummarizer.respond_to?(:plan_open?)
+
+          TaskSummarizer.plan_open?(state: ts)
+        rescue StandardError
+          true
+        end
+
+        private_class_method def self.english_step_bonus(opts = {})
+          return 0.0 unless opts.is_a?(Hash)
+
+          0.0
+        end
+
+        private_class_method def self.contract_fields_met(opts = {})
+          raw = Thread.current[:pwn_loop_deliverables]
+          return 0 unless raw.is_a?(Hash) || opts.key?(:request)
+          return 0 unless raw.is_a?(Hash)
+
+          n = 0
+          n += 1 if raw[:min_seconds].to_i.positive? || raw['min_seconds'].to_i.positive?
+          files = Array(raw[:paths] || raw['paths']) + Array(raw[:proofs] || raw['proofs'])
+          n += files.count { |path| File.file?(path.to_s) && File.size(path.to_s).positive? }
+          n += Array(raw[:hosts] || raw['hosts']).length
+          n += Array(raw[:techniques] || raw['techniques']).length
+          n
+        rescue StandardError
+          0
+        end
+
+        # This is evidence-based attribution, not a claim of causal proof.
+        # Only the trusted caller may construct this receipt after independent
+        # checks or isolated controlled comparisons. Never parse model prose.
+        private_class_method def self.attribute_terminal!(opts = {})
+          ep = opts[:episode]
+          receipt = opts[:attribution].is_a?(Hash) ? opts[:attribution] : {}
+          source = receipt[:source].to_s
+          trusted = %w[independent_verifier controlled_comparison].include?(source)
+          ids = if trusted
+                  Array(receipt[:verified_action_ids]).filter_map do |id|
+                    matches = ep.fetch(:action_ids, {})[id.to_s]
+                    matches.first if matches.is_a?(Array) && matches.length == 1
+                  end.uniq
+                else
+                  []
+                end
+          recipients = ep[:steps].select { |step| ids.include?(step[:action_id]) }
+          ep[:attribution] = { source: trusted ? source : 'none', action_ids: recipients.map { |step| step[:action_id] } }
+          ep[:steps].each do |step|
+            step[:credit_mode] = 'terminal_attribution'
+            step[:credit_eligible] = step[:reward].to_f.negative? || recipients.include?(step)
+          end
+          if recipients.empty?
+            # Keep the terminal budget in the trajectory without pretending an
+            # unlinked tool earned it. This accounting row is never trained.
+            ep[:steps] << {
+              state: ep[:state], action: 'final', next_state: ep[:state],
+              reward: opts[:reward], terminal: true, credit_mode: 'terminal_attribution', credit_eligible: false
+            }
+          else
+            share = opts[:reward].to_f / recipients.length
+            recipients.each { |step| step[:reward] = step[:reward].to_f + share }
+          end
+        end
+
+        private_class_method def self.terminal_reward(opts = {})
+          conf = opts[:confidence]
+          conf = 1.0 if conf.nil? || conf.to_f <= 0.0
+          conf = conf.to_f.clamp(0.0, 1.0)
+          unless opts[:score].nil?
+            base = ((2.0 * opts[:score].to_f) - 1.0).clamp(-1.0, 1.0)
+            return (base * conf).round(4)
+          end
+
+          distrust = 0.0
+          distrust = Reward.proxy_distrust.to_f if defined?(Reward) && Reward.respond_to?(:proxy_distrust)
+          return 0.0 if distrust >= 0.85
+          return 0.0 if opts[:proxy_ok] || !opts[:proxy_ok]
+
+          0.0
+        rescue StandardError
+          0.0
+        end
+
+        private_class_method def self.discounted_return(opts = {})
+          g = 0.0
+          Array(opts[:steps]).reverse_each { |tr| g = tr[:reward].to_f + (GAMMA * g) }
+          g.round(4)
+        end
+
+        private_class_method def self.read_q(opts = {})
+          tab = opts[:table] || load
+          s = opts[:state].to_s.to_sym
+          a = opts[:action].to_s.to_sym
+          ((tab[:q][s] || {})[a] || 0.0).to_f
+        end
+
+        private_class_method def self.max_q(opts = {})
+          tab = opts[:table] || load
+          s = opts[:state].to_s.to_sym
+          acts = tab[:q][s]
+          return 0.0 unless acts.is_a?(Hash) && !acts.empty?
+
+          acts.values.map(&:to_f).max
+        end
+
+        private_class_method def self.write_q!(opts = {})
+          tab = opts[:table]
+          s = opts[:state].to_s.to_sym
+          a = opts[:action].to_s.to_sym
+          tab[:q][s] ||= {}
+          tab[:q][s][a] = opts[:value].to_f.round(5)
+        end
+
+        private_class_method def self.read_visit(opts = {})
+          tab = opts[:table] || load
+          s = opts[:state].to_s.to_sym
+          a = opts[:action].to_s.to_sym
+          ((tab[:visits][s] || {})[a] || 0).to_i
+        end
+
+        private_class_method def self.bump_visit!(opts = {})
+          tab = opts[:table]
+          s = opts[:state].to_s.to_sym
+          a = opts[:action].to_s.to_sym
+          tab[:visits][s] ||= {}
+          tab[:visits][s][a] = tab[:visits][s][a].to_i + 1
+        end
+
+        private_class_method def self.softmax(opts = {})
+          logits = opts[:logits] || {}
+          return {} if logits.empty?
+
+          mx = logits.values.map(&:to_f).max
+          exps = logits.transform_values { |v| Math.exp(v.to_f - mx) }
+          z = exps.values.sum
+          z = 1.0 if z <= 0.0
+          exps.transform_values { |v| v / z }
+        end
+
+        private_class_method def self.plan_quality_bin(opts = {})
+          ts = opts[:ts_state]
+          return 'n' unless ts.is_a?(Hash)
+
+          plan = Array(ts[:plan]).map { |t| t.to_s.strip }.reject(&:empty?)
+          return 'n' if plan.empty?
+
+          open = if defined?(TaskSummarizer) && TaskSummarizer.respond_to?(:plan_open?)
+                   TaskSummarizer.plan_open?(state: ts)
+                 else
+                   true
+                 end
+          return 'h' unless open
+
+          left = if defined?(TaskSummarizer) && TaskSummarizer.respond_to?(:unfinished_tasks)
+                   Array(TaskSummarizer.unfinished_tasks(state: ts)).length
+                 else
+                   plan.length
+                 end
+          done = plan.length - left
+          frac = done.to_f / plan.length
+          return 'm' if frac >= 0.3
+
+          'l'
+        rescue StandardError
+          'n'
+        end
+
+        private_class_method def self.completeness_bin(opts = {})
+          final = opts[:final].to_s
+          return 'n' if final.strip.empty?
+
+          truncated = final.length > 80 && final.match?(/[a-z,;:]$/i) && !final.match?(/[.!?]["')\]]*\s*\z/)
+          return 'l' if truncated || final.length < 80
+          return 'h' if final.length >= 240 || (!opts[:score].nil? && opts[:score].to_f >= 0.75)
+
+          'm'
+        rescue StandardError
+          'n'
+        end
+
+        private_class_method def self.usable_bin(opts = {})
+          final = opts[:final].to_s
+          score = opts[:score]
+          return 'n' if final.strip.empty?
+          return 'n' if defined?(Learning) && Learning.const_defined?(:FAILURE_FINAL_RX) && final.match?(Learning::FAILURE_FINAL_RX)
+          return 'y' if !score.nil? && score.to_f >= 0.6
+          return 'n' if !score.nil? && score.to_f < 0.4
+          return 'y' if final.length >= 80 && final.match?(/[.!?]["')\]]*\s*\z/)
+
+          'n'
+        rescue StandardError
+          'n'
+        end
+
+        # Neighbor average so a never-seen (s,a) is not a cold 0.0.
+        private_class_method def self.smoothed_q(opts = {})
+          tab = opts[:table] || load
+          s = opts[:state].to_s
+          a = opts[:action].to_s
+          exact = read_q(table: tab, state: s, action: a)
+          return exact if read_visit(table: tab, state: s, action: a).positive?
+
+          parts = s.split('|')
+          return exact if parts.length < 3
+
+          kind = parts[0]
+          task = parts[1]
+          eng = parts[-1]
+          act = a.to_sym
+          vals = []
+          tab[:q].each do |key, acts|
+            next unless acts.is_a?(Hash) && acts.key?(act)
+            next if key.to_s.include?('~ctx:')
+
+            ks = key.to_s.split('|')
+            next unless ks[0] == kind && ks[1] == task && ks[-1] == eng
+            next unless ks.find { |part| part.start_with?('env:') } == parts.find { |part| part.start_with?('env:') }
+
+            vals << acts[act].to_f
+          end
+          return exact if vals.empty?
+
+          (vals.sum / vals.length).round(5)
+        rescue StandardError
+          0.0
+        end
+
+        # Replay stored trajectories into Q so a cold table is not empty advice.
+        public_class_method def self.warmup!(opts = {})
+          return { skipped: :disabled } unless enabled?
+          return { skipped: :no_traj } unless File.exist?(TRAJECTORY_FILE)
+
+          tab = load
+          rows = trajectories(limit: opts[:limit] || 400).reject { |ep| ep[:score].nil? }
+          context_counts = Hash.new(0)
+          rows.each do |ep|
+            Array(ep[:steps]).each do |tr|
+              next if tr[:context_state].to_s.empty? || tr[:action].to_s.empty?
+              next if transition_variants(transition: tr).empty?
+
+              context_counts[[tr[:context_state].to_s.to_sym, tr[:action].to_s.to_sym]] += 1
+            end
+          end
+          n = 0
+          2.times do
+            rows.reverse_each do |ep|
+              Array(ep[:steps]).flat_map { |tr| transition_variants(transition: tr) }.each do |tr|
+                s = tr[:state].to_s
+                a = tr[:action].to_s
+                next if s.empty? || a.empty?
+
+                r = tr[:reward].to_f
+                s2 = tr[:next_state].to_s
+                term = tr[:terminal] ? true : false
+                qsa = read_q(table: tab, state: s, action: a)
+                max_n = term ? 0.0 : max_q(table: tab, state: s2)
+                target = r + (GAMMA * max_n)
+                td = target - qsa
+                write_q!(table: tab, state: s, action: a, value: qsa + (ALPHA * td))
+                bump_visit!(table: tab, state: s, action: a) unless s.include?('~ctx:')
+                tab[:n_updates] = tab[:n_updates].to_i + 1
+                tab[:td_abs_sum] = tab[:td_abs_sum].to_f + td.abs
+                n += 1
+              end
+            end
+          end
+          # Replay is not new evidence: restore observed counts, never count
+          # the two passes (or repeated warmups) as independent samples.
+          context_counts.each do |(s, a), count|
+            tab[:visits][s] ||= {}
+            tab[:visits][s][a] = [tab[:visits][s][a].to_i, count].max
+          end
+          # Credit stored returns toward the episode budget so greedy
+          # suggestions are not omitted after a successful replay of a
+          # table that never finished COLD_EPISODES live turns.
+          rets = Array(tab[:returns])
+          need = COLD_EPISODES - rets.length
+          if need.positive?
+            extras = rows.filter_map { |ep| ep[:return] unless ep[:return].nil? }.first(need)
+            tab[:returns] = (rets + extras).last(200)
+          end
+          tab[:warmed_at] = Time.now.utc.iso8601
+          save(table: tab)
+          { replayed: rows.length, td_updates: n, n_episodes: Array(load[:returns]).length }
+        rescue StandardError => e
+          { error: "#{e.class}: #{e.message}" }
+        end
+
+        public_class_method def self.maybe_warmup!
+          return { skipped: :disabled } unless enabled?
+          return { skipped: :no_traj } unless File.exist?(TRAJECTORY_FILE)
+
+          tab = load
+          pairs = 0
+          tab[:q].each_value { |acts| pairs += acts.length if acts.is_a?(Hash) }
+          return { skipped: :warmed } if !tab[:warmed_at].to_s.empty? && pairs >= COLD_EPISODES && !cold?
+
+          warmup!
+        rescue StandardError
+          { skipped: :error }
+        end
+
+        private_class_method def self.persist_episode!(opts = {})
+          ep = opts[:episode]
+          return unless ep.is_a?(Hash)
+
+          tab = load
+          tab[:returns] = (Array(tab[:returns]) + [ep[:return].to_f]).last(200) unless ep[:score].nil?
+          save(table: tab)
+          FileUtils.mkdir_p(File.dirname(TRAJECTORY_FILE))
+          row = {
+            session_id: ep[:session_id],
+            request_family: task_family(text: ep[:request]),
+            kind: ep[:kind],
+            engine: ep[:engine],
+            started_at: ep[:started_at],
+            ended_at: ep[:ended_at],
+            score: ep[:score],
+            verdict: ep[:verdict],
+            return: ep[:return],
+            attribution: ep[:attribution],
+            steps: ep[:steps]
+          }
+          File.open(TRAJECTORY_FILE, 'a') { |f| f.puts(JSON.dump(row)) }
+        end
+      end
+    end
+  end
+end

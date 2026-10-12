@@ -1,0 +1,157 @@
+package query
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/authzed/spicedb/pkg/tuple"
+)
+
+func newTestPaths() (*FixedIterator, *Path, *Path, *Path) {
+	path1 := MustPathFromString("document:doc1#viewer@user:alice")
+	path2 := MustPathFromString("document:doc2#editor@user:bob")
+	path3 := MustPathFromString("document:doc1#editor@user:charlie")
+	return NewFixedIterator(*path1, *path2, *path3), path1, path2, path3
+}
+
+func TestFixedIterator(t *testing.T) {
+	t.Run("Check", func(t *testing.T) {
+		require := require.New(t)
+
+		ctx := NewTestContext(t)
+		fixed, _, _, _ := newTestPaths()
+
+		// doc1 matches alice; doc2 does not
+		path, err := ctx.Check(fixed, NewObject("document", "doc1"), NewObject("user", "alice").WithEllipses())
+		require.NoError(err)
+		require.NotNil(path)
+		require.Equal("doc1", path.Resource.ObjectID)
+		require.Equal("alice", path.Subject.ObjectID)
+
+		path2, err := ctx.Check(fixed, NewObject("document", "doc2"), NewObject("user", "alice").WithEllipses())
+		require.NoError(err)
+		require.Nil(path2, "doc2 should not match alice")
+	})
+
+	t.Run("Check_NoMatches", func(t *testing.T) {
+		require := require.New(t)
+
+		ctx := NewTestContext(t)
+		fixed, _, _, _ := newTestPaths()
+
+		path, err := ctx.Check(fixed, NewObject("document", "doc1"), NewObject("user", "nonexistent").WithEllipses())
+		require.NoError(err)
+		require.Nil(path)
+	})
+
+	t.Run("IterSubjects", func(t *testing.T) {
+		require := require.New(t)
+
+		ctx := NewTestContext(t)
+		fixed, _, _, _ := newTestPaths()
+
+		seq, err := ctx.IterSubjects(fixed, NewObject("document", "doc1"), NoObjectFilter())
+		require.NoError(err)
+
+		results, err := CollectAll(seq)
+		require.NoError(err)
+
+		// Should find rel1 and rel3 (both have doc1 as resource)
+		require.Len(results, 2)
+
+		subjects := []string{results[0].Subject.ObjectID, results[1].Subject.ObjectID}
+		require.Contains(subjects, "alice")
+		require.Contains(subjects, "charlie")
+	})
+
+	t.Run("IterResources", func(t *testing.T) {
+		require := require.New(t)
+
+		ctx := NewTestContext(t)
+		fixed, _, _, _ := newTestPaths()
+
+		seq, err := ctx.IterResources(fixed, NewObject("user", "alice").WithEllipses(), NoObjectFilter())
+		require.NoError(err)
+
+		results, err := CollectAll(seq)
+		require.NoError(err)
+
+		// Should find rel1 (alice is subject)
+		require.Len(results, 1)
+		require.Equal("doc1", results[0].Resource.ObjectID)
+		require.Equal("alice", results[0].Subject.ObjectID)
+	})
+
+	t.Run("Clone", func(t *testing.T) {
+		require := require.New(t)
+
+		ctx := NewTestContext(t)
+		fixed, _, _, _ := newTestPaths()
+		cloned := fixed.Clone()
+		require.NotSame(fixed, cloned)
+
+		// Both should produce the same results
+		originalPath, err := ctx.Check(fixed, NewObject("document", "doc1"), NewObject("user", "alice").WithEllipses())
+		require.NoError(err)
+
+		clonedPath, err := ctx.Check(cloned, NewObject("document", "doc1"), NewObject("user", "alice").WithEllipses())
+		require.NoError(err)
+
+		require.Equal(originalPath, clonedPath)
+	})
+
+	t.Run("Explain", func(t *testing.T) {
+		require := require.New(t)
+
+		fixed, _, _, _ := newTestPaths()
+		explain := fixed.Explain()
+		require.Equal("Fixed(3 paths)", explain.Info)
+		require.Empty(explain.SubExplain)
+	})
+}
+
+func TestFixedIterator_Types(t *testing.T) {
+	t.Run("ResourceType", func(t *testing.T) {
+		require := require.New(t)
+
+		path1 := MustPathFromString("document:doc1#viewer@user:alice")
+		path2 := MustPathFromString("document:doc2#editor@user:bob")
+		fixed := NewFixedIterator(*path1, *path2)
+
+		resourceType, err := fixed.ResourceType()
+		require.NoError(err)
+		require.Len(resourceType, 1)
+		require.Equal("document", resourceType[0].Type)
+		require.Equal(tuple.Ellipsis, resourceType[0].Subrelation)
+	})
+
+	t.Run("SubjectTypes", func(t *testing.T) {
+		require := require.New(t)
+
+		path1 := MustPathFromString("document:doc1#viewer@user:alice")
+		path2 := MustPathFromString("document:doc2#editor@user:bob")
+		path3 := MustPathFromString("document:doc3#owner@group:engineers#member")
+		fixed := NewFixedIterator(*path1, *path2, *path3)
+
+		subjectTypes, err := fixed.SubjectTypes()
+		require.NoError(err)
+		require.Len(subjectTypes, 2, "Should have 2 unique subject types")
+		require.Contains(subjectTypes, ObjectType{Type: "user", Subrelation: tuple.Ellipsis})
+		require.Contains(subjectTypes, ObjectType{Type: "group", Subrelation: "member"})
+	})
+
+	t.Run("EmptyIterator", func(t *testing.T) {
+		require := require.New(t)
+
+		fixed := NewFixedIterator()
+
+		resourceType, err := fixed.ResourceType()
+		require.NoError(err)
+		require.Empty(resourceType)
+
+		subjectTypes, err := fixed.SubjectTypes()
+		require.NoError(err)
+		require.Empty(subjectTypes)
+	})
+}

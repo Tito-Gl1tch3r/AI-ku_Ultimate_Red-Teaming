@@ -1,0 +1,340 @@
+package reporter
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"sort"
+	"time"
+
+	"github.com/armosec/armoapi-go/apis"
+	client "github.com/kubescape/backend/pkg/client/v1"
+	v1 "github.com/kubescape/backend/pkg/server/v1"
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/cautils/getter"
+	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling/reporter"
+	"github.com/kubescape/opa-utils/reporthandling"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/prioritization"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/resourcesresults"
+	reporthandlingv2 "github.com/kubescape/opa-utils/reporthandling/v2"
+	"go.opentelemetry.io/otel"
+)
+
+const MAX_REPORT_SIZE = 2097152 // 2 MB
+
+type SubmitContext string
+
+const (
+	SubmitContextScan       SubmitContext = "scan"
+	SubmitContextRepository SubmitContext = "repository"
+)
+
+var _ reporter.IReport = &ReportEventReceiver{}
+
+type ReportEventReceiver struct {
+	reportTime         time.Time
+	client             *client.KSCloudAPI
+	tenantConfig       cautils.ITenantConfig
+	message            string
+	reportID           string
+	submitContext      SubmitContext
+	accountIdGenerated bool
+	firstChunkSent     bool
+}
+
+func NewReportEventReceiver(tenantConfig cautils.ITenantConfig, reportID string, submitContext SubmitContext, client *client.KSCloudAPI) *ReportEventReceiver {
+	return &ReportEventReceiver{
+		client:        client,
+		tenantConfig:  tenantConfig,
+		reportID:      reportID,
+		submitContext: submitContext,
+	}
+}
+
+func (report *ReportEventReceiver) Submit(ctx context.Context, opaSessionObj *cautils.OPASessionObj) error {
+	ctx, span := otel.Tracer("").Start(ctx, "reportEventReceiver.Submit")
+	defer span.End()
+	report.reportTime = time.Now().UTC()
+
+	if report.GetAccountID() == "" {
+		accountID, err := report.tenantConfig.GenerateAccountID()
+		if err != nil {
+			logger.L().Error("failed to generate account ID", helpers.String("reason", err.Error()))
+			return err
+		}
+		report.accountIdGenerated = true
+		report.client.SetAccountID(accountID)
+		getter.SetKSCloudAPIConnector(report.client)
+		logger.L().Debug("generated account ID", helpers.String("account ID", accountID))
+	}
+
+	defer func() {
+		// Clean up generated credentials if no chunks were successfully sent
+		// This handles early returns (e.g., missing cluster name, context cancellation)
+		if report.accountIdGenerated && !report.firstChunkSent {
+			if err := report.tenantConfig.DeleteCredentials(); err != nil {
+				logger.L().Error("failed to delete generated credentials after report submission failed or returned early", helpers.Error(err))
+			}
+		}
+	}()
+
+	if opaSessionObj.Metadata.ScanMetadata.ScanningTarget == reporthandlingv2.Cluster && report.GetClusterName() == "" {
+		logger.L().Ctx(ctx).Error("failed to publish results because the cluster name is Unknown. If you are scanning YAML files the results are not submitted to the Kubescape SaaS")
+		return nil
+	}
+
+	if err := report.prepareReport(ctx, opaSessionObj); err != nil {
+		return fmt.Errorf("failed to submit scan results. reason: %w", err)
+	}
+
+	logger.L().Debug("", helpers.String("account ID", report.GetAccountID()))
+
+	return nil
+}
+
+func (report *ReportEventReceiver) SetTenantConfig(tenantConfig cautils.ITenantConfig) {
+	report.tenantConfig = tenantConfig
+}
+
+func (report *ReportEventReceiver) GetAccountID() string {
+	return report.tenantConfig.GetAccountID()
+}
+
+func (report *ReportEventReceiver) GetClusterName() string {
+	return cautils.AdoptClusterName(report.tenantConfig.GetContextName()) // clean cluster name
+}
+
+func (report *ReportEventReceiver) prepareReport(ctx context.Context, opaSessionObj *cautils.OPASessionObj) error {
+	// The backend for Kubescape expects scanning targets to be either
+	// Clusters or Files, not other types we support (GitLocal, Directory
+	// etc). So, to submit a compatible report to the backend, we have to
+	// override the scanning target, submit the report and then restore the
+	// original value.
+	originalScanningTarget := opaSessionObj.Metadata.ScanMetadata.ScanningTarget
+
+	if opaSessionObj.Metadata.ScanMetadata.ScanningTarget != reporthandlingv2.Cluster {
+		opaSessionObj.Metadata.ScanMetadata.ScanningTarget = reporthandlingv2.File
+		defer func() {
+			opaSessionObj.Metadata.ScanMetadata.ScanningTarget = originalScanningTarget
+		}()
+	}
+
+	cautils.StartSpinner()
+	defer cautils.StopSpinner()
+
+	return report.sendResources(ctx, opaSessionObj)
+}
+
+func (report *ReportEventReceiver) getReportUrl() string {
+	url, err := client.GetPostureReportUrl(report.client.GetCloudReportURL(), report.GetAccountID(), report.GetClusterName(), report.reportID)
+	if err != nil {
+		return ""
+	}
+	return url.String()
+}
+
+func (report *ReportEventReceiver) sendResources(ctx context.Context, opaSessionObj *cautils.OPASessionObj) error {
+	splittedPostureReport := report.setSubReport(opaSessionObj)
+
+	counter := 0
+	reportCounter := 0
+
+	catalog := opaSessionObj.GetCatalog()
+
+	if err := report.setResourcesFromCatalog(ctx, splittedPostureReport, catalog, opaSessionObj.ResourceSource, opaSessionObj.ResourcesResult, &counter, &reportCounter); err != nil {
+		return err
+	}
+
+	if err := report.setResultsFromCatalog(ctx, splittedPostureReport, opaSessionObj.ResourcesResult, catalog, opaSessionObj.ResourceSource, opaSessionObj.ResourcesPrioritized, &counter, &reportCounter); err != nil {
+		return err
+	}
+
+	return report.sendReport(ctx, splittedPostureReport, reportCounter, true)
+}
+
+func (report *ReportEventReceiver) setResults(ctx context.Context, reportObj *reporthandlingv2.PostureReport, results map[string]resourcesresults.Result, allResources map[string]workloadinterface.IMetadata, resourcesSource map[string]reporthandling.Source, prioritizedResources map[string]prioritization.PrioritizedResource, counter, reportCounter *int) error {
+	return report.setResultsFromCatalog(ctx, reportObj, results, cautils.NewMapResourceCatalog(allResources), resourcesSource, prioritizedResources, counter, reportCounter)
+}
+
+func (report *ReportEventReceiver) setResultsFromCatalog(ctx context.Context, reportObj *reporthandlingv2.PostureReport, results map[string]resourcesresults.Result, catalog cautils.ResourceCatalog, resourcesSource map[string]reporthandling.Source, prioritizedResources map[string]prioritization.PrioritizedResource, counter, reportCounter *int) error {
+	// Chunk boundaries depend on iteration order, so keep the input order stable.
+	resourceIDs := make([]string, 0, len(results))
+	for resourceID := range results {
+		resourceIDs = append(resourceIDs, resourceID)
+	}
+	sort.Strings(resourceIDs)
+
+	for _, resultID := range resourceIDs {
+		v := results[resultID]
+		// set result.RawResource
+		resourceID := v.GetResourceID()
+		var resMeta workloadinterface.IMetadata
+		if catalog != nil {
+			resMeta, _ = catalog.Get(resourceID)
+		}
+		if resMeta == nil {
+			continue
+		}
+		resource := reporthandling.NewResourceIMetadata(resMeta)
+		if r, ok := resourcesSource[resourceID]; ok {
+			resource.SetSource(&r)
+		}
+		v.RawResource = resource
+
+		// set result.PrioritizedResource
+		if results, ok := prioritizedResources[resourceID]; ok {
+			v.PrioritizedResource = &results
+		}
+		sourcePath := ""
+		if source := resource.GetSource(); source != nil {
+			sourcePath = source.RelativePath
+		}
+
+		r, err := json.Marshal(v)
+		if err != nil {
+			logger.L().Error("failed to marshal resource to JSON - skipping",
+				helpers.Error(err),
+				helpers.String("file", sourcePath),
+			)
+			continue
+		}
+
+		if *counter+len(r) >= MAX_REPORT_SIZE && (len(reportObj.Results) > 0 || len(reportObj.Resources) > 0) {
+
+			// send report
+			if err := report.sendReport(ctx, reportObj, *reportCounter, false); err != nil {
+				return err
+			}
+			*reportCounter++
+
+			// delete results
+			reportObj.Results = []resourcesresults.Result{}
+			reportObj.Resources = []reporthandling.Resource{}
+
+			// restart counter
+			*counter = 0
+		}
+
+		*counter += len(r)
+		reportObj.Results = append(reportObj.Results, v)
+	}
+	return nil
+}
+
+func (report *ReportEventReceiver) setResources(ctx context.Context, reportObj *reporthandlingv2.PostureReport, allResources map[string]workloadinterface.IMetadata, resourcesSource map[string]reporthandling.Source, results map[string]resourcesresults.Result, counter, reportCounter *int) error {
+	return report.setResourcesFromCatalog(ctx, reportObj, cautils.NewMapResourceCatalog(allResources), resourcesSource, results, counter, reportCounter)
+}
+
+func (report *ReportEventReceiver) setResourcesFromCatalog(ctx context.Context, reportObj *reporthandlingv2.PostureReport, catalog cautils.ResourceCatalog, resourcesSource map[string]reporthandling.Source, results map[string]resourcesresults.Result, counter, reportCounter *int) error {
+	if catalog == nil {
+		return nil
+	}
+	// Chunk boundaries depend on iteration order, so keep the input order stable.
+	resourceIDs := catalog.ListIDs()
+	sort.Strings(resourceIDs)
+
+	for _, resourceID := range resourceIDs {
+		v, ok := catalog.Get(resourceID)
+		if !ok || v == nil {
+			continue
+		}
+		/*
+
+			// process only resources which have no result because these resources will be sent on the result object
+			if _, hasResult := results[resourceID]; hasResult {
+				continue
+			}
+
+		*/
+
+		resource := reporthandling.NewResourceIMetadata(v)
+		if r, ok := resourcesSource[resourceID]; ok {
+			resource.SetSource(&r)
+		}
+		sourcePath := ""
+		if source := resource.GetSource(); source != nil {
+			sourcePath = source.RelativePath
+		}
+		r, err := json.Marshal(resource)
+		if err != nil {
+			logger.L().Error("failed to marshal resource to JSON - skipping",
+				helpers.Error(err),
+				helpers.String("file", sourcePath),
+			)
+			continue
+		}
+
+		if *counter+len(r) >= MAX_REPORT_SIZE && len(reportObj.Resources) > 0 {
+
+			// send report
+			if err := report.sendReport(ctx, reportObj, *reportCounter, false); err != nil {
+				return err
+			}
+			*reportCounter++
+
+			// delete resources
+			reportObj.Resources = []reporthandling.Resource{}
+			reportObj.Results = []resourcesresults.Result{}
+
+			// restart counter
+			*counter = 0
+		}
+
+		*counter += len(r)
+		reportObj.Resources = append(reportObj.Resources, *resource)
+	}
+	return nil
+}
+
+func (report *ReportEventReceiver) sendReport(ctx context.Context, postureReport *reporthandlingv2.PostureReport, counter int, isLastReport bool) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("scan canceled: %w", err)
+	}
+
+	postureReport.PaginationInfo = apis.PaginationMarks{
+		ReportNumber: counter,
+		IsLastReport: isLastReport,
+	}
+	logger.L().Debug("sending report",
+		helpers.String("url", report.getReportUrl()),
+		helpers.String("account", report.client.GetAccountID()),
+		helpers.Int("accessKey length", len(report.client.GetAccessKey())),
+		helpers.Int("reportNumber", counter),
+	)
+
+	strResponse, err := report.client.SubmitReport(postureReport)
+	if err != nil {
+		return fmt.Errorf("%w:%s", err, strResponse)
+	}
+	report.firstChunkSent = true
+
+	// message is taken only from last report
+	if strResponse != "" && isLastReport {
+		response := v1.PostureReportResponse{}
+		if unmarshalErr := json.Unmarshal([]byte(strResponse), &response); unmarshalErr != nil {
+			logger.L().Error("failed to unmarshal server response")
+		} else {
+			report.setMessage(response.Message)
+		}
+	}
+
+	return err
+}
+
+func (report *ReportEventReceiver) setMessage(message string) {
+	report.message = message
+}
+
+func (report *ReportEventReceiver) DisplayMessage() {
+
+	// print if logger level is lower than warning (debug/info)
+	if report.message != "" && helpers.ToLevel(logger.L().GetLevel()) < helpers.WarningLevel {
+		txt := "View results"
+		cautils.SectionHeadingDisplay(os.Stdout, txt)
+		cautils.SimpleDisplay(os.Stdout, fmt.Sprintf("%s\n\n", report.message))
+	}
+}

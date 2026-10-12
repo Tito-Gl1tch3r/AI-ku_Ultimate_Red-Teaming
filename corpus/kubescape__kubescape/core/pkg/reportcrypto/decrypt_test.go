@@ -1,0 +1,961 @@
+package reportcrypto
+
+import (
+	"testing"
+
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	reporthandling "github.com/kubescape/opa-utils/reporthandling"
+	reporthandlingv2 "github.com/kubescape/opa-utils/reporthandling/v2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestDecryptRepoContextMetadata_RoundTrip(t *testing.T) {
+	dek, err := GenerateDEK()
+	require.NoError(t, err)
+
+	masterKey, err := GenerateDEK()
+	require.NoError(t, err)
+
+	encryptedRepo, err := EncryptString(
+		"demo-repository",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedOwner, err := EncryptString(
+		"demo-owner",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedBranch, err := EncryptString(
+		"main",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedDefaultBranch, err := EncryptString(
+		"main",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedRemoteURL, err := EncryptString(
+		"https://github.com/example/repo",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedLocalRootPath, err := EncryptString(
+		"/home/user/repository",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedCommitHash, err := EncryptString(
+		"abc123def456",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedCommitterName, err := EncryptString(
+		"John Doe",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedCommitterEmail, err := EncryptString(
+		"john@example.com",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedCommitMessage, err := EncryptString(
+		"initial commit",
+		dek,
+	)
+	require.NoError(t, err)
+
+	wrappedDEK, err := WrapDEK(
+		dek,
+		masterKey,
+	)
+	require.NoError(t, err)
+
+	metadata := &reporthandlingv2.Metadata{
+		ContextMetadata: reporthandlingv2.ContextMetadata{
+			RepoContextMetadata: &reporthandlingv2.RepoContextMetadata{
+				Repo:          encryptedRepo,
+				Owner:         encryptedOwner,
+				Branch:        encryptedBranch,
+				DefaultBranch: encryptedDefaultBranch,
+				RemoteURL:     encryptedRemoteURL,
+				LocalRootPath: encryptedLocalRootPath,
+				LastCommit: reporthandling.LastCommit{
+					Hash:           encryptedCommitHash,
+					CommitterName:  encryptedCommitterName,
+					CommitterEmail: encryptedCommitterEmail,
+					Message:        encryptedCommitMessage,
+				},
+			},
+		},
+		EncryptionMetadata: &reporthandlingv2.EncryptionMetadata{
+			Version:      "v1",
+			DEKAlgorithm: "AES256_GCM",
+			KEKAlgorithm: "AES256_GCM",
+			EncryptedDEK: wrappedDEK,
+		},
+	}
+
+	err = DecryptRepoContextMetadata(
+		metadata,
+		masterKey,
+	)
+	require.NoError(t, err)
+
+	repoMetadata :=
+		metadata.ContextMetadata.RepoContextMetadata
+
+	assert.Equal(
+		t,
+		"demo-repository",
+		repoMetadata.Repo,
+	)
+
+	assert.Equal(
+		t,
+		"demo-owner",
+		repoMetadata.Owner,
+	)
+
+	assert.Equal(
+		t,
+		"main",
+		repoMetadata.Branch,
+	)
+
+	assert.Equal(
+		t,
+		"main",
+		repoMetadata.DefaultBranch,
+	)
+
+	assert.Equal(
+		t,
+		"https://github.com/example/repo",
+		repoMetadata.RemoteURL,
+	)
+
+	assert.Equal(
+		t,
+		"/home/user/repository",
+		repoMetadata.LocalRootPath,
+	)
+
+	assert.Equal(
+		t,
+		"abc123def456",
+		repoMetadata.LastCommit.Hash,
+	)
+
+	assert.Equal(
+		t,
+		"John Doe",
+		repoMetadata.LastCommit.CommitterName,
+	)
+
+	assert.Equal(
+		t,
+		"john@example.com",
+		repoMetadata.LastCommit.CommitterEmail,
+	)
+
+	assert.Equal(
+		t,
+		"initial commit",
+		repoMetadata.LastCommit.Message,
+	)
+}
+
+func TestDecryptRepoContextMetadata_WrongMasterKey(
+	t *testing.T,
+) {
+	dek, err := GenerateDEK()
+	require.NoError(t, err)
+
+	masterKey, err := GenerateDEK()
+	require.NoError(t, err)
+
+	wrongMasterKey, err := GenerateDEK()
+	require.NoError(t, err)
+
+	encryptedRepo, err := EncryptString(
+		"demo-repository",
+		dek,
+	)
+	require.NoError(t, err)
+
+	wrappedDEK, err := WrapDEK(
+		dek,
+		masterKey,
+	)
+	require.NoError(t, err)
+
+	metadata := &reporthandlingv2.Metadata{
+		ContextMetadata: reporthandlingv2.ContextMetadata{
+			RepoContextMetadata: &reporthandlingv2.RepoContextMetadata{
+				Repo: encryptedRepo,
+			},
+		},
+		EncryptionMetadata: &reporthandlingv2.EncryptionMetadata{
+			EncryptedDEK: wrappedDEK,
+		},
+	}
+
+	err = DecryptRepoContextMetadata(
+		metadata,
+		wrongMasterKey,
+	)
+
+	require.Error(t, err)
+}
+
+func TestDEKFromMetadata_InvalidMasterKey(t *testing.T) {
+	dek, err := GenerateDEK()
+	require.NoError(t, err)
+
+	masterKey, err := GenerateDEK()
+	require.NoError(t, err)
+
+	wrappedDEK, err := WrapDEK(
+		dek,
+		masterKey,
+	)
+	require.NoError(t, err)
+
+	metadata := &reporthandlingv2.Metadata{
+		EncryptionMetadata: &reporthandlingv2.EncryptionMetadata{
+			EncryptedDEK: wrappedDEK,
+		},
+	}
+
+	_, err = DEKFromMetadata(
+		metadata,
+		[]byte("bad"),
+	)
+
+	require.Error(t, err)
+}
+
+func TestDEKFromMetadata_NoEncryptionMetadata(t *testing.T) {
+	metadata := &reporthandlingv2.Metadata{}
+
+	_, err := DEKFromMetadata(
+		metadata,
+		make([]byte, 32),
+	)
+
+	require.Error(t, err)
+
+	assert.Contains(
+		t,
+		err.Error(),
+		"encryption metadata not found",
+	)
+}
+
+func TestDecryptRepoContextMetadata_NoRepoMetadata(t *testing.T) {
+	dek, err := GenerateDEK()
+	require.NoError(t, err)
+
+	masterKey, err := GenerateDEK()
+	require.NoError(t, err)
+
+	wrappedDEK, err := WrapDEK(
+		dek,
+		masterKey,
+	)
+	require.NoError(t, err)
+
+	metadata := &reporthandlingv2.Metadata{
+		EncryptionMetadata: &reporthandlingv2.EncryptionMetadata{
+			EncryptedDEK: wrappedDEK,
+		},
+	}
+
+	err = DecryptRepoContextMetadata(
+		metadata,
+		masterKey,
+	)
+
+	require.NoError(t, err)
+}
+
+func TestDecryptResourceSource_RoundTrip(
+	t *testing.T,
+) {
+	dek, err := GenerateDEK()
+	require.NoError(t, err)
+
+	encryptedPath, err := EncryptString(
+		"/workspace/private/app.yaml",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedRelativePath, err := EncryptString(
+		"services/payments/app.yaml",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedHelmPath, err := EncryptString(
+		"charts/internal",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedChartName, err := EncryptString(
+		"payments-service",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedTemplateFile, err := EncryptString(
+		"templates/deployment.yaml",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedKustomizeDir, err := EncryptString(
+		"prod-overlay",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedValue1, err := EncryptString(
+		"database.password",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedValue2, err := EncryptString(
+		"redis.password",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedCommitHash, err := EncryptString(
+		"abc123",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedCommitterName, err := EncryptString(
+		"John Doe",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedCommitterEmail, err := EncryptString(
+		"john@example.com",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedCommitMessage, err := EncryptString(
+		"internal change",
+		dek,
+	)
+	require.NoError(t, err)
+
+	source := &reporthandling.Source{
+		Path:                   encryptedPath,
+		RelativePath:           encryptedRelativePath,
+		HelmPath:               encryptedHelmPath,
+		HelmChartName:          encryptedChartName,
+		HelmTemplateFile:       encryptedTemplateFile,
+		KustomizeDirectoryName: encryptedKustomizeDir,
+		HelmValuesPaths: []string{
+			encryptedValue1,
+			encryptedValue2,
+		},
+		LastCommit: reporthandling.LastCommit{
+			Hash:           encryptedCommitHash,
+			CommitterName:  encryptedCommitterName,
+			CommitterEmail: encryptedCommitterEmail,
+			Message:        encryptedCommitMessage,
+		},
+	}
+
+	err = DecryptResourceSource(
+		source,
+		UnboundReportKey(dek),
+	)
+
+	require.NoError(t, err)
+
+	assert.Equal(
+		t,
+		"/workspace/private/app.yaml",
+		source.Path,
+	)
+
+	assert.Equal(
+		t,
+		"services/payments/app.yaml",
+		source.RelativePath,
+	)
+
+	assert.Equal(
+		t,
+		"charts/internal",
+		source.HelmPath,
+	)
+
+	assert.Equal(
+		t,
+		"payments-service",
+		source.HelmChartName,
+	)
+
+	assert.Equal(
+		t,
+		"templates/deployment.yaml",
+		source.HelmTemplateFile,
+	)
+
+	assert.Equal(
+		t,
+		"prod-overlay",
+		source.KustomizeDirectoryName,
+	)
+
+	assert.Equal(
+		t,
+		[]string{
+			"database.password",
+			"redis.password",
+		},
+		source.HelmValuesPaths,
+	)
+
+	assert.Equal(
+		t,
+		"abc123",
+		source.LastCommit.Hash,
+	)
+
+	assert.Equal(
+		t,
+		"John Doe",
+		source.LastCommit.CommitterName,
+	)
+
+	assert.Equal(
+		t,
+		"john@example.com",
+		source.LastCommit.CommitterEmail,
+	)
+
+	assert.Equal(
+		t,
+		"internal change",
+		source.LastCommit.Message,
+	)
+}
+
+func TestDecryptResourceSource_Nil(
+	t *testing.T,
+) {
+	err := DecryptResourceSource(
+		nil,
+		UnboundReportKey(make([]byte, 32)),
+	)
+
+	require.NoError(t, err)
+}
+
+func TestDecryptResourceMetadata_RoundTrip(
+	t *testing.T,
+) {
+	dek, err := GenerateDEK()
+	require.NoError(t, err)
+
+	encryptedName, err := EncryptString(
+		"payments-api",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedNamespace, err := EncryptString(
+		"production",
+		dek,
+	)
+	require.NoError(t, err)
+
+	resource := workloadinterface.NewWorkloadObj(
+		map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Pod",
+			"metadata": map[string]any{
+				"name":      encryptedName,
+				"namespace": encryptedNamespace,
+			},
+		},
+	)
+
+	err = DecryptResourceMetadata(
+		resource,
+		UnboundReportKey(dek),
+	)
+
+	require.NoError(t, err)
+
+	assert.Equal(
+		t,
+		"payments-api",
+		resource.GetName(),
+	)
+
+	assert.Equal(
+		t,
+		"production",
+		resource.GetNamespace(),
+	)
+}
+
+func TestDecryptResourceMetadata_Nil(
+	t *testing.T,
+) {
+	err := DecryptResourceMetadata(
+		nil,
+		UnboundReportKey(make([]byte, 32)),
+	)
+
+	require.NoError(t, err)
+}
+
+func TestDecryptResourceLabels_RoundTrip(t *testing.T) {
+	dek, err := GenerateDEK()
+	require.NoError(t, err)
+
+	encryptedTeam, err := EncryptString(
+		"payments",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedEnv, err := EncryptString(
+		"production",
+		dek,
+	)
+	require.NoError(t, err)
+
+	resource := workloadinterface.NewWorkloadObj(
+		map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Pod",
+			"metadata": map[string]any{
+				"labels": map[string]any{
+					"team": encryptedTeam,
+					"env":  encryptedEnv,
+				},
+			},
+		},
+	)
+
+	err = DecryptResourceLabels(
+		resource,
+		UnboundReportKey(dek),
+	)
+	require.NoError(t, err)
+
+	labels := resource.GetLabels()
+
+	assert.Equal(
+		t,
+		"payments",
+		labels["team"],
+	)
+
+	assert.Equal(
+		t,
+		"production",
+		labels["env"],
+	)
+}
+
+func TestDecryptResourceAnnotations_RoundTrip(t *testing.T) {
+	dek, err := GenerateDEK()
+	require.NoError(t, err)
+
+	encryptedValue1, err := EncryptString(
+		"secret/data/payment",
+		dek,
+	)
+	require.NoError(t, err)
+
+	encryptedValue2, err := EncryptString(
+		"abcd1234",
+		dek,
+	)
+	require.NoError(t, err)
+
+	resource := workloadinterface.NewWorkloadObj(
+		map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Deployment",
+			"metadata": map[string]any{
+				"annotations": map[string]any{
+					"vault.hashicorp.com/path": encryptedValue1,
+					"example.com/token":        encryptedValue2,
+				},
+			},
+		},
+	)
+
+	err = DecryptResourceAnnotations(
+		resource,
+		UnboundReportKey(dek),
+	)
+	require.NoError(t, err)
+
+	metadata := resource.GetObject()["metadata"].(map[string]any)
+	annotations := metadata["annotations"].(map[string]any)
+
+	assert.Equal(
+		t,
+		"secret/data/payment",
+		annotations["vault.hashicorp.com/path"],
+	)
+
+	assert.Equal(
+		t,
+		"abcd1234",
+		annotations["example.com/token"],
+	)
+}
+
+func TestDecryptResourceObjectSourcePath_RoundTrip(t *testing.T) {
+	dek, err := GenerateDEK()
+	require.NoError(t, err)
+
+	encryptedPath, err := EncryptString(
+		"/workspace/manifests/payment.yaml",
+		dek,
+	)
+	require.NoError(t, err)
+
+	resource := workloadinterface.NewWorkloadObj(
+		map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Pod",
+			"sourcePath": encryptedPath + ":42",
+		},
+	)
+
+	err = DecryptResourceObjectSourcePath(
+		resource,
+		UnboundReportKey(dek),
+	)
+	require.NoError(t, err)
+
+	assert.Equal(
+		t,
+		"/workspace/manifests/payment.yaml:42",
+		resource.GetObject()["sourcePath"],
+	)
+}
+
+func TestDecryptResourceLabels_Nil(t *testing.T) {
+	err := DecryptResourceLabels(
+		nil,
+		UnboundReportKey(make([]byte, 32)),
+	)
+
+	require.NoError(t, err)
+}
+
+func TestDecryptResourceAnnotations_Nil(t *testing.T) {
+	err := DecryptResourceAnnotations(
+		nil,
+		UnboundReportKey(make([]byte, 32)),
+	)
+
+	require.NoError(t, err)
+}
+
+func TestDecryptResourceObjectSourcePath_Nil(t *testing.T) {
+	err := DecryptResourceObjectSourcePath(
+		nil,
+		UnboundReportKey(make([]byte, 32)),
+	)
+
+	require.NoError(t, err)
+}
+
+func TestDecryptResourceLabels_Plaintext(t *testing.T) {
+	resource := workloadinterface.NewWorkloadObj(
+		map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Pod",
+			"metadata": map[string]any{
+				"labels": map[string]any{
+					"team": "backend",
+				},
+			},
+		},
+	)
+
+	err := DecryptResourceLabels(resource, UnboundReportKey(make([]byte, 32)))
+	require.NoError(t, err)
+
+	assert.Equal(t, "backend", resource.GetLabels()["team"])
+}
+
+func TestDecryptIfEncrypted_PreservesPlaintextWhitespace(t *testing.T) {
+	dek, err := GenerateDEK()
+	require.NoError(t, err)
+
+	// Values that were never encrypted must survive decryption byte for byte.
+	// Trailing newlines in particular are meaningful: kubectl writes the
+	// last-applied-configuration annotation with one.
+	plaintexts := []string{
+		"{\"apiVersion\":\"v1\"}\n",
+		"  indented value",
+		"trailing spaces   ",
+		"multi\nline\nvalue\n",
+		"\ttabbed\t",
+	}
+
+	for _, plaintext := range plaintexts {
+		got, err := decryptIfEncrypted(plaintext, UnboundReportKey(dek))
+		require.NoError(t, err)
+		assert.Equal(t, plaintext, got, "plaintext must not be rewritten")
+	}
+}
+
+func TestDecryptIfEncrypted_TolerantOfEnvelopeWhitespace(t *testing.T) {
+	dek, err := GenerateDEK()
+	require.NoError(t, err)
+
+	ciphertext, err := EncryptString("secret-value", dek)
+	require.NoError(t, err)
+
+	// An envelope padded by whitespace still decrypts to the exact plaintext.
+	got, err := decryptIfEncrypted("  "+ciphertext+"\n", UnboundReportKey(dek))
+	require.NoError(t, err)
+	assert.Equal(t, "secret-value", got)
+}
+
+func TestDecryptResourceAnnotations_PreservesPlaintextValue(t *testing.T) {
+	const lastApplied = "{\"apiVersion\":\"v1\",\"kind\":\"Pod\"}\n"
+
+	resource := workloadinterface.NewWorkloadObj(
+		map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Pod",
+			"metadata": map[string]any{
+				"annotations": map[string]any{
+					"kubectl.kubernetes.io/last-applied-configuration": lastApplied,
+				},
+			},
+		},
+	)
+
+	require.NoError(t, DecryptResourceAnnotations(resource, UnboundReportKey(make([]byte, 32))))
+
+	metadata := resource.GetObject()["metadata"].(map[string]any)
+	annotations := metadata["annotations"].(map[string]any)
+	assert.Equal(t, lastApplied, annotations["kubectl.kubernetes.io/last-applied-configuration"])
+}
+
+func TestDecryptDirectoryContextMetadata_RoundTrip(t *testing.T) {
+	const (
+		basePath = "/home/devjijo/work/internal-platform"
+		hostName = "build-agent-07.corp.internal"
+	)
+
+	dek, err := GenerateDEK()
+	require.NoError(t, err)
+
+	masterKey, err := GenerateDEK()
+	require.NoError(t, err)
+
+	wrappedDEK, err := WrapDEK(dek, masterKey)
+	require.NoError(t, err)
+
+	reportKey, err := UnwrapReportKey(wrappedDEK, masterKey)
+	require.NoError(t, err)
+
+	encryptedBasePath, err := EncryptString(basePath, dek)
+	require.NoError(t, err)
+
+	encryptedHostName, err := EncryptString(hostName, dek)
+	require.NoError(t, err)
+
+	metadata := &reporthandlingv2.Metadata{
+		ContextMetadata: reporthandlingv2.ContextMetadata{
+			DirectoryContextMetadata: &reporthandlingv2.DirectoryContextMetadata{
+				BasePath: encryptedBasePath,
+				HostName: encryptedHostName,
+			},
+		},
+	}
+
+	require.NoError(t, decryptDirectoryContextMetadata(metadata, reportKey))
+
+	directory := metadata.ContextMetadata.DirectoryContextMetadata
+	assert.Equal(t, basePath, directory.BasePath)
+	assert.Equal(t, hostName, directory.HostName)
+}
+
+func TestDecryptFileContextMetadata_RoundTrip(t *testing.T) {
+	const (
+		filePath = "/home/devjijo/work/internal-platform/deploy.yaml"
+		hostName = "build-agent-07.corp.internal"
+	)
+
+	dek, err := GenerateDEK()
+	require.NoError(t, err)
+
+	masterKey, err := GenerateDEK()
+	require.NoError(t, err)
+
+	wrappedDEK, err := WrapDEK(dek, masterKey)
+	require.NoError(t, err)
+
+	reportKey, err := UnwrapReportKey(wrappedDEK, masterKey)
+	require.NoError(t, err)
+
+	encryptedFilePath, err := EncryptString(filePath, dek)
+	require.NoError(t, err)
+
+	encryptedHostName, err := EncryptString(hostName, dek)
+	require.NoError(t, err)
+
+	metadata := &reporthandlingv2.Metadata{
+		ContextMetadata: reporthandlingv2.ContextMetadata{
+			FileContextMetadata: &reporthandlingv2.FileContextMetadata{
+				FilePath: encryptedFilePath,
+				HostName: encryptedHostName,
+			},
+		},
+	}
+
+	require.NoError(t, decryptFileContextMetadata(metadata, reportKey))
+
+	file := metadata.ContextMetadata.FileContextMetadata
+	assert.Equal(t, filePath, file.FilePath)
+	assert.Equal(t, hostName, file.HostName)
+}
+
+func TestDecryptDirectoryContextMetadata_NoDirectoryMetadata(t *testing.T) {
+	dek, err := GenerateDEK()
+	require.NoError(t, err)
+
+	masterKey, err := GenerateDEK()
+	require.NoError(t, err)
+
+	wrappedDEK, err := WrapDEK(dek, masterKey)
+	require.NoError(t, err)
+
+	reportKey, err := UnwrapReportKey(wrappedDEK, masterKey)
+	require.NoError(t, err)
+
+	assert.NoError(t, decryptDirectoryContextMetadata(&reporthandlingv2.Metadata{}, reportKey))
+}
+
+func TestDecryptClusterMetadata_RoundTrip(t *testing.T) {
+	const (
+		contextName = "gke_acme-prod-1234_us-central1_payments"
+		prefixName  = "gke_acme-prod-1234_us-central1"
+		shortName   = "payments"
+		namespace   = "acme-payments"
+	)
+
+	dek, err := GenerateDEK()
+	require.NoError(t, err)
+
+	masterKey, err := GenerateDEK()
+	require.NoError(t, err)
+
+	wrappedDEK, err := WrapDEK(dek, masterKey)
+	require.NoError(t, err)
+
+	reportKey, err := UnwrapReportKey(wrappedDEK, masterKey)
+	require.NoError(t, err)
+
+	encrypt := func(value string) string {
+		encrypted, encryptErr := EncryptString(value, dek)
+		require.NoError(t, encryptErr)
+		return encrypted
+	}
+
+	clusterMetadata := func() reporthandlingv2.ClusterMetadata {
+		return reporthandlingv2.ClusterMetadata{
+			ContextName:         encrypt(contextName),
+			CloudProvider:       "gke",
+			NumberOfWorkerNodes: 12,
+			CloudMetadata: &reporthandlingv2.CloudMetadata{
+				CloudProvider: "gke",
+				FullName:      encrypt(contextName),
+				ShortName:     encrypt(shortName),
+				PrefixName:    encrypt(prefixName),
+			},
+			MapNamespaceToNumberOfResources: map[string]int{
+				encrypt(namespace): 17,
+				"":                 3,
+			},
+		}
+	}
+
+	contextCluster := clusterMetadata()
+	metadata := &reporthandlingv2.Metadata{
+		ContextMetadata: reporthandlingv2.ContextMetadata{ClusterContextMetadata: &contextCluster},
+		ClusterMetadata: clusterMetadata(),
+	}
+
+	require.NoError(t, decryptClusterMetadata(metadata, reportKey))
+
+	for _, cluster := range []*reporthandlingv2.ClusterMetadata{
+		metadata.ContextMetadata.ClusterContextMetadata,
+		&metadata.ClusterMetadata,
+	} {
+		require.Equal(t, contextName, cluster.ContextName)
+		require.Equal(t, contextName, cluster.CloudMetadata.FullName)
+		require.Equal(t, shortName, cluster.CloudMetadata.ShortName)
+		require.Equal(t, prefixName, cluster.CloudMetadata.PrefixName)
+		require.Equal(t, "gke", cluster.CloudProvider)
+		require.Equal(t, 12, cluster.NumberOfWorkerNodes)
+		require.Equal(
+			t,
+			map[string]int{namespace: 17, "": 3},
+			cluster.MapNamespaceToNumberOfResources,
+		)
+	}
+}
+
+func TestDecryptClusterMetadata_NoClusterMetadata(t *testing.T) {
+	dek, err := GenerateDEK()
+	require.NoError(t, err)
+
+	masterKey, err := GenerateDEK()
+	require.NoError(t, err)
+
+	wrappedDEK, err := WrapDEK(dek, masterKey)
+	require.NoError(t, err)
+
+	reportKey, err := UnwrapReportKey(wrappedDEK, masterKey)
+	require.NoError(t, err)
+
+	metadata := &reporthandlingv2.Metadata{}
+
+	require.NoError(t, decryptClusterMetadata(metadata, reportKey))
+	require.Nil(t, metadata.ContextMetadata.ClusterContextMetadata)
+	require.Nil(t, metadata.ClusterMetadata.MapNamespaceToNumberOfResources)
+
+	require.Error(t, decryptClusterMetadata(nil, reportKey))
+}

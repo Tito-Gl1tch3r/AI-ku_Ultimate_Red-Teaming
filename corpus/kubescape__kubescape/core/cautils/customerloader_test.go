@@ -1,0 +1,558 @@
+package cautils
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"testing"
+
+	v1 "github.com/kubescape/backend/pkg/client/v1"
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	"github.com/kubescape/kubescape/v4/core/cautils/getter"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+)
+
+func mockConfigObj() *ConfigObj {
+	return &ConfigObj{
+		AccountID:      "aaa",
+		ClusterName:    "ddd",
+		CloudReportURL: "report.domain.com",
+		CloudAPIURL:    "api.domain.com",
+	}
+}
+func mockLocalConfig() *LocalConfig {
+	return &LocalConfig{
+		configObj: mockConfigObj(),
+	}
+}
+
+func mockClusterConfig() *ClusterConfig {
+	return &ClusterConfig{
+		configObj: mockConfigObj(),
+	}
+}
+func TestConfig(t *testing.T) {
+	co := mockConfigObj()
+	cop := ConfigObj{}
+
+	assert.NoError(t, json.Unmarshal(co.Config(), &cop))
+	assert.Equal(t, co.AccountID, cop.AccountID)
+	assert.Equal(t, co.CloudReportURL, cop.CloudReportURL)
+	assert.Equal(t, co.CloudAPIURL, cop.CloudAPIURL)
+	assert.Equal(t, "", cop.ClusterName) // Not copied to bytes
+
+}
+
+func TestConfigConcurrentSerializationDoesNotMutateSource(t *testing.T) {
+	co := mockConfigObj()
+
+	originalMarshal := configMarshal
+	firstEntered := make(chan struct{})
+	secondEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	var calls int
+	configMarshal = func(v any) ([]byte, error) {
+		calls++
+		switch calls {
+		case 1:
+			close(firstEntered)
+			<-releaseFirst
+		case 2:
+			close(secondEntered)
+			<-releaseSecond
+		}
+		return json.MarshalIndent(v, "", "  ") // #nosec G117 -- test fixture contains no real credential
+	}
+	t.Cleanup(func() { configMarshal = originalMarshal })
+
+	firstResult := make(chan []byte, 1)
+	go func() { firstResult <- co.Config() }()
+	<-firstEntered
+
+	secondResult := make(chan []byte, 1)
+	go func() { secondResult <- co.Config() }()
+	<-secondEntered
+
+	assert.Equal(t, "ddd", co.ClusterName, "serialization must not expose a temporary empty runtime identity")
+
+	close(releaseFirst)
+	firstJSON := <-firstResult
+	close(releaseSecond)
+	secondJSON := <-secondResult
+
+	assert.Equal(t, "ddd", co.ClusterName, "concurrent serialization must not change the source config")
+	for _, data := range [][]byte{firstJSON, secondJSON} {
+		var persisted map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(data, &persisted))
+		assert.NotContains(t, persisted, "clusterName", "clusterName must remain absent from persisted config")
+	}
+}
+
+func TestITenantConfig(t *testing.T) {
+	var lc ITenantConfig
+	var c ITenantConfig
+	lc = mockLocalConfig()
+	c = mockClusterConfig()
+
+	co := mockConfigObj()
+
+	// test LocalConfig methods
+	assert.Equal(t, co.AccountID, lc.GetAccountID())
+	assert.Equal(t, co.ClusterName, lc.GetContextName())
+	assert.Equal(t, co.CloudReportURL, lc.GetCloudReportURL())
+	assert.Equal(t, co.CloudAPIURL, lc.GetCloudAPIURL())
+
+	// test ClusterConfig methods
+	assert.Equal(t, co.AccountID, c.GetAccountID())
+	assert.Equal(t, co.ClusterName, c.GetContextName())
+	assert.Equal(t, co.CloudReportURL, c.GetCloudReportURL())
+	assert.Equal(t, co.CloudAPIURL, c.GetCloudAPIURL())
+}
+
+func TestUpdateConfigData(t *testing.T) {
+	c := mockClusterConfig()
+
+	configMap := &corev1.ConfigMap{}
+
+	c.updateConfigData(configMap)
+
+	assert.Equal(t, c.GetAccountID(), configMap.Data["accountID"])
+	assert.Equal(t, c.GetCloudReportURL(), configMap.Data["cloudReportURL"])
+	assert.Equal(t, c.GetCloudAPIURL(), configMap.Data["cloudAPIURL"])
+}
+
+func TestReadConfig(t *testing.T) {
+	com := mockConfigObj()
+	co := &ConfigObj{}
+
+	b, e := json.Marshal(com) // #nosec G117 -- test fixture; marshals a mock config object
+	assert.NoError(t, e)
+
+	readConfig(b, co)
+
+	assert.Equal(t, com.AccountID, co.AccountID)
+	assert.Equal(t, com.ClusterName, co.ClusterName)
+	assert.Equal(t, com.CloudReportURL, co.CloudReportURL)
+	assert.Equal(t, com.CloudAPIURL, co.CloudAPIURL)
+}
+
+func TestAdoptClusterName(t *testing.T) {
+	tests := []struct {
+		name        string
+		clusterName string
+		want        string
+	}{
+		{
+			name:        "replace 1",
+			clusterName: "my-name__is--ks",
+			want:        "my-name__is-ks",
+		},
+		{
+			name:        "replace 2",
+			clusterName: "my-name1",
+			want:        "my-name1",
+		},
+		{
+			name:        "replace 3",
+			clusterName: "my:name",
+			want:        "my-name",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := AdoptClusterName(tt.clusterName); got != tt.want {
+				t.Errorf("AdoptClusterName() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUpdateCloudURLs(t *testing.T) {
+	co := mockConfigObj()
+	mockCloudAPIURL := "1-2-3-4.com"
+	t.Setenv("KS_CLOUD_API_URL", mockCloudAPIURL)
+
+	assert.NotEqual(t, co.CloudAPIURL, mockCloudAPIURL)
+	updateCloudURLs(co)
+	assert.Equal(t, co.CloudAPIURL, mockCloudAPIURL)
+}
+
+func Test_initializeCloudAPI(t *testing.T) {
+	type args struct {
+		c ITenantConfig
+	}
+	tests := []struct {
+		name string
+		args args
+	}{
+		{
+			name: "test",
+			args: args{
+				c: mockClusterConfig(),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			initializeCloudAPI(tt.args.c)
+			cloud := getter.GetKSCloudAPIConnector()
+			assert.Equal(t, "https://api.domain.com", cloud.GetCloudAPIURL())
+			assert.Equal(t, "https://report.domain.com", cloud.GetCloudReportURL())
+			assert.Equal(t, tt.args.c.GetAccountID(), cloud.GetAccountID())
+		})
+	}
+}
+
+// Test_initializeCloudAPI_backPropagatesURLsFromConnector verifies that when the global
+// connector already has URLs (e.g. set by initializeSaaSEnv via live service discovery)
+// but configObj has no URLs (e.g. no services.json and no KS_CLOUD_REPORT_URL env var),
+// initializeCloudAPI back-propagates the connector URLs into configObj so that
+// setSubmitBehavior can see a non-empty CloudReportURL and allow result submission.
+func Test_initializeCloudAPI_backPropagatesURLsFromConnector(t *testing.T) {
+	// Pre-populate the global connector with URLs (simulating initializeSaaSEnv via API_URL discovery)
+	presetCloud, err := v1.NewKSCloudAPI("https://api.example.com", "https://report.example.com", "test-account", "test-key")
+	require.NoError(t, err)
+	getter.SetKSCloudAPIConnector(presetCloud)
+
+	// Config with empty URLs (simulating no services.json and no KS_CLOUD_REPORT_URL env var)
+	cfg := &ClusterConfig{
+		configObj: &ConfigObj{
+			AccountID:      "test-account",
+			CloudReportURL: "",
+			CloudAPIURL:    "",
+		},
+	}
+
+	initializeCloudAPI(cfg)
+
+	// configObj should now have URLs from the connector
+	assert.Equal(t, "https://report.example.com", cfg.configObj.CloudReportURL)
+	assert.Equal(t, "https://api.example.com", cfg.configObj.CloudAPIURL)
+}
+
+// Test_initializeCloudAPI_identityFollowsEachClustersConfig guards #3773. The
+// connector is a process global, and --kube-contexts scans several clusters in
+// one process, each reaching initializeCloudAPI through NewClusterConfig. Each
+// case starts from the state the previously scanned cluster leaves behind — an
+// onboarded tenant on the connector — and asserts that the next cluster's
+// config fully determines the identity the connector ends up with. An
+// unconfigured cluster (no cached config, no in-cluster secret, no flag or env
+// var) must come out with no identity at all, not the previous tenant's; with
+// --submit that meant its report was filed under the wrong account.
+func Test_initializeCloudAPI_identityFollowsEachClustersConfig(t *testing.T) {
+	tests := []struct {
+		name          string
+		next          *ConfigObj
+		wantAccountID string
+		wantAccessKey string
+	}{
+		{
+			name:          "unconfigured cluster does not inherit the previous tenant",
+			next:          &ConfigObj{},
+			wantAccountID: "",
+			wantAccessKey: "",
+		},
+		{
+			name:          "onboarded cluster replaces the previous tenant outright",
+			next:          &ConfigObj{AccountID: "tenant-BBBB", AccessKey: "key-BBBB"},
+			wantAccountID: "tenant-BBBB",
+			wantAccessKey: "key-BBBB",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prev := getter.GetKSCloudAPIConnector()
+			t.Cleanup(func() { getter.SetKSCloudAPIConnector(prev) })
+
+			// The previously scanned cluster was onboarded and left its tenant
+			// on the global connector.
+			previous, err := v1.NewKSCloudAPI("https://api.example.com", "https://report.example.com", "tenant-AAAA", "key-AAAA")
+			require.NoError(t, err)
+			getter.SetKSCloudAPIConnector(previous)
+
+			initializeCloudAPI(&ClusterConfig{configObj: tt.next})
+
+			got := getter.GetKSCloudAPIConnector()
+			assert.Equal(t, tt.wantAccountID, got.GetAccountID())
+			assert.Equal(t, tt.wantAccessKey, got.GetAccessKey())
+
+			// The URLs are deliberately outside this contract: they name the
+			// backend rather than the tenant, and initializeSaaSEnv seeds them
+			// on the connector before any config exists, so an empty config URL
+			// keeps the connector's rather than clearing it.
+			assert.Equal(t, "https://api.example.com", got.GetCloudAPIURL())
+			assert.Equal(t, "https://report.example.com", got.GetCloudReportURL())
+		})
+	}
+}
+
+func TestGetConfigMapNamespace(t *testing.T) {
+	tests := []struct {
+		name string
+		env  string
+		want string
+	}{
+		{
+			name: "no env",
+			want: kubescapeNamespace,
+		},
+		{
+			name: "default ns",
+			env:  kubescapeNamespace,
+			want: kubescapeNamespace,
+		},
+		{
+			name: "custom ns",
+			env:  "my-ns",
+			want: "my-ns",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Set unconditionally, including the empty "no env" case, so the
+			// subtest does not inherit a value from the caller's environment.
+			t.Setenv(defaultConfigMapNamespaceEnvVar, tt.env)
+			assert.Equalf(t, tt.want, GetConfigMapNamespace(), "GetConfigMapNamespace()")
+		})
+	}
+}
+
+func TestUpdateEmptyFields(t *testing.T) {
+	tests := []struct {
+		name     string
+		current  ConfigObj
+		fallback *ConfigObj
+		want     ConfigObj
+	}{
+		{
+			name: "all empty fields are populated",
+			fallback: &ConfigObj{
+				AccountID:      "fallback-account",
+				ClusterName:    "fallback-cluster",
+				CloudReportURL: "https://fallback-report.example.com",
+				CloudAPIURL:    "https://fallback-api.example.com",
+			},
+			want: ConfigObj{
+				AccountID:      "fallback-account",
+				ClusterName:    "fallback-cluster",
+				CloudReportURL: "https://fallback-report.example.com",
+				CloudAPIURL:    "https://fallback-api.example.com",
+			},
+		},
+		{
+			name: "existing values keep precedence",
+			current: ConfigObj{
+				AccountID:      "cached-account",
+				ClusterName:    "cached-cluster",
+				CloudReportURL: "https://cached-report.example.com",
+				CloudAPIURL:    "https://cached-api.example.com",
+			},
+			fallback: &ConfigObj{
+				AccountID:      "fallback-account",
+				ClusterName:    "fallback-cluster",
+				CloudReportURL: "https://fallback-report.example.com",
+				CloudAPIURL:    "https://fallback-api.example.com",
+			},
+			want: ConfigObj{
+				AccountID:      "cached-account",
+				ClusterName:    "cached-cluster",
+				CloudReportURL: "https://cached-report.example.com",
+				CloudAPIURL:    "https://cached-api.example.com",
+			},
+		},
+		{
+			name: "only empty fields are populated",
+			current: ConfigObj{
+				AccountID:   "cached-account",
+				CloudAPIURL: "https://cached-api.example.com",
+			},
+			fallback: &ConfigObj{
+				AccountID:      "fallback-account",
+				ClusterName:    "fallback-cluster",
+				CloudReportURL: "https://fallback-report.example.com",
+				CloudAPIURL:    "https://fallback-api.example.com",
+			},
+			want: ConfigObj{
+				AccountID:      "cached-account",
+				ClusterName:    "fallback-cluster",
+				CloudReportURL: "https://fallback-report.example.com",
+				CloudAPIURL:    "https://cached-api.example.com",
+			},
+		},
+		{
+			name:     "empty fallback leaves current values unchanged",
+			current:  ConfigObj{AccountID: "cached-account", ClusterName: "cached-cluster"},
+			fallback: &ConfigObj{},
+			want:     ConfigObj{AccountID: "cached-account", ClusterName: "cached-cluster"},
+		},
+		{
+			name:     "nil fallback leaves current values unchanged",
+			current:  ConfigObj{AccountID: "cached-account", CloudAPIURL: "https://cached-api.example.com"},
+			fallback: nil,
+			want:     ConfigObj{AccountID: "cached-account", CloudAPIURL: "https://cached-api.example.com"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			current := test.current
+			require.NoError(t, current.updateEmptyFields(test.fallback))
+			assert.Equal(t, test.want, current)
+		})
+	}
+}
+
+func TestUpdateCredentials_FlagTakesPrecedenceOverEnv(t *testing.T) {
+	// Regression test: explicit flag values must not be overwritten by env vars.
+	t.Setenv(accountIdEnvVar, "env-account-id")
+	t.Setenv(accessKeyEnvVar, "env-access-key")
+
+	configObj := &ConfigObj{}
+	updateCredentials(configObj, "flag-account-id", "flag-access-key")
+
+	if configObj.AccountID != "flag-account-id" {
+		t.Errorf("expected AccountID=flag-account-id, got %s", configObj.AccountID)
+	}
+	if configObj.AccessKey != "flag-access-key" {
+		t.Errorf("expected AccessKey=flag-access-key, got %s", configObj.AccessKey)
+	}
+}
+
+func TestUpdateCredentials_EnvAppliedWhenNoFlag(t *testing.T) {
+	// Env vars should apply as fallback when no flag value is provided.
+	t.Setenv(accountIdEnvVar, "env-account-id")
+	t.Setenv(accessKeyEnvVar, "env-access-key")
+
+	configObj := &ConfigObj{}
+	updateCredentials(configObj, "", "")
+
+	if configObj.AccountID != "env-account-id" {
+		t.Errorf("expected AccountID=env-account-id, got %s", configObj.AccountID)
+	}
+	if configObj.AccessKey != "env-access-key" {
+		t.Errorf("expected AccessKey=env-access-key, got %s", configObj.AccessKey)
+	}
+}
+
+func TestUpdateConfigFile_RoundTrip(t *testing.T) {
+	// Basic smoke test: writing twice (first write creates the directory/file,
+	// second write exercises the "pre-existing directory" chmod path) must
+	// round-trip the config correctly under normal conditions.
+	originalStore := getter.DefaultLocalStore
+	getter.DefaultLocalStore = t.TempDir()
+	defer func() { getter.DefaultLocalStore = originalStore }()
+
+	configObj := mockConfigObj()
+
+	require.NoError(t, updateConfigFile(configObj))
+	require.NoError(t, updateConfigFile(configObj))
+
+	dat, err := os.ReadFile(ConfigFileFullPath())
+	require.NoError(t, err)
+
+	readBack := &ConfigObj{}
+	require.NoError(t, json.Unmarshal(dat, readBack))
+	assert.Equal(t, configObj.AccountID, readBack.AccountID)
+}
+
+func TestUpdateConfigFile_ClusterNameStripped(t *testing.T) {
+	originalStore := getter.DefaultLocalStore
+	getter.DefaultLocalStore = t.TempDir()
+	defer func() { getter.DefaultLocalStore = originalStore }()
+
+	configObj := mockConfigObj()
+	require.NoError(t, updateConfigFile(configObj))
+
+	dat, err := os.ReadFile(ConfigFileFullPath())
+	require.NoError(t, err)
+	require.NotEmpty(t, dat, "config file must not be empty after write")
+
+	var raw map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(dat, &raw))
+	_, present := raw["clusterName"]
+	assert.False(t, present, "clusterName key must be absent from the persisted JSON, not merely empty")
+	assert.Contains(t, raw, "accountID", "accountID must be present in the persisted JSON")
+	assert.Equal(t, "ddd", configObj.ClusterName, "ClusterName must be restored on the in-memory object after write")
+}
+
+func TestUpdateConfigFile_PropagatesMarshalError(t *testing.T) {
+	originalStore := getter.DefaultLocalStore
+	getter.DefaultLocalStore = t.TempDir()
+	defer func() { getter.DefaultLocalStore = originalStore }()
+
+	origMarshal := configMarshal
+	sentinel := errors.New("injected marshal failure")
+	configMarshal = func(any) ([]byte, error) { return nil, sentinel }
+	defer func() { configMarshal = origMarshal }()
+
+	err := updateConfigFile(mockConfigObj())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, sentinel)
+}
+
+// TestNewLocalConfig_LogsOnMalformedCachedConfigFile guards against a
+// regression where a malformed cached config file (~/.kubescape/config.json)
+// caused loadConfigFromFile to return an error that NewLocalConfig discarded
+// completely - config loading silently fell back to defaults with no trace
+// anywhere that the cache was broken, which is confusing to debug ("why
+// isn't my configured account being picked up?").
+func TestNewLocalConfig_LogsOnMalformedCachedConfigFile(t *testing.T) {
+	originalStore := getter.DefaultLocalStore
+	getter.DefaultLocalStore = t.TempDir()
+	defer func() { getter.DefaultLocalStore = originalStore }()
+
+	require.NoError(t, os.MkdirAll(getter.DefaultLocalStore, 0o700))
+	require.NoError(t, os.WriteFile(ConfigFileFullPath(), []byte("not valid json"), 0o600))
+
+	originalLevel := logger.L().GetLevel()
+	require.NoError(t, logger.L().SetLevel(helpers.DebugLevel.String()))
+	defer func() { _ = logger.L().SetLevel(originalLevel) }()
+
+	originalWriter := logger.L().GetWriter()
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	logger.L().SetWriter(w)
+
+	NewLocalConfig("", "", "", "")
+
+	require.NoError(t, w.Close())
+	logger.L().SetWriter(originalWriter)
+	out, err := io.ReadAll(r)
+	require.NoError(t, err)
+
+	assert.Contains(t, string(out), "failed to load cached config file")
+}
+
+func TestUpdateConfigFile_ToleratesDirectoryChmodFailure(t *testing.T) {
+	// Regression test for https://github.com/kubescape/kubescape/issues/2555:
+	// on some mounted volumes (e.g. an emptyDir mounted as a non-root user)
+	// os.Chmod on an already-correctly-permissioned directory can fail even
+	// though the directory is perfectly usable. That must not abort
+	// persisting the config. A real filesystem can't reliably be made to
+	// reject a chmod from its owning user (which is what tests run as), so
+	// the failure is forced via the package-level `chmod` seam instead.
+	originalStore := getter.DefaultLocalStore
+	getter.DefaultLocalStore = t.TempDir()
+	defer func() { getter.DefaultLocalStore = originalStore }()
+
+	origChmod := chmod
+	chmod = func(string, os.FileMode) error { return os.ErrPermission }
+	defer func() { chmod = origChmod }()
+
+	configObj := mockConfigObj()
+
+	require.NoError(t, updateConfigFile(configObj))
+
+	dat, err := os.ReadFile(ConfigFileFullPath())
+	require.NoError(t, err)
+
+	readBack := &ConfigObj{}
+	require.NoError(t, json.Unmarshal(dat, readBack))
+	assert.Equal(t, configObj.AccountID, readBack.AccountID)
+}

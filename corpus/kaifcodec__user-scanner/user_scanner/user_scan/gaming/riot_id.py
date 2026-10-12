@@ -1,0 +1,49 @@
+from urllib.parse import quote
+
+from user_scanner.core.orchestrator import generic_validate
+from user_scanner.core.result import Result
+
+
+def validate_riot_id(user: str) -> Result:
+    """Check if a Riot ID (Name#Tag) is registered across Riot Games titles."""
+    show_url = "https://www.riotid-lookup.com"
+
+    user = user.strip()
+    if user.count("#") != 1:
+        return Result.error("Riot ID format required: Name#Tag (e.g. TenZ#00005)")
+
+    name, tag = user.split("#")
+    if not name or not tag:
+        return Result.error("Both name and tag are required (e.g. TenZ#00005)")
+
+    if not (3 <= len(tag) <= 5):
+        return Result.error("Tag must be 3-5 characters")
+
+    url = f"https://www.riotid-lookup.com/api/lookup?riotId={quote(user, safe='')}"
+
+    def process(response):
+        if response.status_code == 200:
+            try:
+                data = response.json()
+            except ValueError:
+                return Result.error("Unexpected response body from the lookup API")
+
+            taken = data.get("isTaken") if isinstance(data, dict) else None
+            if not isinstance(taken, bool):
+                return Result.error("Lookup API did not report a verdict")
+
+            return Result.taken() if taken else Result.available()
+
+        if response.status_code == 400:
+            return Result.error("Invalid Riot ID format")
+
+        return Result.error(f"HTTP {response.status_code}")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
+    }
+
+    return generic_validate(url, process, show_url=show_url, headers=headers)

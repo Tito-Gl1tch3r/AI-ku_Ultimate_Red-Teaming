@@ -1,0 +1,186 @@
+import 'dart:async';
+
+import 'package:drift3_preview/drift.dart';
+import 'package:mockito/mockito.dart';
+import 'package:test/test.dart';
+
+QueryResult queryResult(
+  List<Map<String, Object?>>? rows, {
+  int? affectedRows,
+  int? lastInsertRowId,
+}) {
+  return QueryResult(
+    resultSet: switch (rows) {
+      null => null,
+      _ => RawResultSet.fromRows(
+        rows: [for (final row in rows) row.values.toList()],
+        columnNames: rows.isEmpty ? const [] : rows[0].keys.toList(),
+      ),
+    },
+    affectedRows: affectedRows,
+    lastInsertRowId: lastInsertRowId,
+  );
+}
+
+final class MockSession extends Mock
+    implements
+        DriftSession,
+        PersistentSchemaVersion,
+        DriftTransactionParent,
+        DriftTransactionSession,
+        DriftSessionWithInternalLocks {
+  late final MockSession transactions = MockSession(isTransaction: true);
+  late final MockSession exclusiveExecutor = this;
+
+  var open = true;
+  final Completer<void> closedCompleter = Completer();
+
+  MockSession({bool isTransaction = false}) {
+    when(persistentSchemaVersion).thenReturn(this);
+    when(transaction).thenReturn(isTransaction ? this : null);
+    when(transactionParent).thenReturn(this);
+    when(locks).thenReturn(this);
+
+    when(execute(any)).thenAnswer((i) async {
+      assert(open);
+      final statement = i.positionalArguments[0] as StatementInfo;
+      if (statement.needsResultSet) {
+        return QueryResult(
+          resultSet: RawResultSet.fromRows(
+            columnNames: const [],
+            rows: const [],
+          ),
+          affectedRows: 0,
+          lastInsertRowId: 0,
+        );
+      } else {
+        return QueryResult(
+          resultSet: null,
+          affectedRows: 0,
+          lastInsertRowId: 0,
+        );
+      }
+    });
+    when(executeBatch(any)).thenAnswer((i) async {
+      assert(open);
+      return const [];
+    });
+    when(close()).thenAnswer((_) async {
+      assert(open);
+
+      open = false;
+      closedCompleter.complete();
+    });
+    when(closed).thenAnswer((_) => closedCompleter.future);
+    when(isClosed).thenAnswer((_) => !open);
+
+    when(schemaVersion).thenAnswer((i) async {
+      assert(open);
+      return 0;
+    });
+    when(writeSchemaVersion(any)).thenAnswer((i) async {
+      assert(open);
+    });
+    when(exclusive()).thenAnswer((i) async {
+      assert(open);
+      return exclusiveExecutor;
+    });
+    when(begin(any)).thenAnswer((i) async {
+      assert(open);
+      return transactions;
+    });
+
+    when(commit()).thenAnswer((_) async {
+      closedCompleter.complete();
+    });
+    when(rollback()).thenAnswer((_) async {
+      closedCompleter.complete();
+    });
+  }
+
+  @override
+  PersistentSchemaVersion? get persistentSchemaVersion =>
+      _nsm(Invocation.getter(#persistentSchemaVersion), this);
+
+  @override
+  DriftTransactionSession? get transaction =>
+      _nsm(Invocation.getter(#transaction), this);
+
+  @override
+  DriftTransactionParent? get transactionParent =>
+      _nsm(Invocation.getter(#transactionParent), this);
+
+  @override
+  DriftSessionWithInternalLocks? get locks =>
+      _nsm(Invocation.getter(#locks), this);
+
+  @override
+  Future<QueryResult> execute(StatementInfo? statement) => _nsm(
+    Invocation.method(#execute, [statement]),
+    Future.value(QueryResult(resultSet: null)),
+  );
+
+  @override
+  Future<List<QueryResult>> executeBatch(StatementBatch? statement) => _nsm(
+    Invocation.method(#executeBatch, [statement]),
+    Future.value(const <QueryResult>[]),
+  );
+
+  @override
+  Future<void> close() =>
+      _nsm(Invocation.method(#close, []), Future<void>.value());
+
+  @override
+  Future<void> get closed =>
+      _nsm(Invocation.getter(#closed), Future<void>.value());
+
+  @override
+  bool get isClosed => _nsm(Invocation.getter(#isClosed), false);
+
+  @override
+  Future<int> get schemaVersion =>
+      _nsm(Invocation.getter(#schemaVersion), Future.value(0));
+
+  @override
+  Future<void> writeSchemaVersion(int? version) => _nsm(
+    Invocation.method(#writeSchemaVersion, [version]),
+    Future<void>.value(),
+  );
+
+  @override
+  Future<DriftSession> exclusive() =>
+      _nsm(Invocation.method(#exclusive, []), _neverComplete<DriftSession>());
+
+  @override
+  Future<DriftSession> begin(TransactionOptions? options) => _nsm(
+    Invocation.method(#begin, [options]),
+    _neverComplete<DriftSession>(),
+  );
+
+  @override
+  Future<void> commit() {
+    return _nsm(Invocation.method(#commit, []), Future.value(null));
+  }
+
+  @override
+  Future<void> rollback() =>
+      _nsm(Invocation.method(#rollback, []), Future.value(null));
+
+  /// Utility for asserting that a given SQL statement was executed.
+  Future<QueryResult> executeSql(Object? sql, [Object? variables = isEmpty]) =>
+      execute(
+        argThat(
+          isA<StatementInfo>()
+              .having((e) => e.sql, 'sql', sql)
+              .having((e) => e.variables, 'variables', variables),
+        ),
+      );
+
+  static Future<T> _neverComplete<T>() => Completer<T>().future;
+}
+
+extension on Mock {
+  T _nsm<T>(Invocation invocation, Object? returnValue) {
+    return noSuchMethod(invocation, returnValue: returnValue) as T;
+  }
+}

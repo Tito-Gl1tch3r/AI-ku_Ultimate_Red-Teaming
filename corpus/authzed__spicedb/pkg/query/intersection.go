@@ -1,0 +1,519 @@
+package query
+
+import (
+	"fmt"
+	"io"
+
+	"github.com/authzed/spicedb/internal/caveats"
+	"github.com/authzed/spicedb/pkg/genutil/mapz"
+	"github.com/authzed/spicedb/pkg/tuple"
+)
+
+func init() {
+	MustRegisterIterator(IteratorSpec{
+		Type: IntersectionIteratorType,
+		Name: "Intersection",
+		ConstructWithArgs: func(_ *IteratorArgs, subs []Iterator, key CanonicalKey) (Iterator, error) {
+			it := NewIntersectionIterator(subs...)
+			// NewIntersectionIterator returns a FixedIterator when subs is empty.
+			switch v := it.(type) {
+			case *IntersectionIterator:
+				v.canonicalKey = key
+			case *FixedIterator:
+				// This stands in for the fixed, so the canonical key is correct.
+				v.canonicalKey = key
+			}
+			return it, nil
+		},
+		Deserialize: deserializeIntersection,
+	})
+}
+
+// IntersectionIterator the set of paths that are in all of underlying subiterators.
+// This is equivalent to `permission foo = bar & baz`
+type IntersectionIterator struct {
+	subIts       []Iterator
+	canonicalKey CanonicalKey
+}
+
+var _ Iterator = &IntersectionIterator{}
+
+func NewIntersectionIterator(subiterators ...Iterator) Iterator {
+	if len(subiterators) == 0 {
+		return NewEmptyFixedIterator() // Return empty FixedIterator instead of empty Intersection
+	}
+	return &IntersectionIterator{
+		subIts: subiterators,
+	}
+}
+
+func (i *IntersectionIterator) CheckImpl(ctx *Context, resource Object, subject ObjectAndRelation) (*Path, error) {
+	if ctx.shouldTrace() {
+		ctx.TraceStep(i, "processing %d sub-iterators for resource %s:%s", len(i.subIts), resource.ObjectType, resource.ObjectID)
+	}
+
+	var result *Path
+	for iterIdx, it := range i.subIts {
+		if ctx.shouldTrace() {
+			ctx.TraceStep(i, "processing sub-iterator %d", iterIdx)
+		}
+
+		path, err := ctx.Check(it, resource, subject)
+		if err != nil {
+			return nil, err
+		}
+
+		if path == nil {
+			if ctx.shouldTrace() {
+				ctx.TraceStep(i, "sub-iterator %d returned nil, short-circuiting", iterIdx)
+			}
+			return nil, nil
+		}
+
+		result, err = result.MergeAnd(path)
+		if err != nil {
+			return nil, err
+		}
+
+		if ctx.shouldTrace() {
+			ctx.TraceStep(i, "sub-iterator %d matched", iterIdx)
+		}
+	}
+
+	return result, nil
+}
+
+func (i *IntersectionIterator) IterSubjectsImpl(ctx *Context, resource Object, filterSubjectType ObjectType) (PathSeq, error) {
+	if ctx.shouldTrace() {
+		ctx.TraceStep(i, "iterating subjects for resource %s:%s from %d sub-iterators", resource.ObjectType, resource.ObjectID, len(i.subIts))
+	}
+
+	// Track concrete paths by subject key and a separate wildcard path.
+	// A wildcard (subject ID = "*") acts as a universal set that intersects with any concrete subject.
+	pathsByKey := make(map[string]*Path)
+	var wildcardPath *Path
+
+	for iterIdx, it := range i.subIts {
+		if ctx.shouldTrace() {
+			ctx.TraceStep(i, "processing sub-iterator %d", iterIdx)
+		}
+
+		pathSeq, err := ctx.IterSubjects(it, resource, filterSubjectType)
+		if err != nil {
+			return nil, err
+		}
+		paths, err := CollectAll(pathSeq)
+		if err != nil {
+			return nil, err
+		}
+
+		if ctx.shouldTrace() {
+			ctx.TraceStep(i, "sub-iterator %d returned %d paths", iterIdx, len(paths))
+		}
+
+		if len(paths) == 0 {
+			if ctx.shouldTrace() {
+				ctx.TraceStep(i, "sub-iterator %d returned empty, short-circuiting", iterIdx)
+			}
+			return EmptyPathSeq(), nil
+		}
+
+		// Separate wildcard from concrete paths in this iterator's results.
+		var currentWildcard *Path
+		currentIterPaths := make(map[string]*Path)
+		for _, path := range paths {
+			if path.Subject.ObjectID == tuple.PublicWildcard {
+				if currentWildcard == nil {
+					wc := *path
+					currentWildcard = &wc
+				} else {
+					if _, err := currentWildcard.MergeOr(path); err != nil {
+						return nil, err
+					}
+				}
+				continue
+			}
+
+			key := ObjectAndRelationKey(path.Subject)
+			if existing, exists := currentIterPaths[key]; !exists {
+				pathCopy := *path
+				currentIterPaths[key] = &pathCopy
+			} else {
+				if _, err := existing.MergeOr(path); err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		if iterIdx == 0 {
+			pathsByKey = currentIterPaths
+			wildcardPath = currentWildcard
+		} else {
+			pathsByKey, wildcardPath, err = intersectSubjectSets(pathsByKey, wildcardPath, currentIterPaths, currentWildcard)
+			if err != nil {
+				return nil, err
+			}
+
+			if len(pathsByKey) == 0 && wildcardPath == nil {
+				return EmptyPathSeq(), nil
+			}
+		}
+	}
+
+	return func(yield func(*Path, error) bool) {
+		if wildcardPath != nil {
+			if !yield(wildcardPath, nil) {
+				return
+			}
+		}
+		for _, path := range pathsByKey {
+			if !yield(path, nil) {
+				return
+			}
+		}
+	}, nil
+}
+
+// intersectSubjectSets performs a wildcard-aware intersection of two subject sets.
+// A wildcard (subject ID = "*") acts as a universal: it matches all concrete subjects.
+//
+// The intersection rules are:
+//   - Concrete ∩ concrete: keep subjects present in both (caveats AND'd)
+//   - Concrete ∩ wildcard: keep the concrete subject (wildcard's caveat AND'd in)
+//   - Wildcard ∩ wildcard: keep wildcard (caveats AND'd)
+func intersectSubjectSets(
+	prevConcrete map[string]*Path, prevWildcard *Path,
+	currConcrete map[string]*Path, currWildcard *Path,
+) (map[string]*Path, *Path, error) {
+	result := make(map[string]*Path)
+
+	// Concrete subjects that exist in both sides.
+	for key, currPath := range currConcrete {
+		if prevPath, exists := prevConcrete[key]; exists {
+			merged := *prevPath
+			if _, err := merged.MergeAnd(currPath); err != nil {
+				return nil, nil, err
+			}
+			result[key] = &merged
+		}
+	}
+
+	// Concrete subjects in prev matched by curr's wildcard.
+	if currWildcard != nil {
+		excluded := excludedSubjectMap(currWildcard)
+		for key, prevPath := range prevConcrete {
+			if _, exists := result[key]; exists {
+				continue // already handled by concrete ∩ concrete
+			}
+			synth := *prevPath
+			synth.Caveat = caveats.And(prevPath.Caveat, currWildcard.Caveat)
+			// If the wildcard explicitly excludes this concrete subject
+			// (e.g. `viewer:* - banned`), apply that exclusion instead of
+			// admitting the subject unconditionally: drop it when the exclusion
+			// is absolute, or condition it on the negated exclusion caveat.
+			if excludedPath, found := excluded[key]; found {
+				if _, shouldInclude := combineExclusionCaveats(&synth, excludedPath); !shouldInclude {
+					continue
+				}
+			}
+			result[key] = &synth
+		}
+	}
+
+	// Concrete subjects in curr matched by prev's wildcard.
+	if prevWildcard != nil {
+		excluded := excludedSubjectMap(prevWildcard)
+		for key, currPath := range currConcrete {
+			if _, exists := result[key]; exists {
+				continue // already handled above
+			}
+			synth := *currPath
+			synth.Caveat = caveats.And(currPath.Caveat, prevWildcard.Caveat)
+			if excludedPath, found := excluded[key]; found {
+				if _, shouldInclude := combineExclusionCaveats(&synth, excludedPath); !shouldInclude {
+					continue
+				}
+			}
+			result[key] = &synth
+		}
+	}
+
+	// Wildcard ∩ wildcard → wildcard with AND'd caveats and unioned exclusions.
+	// (* - E1) ∩ (* - E2) = * - (E1 ∪ E2): a subject excluded from either side is
+	// excluded from the intersection.
+	var resultWildcard *Path
+	if prevWildcard != nil && currWildcard != nil {
+		wc := *prevWildcard
+		wc.Caveat = caveats.And(prevWildcard.Caveat, currWildcard.Caveat)
+		wc.ExcludedSubjects = unionExcludedSubjects(prevWildcard.ExcludedSubjects, currWildcard.ExcludedSubjects)
+		resultWildcard = &wc
+	}
+
+	return result, resultWildcard, nil
+}
+
+// excludedSubjectMap indexes a wildcard path's ExcludedSubjects by subject key for
+// O(1) lookup. A concrete subject present here was explicitly excluded from the
+// wildcard (e.g. `viewer:* - banned`), so it must not be re-admitted when the
+// wildcard is intersected with a concrete set on the other side.
+func excludedSubjectMap(wildcard *Path) map[string]*Path {
+	if wildcard == nil || len(wildcard.ExcludedSubjects) == 0 {
+		return nil
+	}
+	m := make(map[string]*Path, len(wildcard.ExcludedSubjects))
+	for _, excluded := range wildcard.ExcludedSubjects {
+		m[ObjectAndRelationKey(excluded.Subject)] = excluded
+	}
+	return m
+}
+
+// unionExcludedSubjects merges the ExcludedSubjects of two intersected wildcards.
+// Because (* - E1) ∩ (* - E2) = * - (E1 ∪ E2), a subject excluded from either side
+// is excluded from the result. When the same subject is excluded by both sides
+// under caveats, the exclusion applies if either condition holds, so the caveats
+// are OR'd; an unconditional (nil-caveat) exclusion on either side dominates.
+func unionExcludedSubjects(a, b []*Path) []*Path {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	merged := make(map[string]*Path, len(a)+len(b))
+	order := make([]string, 0, len(a)+len(b))
+	add := func(p *Path) {
+		key := ObjectAndRelationKey(p.Subject)
+		if existing, ok := merged[key]; ok {
+			if existing.Caveat == nil || p.Caveat == nil {
+				existing.Caveat = nil // unconditional exclusion dominates
+			} else {
+				existing.Caveat = caveats.Or(existing.Caveat, p.Caveat)
+			}
+			return
+		}
+		cp := *p
+		merged[key] = &cp
+		order = append(order, key)
+	}
+	for _, p := range a {
+		add(p)
+	}
+	for _, p := range b {
+		add(p)
+	}
+	result := make([]*Path, 0, len(order))
+	for _, key := range order {
+		result = append(result, merged[key])
+	}
+	return result
+}
+
+func (i *IntersectionIterator) IterResourcesImpl(ctx *Context, subject ObjectAndRelation, filterResourceType ObjectType) (PathSeq, error) {
+	if ctx.shouldTrace() {
+		ctx.TraceStep(i, "iterating resources for subject %s:%s from %d sub-iterators", subject.ObjectType, subject.ObjectID, len(i.subIts))
+	}
+
+	// Track paths by resource key for combining with AND logic
+	pathsByKey := make(map[string]*Path)
+
+	for iterIdx, it := range i.subIts {
+		if ctx.shouldTrace() {
+			ctx.TraceStep(i, "processing sub-iterator %d", iterIdx)
+		}
+
+		pathSeq, err := ctx.IterResources(it, subject, filterResourceType)
+		if err != nil {
+			return nil, err
+		}
+		paths, err := CollectAll(pathSeq)
+		if err != nil {
+			return nil, err
+		}
+
+		if ctx.shouldTrace() {
+			ctx.TraceStep(i, "sub-iterator %d returned %d paths", iterIdx, len(paths))
+		}
+
+		if len(paths) == 0 {
+			if ctx.shouldTrace() {
+				ctx.TraceStep(i, "sub-iterator %d returned empty, short-circuiting", iterIdx)
+			}
+			return EmptyPathSeq(), nil
+		}
+
+		if iterIdx == 0 {
+			// First iterator - initialize pathsByKey using resource-based keys
+			for _, path := range paths {
+				key := path.Resource.Key()
+				if existing, exists := pathsByKey[key]; !exists {
+					pathCopy := *path
+					pathsByKey[key] = &pathCopy
+				} else {
+					// Only merge paths with matching subjects
+					if !GetObject(existing.Subject).Equals(GetObject(path.Subject)) {
+						// Keep the first one, skip others with different subjects
+						continue
+					}
+
+					// If multiple paths for same resource in first iterator, merge with OR (mutates existing)
+					if _, err := existing.MergeOr(path); err != nil {
+						return nil, err
+					}
+				}
+			}
+		} else {
+			// Subsequent iterators - intersect based on resources and combine caveats
+			newPathsByKey := make(map[string]*Path)
+
+			// First collect all paths from this iterator by resource
+			currentIterPaths := make(map[string]*Path)
+			for _, path := range paths {
+				key := path.Resource.Key()
+				if existing, exists := currentIterPaths[key]; !exists {
+					pathCopy := *path
+					currentIterPaths[key] = &pathCopy
+				} else {
+					// Only merge paths with matching subjects
+					if !GetObject(existing.Subject).Equals(GetObject(path.Subject)) {
+						// Keep the first one, skip others with different subjects
+						continue
+					}
+
+					// Multiple paths for same resource in current iterator, merge with OR (mutates existing)
+					if _, err := existing.MergeOr(path); err != nil {
+						return nil, err
+					}
+				}
+			}
+
+			// Now intersect: only keep subjects that exist in both previous and current
+			for key, currentPath := range currentIterPaths {
+				if existing, exists := pathsByKey[key]; exists {
+					// Only merge paths with matching subjects
+					// Paths with different subjects can't be combined with AND logic
+					if !GetObject(existing.Subject).Equals(GetObject(currentPath.Subject)) {
+						// Subjects don't match - skip this resource
+						continue
+					}
+
+					// Combine using intersection logic (AND) (mutates existing)
+					if _, err := existing.MergeAnd(currentPath); err != nil {
+						return nil, err
+					}
+					newPathsByKey[key] = existing
+				}
+				// If resource not in previous results, it's filtered out (intersection)
+			}
+			pathsByKey = newPathsByKey
+
+			if len(pathsByKey) == 0 {
+				return EmptyPathSeq(), nil
+			}
+		}
+	}
+
+	return func(yield func(*Path, error) bool) {
+		for _, path := range pathsByKey {
+			if !yield(path, nil) {
+				return
+			}
+		}
+	}, nil
+}
+
+func (i *IntersectionIterator) Clone() Iterator {
+	cloned := &IntersectionIterator{
+		canonicalKey: i.canonicalKey,
+		subIts:       make([]Iterator, len(i.subIts)),
+	}
+	for idx, subIt := range i.subIts {
+		cloned.subIts[idx] = subIt.Clone()
+	}
+	return cloned
+}
+
+func (i *IntersectionIterator) Explain() Explain {
+	subs := make([]Explain, len(i.subIts))
+	for i, it := range i.subIts {
+		subs[i] = it.Explain()
+	}
+	return Explain{
+		Name:       "Intersection",
+		Info:       "Intersection",
+		SubExplain: subs,
+	}
+}
+
+func (i *IntersectionIterator) Subiterators() []Iterator {
+	return i.subIts
+}
+
+func (i *IntersectionIterator) ReplaceSubiterators(newSubs []Iterator) (Iterator, error) {
+	return &IntersectionIterator{canonicalKey: i.canonicalKey, subIts: newSubs}, nil
+}
+
+func (i *IntersectionIterator) CanonicalKey() CanonicalKey {
+	return i.canonicalKey
+}
+
+func (i *IntersectionIterator) ResourceType() ([]ObjectType, error) {
+	if len(i.subIts) == 0 {
+		return []ObjectType{}, nil
+	}
+
+	// For intersection, return types that are common to all sub-iterators
+	// Start with types from the first iterator
+	firstTypes, err := i.subIts[0].ResourceType()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(i.subIts) == 1 {
+		return firstTypes, nil
+	}
+
+	// Build a set of types that appear in ALL sub-iterators
+	result := mapz.NewSet(firstTypes...)
+
+	// Intersect with each subsequent iterator's types
+	for _, subIt := range i.subIts[1:] {
+		subTypes, err := subIt.ResourceType()
+		if err != nil {
+			return nil, err
+		}
+
+		subSet := mapz.NewSet(subTypes...)
+		result = result.Intersect(subSet)
+	}
+
+	return result.AsSlice(), nil
+}
+
+func (i *IntersectionIterator) SubjectTypes() ([]ObjectType, error) {
+	return collectAndDeduplicateSubjectTypes(i.subIts)
+}
+
+func (i *IntersectionIterator) Serialize(w io.Writer) error {
+	return SerializeWithHeader(w, IntersectionIteratorType, i.canonicalKey, func(buf io.Writer) error {
+		if err := writeUvarint(buf, 0); err != nil {
+			return err
+		}
+		return writeSubs(buf, i.subIts)
+	})
+}
+
+func deserializeIntersection(body io.Reader, key CanonicalKey, dctx *DeserializeContext) (Iterator, error) {
+	br := asByteReader(body)
+	if _, err := readUvarint(br); err != nil {
+		return nil, fmt.Errorf("intersection flags: %w", err)
+	}
+	subs, err := readSubs(br, dctx)
+	if err != nil {
+		return nil, err
+	}
+	it := NewIntersectionIterator(subs...)
+	switch v := it.(type) {
+	case *IntersectionIterator:
+		v.canonicalKey = key
+	case *FixedIterator:
+		v.canonicalKey = key
+	}
+	return it, nil
+}

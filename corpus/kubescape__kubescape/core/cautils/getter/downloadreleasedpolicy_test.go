@@ -1,0 +1,285 @@
+package getter
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	jsoniter "github.com/json-iterator/go"
+	"github.com/kubescape/kubescape/v4/internal/testutils"
+	"github.com/kubescape/regolibrary/v2/gitregostore"
+	"github.com/stretchr/testify/require"
+)
+
+func TestReleasedPolicy(t *testing.T) {
+	t.Parallel()
+
+	p := NewDownloadReleasedPolicy()
+
+	t.Run("should initialize objects", func(t *testing.T) {
+		t.Parallel()
+
+		// acquire from github or from local fixture
+		hydrateReleasedPolicyFromMock(t, p)
+
+		require.NoError(t, p.SetRegoObjects())
+
+		t.Run("with ListControls", func(t *testing.T) {
+			t.Parallel()
+
+			controlIDs, err := p.ListControls()
+			require.NoError(t, err)
+			require.NotEmpty(t, controlIDs)
+
+			sampleSize := int(min(int64(len(controlIDs)), 10))
+
+			for _, toPin := range controlIDs[:sampleSize] {
+				// Example of a returned "ID": `C-0154|Ensure_that_the_--client-cert-auth_argument_is_set_to_true|`
+				controlString := toPin
+				parts := strings.Split(controlString, "|")
+				controlID := parts[0]
+
+				t.Run(fmt.Sprintf("with GetControl(%q)", controlID), func(t *testing.T) {
+					t.Parallel()
+
+					ctrl, err := p.GetControl(controlID)
+					require.NoError(t, err)
+					require.NotEmpty(t, ctrl)
+					require.Equal(t, controlID, ctrl.ControlID)
+				})
+			}
+
+			t.Run("with unknown GetControl()", func(t *testing.T) {
+				t.Parallel()
+
+				ctrl, err := p.GetControl("zork")
+				require.Error(t, err)
+				require.Nil(t, ctrl)
+			})
+		})
+
+		t.Run("with GetFrameworks", func(t *testing.T) {
+			t.Parallel()
+
+			frameworks, err := p.GetFrameworks()
+			require.NoError(t, err)
+			require.NotEmpty(t, frameworks)
+
+			for _, toPin := range frameworks {
+				framework := toPin
+				require.NotEmpty(t, framework)
+				require.NotEmpty(t, framework.Name)
+
+				t.Run(fmt.Sprintf("with GetFramework(%q)", framework.Name), func(t *testing.T) {
+					t.Parallel()
+
+					fw, err := p.GetFramework(framework.Name)
+					require.NoError(t, err)
+					require.NotNil(t, fw)
+
+					require.EqualValues(t, framework, *fw)
+				})
+			}
+
+			t.Run("with unknown GetFramework()", func(t *testing.T) {
+				t.Parallel()
+
+				ctrl, err := p.GetFramework("zork")
+				require.Error(t, err)
+				require.Nil(t, ctrl)
+			})
+
+			t.Run("with ListFrameworks", func(t *testing.T) {
+				t.Parallel()
+
+				frameworkIDs, err := p.ListFrameworks()
+				require.NoError(t, err)
+				require.NotEmpty(t, frameworkIDs)
+
+				require.Len(t, frameworkIDs, len(frameworks))
+			})
+
+		})
+
+		t.Run("with GetControlsInput", func(t *testing.T) {
+			t.Parallel()
+
+			controlInputs, err := p.GetControlsInputs(context.TODO(), "") // NOTE: cluster name currently unused
+			require.NoError(t, err)
+			require.NotEmpty(t, controlInputs)
+		})
+
+		t.Run("with GetAttackTracks", func(t *testing.T) {
+			t.Parallel()
+
+			attackTracks, err := p.GetAttackTracks()
+			require.NoError(t, err)
+			require.NotEmpty(t, attackTracks)
+		})
+
+		t.Run("with GetExceptions", func(t *testing.T) {
+			t.Parallel()
+
+			exceptions, err := p.GetExceptions(context.TODO(), "") // NOTE: cluster name currently unused
+			require.NoError(t, err)
+			require.NotEmpty(t, exceptions)
+		})
+	})
+}
+
+func hydrateReleasedPolicyFromMock(t testing.TB, p *DownloadReleasedPolicy) {
+	regoFile := testRegoFile("policy")
+
+	if _, err := os.Stat(regoFile); errors.Is(err, fs.ErrNotExist) {
+		// retrieve fixture from latest released policy from github.
+		//
+		// NOTE: to update the mock, just delete the testdata/policy.json file and run the tests again.
+		t.Logf("updating fixture file %q from github", regoFile)
+
+		require.NoError(t, p.SetRegoObjects())
+		require.NotNil(t, p.gs)
+
+		require.NoError(t,
+			SaveInFile(p.gs, regoFile),
+		)
+
+		return
+	}
+
+	// we have a mock fixture: load this rather than calling github
+	t.Logf("populating rego policy from fixture file %q", regoFile)
+	buf, err := os.ReadFile(regoFile)
+	require.NoError(t, err)
+
+	require.NoError(t,
+		jsoniter.Unmarshal(buf, p.gs),
+	)
+}
+
+func testRegoFile(framework string) string {
+	return filepath.Join(testutils.CurrentDir(), "testdata", fmt.Sprintf("%s.json", framework))
+}
+
+func TestNewDownloadReleasedPolicyWithVersion(t *testing.T) {
+	t.Parallel()
+
+	t.Run("empty version falls back to the latest release", func(t *testing.T) {
+		t.Parallel()
+
+		pinned := NewDownloadReleasedPolicyWithVersion("")
+		latest := NewDownloadReleasedPolicy()
+		require.Equal(t, latest.gs.URL, pinned.gs.URL)
+	})
+
+	t.Run("pinned version targets the release tag", func(t *testing.T) {
+		t.Parallel()
+
+		p := NewDownloadReleasedPolicyWithVersion("v2.0.301")
+		require.Contains(t, p.gs.URL, "download/v2.0.301")
+	})
+}
+
+func TestDownloadReleasedPolicyArtifactPersistence(t *testing.T) {
+	t.Parallel()
+
+	t.Run("rolling release may refresh the shared fallback", func(t *testing.T) {
+		t.Parallel()
+
+		p := NewDownloadReleasedPolicy()
+		require.True(t, p.ShouldPersistPolicyArtifacts())
+	})
+
+	t.Run("pinned release must not replace the unversioned fallback", func(t *testing.T) {
+		t.Parallel()
+
+		p := NewDownloadReleasedPolicyWithVersion("v2.0.301")
+		require.False(t, p.ShouldPersistPolicyArtifacts())
+	})
+}
+
+func TestSetRegoObjectsWithFallback(t *testing.T) {
+	t.Parallel()
+
+	// unroutable URL (port 0) so the download fails deterministically offline
+	const unreachableURL = "http://127.0.0.1:0/download"
+
+	t.Run("empty version keeps cache fallback on download failure", func(t *testing.T) {
+		t.Parallel()
+
+		p := NewDownloadReleasedPolicyWithVersion("")
+		require.False(t, p.IsVersionPinned())
+		p.gs.URL = unreachableURL
+
+		fallback, err := p.SetRegoObjectsWithFallback()
+		require.NoError(t, err)
+		require.True(t, fallback)
+	})
+
+	t.Run("pinned version returns a hard error on download failure", func(t *testing.T) {
+		t.Parallel()
+
+		p := NewDownloadReleasedPolicyWithVersion("v0.0.0-does-not-exist")
+		require.True(t, p.IsVersionPinned())
+		p.gs.URL = unreachableURL
+
+		fallback, err := p.SetRegoObjectsWithFallback()
+		require.Error(t, err)
+		require.False(t, fallback)
+		require.Contains(t, err.Error(), "v0.0.0-does-not-exist")
+	})
+}
+
+func TestSetRegoObjectsWithFallbackChecksumVerificationFailure(t *testing.T) {
+	t.Parallel()
+
+	var signatureRequests atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/download/checksums.txt":
+			_, err := fmt.Fprintln(w, "0000000000000000000000000000000000000000000000000000000000000000  artifact.tar.gz")
+			require.NoError(t, err)
+		case "/download/checksums.sigstore.json":
+			signatureRequests.Add(1)
+			_, err := fmt.Fprintln(w, "not-valid-json")
+			require.NoError(t, err)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	t.Run("unversioned release does not fall back on checksum signature failure", func(t *testing.T) {
+		p := NewDownloadReleasedPolicyWithVersion("")
+		p.gs.URL = server.URL + "/download"
+
+		fallback, err := p.SetRegoObjectsWithFallback()
+
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "error verifying checksums.txt")
+		require.False(t, fallback)
+		require.True(t, errors.Is(err, gitregostore.ErrChecksumVerification))
+	})
+
+	t.Run("pinned release returns checksum signature failure", func(t *testing.T) {
+		p := NewDownloadReleasedPolicyWithVersion("v2.0.301")
+		p.gs.URL = server.URL + "/download"
+
+		fallback, err := p.SetRegoObjectsWithFallback()
+
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "error verifying checksums.txt")
+		require.False(t, fallback)
+		require.True(t, errors.Is(err, gitregostore.ErrChecksumVerification))
+	})
+
+	require.Equal(t, int32(2), signatureRequests.Load())
+}

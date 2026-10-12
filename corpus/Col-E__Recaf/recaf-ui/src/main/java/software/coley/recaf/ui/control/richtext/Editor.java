@@ -1,0 +1,1205 @@
+package software.coley.recaf.ui.control.richtext;
+
+import com.google.common.collect.EvictingQueue;
+import jakarta.annotation.Nonnull;
+import jakarta.annotation.Nullable;
+import javafx.beans.value.ObservableValue;
+import javafx.collections.ObservableList;
+import javafx.scene.Node;
+import javafx.scene.control.IndexRange;
+import javafx.scene.control.ScrollBar;
+import javafx.scene.input.KeyCode;
+import javafx.scene.input.KeyEvent;
+import javafx.scene.layout.BorderPane;
+import javafx.scene.layout.Region;
+import javafx.scene.layout.StackPane;
+import javafx.scene.text.Text;
+import org.fxmisc.flowless.Cell;
+import org.fxmisc.flowless.VirtualFlow;
+import org.fxmisc.richtext.CharacterHit;
+import org.fxmisc.richtext.CodeArea;
+import org.fxmisc.richtext.GenericStyledArea;
+import org.fxmisc.richtext.NavigationActions;
+import org.fxmisc.richtext.StyleActions;
+import org.fxmisc.richtext.model.PlainTextChange;
+import org.fxmisc.richtext.model.ReadOnlyStyledDocument;
+import org.fxmisc.richtext.model.StyleSpans;
+import org.fxmisc.richtext.model.StyledDocument;
+import org.fxmisc.richtext.model.TwoDimensional;
+import org.reactfx.Change;
+import org.reactfx.EventStream;
+import org.reactfx.EventStreams;
+import org.reactfx.collection.MemoizationList;
+import org.slf4j.Logger;
+import software.coley.collections.Lists;
+import software.coley.collections.Unchecked;
+import software.coley.recaf.analytics.logging.Logging;
+import software.coley.recaf.behavior.Closing;
+import software.coley.recaf.ui.control.VirtualizedScrollPaneWrapper;
+import software.coley.recaf.ui.control.richtext.bracket.SelectedBracketTracking;
+import software.coley.recaf.ui.control.richtext.highlight.SelectedWordHighlighting;
+import software.coley.recaf.ui.control.richtext.linegraphics.RootLineGraphicFactory;
+import software.coley.recaf.ui.control.richtext.problem.ProblemTracking;
+import software.coley.recaf.ui.control.richtext.suggest.TabCompleter;
+import software.coley.recaf.ui.control.richtext.syntax.StyleResult;
+import software.coley.recaf.ui.control.richtext.syntax.SyntaxHighlighter;
+import software.coley.recaf.ui.control.richtext.syntax.SyntaxUtil;
+import software.coley.recaf.ui.pane.editing.ProblemOverlay;
+import software.coley.recaf.util.FxThreadUtil;
+import software.coley.recaf.util.IntRange;
+import software.coley.recaf.util.ReflectUtil;
+import software.coley.recaf.util.StringUtil;
+import software.coley.recaf.util.threading.ThreadPoolFactory;
+import software.coley.recaf.util.threading.ThreadUtil;
+
+import java.lang.reflect.Method;
+import java.time.Duration;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+
+/**
+ * Modular text editor control.
+ * <ul>
+ *     <li>Configure syntax with {@link #setSyntaxHighlighter(SyntaxHighlighter)}</li>
+ *     <li>Configure selected bracket tracking with {@link #setSelectedBracketTracking(SelectedBracketTracking)}</li>
+ *     <li>Configure line graphics via {@link #getRootLineGraphicFactory()}</li>
+ * </ul>
+ *
+ * @author Matt Coley
+ */
+public class Editor extends BorderPane implements Closing {
+	private static final Logger logger = Logging.get(Editor.class);
+	public static final int SHORTER_DELAY_MS = 25;
+	public static final int SHORT_DELAY_MS = 150;
+	public static final int MEDIUM_DELAY_MS = 400;
+	private static final StyleResult FALLBACK_STYLE_RESULT = new StyleResult(StyleSpans.singleton(Collections.emptyList(), 0), 0);
+	private static final Map<String, Method> AREA_METHOD_CACHE = new ConcurrentHashMap<>();
+	private final Map<String, EditorComponent> components = new ConcurrentHashMap<>();
+	private final StackPane stackPane = new StackPane();
+	private final SafeCodeArea codeArea = new SafeCodeArea();
+	private final VirtualizedScrollPaneWrapper<CodeArea> codeScrollWrapper;
+	private final VirtualFlow<?, ?> virtualFlow;
+	private final MemoizationList<Cell<?, ?>> virtualCellList;
+	private final ExecutorService syntaxPool = ThreadPoolFactory.newSingleThreadExecutor("syntax-highlight");
+	private final RootLineGraphicFactory rootLineGraphicFactory = new RootLineGraphicFactory(this);
+	private final EventStream<Change<Integer>> caretPosEventStream;
+	private final EvictingQueue<KeyCode> recentKeys = EvictingQueue.create(5);
+	private ReadOnlyStyledDocument<Collection<String>, String, Collection<String>> lastDocumentSnapshot;
+	private ScrollReset lastScrollReset = null;
+	private CaretReset lastCaretReset = null;
+	private boolean typing;
+	private SelectedWordHighlighting selectedWordHighlighting;
+	private TabCompleter<?> tabCompleter;
+	private SyntaxHighlighter syntaxHighlighter;
+	private SelectedBracketTracking selectedBracketTracking;
+	private ProblemTracking problemTracking;
+	private ProblemOverlay problemOverlay;
+
+	/**
+	 * New editor instance.
+	 */
+	public Editor() {
+		// Get the reflection hacks out of the way first.
+		//  - Want to have access to scrollbars & the internal 'virtualFlow'
+		codeScrollWrapper = new VirtualizedScrollPaneWrapper<>(codeArea);
+
+		virtualFlow = Unchecked.get(() -> ReflectUtil.quietGet(codeArea, GenericStyledArea.class.getDeclaredField("virtualFlow")));
+		Object virtualCellManager = Unchecked.get(() -> ReflectUtil.quietGet(virtualFlow, VirtualFlow.class.getDeclaredField("cellListManager")));
+		virtualCellList = ReflectUtil.quietInvoke(virtualCellManager.getClass(), virtualCellManager, "getLazyCellList", new Class[0], new Object[0]);
+
+		// Initial layout.
+		setCenter(stackPane);
+		stackPane.getChildren().add(codeScrollWrapper);
+
+		// Do not want text wrapping in a code editor.
+		codeArea.setWrapText(false);
+
+		// Add event filter to hook tab usage.
+		codeArea.addEventFilter(KeyEvent.KEY_PRESSED, e -> {
+			try {
+				recentKeys.add(e.getCode());
+				if (e.getCode() == KeyCode.TAB)
+					handleTab(e);
+				else if (e.getCode() == KeyCode.ENTER)
+					handleNewline(e);
+				else if (e.getCode() == KeyCode.UP || e.getCode() == KeyCode.DOWN)
+					handleVerticalNavigation(e);
+			} catch (Throwable t) {
+				logger.error("Error handling tab/newline interception in editor", t);
+			}
+		});
+
+		// Set paragraph graphic factory to the user-configurable root graphics factory.
+		codeArea.setParagraphGraphicFactory(rootLineGraphicFactory);
+
+		// This property copies the style of adjacent characters when typing (instead of having no style).
+		// It may not seem like much, but it makes our restyle range computation logic much simpler.
+		// Consider a multi-line comment. If you had this set to use the initial style (none) it would break up
+		// multi-line comment style spans. We would have to re-stitch them together based on the inserted text position
+		// which would be a huge pain in the ass.
+		codeArea.setUseInitialStyleForInsertion(false);
+
+		// Register a text change listener for updating caret/scroll positions after text updates.
+		codeArea.plainTextChanges().addObserver(change -> {
+			typing = true;
+			if (lastCaretReset != null) {
+				lastCaretReset.changed(change);
+				lastCaretReset = null;
+			}
+			if (lastScrollReset != null) {
+				lastScrollReset.changed(change);
+				lastScrollReset = null;
+			}
+		});
+
+		// Register a text change listener for recording state used for tab completion.
+		codeArea.plainTextChanges().addObserver(change -> {
+			try {
+				if (tabCompleter != null)
+					tabCompleter.onFineTextUpdate(change);
+			} catch (Throwable t) {
+				logger.error("Error handling tab-completion update in editor", t);
+			}
+		});
+
+		// Register a text change listener that operates on reduces calls (limit calls to when user stops typing).
+		// Used for:
+		//  - Restyling text near inserted/removed text
+		//  - Taking document snapshots
+		codeArea.plainTextChanges()
+				.reduceSuccessions(Collections::singletonList, Lists::add, Duration.ofMillis(SHORT_DELAY_MS))
+				.addObserver(changes -> {
+					try {
+						// Pass to syntax highlighter.
+						if (syntaxHighlighter != null) {
+							for (PlainTextChange change : changes) {
+								schedule(syntaxPool, FALLBACK_STYLE_RESULT, () -> {
+									String text = getText();
+									IntRange range = SyntaxUtil.getRangeForRestyle(text, getStyleSpans(), syntaxHighlighter, change);
+									int start = range.start();
+									int end = range.end();
+									return new StyleResult(syntaxHighlighter.createStyleSpans(text, start, end), start);
+								}, result -> setStyleSpans(result.position(), result.spans()));
+							}
+						}
+
+						// Do rough completion updates.
+						if (tabCompleter != null)
+							tabCompleter.onRoughTextUpdate(changes);
+
+						// Record content of area.
+						lastDocumentSnapshot = codeArea.getContent().snapshot();
+					} catch (Throwable t) {
+						logger.error("Uncaught error on editor reduced-succession update", t);
+					}
+				});
+
+		// Register a text change listener that operates on further reduces calls for typing indication.
+		codeArea.plainTextChanges()
+				.reduceSuccessions(Collections::singletonList, Lists::add, Duration.ofMillis(MEDIUM_DELAY_MS))
+				.addObserver(changes -> typing = false);
+
+		// Create event-streams for various events.
+		caretPosEventStream = EventStreams.changesOf(codeArea.caretPositionProperty());
+
+		// Initial snapshot state.
+		lastDocumentSnapshot = ReadOnlyStyledDocument.from(codeArea.getDocument());
+	}
+
+	@Override
+	public void close() {
+		if (selectedWordHighlighting != null)
+			selectedWordHighlighting.uninstall(this);
+		if (selectedBracketTracking != null)
+			selectedBracketTracking.close();
+		if (!syntaxPool.isShutdown())
+			syntaxPool.shutdownNow();
+	}
+
+	/**
+	 * @return {@code true} to indicate the contents of this editor are editable. {@code false} for read-only content.
+	 */
+	public boolean isEditable() {
+		return codeArea.isEditable();
+	}
+
+	/**
+	 * Immediately show the given paragraph at the top of the editor.
+	 * This is opposed to {@link CodeArea#showParagraphAtTop(int)} which operates on a slight delay.
+	 *
+	 * @param paragraph
+	 * 		Paragraph index.
+	 */
+	public void showParagraphAtTop(int paragraph) {
+		expandFoldsContaining(paragraph);
+		virtualFlow.showAsFirst(paragraph);
+	}
+
+	/**
+	 * Immediately show the given paragraph at the bottom of the editor.
+	 * This is opposed to {@link CodeArea#showParagraphAtTop(int)} which operates on a slight delay.
+	 *
+	 * @param paragraph
+	 * 		Paragraph index.
+	 */
+	public void showParagraphAtBottom(int paragraph) {
+		expandFoldsContaining(paragraph);
+		virtualFlow.showAsLast(paragraph);
+	}
+
+	/**
+	 * Immediately show the given paragraph at the center of the editor.
+	 * This is opposed to {@link CodeArea#showParagraphAtCenter(int)} which operates on a slight delay.
+	 *
+	 * @param paragraph
+	 * 		Paragraph index.
+	 */
+	public void showParagraphAtCenter(int paragraph) {
+		expandFoldsContaining(paragraph);
+
+		// Approximate center position.
+		// - Assuming all cells are the same height, we can compute the offset needed to center the paragraph.
+		int count = 1 + Math.max(virtualFlow.getLastVisibleIndex() - virtualFlow.getFirstVisibleIndex(), 0);
+		double paragraphHeight = getHeight() / count;
+		virtualFlow.showAtOffset(paragraph, count / 2.0 * paragraphHeight / 2.0);
+	}
+
+	/**
+	 * Force a full restyle of the entire document.
+	 */
+	public void restyleAll() {
+		String text = getText();
+		if (text.isBlank() || syntaxHighlighter == null)
+			return;
+		setStyleSpans(0, syntaxHighlighter.createStyleSpans(text, 0, getTextLength()));
+	}
+
+	/**
+	 * Delegates to {@link StyleActions#setStyleSpans(int, StyleSpans)} but with some scroll-position preservation logic.
+	 *
+	 * @param from
+	 * 		Text position to start applying styles at.
+	 * @param spans
+	 * 		Style spans to apply.
+	 */
+	public void setStyleSpans(int from, @Nonnull StyleSpans<Collection<String>> spans) {
+		// Updating the styles can cause the 'Navigator' to set its target position back to zero for... some reason.
+		// See Navigator:
+		//  - setTargetPosition
+		//  - scrollCurrentPositionBy
+		// To prevent jank, record the precise scroll-pixel estimate before the update, and restore it after.
+		// Using the first visible paragraph snaps mouse-wheel scroll positions to the top of that paragraph.
+		double scrollY = virtualFlow.getEstimatedScrollY();
+		int firstVisibleIndex = virtualFlow.getFirstVisibleIndex();
+		if (selectedWordHighlighting != null) // Inject selected-word highlighting into the style spans.
+			spans = selectedWordHighlighting.apply(from, spans);
+
+		// Syntax and selection highlighting are visual changes and should not be undoable text edits.
+		StyleSpans<Collection<String>> finalSpans = spans;
+		codeArea.runWithoutUndo(() -> codeArea.setStyleSpans(from, finalSpans));
+
+		// We want to use the CodeArea variants of scrolling rather than the virtual-flow for event order reasons.
+		// Without the suspension handling of these variants some of the restores may not take effect.
+		if (Double.isFinite(scrollY))
+			codeArea.scrollYToPixel(scrollY);
+		else
+			codeArea.showParagraphAtTop(firstVisibleIndex);
+	}
+
+	/**
+	 * The passed inputs for the position will be modified as per
+	 * {@link SyntaxUtil#getRangeForRestyle(String, StyleSpans, SyntaxHighlighter, PlainTextChange)}.
+	 * For this reason, you do not have to be super exact with the given values.
+	 *
+	 * @param position
+	 * 		Start position to begin the restyling at.
+	 * @param length
+	 * 		Length of the restyled range.
+	 *
+	 * @return Restyle future.
+	 */
+	@Nonnull
+	public CompletableFuture<Void> restyleAtPosition(int position, int length) {
+		if (syntaxHighlighter != null) {
+			return schedule(syntaxPool, FALLBACK_STYLE_RESULT, () -> {
+				IntRange range = SyntaxUtil.getRangeForRestyle(getText(), getStyleSpans(),
+						syntaxHighlighter, new PlainTextChange(position, "", ".".repeat(length)));
+				int start = range.start();
+				int end = range.end();
+				return new StyleResult(syntaxHighlighter.createStyleSpans(getText(), start, end), start);
+			}, result -> setStyleSpans(result.position(), result.spans()));
+		}
+		return CompletableFuture.completedFuture(null);
+	}
+
+	/**
+	 * The editor is a {@link BorderPane} layout. The sides can be used to toggle "drawers" of sorts.
+	 * The center is home to the primary component, the {@link #getCodeArea() code-area}.
+	 *
+	 * @return The {@link StackPane} present in the {@link #getCenter() center} of the editor.
+	 */
+	@Nonnull
+	public StackPane getPrimaryStack() {
+		return stackPane;
+	}
+
+	/**
+	 * Redraw visible paragraph graphics.
+	 * <br>
+	 * <b>Must be called on FX thread.</b>
+	 */
+	public void redrawParagraphGraphics() {
+		int startParagraphIndex = Math.max(0, virtualFlow.getFirstVisibleIndex() - 1);
+		int endParagraphIndex = Math.min(codeArea.getParagraphs().size() - 1, virtualFlow.getLastVisibleIndex());
+		for (int i = startParagraphIndex; i <= endParagraphIndex; i++)
+			if (!codeArea.isFolded(i))
+				codeArea.recreateParagraphGraphic(i);
+	}
+
+	/**
+	 * @return Current style spans for the entire document.
+	 */
+	@Nonnull
+	public StyleSpans<Collection<String>> getStyleSpans() {
+		return codeArea.getStyleSpans(0, getTextLength());
+	}
+
+	/**
+	 * @return Current length of document text.
+	 */
+	public int getTextLength() {
+		return codeArea.getLength();
+	}
+
+	/**
+	 * @return Current document text.
+	 */
+	@Nonnull
+	public String getText() {
+		return Objects.requireNonNullElse(codeArea.getText(), "");
+	}
+
+	/**
+	 * @return The prior document state, from the last {@link #getTextChangeEventStream() text change event}.
+	 */
+	@Nonnull
+	public ReadOnlyStyledDocument<Collection<String>, String, Collection<String>> getLastDocumentSnapshot() {
+		return lastDocumentSnapshot;
+	}
+
+	/**
+	 * @param text
+	 * 		Text to set.
+	 */
+	public void setText(@Nullable String text) {
+		// Filter input
+		if (text == null)
+			text = "";
+
+		// Prepare reset of caret/scroll position
+		lastCaretReset = new CaretReset(codeArea.getCaretPosition());
+		lastScrollReset = new ScrollReset(virtualFlow.getFirstVisibleIndex());
+
+		// Replace the full text document
+		if (getTextLength() == 0) {
+			codeArea.appendText(text);
+		} else {
+			codeArea.replaceText(text);
+
+			// Whole text replacement often results in the text not applying a restyle, resulting in all default text.
+			// Scheduling a restyle at the start ensures if this happens it gets fixed in the next FX update cycle.
+			if (!text.isBlank())
+				restyleAtPosition(0, 0);
+		}
+	}
+
+	/**
+	 * Adds a tab indentation into the given paragraph.
+	 *
+	 * @param paragraph
+	 * 		Paragraph to indent.
+	 */
+	public void indent(int paragraph) {
+		String paragraphContents = codeArea.getParagraph(paragraph).getText();
+		int column = 0;
+		for (; column < paragraphContents.length(); column++) {
+			char c = paragraphContents.charAt(column);
+			if (c != ' ' && c != '\t') break;
+		}
+		codeArea.insert(paragraph, column, newText("\t"));
+	}
+
+	/**
+	 * Removes indentation from the given paragraph.
+	 *
+	 * @param paragraph
+	 * 		Paragraph to unindent.
+	 *
+	 * @return {@code true} when there was text removed (successful unindentation).
+	 */
+	public boolean unindent(int paragraph) {
+		String paragraphContents = codeArea.getParagraph(paragraph).getText();
+		int column = 0;
+		for (; column < paragraphContents.length(); column++) {
+			char c = paragraphContents.charAt(column);
+			if (c != ' ' && c != '\t') break;
+		}
+		if (column > 0) {
+			codeArea.deleteText(paragraph, column - 1, paragraph, column);
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Delegates to {@link CodeArea#textProperty()}.
+	 * <br>
+	 * Do not use this to set text. Instead, use {@link #setText(String)}.
+	 *
+	 * @return Property representation of {@link #getText()}.
+	 */
+	@Nonnull
+	public ObservableValue<String> textProperty() {
+		return codeArea.textProperty();
+	}
+
+	/**
+	 * Delegates to {@link CodeArea#plainTextChanges()}.
+	 *
+	 * @return Event stream for changes to {@link #textProperty()}.
+	 */
+	@Nonnull
+	public EventStream<PlainTextChange> getTextChangeEventStream() {
+		return codeArea.plainTextChanges();
+	}
+
+	/**
+	 * Typing is indicated by recent plain text changes within a duration of {@link #MEDIUM_DELAY_MS}:
+	 * <pre>{@code
+	 * codeArea.plainTextChanges()
+	 *     .addObserver(change -> typing = true);
+	 * // After ~400ms of no typing, reset the typing state.
+	 * codeArea.plainTextChanges()
+	 *     .reduceSuccessions(List::of, Lists::add, ofMillis(MEDIUM_DELAY_MS))
+	 *     .addObserver(changes -> typing = false);
+	 * }</pre>
+	 *
+	 * @return {@code true} while typing.
+	 */
+	public boolean isTyping() {
+		return typing;
+	}
+
+	/**
+	 * @return Event stream wrapper for {@link CodeArea#caretPositionProperty()}.
+	 */
+	@Nonnull
+	public EventStream<Change<Integer>> getCaretPosEventStream() {
+		return caretPosEventStream;
+	}
+
+	/**
+	 * @return The root line graphics factory.
+	 */
+	@Nonnull
+	public RootLineGraphicFactory getRootLineGraphicFactory() {
+		return rootLineGraphicFactory;
+	}
+
+	/**
+	 * @return Current syntax highlighter.
+	 */
+	@Nullable
+	public SyntaxHighlighter getSyntaxHighlighter() {
+		return syntaxHighlighter;
+	}
+
+	/**
+	 * @return Current selected-word highlighter.
+	 */
+	@Nullable
+	public SelectedWordHighlighting getSelectedWordHighlighting() {
+		return selectedWordHighlighting;
+	}
+
+	/**
+	 * @param syntaxHighlighter
+	 * 		Highlighter to use.
+	 */
+	public void setSyntaxHighlighter(@Nullable SyntaxHighlighter syntaxHighlighter) {
+		// Uninstall prior.
+		SyntaxHighlighter previousSyntaxHighlighter = this.syntaxHighlighter;
+		if (previousSyntaxHighlighter != null)
+			previousSyntaxHighlighter.uninstall(this);
+
+		// Set and install new instance.
+		this.syntaxHighlighter = syntaxHighlighter;
+		if (syntaxHighlighter != null)
+			syntaxHighlighter.install(this);
+		restyleAll();
+	}
+
+	/**
+	 * @param selectedWordHighlighting
+	 * 		Highlighting implementation for selected-word occurrences.
+	 */
+	public void setSelectedWordHighlighting(@Nullable SelectedWordHighlighting selectedWordHighlighting) {
+		// Skip if it is already set to the same instance.
+		if (this.selectedWordHighlighting == selectedWordHighlighting)
+			return;
+
+		// Uninstall prior instance.
+		SelectedWordHighlighting previousSelectedWordHighlighting = this.selectedWordHighlighting;
+		if (previousSelectedWordHighlighting != null)
+			previousSelectedWordHighlighting.uninstall(this);
+
+		// Set and install new instance.
+		this.selectedWordHighlighting = selectedWordHighlighting;
+		if (selectedWordHighlighting != null)
+			selectedWordHighlighting.install(this);
+		restyleAll();
+	}
+
+	/**
+	 * @param selectedBracketTracking
+	 * 		New selected bracket tracking implementation, or {@code null} to disable selected bracket tracking.
+	 */
+	public void setSelectedBracketTracking(@Nullable SelectedBracketTracking selectedBracketTracking) {
+		// Uninstall prior.
+		SelectedBracketTracking previousSelectedBracketTracking = this.selectedBracketTracking;
+		if (previousSelectedBracketTracking != null)
+			previousSelectedBracketTracking.uninstall(this);
+
+		// Set and install new instance.
+		this.selectedBracketTracking = selectedBracketTracking;
+		if (selectedBracketTracking != null)
+			selectedBracketTracking.install(this);
+	}
+
+	/**
+	 * @return Selected bracket tracking implementation.
+	 */
+	@Nullable
+	public SelectedBracketTracking getSelectedBracketTracking() {
+		return selectedBracketTracking;
+	}
+
+	/**
+	 * @param problemTracking
+	 * 		Problem tracking implementation.
+	 */
+	public void setProblemTracking(@Nullable ProblemTracking problemTracking) {
+		// Uninstall prior.
+		ProblemTracking previousProblemTracking = this.problemTracking;
+		if (previousProblemTracking != null)
+			previousProblemTracking.uninstall(this);
+		if (problemOverlay != null) {
+			problemOverlay.uninstall(this);
+			problemOverlay = null;
+		}
+
+		// Set and install new instance.
+		this.problemTracking = problemTracking;
+		if (problemTracking != null) {
+			problemTracking.install(this);
+			problemOverlay = new ProblemOverlay();
+			problemOverlay.install(this);
+		}
+	}
+
+	/**
+	 * @return Problem tracking implementation.
+	 */
+	@Nullable
+	public ProblemTracking getProblemTracking() {
+		return problemTracking;
+	}
+
+	/**
+	 * @return Tab completion implementation.
+	 */
+	@Nullable
+	public TabCompleter<?> getTabCompleter() {
+		return tabCompleter;
+	}
+
+	/**
+	 * @param tabCompleter
+	 * 		Tab completion implementation.
+	 */
+	public void setTabCompleter(@Nullable TabCompleter<?> tabCompleter) {
+		// Uninstall prior.
+		TabCompleter<?> previousTabCompleter = this.tabCompleter;
+		if (previousTabCompleter != null)
+			previousTabCompleter.uninstall(this);
+
+		// Set and install new instance.
+		this.tabCompleter = tabCompleter;
+		if (tabCompleter != null)
+			tabCompleter.install(this);
+	}
+
+	/**
+	 * @param key
+	 * 		Component key.
+	 *
+	 * @return Associated component if found.
+	 */
+	@Nullable
+	public EditorComponent getComponent(@Nonnull String key) {
+		return components.get(key);
+	}
+
+	/**
+	 * @param key
+	 * 		Component key.
+	 * @param component
+	 * 		Component to associate.
+	 */
+	public void setComponent(@Nonnull String key, @Nullable EditorComponent component) {
+		if (component == null)
+			components.remove(key);
+		else
+			components.put(key, component);
+	}
+
+	/**
+	 * @return Backing text editor component.
+	 */
+	@Nonnull
+	public CodeArea getCodeArea() {
+		return codeArea;
+	}
+
+	/**
+	 * @return Virtual flow backing the {@link #getCodeArea() code area}.
+	 */
+	@Nonnull
+	public VirtualFlow<?, ?> getVirtualFlow() {
+		return virtualFlow;
+	}
+
+	/**
+	 * @return Virtualized cell list within the {@link #getVirtualFlow() virtual flow}.
+	 */
+	@Nonnull
+	public MemoizationList<Cell<?, ?>> getVirtualCellList() {
+		return virtualCellList;
+	}
+
+	/**
+	 * Get text nodes on a paragraph
+	 * <p>
+	 * Be <b>very aware</b> of when you call this. You may encounter unexpected values if invoked during early
+	 * layout of your node / scene.
+	 * <p>
+	 * This method is why we have to do the {@link FxThreadUtil#delayedRun(long, Runnable)} call above.
+	 * Normally when you use {@code virtualFlow.getCellIfVisible(paragraph)} it lays out the nodes for
+	 * you so that you don't run into this problem. The problem is it lays out the whole {@code ParagraphBox}
+	 * class, which includes the graphic factory we're currently populating the content of.
+	 * This means using that method will cause a {@link StackOverflowError}.
+	 * Thus, we have the hacky delayed run instead.
+	 *
+	 * @param paragraph
+	 * 		Paragraph index to get the text nodes of.
+	 *
+	 * @return List of text nodes in the paragraph.
+	 */
+	@Nonnull
+	public List<Text> getTextNodes(int paragraph) {
+		// Get the cell from the given paragraph. It should exist since we're
+		// initializing a paragraph graphic for it.
+		Optional<Cell<?, ?>> cell = virtualCellList.getIfMemoized(paragraph);
+		if (cell.isEmpty())
+			return Collections.emptyList();
+
+		// ParagraphBox is private in RichTextFX, but we just need to get the children so
+		// casting to region suffices.
+		Region paragraphBox = (Region) cell.get().getNode();
+		ObservableList<Node> paragraphBoxChildren = paragraphBox.getChildrenUnmodifiable();
+
+		if (paragraphBoxChildren.isEmpty())
+			return Collections.emptyList();
+
+		// The text flow is always the first child of the box.
+		Region textFlow = (Region) paragraphBoxChildren.getFirst();
+
+		// In the text flow, we want the first 'Text' child. This should be the first one with empty spaces.
+		ObservableList<Node> flowChildren = textFlow.getChildrenUnmodifiable();
+		return Unchecked.cast(flowChildren.stream()
+				.filter(c -> c instanceof Text)
+				.toList());
+	}
+
+	/**
+	 * Compute the width of blank text before non-blank text.
+	 *
+	 * @param paragraph
+	 * 		Paragraph index to compute empty space (in pixels) to the first non-whitespace character.
+	 *
+	 * @return Pixels to first non-whitespace character.
+	 *
+	 * @see #getTextNodes(int)
+	 */
+	public double computeWhitespacePrefixWidth(int paragraph) {
+		List<Text> textNodes = getTextNodes(paragraph);
+		double width = 0;
+
+		for (Text textNode : textNodes) {
+			String text = textNode.getText();
+			double boundWidth = textNode.getBoundsInLocal().getWidth();
+			if (text.isBlank()) {
+				// Texts that are blank are all whitespace, add it up.
+				width += boundWidth;
+			} else {
+				// Some texts have leading whitespace that we want to consider.
+				int whitespacePrefix = StringUtil.getWhitespacePrefixLength(text);
+				if (whitespacePrefix > 0) {
+					double charWidth = boundWidth / StringUtil.getTabAdjustedLength(text);
+					width += charWidth * whitespacePrefix;
+				}
+				break;
+			}
+		}
+
+		return width;
+	}
+
+	/**
+	 * Compute the width of text until a specific character.
+	 *
+	 * @param paragraph
+	 * 		Paragraph index to compute the width of.
+	 * @param character
+	 * 		Character index to compute the width until.
+	 *
+	 * @return Width of text until the character.
+	 */
+	public double computeWidthUntilCharacter(int paragraph, int character) {
+		List<Text> textNodes = getTextNodes(paragraph);
+		double width = 0;
+		int index = 0;
+		Text lastNode = null;
+
+		for (Text textNode : textNodes) {
+			String text = textNode.getText();
+			double boundWidth = textNode.getBoundsInLocal().getWidth();
+
+			if (index + text.length() < character) {
+				index += text.length();
+				width += boundWidth;
+			} else {
+				double charWidth = boundWidth / StringUtil.getTabAdjustedLength(text);
+				width += charWidth * (character - index);
+				return width;
+			}
+
+			lastNode = textNode;
+		}
+
+		// we never reached the character
+		if (index < character) {
+			double charWidth;
+			if (lastNode == null)
+				charWidth = 1.7;
+			else
+				charWidth = lastNode.getBoundsInLocal().getWidth() / StringUtil.getTabAdjustedLength(lastNode.getText());
+
+			width += charWidth * (character - index);
+		}
+
+		return width;
+	}
+
+	/**
+	 * @param line
+	 * 		Paragraph index, 0-based.
+	 *
+	 * @return {@code true} when the paragraph is visible.
+	 */
+	public boolean isParagraphVisible(int line) {
+		if (isParagraphFolded(line))
+			return false;
+
+		// We use the internal virtual flow because the provided methods call 'layout()' unnecessarily
+		//  - firstVisibleParToAllParIndex()
+		//  - lastVisibleParToAllParIndex()
+		// It is very likely by the time of calling this that our text is already populated and laid out.
+		// This gets called rather frequently so the constant layout requests contribute a massive waste of time.
+		// If we use these methods from the internal 'VirtualFlow' we skip all that and the result is almost instant.
+		return line >= virtualFlow.getFirstVisibleIndex() && line <= virtualFlow.getLastVisibleIndex();
+	}
+
+	/**
+	 * @param paragraph
+	 * 		Paragraph index, 0-based.
+	 *
+	 * @return {@code true} when the paragraph is folded away.
+	 */
+	public boolean isParagraphFolded(int paragraph) {
+		if (paragraph < 0 || paragraph >= codeArea.getParagraphs().size())
+			return false;
+
+		return codeArea.isFolded(paragraph);
+	}
+
+	/**
+	 * Collapses the given paragraph range, hiding {@code startParagraph + 1} to {@code endParagraph},
+	 * {@code startParagraph} itself is kept as header.
+	 *
+	 * @param startParagraph
+	 * 		Header paragraph of the fold, remains visible.
+	 * @param endParagraph
+	 * 		Last paragraph of the fold, inclusive.
+	 */
+	public void foldParagraphs(int startParagraph, int endParagraph) {
+		codeArea.foldParagraphsSafely(startParagraph, endParagraph);
+	}
+
+	/**
+	 * Expands the folded block following the given paragraph.
+	 *
+	 * @param startParagraph
+	 * 		Index of the header paragraph of the fold.
+	 */
+	public void unfoldParagraphs(int startParagraph) {
+		codeArea.unfoldParagraphsSafely(startParagraph);
+	}
+
+	/**
+	 * Expands any folds hiding the given paragraph.
+	 *
+	 * @param paragraph
+	 * 		Paragraph index to make visible.
+	 */
+	public void expandFoldsContaining(int paragraph) {
+		codeArea.expandFoldsContaining(paragraph);
+	}
+
+	/**
+	 * @return {@link #getCodeArea() Code area's} horizontal scrollbar.
+	 */
+	@Nonnull
+	public ScrollBar getHorizontalScrollbar() {
+		return codeScrollWrapper.getHorizontalScrollbar();
+	}
+
+	/**
+	 * @return {@link #getCodeArea() Code area's} vertical scrollbar.
+	 */
+	@Nonnull
+	public ScrollBar getVerticalScrollbar() {
+		return codeScrollWrapper.getVerticalScrollbar();
+	}
+
+	/**
+	 * @param supplierService
+	 * 		Executor service to run the supplier on.
+	 * @param fallback
+	 * 		Fallback value when the supplier action encounters an exception.
+	 * @param supplier
+	 * 		Value supplier.
+	 * @param consumer
+	 * 		Value consumer, run on the JavaFX UI thread.
+	 * @param <T>
+	 * 		Value type.
+	 *
+	 * @return Future of consumer completion.
+	 */
+	@Nonnull
+	public <T> CompletableFuture<Void> schedule(@Nonnull ExecutorService supplierService, @Nullable T fallback,
+	                                            @Nonnull Supplier<T> supplier, @Nonnull Consumer<T> consumer) {
+		if (supplierService.isShutdown())
+			return CompletableFuture.completedFuture(null);
+		return CompletableFuture.supplyAsync(ThreadUtil.wrap(supplier, fallback), supplierService)
+				.thenAcceptAsync(ThreadUtil.wrap(consumer), FxThreadUtil.executor());
+	}
+
+	/**
+	 * Some RichTextFX methods require styled documents, hence this helper for converting simple strings into those.
+	 *
+	 * @param text
+	 * 		Text to wrap in a styled document with the default values.
+	 *
+	 * @return Text document of the requested text.
+	 */
+	@Nonnull
+	public StyledDocument<Collection<String>, String, Collection<String>> newText(@Nonnull String text) {
+		return ReadOnlyStyledDocument.fromString(text, codeArea.getInitialParagraphStyle(),
+				codeArea.getInitialTextStyle(), codeArea.getSegOps());
+	}
+
+	/**
+	 * Handles newline events. Inserts a new line, but matches the indentation level of the previous line.
+	 *
+	 * @param event
+	 * 		Key event where {@link KeyCode#ENTER} was pressed.
+	 */
+	private void handleNewline(@Nonnull KeyEvent event) {
+		// Consume the event so the normal 'enter' behavior is skipped.
+		event.consume();
+
+		// Abort if handling tab completion.
+		// Holding shift bypasses tab completion.
+		boolean shiftMask = event.isShiftDown();
+		if (!shiftMask && handleTabCompletion(event))
+			return;
+
+		// If there is selected contents, newline should replace it.
+		IndexRange selection = codeArea.getSelection();
+		if (selection.getLength() > 0) {
+			codeArea.replace(selection.getStart(), selection.getEnd(), newText("\n"));
+			return;
+		}
+
+		// Compute matching indentation level.
+		int paragraph = codeArea.getCurrentParagraph();
+		String paragraphContents = codeArea.getParagraph(paragraph).getText();
+		int indent = 0;
+		for (; indent < paragraphContents.length(); indent++) {
+			char c = paragraphContents.charAt(indent);
+			if (c != ' ' && c != '\t') break;
+		}
+
+		// Padding to insert in into the next line.
+		String padding = paragraphContents.substring(0, indent);
+
+		// For open brackets we'd like to do an extra level of indentation
+		// and also complete the brace for the user.
+		char closingBrace = '\0';
+		for (int i = paragraphContents.length() - 1; i >= indent; i--) {
+			char c = paragraphContents.charAt(i);
+			if (c == '{') {
+				closingBrace = '}';
+				padding += '\t';
+				break;
+			} else if (c == '[') {
+				closingBrace = ']';
+				padding += '\t';
+				break;
+			} else if (c != ' ' && c != '\t') {
+				break;
+			}
+		}
+
+		// Insert the indented newline + closing brace (if needed)
+		int caret = codeArea.getCaretPosition();
+		if (closingBrace == '\0' || !recentKeys.contains(KeyCode.OPEN_BRACKET)) {
+			codeArea.insertText(caret, '\n' + padding);
+		} else {
+			// Insert the '}' or ']' and move the caret between
+			codeArea.insertText(caret, '\n' + padding + '\n' + StringUtil.limit(padding, padding.length() - 1) + closingBrace);
+			codeArea.moveTo(caret + padding.length() + 1);
+		}
+
+		// Clear recent keys so that we reset the state of tracking for the open-bracket key.
+		recentKeys.clear();
+	}
+
+	private void handleVerticalNavigation(@Nonnull KeyEvent event) {
+		if (event.isAltDown() || event.isControlDown() || event.isMetaDown())
+			return;
+
+		if (tabCompleter != null && tabCompleter.isCompletionActive())
+			return;
+
+		int direction = event.getCode() == KeyCode.UP ? -1 : 1;
+		int paragraphCount = codeArea.getParagraphs().size();
+		int paragraph = codeArea.getCurrentParagraph();
+
+		int target = paragraph + direction;
+		if (target < 0 || target >= paragraphCount || !isParagraphFolded(target))
+			return;
+
+		int skippedLines = 0;
+		while (target >= 0 && target < paragraphCount && isParagraphFolded(target)) {
+			skippedLines += codeArea.getParagraphLinesCount(target);
+			target += direction;
+		}
+		if (target < 0 || target >= paragraphCount)
+			return;
+
+		event.consume();
+
+		moveCaretByVisualLines(direction * (1 + skippedLines), event.isShiftDown() ?
+				NavigationActions.SelectionPolicy.ADJUST :
+				NavigationActions.SelectionPolicy.CLEAR);
+	}
+
+	/**
+	 * Mirroring the default caret navigation handling in {@code GenericStyledAreaBehavior#downLines}, while handling
+	 * x-offsets normally, even with folded paragraphs.
+	 *
+	 * @param lineDelta
+	 * 		Number of visual lines to move by.
+	 * @param policy
+	 *        {@link NavigationActions.SelectionPolicy#CLEAR} for simple navigation,
+	 *        {@link NavigationActions.SelectionPolicy#ADJUST} for selection.
+	 */
+	private void moveCaretByVisualLines(int lineDelta, @Nonnull NavigationActions.SelectionPolicy policy) {
+		try {
+			TwoDimensional.Position currentLine = Unchecked.cast(resolveAreaMethod("currentLine").invoke(codeArea));
+			if (currentLine == null)
+				return;
+
+			TwoDimensional.Position targetLine = currentLine.offsetBy(lineDelta, TwoDimensional.Bias.Forward).clamp();
+			if (currentLine.sameAs(targetLine))
+				return;
+
+			Object targetOffset = resolveAreaMethod("getTargetCaretOffset").invoke(codeArea);
+			if (targetOffset == null)
+				return;
+
+			CharacterHit hit = Unchecked.cast(
+					resolveAreaMethod(
+							"hit", targetOffset.getClass(), TwoDimensional.Position.class
+					).invoke(codeArea, targetOffset, targetLine)
+			);
+			codeArea.moveTo(hit.getInsertionIndex(), policy);
+		} catch (ReflectiveOperationException e) {
+			throw new IllegalStateException("Failed RichTextFX caret navigation", e);
+		}
+	}
+
+	/**
+	 * Resolves a {@link GenericStyledArea} method, resolved methods are cached and shared across editors.
+	 *
+	 * @param name
+	 * 		Method name.
+	 * @param argTypes
+	 * 		Parameter types.
+	 *
+	 * @return Accessible {@link Method}.
+	 */
+	@Nonnull
+	private Method resolveAreaMethod(@Nonnull String name, @Nonnull Class<?>... argTypes) {
+		return AREA_METHOD_CACHE.computeIfAbsent(name, n -> {
+			for (Class<?> c = codeArea.getClass(); c != null; c = c.getSuperclass()) {
+				try {
+					Method method = c.getDeclaredMethod(n, argTypes);
+					method.setAccessible(true);
+					return method;
+				} catch (NoSuchMethodException ignored) {
+				}
+			}
+
+			throw new IllegalStateException("RichTextFX navigation method not found: " + n);
+		});
+	}
+
+	/**
+	 * Handles tab events.
+	 *
+	 * @param event
+	 * 		Key event where {@link KeyCode#TAB} was pressed.
+	 */
+	private void handleTab(@Nonnull KeyEvent event) {
+		IndexRange selection = codeArea.getSelection();
+
+		// Skip if selection is empty (unless doing shift-tab for unindentation)
+		if (selection.getLength() == 0 && !event.isShiftDown()) {
+			// Abort if handling tab completion.
+			if (handleTabCompletion(event))
+				event.consume();
+
+			// Skip tab handling below.
+			return;
+		}
+
+		// Consume the event so the tab key does not get handled (no insertion of \t)
+		event.consume();
+
+		// Detailed selection info.
+		TwoDimensional.Position selectionStart2D = codeArea.offsetToPosition(selection.getStart(), TwoDimensional.Bias.Forward);
+		TwoDimensional.Position selectionEnd2D = codeArea.offsetToPosition(selection.getEnd(), TwoDimensional.Bias.Forward);
+		boolean isMultiLine = selectionStart2D.getMajor() != selectionEnd2D.getMajor();
+
+		// Check if text selection is multi-line
+		boolean doShift = false;
+		if (isMultiLine) {
+			// Insert a '\t' before the first non-whitespace character of all selected paragaphs.
+			int start = selection.getStart();
+			int end = selection.getEnd();
+			int startParagraph = codeArea.offsetToPosition(start, TwoDimensional.Bias.Forward).getMajor();
+			int endParagraph = codeArea.offsetToPosition(end, TwoDimensional.Bias.Backward).getMajor();
+			for (int i = startParagraph; i <= endParagraph; i++) {
+				// Not ideal as it counts as multiple actions (not undo-able in one go) but good enough for now.
+				if (event.isShiftDown()) {
+					doShift = unindent(i);
+				} else {
+					doShift = true;
+					indent(i);
+				}
+			}
+		} else {
+			// Insert a '\t' before the first non-whitespace character of the paragraph.
+			int paragraph = codeArea.getCurrentParagraph();
+			if (event.isShiftDown()) {
+				doShift = unindent(paragraph);
+			} else {
+				doShift = true;
+				indent(paragraph);
+			}
+		}
+
+		// Re-select the original text.
+		if (doShift)
+			codeArea.selectRange(selectionStart2D.getMajor(), selectionStart2D.getMinor() + 1,
+					selectionEnd2D.getMajor(), selectionEnd2D.getMinor() + 1);
+	}
+
+	/**
+	 * Handle tab completion <i>(completion also works with enter key)</i>
+	 *
+	 * @param event
+	 * 		Key event where {@link KeyCode#TAB} or {@link KeyCode#ENTER} was pressed.
+	 *
+	 * @return {@code true} when a completion was made.
+	 */
+	private boolean handleTabCompletion(@Nonnull KeyEvent event) {
+		return tabCompleter != null && tabCompleter.requestCompletion(event);
+	}
+
+	/**
+	 * Handles re-scrolling to the same location after the text document has been updated.
+	 *
+	 * @see #setText(String)
+	 */
+	private class ScrollReset {
+		private final int firstIndex;
+
+		ScrollReset(int firstIndex) {
+			this.firstIndex = firstIndex;
+		}
+
+		private void changed(@Nonnull PlainTextChange change) {
+			showParagraphAtTop(firstIndex);
+		}
+	}
+
+	/**
+	 * Handles re-positioning the caret to the same location after the text document has been updated.
+	 *
+	 * @see #setText(String)
+	 */
+	private class CaretReset {
+		private final int pos;
+
+		CaretReset(int pos) {
+			this.pos = pos;
+		}
+
+		private void changed(@Nonnull PlainTextChange change) {
+			codeArea.moveTo(Math.min(codeArea.getLength(), pos));
+		}
+	}
+}

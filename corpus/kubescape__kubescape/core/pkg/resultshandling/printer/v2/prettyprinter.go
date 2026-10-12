@@ -1,0 +1,451 @@
+package printer
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"slices"
+	"sort"
+	"strings"
+
+	"github.com/enescakir/emoji"
+	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/jedib0t/go-pretty/v6/text"
+	"github.com/jwalton/gchalk"
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling/printer"
+	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling/printer/v2/prettyprinter"
+	"github.com/kubescape/opa-utils/objectsenvelopes"
+	"github.com/kubescape/opa-utils/reporthandling/apis"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/reportsummary"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/resourcesresults"
+)
+
+const (
+	prettyOutputFile = "report"
+)
+
+var _ printer.IPrinter = &PrettyPrinter{}
+
+type PrettyPrinter struct {
+	mainPrinter     prettyprinter.MainPrinter
+	writer          *os.File
+	formatVersion   string
+	viewType        cautils.ViewTypes
+	scanType        cautils.ScanTypes
+	clusterName     string
+	inputPatterns   []string
+	verboseMode     bool
+	printAttackTree bool
+	showEvidence    bool
+	showSecrets     bool
+}
+
+func NewPrettyPrinter(verboseMode bool, formatVersion string, attackTree bool, viewType cautils.ViewTypes, scanType cautils.ScanTypes, inputPatterns []string, clusterName string, showEvidence bool, showSecrets bool) *PrettyPrinter {
+	prettyPrinter := &PrettyPrinter{
+		verboseMode:     verboseMode,
+		formatVersion:   formatVersion,
+		viewType:        viewType,
+		printAttackTree: attackTree,
+		scanType:        scanType,
+		inputPatterns:   inputPatterns,
+		clusterName:     clusterName,
+		showEvidence:    showEvidence,
+		showSecrets:     showSecrets,
+	}
+
+	return prettyPrinter
+}
+
+func (pp *PrettyPrinter) SetMainPrinter() {
+	switch pp.scanType {
+	case cautils.ScanTypeCluster:
+		pp.mainPrinter = prettyprinter.NewClusterPrinter(pp.writer, pp.verboseMode)
+	case cautils.ScanTypeRepo:
+		pp.mainPrinter = prettyprinter.NewRepoPrinter(pp.writer, pp.inputPatterns, pp.verboseMode)
+	case cautils.ScanTypeImage:
+		pp.mainPrinter = prettyprinter.NewImagePrinter(pp.writer, pp.verboseMode)
+	case cautils.ScanTypeWorkload:
+		pp.mainPrinter = prettyprinter.NewWorkloadPrinter(pp.writer, pp.verboseMode)
+	default:
+		pp.mainPrinter = prettyprinter.NewSummaryPrinter(pp.writer, pp.verboseMode)
+	}
+}
+
+func (pp *PrettyPrinter) PrintNextSteps() {
+	pp.mainPrinter.PrintNextSteps()
+}
+
+func (pp *PrettyPrinter) PrintImageScan(imageScanData []cautils.ImageScanData) error {
+	pp.mainPrinter.PrintImageScanning(buildImageScanSummary(imageScanData))
+	return nil
+}
+
+func (pp *PrettyPrinter) ActionPrint(_ context.Context, opaSessionObj *cautils.OPASessionObj, imageScanData []cautils.ImageScanData) error {
+	if opaSessionObj != nil {
+		if isPrintSeparatorType(pp.scanType) {
+			fmt.Fprintf(pp.writer, "\n%s\n\n",
+				gchalk.WithAnsi256(238).Bold(strings.Repeat("─", 50)))
+		} else {
+			fmt.Fprintf(pp.writer, "\n")
+		}
+
+		sortedControlIDs := getSortedControlsIDs(opaSessionObj.Report.SummaryDetails.Controls) // ListControls().All())
+
+		switch pp.viewType {
+		case cautils.ControlViewType:
+			pp.printResults(&opaSessionObj.Report.SummaryDetails.Controls, opaSessionObj.GetCatalog(), opaSessionObj.ResourcesResult, sortedControlIDs)
+		case cautils.ResourceViewType:
+			// The resource table is the one place that already reads
+			// showEvidence (see generateResourceRows), so gating it on
+			// --verbose alone meant `-E --view resource` printed no table at
+			// all and the evidence column it builds was unreachable without
+			// also passing --verbose.
+			if pp.verboseMode || pp.showEvidence {
+				pp.resourceTable(opaSessionObj)
+			}
+		case cautils.NamespaceViewType:
+			printNamespaceSummaries(pp.writer, opaSessionObj.NamespaceSummaries)
+		}
+
+		pp.printOverview(opaSessionObj, pp.verboseMode)
+
+		pp.mainPrinter.PrintConfigurationsScanning(&opaSessionObj.Report.SummaryDetails, sortedControlIDs, opaSessionObj.TopWorkloadsByScore)
+
+		pp.printScanCoverage(opaSessionObj.ScanCoverage)
+
+		// When writing to Stdout, we aren’t really writing to an output file,
+		// so no need to print that we are
+		if pp.writer.Name() != os.Stdout.Name() {
+			printer.LogOutputFile(pp.writer.Name())
+		}
+
+		pp.printAttackTracks(opaSessionObj)
+	}
+
+	if len(imageScanData) > 0 {
+		if err := pp.PrintImageScan(imageScanData); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (pp *PrettyPrinter) printOverview(opaSessionObj *cautils.OPASessionObj, printExtraLine bool) {
+	if printExtraLine {
+		fmt.Fprintf(pp.writer, "\n")
+	}
+
+	pp.printHeader(opaSessionObj)
+}
+
+func (pp *PrettyPrinter) printHeader(opaSessionObj *cautils.OPASessionObj) {
+	switch pp.scanType {
+	case cautils.ScanTypeCluster:
+		cautils.InfoDisplay(pp.writer, fmt.Sprintf("\nSecurity posture overview for cluster: '%s'\n\n", pp.clusterName))
+		cautils.SimpleDisplay(pp.writer, "In this overview, Kubescape shows you a summary of your cluster security posture, including the number of users who can perform administrative actions. For each result greater than 0, you should evaluate its need, and then define an exception to allow it. This baseline can be used to detect drift in future.\n\n")
+	case cautils.ScanTypeRepo:
+		cautils.InfoDisplay(pp.writer, fmt.Sprintf("\nSecurity posture overview for repo: '%s'\n\n", strings.Join(pp.inputPatterns, ", ")))
+	case cautils.ScanTypeWorkload:
+		cautils.InfoDisplay(pp.writer, "Workload security posture overview for:\n")
+		ns := opaSessionObj.SingleResourceScan.GetNamespace()
+		var rows []table.Row
+		if ns != "" {
+			rows = append(rows, table.Row{"Namespace", gchalk.WithBrightWhite().Bold(opaSessionObj.SingleResourceScan.GetNamespace())})
+		}
+		rows = append(rows, table.Row{"Kind", gchalk.WithBrightWhite().Bold(opaSessionObj.SingleResourceScan.GetKind())})
+		rows = append(rows, table.Row{"Name", gchalk.WithBrightWhite().Bold(opaSessionObj.SingleResourceScan.GetName())})
+
+		tableWriter := table.NewWriter()
+		tableWriter.SetOutputMirror(pp.writer)
+
+		tableWriter.SetColumnConfigs([]table.ColumnConfig{{Number: 1, Align: text.AlignRight}, {Number: 2, Align: text.AlignLeft}})
+		tableWriter.AppendRows(rows)
+
+		tableWriter.Render()
+
+		cautils.SimpleDisplay(pp.writer, "\nIn this overview, Kubescape shows you a summary of the security posture of a workload, including key controls that apply to its configuration, and the vulnerability status of the container image.\n\n\n")
+	}
+
+}
+
+func (pp *PrettyPrinter) SetWriter(ctx context.Context, outputFile string) error {
+	if outputFile == os.Stdout.Name() {
+		pp.writer = printer.GetWriter(ctx, "")
+		pp.SetMainPrinter()
+		return nil
+	}
+
+	if outputFile == os.DevNull {
+		pp.writer = printer.GetWriter(ctx, outputFile)
+		pp.SetMainPrinter()
+		return nil
+	}
+	outputFile, explicitOutput := printer.ResolveOutputFile(printer.PrettyFormat, outputFile, prettyOutputFile)
+
+	if explicitOutput {
+		writer, err := printer.GetWriterNoFallback(outputFile)
+		if err != nil {
+			return err
+		}
+		pp.writer = writer
+	} else {
+		pp.writer = printer.GetWriter(ctx, outputFile)
+	}
+	pp.SetMainPrinter()
+	return nil
+}
+
+func (pp *PrettyPrinter) Score(_ float32) {
+}
+
+func (pp *PrettyPrinter) printResults(controls *reportsummary.ControlSummaries, catalog cautils.ResourceCatalog, resourcesResult map[string]resourcesresults.Result, sortedControlIDs [][]string) {
+	for _, sortedControlID := range slices.Backward(sortedControlIDs) {
+		for _, c := range sortedControlID {
+			controlSummary := controls.GetControl(reportsummary.EControlCriteriaID, c) //  summaryDetails.Controls ListControls().All() Controls.GetControl(ca)
+			pp.printTitle(controlSummary)
+			pp.printResources(controlSummary, catalog, resourcesResult)
+			pp.printSummary(controlSummary)
+		}
+	}
+}
+
+func (prettyPrinter *PrettyPrinter) printSummary(controlSummary reportsummary.IControlSummary) {
+	cautils.SimpleDisplay(prettyPrinter.writer, "Summary - ")
+	cautils.SuccessDisplay(prettyPrinter.writer, "Passed:%v   ", controlSummary.NumberOfResources().Passed())
+	cautils.WarningDisplay(prettyPrinter.writer, "Action Required:%v   ", controlSummary.NumberOfResources().Skipped())
+	cautils.FailureDisplay(prettyPrinter.writer, "Failed:%v   ", controlSummary.NumberOfResources().Failed())
+	cautils.InfoDisplay(prettyPrinter.writer, "Total:%v\n", controlSummary.NumberOfResources().All())
+	if controlSummary.GetStatus().IsFailed() {
+		cautils.DescriptionDisplay(prettyPrinter.writer, "Remediation: %v\n", controlSummary.GetRemediation())
+	}
+	cautils.DescriptionDisplay(prettyPrinter.writer, "\n")
+
+}
+
+func (prettyPrinter *PrettyPrinter) printTitle(controlSummary reportsummary.IControlSummary) {
+	cautils.InfoDisplay(prettyPrinter.writer, "[control: %s - %s] ", controlSummary.GetName(), cautils.GetControlLink(controlSummary.GetID()))
+	statusDetails := ""
+	if controlSummary.GetSubStatus() != apis.SubStatusUnknown {
+		statusDetails = fmt.Sprintf(" (%s)", controlSummary.GetSubStatus())
+	}
+	switch controlSummary.GetStatus().Status() {
+	case apis.StatusSkipped:
+		cautils.InfoDisplay(prettyPrinter.writer, "action required%s %v\n", statusDetails, emoji.ConfusedFace)
+	case apis.StatusFailed:
+		cautils.FailureDisplay(prettyPrinter.writer, "failed%s %v\n", statusDetails, emoji.SadButRelievedFace)
+	default:
+		cautils.SuccessDisplay(prettyPrinter.writer, "passed%s %v\n", statusDetails, emoji.ThumbsUp)
+	}
+	cautils.DescriptionDisplay(prettyPrinter.writer, "Description: %s\n", controlSummary.GetDescription())
+	if controlSummary.GetStatus().Info() != "" {
+		cautils.WarningDisplay(prettyPrinter.writer, "Reason: %v\n", controlSummary.GetStatus().Info())
+	}
+}
+
+func (pp *PrettyPrinter) printResources(controlSummary reportsummary.IControlSummary, catalog cautils.ResourceCatalog, resourcesResult map[string]resourcesresults.Result) {
+
+	workloadsSummary := listResultSummaryFromCatalog(controlSummary, catalog)
+	// --show-evidence asks for the evidence, so it enables the evidence on its
+	// own here. Gating this on --verbose alone left the flag unread on the
+	// control view: showEvidence was threaded all the way to the printer and
+	// then never consulted on this path, so `kubescape scan -E --view control`
+	// printed exactly what a bare scan printed.
+	if pp.verboseMode || pp.showEvidence {
+		attachAssistedRemediation(workloadsSummary, controlSummary.GetID(), resourcesResult, pp.showSecrets)
+	}
+
+	failedWorkloads := groupByNamespaceOrKind(workloadsSummary, workloadSummaryFailed)
+	skippedWorkloads := groupByNamespaceOrKind(workloadsSummary, workloadSummarySkipped)
+
+	// Passed resources stay behind --verbose. They are a different request:
+	// --verbose widens *which resources* are listed, --show-evidence deepens
+	// *what is shown* about a failed one. Widening on -E would change the
+	// output of every control that has passing resources, which is not what
+	// the flag asks for.
+	var passedWorkloads map[string][]WorkloadSummary
+	if pp.verboseMode {
+		passedWorkloads = groupByNamespaceOrKind(workloadsSummary, workloadSummaryPassed)
+	}
+	if len(failedWorkloads) > 0 {
+		cautils.FailureDisplay(pp.writer, "Failed:\n")
+		pp.printGroupedResources(failedWorkloads)
+	}
+	if len(skippedWorkloads) > 0 {
+		cautils.WarningDisplay(pp.writer, "Action required:\n")
+		pp.printGroupedResources(skippedWorkloads)
+	}
+	if len(passedWorkloads) > 0 {
+		cautils.SuccessDisplay(pp.writer, "Passed:\n")
+		pp.printGroupedResources(passedWorkloads)
+	}
+
+}
+
+func attachAssistedRemediation(workloads []WorkloadSummary, controlID string, resourcesResult map[string]resourcesresults.Result, showSecrets bool) {
+	for i := range workloads {
+		if workloads[i].status != apis.StatusFailed {
+			continue
+		}
+		result, ok := resourcesResult[workloads[i].resource.GetID()]
+		if !ok {
+			continue
+		}
+		for j := range result.AssociatedControls {
+			if result.AssociatedControls[j].GetID() != controlID {
+				continue
+			}
+			if !result.AssociatedControls[j].GetStatus(nil).IsFailed() {
+				continue
+			}
+			paths := AssistedRemediationPathsWithCurrentValuesFiltered(&result.AssociatedControls[j], workloads[i].resource, showSecrets)
+			if len(paths) > 0 {
+				workloads[i].assistedRemediation = strings.Join(paths, ", ")
+			}
+			break
+		}
+	}
+}
+
+func (pp *PrettyPrinter) printGroupedResources(workloads map[string][]WorkloadSummary) {
+	indent := "  "
+	for title, rsc := range workloads {
+		pp.printGroupedResource(indent, title, rsc)
+	}
+}
+
+func (pp *PrettyPrinter) printGroupedResource(indent string, title string, rsc []WorkloadSummary) {
+	if title != "" {
+		cautils.SimpleDisplay(pp.writer, "%s%s\n", indent, title)
+		indent += indent
+	}
+
+	resources := []string{}
+	for r := range rsc {
+		relatedObjectsStr := generateRelatedObjectsStr(rsc[r])
+		line := fmt.Sprintf("%s%s - %s %s", indent, rsc[r].resource.GetKind(), rsc[r].resource.GetName(), relatedObjectsStr)
+		if rsc[r].assistedRemediation != "" {
+			line = strings.TrimRight(line, " ") + " " + rsc[r].assistedRemediation
+		}
+		resources = append(resources, line)
+	}
+
+	sort.Strings(resources)
+	for i := range resources {
+		cautils.SimpleDisplay(pp.writer, "%s\n", resources[i])
+	}
+}
+
+func generateRelatedObjectsStr(workload WorkloadSummary) string {
+	relatedStr := ""
+	if workload.resource.GetObjectType() == workloadinterface.TypeWorkloadObject {
+		relatedObjects := objectsenvelopes.NewRegoResponseVectorObject(workload.resource.GetObject()).GetRelatedObjects()
+		for i, related := range relatedObjects {
+			if ns := related.GetNamespace(); i == 0 && ns != "" {
+				relatedStr += fmt.Sprintf("Namespace - %s, ", ns)
+			}
+			relatedStr += fmt.Sprintf("%s - %s, ", related.GetKind(), related.GetName())
+		}
+	}
+	if relatedStr != "" {
+		relatedStr = fmt.Sprintf(" [%s]", relatedStr[:len(relatedStr)-2])
+	}
+	return relatedStr
+}
+
+func getSeparator(sep string) string {
+	var s strings.Builder
+	for range 80 {
+		s.WriteString(sep)
+	}
+	return s.String()
+}
+
+func isPrintSeparatorType(scanType cautils.ScanTypes) bool {
+	switch scanType {
+	case cautils.ScanTypeControl, cautils.ScanTypeFramework:
+		return true
+	default:
+		return false
+	}
+}
+
+// printScanCoverage prints a "Scan Coverage" warning block when GVR pull
+// failures caused controls to be skipped or partial data was collected.
+// Nothing is printed on a clean scan.
+func (pp *PrettyPrinter) printScanCoverage(coverage cautils.ScanCoverage) {
+	if len(coverage.FailedGVRPulls) == 0 && len(coverage.NotEvaluatedControls) == 0 && len(coverage.PartialGVRPulls) == 0 && len(coverage.PolicyDegradations) == 0 && len(coverage.VacuousFrameworks) == 0 && len(coverage.SkippedManifests) == 0 {
+		return
+	}
+
+	fmt.Fprintf(pp.writer, "\n%s\n", getSeparator("─"))
+	fmt.Fprintf(pp.writer, "Scan Coverage Warning\n")
+	fmt.Fprintf(pp.writer, "%s\n", getSeparator("─"))
+
+	fmt.Fprintf(pp.writer, "\nScan coverage score: %d%% (%d/%d controls evaluated)\n", cautils.Float32ToIntFloor(coverage.CoverageScore), coverage.EvaluatedControls, coverage.TotalControls)
+
+	if len(coverage.FailedGVRPulls) > 0 {
+		fmt.Fprintf(pp.writer, "\nThe following resource types could not be collected:\n")
+		for _, f := range coverage.FailedGVRPulls {
+			fmt.Fprintf(pp.writer, "  • %s: %s\n", f.GVR, f.Error)
+		}
+	}
+
+	if len(coverage.NotEvaluatedControls) > 0 {
+		fmt.Fprintf(pp.writer, "\nThe following controls were NOT evaluated:\n")
+		for _, c := range coverage.NotEvaluatedControls {
+			if c.Reason != "" {
+				fmt.Fprintf(pp.writer, "  • %s (%s)\n", c.ControlID, c.Reason)
+			} else {
+				fmt.Fprintf(pp.writer, "  • %s (missing: %s)\n", c.ControlID, strings.Join(c.MissingGVRs, ", "))
+			}
+		}
+	}
+
+	if len(coverage.PartialGVRPulls) > 0 {
+		fmt.Fprintf(pp.writer, "\nThe following resource types were only partially collected (some namespace/name selectors failed):\n")
+		for _, p := range coverage.PartialGVRPulls {
+			fmt.Fprintf(pp.writer, "  • %s (selector: %q): %s\n", p.GVR, p.Selector, p.Error)
+		}
+		fmt.Fprintf(pp.writer, "\nControls depending on these resource types were evaluated against incomplete data.\n")
+	}
+
+	if len(coverage.PolicyDegradations) > 0 {
+		fmt.Fprintf(pp.writer, "\nThe following policy inputs could not be loaded and were served from bundled defaults:\n")
+		for _, d := range coverage.PolicyDegradations {
+			fmt.Fprintf(pp.writer, "  • %s: %s\n", d.Component, d.Reason)
+		}
+		fmt.Fprintf(pp.writer, "\nControls depending on these inputs were evaluated against default configuration, which may not reflect your environment.\n")
+	}
+
+	if len(coverage.VacuousFrameworks) > 0 {
+		fmt.Fprintf(pp.writer, "\nThe following frameworks scored 100%% because no matching resources were found in this cluster:\n")
+		for _, f := range coverage.VacuousFrameworks {
+			fmt.Fprintf(pp.writer, "  • %s\n", f)
+		}
+	}
+
+	if len(coverage.SkippedManifests) > 0 {
+		fmt.Fprintf(pp.writer, "\nThe following manifest files could not be loaded and were not scanned:\n")
+		for _, s := range coverage.SkippedManifests {
+			fmt.Fprintf(pp.writer, "  • %s: %s\n", s.Path, s.Reason)
+		}
+		fmt.Fprintf(pp.writer, "\nControls were evaluated against incomplete input. Fix or exclude these files.\n")
+	}
+
+	if len(coverage.FailedGVRPulls) > 0 || len(coverage.PartialGVRPulls) > 0 {
+		fmt.Fprintf(pp.writer, "\nTo fix this, ensure the scanning identity has list/get permissions on the missing resource types.\n")
+	}
+	if len(coverage.PolicyDegradations) > 0 {
+		fmt.Fprintf(pp.writer, "\nTo fix this, ensure network access to the policy input source, or use --fail-on-degraded-config to fail the scan instead of using bundled defaults.\n")
+	}
+}
+
+// CloseWriter closes the pretty-printer output writer, returning any error from flushing or closing.
+func (p *PrettyPrinter) CloseWriter() error {
+	if p.writer != nil && p.writer != os.Stdout {
+		return p.writer.Close()
+	}
+	return nil
+}

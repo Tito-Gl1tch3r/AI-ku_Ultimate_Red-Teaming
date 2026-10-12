@@ -1,0 +1,244 @@
+package testserver
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/cespare/xxhash/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/balancer"
+	"google.golang.org/grpc/resolver"
+
+	"github.com/authzed/consistent"
+
+	"github.com/authzed/spicedb/internal/dispatch"
+	combineddispatch "github.com/authzed/spicedb/internal/dispatch/combined"
+	"github.com/authzed/spicedb/internal/grpchelpers"
+	"github.com/authzed/spicedb/pkg/cmd/server"
+	"github.com/authzed/spicedb/pkg/cmd/util"
+	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/query"
+	"github.com/authzed/spicedb/pkg/secrets"
+)
+
+const TestResolverScheme = "test"
+
+type TempError struct{}
+
+func (t TempError) Error() string {
+	return "no dialers yet"
+}
+
+func (t TempError) Temporary() bool {
+	return true
+}
+
+type dialerFunc func(ctx context.Context, s string) (net.Conn, error)
+
+// track prefixes used for making test clusters to avoid registering the same
+// prometheus subsystem twice in one run
+var usedPrefixes sync.Map
+
+func getPrefix(t testing.TB) string {
+	for {
+		prefix, err := secrets.TokenHex(8)
+		require.NoError(t, err)
+		if _, ok := usedPrefixes.Load(prefix); !ok {
+			usedPrefixes.Store(prefix, struct{}{})
+			return prefix
+		}
+	}
+}
+
+var testResolverBuilder = &SafeManualResolverBuilder{}
+
+func init() {
+	// register hashring balancer
+	balancer.Register(consistent.NewBuilder(xxhash.Sum64))
+
+	// Register a manual resolver.Builder  that we can feed addresses for tests
+	// Registration is not thread safe, so we register a single resolver.Builder
+	// to handle all clusters, rather than registering a unique resolver.Builder
+	// per cluster.
+	resolver.Register(testResolverBuilder)
+}
+
+// SafeManualResolverBuilder is a resolver builder that builds SafeManualResolvers
+// it is similar to manual.Resolver in grpc, but is thread safe
+type SafeManualResolverBuilder struct {
+	addrs sync.Map
+}
+
+func (b *SafeManualResolverBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOptions) (resolver.Resolver, error) {
+	if target.URL.Scheme != TestResolverScheme {
+		return nil, errors.New("test resolver builder only works with test:// addresses")
+	}
+	var addrs []resolver.Address
+	addrVal, ok := b.addrs.Load(target.URL.Hostname())
+	if !ok {
+		addrs = make([]resolver.Address, 0)
+	} else {
+		addrs = addrVal.([]resolver.Address)
+	}
+	r := &SafeManualResolver{
+		prefix: target.URL.Hostname(),
+		cc:     cc,
+		opts:   opts,
+		addrs:  addrs,
+	}
+	// Push addresses immediately so the gRPC channel can proceed without
+	// requiring a separate ResolveNow call after the resolver is built.
+	r.ResolveNow(resolver.ResolveNowOptions{})
+	return r, nil
+}
+
+func (b *SafeManualResolverBuilder) Scheme() string {
+	return "test"
+}
+
+func (b *SafeManualResolverBuilder) SetAddrs(prefix string, addrs []resolver.Address) {
+	b.addrs.Store(prefix, addrs)
+}
+
+// SafeManualResolver is the resolver type that SafeManualResolverBuilder builds
+// it returns a static list of addresses
+type SafeManualResolver struct {
+	prefix string
+	cc     resolver.ClientConn
+	opts   resolver.BuildOptions
+	addrs  []resolver.Address
+}
+
+// ResolveNow implements the resolver.Resolver interface
+// It sends the static list of addresses to the underlying resolver.ClientConn
+func (r *SafeManualResolver) ResolveNow(_ resolver.ResolveNowOptions) {
+	if r.cc == nil {
+		return
+	}
+	if err := r.cc.UpdateState(resolver.State{Addresses: r.addrs}); err != nil {
+		fmt.Println("ERROR UPDATING STATE", err) // shouldn't happen, log
+	}
+}
+
+// Close implements the resolver.Resolver interface
+func (r *SafeManualResolver) Close() {}
+
+// TestClusterWithDispatch creates a cluster with `size` nodes.
+// The cluster has a real dispatch stack that uses bufconn grpc connections.
+// All Caching is turned off.
+func TestClusterWithDispatch(t testing.TB, size uint, ds datastore.Datastore, additionalServerOptions ...server.ConfigOption) []*grpc.ClientConn {
+	// each cluster gets a unique prefix since grpc resolution is process-global
+	prefix := getPrefix(t)
+
+	// make placeholder resolved addresses, 1 per node
+	addresses := make([]resolver.Address, 0, size)
+	for i := range size {
+		addresses = append(addresses, resolver.Address{
+			Addr:       fmt.Sprintf("%s_%d", prefix, i),
+			ServerName: "",
+		})
+	}
+	testResolverBuilder.SetAddrs(prefix, addresses)
+
+	dialers := make([]dialerFunc, 0, size)
+	conns := make([]*grpc.ClientConn, 0, size)
+
+	for i := range size {
+		// One QueryPlanMetadata per node, shared between the node's dispatcher
+		// (so receiver-side DispatchQueryPlan augments + advises off it) and the
+		// permissions service (so the sender's advisor and the receiver's are
+		// consulting the same store).
+		queryPlanMetadata := query.NewQueryPlanMetadata()
+
+		dispatcherOptions := []combineddispatch.Option{
+			combineddispatch.UpstreamAddr("test://" + prefix),
+			combineddispatch.Metrics(dispatch.MetricsOptions{
+				PrometheusRegistry:  prometheus.NewRegistry(),
+				PrometheusSubsystem: fmt.Sprintf("%s_%d_client_dispatch", prefix, i),
+			}),
+			combineddispatch.QueryPlanMetadata(queryPlanMetadata),
+			combineddispatch.GrpcDialOpts(
+				grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+				grpc.WithDefaultServiceConfig(
+					(&consistent.BalancerConfig{
+						ReplicationFactor: 1500,
+						Spread:            1,
+					}).MustServiceConfigJSON()),
+				grpc.WithContextDialer(func(ctx context.Context, s string) (net.Conn, error) {
+					// it's possible grpc tries to dial before we have set the
+					// buffconn dialers, we have to return a "TempError" so that
+					// grpc knows to retry the connection.
+					if len(dialers) == 0 {
+						return nil, TempError{}
+					}
+					// "s" here will be the address from the manual resolver
+					// like `<prefix>_<node number>`
+					i, err := strconv.Atoi(strings.TrimPrefix(s, prefix+"_"))
+					require.NoError(t, err)
+					return dialers[i](ctx, s)
+				}),
+			),
+		}
+
+		dispatcher, err := combineddispatch.NewDispatcher(dispatcherOptions...)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			dispatcher.Close()
+		})
+
+		serverOptions := []server.ConfigOption{ //nolint: prealloc  // we're not worried about perf here
+			server.WithDatastore(ds),
+			server.WithDispatcher(dispatcher),
+			server.WithQueryPlanMetadata(queryPlanMetadata),
+			server.WithGRPCServer(util.GRPCServerConfig{
+				Network: util.BufferedNetwork,
+				Enabled: true,
+			}),
+			server.WithSchemaPrefixesRequired(false),
+			server.WithGRPCAuthFunc(func(ctx context.Context) (context.Context, error) {
+				return ctx, nil
+			}),
+			server.WithHTTPGateway(util.HTTPServerConfig{HTTPEnabled: false}),
+			server.WithMetricsAPI(util.HTTPServerConfig{HTTPEnabled: false}),
+			server.WithDispatchServer(util.GRPCServerConfig{
+				Enabled: true,
+				Network: util.BufferedNetwork,
+			}),
+			server.WithDispatchClusterMetricsPrefix(fmt.Sprintf("%s_%d_dispatch", prefix, i)),
+		}
+		serverOptions = append(serverOptions, additionalServerOptions...)
+
+		cfg := server.NewConfigWithOptionsAndDefaults(serverOptions...)
+		srv, listeners, err := cfg.CompleteForTesting(t.Context())
+		require.NoError(t, err)
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- srv.Run(t.Context())
+		}()
+		t.Cleanup(func() {
+			err := <-errCh
+			require.NoError(t, err)
+		})
+		dialers = append(dialers, func(ctx context.Context, _ string) (net.Conn, error) {
+			return listeners.Dispatch.DialContext(ctx)
+		})
+
+		conn, err := grpchelpers.NewBufferedClient(listeners.GRPC)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			conn.Close()
+		})
+		conns = append(conns, conn)
+	}
+
+	return conns
+}

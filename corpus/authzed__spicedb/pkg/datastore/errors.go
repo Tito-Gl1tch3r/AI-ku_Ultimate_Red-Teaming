@@ -1,0 +1,417 @@
+package datastore
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/rs/zerolog"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+
+	core "github.com/authzed/spicedb/pkg/proto/core/v1"
+	"github.com/authzed/spicedb/pkg/spiceerrors"
+	"github.com/authzed/spicedb/pkg/tuple"
+)
+
+// ErrNotFound is a shared interface for not found errors.
+type ErrNotFound interface {
+	IsNotFoundError() bool
+}
+
+// NamespaceNotFoundError occurs when a namespace was not found.
+type NamespaceNotFoundError struct {
+	error
+	namespaceName string
+}
+
+var _ ErrNotFound = NamespaceNotFoundError{}
+
+func (err NamespaceNotFoundError) IsNotFoundError() bool {
+	return true
+}
+
+// NotFoundNamespaceName is the name of the namespace not found.
+func (err NamespaceNotFoundError) NotFoundNamespaceName() string {
+	return err.namespaceName
+}
+
+// MarshalZerologObject implements zerolog object marshalling.
+func (err NamespaceNotFoundError) MarshalZerologObject(e *zerolog.Event) {
+	e.Err(err.error).Str("namespace", err.namespaceName)
+}
+
+// DetailsMetadata returns the metadata for details for this error.
+func (err NamespaceNotFoundError) DetailsMetadata() map[string]string {
+	return map[string]string{
+		"definition_name": err.namespaceName,
+	}
+}
+
+// WatchDisconnectedError occurs when a watch has fallen too far behind and was forcibly disconnected
+// as a result.
+type WatchDisconnectedError struct{ error }
+
+// WatchCanceledError occurs when a watch was canceled by the caller.
+type WatchCanceledError struct{ error }
+
+// WatchDisabledError occurs when watch is disabled by being unsupported by the datastore.
+type WatchDisabledError struct{ error }
+
+// ReadOnlyError is returned when the operation cannot be completed because the datastore is in
+// read-only mode.
+type ReadOnlyError struct{ error }
+
+// WatchRetryableError is returned when a transient/temporary error occurred in watch and indicates that
+// the caller *may* retry the watch after some backoff time.
+type WatchRetryableError struct{ error }
+
+// InvalidRevisionReason is the reason the revision could not be used.
+type InvalidRevisionReason int
+
+const (
+	// RevisionStale is the reason returned when a revision is outside the window of
+	// validity by being too old.
+	RevisionStale InvalidRevisionReason = iota
+
+	// CouldNotDetermineRevision is the reason returned when a revision for a
+	// request could not be determined.
+	CouldNotDetermineRevision
+)
+
+// InvalidRevisionError occurs when a revision specified to a call was invalid.
+type InvalidRevisionError struct {
+	error
+	revision Revision
+	reason   InvalidRevisionReason
+}
+
+// InvalidRevision is the revision that failed.
+func (err InvalidRevisionError) InvalidRevision() Revision {
+	return err.revision
+}
+
+// Reason is the reason the revision failed.
+func (err InvalidRevisionError) Reason() InvalidRevisionReason {
+	return err.reason
+}
+
+// MarshalZerologObject implements zerolog object marshalling.
+func (err InvalidRevisionError) MarshalZerologObject(e *zerolog.Event) {
+	switch err.reason {
+	case RevisionStale:
+		e.Err(err.error).Str("reason", "stale")
+	case CouldNotDetermineRevision:
+		e.Err(err.error).Str("reason", "indeterminate")
+	default:
+		e.Err(err.error).Str("reason", "unknown")
+	}
+}
+
+// NewNamespaceNotFoundErr constructs a new namespace not found error.
+func NewNamespaceNotFoundErr(nsName string) error {
+	return NamespaceNotFoundError{
+		error:         fmt.Errorf("object definition `%s` not found", nsName),
+		namespaceName: nsName,
+	}
+}
+
+// SchemaNotDefinedError occurs when no schema has been defined in the datastore.
+type SchemaNotDefinedError struct {
+	error
+}
+
+var _ ErrNotFound = SchemaNotDefinedError{}
+
+func (err SchemaNotDefinedError) IsNotFoundError() bool {
+	return true
+}
+
+// MarshalZerologObject implements zerolog object marshalling.
+func (err SchemaNotDefinedError) MarshalZerologObject(e *zerolog.Event) {
+	e.Err(err.error)
+}
+
+// DetailsMetadata returns the metadata for details for this error.
+func (err SchemaNotDefinedError) DetailsMetadata() map[string]string {
+	return map[string]string{}
+}
+
+// NewSchemaNotDefinedErr constructs a new schema not defined error.
+func NewSchemaNotDefinedErr() error {
+	return SchemaNotDefinedError{
+		error: errors.New("no schema has been defined; please call WriteSchema to start"),
+	}
+}
+
+// NewWatchDisconnectedErr constructs a new watch was disconnected error.
+func NewWatchDisconnectedErr() error {
+	return WatchDisconnectedError{
+		error: errors.New("watch fell too far behind and was disconnected; consider increasing watch buffer size via the flag --datastore-watch-buffer-length"),
+	}
+}
+
+// NewWatchCanceledErr constructs a new watch was canceled error.
+func NewWatchCanceledErr() error {
+	return WatchCanceledError{
+		error: errors.New("watch was canceled by the caller"),
+	}
+}
+
+// NewWatchDisabledErr constructs a new watch is disabled error.
+func NewWatchDisabledErr(reason string) error {
+	return WatchDisabledError{
+		error: fmt.Errorf("watch is currently disabled: %s", reason),
+	}
+}
+
+// NewWatchTemporaryErr wraps another error in watch, indicating that the error is likely
+// a temporary condition and clients may consider retrying by calling watch again (vs a fatal error).
+func NewWatchTemporaryErr(wrapped error) error {
+	return WatchRetryableError{
+		error: fmt.Errorf("watch has failed with a temporary condition: %w. Please retry", wrapped),
+	}
+}
+
+// NewReadonlyErr constructs an error for when a request has failed because
+// the datastore has been configured to be read-only.
+func NewReadonlyErr() error {
+	return ReadOnlyError{
+		error: errors.New("datastore is in read-only mode"),
+	}
+}
+
+// NewInvalidRevisionErr constructs a new invalid revision error.
+func NewInvalidRevisionErr(revision Revision, reason InvalidRevisionReason) error {
+	switch reason {
+	case RevisionStale:
+		return InvalidRevisionError{
+			error:    errors.New("revision has expired"),
+			revision: revision,
+			reason:   reason,
+		}
+
+	default:
+		return InvalidRevisionError{
+			error:    errors.New("revision was invalid"),
+			revision: revision,
+			reason:   reason,
+		}
+	}
+}
+
+// CaveatNameNotFoundError is the error returned when a caveat is not found by its name
+type CaveatNameNotFoundError struct {
+	error
+	name string
+}
+
+var _ ErrNotFound = CaveatNameNotFoundError{}
+
+func (err CaveatNameNotFoundError) IsNotFoundError() bool {
+	return true
+}
+
+// CaveatName returns the name of the caveat that couldn't be found
+func (err CaveatNameNotFoundError) CaveatName() string {
+	return err.name
+}
+
+// NewCaveatNameNotFoundErr constructs a new caveat name not found error.
+func NewCaveatNameNotFoundErr(name string) error {
+	return CaveatNameNotFoundError{
+		error: fmt.Errorf("caveat with name `%s` not found", name),
+		name:  name,
+	}
+}
+
+// DetailsMetadata returns the metadata for details for this error.
+func (err CaveatNameNotFoundError) DetailsMetadata() map[string]string {
+	return map[string]string{
+		"caveat_name": err.name,
+	}
+}
+
+// CounterNotRegisteredError indicates that a counter was not registered.
+type CounterNotRegisteredError struct {
+	error
+	counterName string
+}
+
+// NewCounterNotRegisteredErr constructs a new counter not registered error.
+func NewCounterNotRegisteredErr(counterName string) error {
+	return CounterNotRegisteredError{
+		error:       fmt.Errorf("counter with name `%s` not found", counterName),
+		counterName: counterName,
+	}
+}
+
+// DetailsMetadata returns the metadata for details for this error.
+func (err CounterNotRegisteredError) DetailsMetadata() map[string]string {
+	return map[string]string{
+		"counter_name": err.counterName,
+	}
+}
+
+// CounterAlreadyRegisteredError indicates that a counter  was already registered.
+type CounterAlreadyRegisteredError struct {
+	error
+
+	counterName string
+	filter      *core.RelationshipFilter
+}
+
+// NewCounterAlreadyRegisteredErr constructs a new filter not registered error.
+func NewCounterAlreadyRegisteredErr(counterName string, filter *core.RelationshipFilter) error {
+	return CounterAlreadyRegisteredError{
+		error:       fmt.Errorf("counter with name `%s` already registered", counterName),
+		counterName: counterName,
+		filter:      filter,
+	}
+}
+
+// DetailsMetadata returns the metadata for details for this error.
+func (err CounterAlreadyRegisteredError) DetailsMetadata() map[string]string {
+	subjectType := ""
+	subjectID := ""
+	subjectRelation := ""
+	if err.filter.OptionalSubjectFilter != nil {
+		subjectType = err.filter.OptionalSubjectFilter.SubjectType
+		subjectID = err.filter.OptionalSubjectFilter.OptionalSubjectId
+
+		if err.filter.OptionalSubjectFilter.GetOptionalRelation() != nil {
+			subjectRelation = err.filter.OptionalSubjectFilter.GetOptionalRelation().Relation
+		}
+	}
+
+	return map[string]string{
+		"counter_name":                  err.counterName,
+		"new_filter_resource_type":      err.filter.ResourceType,
+		"new_filter_resource_id":        err.filter.OptionalResourceId,
+		"new_filter_resource_id_prefix": err.filter.OptionalResourceIdPrefix,
+		"new_filter_relation":           err.filter.OptionalRelation,
+		"new_filter_subject_type":       subjectType,
+		"new_filter_subject_id":         subjectID,
+		"new_filter_subject_relation":   subjectRelation,
+	}
+}
+
+// MaximumChangesSizeExceededError is returned when the maximum size of changes is exceeded.
+type MaximumChangesSizeExceededError struct {
+	error
+	maxSize uint64
+}
+
+// NewMaximumChangesSizeExceededError creates a new MaximumChangesSizeExceededError.
+func NewMaximumChangesSizeExceededError(maxSize uint64) error {
+	return MaximumChangesSizeExceededError{fmt.Errorf("maximum changes byte size of %d exceeded; adjust --datastore-watch-change-buffer-maximum-size accordingly", maxSize), maxSize}
+}
+
+var (
+	ErrClosedIterator               = errors.New("unable to iterate: iterator closed")
+	ErrCursorsWithoutSorting        = errors.New("cursors are disabled on unsorted results")
+	ErrCursorEmpty                  = errors.New("cursors are only available after the first result")
+	ErrSchemaNotFound               = errors.New("schema not found")
+	ErrSchemaHashPreconditionFailed = errors.New("schema hash precondition failed: schema changed since last check")
+
+	// ErrCursoredDeleteNotSupported is the sentinel reported when a cursored
+	// relationship deletion is requested of a datastore that does not support one.
+	// Prefer NewCursoredDeleteNotSupportedErr, which names the datastore engine and
+	// matches this sentinel under errors.Is.
+	ErrCursoredDeleteNotSupported = errors.New("cursored relationship deletion is not supported by this datastore")
+)
+
+// CursoredDeleteNotSupportedError indicates that a cursored relationship deletion
+// was requested (via options.WithCursoredDelete or options.WithDeleteAfter) of a
+// datastore that does not support one. It matches ErrCursoredDeleteNotSupported
+// under errors.Is.
+type CursoredDeleteNotSupportedError struct {
+	error
+	engine string
+}
+
+// NewCursoredDeleteNotSupportedErr constructs a CursoredDeleteNotSupportedError for
+// the given datastore engine. The engine may be empty if unknown.
+func NewCursoredDeleteNotSupportedErr(engine string) error {
+	msg := "cursored relationship deletion is not supported by this datastore"
+	if engine != "" {
+		msg = fmt.Sprintf("cursored relationship deletion is not supported by the %q datastore engine", engine)
+	}
+	return CursoredDeleteNotSupportedError{
+		error:  errors.New(msg),
+		engine: engine,
+	}
+}
+
+// Engine returns the name of the datastore engine that does not support cursored
+// deletion, or the empty string if it was not known.
+func (err CursoredDeleteNotSupportedError) Engine() string {
+	return err.engine
+}
+
+// Is matches the ErrCursoredDeleteNotSupported sentinel, so callers may use either
+// errors.Is(err, ErrCursoredDeleteNotSupported) or errors.As with this type.
+func (err CursoredDeleteNotSupportedError) Is(target error) bool {
+	return target == ErrCursoredDeleteNotSupported
+}
+
+// DetailsMetadata returns the metadata for details for this error.
+func (err CursoredDeleteNotSupportedError) DetailsMetadata() map[string]string {
+	return map[string]string{
+		"datastore_engine": err.engine,
+	}
+}
+
+// CreateRelationshipExistsError is returned when attempting to CREATE an already-existing relationship.
+type CreateRelationshipExistsError struct {
+	error
+
+	// Relationship is the relationship that caused the error. May be nil, depending on the datastore.
+	Relationship *tuple.Relationship
+}
+
+// GRPCStatus implements retrieving the gRPC status for the error.
+func (err CreateRelationshipExistsError) GRPCStatus() *status.Status {
+	if err.Relationship == nil {
+		return spiceerrors.WithCodeAndDetails(
+			err,
+			codes.AlreadyExists,
+			spiceerrors.ForReason(
+				v1.ErrorReason_ERROR_REASON_ATTEMPT_TO_RECREATE_RELATIONSHIP,
+				map[string]string{},
+			),
+		)
+	}
+
+	relationship := tuple.ToV1Relationship(*err.Relationship)
+	return spiceerrors.WithCodeAndDetails(
+		err,
+		codes.AlreadyExists,
+		spiceerrors.ForReason(
+			v1.ErrorReason_ERROR_REASON_ATTEMPT_TO_RECREATE_RELATIONSHIP,
+			map[string]string{
+				"relationship":       tuple.V1StringRelationshipWithoutCaveatOrExpiration(relationship),
+				"resource_type":      relationship.Resource.ObjectType,
+				"resource_object_id": relationship.Resource.ObjectId,
+				"resource_relation":  relationship.Relation,
+				"subject_type":       relationship.Subject.Object.ObjectType,
+				"subject_object_id":  relationship.Subject.Object.ObjectId,
+				"subject_relation":   relationship.Subject.OptionalRelation,
+			},
+		),
+	)
+}
+
+// NewCreateRelationshipExistsError creates a new CreateRelationshipExistsError.
+func NewCreateRelationshipExistsError(relationship *tuple.Relationship) error {
+	msg := "could not CREATE one or more relationships, as they already existed. If this is persistent, please switch to TOUCH operations or specify a precondition"
+	if relationship != nil {
+		msg = fmt.Sprintf("could not CREATE relationship `%s`, as it already existed. If this is persistent, please switch to TOUCH operations or specify a precondition", tuple.StringWithoutCaveatOrExpiration(*relationship))
+	}
+
+	return CreateRelationshipExistsError{
+		errors.New(msg),
+		relationship,
+	}
+}

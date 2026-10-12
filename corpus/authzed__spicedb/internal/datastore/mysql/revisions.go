@@ -1,0 +1,211 @@
+package mysql
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	mysqlCommon "github.com/authzed/spicedb/internal/datastore/mysql/common"
+	"github.com/authzed/spicedb/internal/datastore/revisions"
+	"github.com/authzed/spicedb/internal/telemetry/otelconv"
+	"github.com/authzed/spicedb/pkg/datastore"
+)
+
+var ParseRevisionString = revisions.RevisionParser(revisions.TransactionID)
+
+const (
+	errRevision      = "unable to find revision: %w"
+	errCheckRevision = "unable to check revision: %w"
+
+	// querySelectRevision will round the database's timestamp down to the nearest
+	// quantization period, and then find the first transaction after that. If there
+	// are no transactions newer than the quantization period, it just picks the latest
+	// transaction. It will also return the amount of nanoseconds until the next
+	// optimized revision would be selected server-side, for use with caching, and
+	// the schema hash visible at the selected revision (for the stored-schema cache).
+	//
+	//   %[1] Name of id column
+	//   %[2] Relationship tuple transaction table
+	//   %[3] Name of timestamp column
+	//   %[4] Quantization period (in nanoseconds)
+	//   %[5] Follower read delay (in nanoseconds)
+	//   %[6] Schema revision table
+	querySelectRevision = `WITH selected AS (
+			SELECT COALESCE((
+				SELECT MIN(%[1]s)
+				FROM   %[2]s
+				WHERE  %[3]s >= FROM_UNIXTIME(FLOOR((UNIX_TIMESTAMP(UTC_TIMESTAMP(6)) * 1000000000 - %[5]d) / %[4]d) * %[4]d / 1000000000)
+			), (
+				SELECT MAX(%[1]s)
+				FROM   %[2]s
+			)) as xid
+		)
+		SELECT selected.xid as revision,
+			%[4]d - CAST(UNIX_TIMESTAMP(UTC_TIMESTAMP(6)) * 1000000000 AS UNSIGNED INTEGER) %% %[4]d as validForNanos,
+			COALESCE((SELECT hash FROM %[6]s WHERE created_transaction <= selected.xid AND deleted_transaction > selected.xid ORDER BY created_transaction DESC LIMIT 1), '') as schema_hash
+		FROM selected;`
+
+	// queryValidTransaction will return a single row with two values, one boolean
+	// for whether the specified transaction ID is newer than the garbage collection
+	// window, and one boolean for whether the transaction ID represents a transaction
+	// that will occur in the future.
+	// It treats the current head transaction as always valid even if it falls
+	// outside the GC window.
+	//
+	//   %[1] Name of id column
+	//   %[2] Relationship tuple transaction table
+	//   %[3] Name of timestamp column
+	//   %[4] Inverse of GC window (in seconds)
+	queryValidTransaction = `
+		SELECT ? >= COALESCE((
+			SELECT MIN(%[1]s)
+			FROM   %[2]s
+			WHERE  %[3]s >= TIMESTAMPADD(SECOND, %.6[4]f, UTC_TIMESTAMP(6))
+		),( 
+		    SELECT MAX(%[1]s)
+		    FROM %[2]s
+		    LIMIT 1
+		)) as fresh, ? > (
+			SELECT MAX(%[1]s)
+			FROM   %[2]s
+		) as unknown;`
+)
+
+func (mds *mysqlDatastore) OptimizedRevision(ctx context.Context) (datastore.RevisionWithSchemaHashAndValidity, error) {
+	var rev uint64
+	var validForNanos time.Duration
+	var schemaHash []byte
+	if err := mds.db.QueryRowContext(ctx, mds.optimizedRevisionQuery).
+		Scan(&rev, &validForNanos, &schemaHash); err != nil {
+		return datastore.RevisionWithSchemaHashAndValidity{}, fmt.Errorf(errRevision, err)
+	}
+	return datastore.RevisionWithSchemaHashAndValidity{
+		Revision:   revisions.NewForTransactionID(rev),
+		ValidFor:   validForNanos,
+		SchemaHash: string(schemaHash),
+	}, nil
+}
+
+func (mds *mysqlDatastore) HeadRevision(ctx context.Context) (datastore.RevisionWithSchemaHash, error) {
+	revision, err := mds.loadRevision(ctx)
+	if err != nil {
+		return datastore.RevisionWithSchemaHash{}, err
+	}
+	if revision == 0 {
+		return datastore.RevisionWithSchemaHash{}, nil
+	}
+
+	schemaHash, err := mds.loadSchemaHash(ctx, revision)
+	if err != nil {
+		return datastore.RevisionWithSchemaHash{}, err
+	}
+
+	return datastore.RevisionWithSchemaHash{Revision: revisions.NewForTransactionID(revision), SchemaHash: schemaHash}, nil
+}
+
+func (mds *mysqlDatastore) loadSchemaHash(ctx context.Context, revisionID uint64) (string, error) {
+	ctx, span := tracer.Start(ctx, "loadSchemaHash")
+	defer span.End()
+
+	query := fmt.Sprintf( //nolint:gosec // table name is from trusted internal config
+		"SELECT hash FROM %s WHERE created_transaction <= ? AND deleted_transaction > ? ORDER BY created_transaction DESC LIMIT 1",
+		mds.driver.SchemaRevision(),
+	)
+
+	var hash []byte
+	err := mds.db.QueryRowContext(ctx, query, revisionID, revisionID).Scan(&hash)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("unable to load schema hash: %w", err)
+	}
+
+	return string(hash), nil
+}
+
+func (mds *mysqlDatastore) CheckRevision(ctx context.Context, revision datastore.Revision) error {
+	if revision == datastore.NoRevision {
+		return datastore.NewInvalidRevisionErr(revision, datastore.CouldNotDetermineRevision)
+	}
+
+	rev, ok := revision.(revisions.TransactionIDRevision)
+	if !ok {
+		return fmt.Errorf("expected transaction revision, got %T", revision)
+	}
+
+	revisionTx := rev.TransactionID()
+	freshEnough, unknown, err := mds.checkValidTransaction(ctx, revisionTx)
+	if err != nil {
+		return fmt.Errorf(errCheckRevision, err)
+	}
+
+	if !freshEnough {
+		return datastore.NewInvalidRevisionErr(revision, datastore.RevisionStale)
+	}
+	if unknown {
+		return datastore.NewInvalidRevisionErr(revision, datastore.CouldNotDetermineRevision)
+	}
+
+	return nil
+}
+
+func (mds *mysqlDatastore) loadRevision(ctx context.Context) (uint64, error) {
+	// slightly changed to support no revisions at all, needed for runtime seeding of first transaction
+	ctx, span := tracer.Start(ctx, "loadRevision")
+	defer span.End()
+
+	query, args, err := mds.GetLastRevision.ToSql()
+	if err != nil {
+		return 0, fmt.Errorf(errRevision, err)
+	}
+
+	var revision *uint64
+	err = mds.db.QueryRowContext(ctx, query, args...).Scan(&revision)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf(errRevision, err)
+	}
+
+	if revision == nil {
+		return 0, nil
+	}
+
+	return *revision, nil
+}
+
+func (mds *mysqlDatastore) checkValidTransaction(ctx context.Context, revisionTx uint64) (bool, bool, error) {
+	ctx, span := tracer.Start(ctx, "checkValidTransaction")
+	defer span.End()
+
+	var freshEnough, unknown sql.NullBool
+
+	err := mds.db.QueryRowContext(ctx, mds.validTransactionQuery, revisionTx, revisionTx).
+		Scan(&freshEnough, &unknown)
+	if err != nil {
+		return false, false, fmt.Errorf(errCheckRevision, err)
+	}
+
+	span.AddEvent(otelconv.EventDatastoreMySQLTransactionValidated, trace.WithAttributes(
+		attribute.Bool(otelconv.AttrDatastoreMySQLTransactionFresh, freshEnough.Bool),
+		attribute.Bool(otelconv.AttrDatastoreMySQLTransactionUnknown, unknown.Bool),
+	))
+
+	return freshEnough.Bool, unknown.Bool, nil
+}
+
+func (mds *mysqlDatastore) createNewTransaction(ctx context.Context, tx *sql.Tx, metadata map[string]any) (newTxnID uint64, err error) {
+	ctx, span := tracer.Start(ctx, "createNewTransaction")
+	defer span.End()
+
+	// TODO use common.TransactionMetadata?
+	wrappedMetadata := structpbWrapper(metadata)
+	return mysqlCommon.InsertNewTransaction(ctx, tx, mds.driver.RelationTupleTransaction(), &wrappedMetadata)
+}

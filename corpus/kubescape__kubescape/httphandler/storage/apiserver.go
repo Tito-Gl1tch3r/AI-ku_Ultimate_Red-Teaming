@@ -1,0 +1,800 @@
+package storage
+
+import (
+	"context"
+	"encoding/json"
+	stderrors "errors"
+	"fmt"
+	"maps"
+	"time"
+
+	"github.com/armosec/utils-k8s-go/wlid"
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	helpersv1 "github.com/kubescape/k8s-interface/instanceidhandler/v1/helpers"
+	"github.com/kubescape/k8s-interface/k8sinterface"
+	"github.com/kubescape/k8s-interface/names"
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	"github.com/kubescape/opa-utils/objectsenvelopes"
+	"github.com/kubescape/opa-utils/reporthandling"
+	"github.com/kubescape/opa-utils/reporthandling/apis"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/reportsummary"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/resourcesresults"
+	v2 "github.com/kubescape/opa-utils/reporthandling/v2"
+	"github.com/kubescape/storage/pkg/apis/softwarecomposition/v1beta1"
+	spdxv1beta1 "github.com/kubescape/storage/pkg/generated/clientset/versioned/typed/softwarecomposition/v1beta1"
+	"go.opentelemetry.io/otel"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
+)
+
+var storageInstance *APIServerStore
+
+const reportCreatedAtAnnotation = "kubescape.io/report-created-at"
+
+// compareReportTimes returns 0 for the same report (or an incoming report
+// without an identity), 1 for a newer report, and -1 for an older delayed
+// result. A timestamped report supersedes a legacy stored object: otherwise a
+// failure written before report identities existed could never be remediated.
+func compareReportTimes(existing, incoming time.Time) int {
+	if incoming.IsZero() {
+		return 0
+	}
+	if existing.IsZero() {
+		return 1
+	}
+	if incoming.After(existing) {
+		return 1
+	}
+	if incoming.Before(existing) {
+		return -1
+	}
+	return 0
+}
+
+func scanReportTime(spec v1beta1.WorkloadConfigurationScanSpec) time.Time {
+	if spec.Metadata == nil {
+		return time.Time{}
+	}
+	return spec.Metadata.Report.CreatedAt.Time
+}
+
+func summaryReportTime(annotations map[string]string) time.Time {
+	parsed, err := time.Parse(time.RFC3339Nano, annotations[reportCreatedAtAnnotation])
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
+}
+
+func workloadScanReportTime(scan *v1beta1.WorkloadConfigurationScan) time.Time {
+	if annotated := summaryReportTime(scan.Annotations); !annotated.IsZero() {
+		return annotated
+	}
+	return scanReportTime(scan.Spec)
+}
+
+func annotateReportTime(annotations map[string]string, reportTime time.Time) map[string]string {
+	if reportTime.IsZero() {
+		return annotations
+	}
+	return mergeMaps(annotations, map[string]string{
+		reportCreatedAtAnnotation: reportTime.Format(time.RFC3339Nano),
+	})
+}
+
+// ErrIncompleteRelatedObjects is returned when a RegoResponseVector lacks the expected Role+RoleBinding pair (e.g. orphaned binding).
+var ErrIncompleteRelatedObjects = stderrors.New("incomplete related objects")
+
+type PostureRepository interface {
+	GetWorkloadConfigurationScanResult(ctx context.Context, name, namespace string) (*v1beta1.WorkloadConfigurationScan, error)
+	BuildWorkloadConfigurationScan(ctx context.Context, report *v2.PostureReport, result *resourcesresults.Result) (*v1beta1.WorkloadConfigurationScan, error)
+	StoreWorkloadConfigurationScanResult(ctx context.Context, manifest *v1beta1.WorkloadConfigurationScan) error
+	StoreWorkloadConfigurationScanResultSummary(ctx context.Context, workloadScan *v1beta1.WorkloadConfigurationScan) (*v1beta1.WorkloadConfigurationScanSummary, error)
+}
+
+// APIServerStore implements both PostureRepository with in-cluster storage (apiserver) to be used for production
+type APIServerStore struct {
+	StorageClient         spdxv1beta1.SpdxV1beta1Interface
+	clusterName           string
+	namespace             string
+	continuousPostureScan bool
+}
+
+var _ PostureRepository = (*APIServerStore)(nil)
+
+func SetStorage(s *APIServerStore) {
+	storageInstance = s
+}
+
+func GetStorage() *APIServerStore {
+	return storageInstance
+}
+
+// NewAPIServerStorage initializes the APIServerStore struct
+func NewAPIServerStorage(clusterName string, namespace string, ksClient spdxv1beta1.SpdxV1beta1Interface, continuousPostureScan bool) (*APIServerStore, error) {
+	return &APIServerStore{
+		StorageClient:         ksClient,
+		clusterName:           clusterName,
+		namespace:             namespace,
+		continuousPostureScan: continuousPostureScan,
+	}, nil
+}
+
+func (a *APIServerStore) StorePostureReportResults(ctx context.Context, pr *v2.PostureReport) error {
+	recoveredResources := 0
+	recoveredControls := 0
+	failedResults := 0
+	var firstStoreErr error
+	for i := range pr.Results {
+		workloadScan, err := a.BuildWorkloadConfigurationScan(ctx, pr, &pr.Results[i])
+		if err != nil {
+			if stderrors.Is(err, ErrIncompleteRelatedObjects) {
+				logger.L().Ctx(ctx).Warning("skipping result with incomplete related objects", helpers.Error(err), helpers.String("resourceID", pr.Results[i].ResourceID))
+				continue
+			}
+			return err
+		}
+		if len(pr.Results[i].AssociatedControls) == 0 && len(workloadScan.Spec.Controls) > 0 {
+			recoveredResources++
+			recoveredControls += len(workloadScan.Spec.Controls)
+		}
+
+		var storeErr error
+		if a.continuousPostureScan {
+			if err := a.StoreWorkloadConfigurationScanResult(ctx, workloadScan); err != nil {
+				storeErr = err
+			}
+		}
+
+		if _, err := a.StoreWorkloadConfigurationScanResultSummary(ctx, workloadScan); err != nil {
+			if storeErr == nil {
+				storeErr = err
+			}
+		}
+		if storeErr != nil {
+			failedResults++
+			if firstStoreErr == nil {
+				firstStoreErr = fmt.Errorf("%s: %w", workloadScan.Name, storeErr)
+			}
+		}
+	}
+	if recoveredResources > 0 {
+		logger.L().Ctx(ctx).Warning("recovered missing per-resource controls from aggregate posture summary",
+			helpers.Int("resources", recoveredResources), helpers.Int("controls", recoveredControls))
+	}
+	if failedResults > 0 {
+		return fmt.Errorf("failed to store %d of %d posture scan results: %w",
+			failedResults, len(pr.Results), firstStoreErr)
+	}
+	return nil
+}
+
+func getControlsMapFromResult(ctx context.Context, result *resourcesresults.Result, controlSummaries reportsummary.ControlSummaries) map[string]v1beta1.ScannedControl {
+	m := map[string]v1beta1.ScannedControl{}
+
+	for i := range result.AssociatedControls {
+		control := result.AssociatedControls[i]
+		ctrlSummary := controlSummaries.GetControl(reportsummary.EControlCriteriaID, control.GetID())
+
+		m[control.GetID()] = v1beta1.ScannedControl{
+			ControlID: control.GetID(),
+			Name:      control.GetName(),
+			Severity:  parseControlSeverity(ctrlSummary),
+			Status:    parseScannedControlStatus(&control),
+			Rules:     parseScannedControlRules(&control),
+		}
+
+	}
+	if len(m) > 0 {
+		return m
+	}
+
+	// A posture report carries the resource/control relationship twice: in each
+	// Result.AssociatedControls entry and in ControlSummary.ResourceIDs. The
+	// former contains the richer rule-level evidence and remains the preferred
+	// source. When that entire per-resource list is missing, recover its
+	// relationships from the latter so an internally inconsistent report cannot
+	// be persisted as a false-clean WorkloadConfigurationScanSummary. The same
+	// summary resource lists drive the control table printed before in-cluster
+	// persistence. They retain
+	// only the per-resource status, so rule evidence, substatus, and status info
+	// remain empty for a recovered relationship.
+	for summaryKey, controlSummary := range controlSummaries {
+		status, associated := controlSummary.ResourceIDs.All()[result.ResourceID]
+		if !associated {
+			continue
+		}
+
+		controlID := controlSummary.GetID()
+		if controlID == "" {
+			controlID = summaryKey
+		}
+		if _, exists := m[controlID]; exists {
+			continue
+		}
+
+		m[controlID] = v1beta1.ScannedControl{
+			ControlID: controlID,
+			Name:      controlSummary.GetName(),
+			Severity:  parseControlSeverity(&controlSummary),
+			Status: v1beta1.ScannedControlStatus{
+				Status: string(status),
+			},
+		}
+	}
+	return m
+}
+
+func (a *APIServerStore) GetWorkloadConfigurationScanResult(ctx context.Context, name, namespace string) (*v1beta1.WorkloadConfigurationScan, error) {
+	_, span := otel.Tracer("").Start(ctx, "APIServerStore.GetWorkloadConfigurationScanResult")
+	defer span.End()
+	if name == "" {
+		logger.L().Debug("empty name provided, skipping workload scan result retrieval")
+		return &v1beta1.WorkloadConfigurationScan{}, nil
+	}
+	manifest, err := a.StorageClient.WorkloadConfigurationScans(namespace).Get(ctx, name, metav1.GetOptions{})
+	switch {
+	case errors.IsNotFound(err):
+		logger.L().Debug("workload configuration scan manifest not found in storage",
+			helpers.String("name", name))
+		return &v1beta1.WorkloadConfigurationScan{}, nil
+	case err != nil:
+		logger.L().Ctx(ctx).Warning("failed to get workload configuration scan manifest from apiserver", helpers.Error(err),
+			helpers.String("name", name))
+		return &v1beta1.WorkloadConfigurationScan{}, nil
+	}
+
+	logger.L().Debug("got workload configuration scan manifest from storage", helpers.String("name", name))
+	return manifest, nil
+}
+
+func findResourceInReport(resourceID string, report *v2.PostureReport) (*reporthandling.Resource, error) {
+	for i := range report.Resources {
+		if report.Resources[i].ResourceID == resourceID {
+			return &report.Resources[i], nil
+		}
+	}
+
+	return nil, fmt.Errorf("resource %s not found in report", resourceID)
+}
+
+func (a *APIServerStore) getResourceNamespace(resource workloadinterface.IMetadata, relatedObjects []workloadinterface.IMetadata) string {
+	if resource.GetNamespace() == "" || len(relatedObjects) > 0 {
+		return a.namespace
+	}
+
+	return resource.GetNamespace()
+}
+
+// BuildWorkloadConfigurationScan builds a WorkloadConfigurationScan manifest without storing it
+func (a *APIServerStore) BuildWorkloadConfigurationScan(ctx context.Context, report *v2.PostureReport, result *resourcesresults.Result) (*v1beta1.WorkloadConfigurationScan, error) {
+	resource, err := findResourceInReport(result.ResourceID, report)
+	if err != nil {
+		return nil, err
+	}
+
+	relatedObjects := getRelatedObjects(resource)
+	name, err := GetWorkloadScanK8sResourceName(ctx, resource, relatedObjects)
+
+	if err != nil {
+		return nil, err
+	}
+	namespace := a.getResourceNamespace(resource, relatedObjects)
+	labels, annotations, err := getManifestObjectLabelsAndAnnotations(a.clusterName, resource, relatedObjects)
+	if err != nil {
+		return nil, err
+	}
+
+	manifest := v1beta1.WorkloadConfigurationScan{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Annotations: annotations,
+			Labels:      labels,
+			Namespace:   namespace,
+		},
+		Spec: v1beta1.WorkloadConfigurationScanSpec{
+			Controls:       getControlsMapFromResult(ctx, result, report.SummaryDetails.Controls),
+			RelatedObjects: parseWorkloadScanRelatedObjectList(relatedObjects),
+			Metadata:       workloadConfigurationScanMetadata(report),
+		},
+	}
+
+	return &manifest, nil
+}
+
+func workloadConfigurationScanMetadata(report *v2.PostureReport) *v1beta1.WorkloadConfigurationScanMeta {
+	if report == nil || report.ReportGenerationTime.IsZero() {
+		return nil
+	}
+
+	return &v1beta1.WorkloadConfigurationScanMeta{
+		Report: v1beta1.ReportMeta{
+			CreatedAt: metav1.NewTime(report.ReportGenerationTime),
+		},
+	}
+}
+
+// StoreWorkloadConfigurationScanResult stores a WorkloadConfigurationScan manifest
+func (a *APIServerStore) StoreWorkloadConfigurationScanResult(ctx context.Context, manifest *v1beta1.WorkloadConfigurationScan) error {
+	// metav1.Time is serialized with second precision. Keep the exact report
+	// identity in an annotation so partial results from one report are not
+	// mistaken for a newer generation after an API-server round trip.
+	manifest = manifest.DeepCopy()
+	manifest.Annotations = annotateReportTime(manifest.Annotations, scanReportTime(manifest.Spec))
+	namespace := manifest.GetNamespace()
+	_, err := a.StorageClient.WorkloadConfigurationScans(namespace).Create(ctx, manifest, metav1.CreateOptions{})
+	switch {
+	case errors.IsAlreadyExists(err):
+		retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// retrieve the latest version before attempting update
+			// RetryOnConflict uses exponential backoff to avoid exhausting the apiserver
+			result, getErr := a.StorageClient.WorkloadConfigurationScans(namespace).Get(ctx, manifest.Name, metav1.GetOptions{})
+			if getErr != nil {
+				return getErr
+			}
+			switch compareReportTimes(workloadScanReportTime(result), workloadScanReportTime(manifest)) {
+			case 1:
+				result.Spec = manifest.Spec
+			case -1:
+				// Leave status and object metadata untouched for a delayed scan.
+				return nil
+			default:
+				result.Spec = mergeSameReportWorkloadConfigurationScanSpec(result.Spec, manifest.Spec)
+			}
+			// update the workload configuration scan manifest
+			result.Annotations = mergeMaps(result.Annotations, manifest.Annotations)
+			result.Labels = mergeMaps(result.Labels, manifest.Labels)
+			// try to send the updated workload configuration scan manifest
+			_, updateErr := a.StorageClient.WorkloadConfigurationScans(namespace).Update(ctx, result, metav1.UpdateOptions{})
+			return updateErr
+		})
+		if retryErr != nil {
+			logger.L().Ctx(ctx).Warning("failed to update WorkloadConfigurationScan manifest in storage", helpers.Error(retryErr),
+				helpers.String("name", manifest.Name))
+			return retryErr
+		} else {
+			logger.L().Debug("updated WorkloadConfigurationScan manifest in storage", helpers.String("name", manifest.Name))
+		}
+	case err != nil:
+		logger.L().Ctx(ctx).Warning("failed to store WorkloadConfigurationScan manifest in storage", helpers.Error(err), helpers.String("name", manifest.Name))
+		return err
+	default:
+		logger.L().Debug("stored WorkloadConfigurationScan manifest in storage", helpers.String("name", manifest.Name))
+	}
+	return nil
+}
+
+func mergeWorkloadConfigurationScanSpec(existingSpec v1beta1.WorkloadConfigurationScanSpec, newSpec v1beta1.WorkloadConfigurationScanSpec) v1beta1.WorkloadConfigurationScanSpec {
+	switch compareReportTimes(scanReportTime(existingSpec), scanReportTime(newSpec)) {
+	case 1:
+		return newSpec
+	case -1:
+		return existingSpec
+	}
+	return mergeSameReportWorkloadConfigurationScanSpec(existingSpec, newSpec)
+}
+
+func mergeSameReportWorkloadConfigurationScanSpec(existingSpec v1beta1.WorkloadConfigurationScanSpec, newSpec v1beta1.WorkloadConfigurationScanSpec) v1beta1.WorkloadConfigurationScanSpec {
+	if existingSpec.Controls == nil {
+		existingSpec.Controls = make(map[string]v1beta1.ScannedControl)
+	}
+	for ctrlID, newCtrl := range newSpec.Controls {
+		existingCtrl, found := existingSpec.Controls[ctrlID]
+		if !found {
+			existingSpec.Controls[ctrlID] = newCtrl
+			continue
+		}
+
+		existingStatus := apis.ScanningStatus(existingCtrl.Status.Status)
+		existingSubStatus := apis.ScanningSubStatus(existingCtrl.Status.SubStatus)
+		newStatus := apis.ScanningStatus(newCtrl.Status.Status)
+		newSubStatus := apis.ScanningSubStatus(newCtrl.Status.SubStatus)
+		mergedStatus, mergedSubStatus := apis.CompareStatusAndSubStatus(existingStatus, newStatus, existingSubStatus, newSubStatus)
+
+		info := newCtrl.Status.Info
+		if info == "" {
+			info = existingCtrl.Status.Info
+		}
+
+		severity := newCtrl.Severity
+		if severity.Severity == "" {
+			severity = existingCtrl.Severity
+		}
+
+		name := newCtrl.Name
+		if name == "" {
+			name = existingCtrl.Name
+		}
+
+		controlID := existingCtrl.ControlID
+		if controlID == "" {
+			controlID = newCtrl.ControlID
+		}
+
+		existingSpec.Controls[ctrlID] = v1beta1.ScannedControl{
+			ControlID: controlID,
+			Name:      name,
+			Severity:  severity,
+			Status: v1beta1.ScannedControlStatus{
+				Status:    string(mergedStatus),
+				SubStatus: string(mergedSubStatus),
+				Info:      info,
+			},
+			Rules: newCtrl.Rules,
+		}
+	}
+
+	for ctrlID := range existingSpec.Controls {
+		if _, ok := newSpec.Controls[ctrlID]; !ok {
+			delete(existingSpec.Controls, ctrlID)
+		}
+	}
+
+	if newSpec.Metadata != nil {
+		existingSpec.Metadata = newSpec.Metadata.DeepCopy()
+	}
+	existingSpec.RelatedObjects = newSpec.RelatedObjects
+	return existingSpec
+}
+
+func mergeWorkloadConfigurationScanSummarySpec(existingSpec v1beta1.WorkloadConfigurationScanSummarySpec, newSpec v1beta1.WorkloadConfigurationScanSummarySpec) v1beta1.WorkloadConfigurationScanSummarySpec {
+	if existingSpec.Controls == nil {
+		existingSpec.Controls = make(map[string]v1beta1.ScannedControlSummary)
+	}
+	for ctrlID, newCtrl := range newSpec.Controls {
+		existingCtrl, found := existingSpec.Controls[ctrlID]
+		if !found {
+			existingSpec.Controls[ctrlID] = newCtrl
+			continue
+		}
+
+		existingStatus := apis.ScanningStatus(existingCtrl.Status.Status)
+		existingSubStatus := apis.ScanningSubStatus(existingCtrl.Status.SubStatus)
+		newStatus := apis.ScanningStatus(newCtrl.Status.Status)
+		newSubStatus := apis.ScanningSubStatus(newCtrl.Status.SubStatus)
+		mergedStatus, mergedSubStatus := apis.CompareStatusAndSubStatus(existingStatus, newStatus, existingSubStatus, newSubStatus)
+
+		info := newCtrl.Status.Info
+		if info == "" {
+			info = existingCtrl.Status.Info
+		}
+
+		severity := newCtrl.Severity
+		if severity.Severity == "" {
+			severity = existingCtrl.Severity
+		}
+
+		controlID := existingCtrl.ControlID
+		if controlID == "" {
+			controlID = newCtrl.ControlID
+		}
+
+		existingSpec.Controls[ctrlID] = v1beta1.ScannedControlSummary{
+			ControlID: controlID,
+			Severity:  severity,
+			Status: v1beta1.ScannedControlStatus{
+				Status:    string(mergedStatus),
+				SubStatus: string(mergedSubStatus),
+				Info:      info,
+			},
+		}
+	}
+
+	for ctrlID := range existingSpec.Controls {
+		if _, ok := newSpec.Controls[ctrlID]; !ok {
+			delete(existingSpec.Controls, ctrlID)
+		}
+	}
+
+	existingSpec.Severities = calculateSeveritiesSummaryFromControls(existingSpec.Controls)
+	return existingSpec
+}
+
+func (a *APIServerStore) StoreWorkloadConfigurationScanResultSummary(ctx context.Context, workloadScan *v1beta1.WorkloadConfigurationScan) (*v1beta1.WorkloadConfigurationScanSummary, error) {
+	_, span := otel.Tracer("").Start(ctx, "APIServerStore.StoreWorkloadConfigurationScanResultSummary")
+	defer span.End()
+
+	controlsSummary := getControlsSummaryMapFromScannedControlMap(ctx, workloadScan.Spec.Controls)
+	severities := calculateSeveritiesSummaryFromControls(controlsSummary)
+	namespace := workloadScan.GetNamespace()
+	manifest := v1beta1.WorkloadConfigurationScanSummary{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        workloadScan.Name,
+			Namespace:   namespace,
+			Annotations: maps.Clone(workloadScan.Annotations),
+			Labels:      workloadScan.Labels,
+		},
+		Spec: v1beta1.WorkloadConfigurationScanSummarySpec{
+			Severities: severities,
+			Controls:   controlsSummary,
+		},
+	}
+	manifest.Annotations = annotateReportTime(manifest.Annotations, scanReportTime(workloadScan.Spec))
+
+	_, err := a.StorageClient.WorkloadConfigurationScanSummaries(namespace).Create(ctx, &manifest, metav1.CreateOptions{})
+	switch {
+	case errors.IsAlreadyExists(err):
+		retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// retrieve the latest version before attempting update
+			// RetryOnConflict uses exponential backoff to avoid exhausting the apiserver
+			result, getErr := a.StorageClient.WorkloadConfigurationScanSummaries(namespace).Get(ctx, manifest.Name, metav1.GetOptions{})
+			if getErr != nil {
+				return getErr
+			}
+			// update the manifest
+			switch compareReportTimes(summaryReportTime(result.Annotations), summaryReportTime(manifest.Annotations)) {
+			case 1:
+				result.Spec = manifest.Spec
+			case -1:
+				// A delayed older result must not roll a remediated scan back.
+				return nil
+			default:
+				result.Spec = mergeWorkloadConfigurationScanSummarySpec(result.Spec, manifest.Spec)
+			}
+			result.Annotations = mergeMaps(result.Annotations, manifest.Annotations)
+			result.Labels = mergeMaps(result.Labels, manifest.Labels)
+			// try to send the updated manifest
+			_, updateErr := a.StorageClient.WorkloadConfigurationScanSummaries(namespace).Update(ctx, result, metav1.UpdateOptions{})
+			return updateErr
+		})
+		if retryErr != nil {
+			logger.L().Ctx(ctx).Warning("failed to update WorkloadConfigurationScanSummary manifest in storage", helpers.Error(retryErr),
+				helpers.String("name", manifest.Name))
+			return nil, retryErr
+		} else {
+			logger.L().Debug("updated WorkloadConfigurationScanSummary manifest in storage",
+				helpers.String("name", manifest.Name))
+		}
+	case err != nil:
+		logger.L().Ctx(ctx).Warning("failed to store WorkloadConfigurationScanSummary manifest in storage", helpers.Error(err),
+			helpers.String("name", manifest.Name))
+		return nil, err
+	default:
+		logger.L().Debug("stored WorkloadConfigurationScanSummary manifest in storage",
+			helpers.String("name", manifest.Name))
+	}
+	return &manifest, nil
+}
+
+func updateLabelsAndAnnotationsMapFromRelatedObjects(clusterName string, labels map[string]string, annotations map[string]string, relatedObjects []workloadinterface.IMetadata) error {
+	labels[helpersv1.RbacResourceMetadataKey] = "true"
+
+	for i := range relatedObjects {
+		relatedObject := relatedObjects[i]
+		switch relatedObject.GetKind() {
+		case "Role":
+			labels[helpersv1.RoleNameMetadataKey] = relatedObject.GetName()
+			labels[helpersv1.RoleNamespaceMetadataKey] = relatedObject.GetNamespace()
+		case "RoleBinding":
+			labels[helpersv1.RoleBindingNameMetadataKey] = relatedObject.GetName()
+			labels[helpersv1.RoleBindingNamespaceMetadataKey] = relatedObject.GetNamespace()
+			annotations[helpersv1.WlidMetadataKey] = wlid.GetK8sWLID(clusterName, relatedObject.GetNamespace(), relatedObject.GetKind(), relatedObject.GetName())
+		case "ClusterRole":
+			labels[helpersv1.ClusterRoleNameMetadataKey] = relatedObject.GetName()
+		case "ClusterRoleBinding":
+			labels[helpersv1.ClusterRoleBindingNameMetadataKey] = relatedObject.GetName()
+			annotations[helpersv1.WlidMetadataKey] = wlid.GetK8sWLID(clusterName, "", relatedObject.GetKind(), relatedObject.GetName())
+		default:
+			return fmt.Errorf("unknown related object kind %s", relatedObject.GetKind())
+		}
+	}
+	return nil
+}
+
+func getManifestObjectLabelsAndAnnotations(clusterName string, resource workloadinterface.IMetadata, relatedObjects []workloadinterface.IMetadata) (map[string]string, map[string]string, error) {
+	annotations := map[string]string{
+		helpersv1.WlidMetadataKey: wlid.GetK8sWLID(clusterName, resource.GetNamespace(), resource.GetKind(), resource.GetName()),
+	}
+	labels := make(map[string]string)
+	labels[helpersv1.ApiGroupMetadataKey], labels[helpersv1.ApiVersionMetadataKey] = k8sinterface.SplitApiVersion(resource.GetApiVersion())
+	labels[helpersv1.RelatedKindMetadataKey] = resource.GetKind()
+	labels[helpersv1.RelatedNameMetadataKey] = resource.GetName()
+	if k8sinterface.IsResourceInNamespaceScope(resource.GetKind()) {
+		labels[helpersv1.RelatedNamespaceMetadataKey] = resource.GetNamespace()
+	}
+
+	if len(relatedObjects) > 0 {
+		if err := updateLabelsAndAnnotationsMapFromRelatedObjects(clusterName, labels, annotations, relatedObjects); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	names.SanitizeLabelValues(labels)
+
+	return labels, annotations, nil
+}
+
+// getRelatedObjects returns a list of related objects for the given resource
+// This is only relevant for RegoResponseVector objects (which are a triplet of <Subject, Role, RoleBinding>
+// For other objects, an empty list is returned
+func getRelatedObjects(resource *reporthandling.Resource) []workloadinterface.IMetadata {
+	obj := resource.GetObject()
+	if !objectsenvelopes.IsTypeRegoResponseVector(obj) {
+		return []workloadinterface.IMetadata{}
+	}
+	return objectsenvelopes.NewRegoResponseVectorObject(obj).GetRelatedObjects()
+}
+
+func getRoleAndRoleBindingFromRelatedObjects(relatedObjects []workloadinterface.IMetadata) (role workloadinterface.IMetadata, roleBinding workloadinterface.IMetadata, err error) {
+	if len(relatedObjects) != 2 {
+		return nil, nil, fmt.Errorf("%w: expected 2, got %d", ErrIncompleteRelatedObjects, len(relatedObjects))
+	}
+
+	for i := range relatedObjects {
+		switch relatedObjects[i].GetKind() {
+		case "Role", "ClusterRole":
+			role = relatedObjects[i]
+		case "RoleBinding", "ClusterRoleBinding":
+			roleBinding = relatedObjects[i]
+		default:
+			return nil, nil, fmt.Errorf("%w: unknown related object kind %s", ErrIncompleteRelatedObjects, relatedObjects[i].GetKind())
+		}
+	}
+	if role == nil || roleBinding == nil {
+		return nil, nil, fmt.Errorf("%w: both related objects belong to the same RBAC category", ErrIncompleteRelatedObjects)
+	}
+	return role, roleBinding, nil
+}
+
+func GetWorkloadScanK8sResourceName(ctx context.Context, resource workloadinterface.IMetadata, relatedObjects []workloadinterface.IMetadata) (string, error) {
+	if len(relatedObjects) == 0 {
+		return names.ResourceToSlug(resource)
+	}
+
+	role, roleBinding, err := getRoleAndRoleBindingFromRelatedObjects(relatedObjects)
+	if err != nil {
+		return "", err
+	}
+
+	return names.RoleBindingResourceToSlug(resource, role, roleBinding)
+}
+
+func calculateSeveritiesSummaryFromControls(controls map[string]v1beta1.ScannedControlSummary) v1beta1.WorkloadConfigurationScanSeveritiesSummary {
+	var critical int64
+	var high int64
+	var medium int64
+	var low int64
+	var unknown int64
+
+	for _, control := range controls {
+		if apis.ScanningStatus(control.Status.Status) != apis.StatusFailed {
+			continue
+		}
+
+		switch apis.ControlSeverityToInt(control.Severity.ScoreFactor) {
+		case apis.SeverityCritical:
+			critical += 1
+		case apis.SeverityHigh:
+			high += 1
+		case apis.SeverityMedium:
+			medium += 1
+		case apis.SeverityLow:
+			low += 1
+		case apis.SeverityUnknown:
+			unknown += 1
+		}
+
+	}
+
+	return v1beta1.WorkloadConfigurationScanSeveritiesSummary{
+		Critical: critical,
+		High:     high,
+		Medium:   medium,
+		Low:      low,
+		Unknown:  unknown,
+	}
+}
+
+func getControlsSummaryMapFromScannedControlMap(ctx context.Context, scannedControls map[string]v1beta1.ScannedControl) map[string]v1beta1.ScannedControlSummary {
+	m := map[string]v1beta1.ScannedControlSummary{}
+	for id, control := range scannedControls {
+		m[id] = v1beta1.ScannedControlSummary{
+			ControlID: id,
+			Severity:  control.Severity,
+			Status:    control.Status,
+		}
+	}
+	return m
+}
+
+func parseControlSeverity(controlSummary reportsummary.IControlSummary) v1beta1.ControlSeverity {
+	if controlSummary == nil {
+		return v1beta1.ControlSeverity{}
+	}
+	scoreFactor := controlSummary.GetScoreFactor()
+	severity := apis.ControlSeverityToString(scoreFactor)
+
+	return v1beta1.ControlSeverity{
+		Severity:    severity,
+		ScoreFactor: scoreFactor,
+	}
+}
+
+func parseScannedControlRules(control *resourcesresults.ResourceAssociatedControl) []v1beta1.ScannedControlRule {
+	rules := make([]v1beta1.ScannedControlRule, len(control.ResourceAssociatedRules))
+	for i, rule := range control.ResourceAssociatedRules {
+		paths := make([]v1beta1.RulePath, len(rule.Paths))
+		for j, path := range rule.Paths {
+			paths[j] = v1beta1.RulePath{
+				FixPath:      path.FixPath.Path,
+				FixPathValue: path.FixPath.Value,
+				FixCommand:   path.FixCommand,
+			}
+		}
+		appliedIgnoreRules := make([]string, len(rule.Exception))
+		for j, exception := range rule.Exception {
+			appliedIgnoreRules[j] = exception.GetName()
+		}
+
+		controlConfigurations := ruleToControlConfigurations(rule)
+
+		relatedResourceIds := make([]string, len(rule.RelatedResourcesIDs))
+		copy(relatedResourceIds, rule.RelatedResourcesIDs)
+		rules[i] = v1beta1.ScannedControlRule{
+			Name: rule.GetName(),
+			Status: v1beta1.RuleStatus{
+				Status:    string(rule.GetStatus(nil).Status()),
+				SubStatus: string(rule.GetStatus(nil).GetSubStatus()),
+			},
+			ControlConfigurations: controlConfigurations,
+			Paths:                 paths,
+			AppliedIgnoreRules:    appliedIgnoreRules,
+			RelatedResourcesIDs:   relatedResourceIds,
+		}
+	}
+	return rules
+}
+
+func ruleToControlConfigurations(rule resourcesresults.ResourceAssociatedRule) map[string]json.RawMessage {
+	controlConfigurations := make(map[string]json.RawMessage)
+	for key, value := range rule.ControlConfigurations {
+		rawValue, err := json.Marshal(value)
+		if err != nil {
+			logger.L().Warning("failed to marshal control configuration value", helpers.Error(err))
+			continue
+		}
+		controlConfigurations[key] = rawValue
+	}
+	return controlConfigurations
+}
+
+func parseScannedControlStatus(control *resourcesresults.ResourceAssociatedControl) v1beta1.ScannedControlStatus {
+	return v1beta1.ScannedControlStatus{
+		Status:    string(control.GetStatus(nil).Status()),
+		SubStatus: string(control.GetSubStatus()),
+		Info:      control.GetStatus(nil).Info(),
+	}
+}
+
+func parseWorkloadScanRelatedObjectList(relatedObjects []workloadinterface.IMetadata) []v1beta1.WorkloadScanRelatedObject {
+	r := make([]v1beta1.WorkloadScanRelatedObject, len(relatedObjects))
+	for i := range relatedObjects {
+		group, version := k8sinterface.SplitApiVersion(relatedObjects[i].GetApiVersion())
+		r[i] = v1beta1.WorkloadScanRelatedObject{
+			Namespace:  relatedObjects[i].GetNamespace(),
+			APIGroup:   group,
+			APIVersion: version,
+			Kind:       relatedObjects[i].GetKind(),
+			Name:       relatedObjects[i].GetName(),
+		}
+	}
+	return r
+}
+
+// mergeMaps merges new into existing, overwriting existing keys with new values.
+// Both parameters are safe to pass as nil.
+func mergeMaps(existing, new map[string]string) map[string]string {
+	if new == nil {
+		if existing == nil {
+			return make(map[string]string)
+		}
+		return existing
+	}
+	if existing == nil {
+		existing = make(map[string]string)
+	}
+	maps.Copy(existing, new)
+	return existing
+}

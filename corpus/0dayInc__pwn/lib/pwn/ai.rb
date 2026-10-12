@@ -1,0 +1,39 @@
+# frozen_string_literal: true
+
+module PWN
+  # This file, using the autoload directive loads AI modules
+  # into memory only when they're needed. For more information, see:
+  # http://www.rubyinside.com/ruby-techniques-revealed-autoload-1652.html
+  module AI
+    autoload :Agent, 'pwn/ai/agent'
+    autoload :CLI, 'pwn/ai/cli'
+    autoload :Context, 'pwn/ai/context'
+    autoload :Anthropic, 'pwn/ai/anthropic'
+    autoload :Gemini, 'pwn/ai/gemini'
+    autoload :Grok, 'pwn/ai/grok'
+    autoload :HttpRetry, 'pwn/ai/http_retry'
+    autoload :MCP, 'pwn/ai/mcp'
+    autoload :ModelCatalog, 'pwn/ai/model_catalog'
+    autoload :Ollama, 'pwn/ai/ollama'
+    autoload :OpenAI, 'pwn/ai/open_ai'
+    autoload :OpenWebUI, 'pwn/ai/open_web_ui'
+    autoload :RedTeam, 'pwn/ai/red_team'
+    autoload :Router, 'pwn/ai/router'
+
+    # Display a List of Every PWN::AI Module
+
+    # Author(s):: 0day Inc. <support@0dayinc.com>
+
+    public_class_method def self.authors
+      "AUTHOR(S):\n  0day Inc. <support@0dayinc.com>\n"
+    end
+
+    public_class_method def self.help
+      puts "USAGE:
+        # Display a List of Every PWN::AI Module
+        #{self}.authors
+      "
+      constants.sort
+    end
+  end
+end

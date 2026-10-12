@@ -1,0 +1,255 @@
+"""
+ArkhamFrame FastAPI Application.
+
+The main entry point for the Frame REST API.
+"""
+
+from contextlib import asynccontextmanager
+import os
+from pathlib import Path
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+import logging
+
+# Load .env file before anything else accesses environment variables
+from dotenv import load_dotenv
+
+# Look for .env in project root (3 levels up from this file)
+_env_path = Path(__file__).parent.parent.parent.parent / ".env"
+if _env_path.exists():
+    load_dotenv(_env_path)
+    print(f"Loaded environment from {_env_path}")
+
+from .frame import ArkhamFrame
+
+logger = logging.getLogger(__name__)
+
+# Global frame instance
+frame: ArkhamFrame = None
+
+
+async def load_shards(frame: ArkhamFrame, app: FastAPI) -> None:
+    """
+    Load and initialize available shards using entry points.
+
+    Shards register themselves via pyproject.toml:
+        [project.entry-points."arkham.shards"]
+        dashboard = "arkham_shard_dashboard:DashboardShard"
+        ingest = "arkham_shard_ingest:IngestShard"
+    """
+    try:
+        from importlib.metadata import entry_points
+    except ImportError:
+        from importlib_metadata import entry_points
+
+    # Discover shards via entry points
+    eps = entry_points(group="arkham.shards")
+
+    for ep in eps:
+        shard_name = ep.name
+        try:
+            logger.info(f"Loading shard: {shard_name}")
+
+            # Load the shard class
+            shard_class = ep.load()
+
+            # Instantiate (no args) and initialize with frame
+            shard = shard_class()
+            await shard.initialize(frame)
+
+            # Register routes if shard has them
+            router = shard.get_routes() or shard.get_api_router()
+
+            if router:
+                # Routes already include /api prefix
+                app.include_router(
+                    router,
+                    tags=[shard_name.capitalize()],
+                )
+
+            frame.shards[shard_name] = shard
+            logger.info(f"Shard loaded: {shard_name}")
+
+        except Exception as e:
+            logger.warning(f"Failed to load shard {shard_name}: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage Frame lifecycle."""
+    global frame
+
+    # Startup
+    logger.info("Starting ArkhamFrame...")
+    frame = ArkhamFrame()
+    await frame.initialize()
+
+    # Initialize auth database tables
+    from .auth import create_db_and_tables
+    from .auth.dependencies import async_session_maker
+    from .auth.audit import ensure_audit_schema
+    await create_db_and_tables()
+    # Create audit tables
+    async with async_session_maker() as session:
+        await ensure_audit_schema(session)
+        await session.commit()
+
+    # Store app reference on frame for shards to access
+    frame.app = app
+
+    # Load shards
+    await load_shards(frame, app)
+
+    # Set up SPA static serving AFTER shards are loaded
+    # This ensures shard routes have priority over the catch-all
+    import os
+    if os.environ.get("ARKHAM_SERVE_SHELL", "false").lower() == "true":
+        setup_static_serving()
+
+    yield
+
+    # Shutdown shards
+    for name, shard in frame.shards.items():
+        try:
+            await shard.shutdown()
+            logger.info(f"Shard {name} shut down")
+        except Exception as e:
+            logger.error(f"Error shutting down shard {name}: {e}")
+
+    # Shutdown frame
+    logger.info("Stopping ArkhamFrame...")
+    await frame.shutdown()
+
+
+def get_cors_origins() -> list[str]:
+    """Get allowed CORS origins from environment or defaults."""
+    origins_env = os.environ.get("CORS_ORIGINS", "")
+    if origins_env:
+        return [o.strip() for o in origins_env.split(",") if o.strip()]
+
+    # Default: allow localhost for development
+    return [
+        "http://localhost:5173",
+        "http://localhost:8100",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:8100",
+    ]
+
+
+# Create FastAPI app
+app = FastAPI(
+    title="ArkhamFrame",
+    description="ArkhamMirror Shattered Frame - Core Infrastructure API",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+# Security middleware
+from .middleware import SecurityHeadersMiddleware, limiter, rate_limit_handler, TenantContextMiddleware
+from slowapi.errors import RateLimitExceeded
+
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(TenantContextMiddleware)
+
+# Rate limiting
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
+
+# CORS middleware - configurable via CORS_ORIGINS env var
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_cors_origins(),
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Tenant-ID"],
+)
+
+
+# Include API routes
+from .api import health, projects, shards, events, frame as frame_api
+from .api import export, notifications, scheduler
+# NOTE: templates import removed - templates shard handles /api/templates routes
+
+# Authentication routes (must be before other protected routes)
+from .auth import auth_router
+app.include_router(auth_router)
+
+app.include_router(health.router, tags=["Health"])
+# NOTE: Frame's documents router removed - documents shard handles /api/documents routes
+# NOTE: Frame's entities router removed - entities shard handles /api/entities routes
+app.include_router(projects.router, prefix="/api/projects", tags=["Projects"])
+app.include_router(shards.router, prefix="/api/shards", tags=["Shards"])
+app.include_router(events.router, prefix="/api/events", tags=["Events"])
+app.include_router(frame_api.router, prefix="/api/frame", tags=["Frame"])
+
+# Output Services API routes
+# NOTE: export router removed - export shard handles /api/export routes
+# NOTE: templates router removed - templates shard handles /api/templates routes
+app.include_router(notifications.router, prefix="/api/notifications", tags=["Notifications"])
+app.include_router(scheduler.router, prefix="/api/scheduler", tags=["Scheduler"])
+
+
+# Static file serving for Shell UI
+# In production/Docker, Frame serves the built React app
+def setup_static_serving():
+    """Set up static file serving for the Shell UI."""
+    import os
+    from pathlib import Path
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.responses import FileResponse
+
+    # Look for Shell dist directory
+    # Try multiple paths for different deployment scenarios
+    possible_paths = [
+        # Docker container path
+        Path("/app/frontend/dist"),
+        # Development paths (relative to Frame package)
+        Path(__file__).parent.parent.parent / "arkham-shard-shell" / "dist",
+        Path(__file__).parent.parent.parent.parent / "arkham-shard-shell" / "dist",
+        # CWD-relative paths
+        Path.cwd() / "packages" / "arkham-shard-shell" / "dist",
+        Path.cwd() / "arkham-shard-shell" / "dist",
+        Path.cwd() / "frontend" / "dist",
+    ]
+
+    shell_dist = None
+    for path in possible_paths:
+        if path.exists() and (path / "index.html").exists():
+            shell_dist = path
+            break
+
+    if shell_dist:
+        logger.info(f"Serving Shell UI from: {shell_dist}")
+
+        # Mount static assets
+        assets_path = shell_dist / "assets"
+        if assets_path.exists():
+            app.mount("/assets", StaticFiles(directory=assets_path), name="assets")
+
+        # Serve index.html for all non-API routes (SPA fallback)
+        @app.get("/{path:path}")
+        async def serve_spa(path: str):
+            # API routes are handled by routers above
+            if path.startswith("api/"):
+                return {"error": "Not found"}
+
+            # Serve static files if they exist
+            file_path = shell_dist / path
+            if file_path.exists() and file_path.is_file():
+                return FileResponse(file_path)
+
+            # SPA fallback - serve index.html
+            return FileResponse(shell_dist / "index.html")
+    else:
+        logger.info("Shell UI dist not found - static serving disabled")
+        logger.info("Build the Shell with 'npm run build' in arkham-shard-shell/")
+        logger.info(f"Searched paths: {[str(p) for p in possible_paths]}")
+
+
+def get_frame() -> ArkhamFrame:
+    """Get the global Frame instance."""
+    if frame is None:
+        raise RuntimeError("Frame not initialized")
+    return frame

@@ -1,0 +1,765 @@
+# frozen_string_literal: true
+
+require 'json'
+require 'fileutils'
+require 'securerandom'
+require 'digest'
+require 'time'
+require 'open3'
+
+module PWN
+  module Plugins
+    # Persistent finding rows for pwn-ai (title, severity, host, evidence, PoC).
+    module Findings
+      FILE = File.join(Dir.home, '.pwn', 'findings.jsonl')
+
+      public_class_method def self.required_bins
+        []
+      end
+
+      # Strict P10 boundary. Legacy record remains available for older callers.
+      public_class_method def self.record_structured(opts = {})
+        opts = opts.transform_keys(&:to_sym)
+        opts[:affected_asset] ||= opts[:target]
+        opts[:poc] ||= opts[:repro_cmd]
+        opts[:target] ||= opts[:affected_asset]
+        opts[:repro_cmd] ||= opts[:poc]
+        %i[title cwe cvss_vector affected_asset poc remediation].each do |key|
+          raise ArgumentError, "#{key} must be a non-empty string" unless opts[key].is_a?(String) && !opts[key].strip.empty?
+        end
+        raise ArgumentError, 'cwe must be CWE-<positive integer>' unless opts[:cwe].match?(/\ACWE-[1-9]\d*\z/)
+
+        engagement = opts[:engagement_id].to_s
+        raise ArgumentError, 'engagement_id must be a simple identifier' unless engagement.empty? || engagement.match?(/\A[a-zA-Z0-9_-]+\z/)
+
+        validate_cvss(opts)
+        confidence = opts[:confidence]
+        raise ArgumentError, 'confidence must be numeric in 0..1' unless confidence.is_a?(Numeric) && confidence.finite? && confidence.between?(0, 1)
+
+        artifacts = resolve_evidence(opts)
+        paths = artifacts.map { |artifact| artifact[:path] }.uniq
+        steps = opts[:reproduction_steps] || [opts[:poc]]
+        raise ArgumentError, 'reproduction_steps must be a nonempty Array of nonempty strings' unless steps.is_a?(Array) && !steps.empty? && steps.all? { |step| step.is_a?(String) && !step.strip.empty? }
+
+        justification = opts[:severity_justification]
+        raise ArgumentError, 'severity_justification must be a nonempty string' if (opts.key?(:severity_justification) || Array(opts[:artifact_handles]).any?) && (!justification.is_a?(String) || justification.strip.empty?)
+
+        refs = opts[:attack_chain_refs]
+        rows = report.select { |row| engagement_scope(row) == engagement_scope(opts) }
+        raise ArgumentError, 'attack_chain_refs must reference existing findings in this engagement' unless refs.is_a?(Array) && refs.all? { |id| id.is_a?(String) && rows.any? { |row| row[:id] == id } }
+
+        score = opts[:cvss_score]
+        claimed = severity_from_score(score: score)
+        row = opts.slice(:title, :cwe, :cvss_vector, :cvss_score, :affected_asset, :evidence_paths, :poc,
+                         :attack_chain_refs, :remediation, :confidence, :engagement_id, :session_id, :artifact_handles, :severity_justification)
+        row[:enables] = opts.fetch(:enables, [])
+        row[:evidence_paths] = paths
+        row[:reproduction_steps] = steps
+        row = row.merge(id: SecureRandom.hex(6), severity: 'info', claimed_severity: claimed, status: 'open', verification_status: 'not_executed',
+                        chain_refs: refs, host: opts[:affected_asset], target: opts[:affected_asset],
+                        repro_cmd: opts[:poc], evidence: paths.map { |path| Digest::SHA256.file(path).hexdigest },
+                        poc_artifacts: [], at: Time.now.utc.iso8601)
+        validate_links(row: row, rows: report)
+        validate_graph(rows: report + [row])
+        row[:evidence_artifacts] = evidence_anchor(row: row, arts: paths, artifacts: artifacts)
+        FileUtils.mkdir_p(File.dirname(FILE))
+        File.open(FILE, 'a') do |file|
+          file.flock(File::LOCK_EX)
+          file.puts(JSON.generate(row))
+        end
+        row
+      end
+
+      private_class_method def self.engagement_scope(opts = {})
+        value = opts[:engagement_id].to_s
+        value.empty? ? 'default' : value
+      end
+
+      private_class_method def self.validate_links(opts = {})
+        row = opts[:row]
+        ids = row[:enables]
+        raise ArgumentError, 'enables must be an Array of finding ID strings' unless ids.is_a?(Array) && ids.all? { |id| id.is_a?(String) && !id.empty? }
+        raise ArgumentError, 'enables must not contain duplicate IDs' unless ids.uniq == ids
+        raise ArgumentError, 'enables must not reference self' if ids.include?(row[:id])
+
+        scope = engagement_scope(row)
+        raise ArgumentError, 'enables must reference existing findings in this engagement' unless ids.all? { |id| opts[:rows].any? { |target| target[:id] == id && engagement_scope(target) == scope } }
+      end
+
+      private_class_method def self.validate_graph(opts = {})
+        rows = opts[:rows]
+        index = rows.to_h { |row| [row[:id], row] }
+        edges = Hash.new { |hash, key| hash[key] = [] }
+        rows.each do |row|
+          pairs = Array(row[:enables]).map { |id| [row[:id], id] }
+          refs = Array(row[:attack_chain_refs]) + Array(row[:chain_refs]) + Array(row[:chain_parent_id])
+          pairs.concat(refs.map { |id| [id, row[:id]] })
+          pairs.each do |from, to|
+            next unless index[from] && index[to] && engagement_scope(index[from]) == engagement_scope(index[to])
+
+            edges[from] << to
+          end
+        end
+        visiting = {}
+        visited = {}
+        walk = lambda do |id|
+          raise ArgumentError, 'attack chain cycle is not allowed' if visiting[id]
+          return if visited[id]
+
+          visiting[id] = true
+          edges[id].uniq.each { |target| walk.call(target) }
+          visiting.delete(id)
+          visited[id] = true
+        end
+        index.each_key { |id| walk.call(id) }
+        rows
+      end
+
+      private_class_method def self.resolve_evidence(opts = {})
+        paths = opts[:evidence_paths] || []
+        handles = opts[:artifact_handles] || []
+        raise ArgumentError, 'evidence_paths must contain existing readable absolute file paths' unless paths.is_a?(Array) && paths.all? { |path| path.is_a?(String) && path.start_with?('/') && File.file?(path) && File.readable?(path) }
+        raise ArgumentError, 'artifact_handles must be an Array' unless handles.is_a?(Array)
+        raise ArgumentError, 'evidence_paths or artifact_handles are required' if paths.empty? && handles.empty?
+
+        artifacts = paths.map { |path| { path: path, kind: 'evidence', label: File.basename(path), sha256: Digest::SHA256.file(path).hexdigest, size: File.size(path) } }
+        handles.each do |item|
+          descriptor = item.is_a?(Hash) ? item.transform_keys(&:to_sym) : { handle: item }
+          kind = descriptor[:kind] || 'evidence'
+          raise ArgumentError, 'artifact kind must be pcap, screenshot, crash, poc or evidence' unless %w[pcap screenshot crash poc evidence].include?(kind)
+
+          resolved = PWN::Plugins::ArtifactRegistry.resolve(handle: descriptor[:handle], sha256: descriptor[:sha256])
+          label = descriptor[:label] || File.basename(resolved[:path])
+          raise ArgumentError, 'artifact label must be a nonempty string' unless label.is_a?(String) && !label.strip.empty?
+
+          artifacts << resolved.merge(kind: kind, label: label)
+        end
+        artifacts.uniq { |artifact| [artifact[:handle], artifact[:path]] }
+      end
+
+      private_class_method def self.validate_cvss(opts = {})
+        score = opts[:cvss_score]
+        raise ArgumentError, 'cvss_score must be numeric in 0..10' unless score.is_a?(Numeric) && score.finite? && score.between?(0, 10)
+
+        parts = opts[:cvss_vector].split('/')
+        version = parts.shift
+        values = { 'AV' => %w[N A L P], 'AC' => %w[L H], 'PR' => %w[N L H], 'UI' => %w[N R],
+                   'S' => %w[U C], 'C' => %w[N L H], 'I' => %w[N L H], 'A' => %w[N L H] }
+        metrics = parts.map { |part| part.split(':', -1) }
+        raise ArgumentError, 'cvss_vector contains malformed metrics' unless metrics.all? { |metric| metric.length == 2 }
+
+        valid = %w[CVSS:3.0 CVSS:3.1].include?(version) && metrics.length == values.length &&
+                metrics.map(&:first).uniq.length == values.length && metrics.all? { |key, value| values[key]&.include?(value) }
+        raise ArgumentError, 'cvss_vector must be a complete CVSS 3.0/3.1 base vector' unless valid
+
+        metrics = metrics.to_h
+        changed = metrics['S'] == 'C'
+        impact_values = { 'N' => 0.0, 'L' => 0.22, 'H' => 0.56 }
+        iss = 1 - %w[C I A].map { |key| 1 - impact_values.fetch(metrics[key]) }.inject(:*)
+        impact = changed ? ((7.52 * (iss - 0.029)) - (3.25 * ((iss - 0.02)**15))) : 6.42 * iss
+        av = { 'N' => 0.85, 'A' => 0.62, 'L' => 0.55, 'P' => 0.2 }.fetch(metrics['AV'])
+        ac = metrics['AC'] == 'L' ? 0.77 : 0.44
+        pr = { 'N' => 0.85, 'L' => changed ? 0.68 : 0.62, 'H' => changed ? 0.5 : 0.27 }.fetch(metrics['PR'])
+        ui = metrics['UI'] == 'N' ? 0.85 : 0.62
+        base = if impact <= 0
+                 0
+               else
+                 [10, (impact + (8.22 * av * ac * pr * ui)) * (changed ? 1.08 : 1)].min
+               end
+        calculated = ((base * 10).round(8).ceil / 10.0)
+        raise ArgumentError, "cvss_score must match cvss_vector (#{calculated})" unless score == calculated
+      end
+
+      public_class_method def self.record(opts = {})
+        title = opts[:title].to_s
+        raise 'ERROR: title is required' if title.empty?
+
+        arts = Array(opts[:poc_artifacts]).map(&:to_s).reject(&:empty?)
+        if opts[:poc].is_a?(Hash)
+          arts << opts[:poc][:path].to_s unless opts[:poc][:path].to_s.empty?
+        else
+          arts << opts[:poc].to_s unless opts[:poc].to_s.empty?
+        end
+        raise 'ERROR: poc_artifacts are required' if arts.empty?
+
+        ev = opts[:evidence]
+        ev_list = Array(ev).map(&:to_s)
+        ev_text = ev_list.join(' ')
+        raise 'ERROR: evidence must be at least 40 characters citing the PoC' if ev_text.length < 40
+
+        sha_ev = arts.filter_map do |path|
+          next unless File.file?(path)
+
+          Digest::SHA256.file(path).hexdigest
+        end
+        claimed = opts[:severity].to_s
+        claimed = 'info' if claimed.empty?
+        row = {
+          id: SecureRandom.hex(6),
+          title: title,
+          severity: 'info',
+          claimed_severity: claimed,
+          verification_status: 'not_executed',
+          cvss_vector: (opts[:cvss_vector] || opts[:cvss]).to_s,
+          affected_asset: (opts[:affected_asset] || opts[:host]).to_s,
+          host: opts[:host].to_s,
+          evidence: sha_ev.any? ? sha_ev : ev_list,
+          poc: opts[:poc].is_a?(Hash) ? opts[:poc] : { type: 'file', path: arts.first, reproduction_steps: opts[:reproduction_steps].to_s },
+          poc_artifacts: arts,
+          url: opts[:url].to_s,
+          matched_at: (opts[:matched_at] || opts[:url]).to_s,
+          template_id: opts[:template_id].to_s,
+          chain_refs: Array(opts[:chain_refs] || opts[:chain_parent_id]).map(&:to_s).reject(&:empty?),
+          cvss: opts[:cvss].to_s,
+          status: 'open',
+          engagement_id: opts[:engagement_id].to_s,
+          chain_parent_id: opts[:chain_parent_id].to_s,
+          session_id: opts[:session_id].to_s,
+          at: Time.now.utc.iso8601
+        }
+        row[:evidence_artifacts] = evidence_anchor(row: row, arts: arts)
+        FileUtils.mkdir_p(File.dirname(FILE))
+        File.open(FILE, 'a') { |f| f.puts(JSON.generate(row)) }
+        note_mission(finding_id: row[:id], host: opts[:host])
+        row
+      end
+
+      private_class_method def self.note_mission(opts = {})
+        return unless defined?(PWN::AI::Agent::Mission)
+
+        mid = PWN::AI::Agent::Mission.active_id
+        return if mid.to_s.empty?
+
+        PWN::AI::Agent::Mission.note_finding!(id: mid, finding_id: opts[:finding_id], host: opts[:host])
+      rescue StandardError
+        nil
+      end
+
+      public_class_method def self.evidence_verify(opts = {})
+        eng = (opts[:engagement_id] || opts[:name] || 'default').to_s
+        raise ArgumentError, 'engagement_id must be a simple identifier' unless eng.match?(/\A[a-zA-Z0-9_-]+\z/)
+
+        path = File.join(Dir.home, '.pwn', 'engagements', eng, 'evidence.jsonl')
+        return { ok: true, rows: 0 } unless File.file?(path)
+
+        mismatches = []
+        n = 0
+        File.readlines(path).each do |ln|
+          row = JSON.parse(ln, symbolize_names: true)
+          n += 1
+          [row[:path], row[:stored]].compact.uniq.each do |evidence|
+            unless File.file?(evidence.to_s)
+              mismatches << evidence
+              next
+            end
+
+            sha = Digest::SHA256.file(evidence).hexdigest
+            mismatches << evidence unless sha == row[:sha256].to_s && File.size(evidence) == row[:size]
+          end
+        end
+        { ok: mismatches.empty?, rows: n, mismatches: mismatches }
+      end
+
+      public_class_method def self.report(opts = {})
+        return [] unless File.file?(FILE)
+
+        rows = File.readlines(FILE).filter_map do |ln|
+          JSON.parse(ln, symbolize_names: true)
+        rescue JSON::ParserError
+          nil
+        end
+        host = opts[:host].to_s
+        rows = rows.select { |r| r[:host].to_s == host } unless host.empty?
+        rows = rows.select { |r| r[:engagement_id].to_s == opts[:engagement_id].to_s } if opts.key?(:engagement_id)
+        rows
+      end
+
+      public_class_method def self.query(opts = {})
+        report(opts)
+      end
+
+      public_class_method def self.chain(opts = {})
+        parent_id = opts[:parent_id].to_s
+        raise 'ERROR: parent_id is required' if parent_id.empty?
+
+        evidence = opts[:evidence].to_s
+        raise ArgumentError, 'evidence must be at least 40 characters citing the PoC' if evidence.length < 40
+
+        child = record(opts.merge(chain_parent_id: parent_id, evidence: evidence))
+        parent = report.find { |row| row[:id].to_s == parent_id }
+        child.merge(composite_severity: parent ? parent[:severity].to_s : 'info')
+      end
+
+      public_class_method def self.link(opts = {})
+        opts = opts.transform_keys(&:to_sym)
+        rows = report
+        row = rows.find { |item| item[:id] == opts[:id] }
+        raise ArgumentError, 'id must name an existing finding' unless row
+
+        updated = row.merge(enables: opts[:enables])
+        validate_links(row: updated, rows: rows)
+        validate_graph(rows: rows.map { |item| item[:id] == row[:id] ? updated : item })
+        rewrite_row(id: row[:id], patch: { enables: opts[:enables] })
+      end
+
+      public_class_method def self.chain_score(opts = {})
+        opts = opts.transform_keys(&:to_sym)
+        ids = Array(opts[:ids] || opts[:chain_refs]).map(&:to_s)
+        rows = report
+        rows = rows.select { |row| ids.include?(row[:id].to_s) } unless ids.empty?
+        chains = PWN::Reports.attack_chains(findings: rows)
+        chains = chains.select { |chain| chain[:finding_ids] == ids } unless ids.empty?
+        ranks = { 'info' => 0, 'low' => 1, 'medium' => 2, 'high' => 3, 'critical' => 4, 'unproven' => 0 }
+        selected = chains.max_by { |chain| ranks[chain[:combined_severity]] || 0 }
+        peak = rows.map { |row| ranks[row[:severity].to_s] || 0 }.max || 0
+        sev = selected ? selected[:combined_severity] : %w[info low medium high critical][peak]
+        { chain_refs: rows.map { |row| row[:id] }, score: sev, combined_severity: sev, n: rows.length, chains: chains,
+          rationale: selected ? selected[:rationale] : 'Maximum recorded constituent severity. No automatic escalation; linking is not proof of combined exploitability.' }
+      end
+
+      # Attest a working PoC from request/response or script output. File hashes are not execution.
+
+      public_class_method def self.verify(opts = {})
+        attest(opts.merge(mode: 'verify'))
+      end
+
+      # Re-run the same PoC path after a fix. Impact present => still_open; absent => fixed.
+
+      public_class_method def self.retest(opts = {})
+        attest(opts.merge(mode: 'retest'))
+      end
+
+      # Combine findings only when a combined-impact evidence file names every id.
+
+      public_class_method def self.chain_impact(opts = {})
+        opts = opts.transform_keys(&:to_sym)
+        ids = opts[:ids]
+        raise ArgumentError, 'ids must name at least two distinct finding IDs' unless ids.is_a?(Array) && ids.length >= 2 && ids.uniq == ids && ids.all? { |id| id.is_a?(String) && !id.empty? }
+
+        rows = report
+        chosen = ids.map { |id| rows.find { |row| row[:id].to_s == id } }
+        raise ArgumentError, 'ids must name existing findings' if chosen.any?(&:nil?)
+        raise ArgumentError, 'ids must belong to the same engagement' unless chosen.map { |row| engagement_scope(row) }.uniq.length == 1
+
+        candidate = rows.map(&:dup)
+        ids.each_cons(2) do |from, to|
+          row = candidate.find { |item| item[:id] == from }
+          row[:enables] = (Array(row[:enables]) + [to]).uniq
+        end
+        validate_graph(rows: candidate)
+
+        path = opts[:combined_impact_path].to_s
+        raise ArgumentError, 'combined_impact_path must be an existing readable absolute file' unless path.start_with?('/') && File.file?(path) && File.readable?(path)
+
+        text = File.read(path)
+        raise ArgumentError, 'combined_impact_path must be at least 40 characters and name every finding id' unless text.length >= 40 && ids.all? { |id| text.include?(id) }
+
+        score = chain_score(ids: ids)
+        ranks = { 'info' => 0, 'low' => 1, 'medium' => 2, 'high' => 3, 'critical' => 4 }
+        combined = score[:combined_severity]
+        if opts[:escalate]
+          wanted = opts[:combined_severity].to_s
+          raise ArgumentError, 'combined_severity is required when escalate is true' if wanted.empty? || !ranks.key?(wanted)
+
+          combined = wanted
+        end
+        rationale = opts.fetch(:severity_justification, text)
+        raise ArgumentError, 'severity_justification must be a nonempty string' unless rationale.is_a?(String) && !rationale.strip.empty?
+
+        steps = opts.fetch(:reproduction_steps) do
+          chosen.flat_map do |row|
+            row[:reproduction_steps] || (row[:poc].is_a?(Hash) ? Array(row[:poc][:reproduction_steps]).reject { |step| step.to_s.empty? } : Array(row[:poc]))
+          end
+        end
+        raise ArgumentError, 'reproduction_steps must be an Array of nonempty strings' unless steps.is_a?(Array) && steps.all? { |step| step.is_a?(String) && !step.strip.empty? } && (!opts.key?(:reproduction_steps) || !steps.empty?)
+
+        artifacts = evidence_anchor(row: chosen.last, arts: [path])
+        assessment = { finding_ids: ids, combined_severity: combined, rationale: rationale,
+                       evidence_artifacts: artifacts, reproduction_steps: steps }
+        assessments = Array(chosen.last[:chain_assessments]).reject { |item| item[:finding_ids] == ids } + [assessment]
+        patch = { combined_impact: path, combined_severity: combined, chain_assessments: assessments }
+        patch[:evidence_artifacts] = (Array(chosen.last[:evidence_artifacts]) + artifacts).uniq { |artifact| [artifact[:path], artifact[:sha256]] }
+        updated = candidate.find { |row| row[:id] == ids.last }
+        updated.merge!(patch)
+        persist_rows(rows: candidate)
+        note_rates(kind: 'attack', success: true, technique: 'chain_impact', finding_id: ids.last)
+        {
+          finding_ids: ids,
+          combined_severity: combined,
+          combined_impact_path: path,
+          rationale: rationale,
+          finding: updated
+        }
+      end
+
+      # Gaps that keep issue work unfinished: unreproduced rows, unchained pairs.
+
+      public_class_method def self.issue_work_gaps(opts = {})
+        opts = opts.transform_keys(&:to_sym)
+        rows = report
+        eng = opts[:engagement_id].to_s
+        sid = opts[:session_id].to_s
+        rows = rows.select { |row| row[:engagement_id].to_s == eng } unless eng.empty?
+        rows = rows.select { |row| row[:session_id].to_s == sid } unless sid.empty?
+        structured = rows.select { |row| row[:cwe].to_s.start_with?('CWE-') || row.key?(:verification_status) }
+        reproduced = structured.select { |row| row[:verification_status].to_s == 'reproduced' }
+        unverified = structured.select { |row| row[:verification_status].to_s == 'not_executed' }
+        unchained = reproduced.length >= 2 && reproduced.none? { |row| Array(row[:attack_chain_refs]).any? || row[:combined_impact].to_s.strip != '' }
+        { recorded: structured.map { |row| row[:id] }, unverified: unverified.map { |row| row[:id] },
+          reproduced: reproduced.map { |row| row[:id] }, unchained: unchained }
+      end
+
+      public_class_method def self.render(opts = {})
+        dir = opts[:dir_path].to_s
+        dir = File.join(Dir.home, '.pwn', 'exports') if dir.empty?
+        name = opts[:report_name].to_s
+        name = 'findings' if name.empty?
+        payload = { title: 'Findings', findings: report(opts) }
+        {
+          markdown: PWN::Reports::Markdown.generate(results_hash: payload, dir_path: dir, report_name: name),
+          html: PWN::Reports::HTML.generate(results_hash: payload, dir_path: dir, report_name: name),
+          json: PWN::Reports::JSON.generate(results_hash: payload, dir_path: dir, report_name: name),
+          sarif: PWN::Reports::SARIF.generate(results_hash: payload, dir_path: dir, report_name: name)
+        }
+      end
+
+      private_class_method def self.attest(opts = {})
+        opts = opts.transform_keys(&:to_sym)
+        row = report.find { |item| item[:id].to_s == opts[:id].to_s }
+        raise ArgumentError, 'id must name an existing finding' unless row
+
+        kind = opts[:kind].to_s
+        raise ArgumentError, 'kind must be http or script' unless %w[http script].include?(kind)
+
+        impact = opts[:impact].to_s
+        raise ArgumentError, 'impact must be a non-empty string' if impact.strip.empty?
+
+        steps = reproduction_commands(row: row)
+        raise ArgumentError, 'reproduction_steps are required to verify' if steps.empty?
+
+        transcript = run_reproduction(steps: steps)
+        hit = transcript.include?(impact)
+        arts = steps.select { |step| step.start_with?('/') && File.file?(step) }
+        if opts[:mode].to_s == 'retest'
+          status = hit ? 'still_open' : 'fixed'
+          finding_status = hit ? 'open' : 'closed'
+        else
+          status = hit ? 'reproduced' : 'failed'
+          finding_status = row[:status]
+        end
+        published = status == 'reproduced' ? claimed_severity(row: row) : 'info'
+        artifacts = (Array(row[:evidence_artifacts]) + evidence_anchor(row: row, arts: arts)).uniq { |artifact| [artifact[:path], artifact[:sha256]] }
+        updated = rewrite_row(
+          id: row[:id],
+          patch: {
+            verification_status: status,
+            verification_kind: kind,
+            impact: impact,
+            severity: published,
+            transcript: transcript,
+            poc_artifacts: arts,
+            evidence_artifacts: artifacts,
+            status: finding_status,
+            verified_at: Time.now.utc.iso8601
+          }
+        )
+        note_rates(
+          kind: 'exploit',
+          success: status == 'reproduced',
+          tool: row[:cwe].to_s.empty? ? 'poc' : row[:cwe].to_s,
+          vulnerable_tool: (row[:product] || row[:affected_asset] || row[:host] || row[:id]).to_s,
+          vulnerable: status == 'reproduced',
+          technique: row[:cwe],
+          finding_id: row[:id]
+        )
+        note_rates(kind: 'attack', success: %w[reproduced still_open].include?(status), technique: row[:cwe], finding_id: row[:id])
+        updated
+      end
+
+      private_class_method def self.note_rates(opts = {})
+        return unless defined?(PWN::AI::Agent::Metrics)
+
+        PWN::AI::Agent::Metrics.record_attempt(
+          kind: opts[:kind],
+          success: opts[:success],
+          technique: opts[:technique],
+          finding_id: opts[:finding_id],
+          tool: opts[:tool],
+          vulnerable_tool: opts[:vulnerable_tool],
+          vulnerable: opts[:vulnerable],
+          revoke: opts[:revoke]
+        )
+      rescue StandardError
+        nil
+      end
+
+      private_class_method def self.reproduction_commands(opts = {})
+        row = opts[:row] || {}
+        steps = Array(row[:reproduction_steps]).map(&:to_s)
+        poc = row[:poc]
+        steps << (poc.is_a?(Hash) ? (poc[:path] || poc['path']).to_s : poc.to_s)
+        steps << row[:repro_cmd].to_s
+        steps.map(&:strip).reject(&:empty?).uniq
+      end
+
+      private_class_method def self.run_reproduction(opts = {})
+        transcript = +''
+        Array(opts[:steps]).each do |step|
+          stdout, stderr, status = Open3.capture3('sh', '-c', step.to_s)
+          transcript << stdout.to_s << stderr.to_s
+          transcript << "\nexit=#{status.exitstatus}\n"
+        end
+        transcript
+      end
+
+      private_class_method def self.claimed_severity(opts = {})
+        claimed = opts[:row][:claimed_severity].to_s
+        return 'info' if claimed.empty? || claimed == 'unproven'
+
+        claimed
+      end
+
+      private_class_method def self.severity_from_score(opts = {})
+        score = opts[:score].to_f
+        if score.zero?
+          'info'
+        elsif score < 4
+          'low'
+        elsif score < 7
+          'medium'
+        elsif score < 9
+          'high'
+        else
+          'critical'
+        end
+      end
+
+      private_class_method def self.execution_blob(opts = {})
+        kind = opts[:kind].to_s
+        if kind == 'http'
+          req = opts[:request_path].to_s
+          res = opts[:response_path].to_s
+          [req, res].each do |path|
+            raise ArgumentError, 'request_path and response_path must be existing readable absolute files' unless path.start_with?('/') && File.file?(path) && File.readable?(path)
+          end
+          [[req, res], "#{File.read(req)}\n#{File.read(res)}"]
+        else
+          log = opts[:execution_log].to_s
+          raise ArgumentError, 'execution_log must be an existing readable absolute file' unless log.start_with?('/') && File.file?(log) && File.readable?(log)
+
+          [[log], File.read(log)]
+        end
+      end
+
+      private_class_method def self.rewrite_row(opts = {})
+        id = opts[:id].to_s
+        patch = opts[:patch] || {}
+        rows = report
+        idx = rows.index { |row| row[:id].to_s == id }
+        raise ArgumentError, 'id must name an existing finding' unless idx
+
+        rows[idx] = rows[idx].merge(patch)
+        persist_rows(rows: rows)
+        rows[idx]
+      end
+
+      private_class_method def self.persist_rows(opts = {})
+        rows = opts[:rows]
+        FileUtils.mkdir_p(File.dirname(FILE))
+        File.open(FILE, File::RDWR | File::CREAT, 0o644) do |file|
+          file.flock(File::LOCK_EX)
+          file.rewind
+          file.truncate(0)
+          rows.each { |row| file.puts(JSON.generate(row)) }
+          file.flush
+          file.fsync
+        end
+        rows
+      end
+
+      private_class_method def self.evidence_anchor(opts = {})
+        row = opts[:row]
+        arts = Array(opts[:arts])
+        eng = row[:engagement_id].to_s
+        eng = 'default' if eng.empty?
+        raise ArgumentError, 'engagement_id must be a simple identifier' unless eng.match?(/\A[a-zA-Z0-9_-]+\z/)
+
+        dir = File.join(Dir.home, '.pwn', 'engagements', eng)
+        [File.dirname(dir), dir, File.join(dir, 'evidence'), File.join(dir, 'evidence.jsonl')].each do |entry|
+          raise ArgumentError, 'evidence storage contains a symlink' if File.symlink?(entry)
+        end
+        FileUtils.mkdir_p(dir)
+        path = File.join(dir, 'evidence.jsonl')
+        artifacts = opts[:artifacts] || arts.map { |art| { path: art } }
+        artifacts.filter_map do |artifact|
+          art = artifact[:path]
+          next unless File.file?(art.to_s)
+
+          rec = artifact.merge(
+            ts: Time.now.utc.iso8601,
+            finding_id: row[:id],
+            path: art,
+            sha256: Digest::SHA256.file(art).hexdigest,
+            size: File.size(art)
+          )
+          raise ArgumentError, 'evidence changed during recording' if artifact[:sha256] && (artifact[:sha256] != rec[:sha256] || artifact[:size] != rec[:size])
+
+          dest = File.join(dir, 'evidence', rec[:sha256])
+          raise ArgumentError, 'stored evidence must not be a symlink' if File.symlink?(dest)
+
+          FileUtils.mkdir_p(File.dirname(dest))
+          FileUtils.cp(art, dest) unless File.file?(dest)
+          raise ArgumentError, 'stored evidence hash mismatch' unless Digest::SHA256.file(dest).hexdigest == rec[:sha256] && File.size(dest) == rec[:size]
+
+          rec[:stored] = dest
+          File.chmod(0o600, dest)
+          File.open(path, File::WRONLY | File::CREAT | File::APPEND, 0o600) do |file|
+            file.flock(File::LOCK_EX)
+            file.puts(JSON.generate(rec))
+          end
+          rec
+        end
+      end
+
+      public_class_method def self.authors
+        "AUTHOR(S):\n  0day Inc. <support@0dayinc.com>\n"
+      end
+
+      public_class_method def self.help
+        puts "USAGE:
+          # List host binaries this module expects to be installed.
+          #{self}.required_bins
+
+          # Strict structured finding boundary; accepted input is not execution proof.
+          #{self}.record_structured(
+            title: 'required - finding title',
+            cwe: 'required - CWE identifier',
+            cvss_vector: 'required - complete CVSS 3.0/3.1 base vector',
+            cvss_score: 'required - numeric score matching vector',
+            affected_asset: 'required - recon asset ID or asset identifier',
+            evidence_paths: 'optional - existing readable absolute paths; required unless artifact_handles are supplied',
+            artifact_handles: 'optional - Array of handles or objects with handle, kind, label and optional expected sha256',
+            severity_justification: 'optional - evidence-based severity explanation; required for artifact handles',
+            reproduction_steps: 'optional - nonempty Array of ordered PoC instructions; defaults to the supplied poc command',
+            poc: 'required - command or code string',
+            enables: 'optional - Array of existing same-engagement IDs this finding enables; defaults to empty',
+            attack_chain_refs: 'required - Array of existing same-engagement predecessor finding IDs',
+            remediation: 'required - remediation instructions',
+            confidence: 'required - numeric 0..1',
+            engagement_id: 'optional - simple engagement identifier',
+            session_id: 'optional - session identifier',
+            target: 'optional - alias for affected_asset',
+            repro_cmd: 'optional - alias for poc'
+          )
+
+          # Append a legacy finding row to ~/.pwn/findings.jsonl.
+          #{self}.record(
+            title: 'required - short finding title',
+            severity: 'optional - info|low|medium|high|critical (defaults to info)',
+            host: 'optional - affected host or URL',
+            evidence: 'optional - proof text or path',
+            poc: 'optional - filesystem path of a PoC or Hash with type/path/reproduction_steps',
+            poc_artifacts: 'required - Array of artifact paths proving the issue',
+            cvss: 'optional - CVSS vector or score string',
+            cvss_vector: 'optional - CVSS 3.1 vector string (defaults to cvss)',
+            affected_asset: 'optional - host or URL the finding applies to (defaults to host)',
+            reproduction_steps: 'optional - how to replay the PoC',
+            chain_refs: 'optional - Array of related finding ids',
+            status: 'optional - open|closed (defaults to open)',
+            engagement_id: 'optional - engagement identifier',
+            session_id: 'optional - pwn-ai session id',
+            chain_parent_id: 'optional - id of a parent finding this issue chains from',
+            url: 'optional - matched-at URL from nuclei/httpx JSONL',
+            matched_at: 'optional - alias for url from scanner JSONL',
+            template_id: 'optional - nuclei template id that fired'
+          )
+
+          # Alias of report for querying stored findings.
+          #{self}.query(
+            host: 'optional - affected host or URL'
+          )
+
+          # Record a child finding chained to a parent without raising severity above the parent.
+          #{self}.chain(
+            parent_id: 'required - id of the parent finding',
+            title: 'required - short finding title',
+            severity: 'optional - claimed severity stored until verify; does not raise composite severity',
+            evidence: 'required - citation of at least 40 characters; a shorter citation is refused',
+            poc_artifacts: 'required - Array of artifact paths proving the issue',
+            host: 'optional - affected host or URL',
+            session_id: 'optional - pwn-ai session id'
+          )
+
+          # List recorded findings, optionally filtered by host.
+          #{self}.report(
+            host: 'optional - only rows whose host matches this string'
+          )
+
+          # Render findings as markdown, html, json, and SARIF reports.
+          #{self}.render(
+            dir_path: 'optional - output directory (defaults to ~/.pwn/exports)',
+            report_name: 'optional - basename without extension (defaults to findings)'
+          )
+
+          # Re-hash evidence files and report tampering.
+          #{self}.evidence_verify(
+            engagement_id: 'optional - engagement name (defaults to default)',
+            name: 'optional - alias for engagement_id'
+          )
+
+          # Replace outgoing directed links; rejects cross-engagement IDs, duplicates and cycles.
+          #{self}.link(
+            id: 'required - existing finding ID whose outgoing links are replaced',
+            enables: 'required - Array of distinct existing same-engagement finding IDs; empty removes outgoing links'
+          )
+
+          # Score canonical directed paths using exact scoped assessments; no automatic uplift.
+          #{self}.chain_score(
+            ids: 'optional - ordered Array of finding IDs selecting an exact directed path; defaults to all findings',
+            chain_refs: 'optional - alias for ids'
+          )
+
+          # Attest a working PoC from HTTP or script evidence; hashes are not execution.
+          #{self}.verify(
+            id: 'required - finding id',
+            kind: 'required - http or script',
+            impact: 'required - marker that must appear in the evidence',
+            request_path: 'optional - absolute HTTP request file when kind is http',
+            response_path: 'optional - absolute HTTP response file when kind is http',
+            execution_log: 'optional - absolute script output file when kind is script'
+          )
+
+          # Re-run the same PoC path after a fix (still_open or fixed).
+          #{self}.retest(
+            id: 'required - finding id',
+            kind: 'required - http or script',
+            impact: 'required - marker that must appear in the evidence',
+            request_path: 'optional - absolute HTTP request file when kind is http',
+            response_path: 'optional - absolute HTTP response file when kind is http',
+            execution_log: 'optional - absolute script output file when kind is script'
+          )
+
+          # Escalate combined severity only with an evidence file that names every id.
+          #{self}.chain_impact(
+            ids: 'required - ordered Array of at least two distinct same-engagement finding IDs; adds consecutive enables edges',
+            combined_impact_path: 'required - readable absolute evidence file with at least 40 characters naming every ID',
+            escalate: 'optional - true to set combined_severity from evidence; otherwise retains the scored severity',
+            combined_severity: 'optional - info|low|medium|high|critical when escalate is true',
+            severity_justification: 'optional - nonempty evidence-based rationale; defaults to actual combined-impact file text',
+            reproduction_steps: 'optional - nonempty Array of ordered replay instructions; defaults to constituent finding steps'
+          )
+
+          # List unreproduced findings and whether two-plus reproduced rows lack a chain.
+          #{self}.issue_work_gaps(
+            engagement_id: 'optional - engagement identifier',
+            session_id: 'optional - pwn-ai session id'
+          )
+
+          # Print the AUTHOR(S) string for this module.
+          #{self}.authors
+        "
+        constants.sort
+      end
+    end
+  end
+end

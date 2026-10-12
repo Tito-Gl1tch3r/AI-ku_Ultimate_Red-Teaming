@@ -1,0 +1,380 @@
+package hostsensorutils
+
+import (
+	"context"
+	stdjson "encoding/json"
+	"fmt"
+	"os"
+
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	k8shostsensor "github.com/kubescape/k8s-interface/hostsensor"
+	"github.com/kubescape/k8s-interface/k8sinterface"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/opa-utils/objectsenvelopes/hostsensor"
+	"github.com/kubescape/opa-utils/reporthandling/apis"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+)
+
+// crdCollection is what one resource's CRD listing yielded: the items the API
+// server returned and the ones that became envelopes. Both counts are kept
+// because they answer different questions - listed says whether the node-agent
+// reported anything at all, converted says whether any of it reached the scan.
+type crdCollection struct {
+	listed    int
+	converted int
+}
+
+// dropped is the number of reported items the scan could not read.
+func (c crdCollection) dropped() int {
+	return c.listed - c.converted
+}
+
+// reportCollectionGaps records what one resource's collection lost.
+//
+// A resource whose reported items were all unreadable is recorded on the scan
+// like an empty one: it reached the scan with no data, and without an entry the
+// controls that read it are inferred as passing off data that never arrived.
+// A partial loss keeps what it did read and additionally records one
+// PartialGVRPull per GVR: the readable envelopes still flow to the scan, but
+// passes inferred over the surviving subset are marked incomplete downstream
+// instead of looking like a fully inspected fleet.
+//
+// The zero-item case is deliberately not judged here. Whether it is a problem
+// depends on what the caller expected: for a per-node resource it means the
+// node-agent has not reported for its nodes, while for CloudProviderInfo it is
+// the normal answer on an on-prem cluster.
+func reportCollectionGaps(ctx context.Context, resource k8shostsensor.HostSensorResource, collected crdCollection, infoMap map[string]apis.StatusInfo) []cautils.PartialGVRPull {
+	switch {
+	case collected.listed == 0:
+		return nil
+	case collected.converted == 0:
+		err := fmt.Errorf("node-agent reported %d %s but none of them could be read", collected.listed, resource.String())
+		addInfoToMap(resource, infoMap, err)
+		logger.L().Ctx(ctx).Warning("No readable CRD items",
+			helpers.String("resource", resource.String()),
+			helpers.Error(err))
+		return nil
+	case collected.dropped() > 0:
+		err := fmt.Errorf("node-agent reported %d %s but only %d could be read", collected.listed, resource.String(), collected.converted)
+		logger.L().Ctx(ctx).Warning("Some CRD items could not be read",
+			helpers.String("resource", resource.String()),
+			helpers.Int("read", collected.converted),
+			helpers.Int("reported", collected.listed),
+			helpers.Error(err))
+		return partialGVRPullsForResource(resource, err)
+	}
+	return nil
+}
+
+// partialGVRPullsForResource builds the PartialGVRPull for a host sensor
+// resource using its virtual policy-Kind identity — the same key addInfoToMap
+// and ResourceToControlsMap use since host identities stopped following
+// discovery. Discovery may serve the v1beta1 transport CRDs under plural
+// REST names, but the envelopes are virtual v1beta0 resources, so the gap
+// lines up with control dependencies without a key-mapping layer.
+// Selector "conversion" scopes the failure to envelope decoding, distinct
+// from per-selector LIST failures that share the same array.
+func partialGVRPullsForResource(resource k8shostsensor.HostSensorResource, err error) []cautils.PartialGVRPull {
+	group, version := k8sinterface.SplitApiVersion(k8shostsensor.MapHostSensorResourceToApiGroup(resource))
+	return []cautils.PartialGVRPull{{
+		GVR:      k8sinterface.JoinResourceTriplets(group, version, resource.String()),
+		Selector: "conversion",
+		Error:    err.Error(),
+	}}
+}
+
+// getCRDResources retrieves resources from CRDs and converts them to HostSensorDataEnvelope format
+func (hsh *HostSensorHandler) getCRDResources(ctx context.Context, resourceType k8shostsensor.HostSensorResource) ([]hostsensor.HostSensorDataEnvelope, crdCollection, error) {
+	pluralName := k8shostsensor.MapResourceToPlural(resourceType)
+	if pluralName == "" {
+		return nil, crdCollection{}, fmt.Errorf("unsupported resource type: %s", resourceType)
+	}
+
+	clusterName := k8sinterface.GetContextName()
+	// Try loading from cache first
+	if cachedEnvelopes, err := loadFromCache(clusterName, resourceType.String()); err == nil {
+		// The cache only ever holds envelopes that converted, so nothing was dropped.
+		return cachedEnvelopes, crdCollection{listed: len(cachedEnvelopes), converted: len(cachedEnvelopes)}, nil
+	} else if !os.IsNotExist(err) {
+		logger.L().Warning("Failed to load cache, proceeding to fetch", helpers.Error(err))
+	}
+
+	// List CRD resources and process them page by page
+	result := make([]hostsensor.HostSensorDataEnvelope, 0)
+	collected := crdCollection{}
+	err := hsh.listCRDResources(ctx, pluralName, resourceType.String(), func(items []unstructured.Unstructured) error {
+		collected.listed += len(items)
+		for _, item := range items {
+			envelope, err := hsh.convertCRDToEnvelope(item, resourceType)
+			if err != nil {
+				logger.L().Warning("Failed to convert CRD to envelope",
+					helpers.String("kind", resourceType.String()),
+					helpers.String("name", item.GetName()),
+					helpers.Error(err))
+				continue
+			}
+			result = append(result, envelope)
+		}
+		return nil
+	})
+
+	if err != nil {
+		logger.L().Ctx(ctx).Error("failed to list CRD resources",
+			helpers.String("kind", resourceType.String()),
+			helpers.String("plural", pluralName),
+			helpers.Error(err))
+		return nil, crdCollection{}, err
+	}
+
+	collected.converted = len(result)
+	logger.L().Ctx(ctx).Info("Retrieved resources from CRDs",
+		helpers.String("kind", resourceType.String()),
+		helpers.Int("count", len(result)))
+
+	// Save to cache. A partially converted collection is never cached: the
+	// cache stores converted envelopes only and reconstructs listed ==
+	// converted on a hit, so a later scan would forget the gap and serve the
+	// subset as apparently complete.
+	if collected.dropped() > 0 {
+		logger.L().Warning("Skipping cache write for partially converted resource",
+			helpers.String("kind", resourceType.String()),
+			helpers.Int("read", collected.converted),
+			helpers.Int("reported", collected.listed))
+	} else if err := saveToCache(clusterName, resourceType.String(), result); err != nil {
+		logger.L().Warning("Failed to save to cache", helpers.Error(err))
+	}
+
+	return result, collected, nil
+}
+
+// convertCRDToEnvelope converts a CRD unstructured object to HostSensorDataEnvelope
+func (hsh *HostSensorHandler) convertCRDToEnvelope(item unstructured.Unstructured, resourceType k8shostsensor.HostSensorResource) (hostsensor.HostSensorDataEnvelope, error) {
+	envelope := hostsensor.HostSensorDataEnvelope{}
+
+	// Set API version and kind
+	// The cluster CRDs use v1beta1, but the OPA policies expect v1beta0.
+	// We use hostsensor.Version which is "v1beta0".
+	envelope.SetApiVersion(k8sinterface.JoinGroupVersion(hostsensor.GroupHostSensor, hostsensor.Version))
+	envelope.SetKind(resourceType.String())
+
+	// Set name (node name)
+	nodeName := item.GetName()
+	envelope.SetName(nodeName)
+
+	// The host sensor CRDs store the actual data in the 'spec' field.
+	// We need to map 'spec' to the envelope's 'Data' field.
+	spec, found, err := unstructured.NestedMap(item.Object, "spec")
+	if err != nil {
+		return envelope, fmt.Errorf("failed to extract spec: %w", err)
+	}
+	if !found {
+		logger.L().Warning("spec not found in CRD item",
+			helpers.String("kind", resourceType.String()),
+			helpers.String("name", nodeName))
+		return envelope, fmt.Errorf("spec not found in CRD")
+	}
+
+	// Remove nodeName as it's already in the envelope metadata
+	delete(spec, "nodeName")
+
+	// The Rego policies expect the data in a specific structure.
+	// For most resources (like ControlPlaneInfo), the 'spec' already contains the required fields:
+	// APIServerInfo, KubeProxyInfo, etc.
+	// However, for some resources like KubeletInfo, the CRD's 'spec' wraps the actual data
+	// in a field named after the resource type. We need to unwrap it if it exists.
+	var data any = spec
+	if inner, ok := spec[resourceType.String()]; ok {
+		data = inner
+	}
+
+	contentBytes, err := stdjson.Marshal(data)
+	if err != nil {
+		return envelope, fmt.Errorf("failed to marshal spec: %w", err)
+	}
+
+	logger.L().Debug("Converted CRD to envelope",
+		helpers.String("kind", resourceType.String()),
+		helpers.String("name", nodeName),
+		helpers.Int("dataSize", len(contentBytes)))
+
+	// Set data as raw bytes
+	envelope.SetData(contentBytes)
+
+	return envelope, nil
+}
+
+// getOsReleaseFile returns the list of osRelease metadata from CRDs.
+func (hsh *HostSensorHandler) getOsReleaseFile(ctx context.Context) ([]hostsensor.HostSensorDataEnvelope, crdCollection, error) {
+	return hsh.getCRDResources(ctx, k8shostsensor.OsReleaseFile)
+}
+
+// getKernelVersion returns the list of kernelVersion metadata from CRDs.
+func (hsh *HostSensorHandler) getKernelVersion(ctx context.Context) ([]hostsensor.HostSensorDataEnvelope, crdCollection, error) {
+	return hsh.getCRDResources(ctx, k8shostsensor.KernelVersion)
+}
+
+// getLinuxSecurityHardeningStatus returns the list of LinuxSecurityHardeningStatus metadata from CRDs.
+func (hsh *HostSensorHandler) getLinuxSecurityHardeningStatus(ctx context.Context) ([]hostsensor.HostSensorDataEnvelope, crdCollection, error) {
+	return hsh.getCRDResources(ctx, k8shostsensor.LinuxSecurityHardeningStatus)
+}
+
+// getOpenPortsList returns the list of open ports from CRDs.
+func (hsh *HostSensorHandler) getOpenPortsList(ctx context.Context) ([]hostsensor.HostSensorDataEnvelope, crdCollection, error) {
+	return hsh.getCRDResources(ctx, k8shostsensor.OpenPortsList)
+}
+
+// getKernelVariables returns the list of Linux Kernel variables from CRDs.
+func (hsh *HostSensorHandler) getKernelVariables(ctx context.Context) ([]hostsensor.HostSensorDataEnvelope, crdCollection, error) {
+	return hsh.getCRDResources(ctx, k8shostsensor.LinuxKernelVariables)
+}
+
+// getKubeletInfo returns the list of kubelet metadata from CRDs.
+func (hsh *HostSensorHandler) getKubeletInfo(ctx context.Context) ([]hostsensor.HostSensorDataEnvelope, crdCollection, error) {
+	return hsh.getCRDResources(ctx, k8shostsensor.KubeletInfo)
+}
+
+// getKubeProxyInfo returns the list of kubeProxy metadata from CRDs.
+func (hsh *HostSensorHandler) getKubeProxyInfo(ctx context.Context) ([]hostsensor.HostSensorDataEnvelope, crdCollection, error) {
+	return hsh.getCRDResources(ctx, k8shostsensor.KubeProxyInfo)
+}
+
+// getControlPlaneInfo returns the list of controlPlaneInfo metadata from CRDs.
+func (hsh *HostSensorHandler) getControlPlaneInfo(ctx context.Context) ([]hostsensor.HostSensorDataEnvelope, crdCollection, error) {
+	return hsh.getCRDResources(ctx, k8shostsensor.ControlPlaneInfo)
+}
+
+// getCloudProviderInfo returns the list of cloudProviderInfo metadata from CRDs.
+func (hsh *HostSensorHandler) getCloudProviderInfo(ctx context.Context) ([]hostsensor.HostSensorDataEnvelope, crdCollection, error) {
+	return hsh.getCRDResources(ctx, k8shostsensor.CloudProviderInfo)
+}
+
+// getCNIInfo returns the list of CNI metadata from CRDs.
+func (hsh *HostSensorHandler) getCNIInfo(ctx context.Context) ([]hostsensor.HostSensorDataEnvelope, crdCollection, error) {
+	return hsh.getCRDResources(ctx, k8shostsensor.CNIInfo)
+}
+
+// hasCloudProviderInfo iterates over the []hostsensor.HostSensorDataEnvelope list to find info about the cloud provider.
+//
+// If information are found, then return true. Return false otherwise.
+func hasCloudProviderInfo(cpi []hostsensor.HostSensorDataEnvelope) bool {
+	for index := range cpi {
+		var data map[string]any
+		if err := stdjson.Unmarshal(cpi[index].GetData(), &data); err != nil {
+			continue
+		}
+		if val, ok := data["providerMetaDataAPIAccess"]; ok {
+			if b, ok := val.(bool); ok && b {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// CollectResources collects all required information from CRDs. Partial
+// conversion losses are returned as PartialGVRPull records alongside the
+// readable envelopes so callers can surface them on the session without
+// touching InfoMap (which BuildScanCoverage reads as total pull failures).
+func (hsh *HostSensorHandler) CollectResources(ctx context.Context) ([]hostsensor.HostSensorDataEnvelope, map[string]apis.StatusInfo, []cautils.PartialGVRPull, error) {
+	res := make([]hostsensor.HostSensorDataEnvelope, 0)
+	infoMap := make(map[string]apis.StatusInfo)
+	var partialPulls []cautils.PartialGVRPull
+
+	logger.L().Info("Collecting host sensor data from CRDs")
+
+	var hasCloudProvider bool
+	// We first query CloudProviderInfo to determine if we should skip ControlPlaneInfo
+	cloudProviderData, collected, err := hsh.getCloudProviderInfo(ctx)
+	if err != nil {
+		addInfoToMap(k8shostsensor.CloudProviderInfo, infoMap, err)
+		logger.L().Ctx(ctx).Warning("Failed to get CloudProviderInfo from CRD", helpers.Error(err))
+	} else {
+		// This query runs ahead of the loop below, so it needs its own call:
+		// without one, CloudProviderInfo is the resource that can lose every
+		// item it reported and still leave no status behind. It also decides
+		// whether ControlPlaneInfo is collected at all, and an unreadable
+		// answer reads the same as "no cloud provider".
+		partialPulls = append(partialPulls, reportCollectionGaps(ctx, k8shostsensor.CloudProviderInfo, collected, infoMap)...)
+		hasCloudProvider = hasCloudProviderInfo(cloudProviderData)
+		if len(cloudProviderData) > 0 {
+			res = append(res, cloudProviderData...)
+		}
+	}
+
+	for _, toPin := range []struct {
+		Resource k8shostsensor.HostSensorResource
+		Query    func(context.Context) ([]hostsensor.HostSensorDataEnvelope, crdCollection, error)
+	}{
+		// queries to CRDs
+		{
+			Resource: k8shostsensor.OsReleaseFile,
+			Query:    hsh.getOsReleaseFile,
+		},
+		{
+			Resource: k8shostsensor.KernelVersion,
+			Query:    hsh.getKernelVersion,
+		},
+		{
+			Resource: k8shostsensor.LinuxSecurityHardeningStatus,
+			Query:    hsh.getLinuxSecurityHardeningStatus,
+		},
+		{
+			Resource: k8shostsensor.OpenPortsList,
+			Query:    hsh.getOpenPortsList,
+		},
+		{
+			Resource: k8shostsensor.LinuxKernelVariables,
+			Query:    hsh.getKernelVariables,
+		},
+		{
+			Resource: k8shostsensor.KubeletInfo,
+			Query:    hsh.getKubeletInfo,
+		},
+		{
+			Resource: k8shostsensor.KubeProxyInfo,
+			Query:    hsh.getKubeProxyInfo,
+		},
+		{
+			Resource: k8shostsensor.CNIInfo,
+			Query:    hsh.getCNIInfo,
+		},
+		{
+			Resource: k8shostsensor.ControlPlaneInfo,
+			Query:    hsh.getControlPlaneInfo,
+		},
+	} {
+		k8sInfo := toPin
+
+		if k8sInfo.Resource == k8shostsensor.ControlPlaneInfo && hasCloudProvider {
+			logger.L().Info("Skipping ControlPlaneInfo collection due to cloud provider presence")
+			// we retrieve control plane info only if we are not using a cloud provider
+			continue
+		}
+
+		kcData, collected, err := k8sInfo.Query(ctx)
+		switch {
+		case err != nil:
+			addInfoToMap(k8sInfo.Resource, infoMap, err)
+			logger.L().Ctx(ctx).Warning("Failed to get resource from CRD",
+				helpers.String("resource", k8sInfo.Resource.String()),
+				helpers.Error(err))
+		case collected.listed == 0 && hsh.nodeCount > 0:
+			err = fmt.Errorf("node-agent didn't report any %s for %d nodes", k8sInfo.Resource.String(), hsh.nodeCount)
+			addInfoToMap(k8sInfo.Resource, infoMap, err)
+			logger.L().Ctx(ctx).Warning("Zero CRD items found",
+				helpers.String("resource", k8sInfo.Resource.String()),
+				helpers.Error(err))
+		default:
+			partialPulls = append(partialPulls, reportCollectionGaps(ctx, k8sInfo.Resource, collected, infoMap)...)
+		}
+
+		if len(kcData) > 0 {
+			res = append(res, kcData...)
+		}
+	}
+
+	logger.L().Info("Done collecting information from CRDs", helpers.Int("totalResources", len(res)))
+	return res, infoMap, partialPulls, nil
+}

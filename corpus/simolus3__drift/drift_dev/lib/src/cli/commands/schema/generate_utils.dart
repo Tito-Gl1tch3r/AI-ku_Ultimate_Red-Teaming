@@ -1,0 +1,257 @@
+import 'dart:io';
+
+import 'package:args/command_runner.dart';
+import 'package:drift_dev/src/utils/header.dart';
+import 'package:path/path.dart' as p;
+import 'package:collection/collection.dart';
+import 'package:sqlparser/sqlparser.dart';
+
+import '../../../analysis/results/file_results.dart';
+import '../../../analysis/results/results.dart';
+import '../../../analysis/options.dart';
+import '../../../services/schema/schema_files.dart';
+import '../../../writer/database_writer.dart';
+import '../../../writer/import_manager.dart';
+import '../../../writer/writer.dart';
+import '../../cli.dart';
+import '../schema.dart';
+
+class GenerateUtilsCommand extends Command {
+  final DriftDevCli cli;
+
+  GenerateUtilsCommand(this.cli) {
+    argParser.addFlag(
+      'data-classes',
+      defaultsTo: false,
+      help: 'Whether to generate data classes for each schema version.',
+    );
+    argParser.addFlag(
+      'companions',
+      defaultsTo: false,
+      help: 'Whether to generate companions for each schema version.',
+    );
+  }
+
+  @override
+  String get description {
+    return 'Generate Dart code to help verify schema migrations.';
+  }
+
+  @override
+  String get name => 'generate';
+
+  @override
+  String get invocation {
+    return '${runner!.executableName} schema generate <input> <output>';
+  }
+
+  @override
+  Future<void> run() async {
+    final rest = argResults!.rest;
+    if (rest.length != 2) {
+      usageException('Expected input and output directories');
+    }
+
+    final inputDir = Directory(rest[0]);
+    final outputDir = Directory(rest[1]);
+
+    if (!await inputDir.exists()) {
+      cli.exit('The provided input directory does not exist.');
+    }
+
+    if (!await outputDir.exists()) {
+      await outputDir.create();
+    }
+
+    final schema = await parseSchema(inputDir);
+    for (final versionAndEntities in schema.entries) {
+      final version = versionAndEntities.key;
+      final entities = versionAndEntities.value;
+
+      final file = File(
+        p.join(outputDir.path, GenerateUtils._filenameForVersion(version)),
+      );
+      await file.writeAsString(
+        await GenerateUtils.generateSchemaCode(
+          cli,
+          version,
+          entities,
+          argResults?['data-classes'] as bool,
+          argResults?['companions'] as bool,
+        ),
+      );
+    }
+
+    final versions = schema.keys.toList()..sort();
+    final libraryFile = File(p.join(outputDir.path, 'schema.dart'));
+    await libraryFile.writeAsString(
+      await GenerateUtils.generateLibraryCode(cli, versions),
+    );
+    print(
+      'Wrote ${schema.length + 1} files into ${p.relative(outputDir.path)}',
+    );
+  }
+}
+
+class GenerateUtils {
+  static String _filenameForVersion(int version) => 'schema_v$version.dart';
+
+  /// Generates Dart code for a specific schema version.
+  static Future<String> generateSchemaCode(
+    DriftDevCli cli,
+    int version,
+    ExportedSchema schema,
+    bool dataClasses,
+    bool companions,
+  ) async {
+    // let serialized options take precedence, otherwise use current options
+    // from project.
+    final options = _mergeDriftOptions(cli, schema);
+
+    final imports = LibraryImportManager()
+      ..enforceAlias(AnnotatedDartCode.drift, null)
+      // Internal URL of the generated file, just skip the import prefix.
+      ..enforceAlias(Uri.parse('${SchemaReader.elementUri}.dart'), null);
+
+    final writer = Writer(
+      options,
+      generationOptions: GenerationOptions(
+        forSchema: version,
+        writeCompanions: companions,
+        writeDataClasses: dataClasses,
+        imports: imports,
+      ),
+    );
+    imports.linkToWriter(writer);
+
+    // We need to use the core drift package without an import alias because it
+    // can be referenced in snippets that are part of the schema files.
+    writer.leaf()
+      ..writeln(generatedHeader)
+      ..writeln("import '${imports.driftUri}';");
+
+    final database = DriftDatabase(
+      id: DriftElementId(SchemaReader.elementUri, 'database'),
+      declaration: DriftDeclaration(SchemaReader.elementUri, 0, 'database'),
+      declaredIncludes: const [],
+      declaredQueries: const [],
+      declaredTables: const [],
+      declaredViews: const [],
+      hasConstructorArgumentForConnection: false,
+    );
+
+    final engine = SqlEngine(EngineOptions(version: SqliteVersion.current));
+    final definedQueries = {
+      for (final query in schema.schema.whereType<DefinedSqlQuery>())
+        query: SqlQuery.astOnly(
+          engine: engine,
+          name: query.name,
+          sql: query.sql,
+        ),
+    };
+
+    final resolved = ResolvedDatabaseAccessor(
+      const {},
+      const [],
+      schema.schema,
+    );
+    final input = DatabaseGenerationInput(
+      database,
+      resolved,
+      definedQueries,
+      null,
+    );
+
+    DatabaseWriter(input, writer.child()).write();
+
+    return await cli.project.formatSource(writer.writeGenerated());
+  }
+
+  static DriftOptions _mergeDriftOptions(
+    DriftDevCli cli,
+    ExportedSchema schema,
+  ) {
+    // let serialized options take precedence, otherwise use current options
+    // from project.
+    final targetIsDrift3 = cli.project.options.drift3Preview;
+    final schemaIsDrift3 = schema.options.containsKey('dialects');
+    var schemaOptions = schema.options;
+
+    if (targetIsDrift3 && !schemaIsDrift3) {
+      // Interpret old options as drift3 options.
+      schemaOptions = {
+        'dialects': [
+          {
+            'dialect': 'sqlite',
+            'store_date_times_as_text':
+                schema.options['store_date_time_values_as_text'] ?? false,
+
+            // These options didn't exist before
+            'strict_tables_by_default': false,
+            'use_binary_json_representation': false,
+          },
+        ],
+      };
+    }
+
+    return DriftOptions.fromJson({
+      ...cli.project.options.toJson(),
+      ...schemaOptions,
+      'generate_manager': false,
+    });
+  }
+
+  /// Generates the Dart code for a library file that instantiates the schema
+  /// for each version.
+  static Future<String> generateLibraryCode(
+    DriftDevCli cli,
+    Iterable<int> versions,
+  ) async {
+    final isDrift3 = cli.project.options.drift3Preview;
+
+    final buffer = StringBuffer()..writeln(generatedHeader);
+    if (isDrift3) {
+      buffer
+        ..writeln("import 'package:drift3_preview/drift.dart';")
+        ..writeln("import 'package:drift_sqlite/schema_verifier.dart';");
+    } else {
+      buffer
+        ..writeln("import 'package:drift/drift.dart';")
+        ..writeln("import 'package:drift/internal/migrations.dart';");
+    }
+
+    for (final version in versions) {
+      buffer.writeln("import '${_filenameForVersion(version)}' as v$version;");
+    }
+
+    final connectionType = isDrift3 ? 'DriftConnection' : 'QueryExecutor';
+
+    buffer
+      ..writeln('class GeneratedHelper implements SchemaInstantiationHelper {')
+      ..writeln('@override')
+      ..writeln(
+        'GeneratedDatabase databaseForVersion($connectionType db, '
+        'int version) {',
+      )
+      ..writeln('switch (version) {');
+
+    for (final version in versions) {
+      buffer
+        ..writeln('case $version:')
+        ..writeln('return v$version.DatabaseAtV$version(db);');
+    }
+
+    final versionsSet =
+        '[${versions.sorted((a, b) => a.compareTo(b)).join(', ')}]';
+    buffer
+      ..writeln('default:')
+      ..writeln('throw MissingSchemaException(version, versions);')
+      ..writeln('}}');
+
+    buffer
+      ..writeln('static const versions = const $versionsSet;')
+      ..writeln('}');
+
+    return await cli.project.formatSource(buffer.toString());
+  }
+}

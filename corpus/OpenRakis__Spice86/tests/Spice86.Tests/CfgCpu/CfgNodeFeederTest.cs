@@ -1,0 +1,288 @@
+﻿using JetBrains.Annotations;
+
+using NSubstitute;
+
+using Spice86.Logging;
+
+using Spice86.Core.Emulator.CPU;
+using Spice86.Core.Emulator.CPU.CfgCpu.ControlFlowGraph;
+using Spice86.Core.Emulator.CPU.CfgCpu.Feeder;
+using Spice86.Core.Emulator.CPU.CfgCpu.ParsedInstruction;
+using Spice86.Core.Emulator.CPU.CfgCpu.ParsedInstruction.SelfModifying;
+using Spice86.Core.Emulator.Memory;
+using Spice86.Core.Emulator.Memory.Mmu;
+using Spice86.Core.Emulator.VM;
+using Spice86.Shared.Emulator.Memory;
+using Spice86.Shared.Interfaces;
+using Spice86.Shared.Utils;
+
+using Xunit;
+
+namespace Spice86.Tests.CfgCpu;
+
+using Spice86.Core.CLI;
+using Spice86.Core.Emulator.CPU.CfgCpu;
+using Spice86.Core.Emulator.CPU.CfgCpu.InstructionExecutor.Expressions;
+using Spice86.Core.Emulator.CPU.CfgCpu.Linker;
+using Spice86.Core.Emulator.Function;
+using Spice86.Core.Emulator.VM.Breakpoint;
+
+public class CfgNodeFeederTest : IDisposable {
+    private const ushort MovAxOpcode = 0xB8;
+    private const ushort MovCxOpcode = 0xB9;
+    private const ushort MovBxOpcode = 0xBB;
+    private const ushort DefaultValue = 0xFFFF;
+    private const ushort NewValue = 0x1234;
+    private const int MovRegImm16Length = 3;
+    private static readonly SegmentedAddress ZeroAddress = SegmentedAddress.ZERO;
+    private static readonly SegmentedAddress EndOfMov0Address = new(0, MovRegImm16Length);
+
+    private Memory _memory = new(new(), new Ram(64), new A20Gate(), new RealModeMmu386(), false);
+    private State _state = new(CpuModel.INTEL_80286);
+    private CfgNodeExecutionCompiler? _compiler;
+
+    private (CfgNodeFeeder, ExecutionContext) CreateCfgNodeFeeder() {
+        ILogger loggerService = Substitute.For<ILogger>();
+        Spice86LoggerState loggerState = new();
+        AddressReadWriteBreakpoints memoryBreakpoints = new();
+        AddressReadWriteBreakpoints ioBreakpoints = new();
+        _memory = new(memoryBreakpoints, new Ram(64), new A20Gate(), new RealModeMmu386(), false);
+        _state = new State(CpuModel.INTEL_80286);
+        EmulatorBreakpointsManager emulatorBreakpointsManager = new(new PauseHandler(loggerService), _state, _memory, memoryBreakpoints, ioBreakpoints);
+        InstructionReplacerRegistry replacerRegistry = new();
+        _compiler?.Dispose();
+        _compiler = new CfgNodeExecutionCompiler(new CfgNodeExecutionCompilerMonitor(loggerService), loggerService, JitMode.InterpretedOnly);
+        CfgNodeFeeder cfgNodeFeeder = new(_memory, _state, emulatorBreakpointsManager, replacerRegistry,
+            _compiler, new SequentialIdAllocator(), enableSpeculativeExploration: false);
+        ExecutionContextManager executionContextManager = new(_memory, _state, cfgNodeFeeder, replacerRegistry, new(), false, loggerService, loggerState, null);
+        ExecutionContext executionContext = executionContextManager.CurrentExecutionContext;
+        return (cfgNodeFeeder, executionContext);
+    }
+
+    private void WriteMovReg16(SegmentedAddress address, byte opcode, ushort value) {
+        _memory.UInt8[ToPhysicalAddress(address)] = opcode;
+        _memory.UInt16[ToPhysicalAddress(address + 1)] = value;
+    }
+
+    private static uint ToPhysicalAddress(SegmentedAddress address) {
+        return MemoryUtils.ToPhysicalAddress(address.Segment, address.Offset);
+    }
+
+    private void WriteMovAx(SegmentedAddress address, ushort value) {
+        WriteMovReg16(address, 0xB8, value);
+    }
+
+    private void WriteMovBx(SegmentedAddress address, ushort value) {
+        WriteMovReg16(address, 0xBB, value);
+    }
+
+    private void WriteMovCx(SegmentedAddress address, ushort value) {
+        WriteMovReg16(address, 0xB9, value);
+    }
+
+    private ICfgNode SimulateExecution(CfgNodeFeeder cfgNodeFeeder, ExecutionContext executionContext) {
+        ICfgNode node = cfgNodeFeeder.GetLinkedCfgNodeToExecute(executionContext);
+        executionContext.LastExecuted = node;
+        if (node is CfgInstruction cfgInstruction) {
+            _state.IP = cfgInstruction.Length;
+        }
+
+        return node;
+    }
+
+    private void WriteTwoMovAx() {
+        WriteMovAx(ZeroAddress, DefaultValue);
+        WriteMovAx(EndOfMov0Address, DefaultValue);
+    }
+
+    [Fact]
+    public void ReadInstructionViaParser() {
+        // Arrange
+        (CfgNodeFeeder cfgNodeFeeder, ExecutionContext executionContext) = CreateCfgNodeFeeder();
+        WriteMovAx(ZeroAddress, DefaultValue);
+
+        // Act
+        ICfgNode movAx = cfgNodeFeeder.GetLinkedCfgNodeToExecute(executionContext);
+
+        // Assert
+        CfgInstruction movAxRegImm16 = AssertIsMovWithOpcode(movAx, MovAxOpcode);
+        AssertUsesValue(movAxRegImm16, DefaultValue);
+    }
+
+    [Fact]
+    public void LinkTwoInstructions() {
+        // Arrange
+        (CfgNodeFeeder cfgNodeFeeder, ExecutionContext executionContext) = CreateCfgNodeFeeder();
+        WriteMovAx(ZeroAddress, DefaultValue);
+        WriteMovBx(EndOfMov0Address, DefaultValue);
+        ICfgNode movAx = SimulateExecution(cfgNodeFeeder, executionContext);
+
+        // Act
+        ICfgNode movBx = cfgNodeFeeder.GetLinkedCfgNodeToExecute(executionContext);
+
+        // Assert
+        CfgInstruction movAxRegImm16 = AssertIsMovWithOpcode(movAx, MovAxOpcode);
+        CfgInstruction movBxRegImm16 = AssertIsMovWithOpcode(movBx, MovBxOpcode);
+        AssertUsesValue(movBxRegImm16, DefaultValue);
+        AssertSuccessorAtAddress(movAxRegImm16, EndOfMov0Address, movBx);
+    }
+
+    [Fact]
+    public void MovAxChangedToMovBx() {
+        // Arrange
+        (CfgNodeFeeder cfgNodeFeeder, ExecutionContext executionContext) = CreateCfgNodeFeeder();
+        WriteTwoMovAx();
+        ICfgNode movAx0 = SimulateExecution(cfgNodeFeeder, executionContext);
+        // Parse second Mov AX and insert it in graph
+        ICfgNode movAx1 = cfgNodeFeeder.GetLinkedCfgNodeToExecute(executionContext);
+
+
+        // Act
+        // Some time later second Mov AX changes to Mov BX and we are about to execute it, graph says next is Mov AX but this is no the case.
+        WriteMovBx(EndOfMov0Address, DefaultValue);
+        executionContext.NodeToExecuteNextAccordingToGraph = movAx1;
+        SelectorNode selectorNode = AssertIsSelectorNode(cfgNodeFeeder.GetLinkedCfgNodeToExecute(executionContext));
+
+        // Assert
+        // Mov AX0 is not anymore linked to mov ax1, there is a selector node between them.
+        AssertDoesNotLinkTo(movAx0, movAx1);
+        // Check the selector node is there
+        AssertLinksTo(movAx0, selectorNode);
+        // Check selector node also contains Mov BX
+        ICfgNode movBx = selectorNode.Successors.First(node => !node.Equals(movAx1));
+        CfgInstruction movBxRegImm16 = AssertIsMovWithOpcode(movBx, MovBxOpcode);
+        CfgInstruction movAx1RegImm16 = AssertIsMovWithOpcode(movAx1, MovAxOpcode);
+        AssertUsesValue(movBxRegImm16, DefaultValue);
+        AssertSuccessorAtSignature(selectorNode, movBxRegImm16);
+        AssertSuccessorAtSignature(selectorNode, movAx1RegImm16);
+    }
+
+    [Fact]
+    public void MovAxChangedValue() {
+        // Arrange
+        (CfgNodeFeeder cfgNodeFeeder, ExecutionContext executionContext) = CreateCfgNodeFeeder();
+        WriteTwoMovAx();
+        SimulateExecution(cfgNodeFeeder, executionContext);
+        // Just parse next and insert it in graph
+        ICfgNode movAx1 = cfgNodeFeeder.GetLinkedCfgNodeToExecute(executionContext);
+
+        // Act
+        // We are still after movAx0 but it changed to MOV AX 1234.
+        WriteMovAx(EndOfMov0Address, NewValue);
+        // Execute changed instruction
+        executionContext.NodeToExecuteNextAccordingToGraph = movAx1;
+        ICfgNode movAx1WithNullSignature = cfgNodeFeeder.GetLinkedCfgNodeToExecute(executionContext);
+
+        // Assert
+        AssertMovAxIsSameButValueFieldRefersMemory(movAx1, movAx1WithNullSignature);
+    }
+
+    [Fact]
+    public void MovAxChangedToMovBxThenMovCx() {
+        // Arrange
+        (CfgNodeFeeder cfgNodeFeeder, ExecutionContext executionContext) = CreateCfgNodeFeeder();
+        WriteTwoMovAx();
+        SimulateExecution(cfgNodeFeeder, executionContext);
+        ICfgNode movAx1 = cfgNodeFeeder.GetLinkedCfgNodeToExecute(executionContext);
+        executionContext.NodeToExecuteNextAccordingToGraph = movAx1;
+        WriteMovBx(EndOfMov0Address, DefaultValue);
+        ICfgNode selector = cfgNodeFeeder.GetLinkedCfgNodeToExecute(executionContext);
+        WriteMovCx(EndOfMov0Address, DefaultValue);
+        // CPU executed signature but Mov CX was in memory => no successor of the signature matched
+        executionContext.LastExecuted = selector;
+        executionContext.NodeToExecuteNextAccordingToGraph = null;
+
+        // Act
+        // We at signature but instruction got changed to something that is not yet in the signature list of values.
+        ICfgNode movCx = cfgNodeFeeder.GetLinkedCfgNodeToExecute(executionContext);
+
+        // Assert
+        SelectorNode selectorNode = AssertIsSelectorNode(selector);
+        CfgInstruction movCxRegImm16 = AssertIsMovWithOpcode(movCx, MovCxOpcode);
+        AssertSuccessorAtSignature(selectorNode, movCxRegImm16);
+    }
+
+    [Fact]
+    public void MovAxChangedToMovBxThenMovAxWithDifferentValue() {
+        // Arrange
+        (CfgNodeFeeder cfgNodeFeeder, ExecutionContext executionContext) = CreateCfgNodeFeeder();
+        WriteTwoMovAx();
+        SimulateExecution(cfgNodeFeeder, executionContext);
+        ICfgNode movAx1 = cfgNodeFeeder.GetLinkedCfgNodeToExecute(executionContext);
+        // Code goes back to mov AX1 but it has been changed to MOV BX, selector node should have been created
+        executionContext.NodeToExecuteNextAccordingToGraph = movAx1;
+        WriteMovBx(EndOfMov0Address, DefaultValue);
+        ICfgNode selector = cfgNodeFeeder.GetLinkedCfgNodeToExecute(executionContext);
+        // Then write MOV AX back but with a different value
+        WriteMovAx(EndOfMov0Address, NewValue);
+        // CPU executed selector node, and determined Mov AX was next according to graph since it was in memory => should match with initial mov AX
+        executionContext.LastExecuted = selector;
+        executionContext.NodeToExecuteNextAccordingToGraph = movAx1;
+
+        // Act
+        ICfgNode movAx1WithNullSignature = cfgNodeFeeder.GetLinkedCfgNodeToExecute(executionContext);
+
+        // Assert
+        AssertMovAxIsSameButValueFieldRefersMemory(movAx1, movAx1WithNullSignature);
+    }
+
+    [AssertionMethod]
+    private static void AssertSuccessorAtSignature(SelectorNode predecessor, CfgInstruction expectedSuccessor) {
+        AssertLinksTo(predecessor, expectedSuccessor);
+        Assert.Equal(expectedSuccessor, predecessor.SuccessorsPerSignature[expectedSuccessor.Signature]);
+    }
+
+    private void AssertSuccessorAtAddress(CfgInstruction predecessor, SegmentedAddress address,
+        ICfgNode expectedSuccessor) {
+        AssertLinksTo(predecessor, expectedSuccessor);
+        Assert.Equal(expectedSuccessor, predecessor.SuccessorsPerAddress[address]);
+    }
+
+    [AssertionMethod]
+    private static void AssertLinksTo(ICfgNode previous, ICfgNode next) {
+        Assert.Contains(next, previous.Successors);
+        Assert.Contains(previous, next.Predecessors);
+    }
+
+    [AssertionMethod]
+    private static void AssertDoesNotLinkTo(ICfgNode previous, ICfgNode next) {
+        Assert.DoesNotContain(next, previous.Successors);
+        Assert.DoesNotContain(previous, next.Predecessors);
+    }
+
+    [AssertionMethod]
+    private static SelectorNode AssertIsSelectorNode(ICfgNode selector) {
+        Assert.Equal(typeof(SelectorNode), selector.GetType());
+        return (SelectorNode)selector;
+    }
+
+    private static void AssertUsesValue(CfgInstruction node, ushort expectedValue) {
+        InstructionField<ushort> valueField = (InstructionField<ushort>)node.FieldsInOrder[^1];
+        Assert.True(valueField.UseValue);
+        Assert.Equal(expectedValue, valueField.Value);
+    }
+
+    [AssertionMethod]
+    private static CfgInstruction AssertIsMovWithOpcode(ICfgNode node, ushort expectedOpcode) {
+        CfgInstruction instruction = Assert.IsAssignableFrom<CfgInstruction>(node);
+        Assert.Equal(expectedOpcode, instruction.OpcodeField.Value);
+        return instruction;
+    }
+
+    [AssertionMethod]
+    private void AssertMovAxIsSameButValueFieldRefersMemory(ICfgNode movAx1, ICfgNode movAx1WithNullSignature) {
+        // Instructions instances are not necessarily the same. However, their types and addresses should be the same.
+        // The value of the new instruction should be read from memory.
+        Assert.Equal(movAx1.Address, movAx1WithNullSignature.Address);
+        CfgInstruction movAx1RegImm16 = AssertIsMovWithOpcode(movAx1WithNullSignature, MovAxOpcode);
+        // Since value has been overwritten use value should be false. Value need to be read from ram
+        InstructionField<ushort> valueField = (InstructionField<ushort>)movAx1RegImm16.FieldsInOrder[^1];
+        Assert.False(valueField.UseValue);
+        Assert.Null(valueField.SignatureValue[0]);
+        Assert.Null(valueField.SignatureValue[1]);
+    }
+
+    public void Dispose() {
+        _compiler?.Dispose();
+    }
+}

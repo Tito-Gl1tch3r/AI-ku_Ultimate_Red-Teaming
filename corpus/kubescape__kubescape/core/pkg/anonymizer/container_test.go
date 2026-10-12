@@ -1,0 +1,1318 @@
+package anonymizer
+
+import (
+	"testing"
+
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
+)
+
+func TestTransformContainerMetadata(t *testing.T) {
+	tests := []struct {
+		name     string
+		object   map[string]any
+		validate func(t *testing.T, spec map[string]any)
+	}{
+		{
+			name: "typed containers should be anonymized",
+			object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"spec": map[string]any{
+					"containers": []corev1.Container{
+						{
+							Name:  "payment-api",
+							Image: "nginx:latest",
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				containers, ok := spec["containers"].([]corev1.Container)
+				if !assert.True(t, ok, "expected typed containers") {
+					return
+				}
+				if !assert.Len(t, containers, 1) {
+					return
+				}
+
+				assert.NotEqual(t, "payment-api", containers[0].Name)
+				assert.NotEqual(t, "nginx:latest", containers[0].Image)
+				assert.Contains(t, containers[0].Name, "ctr-")
+				assert.Contains(t, containers[0].Image, "img-")
+			},
+		},
+		{
+			name: "unstructured containers should be anonymized",
+			object: map[string]any{
+				"spec": map[string]any{
+					"containers": []any{
+						map[string]any{
+							"name":  "payment-api",
+							"image": "nginx:latest",
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				containers, ok := spec["containers"].([]any)
+				if !assert.True(t, ok, "expected unstructured containers") {
+					return
+				}
+				if !assert.Len(t, containers, 1) {
+					return
+				}
+
+				container, ok := containers[0].(map[string]any)
+				if !assert.True(t, ok, "expected unstructured container map") {
+					return
+				}
+
+				assert.NotEqual(t, "payment-api", container["name"])
+				assert.NotEqual(t, "nginx:latest", container["image"])
+				assert.Contains(t, container["name"], "ctr-")
+				assert.Contains(t, container["image"], "img-")
+			},
+		},
+		{
+			name: "typed init containers should be anonymized",
+			object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"spec": map[string]any{
+					"initContainers": []corev1.Container{
+						{
+							Name:  "init-db",
+							Image: "postgres:latest",
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				containers, ok := spec["initContainers"].([]corev1.Container)
+				if !assert.True(t, ok, "expected typed init containers") {
+					return
+				}
+				if !assert.Len(t, containers, 1) {
+					return
+				}
+
+				assert.NotEqual(t, "init-db", containers[0].Name)
+				assert.NotEqual(t, "postgres:latest", containers[0].Image)
+				assert.Contains(t, containers[0].Name, "ctr-")
+				assert.Contains(t, containers[0].Image, "img-")
+			},
+		},
+		{
+			name: "typed ephemeral containers should be anonymized",
+			object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"spec": map[string]any{
+					"ephemeralContainers": []corev1.EphemeralContainer{
+						{
+							EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+								Name:  "debug-shell",
+								Image: "busybox:latest",
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				containers, ok := spec["ephemeralContainers"].([]corev1.EphemeralContainer)
+				if !assert.True(t, ok, "expected typed ephemeral containers") {
+					return
+				}
+				if !assert.Len(t, containers, 1) {
+					return
+				}
+
+				assert.NotEqual(t, "debug-shell", containers[0].Name)
+				assert.NotEqual(t, "busybox:latest", containers[0].Image)
+				assert.Contains(t, containers[0].Name, "ctr-")
+				assert.Contains(t, containers[0].Image, "img-")
+			},
+		},
+		{
+			name: "unstructured ephemeral containers should be anonymized",
+			object: map[string]any{
+				"spec": map[string]any{
+					"ephemeralContainers": []any{
+						map[string]any{
+							"name":  "debug-shell",
+							"image": "busybox:latest",
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				containers, ok := spec["ephemeralContainers"].([]any)
+				if !assert.True(t, ok, "expected unstructured ephemeral containers") {
+					return
+				}
+				if !assert.Len(t, containers, 1) {
+					return
+				}
+
+				container, ok := containers[0].(map[string]any)
+				if !assert.True(t, ok, "expected unstructured ephemeral container map") {
+					return
+				}
+
+				assert.NotEqual(t, "debug-shell", container["name"])
+				assert.NotEqual(t, "busybox:latest", container["image"])
+				assert.Contains(t, container["name"], "ctr-")
+				assert.Contains(t, container["image"], "img-")
+			},
+		},
+		{
+			name: "typed container env references should be anonymized",
+			object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"spec": map[string]any{
+					"containers": []corev1.Container{
+						{
+							Name:  "payment-api",
+							Image: "nginx:latest",
+							Env: []corev1.EnvVar{
+								{
+									Name: "SECRET_TOKEN",
+									ValueFrom: &corev1.EnvVarSource{
+										SecretKeyRef: &corev1.SecretKeySelector{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: "payment-secret",
+											},
+										},
+									},
+								},
+								{
+									Name: "CONFIG_PATH",
+									ValueFrom: &corev1.EnvVarSource{
+										ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: "payment-config",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				containers, ok := spec["containers"].([]corev1.Container)
+				if !assert.True(t, ok, "expected typed containers") {
+					return
+				}
+				if !assert.Len(t, containers, 1) {
+					return
+				}
+
+				assert.NotEqual(t, "payment-secret", containers[0].Env[0].ValueFrom.SecretKeyRef.Name)
+				assert.NotEqual(t, "payment-config", containers[0].Env[1].ValueFrom.ConfigMapKeyRef.Name)
+
+				assert.Contains(t, containers[0].Env[0].ValueFrom.SecretKeyRef.Name, "ref-")
+				assert.Contains(t, containers[0].Env[1].ValueFrom.ConfigMapKeyRef.Name, "ref-")
+
+				assert.NotEqual(t, "SECRET_TOKEN", containers[0].Env[0].Name)
+				assert.Contains(t, containers[0].Env[0].Name, "env-")
+				assert.NotEqual(t, "CONFIG_PATH", containers[0].Env[1].Name)
+				assert.Contains(t, containers[0].Env[1].Name, "env-")
+			},
+		},
+		{
+			name: "unstructured container env references should be anonymized",
+			object: map[string]any{
+				"spec": map[string]any{
+					"containers": []any{
+						map[string]any{
+							"name":  "payment-api",
+							"image": "nginx:latest",
+							"env": []any{
+								map[string]any{
+									"name": "SECRET_TOKEN",
+									"valueFrom": map[string]any{
+										"secretKeyRef": map[string]any{
+											"name": "payment-secret",
+										},
+									},
+								},
+								map[string]any{
+									"name": "CONFIG_PATH",
+									"valueFrom": map[string]any{
+										"configMapKeyRef": map[string]any{
+											"name": "payment-config",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				containers, ok := spec["containers"].([]any)
+				if !assert.True(t, ok, "expected unstructured containers") {
+					return
+				}
+				if !assert.Len(t, containers, 1) {
+					return
+				}
+
+				container, ok := containers[0].(map[string]any)
+				if !assert.True(t, ok, "expected unstructured container map") {
+					return
+				}
+
+				env, ok := container["env"].([]any)
+				if !assert.True(t, ok, "expected env slice") {
+					return
+				}
+				if !assert.Len(t, env, 2) {
+					return
+				}
+
+				secretEnv, ok := env[0].(map[string]any)
+				if !assert.True(t, ok, "expected secret env map") {
+					return
+				}
+
+				configEnv, ok := env[1].(map[string]any)
+				if !assert.True(t, ok, "expected config env map") {
+					return
+				}
+
+				secretValueFrom, ok := secretEnv["valueFrom"].(map[string]any)
+				if !assert.True(t, ok, "expected secret valueFrom map") {
+					return
+				}
+
+				configValueFrom, ok := configEnv["valueFrom"].(map[string]any)
+				if !assert.True(t, ok, "expected config valueFrom map") {
+					return
+				}
+
+				secretRef, ok := secretValueFrom["secretKeyRef"].(map[string]any)
+				if !assert.True(t, ok, "expected secretKeyRef map") {
+					return
+				}
+
+				configRef, ok := configValueFrom["configMapKeyRef"].(map[string]any)
+				if !assert.True(t, ok, "expected configMapKeyRef map") {
+					return
+				}
+
+				assert.NotEqual(t, "payment-secret", secretRef["name"])
+				assert.NotEqual(t, "payment-config", configRef["name"])
+				assert.Contains(t, secretRef["name"], "ref-")
+				assert.Contains(t, configRef["name"], "ref-")
+
+				assert.NotEqual(t, "SECRET_TOKEN", secretEnv["name"])
+				assert.Contains(t, secretEnv["name"], "env-")
+				assert.NotEqual(t, "CONFIG_PATH", configEnv["name"])
+				assert.Contains(t, configEnv["name"], "env-")
+			},
+		},
+		{
+			name: "typed env var names referencing secrets/configmaps should be anonymized even when not sensitive",
+			object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"spec": map[string]any{
+					"containers": []corev1.Container{
+						{
+							Name:  "app",
+							Image: "busybox:latest",
+							Env: []corev1.EnvVar{
+								{
+									Name: "USER",
+									ValueFrom: &corev1.EnvVarSource{
+										SecretKeyRef: &corev1.SecretKeySelector{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: "my-secret",
+											},
+										},
+									},
+								},
+								{
+									Name: "SOMEKEY",
+									ValueFrom: &corev1.EnvVarSource{
+										ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+											LocalObjectReference: corev1.LocalObjectReference{
+												Name: "my-cm",
+											},
+										},
+									},
+								},
+								{
+									Name:  "PLAIN",
+									Value: "not-a-secret",
+								},
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				containers, ok := spec["containers"].([]corev1.Container)
+				if !assert.True(t, ok, "expected typed containers") {
+					return
+				}
+				if !assert.Len(t, containers, 1) {
+					return
+				}
+
+				env := containers[0].Env
+
+				assert.NotEqual(t, "USER", env[0].Name)
+				assert.Contains(t, env[0].Name, "env-")
+				assert.NotEqual(t, "my-secret", env[0].ValueFrom.SecretKeyRef.Name)
+				assert.Contains(t, env[0].ValueFrom.SecretKeyRef.Name, "ref-")
+
+				assert.NotEqual(t, "SOMEKEY", env[1].Name)
+				assert.Contains(t, env[1].Name, "env-")
+				assert.NotEqual(t, "my-cm", env[1].ValueFrom.ConfigMapKeyRef.Name)
+				assert.Contains(t, env[1].ValueFrom.ConfigMapKeyRef.Name, "ref-")
+
+				assert.Equal(t, "PLAIN", env[2].Name)
+				assert.Equal(t, "not-a-secret", env[2].Value)
+			},
+		},
+		{
+			name: "unstructured env var names referencing secrets/configmaps should be anonymized even when not sensitive",
+			object: map[string]any{
+				"spec": map[string]any{
+					"containers": []any{
+						map[string]any{
+							"name":  "app",
+							"image": "busybox:latest",
+							"env": []any{
+								map[string]any{
+									"name": "USER",
+									"valueFrom": map[string]any{
+										"secretKeyRef": map[string]any{
+											"name": "my-secret",
+										},
+									},
+								},
+								map[string]any{
+									"name": "SOMEKEY",
+									"valueFrom": map[string]any{
+										"configMapKeyRef": map[string]any{
+											"name": "my-cm",
+										},
+									},
+								},
+								map[string]any{
+									"name":  "PLAIN",
+									"value": "not-a-secret",
+								},
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				containers, ok := spec["containers"].([]any)
+				if !assert.True(t, ok, "expected unstructured containers") {
+					return
+				}
+				if !assert.Len(t, containers, 1) {
+					return
+				}
+
+				container, ok := containers[0].(map[string]any)
+				if !assert.True(t, ok, "expected unstructured container map") {
+					return
+				}
+
+				env, ok := container["env"].([]any)
+				if !assert.True(t, ok, "expected env slice") {
+					return
+				}
+				if !assert.Len(t, env, 3) {
+					return
+				}
+
+				secretEnv, ok := env[0].(map[string]any)
+				if !assert.True(t, ok, "expected secret env map") {
+					return
+				}
+				configEnv, ok := env[1].(map[string]any)
+				if !assert.True(t, ok, "expected config env map") {
+					return
+				}
+				plainEnv, ok := env[2].(map[string]any)
+				if !assert.True(t, ok, "expected plain env map") {
+					return
+				}
+
+				assert.NotEqual(t, "USER", secretEnv["name"])
+				assert.Contains(t, secretEnv["name"], "env-")
+
+				secretValueFrom, ok := secretEnv["valueFrom"].(map[string]any)
+				if !assert.True(t, ok, "expected secret valueFrom map") {
+					return
+				}
+				secretRef, ok := secretValueFrom["secretKeyRef"].(map[string]any)
+				if !assert.True(t, ok, "expected secretKeyRef map") {
+					return
+				}
+				assert.NotEqual(t, "my-secret", secretRef["name"])
+				assert.Contains(t, secretRef["name"], "ref-")
+
+				assert.NotEqual(t, "SOMEKEY", configEnv["name"])
+				assert.Contains(t, configEnv["name"], "env-")
+
+				configValueFrom, ok := configEnv["valueFrom"].(map[string]any)
+				if !assert.True(t, ok, "expected config valueFrom map") {
+					return
+				}
+				configRef, ok := configValueFrom["configMapKeyRef"].(map[string]any)
+				if !assert.True(t, ok, "expected configMapKeyRef map") {
+					return
+				}
+				assert.NotEqual(t, "my-cm", configRef["name"])
+				assert.Contains(t, configRef["name"], "ref-")
+
+				assert.Equal(t, "PLAIN", plainEnv["name"])
+				assert.Equal(t, "not-a-secret", plainEnv["value"])
+			},
+		},
+		{
+			name: "typed container env var names with fieldRef should be anonymized",
+			object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"spec": map[string]any{
+					"containers": []corev1.Container{
+						{
+							Name:  "app",
+							Image: "busybox:latest",
+							Env: []corev1.EnvVar{
+								{
+									Name: "MY_NODE_NAME",
+									ValueFrom: &corev1.EnvVarSource{
+										FieldRef: &corev1.ObjectFieldSelector{
+											FieldPath: "spec.nodeName",
+										},
+									},
+								},
+								{
+									Name: "MY_CPU_LIMIT",
+									ValueFrom: &corev1.EnvVarSource{
+										ResourceFieldRef: &corev1.ResourceFieldSelector{
+											Resource: "limits.cpu",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				containers, ok := spec["containers"].([]corev1.Container)
+				if !assert.True(t, ok, "expected typed containers") {
+					return
+				}
+				if !assert.Len(t, containers, 1) {
+					return
+				}
+				assert.NotEqual(t, "MY_NODE_NAME", containers[0].Env[0].Name,
+					"env var name referencing fieldRef should be anonymized")
+				assert.Contains(t, containers[0].Env[0].Name, "env-")
+				assert.NotEqual(t, "MY_CPU_LIMIT", containers[0].Env[1].Name,
+					"env var name referencing resourceFieldRef should be anonymized")
+				assert.Contains(t, containers[0].Env[1].Name, "env-")
+			},
+		},
+		{
+			name: "unstructured container env var names with fieldRef should be anonymized",
+			object: map[string]any{
+				"spec": map[string]any{
+					"containers": []any{
+						map[string]any{
+							"name":  "app",
+							"image": "busybox:latest",
+							"env": []any{
+								map[string]any{
+									"name": "MY_POD_NAME",
+									"valueFrom": map[string]any{
+										"fieldRef": map[string]any{
+											"fieldPath": "metadata.name",
+										},
+									},
+								},
+								map[string]any{
+									"name": "MY_MEM_LIMIT",
+									"valueFrom": map[string]any{
+										"resourceFieldRef": map[string]any{
+											"resource": "limits.memory",
+										},
+									},
+								},
+								map[string]any{
+									"name":  "PLAIN",
+									"value": "not-a-secret",
+								},
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				containers, ok := spec["containers"].([]any)
+				if !assert.True(t, ok, "expected unstructured containers") {
+					return
+				}
+				container, ok := containers[0].(map[string]any)
+				if !assert.True(t, ok) {
+					return
+				}
+				env, ok := container["env"].([]any)
+				if !assert.True(t, ok) {
+					return
+				}
+				if !assert.Len(t, env, 3) {
+					return
+				}
+				fieldEnv := env[0].(map[string]any)
+				resourceEnv := env[1].(map[string]any)
+				plainEnv := env[2].(map[string]any)
+				assert.NotEqual(t, "MY_POD_NAME", fieldEnv["name"],
+					"env var name referencing fieldRef should be anonymized")
+				assert.Contains(t, fieldEnv["name"], "env-")
+				assert.NotEqual(t, "MY_MEM_LIMIT", resourceEnv["name"],
+					"env var name referencing resourceFieldRef should be anonymized")
+				assert.Contains(t, resourceEnv["name"], "env-")
+				assert.Equal(t, "PLAIN", plainEnv["name"],
+					"plain env var name should not be anonymized")
+			},
+		},
+
+		{
+			name: "typed container envFrom references should be anonymized",
+			object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"spec": map[string]any{
+					"containers": []corev1.Container{
+						{
+							Name: "payment-api",
+							EnvFrom: []corev1.EnvFromSource{
+								{
+									SecretRef: &corev1.SecretEnvSource{
+										LocalObjectReference: corev1.LocalObjectReference{
+											Name: "payment-secret",
+										},
+									},
+								},
+								{
+									ConfigMapRef: &corev1.ConfigMapEnvSource{
+										LocalObjectReference: corev1.LocalObjectReference{
+											Name: "payment-config",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				containers, ok := spec["containers"].([]corev1.Container)
+				if !assert.True(t, ok, "expected typed containers") {
+					return
+				}
+				if !assert.Len(t, containers, 1) {
+					return
+				}
+
+				assert.NotEqual(t, "payment-secret", containers[0].EnvFrom[0].SecretRef.Name)
+				assert.NotEqual(t, "payment-config", containers[0].EnvFrom[1].ConfigMapRef.Name)
+				assert.Contains(t, containers[0].EnvFrom[0].SecretRef.Name, "ref-")
+				assert.Contains(t, containers[0].EnvFrom[1].ConfigMapRef.Name, "ref-")
+			},
+		},
+		{
+			name: "unstructured container envFrom references should be anonymized",
+			object: map[string]any{
+				"spec": map[string]any{
+					"containers": []any{
+						map[string]any{
+							"name": "payment-api",
+							"envFrom": []any{
+								map[string]any{
+									"secretRef": map[string]any{
+										"name": "payment-secret",
+									},
+								},
+								map[string]any{
+									"configMapRef": map[string]any{
+										"name": "payment-config",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				containers, ok := spec["containers"].([]any)
+				if !assert.True(t, ok, "expected unstructured containers") {
+					return
+				}
+				if !assert.Len(t, containers, 1) {
+					return
+				}
+
+				container, ok := containers[0].(map[string]any)
+				if !assert.True(t, ok, "expected unstructured container map") {
+					return
+				}
+
+				envFrom, ok := container["envFrom"].([]any)
+				if !assert.True(t, ok, "expected envFrom slice") {
+					return
+				}
+				if !assert.Len(t, envFrom, 2) {
+					return
+				}
+
+				secretEnvFrom, ok := envFrom[0].(map[string]any)
+				if !assert.True(t, ok, "expected secret envFrom map") {
+					return
+				}
+
+				configEnvFrom, ok := envFrom[1].(map[string]any)
+				if !assert.True(t, ok, "expected config envFrom map") {
+					return
+				}
+
+				secretRef, ok := secretEnvFrom["secretRef"].(map[string]any)
+				if !assert.True(t, ok, "expected secretRef map") {
+					return
+				}
+
+				configRef, ok := configEnvFrom["configMapRef"].(map[string]any)
+				if !assert.True(t, ok, "expected configMapRef map") {
+					return
+				}
+
+				assert.NotEqual(t, "payment-secret", secretRef["name"])
+				assert.NotEqual(t, "payment-config", configRef["name"])
+				assert.Contains(t, secretRef["name"], "ref-")
+				assert.Contains(t, configRef["name"], "ref-")
+			},
+		},
+		{
+			name: "typed container literal env values should be anonymized",
+			object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"spec": map[string]any{
+					"containers": []corev1.Container{
+						{
+							Name: "payment-api",
+							Env: []corev1.EnvVar{
+								{
+									Name:  "DATABASE_URL",
+									Value: "postgres://example-user@example-host.internal/prod",
+								},
+								{
+									Name:  "CONNECTION_STRING",
+									Value: "Server=db;User=demo;Password=masked;",
+								},
+								{
+									Name:  "CONFIG",
+									Value: "redis://:secret@redis.internal:6379",
+								},
+								{
+									Name:  "LOG_LEVEL",
+									Value: "info",
+								},
+								{
+									Name:  "PORT",
+									Value: "8080",
+								},
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				containers, ok := spec["containers"].([]corev1.Container)
+				if !assert.True(t, ok, "expected typed containers") {
+					return
+				}
+				if !assert.Len(t, containers, 1) {
+					return
+				}
+
+				assert.NotEqual(t, "postgres://example-user@example-host.internal/prod", containers[0].Env[0].Value)
+				assert.NotEqual(t, "Server=db;User=demo;Password=masked;", containers[0].Env[1].Value)
+				assert.NotEqual(t, "redis://:secret@redis.internal:6379", containers[0].Env[2].Value)
+
+				assert.Contains(t, containers[0].Env[0].Value, "env-")
+				assert.Contains(t, containers[0].Env[1].Value, "env-")
+				assert.Contains(t, containers[0].Env[2].Value, "env-")
+
+				assert.Equal(t, "info", containers[0].Env[3].Value)
+				assert.Equal(t, "8080", containers[0].Env[4].Value)
+			},
+		},
+		{
+			name: "unstructured container literal env values should be anonymized",
+			object: map[string]any{
+				"spec": map[string]any{
+					"containers": []any{
+						map[string]any{
+							"name": "payment-api",
+							"env": []any{
+								map[string]any{
+									"name":  "DATABASE_URL",
+									"value": "postgres://example-user@example-host.internal/prod",
+								},
+								map[string]any{
+									"name":  "REDIS_URL",
+									"value": "redis://:secret@redis.internal:6379",
+								},
+								map[string]any{
+									"name":  "CONFIG",
+									"value": "mongodb://example-user@example-host.internal:27017/prod",
+								},
+								map[string]any{
+									"name":  "FEATURE_FLAG",
+									"value": "true",
+								},
+								map[string]any{
+									"name":  "PORT",
+									"value": "8080",
+								},
+							},
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				containers, ok := spec["containers"].([]any)
+				if !assert.True(t, ok, "expected unstructured containers") {
+					return
+				}
+				if !assert.Len(t, containers, 1) {
+					return
+				}
+
+				container, ok := containers[0].(map[string]any)
+				if !assert.True(t, ok, "expected unstructured container map") {
+					return
+				}
+
+				env, ok := container["env"].([]any)
+				if !assert.True(t, ok, "expected env slice") {
+					return
+				}
+				if !assert.Len(t, env, 5) {
+					return
+				}
+
+				firstEnv, ok := env[0].(map[string]any)
+				if !assert.True(t, ok, "expected first env map") {
+					return
+				}
+
+				secondEnv, ok := env[1].(map[string]any)
+				if !assert.True(t, ok, "expected second env map") {
+					return
+				}
+
+				thirdEnv, ok := env[2].(map[string]any)
+				if !assert.True(t, ok, "expected third env map") {
+					return
+				}
+
+				fourthEnv, ok := env[3].(map[string]any)
+				if !assert.True(t, ok, "expected fourth env map") {
+					return
+				}
+
+				fifthEnv, ok := env[4].(map[string]any)
+				if !assert.True(t, ok, "expected fifth env map") {
+					return
+				}
+
+				assert.NotEqual(t, "postgres://example-user@example-host.internal/prod", firstEnv["value"])
+				assert.NotEqual(t, "redis://:secret@redis.internal:6379", secondEnv["value"])
+				assert.NotEqual(t, "mongodb://example-user@example-host.internal:27017/prod", thirdEnv["value"])
+
+				assert.Contains(t, firstEnv["value"], "env-")
+				assert.Contains(t, secondEnv["value"], "env-")
+				assert.Contains(t, thirdEnv["value"], "env-")
+
+				assert.Equal(t, "true", fourthEnv["value"])
+				assert.Equal(t, "8080", fifthEnv["value"])
+			},
+		},
+
+		{
+			name: "typed image pull secrets should be anonymized",
+			object: map[string]any{
+				"spec": map[string]any{
+					"imagePullSecrets": []corev1.LocalObjectReference{
+						{
+							Name: "corp-registry-creds",
+						},
+					},
+				},
+			},
+
+			validate: func(t *testing.T, spec map[string]any) {
+				refs, ok := spec["imagePullSecrets"].([]corev1.LocalObjectReference)
+				if !assert.True(t, ok, "expected typed image pull secrets") {
+					return
+				}
+				if !assert.Len(t, refs, 1) {
+					return
+				}
+
+				assert.NotEqual(t, "corp-registry-creds", refs[0].Name)
+				assert.Contains(t, refs[0].Name, "ref-")
+			},
+		},
+
+		{
+			name: "typed service account name should be anonymized",
+			object: map[string]any{
+				"spec": map[string]any{
+					"serviceAccountName": "payments-runtime",
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				serviceAccountName, ok := spec["serviceAccountName"].(string)
+				if !assert.True(t, ok, "expected serviceAccountName string") {
+					return
+				}
+
+				assert.NotEqual(t, "payments-runtime", serviceAccountName)
+				assert.Contains(t, serviceAccountName, "sa-")
+			},
+		},
+		{
+			name: "deprecated service account should be anonymized",
+			object: map[string]any{
+				"spec": map[string]any{
+					"serviceAccount": "payments-runtime",
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				serviceAccount, ok := spec["serviceAccount"].(string)
+				if !assert.True(t, ok, "expected serviceAccount string") {
+					return
+				}
+
+				assert.NotEqual(t, "payments-runtime", serviceAccount)
+				assert.Contains(t, serviceAccount, "sa-")
+			},
+		},
+		{
+			name: "nested template deprecated service account should be anonymized",
+			object: map[string]any{
+				"spec": map[string]any{
+					"template": map[string]any{
+						"spec": map[string]any{
+							"serviceAccount": "analytics-runtime",
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				template, ok := spec["template"].(map[string]any)
+				if !assert.True(t, ok, "expected template map") {
+					return
+				}
+
+				templateSpec, ok := template["spec"].(map[string]any)
+				if !assert.True(t, ok, "expected template spec map") {
+					return
+				}
+
+				serviceAccount, ok := templateSpec["serviceAccount"].(string)
+				if !assert.True(t, ok, "expected serviceAccount string") {
+					return
+				}
+
+				assert.NotEqual(t, "analytics-runtime", serviceAccount)
+				assert.Contains(t, serviceAccount, "sa-")
+			},
+		},
+		{
+			name: "nested template service account name should be anonymized",
+			object: map[string]any{
+				"spec": map[string]any{
+					"template": map[string]any{
+						"spec": map[string]any{
+							"serviceAccountName": "analytics-runtime",
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				template, ok := spec["template"].(map[string]any)
+				if !assert.True(t, ok, "expected template map") {
+					return
+				}
+
+				templateSpec, ok := template["spec"].(map[string]any)
+				if !assert.True(t, ok, "expected template spec map") {
+					return
+				}
+
+				serviceAccountName, ok := templateSpec["serviceAccountName"].(string)
+				if !assert.True(t, ok, "expected serviceAccountName string") {
+					return
+				}
+
+				assert.NotEqual(t, "analytics-runtime", serviceAccountName)
+				assert.Contains(t, serviceAccountName, "sa-")
+			},
+		},
+
+		{
+			name: "unstructured image pull secrets should be anonymized",
+			object: map[string]any{
+				"spec": map[string]any{
+					"imagePullSecrets": []any{
+						map[string]any{
+							"name": "corp-registry-creds",
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, spec map[string]any) {
+				refs, ok := spec["imagePullSecrets"].([]any)
+				if !assert.True(t, ok, "expected unstructured image pull secrets") {
+					return
+				}
+				if !assert.Len(t, refs, 1) {
+					return
+				}
+
+				ref, ok := refs[0].(map[string]any)
+				if !assert.True(t, ok, "expected image pull secret map") {
+					return
+				}
+
+				assert.NotEqual(t, "corp-registry-creds", ref["name"])
+				assert.Contains(t, ref["name"], "ref-")
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transformer := NewMappingTransformer()
+			resource := workloadinterface.NewWorkloadObj(test.object)
+
+			assert.NoError(t, transformContainerMetadata(resource, nil, transformer))
+
+			spec, ok := resource.GetObject()["spec"].(map[string]any)
+			assert.True(t, ok, "expected spec to be a map[string]any")
+
+			test.validate(t, spec)
+		})
+	}
+}
+
+func TestTransformContainerMetadata_NilResource(t *testing.T) {
+	assert.NoError(t, transformContainerMetadata(nil, nil, NewMappingTransformer()))
+}
+
+func TestTransformContainerList_MissingKey(t *testing.T) {
+	obj := map[string]any{}
+
+	assert.NoError(t, transformContainerList(obj, "containers", nil, NewMappingTransformer()))
+}
+
+func TestTransformContainerList_NilValue(t *testing.T) {
+	obj := map[string]any{"containers": nil}
+
+	assert.NoError(t, transformContainerList(obj, "containers", nil, NewMappingTransformer()))
+}
+
+func TestTransformContainerList_InvalidType(t *testing.T) {
+	obj := map[string]any{
+		"containers": "invalid",
+	}
+
+	assert.NoError(t, transformContainerList(obj, "containers", nil, NewMappingTransformer()))
+}
+
+func TestIsSensitiveEnvName_SeparatorlessVariants(t *testing.T) {
+	cases := map[string]bool{
+		"API_KEY":          true,
+		"APIKEY":           true,
+		"ACCESS_KEY":       true,
+		"ACCESSKEY":        true,
+		"PRIVATEKEY":       true,
+		"PRIVATE_KEY":      true,
+		"SECRETKEY":        true,
+		"AUTHTOKEN":        true,
+		"AUTH_TOKEN":       true,
+		"app.api-key":      true,
+		"CREDENTIAL":       true,
+		"DATABASE_URL":     true,
+		"DATABASEURL":      true,
+		"CONNECTIONSTRING": true,
+		"NORMAL_ENV":       false,
+		"PORT":             false,
+		"LOG_LEVEL":        false,
+	}
+
+	for name, want := range cases {
+		if got := isSensitiveEnvName(name); got != want {
+			t.Errorf("isSensitiveEnvName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestTransformUnstructuredEnv_LeaksAPIKeyValue(t *testing.T) {
+
+	//nolint:gosec // Hardcoded test credential is intentional for transformation regression tests.
+	const secret = "AKIAIOSFODNN7EXAMPLE"
+
+	container := map[string]any{
+		"env": []any{
+			map[string]any{
+				"name":  "APIKEY",
+				"value": secret,
+			},
+		},
+	}
+
+	assert.NoError(t, transformUnstructuredEnv(container, nil, NewMappingTransformer()))
+
+	got := container["env"].([]any)[0].(map[string]any)["value"].(string)
+	if got == secret {
+		t.Fatalf("env var APIKEY value was not transformed; secret leaked into output")
+	}
+}
+
+func TestTransformContainerList_TypedSlice(t *testing.T) {
+	obj := map[string]any{
+		"containers": []corev1.Container{
+			{
+				Name:  "my-container",
+				Image: "registry.internal.corp/team/app:1.0",
+				Env:   []corev1.EnvVar{{Name: "API_KEY", Value: "s3cret"}},
+			},
+		},
+	}
+
+	assert.NoError(t, transformContainerList(obj, "containers", nil, NewMappingTransformer()))
+
+	containers, ok := obj["containers"].([]corev1.Container)
+	assert.True(t, ok)
+	assert.NotEqual(t, "my-container", containers[0].Name)
+	assert.NotEqual(t, "registry.internal.corp/team/app:1.0", containers[0].Image)
+	assert.NotEqual(t, "s3cret", containers[0].Env[0].Value)
+}
+
+func TestTransformEphemeralContainerList_TypedSlice(t *testing.T) {
+	obj := map[string]any{
+		"ephemeralContainers": []corev1.EphemeralContainer{
+			{
+				EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+					Name:  "debugger",
+					Image: "registry.internal.corp/team/debug:1.0",
+				},
+			},
+		},
+	}
+
+	assert.NoError(t, transformEphemeralContainerList(obj, "ephemeralContainers", nil, NewMappingTransformer()))
+
+	containers, ok := obj["ephemeralContainers"].([]corev1.EphemeralContainer)
+	assert.True(t, ok)
+	assert.NotEqual(t, "debugger", containers[0].Name)
+	assert.NotEqual(t, "registry.internal.corp/team/debug:1.0", containers[0].Image)
+}
+
+func TestTransformPodSpecs_TypedContainersFromScanPipeline(t *testing.T) {
+	obj := map[string]any{
+		"spec": map[string]any{
+			"containers": []corev1.Container{
+				{Name: "app", Image: "registry.internal.corp/team/app:1.0"},
+			},
+			"initContainers": []corev1.Container{
+				{Name: "migrate", Image: "registry.internal.corp/team/migrate:1.0"},
+			},
+		},
+	}
+
+	assert.NoError(t, transformPodSpecs(obj, nil, NewMappingTransformer()))
+
+	spec := obj["spec"].(map[string]any)
+	containers := spec["containers"].([]corev1.Container)
+	initContainers := spec["initContainers"].([]corev1.Container)
+	assert.NotEqual(t, "app", containers[0].Name)
+	assert.NotEqual(t, "migrate", initContainers[0].Name)
+	assert.NotContains(t, containers[0].Image, "registry.internal.corp")
+	assert.NotContains(t, initContainers[0].Image, "registry.internal.corp")
+}
+
+func TestTransformVolumes_TypedSecretConfigMapPVCCSIProjected(t *testing.T) {
+	obj := map[string]any{
+		"volumes": []corev1.Volume{
+			{
+				Name: "creds",
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{SecretName: "db-creds"},
+				},
+			},
+			{
+				Name: "config",
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "app-config"},
+					},
+				},
+			},
+			{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data-pvc"},
+				},
+			},
+			{
+				Name: "csi-secret",
+				VolumeSource: corev1.VolumeSource{
+					CSI: &corev1.CSIVolumeSource{
+						Driver:               "csi.example.com",
+						NodePublishSecretRef: &corev1.LocalObjectReference{Name: "csi-creds"},
+					},
+				},
+			},
+			{
+				Name: "projected",
+				VolumeSource: corev1.VolumeSource{
+					Projected: &corev1.ProjectedVolumeSource{
+						Sources: []corev1.VolumeProjection{
+							{Secret: &corev1.SecretProjection{LocalObjectReference: corev1.LocalObjectReference{Name: "proj-secret"}}},
+							{ConfigMap: &corev1.ConfigMapProjection{LocalObjectReference: corev1.LocalObjectReference{Name: "proj-config"}}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	assert.NoError(t, transformVolumes(obj, NewMappingTransformer()))
+
+	volumes := obj["volumes"].([]corev1.Volume)
+	assert.NotEqual(t, "db-creds", volumes[0].Secret.SecretName)
+	assert.NotEqual(t, "app-config", volumes[1].ConfigMap.Name)
+	assert.NotEqual(t, "data-pvc", volumes[2].PersistentVolumeClaim.ClaimName)
+	assert.NotEqual(t, "csi-creds", volumes[3].CSI.NodePublishSecretRef.Name)
+	assert.NotEqual(t, "proj-secret", volumes[4].Projected.Sources[0].Secret.Name)
+	assert.NotEqual(t, "proj-config", volumes[4].Projected.Sources[1].ConfigMap.Name)
+}
+
+func TestTransformVolumes_UnstructuredSecretConfigMapPVCCSIProjected(t *testing.T) {
+	obj := map[string]any{
+		"volumes": []any{
+			map[string]any{
+				"name":   "creds",
+				"secret": map[string]any{"secretName": "db-creds"},
+			},
+			map[string]any{
+				"name":      "config",
+				"configMap": map[string]any{"name": "app-config"},
+			},
+			map[string]any{
+				"name":                  "data",
+				"persistentVolumeClaim": map[string]any{"claimName": "data-pvc"},
+			},
+			map[string]any{
+				"name": "csi-secret",
+				"csi": map[string]any{
+					"driver":               "csi.example.com",
+					"nodePublishSecretRef": map[string]any{"name": "csi-creds"},
+				},
+			},
+			map[string]any{
+				"name": "projected",
+				"projected": map[string]any{
+					"sources": []any{
+						map[string]any{"secret": map[string]any{"name": "proj-secret"}},
+						map[string]any{"configMap": map[string]any{"name": "proj-config"}},
+					},
+				},
+			},
+		},
+	}
+
+	assert.NoError(t, transformVolumes(obj, NewMappingTransformer()))
+
+	volumes := obj["volumes"].([]any)
+	v0 := volumes[0].(map[string]any)
+	assert.NotEqual(t, "db-creds", v0["secret"].(map[string]any)["secretName"])
+
+	v1 := volumes[1].(map[string]any)
+	assert.NotEqual(t, "app-config", v1["configMap"].(map[string]any)["name"])
+
+	v2 := volumes[2].(map[string]any)
+	assert.NotEqual(t, "data-pvc", v2["persistentVolumeClaim"].(map[string]any)["claimName"])
+
+	v3 := volumes[3].(map[string]any)
+	assert.NotEqual(t, "csi-creds", v3["csi"].(map[string]any)["nodePublishSecretRef"].(map[string]any)["name"])
+
+	v4 := volumes[4].(map[string]any)
+	sources := v4["projected"].(map[string]any)["sources"].([]any)
+	assert.NotEqual(t, "proj-secret", sources[0].(map[string]any)["secret"].(map[string]any)["name"])
+	assert.NotEqual(t, "proj-config", sources[1].(map[string]any)["configMap"].(map[string]any)["name"])
+}
+
+func TestTransformVolumes_MissingOrEmptyIsSafe(t *testing.T) {
+	assert.NoError(t, transformVolumes(map[string]any{}, NewMappingTransformer()))
+	assert.NoError(t, transformVolumes(map[string]any{"volumes": nil}, NewMappingTransformer()))
+	assert.NoError(t, transformVolumes(map[string]any{"volumes": []any{"not-a-map"}}, NewMappingTransformer()))
+}
+
+// TestTransformPodSpecs_VolumeSecretNameMatchesEnvFromRefPseudonym is the
+// direct regression test for the leak this fixes: a Secret referenced both
+// via a volume and via envFrom must be pseudonymized to the SAME value in
+// both places (Mapping.GetOrCreate's cross-prefix suffix sharing), and
+// neither occurrence may leave it in cleartext.
+func TestTransformPodSpecs_VolumeSecretNameMatchesEnvFromRefPseudonym(t *testing.T) {
+	obj := map[string]any{
+		"spec": map[string]any{
+			"volumes": []any{
+				map[string]any{
+					"name":   "creds-volume",
+					"secret": map[string]any{"secretName": "db-creds"},
+				},
+			},
+			"containers": []any{
+				map[string]any{
+					"name": "app",
+					"envFrom": []any{
+						map[string]any{"secretRef": map[string]any{"name": "db-creds"}},
+					},
+				},
+			},
+		},
+	}
+
+	assert.NoError(t, transformPodSpecs(obj, nil, NewMappingTransformer()))
+
+	spec := obj["spec"].(map[string]any)
+	volumeSecretName := spec["volumes"].([]any)[0].(map[string]any)["secret"].(map[string]any)["secretName"]
+	containerSecretName := spec["containers"].([]any)[0].(map[string]any)["envFrom"].([]any)[0].(map[string]any)["secretRef"].(map[string]any)["name"]
+
+	assert.NotEqual(t, "db-creds", volumeSecretName, "the volume's secretName must not stay in cleartext")
+	assert.Equal(t, containerSecretName, volumeSecretName, "the same Secret name referenced two ways must produce the same pseudonym")
+}

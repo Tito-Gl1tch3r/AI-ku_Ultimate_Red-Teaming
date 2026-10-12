@@ -1,0 +1,532 @@
+package spanner
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"regexp"
+	"strconv"
+	"sync/atomic"
+	"time"
+
+	"cloud.google.com/go/spanner"
+	sq "github.com/Masterminds/squirrel"
+	"github.com/google/uuid"
+	slogzerolog "github.com/samber/slog-zerolog/v2"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
+	"go.opentelemetry.io/otel/sdk/metric"
+	otelres "go.opentelemetry.io/otel/sdk/resource"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/api/option"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+
+	"github.com/authzed/spicedb/internal/datastore/common"
+	"github.com/authzed/spicedb/internal/datastore/revisions"
+	"github.com/authzed/spicedb/internal/datastore/spanner/migrations"
+	log "github.com/authzed/spicedb/internal/logging"
+	"github.com/authzed/spicedb/internal/telemetry/otelconv"
+	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/datastore/options"
+	"github.com/authzed/spicedb/pkg/spiceerrors"
+	"github.com/authzed/spicedb/pkg/tuple"
+)
+
+func init() {
+	datastore.Engines = append(datastore.Engines, Engine)
+}
+
+const (
+	Engine = "spanner"
+
+	errUnableToInstantiate = "unable to instantiate spanner client"
+
+	errRevision = "unable to load revision: %w"
+
+	errUnableToWriteRelationships    = "unable to write relationships: %w"
+	errUnableToBulkLoadRelationships = "unable to bulk load relationships: %w"
+	errUnableToDeleteRelationships   = "unable to delete relationships: %w"
+
+	errUnableToWriteConfig    = "unable to write namespace config: %w"
+	errUnableToReadConfig     = "unable to read namespace config: %w"
+	errUnableToDeleteConfig   = "unable to delete namespace config: %w"
+	errUnableToListNamespaces = "unable to list namespaces: %w"
+
+	errUnableToReadCaveat   = "unable to read caveat: %w"
+	errUnableToWriteCaveat  = "unable to write caveat: %w"
+	errUnableToListCaveats  = "unable to list caveats: %w"
+	errUnableToDeleteCaveat = "unable to delete caveat: %w"
+
+	errUnableToSerializeFilter = "unable to serialize filter: %w"
+	errUnableToWriteCounter    = "unable to write counter: %w"
+	errUnableToDeleteCounter   = "unable to delete counter: %w"
+	errUnableToUpdateCounter   = "unable to update counter: %w"
+
+	// See https://cloud.google.com/spanner/docs/change-streams#data-retention
+	// See https://github.com/authzed/spicedb/issues/1457
+	defaultChangeStreamRetention = 24 * time.Hour
+)
+
+const tableSizesStatsTable = "spanner_sys.table_sizes_stats_1hour"
+
+var (
+	sql    = sq.StatementBuilder.PlaceholderFormat(sq.AtP)
+	tracer = otel.Tracer("spicedb/internal/datastore/spanner")
+
+	alreadyExistsRegex = regexp.MustCompile(`^Table relation_tuple: Row {String\("([^\"]+)"\), String\("([^\"]+)"\), String\("([^\"]+)"\), String\("([^\"]+)"\), String\("([^\"]+)"\), String\("([^\"]+)"\)} already exists.$`)
+)
+
+type spannerDatastore struct {
+	revisions.CommonDecoder
+	*common.MigrationValidator
+
+	followerReadDelay            time.Duration
+	revisionQuantization         time.Duration
+	gcWindow                     time.Duration
+	watchBufferLength            uint16
+	watchChangeBufferMaximumSize uint64
+	watchBufferWriteTimeout      time.Duration
+	watchEnabled                 bool
+
+	client   *spanner.Client
+	config   spannerOptions
+	database string
+	schema   common.SchemaInformation
+
+	cachedEstimatedBytesPerRelationship atomic.Uint64
+
+	tableSizesStatsTable string
+	filterMaximumIDCount uint16
+	uniqueID             atomic.Pointer[string]
+	meterProvider        *metric.MeterProvider
+}
+
+// NewSpannerDatastore returns a datastore backed by cloud spanner
+func NewSpannerDatastore(ctx context.Context, database string, opts ...Option) (datastore.Datastore, error) {
+	config, err := generateConfig(opts)
+	if err != nil {
+		return nil, common.RedactAndLogSensitiveConnString(ctx, errUnableToInstantiate, err, database)
+	}
+
+	if config.migrationPhase != "" {
+		log.Info().
+			Str("phase", config.migrationPhase).
+			Msg("spanner configured to use intermediate migration phase")
+	}
+
+	if len(config.emulatorHost) > 0 {
+		if err := os.Setenv("SPANNER_EMULATOR_HOST", config.emulatorHost); err != nil {
+			log.Error().Err(err).Msg("failed to set SPANNER_EMULATOR_HOST env variable")
+		}
+	}
+	if len(os.Getenv("SPANNER_EMULATOR_HOST")) > 0 {
+		log.Info().Str("spanner-emulator-host", os.Getenv("SPANNER_EMULATOR_HOST")).Msg("running against spanner emulator")
+	}
+
+	var meterProvider *metric.MeterProvider
+	if config.datastoreMetricsOption == DatastoreMetricsOptionOpenTelemetry {
+		log.Info().Msg("enabling OpenTelemetry metrics for Spanner datastore")
+		spanner.EnableOpenTelemetryMetrics()
+
+		res, err := otelres.Merge(otelres.Default(),
+			otelres.NewWithAttributes(semconv.SchemaURL,
+				semconv.ServiceName("spicedb"),
+			))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create otel metrics resource: %w", err)
+		}
+
+		meterProvider, err = getMeterProviderWithPromExporter(res)
+		if err != nil {
+			return nil, fmt.Errorf("failed to enable Spanner prometheus metrics: %w", err)
+		}
+	}
+
+	var spannerOpts []option.ClientOption
+	if config.credentialsJSON != nil {
+		spannerOpts = append(spannerOpts, option.WithCredentialsJSON(config.credentialsJSON)) //nolint:staticcheck  // The preferred approach is using Application Default Credentials
+	}
+
+	slogger := slog.New(slogzerolog.Option{Level: slog.LevelDebug, Logger: &log.Logger}.NewZerologHandler())
+	spannerOpts = append(spannerOpts,
+		option.WithCredentialsFile(config.credentialsFilePath), //nolint:staticcheck  // The preferred approach is using Application Default Credentials
+		option.WithGRPCConnectionPool(max(config.readMaxOpen, config.writeMaxOpen)),
+		option.WithGRPCDialOption(
+			grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+		),
+		option.WithLogger(slogger),
+	)
+
+	clientConfig := spanner.ClientConfig{
+		DisableNativeMetrics: config.datastoreMetricsOption != DatastoreMetricsOptionNative,
+	}
+	if meterProvider != nil {
+		clientConfig.OpenTelemetryMeterProvider = meterProvider
+	}
+	client, err := spanner.NewClientWithConfig(ctx, database, clientConfig, spannerOpts...)
+	if err != nil {
+		return nil, common.RedactAndLogSensitiveConnString(ctx, errUnableToInstantiate, err, database)
+	}
+
+	headMigration, err := migrations.SpannerMigrations.HeadRevision()
+	if err != nil {
+		return nil, fmt.Errorf("invalid head migration found for spanner: %w", err)
+	}
+
+	schema := common.NewSchemaInformationWithOptions(
+		common.WithRelationshipTableName(tableRelationship),
+		common.WithColNamespace(colNamespace),
+		common.WithColObjectID(colObjectID),
+		common.WithColRelation(colRelation),
+		common.WithColUsersetNamespace(colUsersetNamespace),
+		common.WithColUsersetObjectID(colUsersetObjectID),
+		common.WithColUsersetRelation(colUsersetRelation),
+		common.WithColCaveatName(colCaveatName),
+		common.WithColCaveatContext(colCaveatContext),
+		common.WithColExpiration(colExpiration),
+		common.WithPaginationFilterType(common.ExpandedLogicComparison),
+		common.WithPlaceholderFormat(sq.AtP),
+		common.WithNowFunction("CURRENT_TIMESTAMP"),
+		common.WithColumnOptimization(config.columnOptimizationOption),
+
+		// NOTE: this order differs from the default because the index
+		// used for sorting by subject (ix_relation_tuple_by_subject) is
+		// defined with the userset object ID first.
+		common.SetSortBySubjectColumnOrder([]string{
+			colUsersetObjectID,
+			colUsersetNamespace,
+			colUsersetRelation,
+			colNamespace,
+			colRelation,
+			colObjectID,
+		}),
+	)
+
+	ds := &spannerDatastore{
+		CommonDecoder: revisions.CommonDecoder{
+			Kind: revisions.Timestamp,
+		},
+		MigrationValidator:                  common.NewMigrationValidator(headMigration, config.allowedMigrations),
+		followerReadDelay:                   config.followerReadDelay,
+		revisionQuantization:                config.revisionQuantization,
+		gcWindow:                            config.gcWindow,
+		client:                              client,
+		config:                              config,
+		database:                            database,
+		watchBufferWriteTimeout:             config.watchBufferWriteTimeout,
+		watchChangeBufferMaximumSize:        config.watchChangeBufferMaximumSize,
+		watchBufferLength:                   config.watchBufferLength,
+		watchEnabled:                        !config.watchDisabled,
+		cachedEstimatedBytesPerRelationship: atomic.Uint64{},
+		tableSizesStatsTable:                tableSizesStatsTable,
+		filterMaximumIDCount:                config.filterMaximumIDCount,
+		schema:                              *schema,
+		meterProvider:                       meterProvider,
+	}
+	return ds, nil
+}
+
+// OptimizedRevision computes the uncached quantized revision for Spanner. It
+// reads the current timestamp via a stale read and quantizes it in Go. Caching,
+// deduplication, and jitter are layered on by proxy.NewOptimizedRevisionProxy.
+//
+// Optimized revision and revision checking use a stale read for the current
+// timestamp.
+// TODO: Still investigating whether a stale read can be used for HeadRevision
+//
+//	for FullConsistency queries.
+func (sd *spannerDatastore) OptimizedRevision(ctx context.Context) (datastore.RevisionWithSchemaHashAndValidity, error) {
+	ctx, span := tracer.Start(ctx, "OptimizedRevision")
+	defer span.End()
+
+	nowRev, schemaHash, err := sd.staleHeadRevision(ctx)
+	if err != nil {
+		return datastore.RevisionWithSchemaHashAndValidity{}, err
+	}
+
+	if nowRev == datastore.NoRevision {
+		return datastore.RevisionWithSchemaHashAndValidity{}, datastore.NewInvalidRevisionErr(nowRev, datastore.CouldNotDetermineRevision)
+	}
+
+	nowTS, ok := nowRev.(revisions.WithTimestampRevision)
+	if !ok {
+		return datastore.RevisionWithSchemaHashAndValidity{}, spiceerrors.MustBugf("expected with-timestamp revision, got %T", nowRev)
+	}
+
+	rev, validFor := revisions.Quantize(nowTS, sd.followerReadDelay, sd.revisionQuantization)
+	return datastore.RevisionWithSchemaHashAndValidity{Revision: rev, ValidFor: validFor, SchemaHash: schemaHash}, nil
+}
+
+// CheckRevision verifies the given revision is within the software GC window. It
+// lives on the datastore (not the caching layer) because it is not a caching
+// concern, and uses the hash-free stale read since the schema hash is not needed.
+func (sd *spannerDatastore) CheckRevision(ctx context.Context, dsRevision datastore.Revision) error {
+	if dsRevision == datastore.NoRevision {
+		return datastore.NewInvalidRevisionErr(dsRevision, datastore.CouldNotDetermineRevision)
+	}
+
+	revision, ok := dsRevision.(revisions.WithTimestampRevision)
+	if !ok {
+		return spiceerrors.MustBugf("expected HLC revision, got %T", dsRevision)
+	}
+
+	ctx, span := tracer.Start(ctx, "CheckRevision")
+	defer span.End()
+
+	now, err := sd.nowOnly(ctx)
+	if err != nil {
+		return err
+	}
+
+	nowTS, ok := now.(revisions.WithTimestampRevision)
+	if !ok {
+		return spiceerrors.MustBugf("expected HLC revision, got %T", now)
+	}
+
+	return revisions.CheckGCWindow(nowTS, revision, sd.gcWindow)
+}
+
+func getMeterProviderWithPromExporter(res *otelres.Resource) (*metric.MeterProvider, error) {
+	exporter, err := otelprom.New()
+	if err != nil {
+		return nil, err
+	}
+
+	meterProvider := metric.NewMeterProvider(
+		metric.WithResource(res),
+		metric.WithReader(exporter),
+	)
+
+	return meterProvider, nil
+}
+
+type traceableRTX struct {
+	delegate readTX
+}
+
+func (t *traceableRTX) ReadRow(ctx context.Context, table string, key spanner.Key, columns []string) (*spanner.Row, error) {
+	trace.SpanFromContext(ctx).SetAttributes(
+		attribute.String(otelconv.AttrDatastoreSpannerAPI, "ReadOnlyTransaction.ReadRow"),
+		attribute.String(otelconv.AttrDatastoreSpannerTable, table),
+		attribute.String(otelconv.AttrDatastoreSpannerKey, key.String()),
+		attribute.StringSlice(otelconv.AttrDatastoreSpannerColumns, columns))
+
+	return t.delegate.ReadRow(ctx, table, key, columns)
+}
+
+func (t *traceableRTX) Read(ctx context.Context, table string, keys spanner.KeySet, columns []string) *spanner.RowIterator {
+	trace.SpanFromContext(ctx).SetAttributes(
+		attribute.String(otelconv.AttrDatastoreSpannerAPI, "ReadOnlyTransaction.Read"),
+		attribute.String(otelconv.AttrDatastoreSpannerTable, table),
+		attribute.StringSlice(otelconv.AttrDatastoreSpannerColumns, columns))
+
+	return t.delegate.Read(ctx, table, keys, columns)
+}
+
+func (t *traceableRTX) Query(ctx context.Context, statement spanner.Statement) *spanner.RowIterator {
+	trace.SpanFromContext(ctx).SetAttributes(
+		attribute.String(otelconv.AttrDatastoreSpannerAPI, "ReadOnlyTransaction.Query"),
+		attribute.String(otelconv.AttrDatastoreSpannerStatement, statement.SQL))
+
+	return t.delegate.Query(ctx, statement)
+}
+
+func (sd *spannerDatastore) SnapshotReader(revisionRaw datastore.Revision) datastore.Reader {
+	r := revisionRaw.(revisions.TimestampRevision)
+
+	txSource := func() readTX {
+		return &traceableRTX{delegate: sd.client.Single().WithTimestampBound(spanner.ReadTimestamp(r.Time()))}
+	}
+	executor := common.QueryRelationshipsExecutor{Executor: queryExecutor(txSource)}
+	return &spannerReader{executor, txSource, sd.filterMaximumIDCount, sd.schema}
+}
+
+func (sd *spannerDatastore) MetricsID() (string, error) {
+	return sd.database, nil
+}
+
+func (sd *spannerDatastore) EngineName() string {
+	return Engine
+}
+
+func (sd *spannerDatastore) readTransactionMetadata(ctx context.Context, transactionTag string) (common.TransactionMetadata, error) {
+	row, err := sd.client.Single().ReadRow(ctx, tableTransactionMetadata, spanner.Key{transactionTag}, []string{colMetadata})
+	if err != nil {
+		if spanner.ErrCode(err) == codes.NotFound {
+			log.Err(err).Str("key", transactionTag).Send()
+			return map[string]any{}, nil
+		}
+
+		return nil, err
+	}
+
+	var metadataJSON spanner.NullJSON
+	if err := row.Columns(&metadataJSON); err != nil {
+		log.Err(err).Str("key", transactionTag).Msg("error unmarshaling transaction metadata json")
+		return map[string]any{}, nil
+	}
+
+	if !metadataJSON.Valid || metadataJSON.Value == nil {
+		log.Err(err).Str("key", transactionTag).Msg("error validating transaction metadata json")
+		return map[string]any{}, nil
+	}
+
+	metadata := metadataJSON.Value.(map[string]any)
+	return metadata, nil
+}
+
+func (sd *spannerDatastore) ReadWriteTx(ctx context.Context, fn datastore.TxUserFunc, opts ...options.RWTOptionsOption) (datastore.Revision, error) {
+	config := options.NewRWTOptionsWithOptions(opts...)
+
+	ctx, span := tracer.Start(ctx, "ReadWriteTx")
+	defer span.End()
+
+	transactionTag := "sdb-rwt-" + uuid.NewString()
+	transactionTag = transactionTag[:36] // there is a column constraint on the length
+
+	ctx, cancel := context.WithCancel(ctx)
+	rs, err := sd.client.ReadWriteTransactionWithOptions(ctx, func(ctx context.Context, spannerRWT *spanner.ReadWriteTransaction) error {
+		txSource := func() readTX {
+			return &traceableRTX{delegate: spannerRWT}
+		}
+
+		if config.Metadata != nil && len(config.Metadata.GetFields()) > 0 {
+			// Insert the metadata into the transaction metadata table.
+			mutation := spanner.Insert(tableTransactionMetadata,
+				[]string{colTransactionTag, colMetadata},
+				[]any{transactionTag, spanner.NullJSON{
+					Value: config.Metadata.AsMap(),
+					Valid: true,
+				}},
+			)
+
+			if err := spannerRWT.BufferWrite([]*spanner.Mutation{mutation}); err != nil {
+				return fmt.Errorf("unable to write metadata: %w", err)
+			}
+		}
+
+		executor := common.QueryRelationshipsExecutor{Executor: queryExecutor(txSource)}
+		rwt := &spannerReadWriteTXN{
+			spannerReader{executor, txSource, sd.filterMaximumIDCount, sd.schema},
+			spannerRWT,
+		}
+
+		if config.SchemaHashPrecondition != "" {
+			if err := assertSchemaHash(ctx, spannerRWT, config.SchemaHashPrecondition); err != nil {
+				return err
+			}
+		}
+
+		err := func() error {
+			innerCtx, innerSpan := tracer.Start(ctx, "TxUserFunc")
+			defer innerSpan.End()
+
+			return fn(innerCtx, rwt)
+		}()
+		if err != nil {
+			if config.DisableRetries {
+				defer cancel()
+			}
+			return err
+		}
+
+		return nil
+	}, spanner.TransactionOptions{TransactionTag: transactionTag})
+	if err != nil {
+		if cerr := convertToWriteConstraintError(err); cerr != nil {
+			return datastore.NoRevision, cerr
+		}
+		return datastore.NoRevision, err
+	}
+
+	return revisions.NewForTime(rs.CommitTs), nil
+}
+
+func (sd *spannerDatastore) ReadyState(ctx context.Context) (datastore.ReadyState, error) {
+	checker := migrations.NewSpannerVersionChecker(sd.client)
+	version, err := checker.Version(ctx)
+	if err != nil {
+		return datastore.ReadyState{}, err
+	}
+
+	return sd.MigrationReadyState(version), nil
+}
+
+func (sd *spannerDatastore) Features(ctx context.Context) (*datastore.Features, error) {
+	return sd.OfflineFeatures()
+}
+
+func (sd *spannerDatastore) OfflineFeatures() (*datastore.Features, error) {
+	watchSupported := datastore.FeatureUnsupported
+	if sd.watchEnabled {
+		watchSupported = datastore.FeatureSupported
+	}
+
+	return &datastore.Features{
+		Watch: datastore.Feature{
+			Status: watchSupported,
+		},
+		IntegrityData: datastore.Feature{
+			Status: datastore.FeatureUnsupported,
+		},
+		ContinuousCheckpointing: datastore.Feature{
+			Status: datastore.FeatureSupported,
+		},
+		WatchEmitsImmediately: datastore.Feature{
+			Status: datastore.FeatureUnsupported,
+		},
+	}, nil
+}
+
+func (sd *spannerDatastore) Close() error {
+	sd.client.Close()
+
+	if sd.meterProvider != nil {
+		return sd.meterProvider.ForceFlush(context.TODO())
+	}
+
+	return nil
+}
+
+func statementFromSQL(sql string, args []any) spanner.Statement {
+	params := make(map[string]any, len(args))
+	for index, arg := range args {
+		params["p"+strconv.Itoa(index+1)] = arg
+	}
+
+	return spanner.Statement{
+		SQL:    sql,
+		Params: params,
+	}
+}
+
+func convertToWriteConstraintError(err error) error {
+	if spanner.ErrCode(err) == codes.AlreadyExists {
+		description := spanner.ErrDesc(err)
+		found := alreadyExistsRegex.FindStringSubmatch(description)
+		if found != nil {
+			return datastore.NewCreateRelationshipExistsError(&tuple.Relationship{
+				RelationshipReference: tuple.RelationshipReference{
+					Resource: tuple.ObjectAndRelation{
+						ObjectType: found[1],
+						ObjectID:   found[2],
+						Relation:   found[3],
+					},
+					Subject: tuple.ObjectAndRelation{
+						ObjectType: found[4],
+						ObjectID:   found[5],
+						Relation:   found[6],
+					},
+				},
+			})
+		}
+
+		return datastore.NewCreateRelationshipExistsError(nil)
+	}
+	return nil
+}

@@ -1,0 +1,370 @@
+# frozen_string_literal: true
+
+require 'json'
+require 'fileutils'
+require 'digest'
+
+module PWN
+  # PWN::MemoryIndex is a lightweight local embedding index over
+  # PWN::Memory (~/.pwn/memory.json) so PromptBuilder can inject the N
+  # MOST-RELEVANT memories for the current request instead of the N
+  # newest. Embeddings prefer a direct Ollama /api/embed endpoint
+  # (PWN::Env[:ai][:ollama][:embed_model], default 'nomic-embed-text').
+  # When only Open WebUI is configured, embeddings go through its
+  # /ollama/api/embed proxy with the openwebui key/base_uri.
+  #
+  # Index layout (~/.pwn/memory.idx):
+  #   { "<key>": { "sha": "<sha16 of value>", "vec": [Float,…] }, … }
+  #
+  # Rebuilds are incremental: only entries whose value-sha changed are
+  # (re)embedded, so a warm index costs one embed call (the query).
+  module MemoryIndex
+    INDEX_FILE = File.join(Dir.home, '.pwn', 'memory.idx')
+    DEFAULT_EMBED_MODEL = 'nomic-embed-text'
+
+    # Supported Method Parameters::
+    #   bool = PWN::MemoryIndex.available?
+    #
+    # True when a local Ollama or Open WebUI base_uri is configured. All
+    # public methods degrade to substring recall when this is false.
+
+    public_class_method def self.available?
+      !embed_endpoint.nil?
+    rescue StandardError
+      false
+    end
+
+    # Supported Method Parameters::
+    #   hits = PWN::MemoryIndex.recall_semantic(
+    #     query: 'required - user request / search text',
+    #     limit: 'optional - top-K by cosine similarity (default 6)'
+    #   )
+    #
+    # Returns [{ key:, value:, category:, timestamp:, score: }, …]
+    # (newest-first Memory.recall shape + :score) or falls back to
+    # PWN::Memory.recall(query:) when embedding is unavailable.
+
+    public_class_method def self.recall_semantic(opts = {})
+      query = opts[:query].to_s
+      limit = (opts[:limit] || 6).to_i
+      mem   = PWN::Memory.load
+      return [] if mem.empty? || query.strip.empty?
+
+      qv = embed(texts: [query]).first
+      return fallback(query: query, limit: limit) unless qv
+
+      idx = refresh(mem: mem)
+      now = Time.now.utc
+      # M2 — Generative-Agents retrieval: score = α·sim + β·recency + γ·importance
+      # (Park '23). pwn had only sim; recency and importance now let a
+      # 3-day-old human :fact outrank a 1-hour-old heuristic :lesson.
+      scored = mem.map do |k, v|
+        vec = idx.dig(k, :vec)
+        next unless vec
+
+        sim = cosine(a: qv, b: vec)
+        age_h = (now - Time.parse(v[:timestamp].to_s)) / 3_600.0
+        rec = Math.exp(-age_h / (24.0 * 7.0))
+        imp = (v[:importance] || 0.5).to_f
+        score = (0.6 * sim) + (0.25 * rec) + (0.15 * imp)
+        { key: k, value: v[:value], category: v[:category], timestamp: v[:timestamp], score: score, sim: sim.round(3), importance: imp }
+      rescue StandardError
+        nil
+      end
+      scored.compact.sort_by { |h| -h[:score] }.first(limit)
+    rescue StandardError
+      fallback(query: query, limit: limit)
+    end
+
+    # Supported Method Parameters::
+    #   ctx = PWN::MemoryIndex.to_context(query:, limit: 6)
+    #
+    # Drop-in replacement for PWN::Memory.to_context that ranks by
+    # relevance to +query+ instead of insertion order. Emitted format is
+    # identical so PromptBuilder needs no special-casing.
+
+    public_class_method def self.to_context(opts = {})
+      limit = opts[:limit] || 6
+      # Fetch extra when filtering hygiene SOPs so we still fill the budget.
+      fetch_n = opts[:drop_hygiene_sops] ? [limit * 3, 18].max : limit
+      hits = recall_semantic(query: opts[:query], limit: fetch_n)
+      return PWN::Memory.to_context(limit: limit) if hits.empty?
+
+      if opts[:drop_hygiene_sops]
+        hits = hits.reject do |h|
+          k = h[:key].to_s
+          v = h[:value].to_s
+          k.match?(/process_sop_.*(?:rubocop|rake|docs_after|code_hygiene)|operator_pref_docs_after_rubocop/i) ||
+            v.match?(/\b(?:bundle exec )?rubocop\b.*\brake\b|docs_after_rubocop_rake|Documentation after code changes/i)
+        end.first(limit)
+        return PWN::Memory.to_context(limit: limit) if hits.empty?
+      else
+        hits = hits.first(limit)
+      end
+
+      ctx = "\n\nPERSISTENT MEMORY (relevance-ranked for this request - use PWN::Memory.remember to store new ones):\n"
+      hits.each do |h|
+        ctx += "- #{h[:key]} [#{h[:category]} @ #{h[:timestamp]}]: #{h[:value].to_s[0, 300]}\n"
+      end
+      ctx
+    end
+
+    # Supported Method Parameters::
+    #   idx = PWN::MemoryIndex.refresh(mem: 'optional - preloaded PWN::Memory hash')
+    #
+    # Incrementally (re)embed changed entries and prune deleted keys.
+    # Returns the in-memory index Hash keyed by memory key (Symbol).
+
+    public_class_method def self.refresh(opts = {})
+      mem = opts[:mem] || PWN::Memory.load
+      idx = load_index
+      idx.delete_if { |k, _| !mem.key?(k) }
+
+      todo = mem.reject { |k, v| idx.dig(k, :sha) == sha(text: v[:value].to_s) }
+      unless todo.empty?
+        vecs = embed(texts: todo.values.map { |v| "#{v[:category]}: #{v[:value]}" })
+        todo.keys.each_with_index do |k, i|
+          next unless vecs[i]
+
+          idx[k] = { sha: sha(text: mem[k][:value].to_s), vec: vecs[i] }
+        end
+        save_index(idx: idx)
+      end
+      idx
+    rescue StandardError
+      idx || {}
+    end
+
+    # Supported Method Parameters::
+    #   vecs = PWN::MemoryIndex.embed(texts: ['a', 'b'])
+    #
+    # POST /api/embed on direct Ollama, or /ollama/api/embed via Open WebUI.
+    # Returns Array<Array<Float>> (one vector per input, nil on per-item
+    # failure). Batches of 32.
+
+    public_class_method def self.embed(opts = {})
+      texts = Array(opts[:texts]).map(&:to_s)
+      ep = embed_endpoint
+      return Array.new(texts.length) unless ep && !texts.empty?
+
+      model = ep[:model]
+      browser = PWN::Plugins::TransparentBrowser.open(browser_type: :rest)
+      rest    = browser[:browser]::Request
+      headers = { content_type: 'application/json; charset=UTF-8' }
+      token   = ep[:token]
+      headers[:authorization] = "Bearer #{token}" if token && !token.to_s.empty?
+
+      out = []
+      texts.each_slice(32) do |batch|
+        resp = rest.execute(
+          method: :post,
+          url: ep[:url],
+          headers: headers,
+          payload: { model: model, input: batch }.to_json,
+          verify_ssl: false,
+          timeout: 120
+        )
+        j = JSON.parse(resp, symbolize_names: true)
+        out.concat(Array(j[:embeddings]))
+      end
+      out
+    rescue StandardError
+      Array.new(texts.length)
+    end
+
+    # Supported Method Parameters::
+    #   PWN::MemoryIndex.reset
+
+    public_class_method def self.reset
+      FileUtils.rm_f(INDEX_FILE)
+      {}
+    end
+
+    # -----------------------------------------------------------------
+    # privates
+    # -----------------------------------------------------------------
+
+    private_class_method def self.load_index
+      return {} unless File.exist?(INDEX_FILE)
+
+      JSON.parse(File.read(INDEX_FILE), symbolize_names: true)
+    rescue StandardError
+      {}
+    end
+
+    private_class_method def self.save_index(opts = {})
+      FileUtils.mkdir_p(File.dirname(INDEX_FILE))
+      File.write(INDEX_FILE, JSON.generate(opts[:idx] || {}))
+    end
+
+    private_class_method def self.cosine(opts = {})
+      a = opts[:a]
+      b = opts[:b]
+      return 0.0 unless a && b && a.length == b.length
+
+      dot = na = nb = 0.0
+      a.each_with_index do |x, i|
+        y = b[i]
+        dot += x * y
+        na  += x * x
+        nb  += y * y
+      end
+      return 0.0 if na.zero? || nb.zero?
+
+      dot / (Math.sqrt(na) * Math.sqrt(nb))
+    end
+
+    private_class_method def self.sha(opts = {})
+      Digest::SHA256.hexdigest(opts[:text].to_s)[0, 16]
+    end
+
+    # Prefer direct Ollama (native /api/embed). Fall back to Open WebUI's
+    # /ollama/api/embed proxy when only openwebui is configured.
+    private_class_method def self.embed_endpoint
+      return nil unless defined?(PWN::Env) && PWN::Env.is_a?(Hash)
+
+      ollama_b = PWN::Env.dig(:ai, :ollama, :base_uri).to_s.strip
+      if ollama_b.start_with?('http')
+        model = PWN::Env.dig(:ai, :ollama, :embed_model).to_s
+        model = DEFAULT_EMBED_MODEL if model.empty? || model.match?(/\A(optional|required)\b/i)
+        token = PWN::Env.dig(:ai, :ollama, :key)
+        token = nil if token.to_s.strip.empty? || token.to_s.match?(/\A(optional|required)\b/i)
+        return {
+          url: "#{ollama_b.chomp('/')}/api/embed",
+          model: model,
+          token: token,
+          via: :ollama
+        }
+      end
+
+      owu_b = PWN::Env.dig(:ai, :openwebui, :base_uri).to_s.strip
+      return nil unless owu_b.start_with?('http')
+
+      model = PWN::Env.dig(:ai, :openwebui, :embed_model).to_s
+      model = PWN::Env.dig(:ai, :ollama, :embed_model).to_s if model.empty?
+      model = DEFAULT_EMBED_MODEL if model.empty? || model.match?(/\A(optional|required)\b/i)
+      token = PWN::Env.dig(:ai, :openwebui, :key)
+      token = nil if token.to_s.strip.empty? || token.to_s.match?(/\A(optional|required)\b/i)
+      {
+        url: "#{owu_b.chomp('/')}/ollama/api/embed",
+        model: model,
+        token: token,
+        via: :openwebui
+      }
+    rescue StandardError
+      nil
+    end
+
+    # Backward-compatible private alias (specs / older callers).
+    private_class_method def self.ollama_base
+      ep = embed_endpoint
+      return nil unless ep
+
+      # Strip trailing path so callers that append still work if any remain.
+      ep[:url].sub(%r{/api/embed\z}, '').sub(%r{/ollama\z}, '')
+    end
+
+    private_class_method def self.fallback(opts = {})
+      PWN::Memory.recall(query: opts[:query], limit: opts[:limit]).map do |k, v|
+        { key: k, value: v[:value], category: v[:category], timestamp: v[:timestamp], score: 0.0 }
+      end
+    rescue StandardError
+      []
+    end
+
+    public_class_method def self.bm25(opts = {})
+      query = opts[:query].to_s.downcase
+      docs = Array(opts[:docs]).map(&:to_s)
+      qtok = expand_query(query: query)
+      return docs.map { |d| { doc: d, score: 0.0 } } if qtok.empty?
+
+      df = Hash.new(0)
+      tokenized = docs.map do |d|
+        toks = d.downcase.scan(/[a-z0-9]{3,}/)
+        toks.uniq.each { |t| df[t] += 1 }
+        toks
+      end
+      n = docs.length.to_f
+      avgdl = tokenized.sum(&:length) / [n, 1].max
+      k1 = 1.2
+      b = 0.75
+      ranked = docs.each_with_index.map do |doc, i|
+        toks = tokenized[i]
+        tf = Hash.new(0)
+        toks.each { |t| tf[t] += 1 }
+        dl = toks.length.to_f
+        score = qtok.sum do |t|
+          f = tf[t]
+          next 0.0 if f.zero?
+
+          idf = Math.log(((n - df[t] + 0.5) / (df[t] + 0.5)) + 1)
+          idf * ((f * (k1 + 1)) / (f + (k1 * (1 - b + (b * dl / avgdl)))))
+        end
+        { doc: doc, score: score }
+      end
+      ranked.sort_by { |h| -h[:score] }
+    end
+
+    private_class_method def self.expand_query(opts = {})
+      toks = opts[:query].to_s.downcase.scan(/[a-z0-9]{3,}/)
+      table = {
+        'bypass' => %w[evasion evade],
+        'rate' => %w[throttle],
+        'limit' => %w[throttle],
+        'login' => %w[auth]
+      }
+      toks.flat_map { |t| [t] + Array(table[t]) }.uniq
+    end
+
+    # Author(s):: 0day Inc. <support@0dayinc.com>
+
+    public_class_method def self.authors
+      "AUTHOR(S):\n  0day Inc. <support@0dayinc.com>\n"
+    end
+
+    # Display Usage for this Module
+
+    public_class_method def self.help
+      puts "USAGE:
+        # Run available and return its result
+        #{self}.available?
+
+        # Run recall semantic and return its result
+        #{self}.recall_semantic(
+          query: 'required - user request / search text',
+          limit: 'optional - top-K by cosine similarity (default 6)'
+        )
+
+        # Run to context and return its result
+        #{self}.to_context(
+          limit: 'optional - limit value consumed by #to_context (defaults to 6)',
+          drop_hygiene_sops: 'optional - drop hygiene sops value consumed by #to_context',
+          query: 'optional - search query string'
+        )
+
+        # Run refresh and return its result
+        #{self}.refresh(
+          mem: 'optional - mem value consumed by #refresh (defaults to PWN::Memory.load)'
+        )
+
+        # Run embed and return its result
+        #{self}.embed(
+          texts: 'required - Array texts value consumed by #embed'
+        )
+
+        # Rank documents by BM25 (pure Ruby; no embedder required).
+        #{self}.bm25(
+          query: 'required - search text',
+          docs: 'required - Array of document strings'
+        )
+
+        # Run reset and return its result
+        #{self}.reset
+
+        # Print the AUTHOR(S) string for this module.
+        #{self}.authors
+      "
+      constants.sort
+    end
+  end
+end

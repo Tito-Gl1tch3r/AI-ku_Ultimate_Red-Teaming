@@ -1,0 +1,54 @@
+//! Network filtering proxy for the nono sandbox.
+//!
+//! `nono-proxy` provides three proxy modes:
+//!
+//! 1. **CONNECT tunnel** (`connect`) - Host-filtered HTTPS tunnelling.
+//!    The proxy validates the target host against an allowlist and cloud
+//!    metadata deny list, then establishes a raw TCP tunnel.
+//!
+//! 2. **Reverse proxy** (`reverse`) - Credential injection for API calls.
+//!    Requests arrive at `http://127.0.0.1:<port>/<service>/...`, the proxy
+//!    injects the real API credential and forwards to the upstream.
+//!
+//! 3. **External proxy** (`external`) - Enterprise proxy passthrough.
+//!    CONNECT requests are chained through a corporate proxy with the
+//!    default deny list enforced as a floor.
+//!
+//! The proxy runs **unsandboxed** in the supervisor process. The sandboxed
+//! child can only reach `localhost:<port>` via `NetworkMode::ProxyOnly`.
+
+pub mod approval;
+pub mod audit;
+pub mod auth;
+pub mod aws;
+pub mod capture;
+pub mod config;
+pub mod connect;
+pub mod credential;
+pub mod diagnostic;
+pub mod error;
+pub mod external;
+pub mod filter;
+pub mod forward;
+pub mod jwt_phantom;
+pub(crate) mod line_reader;
+pub mod oauth2;
+pub mod oauth_capture;
+pub mod pool;
+pub mod rate_limit;
+pub mod reverse;
+pub mod route;
+pub mod server;
+pub mod spiffe;
+pub mod tls_intercept;
+pub mod token;
+
+#[cfg(test)]
+pub mod test_env;
+
+pub use config::ProxyConfig;
+pub use credential::{CredentialLoadOutcome, CredentialStore};
+pub use diagnostic::{ProxyDiagnostic, ProxyDiagnosticCode, ProxyDiagnosticSeverity};
+pub use error::{ProxyError, Result};
+pub use server::{ProxyHandle, start};
+pub use token::NonceResolver;

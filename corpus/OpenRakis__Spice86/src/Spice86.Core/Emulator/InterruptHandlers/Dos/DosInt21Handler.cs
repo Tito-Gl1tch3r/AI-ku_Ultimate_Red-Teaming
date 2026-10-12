@@ -1,0 +1,2626 @@
+using Microsoft.Extensions.Logging;
+namespace Spice86.Core.Emulator.InterruptHandlers.Dos;
+
+
+using Spice86.Core.Emulator.CPU;
+using Spice86.Core.Emulator.Devices.Cmos;
+using Spice86.Core.Emulator.Errors;
+using Spice86.Core.Emulator.Function;
+using Spice86.Core.Emulator.InterruptHandlers.Common.MemoryWriter;
+using Spice86.Core.Emulator.InterruptHandlers.Input.Keyboard;
+using Spice86.Core.Emulator.IOPorts;
+using Spice86.Core.Emulator.Memory;
+using Spice86.Core.Emulator.OperatingSystem;
+using Spice86.Core.Emulator.OperatingSystem.Devices;
+using Spice86.Core.Emulator.OperatingSystem.Enums;
+using Spice86.Core.Emulator.OperatingSystem.Structures;
+using Spice86.Shared.Emulator.Memory;
+using Spice86.Shared.Interfaces;
+using Spice86.Shared.Utils;
+
+using System;
+
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Text;
+
+/// <summary>
+/// Implementation of the DOS INT21H services.
+/// </summary>
+public class DosInt21Handler : InterruptHandler {
+    private readonly DosMemoryManager _dosMemoryManager;
+    private readonly DosDriveManager _dosDriveManager;
+    private readonly InterruptVectorTable _interruptVectorTable;
+    private readonly DosFileManager _dosFileManager;
+    private readonly KeyboardInt16Handler _keyboardInt16Handler;
+    private readonly DosCodePageState _dosCodePageState;
+    private readonly DosStringDecoder _dosStringDecoder;
+    private readonly CountryInfo _countryInfo;
+    private readonly DosProcessManager _dosProcessManager;
+    private readonly IOPortDispatcher _ioPortDispatcher;
+    private readonly DosTables _dosTables;
+    private readonly DosSwappableDataArea _sda;
+    private readonly DosFcbManager _dosFcbManager;
+    private readonly DosSysVars _dosSysVars;
+    private readonly DosJobFileTable _jobFileTable;
+    private uint _stdinReadyFlagLinearAddress;
+    private bool _isCtrlCFlag;
+
+    private const ushort OffsetMask = 0x0F;
+    private const byte ExpectedValueOfALInCreateChildPsp = 0xF0;
+    private const ushort DefaultBytesPerSector = 0x200;
+    private const byte DefaultSectorsPerCluster = 0x20;
+    private const ushort DefaultTotalClusters = 0x7FFD;
+    private const ushort MaximumJobFileTableSize = 0xFF;
+    private const ushort PspJobFileTableOffset = 0x18;
+    private const byte SetCurrentPspFunction = 0x50;
+    private const byte GetCurrentPspFunction = 0x51;
+    private const byte GetPspAddressFunction = 0x62;
+
+    /// <summary>
+    /// Initializes a new instance.
+    /// </summary>
+    /// <param name="memory">The emulator memory.</param>
+    /// <param name="functionHandlerProvider">Provides current call flow handler to peek call stack.</param>
+    /// <param name="stack">The CPU stack.</param>
+    /// <param name="state">The CPU state.</param>
+    /// <param name="keyboardInt16Handler">The keyboard interrupt handler.</param>
+    /// <param name="countryInfo">The DOS kernel's global region settings.</param>
+    /// <param name="dosCodePageState">The DOS kernel's shared code page state.</param>
+    /// <param name="dosStringDecoder">The helper class used to encode/decode DOS strings.</param>
+    /// <param name="dosMemoryManager">The DOS class used to manage DOS MCBs.</param>
+    /// <param name="dosFileManager">The DOS class responsible for DOS file access.</param>
+    /// <param name="dosDriveManager">The DOS class responsible for DOS volumes.</param>
+    /// <param name="dosProcessManager">The DOS class responsible for program loading and execution.</param>
+    /// <param name="ioPortDispatcher">The I/O port dispatcher for accessing hardware ports (e.g., CMOS).</param>
+    /// <param name="dosTables">The DOS tables structure containing CDS and DBCS information.</param>
+    /// <param name="loggerService">The logger service implementation.</param>
+    /// <param name="dosFcbManager">FCB manager shared with the process manager for cleanup.</param>
+    public DosInt21Handler(IMemory memory,
+        IFunctionHandlerProvider functionHandlerProvider, Stack stack, State state,
+        KeyboardInt16Handler keyboardInt16Handler, CountryInfo countryInfo,
+        DosCodePageState dosCodePageState, DosStringDecoder dosStringDecoder, DosMemoryManager dosMemoryManager,
+        DosFileManager dosFileManager, DosDriveManager dosDriveManager,
+        DosProcessManager dosProcessManager,
+        IOPortDispatcher ioPortDispatcher, DosTables dosTables, DosSysVars dosSysVars, ILogger loggerService, DosFcbManager dosFcbManager)
+            : base(memory, functionHandlerProvider, stack, state, loggerService) {
+        _sda = new(memory, MemoryUtils.ToPhysicalAddress(DosSwappableDataArea.BaseSegment, 0));
+        _countryInfo = countryInfo;
+        _dosCodePageState = dosCodePageState;
+        _dosStringDecoder = dosStringDecoder;
+        _keyboardInt16Handler = keyboardInt16Handler;
+        _dosMemoryManager = dosMemoryManager;
+        _dosFileManager = dosFileManager;
+        _dosDriveManager = dosDriveManager;
+        _dosProcessManager = dosProcessManager;
+        _ioPortDispatcher = ioPortDispatcher;
+        _dosTables = dosTables;
+        _dosSysVars = dosSysVars;
+        _interruptVectorTable = new InterruptVectorTable(memory);
+        _dosFcbManager = dosFcbManager;
+        _jobFileTable = new DosJobFileTable(memory);
+        FillDispatchTable();
+    }
+
+    /// <summary>
+    /// Gets the DOS process manager for the <see cref="DosProgramLoader"/>
+    /// </summary>
+    internal DosProcessManager ProcessManager => _dosProcessManager;
+
+    /// <summary>
+    /// Gets the DOS file manager for the <see cref="DosProgramLoader"/>
+    /// </summary>
+    internal DosFileManager FileManager => _dosFileManager;
+
+    /// <summary>
+    /// Register the handlers for the DOS INT21H services that we support.
+    /// </summary>
+    private void FillDispatchTable() {
+        AddAction(0x00, LegacyTerminateProgram);
+        AddAction(0x01, CharacterInputWithEcho);
+        AddAction(0x02, DisplayOutput);
+        AddAction(0x03, ReadCharacterFromStdAux);
+        AddAction(0x04, WriteCharacterToStdAux);
+        AddAction(0x05, PrinterOutput);
+        AddAction(0x06, () => DirectConsoleIo(true));
+        AddAction(0x07, DirectStandardInputWithoutEcho);
+        AddAction(0x08, DirectStandardInputWithoutEchoWithBreakCheck);
+        AddAction(0x09, PrintString);
+        AddAction(0x0A, BufferedInput);
+        AddAction(0x0B, CheckStandardInputStatus);
+        AddAction(0x0C, ClearKeyboardBufferAndInvokeKeyboardFunction);
+        AddAction(0x0D, DiskReset);
+        AddAction(0x0E, SelectDefaultDrive);
+        // FCB file operations (CP/M compatible)
+        AddAction(0x0F, FcbOpenFile);
+        AddAction(0x10, FcbCloseFile);
+        AddAction(0x11, FcbFindFirst);
+        AddAction(0x12, FcbFindNext);
+        AddAction(0x13, FcbDeleteFile);
+        AddAction(0x14, FcbSequentialRead);
+        AddAction(0x15, FcbSequentialWrite);
+        AddAction(0x16, FcbCreateFile);
+        AddAction(0x17, FcbRenameFile);
+        AddAction(0x19, GetCurrentDefaultDrive);
+        AddAction(0x21, FcbRandomRead);
+        AddAction(0x22, FcbRandomWrite);
+        AddAction(0x23, FcbGetFileSize);
+        AddAction(0x24, FcbSetRandomRecordNumber);
+        AddAction(0x27, FcbRandomBlockRead);
+        AddAction(0x28, FcbRandomBlockWrite);
+        AddAction(0x29, FcbParseFilename);
+        AddAction(0x1A, SetDiskTransferAddress);
+        AddAction(0x1B, GetAllocationInfoForDefaultDrive);
+        AddAction(0x1C, GetAllocationInfoForAnyDrive);
+        AddAction(0x25, SetInterruptVector);
+        AddAction(0x26, CreateNewPsp);
+        AddAction(0x2A, GetDate);
+        AddAction(0x2B, SetDate);
+        AddAction(0x2C, GetTime);
+        AddAction(0x2D, SetTime);
+        AddAction(0x2F, GetDiskTransferAddress);
+        AddAction(0x30, GetDosVersion);
+        AddAction(0x31, TerminateAndStayResident);
+        AddAction(0x33, GetSetControlBreak);
+        AddAction(0x34, GetInDosFlagAddress);
+        AddAction(0x35, GetInterruptVector);
+        AddAction(0x36, GetFreeDiskSpace);
+        AddAction(0x38, () => SetCountryCode(true));
+        AddAction(0x39, () => CreateDirectory(true));
+        AddAction(0x3A, () => RemoveDirectory(true));
+        AddAction(0x3B, () => ChangeCurrentDirectory(true));
+        AddAction(0x3C, () => CreateFileUsingHandle(true));
+        AddAction(0x3D, () => OpenFileOrDevice(true));
+        AddAction(0x3E, () => CloseFileOrDevice(true));
+        AddAction(0x3F, () => ReadFileOrDevice(true));
+        AddAction(0x40, () => WriteToFileOrDevice(true));
+        AddAction(0x41, () => RemoveFile(true));
+        AddAction(0x42, () => MoveFilePointerUsingHandle(true));
+        AddAction(0x43, () => GetSetFileAttributes(true));
+        AddAction(0x44, () => IoControl(true));
+        AddAction(0x45, () => DuplicateFileHandle(true));
+        AddAction(0x46, () => ForceDuplicateFileHandle(true));
+        AddAction(0x47, () => GetCurrentDirectory(true));
+        AddAction(0x48, () => AllocateMemoryBlock(true));
+        AddAction(0x49, () => FreeMemoryBlock(true));
+        AddAction(0x4A, () => ModifyMemoryBlock(true));
+        AddAction(0x4B, () => LoadAndOrExecute(true));
+        AddAction(0x4C, QuitWithExitCode);
+        AddAction(0x4D, GetReturnCode);
+        AddAction(0x4E, () => FindFirstMatchingFile(true));
+        AddAction(0x4F, () => FindNextMatchingFile(true));
+        AddAction(0x50, () => SetCurrentPsp());
+        AddAction(0x51, GetPspAddress);
+        AddAction(0x52, GetListOfLists);
+        AddAction(0x55, CreateChildPsp);
+        AddAction(0x57, () => GetSetFileDateAndTime(true));
+        AddAction(0x58, () => AllocationStrategyOrUpperMemoryLinkState(true));
+        AddAction(0x62, GetPspAddress);
+        AddAction(0x63, GetLeadByteTable);
+        AddAction(0x66, () => GetSetGlobalLoadedCodePageTable(true));
+        AddAction(0x67, () => SetHandleCount(true));
+    }
+
+    /// <summary>
+    ///     Emits an INT 21h handler stub into guest RAM that dispatches all AH values to the
+    ///     C# handler via <c>callback(Run)</c>. For AH=07h, 08h, and 0Ah the stub first
+    ///     polls STDIN readiness with INT 28h idle calls before dispatching.
+    ///     AH=01h is NOT polled here — it goes through L_DEFAULT to the C# handler which
+    ///     reads via ConsoleDevice → INT 16h (which has its own INT 09h-based keyboard polling).
+    /// </summary>
+    /// <remarks><![CDATA[
+    ///     A flag byte is reserved in the handler segment, before the entry point.
+    ///     The CheckStdinReady callback writes to this byte (1 = ready, 0 = not ready).
+    ///     ASM reads it with CMP byte CS:[flagOffset], 0 — no CPU state is modified by the
+    ///     readiness callback.
+    ///
+    ///     Assembled control flow (labels for readability):
+    ///
+    ///     stdin_ready_flag: DB 0            ; private flag byte in handler segment
+    ///
+    ///     L_HANDLER:
+    ///       CMP AH, 07h
+    ///       JZ  L_WAIT_FOR_STDIN
+    ///       CMP AH, 08h
+    ///       JZ  L_WAIT_FOR_STDIN
+    ///       CMP AH, 0Ah
+    ///       JZ  L_WAIT_FOR_STDIN
+    ///
+    ///     L_DEFAULT:
+    ///       callback(Run)                    ; dispatch to C# for all AH values
+    ///       IRET
+    ///
+    ///     L_WAIT_FOR_STDIN:
+    ///       callback(CheckStdinReady)        ; writes flag byte
+    ///       CMP byte CS:[stdin_ready_flag], 0
+    ///       JNZ L_DISPATCH
+    ///       INT 28h                          ; DOS idle
+    ///       JMP short L_WAIT_FOR_STDIN
+    ///
+    ///     L_DISPATCH:
+    ///       callback(Run)                    ; dispatch to C# handler for this AH value
+    ///       IRET
+    /// ]]></remarks>
+    public override SegmentedAddress WriteAssemblyInRam(MemoryAsmWriter memoryAsmWriter) {
+        // Reserve a flag byte in the handler segment for callback→ASM communication.
+        // The CheckStdinReady callback writes to this byte; ASM reads with CS:[flagOffset].
+        SegmentedAddress flagAddress = memoryAsmWriter.CurrentAddress;
+        _stdinReadyFlagLinearAddress = MemoryUtils.ToPhysicalAddress(flagAddress.Segment, flagAddress.Offset);
+        ushort flagOffset = flagAddress.Offset;
+        memoryAsmWriter.WriteUInt8(0x00);
+
+        // Block sizes for jump offset calculation:
+        // L_DEFAULT:          callback(4) + IRET(1) = 5 bytes
+        // L_WAIT_FOR_STDIN:   STI(1) + callback(4) + CMP(6) + JNZ(2) + INT(2) + JMP(2) = 17 bytes
+        // L_DISPATCH:         callback(4) + IRET(1) = 5 bytes
+
+        SegmentedAddress handlerAddress = memoryAsmWriter.CurrentAddress;
+
+        // CMP AH, 07h → JZ L_WAIT_FOR_STDIN
+        memoryAsmWriter.WriteCmpAh(0x07);
+        // skip: CMP 08h(5) + CMP 0Ah(5) + L_DEFAULT(5) = 15
+        memoryAsmWriter.WriteJz(15);
+
+        // CMP AH, 08h → JZ L_WAIT_FOR_STDIN
+        memoryAsmWriter.WriteCmpAh(0x08);
+        // skip: CMP 0Ah(5) + L_DEFAULT(5) = 10
+        memoryAsmWriter.WriteJz(10);
+
+        // CMP AH, 0Ah → JZ L_WAIT_FOR_STDIN
+        memoryAsmWriter.WriteCmpAh(0x0A);
+        // skip: L_DEFAULT(5) = 5
+        memoryAsmWriter.WriteJz(5);
+
+        // L_DEFAULT: callback to C# Run() then IRET
+        memoryAsmWriter.RegisterAndWriteCallback(VectorNumber, Run);
+        memoryAsmWriter.WriteIret();
+
+        // L_WAIT_FOR_STDIN: poll STDIN readiness in a loop with INT 28h idle
+        // STI — re-enable hardware interrupts so IRQ1 (keyboard) can fire.
+        // INT 21h clears IF per x86 spec; without STI the polling loop would
+        // spin forever because keyboard scancodes never reach BiosKeyboardBuffer.
+        // This matches FreeDOS (INT 21h starts with STI) and DOSBox (idle uses STI+HLT).
+        memoryAsmWriter.WriteSti();
+        // callback(CheckStdinReady) — writes flag byte, 4 bytes
+        memoryAsmWriter.RegisterAndWriteCallback(CallbackCheckStdinReady);
+        // CMP byte CS:[flagOffset], 0 — 6 bytes
+        memoryAsmWriter.WriteUInt8(0x2E); // CS: segment override
+        memoryAsmWriter.WriteUInt8(0x80); // CMP Eb, Ib
+        memoryAsmWriter.WriteUInt8(0x3E); // ModR/M: [disp16], /7 (CMP)
+        memoryAsmWriter.WriteUInt16(flagOffset);
+        memoryAsmWriter.WriteUInt8(0x00); // imm8 = 0
+        // JNZ L_DISPATCH — skip INT 28h(2) + JMP(2) = 4
+        memoryAsmWriter.WriteJnz(4);
+        // INT 28h (DOS idle)
+        memoryAsmWriter.WriteInt(0x28);
+        // JMP short back to STI: -(4+6+2+2+2+1) = -17
+        memoryAsmWriter.WriteJumpShort(-17);
+
+        // L_DISPATCH: dispatch to C# handler for AH=07h/08h/0Ah
+        memoryAsmWriter.RegisterAndWriteCallback(Run);
+        memoryAsmWriter.WriteIret();
+
+        return handlerAddress;
+    }
+
+
+    /// <summary>
+    /// Writes 1 to the handler's flag byte if stdin has data, 0 if empty.
+    /// No CPU registers or flags are modified.
+    /// Used by the ASM wait loop for AH=07h/08h/0Ah.
+    /// </summary>
+    public void CallbackCheckStdinReady() {
+        Memory[_stdinReadyFlagLinearAddress] = IsStandardInputAvailable() ? (byte)1 : (byte)0;
+    }
+
+    /// <summary>
+    /// INT 21h, AH=01h - Character Input with Echo.
+    /// <para>
+    /// Reads a single character from standard input and echoes it to standard output.
+    /// The program waits for input; the user just needs to press the intended key
+    /// WITHOUT pressing "enter" key.
+    /// </para>
+    /// <b>Returns:</b><br/>
+    /// AL = ASCII code of the input character
+    /// </summary>
+    /// <remarks>
+    /// This is a blocking call that reads from STDIN.
+    /// The console device's Read method handles the echo internally when Echo is true. <br/>
+    /// Used by (for example): Civilization.
+    /// </remarks>
+    public void CharacterInputWithEcho() {
+        if (CheckCtrlCOrCtrlBreakInKeyboardBuffer()) {
+            return;
+        }
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("CHARACTER INPUT WITH ECHO");
+        }
+        VirtualFileBase? stdin = GetStandardFile(DosStandardHandle.Stdin);
+        if (stdin != null && stdin.CanRead) {
+            ConsoleDevice? consoleDevice = stdin as ConsoleDevice;
+            bool previousEchoState = false;
+            if (consoleDevice != null) {
+                previousEchoState = consoleDevice.Echo;
+                consoleDevice.Echo = true;
+            }
+
+            byte[] bytes = new byte[1];
+            int readCount = stdin.Read(bytes, 0, 1);
+
+            if (consoleDevice != null) {
+                consoleDevice.Echo = previousEchoState;
+            }
+
+            State.AL = readCount < 1 ? (byte)0 : bytes[0];
+        } else {
+            State.AL = 0;
+        }
+    }
+
+    public void SetDate() {
+        ushort year = State.CX;
+        byte month = State.DH;
+        byte day = State.DL;
+
+        bool valid = false;
+        try {
+            if (year >= 1980 && year <= 2099 && month >= 1 && month <= 12 && day >= 1) {
+                _ = new DateTime(year, month, day);
+                valid = true;
+            }
+        } catch (ArgumentOutOfRangeException) {
+            valid = false;
+        }
+
+        if (valid) {
+            int century = year / 100;
+            int yearPart = year % 100;
+
+            byte yearBcd = BcdConverter.ToBcd((byte)yearPart);
+            byte monthBcd = BcdConverter.ToBcd(month);
+            byte dayBcd = BcdConverter.ToBcd(day);
+            byte centuryBcd = BcdConverter.ToBcd((byte)century);
+
+            WriteCmosRegister(CmosRegisterAddresses.Year, yearBcd);
+            WriteCmosRegister(CmosRegisterAddresses.Month, monthBcd);
+            WriteCmosRegister(CmosRegisterAddresses.DayOfMonth, dayBcd);
+            WriteCmosRegister(CmosRegisterAddresses.Century, centuryBcd);
+
+            State.AL = 0;
+
+            if (LoggerService.IsEnabled(LogLevel.Trace)) {
+                LoggerService.LogTrace("SET DOS DATE to CMOS: {Year}-{Month:D2}-{Day:D2}",
+                    year, month, day);
+            }
+        } else {
+            State.AL = 0xFF;
+
+            if (LoggerService.IsEnabled(LogLevel.Warning)) {
+                LoggerService.LogWarning("SET DOS DATE called with invalid date: {Year}-{Month:D2}-{Day:D2}",
+                    year, month, day);
+            }
+        }
+    }
+
+    public void SetTime() {
+        byte hour = State.CH;
+        byte minutes = State.CL;
+        byte seconds = State.DH;
+        byte hundredths = State.DL;
+
+        bool valid = hour <= 23 &&
+                     minutes <= 59 &&
+                     seconds <= 59 &&
+                     hundredths <= 99;
+
+        if (valid) {
+            byte hourBcd = BcdConverter.ToBcd(hour);
+            byte minutesBcd = BcdConverter.ToBcd(minutes);
+            byte secondsBcd = BcdConverter.ToBcd(seconds);
+
+            WriteCmosRegister(CmosRegisterAddresses.Hours, hourBcd);
+            WriteCmosRegister(CmosRegisterAddresses.Minutes, minutesBcd);
+            WriteCmosRegister(CmosRegisterAddresses.Seconds, secondsBcd);
+
+            State.AL = 0;
+
+            if (LoggerService.IsEnabled(LogLevel.Trace)) {
+                LoggerService.LogTrace("SET DOS TIME to CMOS: {Hour:D2}:{Minutes:D2}:{Seconds:D2}.{Hundredths:D2}",
+                    hour, minutes, seconds, hundredths);
+            }
+        } else {
+            State.AL = 0xFF;
+
+            if (LoggerService.IsEnabled(LogLevel.Warning)) {
+                LoggerService.LogWarning("SET DOS TIME called with invalid time: {Hour:D2}:{Minutes:D2}:{Seconds:D2}.{Hundredths:D2}",
+                    hour, minutes, seconds, hundredths);
+            }
+        }
+    }
+
+    /// <summary>
+    /// INT 21h, AH=63h - Get Double Byte Character Set (DBCS) Lead Byte Table.
+    /// <para>
+    /// Returns a pointer to the DBCS lead-byte table, which indicates which byte values
+    /// are lead bytes in double-byte character sequences (e.g., Japanese, Chinese, Korean).
+    /// An empty table (value 0) indicates no DBCS ranges are defined.
+    /// </para>
+    /// <b>Expects:</b><br/>
+    /// AL = 0 to get DBCS lead byte table pointer
+    /// <b>Returns:</b><br/>
+    /// If AL was 0:<br/>
+    /// - DS:SI = pointer to DBCS lead byte table<br/>
+    /// - AL = 0<br/>
+    /// - CF = 0 (undocumented)<br/>
+    /// If AL was not 0:<br/>
+    /// - AL = 0xFF<br/>
+    /// </summary>
+    private void GetLeadByteTable() {
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("INT 21h AH=63h - Get DBCS Lead Byte Table, AL={AL:X2}", State.AL);
+        }
+
+        if (State.AL == 0) {
+            uint dbcsAddress = _dosTables.DoubleByteCharacterSet.BaseAddress;
+            ushort segment = MemoryUtils.ToSegment(dbcsAddress);
+            ushort offset = (ushort)(dbcsAddress & OffsetMask);
+
+            State.DS = segment;
+            State.SI = offset;
+            State.AL = 0;
+            SetCarryFlag(false, true);
+
+            if (LoggerService.IsEnabled(LogLevel.Trace)) {
+                LoggerService.LogTrace("Returning DBCS table pointer at {Segment:X4}:{Offset:X4}", segment, offset);
+            }
+        } else {
+            // Returns error without modifying carry flag for invalid subfunction
+            State.AL = 0xFF;
+        }
+    }
+
+    /// <summary>
+    /// Obtains or selects the current code page.
+    /// </summary>
+    /// <param name="calledFromVm">Whether this was called by the emulator.</param>
+    public void GetSetGlobalLoadedCodePageTable(bool calledFromVm) {
+        switch (State.AL) {
+            case 1:
+                State.BX = _dosCodePageState.ActiveCodePage;
+                State.DX = _dosCodePageState.SystemCodePage;
+                SetCarryFlag(false, calledFromVm);
+                break;
+            case 2:
+                if (_dosCodePageState.TrySetActiveCodePage(State.BX, State.DX, out DosErrorCode errorCode)) {
+                    SetCarryFlag(false, calledFromVm);
+                    break;
+                }
+
+                State.AX = (byte)errorCode;
+                SetCarryFlag(true, calledFromVm);
+                break;
+            default:
+                State.AX = (byte)DosErrorCode.FunctionNumberInvalid;
+                SetCarryFlag(true, calledFromVm);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// INT 21h, AH=67h - Set handle count.
+    /// </summary>
+    /// <remarks>
+    /// Input: BX = number of file handles for the current PSP.
+    /// </remarks>
+    /// <param name="calledFromVm">Whether this was called by the emulator.</param>
+    public void SetHandleCount(bool calledFromVm) {
+        ushort currentPspSegment = _sda.CurrentProgramSegmentPrefix;
+        uint pspAddress = MemoryUtils.ToPhysicalAddress(currentPspSegment, 0);
+        DosProgramSegmentPrefix currentPsp = new(Memory, pspAddress);
+        ushort currentSize = _jobFileTable.GetSize(currentPspSegment);
+        ushort requestedSize = Math.Clamp(State.BX, DosFileManager.MaxOpenFilesPerProcess, MaximumJobFileTableSize);
+        if (requestedSize == currentSize) {
+            SetCarryFlag(false, calledFromVm);
+            return;
+        }
+        for (ushort handle = requestedSize; handle < currentSize; handle++) {
+            if (_jobFileTable.GetEntry(currentPspSegment, handle) != DosJobFileTable.UnusedEntry) {
+                SetStateFromDosFileOperationResult(calledFromVm, DosFileOperationResult.LogError(DosErrorCode.TooManyOpenFiles));
+                return;
+            }
+        }
+        SegmentedAddress newTableAddress = new(currentPspSegment, PspJobFileTableOffset);
+        if (requestedSize > DosFileManager.MaxOpenFilesPerProcess) {
+            try {
+                ushort tableSegment = _dosTables.GetJobFileTableSegment(currentPspSegment);
+                newTableAddress = new SegmentedAddress(tableSegment, 0);
+            } catch (InvalidOperationException) {
+                SetStateFromDosFileOperationResult(calledFromVm,
+                    DosFileOperationResult.LogError(DosErrorCode.InsufficientMemory));
+                return;
+            }
+        }
+        byte[] entries = new byte[requestedSize];
+        Array.Fill(entries, DosJobFileTable.UnusedEntry);
+        for (ushort handle = 0; handle < Math.Min(requestedSize, currentSize); handle++) {
+            entries[handle] = _jobFileTable.GetEntry(currentPspSegment, handle);
+        }
+        currentPsp.FileTableAddress = newTableAddress;
+        currentPsp.MaximumOpenFiles = requestedSize;
+        for (ushort handle = 0; handle < requestedSize; handle++) {
+            _jobFileTable.SetEntry(currentPspSegment, handle, entries[handle]);
+        }
+        SetCarryFlag(false, calledFromVm);
+    }
+
+    private bool IsStandardInputAvailable() {
+        return _dosFileManager.IsInputAvailable(GetStandardFile(DosStandardHandle.Stdin));
+    }
+
+    /// <summary>
+    /// Reads a character from the standard auxiliary device (usually the keyboard) and stores it in AL.
+    /// </summary>
+    /// <remarks>
+    /// Standard AUX is usually the first serial port (COM1). <br/>
+    /// Checks for Ctrl-C/Ctrl-Break in STDIN before reading. <br/>
+    /// </remarks>
+    public void ReadCharacterFromStdAux() {
+        if (CheckCtrlCOrCtrlBreakInKeyboardBuffer()) {
+            return;
+        }
+        if (_dosFileManager.TryGetOpenDeviceWithAttributes(DeviceAttributes.Character,
+            out AuxDevice? aux) && aux.CanRead is true) {
+            State.AL = (byte)aux.ReadByte();
+        } else {
+            State.AL = 0x0;
+        }
+    }
+
+    /// <summary>
+    /// Writes a character from the AL register to the standard auxiliary device.
+    /// </summary>
+    /// <remarks>
+    /// Checks for Ctrl-C/Ctrl-Break in STDIN before writing. <br/>
+    /// </remarks>
+    public void WriteCharacterToStdAux() {
+        if (CheckCtrlCOrCtrlBreakInKeyboardBuffer()) {
+            return;
+        }
+        if (_dosFileManager.TryGetOpenDeviceWithAttributes(DeviceAttributes.Character,
+            out AuxDevice? aux) && aux.CanWrite is true) {
+            aux.WriteByte(State.AL);
+        }
+    }
+
+    /// <summary>
+    /// Writes a character from the AL register to the printer device.
+    /// </summary>
+    /// <remarks>
+    /// Standard printer is usually the first parallel port (LPT1), but may be redirected, as usual with any device in DOS 2+. <br/>
+    /// Checks for Ctrl-C/Ctrl-Break in STDIN before writing. <br/>
+    /// TODO: If the printer is busy, this function will wait. <br/>
+    /// </remarks>
+    public void PrinterOutput() {
+        if (CheckCtrlCOrCtrlBreakInKeyboardBuffer()) {
+            return;
+        }
+        if (_dosFileManager.TryGetOpenDeviceWithAttributes(DeviceAttributes.Character,
+            out PrinterDevice? prn) && prn.CanWrite is true) {
+            prn.Write(State.AL);
+        } else if (LoggerService.IsEnabled(LogLevel.Warning)) {
+            LoggerService.LogWarning("DOS INT21H PrinterOutput: Cannot write to printer device.");
+        }
+    }
+
+    /// <summary>
+    /// Returns 0xFF in AL if input character is available in the standard input, 0 otherwise.
+    /// When the break flag is set, also checks for Ctrl-C in the keyboard buffer.
+    /// </summary>
+    public void CheckStandardInputStatus() {
+        if (_isCtrlCFlag && CheckCtrlCOrCtrlBreakInKeyboardBuffer()) {
+            return;
+        }
+        State.AL = IsStandardInputAvailable() ? (byte)0xFF : (byte)0x0;
+    }
+
+    /// <summary>
+    /// INT 21h, AH=07h - Direct Standard Input Without Echo.
+    /// <para>
+    /// Reads a single character from the STDIN handle into AL, without echo.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// The in-RAM ASM stub waits for STDIN readiness with INT 28h idle calls,
+    /// then dispatches here via <c>callback(Run)</c>.
+    /// </remarks>
+    public void DirectStandardInputWithoutEcho() {
+        VirtualFileBase? stdin = GetStandardFile(DosStandardHandle.Stdin);
+        if (stdin != null && stdin.CanRead) {
+            byte[] bytes = new byte[1];
+            int readCount = stdin.Read(bytes, 0, 1);
+            if (readCount < 1) {
+                State.AL = 0;
+            } else {
+                State.AL = bytes[0];
+            }
+        } else {
+            State.AL = 0;
+        }
+    }
+
+    /// <summary>
+    /// INT 21h, AH=08h - Direct Standard Input Without Echo With Break Check.
+    /// <para>
+    /// Reads a single character from the STDIN handle into AL, without echo.
+    /// Checks for Ctrl-C in the keyboard buffer first.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// The in-RAM ASM stub waits for STDIN readiness with INT 28h idle calls,
+    /// then dispatches here via <c>callback(Run)</c>.
+    /// </remarks>
+    public void DirectStandardInputWithoutEchoWithBreakCheck() {
+        if (CheckCtrlCOrCtrlBreakInKeyboardBuffer()) {
+            return;
+        }
+        DirectStandardInputWithoutEcho();
+    }
+
+    /// <summary>
+    /// Creates a directory from the path pointed by DS:DX.
+    /// </summary>
+    /// <param name="calledFromVm">Whether the method was called by the emulator.</param>
+    public void CreateDirectory(bool calledFromVm) {
+        DosFileOperationResult dosFileOperationResult = _dosFileManager.CreateDirectory(
+            _dosStringDecoder.GetZeroTerminatedStringAtDsDx());
+        SetStateFromDosFileOperationResult(calledFromVm, dosFileOperationResult);
+    }
+
+    /// <summary>
+    /// Removes a file path, pointed by DS:DX.
+    /// </summary>
+    /// <param name="calledFromVm">Whether the method was called by the emulator.</param>
+    public void RemoveFile(bool calledFromVm) {
+        DosFileOperationResult dosFileOperationResult = _dosFileManager.RemoveFile(
+            _dosStringDecoder.GetZeroTerminatedStringAtDsDx());
+        SetStateFromDosFileOperationResult(calledFromVm, dosFileOperationResult);
+    }
+
+    /// <summary>
+    /// Removes a directory, pointed by DS:DX.
+    /// </summary>
+    /// <param name="calledFromVm">Whether the method was called by the emulator.</param>
+    public void RemoveDirectory(bool calledFromVm) {
+        DosFileOperationResult dosFileOperationResult = _dosFileManager.RemoveDirectory(
+            _dosStringDecoder.GetZeroTerminatedStringAtDsDx());
+        SetStateFromDosFileOperationResult(calledFromVm, dosFileOperationResult);
+    }
+
+    /// <summary>
+    /// INT 21h, AH=1Ch - Get allocation info for a specific drive.
+    /// Returns AL=0xFF if the drive is invalid or not mounted as a block drive.
+    /// </summary>
+    public void GetAllocationInfoForAnyDrive() {
+        if (!TryGetAllocationInfoDrive(State.DL, out byte driveIndex, out _)) {
+            if (LoggerService.IsEnabled(LogLevel.Trace)) {
+                LoggerService.LogTrace("INT 21h AH=1Ch invalid/unmounted drive request DL={DriveRequest:X2}", State.DL);
+            }
+            State.AL = 0xFF;
+            return;
+        }
+        SetAllocationInfoRegisters(driveIndex);
+    }
+
+    /// <summary>
+    /// INT 21h, AH=1Bh - Get allocation info for the default drive.
+    /// Returns AL=0xFF if the current default drive is invalid for FAT allocation queries.
+    /// </summary>
+    public void GetAllocationInfoForDefaultDrive() {
+        if (!TryGetAllocationInfoDrive(0, out byte driveIndex, out _)) {
+            if (LoggerService.IsEnabled(LogLevel.Trace)) {
+                LoggerService.LogTrace("INT 21h AH=1Bh default drive invalid/unmounted (CurrentDriveIndex={DriveIndex})",
+                    _dosDriveManager.CurrentDriveIndex);
+            }
+            State.AL = 0xFF;
+            return;
+        }
+        SetAllocationInfoRegisters(driveIndex);
+    }
+
+    private bool TryGetAllocationInfoDrive(byte driveRequest, out byte driveIndex, out DosDriveBase? drive) {
+        drive = null;
+        if (driveRequest == 0) {
+            driveIndex = _dosDriveManager.CurrentDriveIndex;
+        } else {
+            driveIndex = (byte)(driveRequest - 1);
+        }
+
+        if (!_dosDriveManager.TryGetDriveAtIndex(driveIndex, out DosDriveBase? resolvedDrive) ||
+            resolvedDrive is EmptyDosDrive) {
+            return false;
+        }
+
+        drive = resolvedDrive;
+        return true;
+    }
+
+    private void SetAllocationInfoRegisters(byte driveIndex) {
+        State.CX = DefaultBytesPerSector;
+        State.AL = DefaultSectorsPerCluster;
+        State.AH = 0;
+        State.DX = DefaultTotalClusters;
+        State.DS = _dosDriveManager.MediaIdTableSegment;
+        State.BX = _dosDriveManager.MediaIdEntryOffset(driveIndex);
+
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace(
+                "INT 21h AH=1Bh/1Ch allocation info drive={DriveLetter}: AL(spc)={SectorsPerCluster:X2} CX(bps)={BytesPerSector:X4} DX(totalClusters)={TotalClusters:X4} DS:BX={Segment:X4}:{Offset:X4}",
+                (char)('A' + driveIndex), State.AL, State.CX, State.DX, State.DS, State.BX);
+        }
+    }
+
+    /// <summary>
+    /// Either gets (AL: 0) or sets (AL: not zero) the country code. <br/>
+    /// </summary>
+    /// <param name="calledFromVm">Whether this was called by the emulator.</param>
+    public void SetCountryCode(bool calledFromVm) {
+        switch (State.AL) {
+            case 0: //Get country specific information
+                uint dest = MemoryUtils.ToPhysicalAddress(State.DS, State.DX);
+                Memory.LoadData(dest, BitConverter.GetBytes((ushort)_countryInfo.Country));
+                State.AX = (ushort)(State.BX + 1);
+                SetCarryFlag(false, calledFromVm);
+                break;
+            default: //Set country code
+                if (LoggerService.IsEnabled(LogLevel.Warning)) {
+                    LoggerService.LogWarning("{MethodName}: subFunction is unsupported", nameof(SetCountryCode));
+                }
+                State.AX = 0;
+                SetCarryFlag(false, calledFromVm);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Allocates a memory block of the requested size in paragraphs in BX. <br/>
+    /// </summary>
+    /// <returns>
+    /// CF is cleared on success. <br/>
+    /// CF is set on error. Possible error code in AX: 0x08 (Insufficient memory).
+    /// </returns>
+    /// <param name="calledFromVm">Whether the method was called by the emulator.</param>
+    public void AllocateMemoryBlock(bool calledFromVm) {
+        ushort requestedSizeInParagraphs = State.BX;
+        LoggerService.LogTrace("ALLOCATE MEMORY BLOCK {RequestedSize}", requestedSizeInParagraphs);
+        SetCarryFlag(false, calledFromVm);
+        DosMemoryControlBlock? res = _dosMemoryManager.AllocateMemoryBlock(requestedSizeInParagraphs);
+        if (res == null) {
+            LogDosError(calledFromVm);
+            // did not find something good, error
+            SetCarryFlag(true, calledFromVm);
+            // INSUFFICIENT MEMORY
+            State.AX = (byte)DosErrorCode.InsufficientMemory;
+            State.BX = _dosMemoryManager.FindLargestFreeSizeForAllocation();
+            return;
+        }
+        State.AX = res.DataBlockSegment;
+    }
+
+    /// <summary>
+    /// Changes the current directory to the one pointed by DS:DX.
+    /// </summary>
+    /// <returns>
+    /// CF is cleared on success. <br/>
+    /// CF is set on error.
+    /// </returns>
+    /// <param name="calledFromVm">Whether the method was called by the emulator.</param>
+    public void ChangeCurrentDirectory(bool calledFromVm) {
+        string newDirectory = _dosStringDecoder.GetZeroTerminatedStringAtDsDx();
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("SET CURRENT DIRECTORY: {NewDirectory}", newDirectory);
+        }
+        DosFileOperationResult dosFileOperationResult = _dosFileManager.SetCurrentDir(newDirectory);
+        SetStateFromDosFileOperationResult(calledFromVm, dosFileOperationResult);
+    }
+
+    /// <summary>
+    /// Clears the keyboard buffer and calls the INT21H function number from AL.
+    /// </summary>
+    public void ClearKeyboardBufferAndInvokeKeyboardFunction() {
+        byte operation = State.AL;
+        if (LoggerService.IsEnabled(LogLevel.Debug)) {
+            LoggerService.LogDebug("CLEAR KEYBOARD AND CALL INT 21 {Operation}", operation);
+        }
+        _keyboardInt16Handler.FlushKeyboardBuffer();
+        // NANSI dosfn7: also clears all device-level stuffahead buffers.
+        GetStandardFile(DosStandardHandle.Stdin)?.Flush();
+        if (operation is not 0x0 and not 0x6 and not 0x7 and not 0x8 and not 0xA) {
+            return;
+        }
+        Run(operation);
+    }
+
+    /// <summary>
+    /// Closes a file handle. The handle is in BX.
+    /// </summary>
+    /// <returns>
+    /// CF is cleared on success. <br/>
+    /// CF is set on error.
+    /// </returns>
+    /// <param name="calledFromVm">Whether this was called by the emulator.</param>
+    public void CloseFileOrDevice(bool calledFromVm) {
+        ushort fileHandle = State.BX;
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("CLOSE FILE handle {FileHandle}", ConvertUtils.ToHex(fileHandle));
+        }
+        ushort pspSegment = _sda.CurrentProgramSegmentPrefix;
+        if (!_jobFileTable.TryResolve(pspSegment, fileHandle, out byte systemFileTableIndex)) {
+            SetStateFromDosFileOperationResult(calledFromVm, DosFileOperationResult.LogError(DosErrorCode.InvalidHandle));
+            return;
+        }
+        DosFileOperationResult dosFileOperationResult = _dosFileManager.ReleaseHandleReference(systemFileTableIndex);
+        _jobFileTable.SetEntry(pspSegment, fileHandle, DosJobFileTable.UnusedEntry);
+        SetStateFromDosFileOperationResult(calledFromVm, dosFileOperationResult);
+        if (!dosFileOperationResult.IsError) {
+            State.AL = dosFileOperationResult.RefCount;
+        }
+    }
+
+    /// <summary>
+    /// Creates a file using a handle. The file name is in DS:DX, the file attribute in CX.
+    /// </summary>
+    /// <returns>
+    /// CF is cleared on success. <br/>
+    /// CF is set on error.
+    /// </returns>
+    /// <param name="calledFromVm">Whether this was called by the emulator.</param>
+    public void CreateFileUsingHandle(bool calledFromVm) {
+        string fileName = _dosStringDecoder.GetZeroTerminatedStringAtDsDx();
+        ushort fileAttribute = State.CX;
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("CREATE FILE USING HANDLE: {FileName} with attribute {FileAttribute}",
+                fileName, fileAttribute);
+        }
+        DosFileOperationResult dosFileOperationResult = AssignJobFileTableHandle(
+            _dosFileManager.CreateFileUsingHandle(fileName, fileAttribute));
+        SetStateFromDosFileOperationResult(calledFromVm, dosFileOperationResult);
+    }
+
+    /// <summary>
+    /// INT 21h, AH=0Ah - Buffered Input.
+    /// <para>
+    /// Reads characters from STDIN into a buffer at DS:DX until CR is received (or buffer is full).
+    /// Echoes each character to STDOUT. Supports backspace editing.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// The in-RAM ASM stub waits for STDIN readiness with INT 28h idle calls,
+    /// then dispatches here via <c>callback(Run)</c>.
+    /// </remarks>
+    public void BufferedInput() {
+        if (CheckCtrlCOrCtrlBreakInKeyboardBuffer()) {
+            return;
+        }
+        uint address = MemoryUtils.ToPhysicalAddress(State.DS, State.DX);
+        DosInputBuffer dosInputBuffer = new DosInputBuffer(Memory, address);
+        int charCount = 0;
+        bool endedWithCr = false;
+        VirtualFileBase? stdin = GetStandardFile(DosStandardHandle.Stdin);
+        VirtualFileBase? stdout = GetStandardFile(DosStandardHandle.Stdout);
+        if (stdin == null || stdout == null) {
+            return;
+        }
+        dosInputBuffer.Characters = string.Empty;
+
+        while (State.IsRunning) {
+            byte[] inputBuffer = new byte[1];
+            int bytesRead = stdin.Read(inputBuffer, 0, 1);
+            if (bytesRead < 1) {
+                break;
+            }
+            byte c = inputBuffer[0];
+            if (c == (byte)AsciiControlCodes.LineFeed) {
+                continue;
+            }
+
+            if (c == (byte)AsciiControlCodes.Backspace) {
+                if (charCount > 0) {
+                    stdout.WriteByte(c);
+                    stdout.WriteByte((byte)' ');
+                    stdout.WriteByte((byte)AsciiControlCodes.Backspace);
+                    string chars = dosInputBuffer.Characters;
+                    if (chars.Length > 0) {
+                        dosInputBuffer.Characters = chars[..^1];
+                    }
+                    charCount--;
+                }
+                continue;
+            }
+            if (charCount >= dosInputBuffer.Length && c != (byte)AsciiControlCodes.CarriageReturn) {
+                stdout.WriteByte(7); // bell
+                continue;
+            }
+            stdout.WriteByte(c);
+            dosInputBuffer.Characters += (char)c;
+            charCount++;
+            if (c == (byte)AsciiControlCodes.CarriageReturn) {
+                endedWithCr = true;
+                break;
+            }
+        }
+        // FreeDOS read_line: kp->kb_count = count - 1 — kb_count never includes the trailing CR.
+        dosInputBuffer.ReadCount = (byte)(endedWithCr ? charCount - 1 : charCount);
+    }
+
+    /// <summary>
+    /// Performs an IO control operation. <br/>
+    /// </summary>
+    /// <remarks>
+    /// Does not check for Ctrl-C or Ctrl-Break <br/>
+    /// </remarks>
+    /// <returns>
+    /// On output, returns the character in AL, despite the docs saying that nothing is returned. <br/>
+    /// On input, AL is set to 0 when no input is available, despite this being not documented. <br/>
+    /// If there is no keycode pending in the keyboard controller buffer, ZF is cleared and AL is set to 0. <br/>
+    /// Otherwise, the Zero flag is cleared and the keycode is in AL.
+    /// </returns>
+    /// <param name="calledFromVm">Whether this was called by the emulator.</param>
+    public void DirectConsoleIo(bool calledFromVm) {
+        byte character = State.DL;
+        if (character == 0xFF) {
+            if (LoggerService.IsEnabled(LogLevel.Trace)) {
+                LoggerService.LogTrace("DOS INT21H DirectConsoleIo, INPUT REQUESTED");
+            }
+            VirtualFileBase? stdin = GetStandardFile(DosStandardHandle.Stdin);
+            if (stdin != null && _dosFileManager.IsInputAvailable(stdin)) {
+                byte[] bytes = new byte[1];
+                int readCount = stdin.Read(bytes, 0, 1);
+                if (readCount < 1) {
+                    SetZeroFlag(true, calledFromVm);
+                    State.AL = 0;
+                    return;
+                }
+                SetZeroFlag(false, calledFromVm);
+                State.AL = bytes[0];
+            } else {
+                SetZeroFlag(true, calledFromVm);
+                State.AL = 0;
+            }
+        } else {
+            // Output
+            if (LoggerService.IsEnabled(LogLevel.Trace)) {
+                LoggerService.LogTrace("DOS INT21H DirectConsoleIo, OUTPUT REQUESTED: {Character}, {Ascii}",
+                    character, ConvertUtils.ToChar(character));
+            }
+            VirtualFileBase? stdout = GetStandardFile(DosStandardHandle.Stdout);
+            if (stdout != null) {
+                ConsoleDevice? console = stdout as ConsoleDevice;
+                if (console != null) {
+                    console.DirectOutput = true;
+                }
+                stdout.WriteByte(character);
+                if (console != null) {
+                    console.DirectOutput = false;
+                }
+                State.AL = character;
+            } else if (LoggerService.IsEnabled(LogLevel.Warning)) {
+                LoggerService.LogWarning("DOS INT21H DirectConsoleIo: Cannot write to standard output device.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Disk Reset. Not implemented. Does nothing.
+    /// </summary>
+    public void DiskReset() {
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("DISK RESET (Nothing to do...)");
+        }
+    }
+
+    /// <summary>
+    /// Writes the character from the DL register to the standard output device. <br/>
+    /// </summary>
+    /// <returns>
+    /// AL = DL (the character being written), as per FreeDOS. <br/>
+    /// </returns>
+    /// <remarks>
+    /// FreeDOS equivalent: lr.AL = lr.DL; write_char_stdout(lr.AL); <br/>
+    /// Checks for Ctrl-C/Ctrl-Break in STDIN before writing, like FreeDOS check_handle_break.
+    /// </remarks>
+    public void DisplayOutput() {
+        if (CheckCtrlCOrCtrlBreakInKeyboardBuffer()) {
+            return;
+        }
+        byte characterByte = State.DL;
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            string character = _dosStringDecoder.ConvertSingleDosChar(characterByte);
+            LoggerService.LogTrace("PRINT CHR: {CharacterByte} ({Character})",
+                ConvertUtils.ToHex8(characterByte), character);
+        }
+        State.AL = characterByte;
+        WriteCharToStdout(characterByte);
+    }
+
+    /// <summary>
+    /// Writes one character to the standard output handle. <br/>
+    /// FreeDOS equivalent of write_char_stdout: routes through the stdout SFT entry.
+    /// </summary>
+    private void WriteCharToStdout(byte character) {
+        VirtualFileBase? stdout = GetStandardFile(DosStandardHandle.Stdout);
+        if (stdout != null && stdout.CanWrite) {
+            stdout.WriteByte(character);
+        }
+    }
+
+    /// <summary>
+    /// Duplicate a file handle. The handle is in BX.
+    /// </summary>
+    /// <returns>
+    /// CF is cleared on success. <br/>
+    /// CF is set on error.
+    /// </returns>
+    /// <param name="calledFromVm">Whether this was called by the emulator.</param>
+    public void DuplicateFileHandle(bool calledFromVm) {
+        ushort fileHandle = State.BX;
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("DUPLICATE FILE HANDLE. {FileHandle}", fileHandle);
+        }
+        ushort pspSegment = _sda.CurrentProgramSegmentPrefix;
+        if (!_jobFileTable.TryResolve(pspSegment, fileHandle, out byte systemFileTableIndex)) {
+            SetStateFromDosFileOperationResult(calledFromVm, DosFileOperationResult.LogError(DosErrorCode.InvalidHandle));
+            return;
+        }
+        if (!_jobFileTable.TryFindFreeHandle(pspSegment, out ushort newHandle)
+            || !_dosFileManager.AddHandleReference(systemFileTableIndex)) {
+            SetStateFromDosFileOperationResult(calledFromVm, DosFileOperationResult.LogError(DosErrorCode.TooManyOpenFiles));
+            return;
+        }
+        _jobFileTable.SetEntry(pspSegment, newHandle, systemFileTableIndex);
+        SetStateFromDosFileOperationResult(calledFromVm, DosFileOperationResult.Value16(newHandle));
+    }
+
+    /// <summary>
+    /// Force duplicates a file handle. The handle is in BX. The new handle is in CX.
+    /// </summary>
+    /// <remarks>
+    /// When the new handle is already open, it is closed first.
+    /// </remarks>
+    /// <returns>
+    /// CF is cleared on success. <br/>
+    /// CF is set on error.
+    /// </returns>
+    /// <param name="calledFromVm">Whether this was called by the emulator.</param>
+    public void ForceDuplicateFileHandle(bool calledFromVm) {
+        ushort fileHandle = State.BX;
+        ushort newHandle = State.CX;
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FORCE DUPLICATE FILE HANDLE. {FileHandle}, {NewHandle}",
+                fileHandle, newHandle);
+        }
+        ushort pspSegment = _sda.CurrentProgramSegmentPrefix;
+        if (newHandle == fileHandle || newHandle >= _jobFileTable.GetSize(pspSegment)
+            || !_jobFileTable.TryResolve(pspSegment, fileHandle, out byte systemFileTableIndex)) {
+            SetStateFromDosFileOperationResult(calledFromVm, DosFileOperationResult.LogError(DosErrorCode.InvalidHandle));
+            return;
+        }
+        if (_jobFileTable.TryResolve(pspSegment, newHandle, out byte replacedSystemFileTableIndex)) {
+            _dosFileManager.ReleaseHandleReference(replacedSystemFileTableIndex);
+            _jobFileTable.SetEntry(pspSegment, newHandle, DosJobFileTable.UnusedEntry);
+        }
+        if (!_dosFileManager.AddHandleReference(systemFileTableIndex)) {
+            SetStateFromDosFileOperationResult(calledFromVm, DosFileOperationResult.LogError(DosErrorCode.TooManyOpenFiles));
+            return;
+        }
+        _jobFileTable.SetEntry(pspSegment, newHandle, systemFileTableIndex);
+        SetStateFromDosFileOperationResult(calledFromVm, DosFileOperationResult.NoValue());
+        State.AX = newHandle;
+    }
+
+    private DosFileOperationResult AssignJobFileTableHandle(DosFileOperationResult systemFileTableResult) {
+        if (systemFileTableResult.IsError || systemFileTableResult.Value is null) {
+            return systemFileTableResult;
+        }
+        byte systemFileTableIndex = (byte)systemFileTableResult.Value.Value;
+        ushort pspSegment = _sda.CurrentProgramSegmentPrefix;
+        if (!_jobFileTable.TryFindFreeHandle(pspSegment, out ushort handle)) {
+            _dosFileManager.ReleaseHandleReference(systemFileTableIndex);
+            return DosFileOperationResult.LogError(DosErrorCode.TooManyOpenFiles);
+        }
+        _jobFileTable.SetEntry(pspSegment, handle, systemFileTableIndex);
+        return DosFileOperationResult.Value16(handle);
+    }
+
+    private bool TryResolveFileHandle(ushort fileHandle, out byte systemFileTableIndex) {
+        return _jobFileTable.TryResolve(_sda.CurrentProgramSegmentPrefix, fileHandle, out systemFileTableIndex);
+    }
+
+    private VirtualFileBase? GetStandardFile(DosStandardHandle standardHandle) {
+        if (_sda.CurrentProgramSegmentPrefix == 0) {
+            return _dosFileManager.OpenFiles[(ushort)standardHandle];
+        }
+        if (TryResolveFileHandle((ushort)standardHandle, out byte systemFileTableIndex)) {
+            return _dosFileManager.OpenFiles[systemFileTableIndex];
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Finds the first file matching the DOS file spec pointed by DS:DX and the attributes in CX. <br/>
+    /// </summary>
+    /// <returns>
+    /// CF and AX are cleared on success. <br/>
+    /// CF is set on error. <br/>
+    /// The matching file is returned in the Disk Transfer Area.
+    /// </returns>
+    /// <param name="calledFromVm">Whether this was called by the emulator.</param>
+    public void FindFirstMatchingFile(bool calledFromVm) {
+        ushort attributes = State.CX;
+        string fileSpec = _dosStringDecoder.GetZeroTerminatedStringAtDsDx();
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FIND FIRST MATCHING FILE {Attributes}, {FileSpec}",
+                ConvertUtils.ToHex16(attributes), fileSpec);
+        }
+        DosFileOperationResult dosFileOperationResult = _dosFileManager.FindFirstMatchingFile(fileSpec, attributes);
+        SetStateFromDosFileOperationResult(calledFromVm, dosFileOperationResult);
+        SetAxToZeroOnSuccess(dosFileOperationResult);
+    }
+
+    /// <summary>
+    /// Undocumented behavior expected by Qbix and Willy Beamish, when FindFirst or FindNext is called.
+    /// </summary>
+    /// <param name="dosFileOperationResult">The DOS File operation result to check for error status</param>
+    private void SetAxToZeroOnSuccess(DosFileOperationResult dosFileOperationResult) {
+        if (!dosFileOperationResult.IsError) {
+            State.AX = 0;
+        }
+    }
+
+    /// <summary>
+    /// Finds the next file matching the DOS file spec given to <see cref="FindFirstMatchingFile"/>. <br/>
+    /// </summary>
+    /// <returns>
+    /// CF and AX are cleared on success. <br/>
+    /// CF is set on error. <br/>
+    /// The matching file is returned in the Disk Transfer Area.
+    /// </returns>
+    /// <param name="calledFromVm">Whether this was called by the emulator.</param>
+    public void FindNextMatchingFile(bool calledFromVm) {
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FIND NEXT MATCHING FILE");
+        }
+        DosFileOperationResult dosFileOperationResult = _dosFileManager.FindNextMatchingFile();
+        SetStateFromDosFileOperationResult(calledFromVm, dosFileOperationResult);
+        SetAxToZeroOnSuccess(dosFileOperationResult);
+    }
+
+    /// <summary>
+    /// Free a memory block identified by the block segment in ES. <br/>
+    /// </summary>
+    /// <returns>
+    /// CF and AX are cleared on success. <br/>
+    /// CF is set on error. Possible error code in AX: 0x09 (Invalid memory block address). <br/>
+    /// </returns>
+    /// <param name="calledFromVm">Whether the method was called by the emulator.</param>
+    public void FreeMemoryBlock(bool calledFromVm) {
+        ushort blockSegment = State.ES;
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FREE ALLOCATED MEMORY {BlockSegment}",
+                ConvertUtils.ToHex16(blockSegment));
+        }
+        SetCarryFlag(false, calledFromVm);
+        if (!_dosMemoryManager.FreeMemoryBlock((ushort)(blockSegment - 1))) {
+            LogDosError(calledFromVm);
+            SetCarryFlag(true, calledFromVm);
+            // INVALID MEMORY BLOCK ADDRESS
+            State.AX = (ushort)DosErrorCode.MemoryBlockAddressInvalid;
+        }
+    }
+
+    /// <summary>
+    /// Sets the current Program Segment Prefix (PSP) segment. Function 50H. <br/>
+    /// </summary>
+    /// <remarks>
+    /// Input: BX = new PSP segment value. <br/>
+    /// Used by (for example) Day of the Tentacle.
+    /// </remarks>
+    /// <returns>
+    /// None.
+    /// </returns>
+    public void SetCurrentPsp() {
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("SET CURRENT PSP: {PspSegment}", ConvertUtils.ToHex16(State.BX));
+        }
+        _sda.CurrentProgramSegmentPrefix = State.BX;
+    }
+
+    /// <summary>
+    /// Gets the current default drive
+    /// </summary>
+    /// <returns>
+    /// AL = current default drive (0x0: A:, 0x1: B:, 0x2: C:, 0x3: D:, ...)
+    /// </returns>
+    public void GetCurrentDefaultDrive() {
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("GET CURRENT DEFAULT DRIVE");
+        }
+        State.AL = _dosDriveManager.CurrentDriveIndex;
+    }
+
+    /// <summary>
+    /// Gets the current data from the host's DateTime.Now.
+    /// </summary>
+    /// <returns>
+    /// AL = day of the week <br/>
+    /// CX = year <br/>
+    /// DH = month <br/>
+    /// DL = day <br/>
+    /// </returns>
+    public void GetDate() {
+        byte yearBcd = ReadCmosRegister(CmosRegisterAddresses.Year);
+        byte monthBcd = ReadCmosRegister(CmosRegisterAddresses.Month);
+        byte dayBcd = ReadCmosRegister(CmosRegisterAddresses.DayOfMonth);
+        byte dayOfWeekBcd = ReadCmosRegister(CmosRegisterAddresses.DayOfWeek);
+        byte centuryBcd = ReadCmosRegister(CmosRegisterAddresses.Century);
+
+        int year = BcdConverter.FromBcd(yearBcd);
+        int century = BcdConverter.FromBcd(centuryBcd);
+        int month = BcdConverter.FromBcd(monthBcd);
+        int day = BcdConverter.FromBcd(dayBcd);
+        int dayOfWeek = BcdConverter.FromBcd(dayOfWeekBcd);
+
+        int fullYear = century * 100 + year;
+
+        int dosDayOfWeek;
+        if (dayOfWeek == 0) {
+            dosDayOfWeek = 0;
+            if (LoggerService.IsEnabled(LogLevel.Warning)) {
+                LoggerService.LogWarning("CMOS DayOfWeek register returned 0 (invalid). Defaulting DOS day of week to Sunday (0).");
+            }
+        } else {
+            dosDayOfWeek = dayOfWeek - 1;
+        }
+
+        State.CX = (ushort)fullYear;
+        State.DH = (byte)month;
+        State.DL = (byte)day;
+        State.AL = (byte)dosDayOfWeek;
+
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("GET DOS DATE from CMOS: {Year}-{Month:D2}-{Day:D2} (day of week: {DayOfWeek})",
+                fullYear, month, day, dosDayOfWeek);
+        }
+    }
+
+    /// <summary>
+    /// Gets the address of the DTA.
+    /// </summary>
+    public void GetDiskTransferAddress() {
+        State.ES = _dosFileManager.DiskTransferAreaAddressSegment;
+        State.BX = _dosFileManager.DiskTransferAreaAddressOffset;
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("GET DTA (DISK TRANSFER ADDRESS) DS:DX {DsDx}",
+                ConvertUtils.ToSegmentedAddressRepresentation(State.ES, State.BX));
+        }
+    }
+
+    /// <summary>
+    /// Returns the major, minor, and OEM version of MS-DOS.
+    /// </summary>
+    public void GetDosVersion() {
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("GET DOS VERSION");
+        }
+        // 5.0
+        State.AL = 0x05;
+        State.AH = 0x00;
+        // FF => MS DOS
+        State.BH = 0xFF;
+        // DOS OEM KEY 0x00000
+        State.BL = 0x00;
+        State.CX = 0x00;
+    }
+
+    /// <summary>
+    /// INT 21h, AH=31h - Terminate and Stay Resident.
+    /// Keeps the program in memory and returns control to the parent process.
+    /// </summary>
+    /// <remarks>
+    /// Input: AL = return code, DX = number of paragraphs to keep resident
+    /// </remarks>
+    private void TerminateAndStayResident() {
+        ushort paragraphsToKeep = State.DX;
+        byte returnCode = State.AL;
+
+        ushort currentPspSegment = _sda.CurrentProgramSegmentPrefix;
+
+        if (LoggerService.IsEnabled(LogLevel.Information)) {
+            LoggerService.LogInformation(
+                "TSR: Terminating with return code {ReturnCode}, keeping {Paragraphs} paragraphs at PSP {PspSegment:X4}",
+                returnCode, paragraphsToKeep, currentPspSegment);
+        }
+
+        DosErrorCode errorCode = _dosMemoryManager.TryModifyBlock(
+            currentPspSegment,
+            paragraphsToKeep,
+            out DosMemoryControlBlock resizedBlock);
+
+        if (errorCode == DosErrorCode.NoError) {
+            _dosProcessManager.TrackResidentBlock(resizedBlock);
+        }
+
+        // Even if resize fails, we still terminate as a TSR
+        if (errorCode != DosErrorCode.NoError && LoggerService.IsEnabled(LogLevel.Warning)) {
+            LoggerService.LogWarning(
+                "TSR: Failed to resize memory block to {Paragraphs} paragraphs, error: {Error}",
+                paragraphsToKeep, errorCode);
+        }
+
+        _dosProcessManager.TerminateProcess(returnCode, DosTerminationType.TSR);
+    }
+
+    /// <summary>
+    /// Returns the amount of free disk space, in clusters, sectors per byte, and number of available clusters.
+    /// <remarks>
+    /// Always returns 127 sectors per cluster, 512 bytes per sector, 4031 clusters available (~250MB), and 16383 total clusters (~1000MB)
+    /// </remarks>
+    /// </summary>
+    public void GetFreeDiskSpace() {
+        byte driveNumber = State.DL;
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("GET FREE DISK SPACE FOR DRIVE {DriveNumber}",
+                driveNumber);
+        }
+        // 127 sectors per cluster
+        State.AX = 0x7F;
+        // 512 bytes per sector
+        State.CX = 0x200;
+        // 4031 clusters available (~250MB)
+        State.BX = 0xFBF;
+        // 16383 total clusters on disk (~1000MB)
+        State.DX = 0x3FFF;
+    }
+
+    /// <inheritdoc/>
+    public override byte VectorNumber => 0x21;
+
+    /// <summary>
+    /// Function 35H returns the address stored in the interrupt vector table for the handler associated with the specified interrupt. <br/>
+    /// To call:
+    /// <ul>
+    ///   <li>AH = 35H</li>
+    ///   <li>AL = interrupt number</li>
+    /// </ul>
+    /// <returns>ES:BX = segment:offset of handler for interrupt specified in AL</returns>
+    /// <remarks>Interrupt vectors should always be read with function 35H and set with function 25H (SetInterruptVector). <br/>
+    /// Programs should never attempt to read or change interrupt vectors directly in memory.</remarks>
+    /// </summary>
+    public void GetInterruptVector() {
+        byte vectorNumber = State.AL;
+        (ushort segment, ushort offset) = _interruptVectorTable[vectorNumber];
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("GET INTERRUPT VECTOR INT {VectorInt}, got {SegmentedAddress}",
+                ConvertUtils.ToHex8(vectorNumber),
+                ConvertUtils.ToSegmentedAddressRepresentation(segment, offset));
+        }
+        State.ES = segment;
+        State.BX = offset;
+    }
+
+    /// <summary>
+    /// Gets the address of the current Program Segment Prefix.
+    /// </summary>
+    /// <returns>
+    /// The segment of the current PSP in BX.
+    /// </returns>
+    public void GetPspAddress() {
+        ushort pspSegment = _sda.CurrentProgramSegmentPrefix;
+        State.BX = pspSegment;
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("GET PSP ADDRESS {PspSegment}",
+                ConvertUtils.ToHex16(pspSegment));
+        }
+    }
+
+    /// <summary>
+    /// INT 21h, AH=52h - Get List of Lists (SYSVARS).
+    /// <para>
+    /// Returns a pointer to the DOS internal tables (also known as the "List of Lists" or SYSVARS).
+    /// </para>
+    /// <remarks>
+    /// Like MS-DOS, this actually returns a pointer to the first drive DOS Parameter Block, which is the "official" start of the structure. <br/>
+    /// This is used by (for example) the game 'Day of the Tentacle' and 'Indiana Jones and the Fate of Atlantis'.
+    /// </remarks>
+    /// </summary>
+    private void GetListOfLists() {
+        // Return pointer to the List of Lists (SYSVARS)
+        // ES:BX points to offset 0 of the SYSVARS structure
+        State.ES = DosSysVars.Segment;
+        State.BX = DosSysVars.OfficialOffset;
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace(
+                "GET LIST OF LISTS ES:BX={Es}:{Bx}",
+                ConvertUtils.ToHex16(State.ES),
+                ConvertUtils.ToHex16(State.BX));
+        }
+    }
+
+    /// <summary>
+    /// Peeks the keyboard buffer for a pending Ctrl-C (ASCII 0x03) or Ctrl-Break (AX=0).
+    /// If found, flushes the buffer and terminates the current process via
+    /// <see cref="DosTerminationType.CtrlC"/>.
+    /// </summary>
+    /// <returns><c>true</c> if Ctrl-C/Ctrl-Break was detected and the process was terminated; otherwise <c>false</c>.</returns>
+    private bool CheckCtrlCOrCtrlBreakInKeyboardBuffer() {
+        if (_keyboardInt16Handler.TryGetPendingKeyCode(out ushort? keyCode) &&
+            ((keyCode.Value & 0xFF) == 0x03 || keyCode.Value == 0x0000)) {
+            _keyboardInt16Handler.FlushKeyboardBuffer();
+            _dosProcessManager.TerminateProcess(0xFF, DosTerminationType.CtrlC);
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Gets or sets the Ctrl-C flag and other DOS variables (INT 21h AH=33h, "DosVars").
+    /// </summary>
+    public void GetSetControlBreak() {
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("GET/SET CTRL-C FLAG / DOSVARS");
+        }
+        byte subfunction = State.AL;
+        switch (subfunction) {
+            case 0x00: // Get Ctrl-C flag
+                State.DL = _isCtrlCFlag ? (byte)1 : (byte)0;
+                break;
+            case 0x01: // Set Ctrl-C flag
+                _isCtrlCFlag = (State.DL & 1) == 1;
+                State.DL = _isCtrlCFlag ? (byte)1 : (byte)0;
+                break;
+            case 0x02: // Get/Set extended control break
+                byte tmp = _isCtrlCFlag ? (byte)1 : (byte)0;
+                _isCtrlCFlag = (State.DL & 1) == 1;
+                State.DL = tmp;
+                break;
+            case 0x05: // Get Boot Drive
+                State.DL = _dosSysVars.BootDrive;
+                break;
+            case 0x06: // Get (real) DOS version
+                State.BL = 0x05; // Major version (example: 5)
+                State.BH = 0x00; // Minor version (example: 0)
+                State.DL = 0x00; // Revision (lower 3 bits), rest 0
+                State.DH = 0x00; // Version flags (bit3: ROM, bit4: HMA)
+                break;
+            default:
+                State.AL = 0xFF; // Error, do NOT set carry
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Gets the address of the InDOS flag.
+    /// </summary>
+    private void GetInDosFlagAddress() {
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("GET InDOS FLAG ADDRESS");
+        }
+        State.ES = DosSwappableDataArea.BaseSegment;
+        State.BX = DosSwappableDataArea.InDosFlagOffset;
+    }
+
+    /// <summary>
+    /// Returns the current MS-DOS time in CH (hour), CL (minute), DH (second), and DL (hundredths of a second).
+    /// CH, CL and DH come from the CMOS RTC; DL comes from the host clock because the RTC only has one second resolution.
+    /// </summary>
+    public void GetTime() {
+        byte hourBcd = ReadCmosRegister(CmosRegisterAddresses.Hours);
+        byte minuteBcd = ReadCmosRegister(CmosRegisterAddresses.Minutes);
+        byte secondBcd = ReadCmosRegister(CmosRegisterAddresses.Seconds);
+
+        byte hour = BcdConverter.FromBcd(hourBcd);
+        byte minute = BcdConverter.FromBcd(minuteBcd);
+        byte second = BcdConverter.FromBcd(secondBcd);
+
+        // The CMOS RTC only has a one second resolution, so the sub-second part is
+        // taken from the host clock. Games measure short elapsed times with this field.
+        byte hundredths = (byte)(DateTime.Now.Millisecond / 10);
+
+        State.CH = hour;
+        State.CL = minute;
+        State.DH = second;
+        State.DL = hundredths;
+
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("GET DOS TIME from CMOS: {Hour:D2}:{Minute:D2}:{Second:D2}.{Hundredths:D2}",
+                hour, minute, second, hundredths);
+        }
+    }
+
+    /// <summary>
+    /// Modifies a memory block identified by the block segment in ES, <br/>
+    /// and sets the new requested size in paragraphs to the value in BX. <br/>
+    /// </summary>
+    /// <returns>
+    /// CF is cleared on success. <br/>
+    /// On success, AX is set to the segment (ES value).
+    /// CF is set on error. The error is in AX. <br/>
+    /// Possible error code in AX: 0x08 (Insufficient memory) or 0x09 (MCB block destroyed). <br/>
+    /// BX is set to largest free block size in paragraphs on error. <br/>
+    /// </returns>
+    /// <param name="calledFromVm">Whether the code was called by the emulator.</param>
+    public void ModifyMemoryBlock(bool calledFromVm) {
+        ushort requestedSizeInParagraphs = State.BX;
+        ushort blockSegment = State.ES;
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("MODIFY MEMORY BLOCK {Size} at {BlockSegment}",
+                requestedSizeInParagraphs, ConvertUtils.ToHex16(blockSegment));
+        }
+        DosErrorCode errorCode = _dosMemoryManager.TryModifyBlock(blockSegment,
+            requestedSizeInParagraphs, out DosMemoryControlBlock mcb);
+        if (errorCode == DosErrorCode.NoError) {
+            // Undocumented MS-DOS behaviour expected by BRUN45!
+            State.AX = blockSegment;
+            SetCarryFlag(false, calledFromVm);
+        } else {
+            LogDosError(calledFromVm);
+            SetCarryFlag(true, calledFromVm);
+            State.AX = (byte)errorCode;
+            State.BX = mcb.Size;
+        }
+    }
+
+    /// <summary>
+    /// INT 21h, AH=4Bh - EXEC: Load and/or Execute Program.
+    /// <para>
+    /// <b>Call with:</b><br/>
+    /// AH = 4Bh<br/>
+    /// AL = 00h (Load and Execute), 01h (Load Only), 03h (Load Overlay)<br/>
+    /// DS:DX = ASCIIZ program path<br/>
+    /// ES:BX = parameter block
+    /// </para>
+    /// <para>
+    /// <b>Parameter Block (AL=00h/01h):</b><br/>
+    /// +00h WORD environment segment (0=inherit)<br/>
+    /// +02h DWORD command tail pointer<br/>
+    /// +06h DWORD FCB1 pointer<br/>
+    /// +0Ah DWORD FCB2 pointer<br/>
+    /// AL=01h returns: +0Eh SS, +10h SP, +12h CS, +14h IP
+    /// </para>
+    /// <para>
+    /// <b>Parameter Block (AL=03h):</b><br/>
+    /// +00h WORD load segment<br/>
+    /// +02h WORD relocation factor
+    /// </para>
+    /// <para>
+    /// <b>Returns:</b><br/>
+    /// CF=0: success (AL=00h: child terminated; AL=01h: param block filled; AL=03h: AX=DX=0)<br/>
+    /// CF=1: error (AX=02h file not found, 05h access denied, 08h insufficient memory, 0Bh invalid format)
+    /// </para>
+    /// <para>
+    /// <b>Behavior:</b><br/>
+    /// AL=00h: Creates child PSP, loads EXE/COM, executes, returns when child terminates via INT 21h/4Ch<br/>
+    /// AL=01h: Creates child PSP, loads program, fills param block with CS:IP/SS:SP, returns immediately without execution<br/>
+    /// AL=03h: Loads EXE overlay at specified segment with relocation, no PSP creation or execution<br/>
+    /// Child PSP inherits file handles (except DoNotInherit/Private), environment, parent's termination address from caller's CS:IP on stack<br/>
+    /// EXE: loads at PSP+10h, applies relocations, sets CS:IP/SS:SP from header<br/>
+    /// COM: loads at PSP:0100h, sets CS=DS=ES=SS=PSP, IP=0100h, SP=FFFEh<br/>
+    /// FCB pointers 0000:0000 and FFFF:FFFF treated as null<br/>
+    /// AX/BX return FCB validity code (00FFh=FCB1 invalid, FF00h=FCB2 invalid, 0000h=both valid)<br/>
+    /// Parent SS:SP saved; on child termination, restores parent context via modified interrupt frame and IRET to INT 22h vector
+    /// </para>
+    /// </summary>
+    /// <param name="calledFromVm">Whether the code was called by the emulator.</param>
+    public void LoadAndOrExecute(bool calledFromVm) {
+        string programName = _dosStringDecoder.GetZeroTerminatedStringAtDsDx();
+        DosExecLoadType loadType = (DosExecLoadType)State.AL;
+        uint paramBlockAddress = MemoryUtils.ToPhysicalAddress(State.ES, State.BX);
+
+        if (LoggerService.IsEnabled(LogLevel.Information)) {
+            LoggerService.LogInformation("INT21H/4B: DS:DX={Ds:X4}:{Dx:X4}, programName=\"{ProgramName}\", loadType={LoadType}",
+                State.DS, State.DX, programName, loadType);
+        }
+
+        DosExecResult result;
+
+        if (loadType == DosExecLoadType.LoadOverlay) {
+            DosExecOverlayParameterBlock overlayParamBlock = new(Memory, paramBlockAddress);
+            result = _dosProcessManager.LoadOverlay(programName, overlayParamBlock.LoadSegment, overlayParamBlock.RelocationFactor);
+        } else {
+            DosExecParameterBlock paramBlock = new(Memory, paramBlockAddress);
+            uint cmdTailAddress = MemoryUtils.ToPhysicalAddress(paramBlock.CommandTailSegment, paramBlock.CommandTailOffset);
+            DosCommandTail cmdTail = new(Memory, cmdTailAddress);
+            string commandTail = cmdTail.Length > 0 ? cmdTail.Command.TrimEnd('\r') : string.Empty;
+            result = _dosProcessManager.LoadOrLoadAndExecute(programName, paramBlock, commandTail, loadType, paramBlock.EnvironmentSegment);
+        }
+        HandleDosExecResult(calledFromVm, result);
+    }
+
+    private void HandleDosExecResult(bool calledFromVm, DosExecResult result) {
+        if (result.Success) {
+            SetCarryFlag(false, calledFromVm);
+            // Set AX and DX if the result specifies values (e.g., LoadOverlay returns AX=0, DX=0)
+            if (result.AX.HasValue) {
+                State.AX = result.AX.Value;
+            }
+            if (result.DX.HasValue) {
+                State.DX = result.DX.Value;
+            }
+        } else {
+            SetCarryFlag(true, calledFromVm);
+            State.AX = (ushort)result.ErrorCode;
+            LogDosError(calledFromVm);
+        }
+    }
+
+    public DosExecResult LoadOverlay(string programName, DosExecOverlayParameterBlock overlayParamBlock) {
+        DosExecResult result = _dosProcessManager.LoadOverlay(programName, overlayParamBlock.LoadSegment, overlayParamBlock.RelocationFactor);
+        HandleDosExecResult(calledFromVm: true, result);
+        return result;
+    }
+
+    public DosExecResult LoadOnly(string programName, DosExecParameterBlock paramBlock, string? commandTail = "") {
+        DosExecResult result = _dosProcessManager.LoadOrLoadAndExecute(programName, paramBlock, commandTail ?? "", DosExecLoadType.LoadOnly, paramBlock.EnvironmentSegment);
+        HandleDosExecResult(calledFromVm: true, result);
+        return result;
+    }
+
+    public DosExecResult LoadAndExecute(string programName, DosExecParameterBlock paramBlock, string? commandTail = "") {
+        DosExecResult result = _dosProcessManager.LoadOrLoadAndExecute(programName, paramBlock, commandTail ?? "", DosExecLoadType.LoadAndExecute, paramBlock.EnvironmentSegment);
+        HandleDosExecResult(calledFromVm: true, result);
+        return result;
+    }
+
+    /// <summary>
+    /// Moves a file using a DOS handle. AL specifies the origin of the move, BX the file handle, CX:DX the offset.
+    /// </summary>
+    /// <returns>
+    /// CF is cleared on success. <br/>
+    /// CF is set on error.
+    /// </returns>
+    /// <param name="calledFromVm">Whether the code was called by the emulator.</param>
+    public void MoveFilePointerUsingHandle(bool calledFromVm) {
+        SeekOrigin originOfMove = (SeekOrigin)State.AL;
+        ushort fileHandle = State.BX;
+        int offset = (State.CX << 16) | State.DX;
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("MOVE FILE POINTER USING HANDLE. {OriginOfMove}, {FileHandle}, {Offset}",
+                originOfMove, fileHandle, offset);
+        }
+
+        if (!TryResolveFileHandle(fileHandle, out byte systemFileTableIndex)) {
+            SetStateFromDosFileOperationResult(calledFromVm, DosFileOperationResult.LogError(DosErrorCode.InvalidHandle));
+            return;
+        }
+        DosFileOperationResult dosFileOperationResult =
+            _dosFileManager.MoveFilePointerUsingHandle(originOfMove, systemFileTableIndex, offset);
+        SetStateFromDosFileOperationResult(calledFromVm, dosFileOperationResult);
+    }
+
+    /// <summary>
+    /// Opens the file pointed by DS:DX with the access mode in AL.
+    /// </summary>
+    /// <returns>
+    /// CF is cleared on success. <br/>
+    /// CF is set on error.
+    /// </returns>
+    /// <param name="calledFromVm">Whether the code was called by the emulator.</param>
+    public void OpenFileOrDevice(bool calledFromVm) {
+        string fileName = _dosStringDecoder.GetZeroTerminatedStringAtDsDx();
+        byte accessMode = State.AL;
+        FileAccessMode fileAccessMode = (FileAccessMode)(accessMode & 0b111);
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("OPEN FILE {FileName} with mode {AccessMode} : {FileAccessModeByte}",
+                fileName, fileAccessMode,
+                ConvertUtils.ToHex8(State.AL));
+        }
+        DosFileOperationResult dosFileOperationResult = AssignJobFileTableHandle(
+            _dosFileManager.OpenFileOrDevice(fileName, fileAccessMode));
+        SetStateFromDosFileOperationResult(calledFromVm, dosFileOperationResult);
+    }
+
+    /// <summary>
+    /// Prints a dollar terminated string pointed by DS:DX to the standard output.
+    /// </summary>
+    public void PrintString() {
+        if (CheckCtrlCOrCtrlBreakInKeyboardBuffer()) {
+            return;
+        }
+        ushort segment = State.DS;
+        ushort offset = State.DX;
+        string str = _dosStringDecoder.GetDosString(segment, offset, '$');
+
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("PRINT STRING: {String}", str);
+        }
+        VirtualFileBase? stdout = GetStandardFile(DosStandardHandle.Stdout);
+        if (stdout != null) {
+            byte[] bytes = Encoding.ASCII.GetBytes(str);
+            stdout.Write(bytes, 0, bytes.Length);
+        } else if (LoggerService.IsEnabled(LogLevel.Warning)) {
+            LoggerService.LogWarning("DOS INT21H PrintString: Cannot write to standard output device.");
+        }
+    }
+
+    /// <summary>
+    /// Legacy CP/M program termination handler (INT 21h, AH=00h).
+    /// Behaves like INT 21h, AH=4Ch with AL=0.
+    /// </summary>
+    public void LegacyTerminateProgram() {
+        State.AL = 0;
+        State.AH = 0x4C;
+        QuitWithExitCode();
+    }
+
+    /// <summary>
+    /// INT 21h, AH=4Ch - Terminate Program.
+    /// Terminates the current process and returns control to the parent via INT 22h.
+    /// If Ctrl-C was detected, termination type is set to CtrlC (1) instead of Normal (0).
+    /// </summary>
+    /// <remarks>
+    /// INT 20h is an alias for this function with AL=0.
+    /// </remarks>
+    public void QuitWithExitCode() {
+        byte exitCode = State.AL;
+        // Determine termination type based on break flag
+        DosTerminationType terminationType = DosTerminationType.Normal;
+        if (_isCtrlCFlag) {
+            terminationType = DosTerminationType.CtrlC;
+            _isCtrlCFlag = false;
+
+            if (LoggerService.IsEnabled(LogLevel.Information)) {
+                LoggerService.LogInformation(
+                    "INT21H AH=4Ch: TERMINATE with exit code {ExitCode:X2} (Ctrl-C break detected)",
+                    exitCode);
+            }
+        } else if (LoggerService.IsEnabled(LogLevel.Information)) {
+            LoggerService.LogInformation("INT21H AH=4Ch: TERMINATE with exit code {ExitCode:X2}", exitCode);
+        }
+
+        _dosProcessManager.TerminateProcess(exitCode, terminationType);
+    }
+
+    /// <summary>
+    /// INT 21h, AH=4Dh - Get Return Code of Subprogram.
+    /// </summary>
+    public void GetReturnCode() {
+        ushort returnCode = _dosProcessManager.LastChildReturnCode;
+        State.AX = returnCode;
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("GET RETURN CODE: AX={Ax:X4}", returnCode);
+        }
+        // Clear the stored return code after reading it (RBIL)
+        _dosProcessManager.LastChildReturnCode = 0;
+    }
+
+    /// <summary>
+    /// INT 21h, AH=26h - Create New PSP.
+    /// Creates a copy of the current PSP at the segment specified in DX.
+    /// </summary>
+    public void CreateNewPsp() {
+        ushort newPspSegment = State.DX;
+
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("CREATE NEW PSP at segment {Segment:X4}", newPspSegment);
+        }
+
+        _dosProcessManager.CreateNewPsp(newPspSegment);
+        State.AL = ExpectedValueOfALInCreateChildPsp;
+    }
+
+    /// <summary>
+    /// INT 21h, AH=55h - Create Child PSP.
+    /// Creates a child PSP at DX with size SI paragraphs, makes it the current PSP, and returns AL=0xF0.
+    /// </summary>
+    public void CreateChildPsp() {
+        ushort childSegment = State.DX;
+        ushort sizeInParagraphs = State.SI;
+
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("CREATE CHILD PSP at segment {Segment:X4}, size {Size} paragraphs",
+                childSegment, sizeInParagraphs);
+        }
+
+        _dosProcessManager.CreateChildPsp(childSegment, sizeInParagraphs);
+        _sda.CurrentProgramSegmentPrefix = childSegment;
+        State.AL = ExpectedValueOfALInCreateChildPsp;
+    }
+
+    /// <summary>
+    /// Subfunction ID in AL for <see cref="AllocationStrategyOrUpperMemoryLinkState"/>
+    /// </summary>
+    public enum AllocationStrategySubFunction : byte {
+        /// <summary>
+        /// Gets the current strategy in AX
+        /// </summary>
+        QueryMemoryAllocationStrategy = 0x0,
+        /// <summary>
+        /// Sets the current strategy from BX
+        /// </summary>
+        SetMemoryAllocationStrategy = 0x1,
+        /// <summary>
+        /// Gets whether the upper memory block is currently linked in AL (1) or not (0).
+        /// </summary>
+        QueryUpperMemoryBlockState = 0x2,
+        /// <summary>
+        /// Set the state of the upper memory block link.
+        /// </summary>
+        SetUpperMemoryBlockState = 0x3,
+    }
+
+    /// <summary>
+    /// INT 21h, AH=58h
+    /// AX=5800H Query Memory Allocation Strategy
+    /// AX=5801H Set Memory Allocation Strategy
+    /// AX=5802H Query Upper-Memory Link State
+    /// AX=5803H Set Upper-Memory Link State
+    /// </summary>
+    public void AllocationStrategyOrUpperMemoryLinkState(bool calledFromVm) {
+        byte op = State.AL;
+        if (op == (byte)AllocationStrategySubFunction.QueryMemoryAllocationStrategy) {
+            State.AX = _dosMemoryManager.AllocationStrategyValue;
+            SetCarryFlag(false, calledFromVm);
+        } else if (op == (byte)AllocationStrategySubFunction.SetMemoryAllocationStrategy) {
+            if (_dosMemoryManager.TrySetAllocationStrategy(State.BX)) {
+                State.AX = 0;
+                SetCarryFlag(false, calledFromVm);
+            } else {
+                State.AX = 1;
+                SetCarryFlag(true, calledFromVm);
+            }
+        } else if (op == (byte)AllocationStrategySubFunction.QueryUpperMemoryBlockState) {
+            // AL bit 0 is set when the UMB chain is linked to the conventional MCB chain.
+            State.AL = _dosMemoryManager.UmbChainState;
+            SetCarryFlag(false, calledFromVm);
+        } else if (op == (byte)AllocationStrategySubFunction.SetUpperMemoryBlockState) {
+            if (_dosMemoryManager.SetUmbChainLinkState(State.BX)) {
+                SetCarryFlag(false, calledFromVm);
+            } else {
+                State.AX = 0x01; // 0001h (invalid function)
+                SetCarryFlag(true, calledFromVm);
+            }
+        } else {
+            throw GenerateUnhandledOperationException(op);
+        }
+    }
+    /// <summary>
+    /// Reads a file from disk from the file handle in BX, the read length in CX, and the buffer at DS:DX.
+    /// </summary>
+    /// <returns>
+    /// CF is cleared on success. <br/>
+    /// CF is set on error.
+    /// </returns>
+    /// <param name="calledFromVm">Whether the method was called by the emulator.</param>
+    public void ReadFileOrDevice(bool calledFromVm) {
+        ushort fileHandle = State.BX;
+        ushort readLength = State.CX;
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("READ FROM FILE handle {FileHandle} length {ReadLength} to {DsDx}",
+                fileHandle, readLength,
+                ConvertUtils.ToSegmentedAddressRepresentation(State.DS, State.DX));
+        }
+        uint targetMemory = MemoryUtils.ToPhysicalAddress(State.DS, State.DX);
+        if (!TryResolveFileHandle(fileHandle, out byte systemFileTableIndex)) {
+            SetStateFromDosFileOperationResult(calledFromVm, DosFileOperationResult.LogError(DosErrorCode.InvalidHandle));
+            return;
+        }
+        DosFileOperationResult dosFileOperationResult = _dosFileManager.ReadFileOrDevice(
+            systemFileTableIndex, readLength, targetMemory);
+        SetStateFromDosFileOperationResult(calledFromVm, dosFileOperationResult);
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Like MS-DOS, the caller SS:SP is saved into the current PSP (offset 2Eh) on entry, except for the
+    /// PSP get/set functions. Process termination restores the parent's stack from this field.
+    /// </remarks>
+    public override void Run() {
+        byte operation = State.AH;
+        SaveCallerStackInCurrentPsp(operation);
+        Run(operation);
+    }
+
+    private void SaveCallerStackInCurrentPsp(byte operation) {
+        if (operation is SetCurrentPspFunction or GetCurrentPspFunction or GetPspAddressFunction) {
+            return;
+        }
+        ushort currentPspSegment = _sda.CurrentProgramSegmentPrefix;
+        if (currentPspSegment == 0) {
+            return;
+        }
+        DosProgramSegmentPrefix currentPsp = new(Memory, MemoryUtils.ToPhysicalAddress(currentPspSegment, 0));
+        currentPsp.StackPointer = new SegmentedAddress(State.SS, State.SP);
+    }
+
+    /// <summary>
+    /// Sets the default drive from the value in the DL register.
+    /// </summary>
+    /// <returns>
+    /// The number of potentially valid drive letters in AL.
+    /// </returns>
+    public void SelectDefaultDrive() {
+        byte driveIndex = State.DL;
+        if (driveIndex < DosDriveManager.MaxDriveCount) {
+            if (_dosDriveManager.TryGetDriveAtIndex(driveIndex, out FolderDrive? mountedDrive)) {
+                _dosDriveManager.CurrentDrive = mountedDrive;
+            }
+        } else if (LoggerService.IsEnabled(LogLevel.Error)) {
+            LoggerService.LogError("DOS INT21H: Could not set default drive! Unrecognized index in State.DL: {DriveIndex}", driveIndex);
+        }
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("SELECT DEFAULT DRIVE {@DefaultDrive}", _dosDriveManager.CurrentDrive);
+        }
+        State.AL = DosDriveManager.MaxDriveCount;
+    }
+
+    /// <summary>
+    /// Sets the address of the DTA from DS:DX.
+    /// </summary>
+    public void SetDiskTransferAddress() {
+        ushort segment = State.DS;
+        ushort offset = State.DX;
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("SET DTA (DISK TRANSFER ADDRESS) DS:DX {DsDxSegmentOffset}",
+                ConvertUtils.ToSegmentedAddressRepresentation(
+                    segment, offset));
+        }
+        _dosFileManager.SetDiskTransferAreaAddress(segment, offset);
+    }
+
+    /// <summary>
+    /// Sets a new interrupt vector from an existing one in the Interrupt Vector Table. <br/>
+    /// Be sure to call <see cref="GetInterruptVector"/> first to get the current vector address. <br/>
+    /// Params: <br/>
+    /// - AL: Vector Number <br/>
+    /// - DS:DX: New interrupt vector address
+    /// </summary>
+    public void SetInterruptVector() {
+        byte vectorNumber = State.AL;
+        ushort segment = State.DS;
+        ushort offset = State.DX;
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("SET INTERRUPT VECTOR FOR INT {VectorNumber} at address {SegmentOffset}",
+                ConvertUtils.ToHex(vectorNumber),
+                ConvertUtils.ToSegmentedAddressRepresentation(
+                    segment, offset));
+        }
+
+        SetInterruptVector(vectorNumber, segment, offset);
+    }
+
+    /// <summary>
+    /// Sets a new interrupt vector from an existing one in the Interrupt Vector Table.
+    /// </summary>
+    /// <param name="vectorNumber">The vector number the new vector will answer to.</param>
+    /// <param name="segment">The address of the new interrupt vector, segment part.</param>
+    /// <param name="offset">The address of the new interrupt vector, offset part.</param>
+    public void SetInterruptVector(byte vectorNumber, ushort segment, ushort offset) {
+        _interruptVectorTable[vectorNumber] = new(segment, offset);
+    }
+
+    /// <summary>
+    /// Writes a file to disk from the file handle in BX, the file length in CX, and the buffer at DS:DX.
+    /// </summary>
+    /// <returns>
+    /// CF is cleared on success. <br/>
+    /// CF is set on error.
+    /// </returns>
+    /// <param name="calledFromVm">Whether the called was called by the emulator.</param>
+    public void WriteToFileOrDevice(bool calledFromVm) {
+        ushort fileHandle = State.BX;
+        ushort writeLength = State.CX;
+        uint bufferAddress = MemoryUtils.ToPhysicalAddress(State.DS, State.DX);
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("WRITE TO FILE handle {FileHandle} length {WriteLength} from {DsDx}",
+                ConvertUtils.ToHex(fileHandle),
+                ConvertUtils.ToHex(writeLength),
+                ConvertUtils.ToSegmentedAddressRepresentation(State.DS, State.DX));
+        }
+        if (!TryResolveFileHandle(fileHandle, out byte systemFileTableIndex)) {
+            SetStateFromDosFileOperationResult(calledFromVm, DosFileOperationResult.LogError(DosErrorCode.InvalidHandle));
+            return;
+        }
+        DosFileOperationResult dosFileOperationResult =
+            _dosFileManager.WriteToFileOrDevice(systemFileTableIndex, writeLength, bufferAddress);
+        SetStateFromDosFileOperationResult(calledFromVm, dosFileOperationResult);
+    }
+
+    /// <summary>
+    /// Gets an ASCIIZ pathname containing the current DOS directory in the address at DS:DI. <br/>
+    /// Params: <br/>
+    /// DL = drive number (0x0: A:, 0x1: B:, 0x2: C:, 0x3: D:, ...)
+    /// </summary>
+    /// <remarks>
+    /// Does not include a drive, or the initial backslash
+    /// </remarks>
+    /// <returns>
+    /// DS:DI = ASCIZ pathname containing the current DOS directory. <br/>
+    /// CF is cleared on success. <br/>
+    /// CF is set on error. Possible error code in AX: 0xF (Invalid Drive).
+    /// </returns>
+    /// <param name="calledFromVm">Whether the method was called by the emulator.</param>
+    public void GetCurrentDirectory(bool calledFromVm) {
+        uint responseAddress = MemoryUtils.ToPhysicalAddress(State.DS, State.SI);
+        DosFileOperationResult result = _dosFileManager.GetCurrentDir(State.DL, out string currentDir);
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("GET CURRENT DIRECTORY {ResponseAddress}: {CurrentDpsDirectory}",
+                ConvertUtils.ToSegmentedAddressRepresentation(
+                    State.DS, State.SI), currentDir);
+        }
+        Memory.SetZeroTerminatedString(responseAddress, currentDir);
+        // According to Ralf's Interrupt List, many Microsoft Windows products rely on AX being 0x0100 on success
+        if (!result.IsError) {
+            State.AX = 0x0100;
+        }
+        SetStateFromDosFileOperationResult(calledFromVm, result);
+    }
+
+    /// <summary>
+    /// Gets (AL: 0) or sets (AL: 1) file attributes for the file identified via its file path at DS:DX.
+    /// TODO: The Set File Attributes operation is not implemented.
+    /// </summary>
+    /// <returns>
+    /// CF is cleared on success. <br/>
+    /// CF is set on error. Possible error code in AX: 0x2 (File not found). <br/>
+    /// TODO: Always returns that the file is read / write in Get File Attributes mode.
+    /// </returns>
+    /// <exception cref="UnhandledOperationException">When the operation in the AL Register is not supported.</exception>
+    /// <param name="calledFromVm">Whether this was called from internal emulator code.</param>
+    public void GetSetFileAttributes(bool calledFromVm) {
+        byte op = State.AL;
+        string dosFileName = _dosStringDecoder.GetZeroTerminatedStringAtDsDx();
+        if (_dosDriveManager.TryGetContentEntry(dosFileName, out DosContentEntry? contentEntry) &&
+            contentEntry?.HostPath is null) {
+            if (contentEntry is null) {
+                LogDosError(calledFromVm);
+                SetCarryFlag(true, calledFromVm);
+                State.AX = 0x2;
+                return;
+            }
+            if (op == 0) {
+                State.CX = (ushort)contentEntry.Attributes;
+                SetCarryFlag(false, calledFromVm);
+                return;
+            }
+            SetCarryFlag(true, calledFromVm);
+            State.AX = (ushort)DosErrorCode.AccessDenied;
+            return;
+        }
+        string? fileName = _dosFileManager.TryGetFullHostPathFromDos(dosFileName);
+        if (!File.Exists(fileName)) {
+            LogDosError(calledFromVm);
+            SetCarryFlag(true, calledFromVm);
+            // File not found
+            State.AX = 0x2;
+            return;
+        }
+        SetCarryFlag(false, calledFromVm);
+        switch (op) {
+            case 0: {
+                    if (LoggerService.IsEnabled(LogLevel.Trace)) {
+                        LoggerService.LogTrace("GET FILE ATTRIBUTE {FileName}", fileName);
+                    }
+                    FileAttributes attributes = File.GetAttributes(fileName);
+                    // .NET FileAttributes bits match DOS FAT bits for ReadOnly(0x01), Hidden(0x02),
+                    // System(0x04), Directory(0x10), Archive(0x20). Mask to valid DOS range.
+                    State.CX = (ushort)((int)attributes & 0x37);
+                    break;
+                }
+            case 1: {
+                    ushort dosAttribute = State.CX;
+                    if (LoggerService.IsEnabled(LogLevel.Trace)) {
+                        LoggerService.LogTrace("SET FILE ATTRIBUTE {FileName}, {Attribute}",
+                            fileName, dosAttribute);
+                    }
+                    // Preserve Directory bit from current attributes (cannot be changed via this call).
+                    FileAttributes current = File.GetAttributes(fileName);
+                    FileAttributes preserved = current & FileAttributes.Directory;
+                    // Map DOS bits to .NET FileAttributes (same numeric values for the shared flags).
+                    FileAttributes newAttrs = (FileAttributes)(dosAttribute & 0x27) | preserved;
+                    File.SetAttributes(fileName, newAttrs);
+                    break;
+                }
+            default: throw new UnhandledOperationException(State, "getSetFileAttribute operation unhandled: " + op);
+        }
+    }
+
+    /// <summary>
+    /// Gets (AL: 0) or sets (AL: 1) file DateTime for the file identified via its file path at DS:DX.
+    /// </summary>
+    /// <returns>
+    /// CF is cleared on success. <br/>
+    /// CF is set on error. Possible error code in AX: 0x1 (function number invalid) 0x6 (invalid handle). <br/>
+    /// </returns>
+    /// <param name="calledFromVm">Whether this was called from internal emulator code.</param>
+    public void GetSetFileDateAndTime(bool calledFromVm) {
+        byte op = State.AL;
+        string dosFileName = _dosStringDecoder.GetZeroTerminatedStringAtDsDx();
+        if (_dosDriveManager.TryGetContentEntry(dosFileName, out DosContentEntry? contentEntry) &&
+            contentEntry?.HostPath is null) {
+            if (contentEntry is null) {
+                SetCarryFlag(true, calledFromVm);
+                State.AX = (int)DosErrorCode.InvalidHandle;
+                return;
+            }
+            if (op == 0) {
+                DateTime dateTime = contentEntry.CreationTimeUtc.ToLocalTime();
+                State.CX = DosFileManager.ToDosTime(dateTime);
+                State.DX = DosFileManager.ToDosDate(dateTime);
+                SetCarryFlag(false, calledFromVm);
+                return;
+            }
+            SetCarryFlag(true, calledFromVm);
+            State.AX = (int)DosErrorCode.AccessDenied;
+            return;
+        }
+        string? fileName = _dosFileManager.TryGetFullHostPathFromDos(dosFileName);
+        if (!File.Exists(fileName)) {
+            LogDosError(calledFromVm);
+            SetCarryFlag(true, calledFromVm);
+            State.AX = (int)DosErrorCode.InvalidHandle;
+            return;
+        }
+        switch (op) {
+            case 0: {
+                    if (LoggerService.IsEnabled(LogLevel.Trace)) {
+                        LoggerService.LogTrace("GET FILE DATETIME {FileName}", fileName);
+                    }
+                    DateTime dateTime = File.GetLastAccessTime(fileName);
+                    State.CX = DosFileManager.ToDosTime(dateTime);
+                    State.DX = DosFileManager.ToDosDate(dateTime);
+                    SetCarryFlag(false, calledFromVm);
+                    break;
+                }
+            case 1: {
+                    ushort dosFileTime = State.CX;
+                    ushort dosFileDate = State.DX;
+                    if (LoggerService.IsEnabled(LogLevel.Trace)) {
+                        LoggerService.LogTrace("SET FILE DATETIME {FileName}, {FileTime}, {FileDate}",
+                            fileName, dosFileDate, dosFileTime);
+                    }
+                    DateTime fileDateTime = DateTimeFormDosDateAndTime(dosFileTime, dosFileDate);
+                    File.SetLastAccessTime(fileName, fileDateTime);
+                    SetCarryFlag(false, calledFromVm);
+                    break;
+                }
+            default: {
+                    SetCarryFlag(true, calledFromVm);
+                    State.AX = (int)DosErrorCode.FunctionNumberInvalid;
+                    break;
+                }
+        }
+    }
+
+    /// <summary>
+    /// Converts DOS Date and Time to DateTime
+    /// DOS date format: bits 15-9=year-1980, bits 8-5=month, bits 4-0=day.
+    /// DOS time format: bits 15-11=hour, bits 10-5=minute, bits 4-0=seconds/2.
+    /// </summary>
+    public static DateTime DateTimeFormDosDateAndTime(ushort dosDate, ushort dosTime) {
+        int day = (dosDate >> 0) & 0b11111;
+        int month = (dosDate >> 5) & 0b1111;
+        int year = (dosDate >> 9) & 0b1111111 + 1980;
+
+        int seconds = (dosTime >> 0) & 0b11111 * 2;
+        int minutes = (dosTime >> 5) & 0b111111;
+        int hours = (dosTime >> 11) & 0b11111;
+
+        return new DateTime(year, month, day, hours, minutes, seconds);
+    }
+
+    /// <summary>
+    /// Gets the FCB linear address from DS:DX.
+    /// </summary>
+    private uint GetFcbAddress() => MemoryUtils.ToPhysicalAddress(State.DS, State.DX);
+
+    /// <summary>
+    /// Gets the DTA address for FCB operations.
+    /// </summary>
+    private uint GetDtaAddress() => _dosFileManager.GetDiskTransferAreaPhysicalAddress();
+
+    /// <summary>
+    /// INT 21h, AH=0Fh - Open File Using FCB.
+    /// Opens an existing file using a File Control Block.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Expects:</b></para>
+    /// <para>DS:DX = pointer to an unopened FCB</para>
+    /// <para><b>Returns:</b></para>
+    /// <para>AL = 00h if file opened/found, FFh if file not found</para>
+    /// </remarks>
+    private void FcbOpenFile() {
+        uint fcbAddress = GetFcbAddress();
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FCB OPEN FILE at {Address}", fcbAddress);
+        }
+        State.AL = (byte)_dosFcbManager.OpenFile(fcbAddress);
+    }
+
+    /// <summary>
+    /// INT 21h, AH=10h - Close File Using FCB.
+    /// Closes a file opened with an FCB.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Expects:</b></para>
+    /// <para>DS:DX = pointer to an opened FCB</para>
+    /// <para><b>Returns:</b></para>
+    /// <para>AL = 00h if file closed, FFh if file not found</para>
+    /// </remarks>
+    private void FcbCloseFile() {
+        uint fcbAddress = GetFcbAddress();
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FCB CLOSE FILE at {Address}", fcbAddress);
+        }
+        State.AL = (byte)_dosFcbManager.CloseFile(fcbAddress);
+    }
+
+    /// <summary>
+    /// INT 21h, AH=11h - Find First Matching File Using FCB.
+    /// Finds the first file matching the FCB file specification.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Expects:</b></para>
+    /// <para>DS:DX = pointer to an unopened FCB (filespec may contain '?'s)</para>
+    /// <para><b>Returns:</b></para>
+    /// <para>AL = 00h if a matching filename found (and DTA is filled)</para>
+    /// <para>AL = FFh if no match was found</para>
+    /// <para>The DTA is filled with the directory entry of the matching file.</para>
+    /// </remarks>
+    private void FcbFindFirst() {
+        uint fcbAddress = GetFcbAddress();
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FCB FIND FIRST at {Address}", fcbAddress);
+        }
+        State.AL = (byte)_dosFcbManager.FindFirst(fcbAddress);
+    }
+
+    /// <summary>
+    /// INT 21h, AH=12h - Find Next Matching File Using FCB.
+    /// Finds the next file matching the FCB file specification from a previous Find First call.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Expects:</b></para>
+    /// <para>DS:DX = pointer to the same FCB used in Find First</para>
+    /// <para><b>Returns:</b></para>
+    /// <para>AL = 00h if a matching filename found (and DTA is filled)</para>
+    /// <para>AL = FFh if no more files match</para>
+    /// <para>The reserved area of the FCB carries information used in continuing the search,</para>
+    /// <para>so don't open or alter the FCB between calls to Fns 11h and 12h.</para>
+    /// </remarks>
+    private void FcbFindNext() {
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FCB FIND NEXT at {Address}", GetFcbAddress());
+        }
+        State.AL = (byte)_dosFcbManager.FindNext();
+    }
+
+    /// <summary>
+    /// INT 21h, AH=13h - Delete File Using FCB.
+    /// Deletes a file specified by the FCB filename pattern.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Expects:</b></para>
+    /// <para>DS:DX = pointer to an FCB or extended FCB with filename pattern (may contain wildcards)</para>
+    /// <para><b>Returns:</b></para>
+    /// <para>AL = 00h on success, FFh if no files matched or error</para>
+    /// </remarks>
+    private void FcbDeleteFile() {
+        uint fcbAddress = GetFcbAddress();
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FCB DELETE FILE at {Address}", fcbAddress);
+        }
+        State.AL = (byte)_dosFcbManager.DeleteFile(fcbAddress);
+    }
+
+    /// <summary>
+    /// INT 21h, AH=17h - Rename File Using FCB.
+    /// Renames a file using a special rename FCB structure.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Expects:</b></para>
+    /// <para>DS:DX = pointer to a rename FCB (special structure with old and new filenames)</para>
+    /// <para>Format: drive (1 byte), old name (8 bytes), old ext (3 bytes), reserved (5 bytes),</para>
+    /// <para>        new name (8 bytes), new ext (3 bytes), reserved (9 bytes)</para>
+    /// <para><b>Returns:</b></para>
+    /// <para>AL = 00h on success</para>
+    /// <para>AL = FFh if file not found or error</para>
+    /// <para>Supports wildcards: '?' in new name takes character from old filename</para>
+    /// </remarks>
+    private void FcbRenameFile() {
+        uint fcbAddress = GetFcbAddress();
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FCB RENAME FILE at {Address}", fcbAddress);
+        }
+        State.AL = (byte)_dosFcbManager.RenameFile(fcbAddress);
+    }
+
+    /// <summary>
+    /// INT 21h, AH=14h - Sequential Read Using FCB.
+    /// Reads the next sequential record from a file.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Expects:</b></para>
+    /// <para>DS:DX = pointer to an opened FCB</para>
+    /// <para><b>Returns:</b></para>
+    /// <para>AL = 00h if successful, 01h if EOF and no data read, 02h if segment wrap, 03h if EOF with partial read</para>
+    /// </remarks>
+    private void FcbSequentialRead() {
+        uint fcbAddress = GetFcbAddress();
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FCB SEQUENTIAL READ at {Address}", fcbAddress);
+        }
+        State.AL = (byte)_dosFcbManager.SequentialRead(fcbAddress, GetDtaAddress());
+    }
+
+    /// <summary>
+    /// INT 21h, AH=15h - Sequential Write Using FCB.
+    /// Writes the next sequential record to a file.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Expects:</b></para>
+    /// <para>DS:DX = pointer to an opened FCB</para>
+    /// <para><b>Returns:</b></para>
+    /// <para>AL = 00h if successful, 01h if disk full, 02h if segment wrap</para>
+    /// </remarks>
+    private void FcbSequentialWrite() {
+        uint fcbAddress = GetFcbAddress();
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FCB SEQUENTIAL WRITE at {Address}", fcbAddress);
+        }
+        State.AL = (byte)_dosFcbManager.SequentialWrite(fcbAddress, GetDtaAddress());
+    }
+
+    /// <summary>
+    /// INT 21h, AH=16h - Create File Using FCB.
+    /// Creates a new file or truncates an existing file.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Expects:</b></para>
+    /// <para>DS:DX = pointer to an unopened FCB</para>
+    /// <para><b>Returns:</b></para>
+    /// <para>AL = 00h if file created, FFh if error</para>
+    /// </remarks>
+    private void FcbCreateFile() {
+        uint fcbAddress = GetFcbAddress();
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FCB CREATE FILE at {Address}", fcbAddress);
+        }
+        State.AL = (byte)_dosFcbManager.CreateFile(fcbAddress);
+    }
+
+    /// <summary>
+    /// INT 21h, AH=21h - Random Read Using FCB.
+    /// Reads a record at the random record position.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Expects:</b></para>
+    /// <para>DS:DX = pointer to an opened FCB</para>
+    /// <para><b>Returns:</b></para>
+    /// <para>AL = 00h if successful, 01h if EOF, 02h if segment wrap, 03h if partial read</para>
+    /// </remarks>
+    private void FcbRandomRead() {
+        uint fcbAddress = GetFcbAddress();
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FCB RANDOM READ at {Address}", fcbAddress);
+        }
+        State.AL = (byte)_dosFcbManager.RandomRead(fcbAddress, GetDtaAddress());
+    }
+
+    /// <summary>
+    /// INT 21h, AH=22h - Random Write Using FCB.
+    /// Writes a record at the random record position.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Expects:</b></para>
+    /// <para>DS:DX = pointer to an opened FCB</para>
+    /// <para><b>Returns:</b></para>
+    /// <para>AL = 00h if successful, 01h if disk full, 02h if segment wrap</para>
+    /// </remarks>
+    private void FcbRandomWrite() {
+        uint fcbAddress = GetFcbAddress();
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FCB RANDOM WRITE at {Address}", fcbAddress);
+        }
+        State.AL = (byte)_dosFcbManager.RandomWrite(fcbAddress, GetDtaAddress());
+    }
+
+    /// <summary>
+    /// INT 21h, AH=23h - Get File Size Using FCB.
+    /// Gets the file size in records and stores it in the FCB random record field.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Expects:</b></para>
+    /// <para>DS:DX = pointer to an FCB with file name and record size set</para>
+    /// <para><b>Returns:</b></para>
+    /// <para>AL = 00h if file found (random record field set to file size in records), FFh if file not found</para>
+    /// </remarks>
+    private void FcbGetFileSize() {
+        uint fcbAddress = GetFcbAddress();
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FCB GET FILE SIZE at {Address}", fcbAddress);
+        }
+        State.AL = (byte)_dosFcbManager.GetFileSize(fcbAddress);
+    }
+
+    /// <summary>
+    /// INT 21h, AH=24h - Set Random Record Number (FCB).
+    /// Sets the <c>RandomRecord</c> field in the FCB from the current block and record numbers.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Expects:</b></para>
+    /// <para>DS:DX = pointer to an FCB (standard or extended with 0xFF header)</para>
+    /// <para><b>Operation:</b></para>
+    /// <para>Computes `RandomRecord = CurrentBlock * 128 + CurrentRecord` and stores it in the FCB (DWORD at offset 0x21).</para>
+    /// <para><b>Notes:</b></para>
+    /// <para>Extended FCBs with 0xFF marker are supported; the inner FCB begins at +7 bytes.</para>
+    /// </remarks>
+    private void FcbSetRandomRecordNumber() {
+        uint fcbAddress = GetFcbAddress();
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FCB SET RANDOM RECORD NUMBER at {Address}", fcbAddress);
+        }
+        _dosFcbManager.UpdateRandomRecord(fcbAddress);
+    }
+
+    /// <summary>
+    /// INT 21h, AH=27h - Random Block Read Using FCB.
+    /// Reads one or more records starting at the random record position.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Expects:</b></para>
+    /// <para>DS:DX = pointer to an opened FCB</para>
+    /// <para>CX = number of records to read</para>
+    /// <para><b>Returns:</b></para>
+    /// <para>AL = 00h if successful, 01h if EOF, 02h if segment wrap, 03h if partial read</para>
+    /// <para>CX = actual number of records read</para>
+    /// </remarks>
+    private void FcbRandomBlockRead() {
+        uint fcbAddress = GetFcbAddress();
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FCB RANDOM BLOCK READ at {Address}, {Count} records", fcbAddress, State.CX);
+        }
+        (FcbStatus status, ushort actualRecordCount) = _dosFcbManager.RandomBlockRead(fcbAddress, GetDtaAddress(), State.CX);
+        State.AL = (byte)status;
+        State.CX = actualRecordCount;
+    }
+
+    /// <summary>
+    /// INT 21h, AH=28h - Random Block Write Using FCB.
+    /// Writes one or more records starting at the random record position.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Expects:</b></para>
+    /// <para>DS:DX = pointer to an opened FCB</para>
+    /// <para>CX = number of records to write (0 = truncate file to random record position)</para>
+    /// <para><b>Returns:</b></para>
+    /// <para>AL = 00h if successful, 01h if disk full, 02h if segment wrap</para>
+    /// <para>CX = actual number of records written</para>
+    /// </remarks>
+    private void FcbRandomBlockWrite() {
+        uint fcbAddress = GetFcbAddress();
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FCB RANDOM BLOCK WRITE at {Address}, {Count} records", fcbAddress, State.CX);
+        }
+        (FcbStatus status, ushort actualRecordCount) = _dosFcbManager.RandomBlockWrite(fcbAddress, GetDtaAddress(), State.CX);
+        State.AL = (byte)status;
+        State.CX = actualRecordCount;
+    }
+
+    /// <summary>
+    /// INT 21h, AH=29h - Parse Filename into FCB.
+    /// Parses a filename string into an FCB format.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Expects:</b></para>
+    /// <para>DS:SI = pointer to filename string to parse</para>
+    /// <para>ES:DI = pointer to FCB to fill</para>
+    /// <para>AL = parsing control byte:</para>
+    /// <para>  bit 0: when set, skip leading separators</para>
+    /// <para>  bit 1: when clear, set default drive if not specified; when set, do not change drive</para>
+    /// <para>  bit 2: when clear, blank filename if not specified; when set, leave filename unchanged</para>
+    /// <para>  bit 3: when clear, blank extension if not specified; when set, leave extension unchanged</para>
+    /// <para><b>Returns:</b></para>
+    /// <para>AL = 00h if no wildcards, 01h if wildcards present, FFh if invalid drive</para>
+    /// <para>DS:SI = pointer to first byte after parsed filename</para>
+    /// </remarks>
+    private void FcbParseFilename() {
+        SegmentedAddress stringAddress = new SegmentedAddress(State.DS, State.SI);
+        SegmentedAddress fcbAddress = new SegmentedAddress(State.ES, State.DI);
+        FcbParseControl parseControl = (FcbParseControl)State.AL;
+
+        if (LoggerService.IsEnabled(LogLevel.Trace)) {
+            LoggerService.LogTrace("FCB PARSE FILENAME from {StringAddress} to {FcbAddress}, control={Control:X2}",
+                stringAddress, fcbAddress, parseControl);
+        }
+
+        (FcbParseResult parseStatus, uint bytesAdvanced) = _dosFcbManager.ParseFilename(
+            MemoryUtils.ToPhysicalAddress(stringAddress.Segment, stringAddress.Offset),
+            MemoryUtils.ToPhysicalAddress(fcbAddress.Segment, fcbAddress.Offset),
+            parseControl);
+        State.AL = (byte)parseStatus;
+        State.SI += (ushort)bytesAdvanced;
+    }
+
+    /// <summary>
+    /// Provides MS-DOS drivers based IOCTL operations, which are device-driver specific operations.
+    /// </summary>
+    /// <param name="calledFromVm">Whether this was called by the emulator.</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    /// <remarks>
+    /// Supports the following operations based on the AL register:
+    /// <list type="bullet">
+    ///   <item><description>AL = 0x00: Get Device Information from handle in BX. Returns information in DX.</description></item>
+    ///   <item><description>AL = 0x01: Set Device Information using handle in BX and data in DL.</description></item>
+    ///   <item><description>AL = 0x02: Read from Device Control Channel using handle in BX.</description></item>
+    ///   <item><description>AL = 0x03: Write to Device Control Channel using handle in BX.</description></item>
+    ///   <item><description>AL = 0x06: Get Input Status for handle in BX. Returns status in AL (0xFF=ready, 0x00=not ready).</description></item>
+    ///   <item><description>AL = 0x07: Get Output Status for handle in BX. Returns status in AL (0xFF=ready, 0x00=not ready).</description></item>
+    ///   <item><description>AL = 0x08: Check if block device in BL is removable. Returns AL=0 for removable, AL=1 for fixed.</description></item>
+    ///   <item><description>AL = 0x09: Check if block device in BL is remote. Returns DX with device attributes.</description></item>
+    ///   <item><description>AL = 0x0B: Set sharing retry count. DX=retry count.</description></item>
+    ///   <item><description>AL = 0x0D: Generic block device request for drive in BL. Command in CL, parameter block at DS:DX.</description></item>
+    ///   <item><description>AL = 0x0E: Get Logical Drive Map for drive in BL. Returns physical drive in AL.</description></item>
+    /// </list>
+    /// </remarks>
+    public void IoControl(bool calledFromVm) {
+        if (!DosFileManager.IsIoctlHandleSubfunction(State.AL)) {
+            SetStateFromDosFileOperationResult(calledFromVm, _dosFileManager.IoControl(State));
+            return;
+        }
+        if (!TryResolveFileHandle(State.BX, out byte systemFileTableIndex)) {
+            SetStateFromDosFileOperationResult(calledFromVm, DosFileOperationResult.LogError(DosErrorCode.InvalidHandle));
+            return;
+        }
+        ushort fileHandle = State.BX;
+        State.BX = systemFileTableIndex;
+        DosFileOperationResult result = _dosFileManager.IoControl(State);
+        State.BX = fileHandle;
+        SetStateFromDosFileOperationResult(calledFromVm, result);
+    }
+
+    private void LogDosError(bool calledFromVm, [CallerMemberName] string? callerName = null) {
+        string returnMessage = "";
+        if (calledFromVm) {
+            returnMessage = $"Int will return to {FunctionHandlerProvider.FunctionHandlerInUse.PeekReturn()}. ";
+        }
+        if (LoggerService.IsEnabled(LogLevel.Error)) {
+            LoggerService.LogError("DOS operation from {CallerName} failed with an error. {ReturnMessage}. State is {State}",
+                callerName, returnMessage, State.ToString());
+        }
+    }
+
+    private void SetStateFromDosFileOperationResult(bool calledFromVm,
+        DosFileOperationResult dosFileOperationResult, [CallerMemberName] string? callerName = null) {
+        if (dosFileOperationResult.IsError) {
+            LogDosError(calledFromVm, callerName);
+            SetCarryFlag(true, calledFromVm);
+        } else {
+            SetCarryFlag(false, calledFromVm);
+        }
+        uint? value = dosFileOperationResult.Value;
+        if (value == null) {
+            return;
+        }
+        State.AX = (ushort)value.Value;
+        if (dosFileOperationResult.IsValueIsUint32) {
+            State.DX = (ushort)(value >> 16);
+        }
+    }
+
+    /// <summary>
+    /// Reads a value from a CMOS register via I/O ports.
+    /// Writes the register index to the address port and reads the value from the data port.
+    /// </summary>
+    private byte ReadCmosRegister(byte register) {
+        _ioPortDispatcher.WriteByte(CmosPorts.Address, register);
+        return _ioPortDispatcher.ReadByte(CmosPorts.Data);
+    }
+
+    /// <summary>
+    /// Writes a value to a CMOS register via I/O ports.
+    /// Writes the register index to the address port and the value to the data port.
+    /// </summary>
+    private void WriteCmosRegister(byte register, byte value) {
+        _ioPortDispatcher.WriteByte(CmosPorts.Address, register);
+        _ioPortDispatcher.WriteByte(CmosPorts.Data, value);
+    }
+}

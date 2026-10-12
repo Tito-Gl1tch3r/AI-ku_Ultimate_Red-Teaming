@@ -1,0 +1,1870 @@
+using Microsoft.Extensions.Logging;
+namespace Spice86.Core.Emulator.OperatingSystem;
+
+
+using Spice86.Core.Emulator.CPU;
+using Spice86.Core.Emulator.Memory;
+using Spice86.Core.Emulator.OperatingSystem.Devices;
+using Spice86.Core.Emulator.OperatingSystem.Enums;
+using Spice86.Core.Emulator.OperatingSystem.Structures;
+using Spice86.Shared.Emulator.Errors;
+using Spice86.Shared.Emulator.Memory;
+using Spice86.Shared.Interfaces;
+using Spice86.Shared.Utils;
+
+using System.Diagnostics.CodeAnalysis;
+using System.Linq;
+using System.Text;
+
+/// <summary>
+/// The class that implements DOS file operations, such as finding files,
+/// allocating file handles, and updating the Disk Transfer Area.
+/// </summary>
+public class DosFileManager {
+    private const int ExtDeviceBit = 0x0200;
+    public const ushort MaxOpenFilesPerProcess = 0x14;
+    private static readonly char[] _directoryChars = {
+        DosDriveManager.DirectorySeparatorChar,
+        DosDriveManager.AltDirectorySeparatorChar };
+
+    private readonly DosDriveManager _dosDriveManager;
+
+    private readonly ILogger _loggerService;
+
+    private ushort _diskTransferAreaAddressOffset;
+
+    private ushort _diskTransferAreaAddressSegment;
+
+    private readonly IMemory _memory;
+
+    private readonly DosDriveManager _driveManager;
+
+    private class FileSearchPrivateData {
+        public FileSearchPrivateData(string fileSpec, int index, ushort searchAttributes, bool isFcbSearch) {
+            FileSpec = fileSpec;
+            Index = index;
+            SearchAttributes = searchAttributes;
+            IsFcbSearch = isFcbSearch;
+        }
+
+        public string FileSpec { get; set; }
+
+        public int Index { get; set; }
+
+        public ushort SearchAttributes { get; init; }
+
+        public bool IsFcbSearch { get; init; }
+    }
+
+    private readonly Dictionary<uint, FileSearchPrivateData> _activeFileSearches = new();
+
+    private readonly DosStringDecoder _dosStringDecoder;
+
+    /// <summary>
+    /// All the files opened by DOS.
+    /// </summary>
+    public VirtualFileBase?[] OpenFiles { get; } = new VirtualFileBase[0xFF];
+
+    private readonly byte[] _jobFileTableReferenceCounts = new byte[0xFF];
+
+    private readonly IList<IVirtualDevice> _dosVirtualDevices;
+
+    /// <summary>
+    /// Initializes a new instance.
+    /// </summary>
+    /// <param name="memory">The memory bus.</param>
+    /// <param name="dosStringDecoder">A helper class to encode/decode DOS strings.</param>
+    /// <param name="dosDriveManager">The class used to manage folders mounted as DOS drives.</param>
+    /// <param name="loggerService">The logger service implementation.</param>
+    /// <param name="dosVirtualDevices">The virtual devices from the DOS kernel.</param>
+    public DosFileManager(IMemory memory, DosStringDecoder dosStringDecoder,
+        DosDriveManager dosDriveManager, ILogger loggerService, IList<IVirtualDevice> dosVirtualDevices) {
+        _loggerService = loggerService;
+        _dosStringDecoder = dosStringDecoder;
+        _driveManager = dosDriveManager;
+        _memory = memory;
+        _dosDriveManager = dosDriveManager;
+        _dosVirtualDevices = dosVirtualDevices;
+    }
+
+    /// <summary>
+    /// Gets the file or device at the stdout handle (1), respecting batch redirection.
+    /// </summary>
+    public VirtualFileBase? Stdout => OpenFiles[(ushort)DosStandardHandle.Stdout];
+
+    /// <summary>
+    /// Gets the file or device at the stdin handle (0), respecting batch redirection.
+    /// </summary>
+    public VirtualFileBase? Stdin => OpenFiles[(ushort)DosStandardHandle.Stdin];
+
+    /// <summary>
+    /// Checks whether input is available on a file handle.
+    /// For character devices, checks the device information bits.
+    /// For regular files, checks whether the file position is before the end.
+    /// </summary>
+    public bool IsInputAvailable(VirtualFileBase? file) {
+        if (file is IVirtualDevice device && (device.Information & 0x8000) > 0) {
+            return (device.Information & 0x40) == 0;
+        }
+        if (file != null) {
+            return file.Position < file.Length;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Gets the device file handle of the first open character device with the specified attributes.
+    /// </summary>
+    /// <param name="attributes">The device attributes, such as <see cref="DeviceAttributes.CurrentStdin"/>. <br/>
+    /// There can be several.</param>
+    /// <param name="device">The DOS device if found, or <c>null</c> if not found.</param>
+    /// <returns>Whether the DOS Device was found.</returns>
+    public bool TryGetOpenDeviceWithAttributes<T>(DeviceAttributes attributes,
+        [NotNullWhen(true)] out T? device) where T : IVirtualDevice {
+        device = OpenFiles.OfType<T>().FirstOrDefault(x => x is
+            CharacterDevice device &&
+            device.Header.Attributes.HasFlag(attributes));
+        return device is not null;
+    }
+
+    /// <summary>
+    /// Closes a file handle.
+    /// </summary>
+    /// <param name="fileHandle">The file handle to an open file.</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    /// <exception cref="UnrecoverableException">If the host OS refuses to close the file.</exception>
+    public DosFileOperationResult CloseFileOrDevice(ushort fileHandle) {
+        if (GetOpenFile(fileHandle) is not DosFile file) {
+            return FileNotOpenedError(fileHandle);
+        }
+
+        if (_loggerService.IsEnabled(LogLevel.Debug)) {
+            _loggerService.LogDebug("Closed {ClosedFileName}, file was loaded in ram in those addresses: {ClosedFileAddresses}",
+                file.Name, file.LoadedMemoryRanges);
+        }
+
+        SetOpenFile(fileHandle, null);
+        byte refCount = (byte)CountHandles(file);
+        try {
+            if (refCount == 0) {
+                // Only close the file if no other handle to it exist.
+                file.Close();
+            }
+        } catch (IOException e) {
+            throw new UnrecoverableException("IOException while closing file", e);
+        }
+
+        return DosFileOperationResult.NoValueWithRefCount(refCount);
+    }
+
+    /// <summary>
+    /// Creates a file and returns the handle to the file.
+    /// </summary>
+    /// <param name="fileName">The target file name.</param>
+    /// <param name="fileAttribute">The file system attributes to set on the new file.</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    /// <exception cref="UnrecoverableException"></exception>
+    public DosFileOperationResult CreateFileUsingHandle(string fileName, ushort fileAttribute) {
+        CharacterDevice? device = _dosVirtualDevices.OfType<CharacterDevice>()
+            .FirstOrDefault(device => device.IsName(fileName));
+        if (device is not null) {
+            if (_loggerService.IsEnabled(LogLevel.Trace)) {
+                _loggerService.LogTrace("Opening device {FileName}", fileName);
+            }
+            return OpenDevice(device);
+        }
+
+        if (IsReadOnlyDosPath(fileName)) {
+            return DosFileOperationResult.LogError(DosErrorCode.AccessDenied);
+        }
+
+        string? newHostFilePath = _driveManager.ResolveNewFilePath(fileName);
+        if (string.IsNullOrWhiteSpace(newHostFilePath)) {
+            return PathNotFoundError(fileName);
+        }
+
+        FileStream? testFileStream = null;
+        try {
+            if (_loggerService.IsEnabled(LogLevel.Information)) {
+                _loggerService.LogInformation("Creating file using handle: {PrefixedPath} with {Attributes}",
+                    newHostFilePath, fileAttribute);
+            }
+
+            // PYRO2 opens a file and re-creates it again.
+            // Ensure we close it if it was opened first,
+            // in order to avoid an exception
+            for (ushort i = 0; i < OpenFiles.Length; i++) {
+                VirtualFileBase? virtualFile = OpenFiles[i];
+                if (virtualFile is DosFile dosFile) {
+                    string? openHostFilePath = _driveManager.GetFullHostPathFromDosOrDefault(dosFile.Name);
+                    if (string.Equals(openHostFilePath, newHostFilePath, StringComparison.OrdinalIgnoreCase)) {
+                        CloseFileOrDevice(i);
+                    }
+                }
+            }
+
+            testFileStream = File.Create(newHostFilePath);
+            File.SetAttributes(newHostFilePath, (FileAttributes)fileAttribute);
+        } catch (IOException e) {
+            if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                _loggerService.LogWarning(e, "Error while creating a file using a handle with {FileName} and {FileAttribute}",
+                    fileName, fileAttribute);
+            }
+            return PathNotFoundError(fileName);
+        } finally {
+            testFileStream?.Dispose();
+        }
+
+        return OpenFileInternal(fileName, newHostFilePath, FileAccessMode.ReadWrite);
+    }
+
+    /// <summary>
+    /// Gets another file handle for the same file
+    /// </summary>
+    /// <param name="fileHandle">The handle to a file.</param>
+    /// <param name="newHandle">The new handle to a file.</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult ForceDuplicateFileHandle(ushort fileHandle, ushort newHandle) {
+        if (fileHandle == newHandle) {
+            return DosFileOperationResult.LogError(DosErrorCode.InvalidHandle);
+        }
+        // Out of range in our array
+        if (!IsHandleInRange(newHandle)) {
+            return DosFileOperationResult.LogError(DosErrorCode.InvalidHandle);
+        }
+        // New handle is already opened
+        if (OpenFiles[newHandle] != null) {
+            return DosFileOperationResult.LogError(DosErrorCode.InvalidHandle);
+        }
+        // Open it and assign it to a var named file.
+        // Should always pass: we already called IsValidFileHandle for our own error code.
+        if (GetOpenFile(fileHandle) is not VirtualFileBase file) {
+            return FileNotOpenedError(fileHandle);
+        }
+        if (newHandle < OpenFiles.Length && OpenFiles[newHandle] != null) {
+            CloseFileOrDevice(newHandle);
+        }
+        SetOpenFile(newHandle, file);
+        return DosFileOperationResult.NoValue();
+    }
+
+    /// <summary>
+    /// Gets another file handle for the same file
+    /// </summary>
+    /// <param name="fileHandle">The handle to a file.</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult DuplicateFileHandle(ushort fileHandle) {
+        if (GetOpenFile(fileHandle) is not VirtualFileBase file) {
+            return FileNotOpenedError(fileHandle);
+        }
+
+        int? freeIndex = FindNextFreeFileIndex();
+        if (freeIndex == null) {
+            return NoFreeHandleError();
+        }
+
+        ushort dosIndex = (ushort)freeIndex.Value;
+        SetOpenFile(dosIndex, file);
+        return DosFileOperationResult.Value16(dosIndex);
+    }
+
+    /// <summary>
+    /// Returns the first matching file in the DTA using the extended format (ASCIIZ 8.3 filename at offset 0x1E),
+    /// according to the <paramref name="fileSpec"/>. Used by INT 21h AH=4Eh.
+    /// </summary>
+    /// <param name="fileSpec">a filename with ? when any character can match or * when multiple characters can match.
+    /// Case is insensitive</param>
+    /// <param name="searchAttributes">The MS-DOS file attributes, such as Directory.</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult FindFirstMatchingFile(string fileSpec, ushort searchAttributes) {
+        return FindFirstMatchingFileInternal(fileSpec, searchAttributes, isFcbSearch: false);
+    }
+
+    /// <summary>
+    /// Returns the first matching file in the DTA using FCB format (drive + 8.3 space-padded name),
+    /// according to the <paramref name="fileSpec"/>. Used by INT 21h AH=11h.
+    /// </summary>
+    /// <param name="fileSpec">a filename with ? when any character can match or * when multiple characters can match.
+    /// Case is insensitive</param>
+    /// <param name="searchAttributes">The MS-DOS file attributes, such as Directory.</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult FcbFindFirstMatchingFile(string fileSpec, ushort searchAttributes) {
+        return FindFirstMatchingFileInternal(fileSpec, searchAttributes, isFcbSearch: true);
+    }
+
+    private DosFileOperationResult FindFirstMatchingFileInternal(string fileSpec, ushort searchAttributes, bool isFcbSearch) {
+        if (string.IsNullOrWhiteSpace(fileSpec)) {
+            return PathNotFoundError(fileSpec);
+        }
+
+        DosDiskTransferArea dta = GetDosDiskTransferArea();
+        dta.SearchId = GenerateNewKey();
+
+        DosFileAttributes dosSearchAttributes = (DosFileAttributes)searchAttributes;
+        if (dosSearchAttributes.HasFlag(DosFileAttributes.VolumeId)) {
+            return FindVolumeLabel(dta, fileSpec, searchAttributes, isFcbSearch);
+        }
+
+        if (_dosVirtualDevices.OfType<CharacterDevice>().SingleOrDefault(
+            x => x.IsName(fileSpec)) is { } characterDevice) {
+            if (isFcbSearch) {
+                UpdateDosTransferAreaWithFcbResult(dta, characterDevice.Name, 0, 0, 0, 0);
+            } else {
+                UpdateDosTransferAreaWithDeviceMatch(dta, characterDevice.Name);
+            }
+            _activeFileSearches.Add(dta.SearchId, new(characterDevice.Name, 1, searchAttributes, isFcbSearch));
+            return DosFileOperationResult.NoValue();
+        }
+
+        if (IsOnlyADosDriveRoot(fileSpec)) {
+            return DosFileOperationResult.LogError(DosErrorCode.NoMoreFiles);
+        }
+
+        if (TryGetVirtualMatches(fileSpec, searchAttributes, out List<DosContentEntry>? virtualMatches) &&
+            virtualMatches is not null) {
+            if (virtualMatches.Count == 0) {
+                return DosFileOperationResult.LogError(DosErrorCode.NoMoreFiles);
+            }
+            if (isFcbSearch) {
+                UpdateDosTransferAreaWithFcbContentMatch(dta, virtualMatches[0], fileSpec);
+            } else {
+                UpdateDosTransferAreaWithContentMatch(dta, virtualMatches[0]);
+            }
+            _activeFileSearches.Add(dta.SearchId, new(fileSpec, 1, searchAttributes, isFcbSearch));
+            return DosFileOperationResult.NoValue();
+        }
+
+        if (!GetSearchFolder(fileSpec, out string? searchFolder)) {
+            return DosFileOperationResult.LogError(DosErrorCode.PathNotFound);
+        }
+
+        EnumerationOptions enumerationOptions = GetEnumerationOptions(searchAttributes);
+
+        try {
+            string searchPattern = GetFileSpecWithoutSubFolderOrDriveInIt(fileSpec) ?? fileSpec;
+            // DOS convention: bare * (no dot) is equivalent to *.* — match all files
+            if (string.Equals(searchPattern, "*", StringComparison.Ordinal)) {
+                searchPattern = "*.*";
+            }
+
+            string[] matchingPaths =
+                _driveManager.FindFilesUsingWildCmp(searchFolder, searchPattern, enumerationOptions).ToArray();
+
+            if (matchingPaths.Length == 0) {
+                return DosFileOperationResult.LogError(DosErrorCode.NoMoreFiles);
+            }
+
+            if (isFcbSearch) {
+                UpdateDosTransferAreaWithFcbFileMatch(dta, matchingPaths[0], searchFolder, fileSpec);
+            } else {
+                UpdateDosTransferAreaWithFileMatch(dta, fileSpec, matchingPaths[0], searchFolder);
+            }
+
+            _activeFileSearches.Add(dta.SearchId, new(fileSpec, 1, searchAttributes, isFcbSearch));
+            return DosFileOperationResult.NoValue();
+
+        } catch (Exception e) when (e is UnauthorizedAccessException or
+            IOException or PathTooLongException or DirectoryNotFoundException
+            or ArgumentException) {
+            if (_loggerService.IsEnabled(LogLevel.Error)) {
+                _loggerService.LogError(e, "Error while walking path {SearchFolder} or getting attributes",
+                    searchFolder);
+            }
+        }
+        return DosFileOperationResult.LogError(DosErrorCode.PathNotFound);
+    }
+
+    private uint GenerateNewKey() {
+        if (_activeFileSearches.Count == 0) {
+            return 0;
+        }
+
+        return (uint)_activeFileSearches.Keys.Count;
+    }
+
+    private bool GetSearchFolder(string fileSpec, [NotNullWhen(true)] out string? searchFolder) {
+        string subFolderName = GetSubFoldersInFileSpec(fileSpec) ?? ".";
+        searchFolder = _driveManager.GetFullHostPathFromDosOrDefault(subFolderName);
+        return searchFolder is not null;
+    }
+
+    private bool TryGetVirtualMatches(string fileSpec, ushort searchAttributes,
+        out List<DosContentEntry>? matches) {
+        matches = null;
+        string subFolderName = GetSubFoldersInFileSpec(fileSpec) ?? ".";
+        if (!_dosDriveManager.TryGetDirectoryEntries(subFolderName, out IReadOnlyList<DosContentEntry> entries)) {
+            return false;
+        }
+
+        string searchPattern = GetFileSpecWithoutSubFolderOrDriveInIt(fileSpec) ?? fileSpec;
+        if (string.Equals(searchPattern, "*", StringComparison.Ordinal)) {
+            searchPattern = "*.*";
+        }
+        matches = entries
+            .Where(entry => MatchesSearchAttributes(entry, searchAttributes))
+            .Where(entry => DosDriveManager.WildFileCmp(entry.Name, searchPattern))
+            .OrderBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        return true;
+    }
+
+    private static bool MatchesSearchAttributes(DosContentEntry entry, ushort searchAttributes) {
+        DosFileAttributes attributes = entry.Attributes;
+        if (searchAttributes == 0) {
+            return !entry.IsDirectory && !attributes.HasFlag(DosFileAttributes.Hidden) &&
+                !attributes.HasFlag(DosFileAttributes.System);
+        }
+        DosFileAttributes requested = (DosFileAttributes)searchAttributes;
+        if (entry.IsDirectory && !requested.HasFlag(DosFileAttributes.Directory)) {
+            return false;
+        }
+        if (attributes.HasFlag(DosFileAttributes.Hidden) && !requested.HasFlag(DosFileAttributes.Hidden)) {
+            return false;
+        }
+        if (attributes.HasFlag(DosFileAttributes.System) && !requested.HasFlag(DosFileAttributes.System)) {
+            return false;
+        }
+        return true;
+    }
+
+    private static void UpdateDosTransferAreaWithContentMatch(DosDiskTransferArea dta, DosContentEntry entry) {
+        dta.FileAttributes = (byte)entry.Attributes;
+        dta.FileDate = ToDosDate(entry.CreationTimeUtc.ToLocalTime());
+        dta.FileTime = ToDosTime(entry.CreationTimeUtc.ToLocalTime());
+        dta.FileSize = entry.Size;
+        string parentDir = !string.IsNullOrWhiteSpace(entry.HostPath) ? Path.GetDirectoryName(entry.HostPath) ?? string.Empty : string.Empty;
+        dta.FileName = DosDriveManager.GetShortFileName(entry.Name, parentDir);
+    }
+
+    private static void UpdateDosTransferAreaWithFcbContentMatch(DosDiskTransferArea dta,
+        DosContentEntry entry, string fileSpec) {
+        string name = Path.GetFileNameWithoutExtension(entry.Name);
+        string extension = Path.GetExtension(entry.Name).TrimStart('.');
+        byte driveNumber = fileSpec.Length >= 2 && fileSpec[1] == DosDriveManager.VolumeSeparatorChar
+            ? (byte)(DosDriveManager.GetDriveIndex(fileSpec[0]) + 1)
+            : (byte)0;
+        UpdateDosTransferAreaWithFcbResult(dta, name, extension, (byte)entry.Attributes,
+            ToDosDate(entry.CreationTimeUtc.ToLocalTime()), ToDosTime(entry.CreationTimeUtc.ToLocalTime()),
+            entry.Size, driveNumber);
+    }
+
+    private static string? GetSubFoldersInFileSpec(string fileSpec) {
+        int index = fileSpec.LastIndexOfAny(_directoryChars);
+        if (index != -1) {
+            return fileSpec[..index];
+        }
+        return null;
+    }
+
+
+    private static string? GetFileSpecWithoutSubFolderOrDriveInIt(string fileSpec) {
+        int index = fileSpec.LastIndexOfAny(_directoryChars);
+        if (index == -1) {
+            index = fileSpec.LastIndexOfAny([DosDriveManager.VolumeSeparatorChar]);
+        }
+        if (index != -1) {
+            int indexIncludingDirChar = index + 1;
+            return fileSpec[indexIncludingDirChar..];
+        }
+        return null;
+    }
+
+    private void UpdateActiveSearch(uint key, string fileSpec) {
+        if (_activeFileSearches.TryGetValue(key, out FileSearchPrivateData? search)) {
+            search.FileSpec = fileSpec;
+            _activeFileSearches[key] = search;
+        }
+    }
+
+    private static bool IsOnlyADosDriveRoot(string filePath) =>
+        filePath.Length == 3 && (filePath[2] == DosDriveManager.DirectorySeparatorChar ||
+        filePath[2] == DosDriveManager.AltDirectorySeparatorChar);
+
+    private EnumerationOptions GetEnumerationOptions(ushort attributes) {
+        EnumerationOptions enumerationOptions = new() {
+            IgnoreInaccessible = true,
+            RecurseSubdirectories = false,
+            MatchCasing = MatchCasing.CaseInsensitive,
+            MatchType = MatchType.Win32
+        };
+
+        if (attributes == 0) {
+            enumerationOptions.AttributesToSkip = FileAttributes.System | FileAttributes.Hidden;
+            return enumerationOptions;
+        }
+
+        DosFileAttributes attributesToInclude = (DosFileAttributes)attributes;
+
+        FileAttributes attributesToSkip = 0;
+
+        if (!attributesToInclude.HasFlag(DosFileAttributes.Directory)) {
+            attributesToSkip |= FileAttributes.Directory;
+        }
+        if (!attributesToInclude.HasFlag(DosFileAttributes.System)) {
+            attributesToSkip |= FileAttributes.System;
+        }
+        if (!attributesToInclude.HasFlag(DosFileAttributes.Hidden)) {
+            attributesToSkip |= FileAttributes.Hidden;
+        }
+
+        enumerationOptions.AttributesToSkip = attributesToSkip;
+
+        return enumerationOptions;
+    }
+
+    /// <summary>
+    /// Returns the next matching file in the DTA, according to the stored file spec.
+    /// </summary>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult FindNextMatchingFile() {
+        DosDiskTransferArea dta = GetDosDiskTransferArea();
+        uint key = dta.SearchId;
+        if (!_activeFileSearches.TryGetValue(key, out FileSearchPrivateData? search)) {
+            return FileOperationErrorWithLog($"Call FindFirst first to initiate a search.",
+                DosErrorCode.NoMoreFiles);
+        }
+
+        DosFileAttributes dosSearchAttributes = (DosFileAttributes)search.SearchAttributes;
+        if (dosSearchAttributes.HasFlag(DosFileAttributes.VolumeId)) {
+            _activeFileSearches.Remove(key);
+            dta.SearchId = 0;
+            return DosFileOperationResult.LogError(DosErrorCode.NoMoreFiles);
+        }
+
+        if (TryGetVirtualMatches(search.FileSpec, search.SearchAttributes, out List<DosContentEntry>? virtualMatches) &&
+            virtualMatches is not null) {
+            DosContentEntry? contentMatch = virtualMatches.ElementAtOrDefault(search.Index);
+            if (contentMatch is null) {
+                _activeFileSearches.Remove(key);
+                dta.SearchId = 0;
+                return FileOperationErrorWithLog("No more virtual files match the search", DosErrorCode.NoMoreFiles);
+            }
+            search.Index++;
+            if (search.IsFcbSearch) {
+                UpdateDosTransferAreaWithFcbContentMatch(dta, contentMatch, search.FileSpec);
+            } else {
+                UpdateDosTransferAreaWithContentMatch(dta, contentMatch);
+            }
+            UpdateActiveSearch(key, search.FileSpec);
+            return DosFileOperationResult.NoValue();
+        }
+
+        if (!GetSearchFolder(search.FileSpec, out string? searchFolder)) {
+            return FileOperationErrorWithLog("Search in an invalid folder",
+                DosErrorCode.NoMoreFiles);
+        }
+
+        string searchPattern = GetFileSpecWithoutSubFolderOrDriveInIt(search.FileSpec) ?? search.FileSpec;
+        // DOS convention: bare * (no dot) is equivalent to *.* — match all files
+        if (string.Equals(searchPattern, "*", StringComparison.Ordinal)) {
+            searchPattern = "*.*";
+        }
+
+        EnumerationOptions enumerationOptions = GetEnumerationOptions(search.SearchAttributes);
+        string[] matchingFiles =
+            _driveManager.FindFilesUsingWildCmp(searchFolder, searchPattern, enumerationOptions).ToArray();
+
+        string? fileMatch = matchingFiles.ElementAtOrDefault(search.Index);
+        if (matchingFiles.Length == 0 || fileMatch is null) {
+            return FileOperationErrorWithLog($"No more files matching for {search.FileSpec} in path {searchFolder}",
+                DosErrorCode.NoMoreFiles);
+        }
+
+        search.Index++;
+
+        if (search.IsFcbSearch) {
+            UpdateDosTransferAreaWithFcbFileMatch(dta, fileMatch, searchFolder, search.FileSpec);
+        } else {
+            UpdateDosTransferAreaWithFileMatch(dta, search.FileSpec, fileMatch, searchFolder);
+        }
+        UpdateActiveSearch(key, search.FileSpec);
+
+        return DosFileOperationResult.NoValue();
+    }
+
+    /// <summary>
+    /// The offset part of the segmented address to the DTA.
+    /// </summary>
+    public ushort DiskTransferAreaAddressOffset => _diskTransferAreaAddressOffset;
+
+    /// <summary>
+    /// The segment part of the segmented address to the DTA.
+    /// </summary>
+    public ushort DiskTransferAreaAddressSegment => _diskTransferAreaAddressSegment;
+
+    /// <summary>
+    /// Gets the current Disk Transfer Area structure.
+    /// </summary>
+    public DosDiskTransferArea DiskTransferArea => new(_memory, GetDiskTransferAreaPhysicalAddress());
+
+    /// <summary>
+    /// Seeks to specified location in file.
+    /// </summary>
+    /// <param name="originOfMove">Can be one of those values: <br/>
+    /// 00 = beginning of file plus offset  (SEEK_SET) <br/>
+    /// 01 = current location plus offset	(SEEK_CUR) <br/>
+    /// 02 = end of file plus offset  (SEEK_END)
+    /// </param>
+    /// <param name="fileHandle">The handle to the file.</param>
+    /// <param name="offset">Number of bytes to move.</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult MoveFilePointerUsingHandle(SeekOrigin originOfMove, ushort fileHandle, int offset) {
+        if (GetOpenFile(fileHandle) is not VirtualFileBase file) {
+            return FileNotOpenedError(fileHandle);
+        }
+
+        if (_loggerService.IsEnabled(LogLevel.Trace)) {
+            _loggerService.LogTrace("Moving in file {FileMove}", file.Name);
+        }
+        try {
+            long currentPosition = file.Position;
+            if (_loggerService.IsEnabled(LogLevel.Debug)) {
+                _loggerService.LogDebug("DOS Seek handle {Handle} {Origin} offset=0x{Offset:X8} before=0x{Before:X8}",
+                    fileHandle, originOfMove, offset, currentPosition);
+            }
+            long newOffset = file.Seek(offset, originOfMove);
+            _loggerService.LogDebug("DOS Seek handle {Handle} after=0x{After:X8}", fileHandle, newOffset);
+            return DosFileOperationResult.Value32((uint)newOffset);
+        } catch (IOException e) {
+            if (_loggerService.IsEnabled(LogLevel.Error)) {
+                _loggerService.LogError(e, "An error occurred while seeking file {Error}", e);
+            }
+            return DosFileOperationResult.LogError(DosErrorCode.InvalidHandle);
+        }
+    }
+
+    /// <summary>
+    /// Opens a file and returns the file handle.
+    /// </summary>
+    /// <param name="fileName">The name of the file to open.</param>
+    /// <param name="accessMode">The access mode (read, write, or read+write)</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult OpenFileOrDevice(string fileName, FileAccessMode accessMode) {
+        CharacterDevice? device = _dosVirtualDevices.OfType<CharacterDevice>()
+            .FirstOrDefault(device => device.IsName(fileName));
+        if (device is not null) {
+            if (_loggerService.IsEnabled(LogLevel.Trace)) {
+                _loggerService.LogTrace("Opening device {FileName} with mode {OpenMode}", fileName, accessMode);
+            }
+            return OpenDevice(device);
+        }
+
+        DosFileOperationResult? memoryDriveResult = OpenMemoryDriveFile(fileName, accessMode);
+        if (memoryDriveResult != null) {
+            return memoryDriveResult;
+        }
+
+        if (accessMode == FileAccessMode.ReadOnly &&
+            _driveManager.TryOpenRead(fileName, out string? fullDosPath, out Stream? contentStream) &&
+            fullDosPath is not null && contentStream is not null) {
+            return OpenReadStream(fileName, fullDosPath, contentStream);
+        }
+
+        string? hostFileName = _driveManager.GetFullHostPathFromDosOrDefault(fileName);
+        if (string.IsNullOrWhiteSpace(hostFileName)) {
+            if (_loggerService.IsEnabled(LogLevel.Error)) {
+                _loggerService.LogError("DOS: File not found! {DosFilePathNotFound} {AccessMode}", fileName, accessMode);
+            }
+            return FileNotFoundError($"'{fileName}'");
+        }
+
+        if (_loggerService.IsEnabled(LogLevel.Debug)) {
+            _loggerService.LogDebug("Opening file {HostFileName} with mode {OpenMode}", hostFileName, accessMode);
+        }
+
+        return OpenFileInternal(fileName, hostFileName, accessMode);
+    }
+
+    private DosFileOperationResult OpenReadStream(string dosFileName, string fullDosPath, Stream stream) {
+        int? freeIndex = FindNextFreeFileIndex();
+        if (freeIndex is null) {
+            stream.Dispose();
+            return NoFreeHandleError();
+        }
+
+        ushort dosIndex = (ushort)freeIndex.Value;
+        DosFile dosFile = new(fullDosPath, dosIndex, stream) {
+            Drive = (byte)DosDriveManager.GetDriveIndex(fullDosPath[0])
+        };
+        dosFile.DeviceInformation = ComputeDefaultDeviceInformation(dosFile);
+        SetOpenFile(dosIndex, dosFile);
+        return DosFileOperationResult.Value16(dosIndex);
+    }
+
+    /// <summary>
+    /// Returns a handle to a DOS <see cref="CharacterDevice"/>
+    /// </summary>
+    /// <param name="device">The character device</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult OpenDevice(VirtualFileBase device) {
+        int? freeIndex = FindNextFreeFileIndex();
+        if (freeIndex == null) {
+            return NoFreeHandleError();
+        }
+
+        ushort dosIndex = (ushort)freeIndex.Value;
+        SetOpenFile(dosIndex, device);
+
+        return DosFileOperationResult.Value16(dosIndex);
+    }
+
+    /// <summary>
+    /// Opens a device at a requested DOS handle if that handle is available.
+    /// This is used during initialization to ensure standard devices occupy fixed handles.
+    /// </summary>
+    /// <param name="device">The device to open.</param>
+    /// <param name="requestedHandle">The DOS handle to open the device at.</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult OpenDeviceAtHandle(VirtualFileBase device, ushort requestedHandle) {
+        if (!IsHandleInRange(requestedHandle)) {
+            return DosFileOperationResult.LogError(DosErrorCode.InvalidHandle);
+        }
+
+        if (OpenFiles[requestedHandle] != null) {
+            // Slot already used
+            return DosFileOperationResult.LogError(DosErrorCode.InvalidHandle);
+        }
+
+        SetOpenFile(requestedHandle, device);
+        return DosFileOperationResult.Value16(requestedHandle);
+    }
+
+    /// <summary>
+    /// Read a file using a handle
+    /// </summary>
+    /// <param name="fileHandle">The handle to the file.</param>
+    /// <param name="readLength">The amount of data to read.</param>
+    /// <param name="targetAddress">The start address of the receiving buffer.</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult ReadFileOrDevice(ushort fileHandle, ushort readLength, uint targetAddress) {
+        if (GetOpenFile(fileHandle) is not VirtualFileBase file) {
+            return FileNotOpenedError(fileHandle);
+        }
+
+        if (_loggerService.IsEnabled(LogLevel.Trace)) {
+            _loggerService.LogTrace("Reading from file {FileName}", file.Name);
+        }
+
+        byte[] buffer = new byte[readLength];
+        int actualReadLength;
+        try {
+            actualReadLength = file.Read(buffer, 0, readLength);
+        } catch (IOException e) {
+            throw new UnrecoverableException("IOException while reading file", e);
+        }
+
+        if (actualReadLength < 1) {
+            // EOF
+            return DosFileOperationResult.Value16(0);
+        }
+
+        if (actualReadLength > 0) {
+            _memory.LoadData(targetAddress, buffer, actualReadLength);
+            if (file is DosFile actualFile) {
+                actualFile.AddMemoryRange(new MemoryRange(targetAddress,
+                    (uint)(targetAddress + actualReadLength - 1), file.Name));
+            }
+        }
+
+        return DosFileOperationResult.Value16((ushort)actualReadLength);
+    }
+
+    /// <summary>
+    /// Sets the current directory for the <see cref="DosFileManager"/>
+    /// </summary>
+    /// <param name="newPath">The new current directory path</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult SetCurrentDir(string newPath) => _driveManager.SetCurrentDir(newPath);
+
+    /// <summary>
+    /// Sets the segmented address to the DTA.
+    /// </summary>
+    /// <param name="diskTransferAreaAddressSegment">The segment part of the segmented address to the DTA.</param>
+    /// <param name="diskTransferAreaAddressOffset">The offset part of the segmented address to the DTA.</param>
+    public void SetDiskTransferAreaAddress(ushort diskTransferAreaAddressSegment, ushort diskTransferAreaAddressOffset) {
+        _diskTransferAreaAddressSegment = diskTransferAreaAddressSegment;
+        _diskTransferAreaAddressOffset = diskTransferAreaAddressOffset;
+    }
+
+    /// <summary>
+    /// Writes data to a file using a file handle.
+    /// </summary>
+    /// <param name="fileHandle">The file handle to use.</param>
+    /// <param name="writeLength">The length of the data to write.</param>
+    /// <param name="bufferAddress">The address of the buffer containing the data to write.</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> object representing the result of the operation.</returns>
+    public DosFileOperationResult WriteToFileOrDevice(ushort fileHandle, ushort writeLength, uint bufferAddress) {
+        if (!IsHandleInRange(fileHandle)) {
+            if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                _loggerService.LogWarning("Invalid or unsupported file handle {FileHandle}. Doing nothing", fileHandle);
+            }
+        }
+
+        VirtualFileBase? file = GetOpenFile(fileHandle);
+        if (file == null) {
+            return FileNotOpenedError(fileHandle);
+        }
+
+        if (file is DosFile dosFile && IsReadOnlyDrive(dosFile.Drive)) {
+            return DosFileOperationResult.LogError(DosErrorCode.AccessDenied);
+        }
+
+        try {
+            byte[] data = _memory.GetSlice((int)bufferAddress, writeLength).ToArray();
+            if (_loggerService.IsEnabled(LogLevel.Trace)) {
+                string valueAsString = _dosStringDecoder.ConvertDosChars(data);
+                _loggerService.LogTrace("Writing to file or device content: {Name} {Bytes} {CodePage850String}",
+                    file.Name, data.ToArray(), valueAsString);
+            }
+
+            file.Write(data);
+        } catch (IOException e) {
+            throw new UnrecoverableException("IOException while writing file", e);
+        }
+
+        return DosFileOperationResult.Value16(writeLength);
+    }
+
+    private static void UpdateDosTransferAreaWithDeviceMatch(DosDiskTransferArea dta,
+        string deviceName) {
+        dta.FileAttributes = (byte)DosFileAttributes.Normal;
+        dta.FileDate = 0;
+        dta.FileTime = 0;
+        dta.FileSize = 0;
+        dta.FileName = deviceName.ToUpperInvariant();
+    }
+
+    private int CountHandles(DosFile openFileToCount) => OpenFiles.Count(openFile => openFile == openFileToCount);
+
+    private DosFileOperationResult FileAccessDeniedError(string? filename) {
+        return FileOperationErrorWithLog($"File {filename} already in use!", DosErrorCode.AccessDenied);
+    }
+
+    private bool IsReadOnlyDosPath(string dosPath) {
+        if (!_driveManager.TryGetDosDriveIndexFromDosPath(dosPath.AsSpan(), out int driveIndex, out bool _)) {
+            return false;
+        }
+
+        return IsReadOnlyDrive((byte)driveIndex);
+    }
+
+    private bool IsReadOnlyDrive(byte driveIndex) {
+        if (!_dosDriveManager.TryGetDriveAtIndex(driveIndex, out DosDriveBase? drive)) {
+            return false;
+        }
+
+        return drive.IsReadOnlyMedium;
+    }
+
+    private DosFileOperationResult FileNotFoundError(string? fileName) {
+        return FileOperationErrorWithLog($"File {fileName} not found!", DosErrorCode.FileNotFound);
+    }
+
+    private DosFileOperationResult PathNotFoundError(string? path) {
+        return FileOperationErrorWithLog($"File {path} not found!", DosErrorCode.PathNotFound);
+    }
+
+    private DosFileOperationResult RemoveCurrentDirError(string? path) {
+        return FileOperationErrorWithLog($"Attempted to remove current dir {path}",
+            DosErrorCode.AttemptedToRemoveCurrentDirectory);
+    }
+
+    private DosFileOperationResult FileOperationErrorWithLog(string message, DosErrorCode errorCode) {
+        if (_loggerService.IsEnabled(LogLevel.Warning)) {
+            _loggerService.LogWarning("{FileNotFoundErrorWithLog}: {Message}", nameof(FileOperationErrorWithLog), message);
+        }
+
+        return DosFileOperationResult.LogError(errorCode);
+    }
+
+    private DosFileOperationResult FileNotOpenedError(int fileHandle) {
+        if (_loggerService.IsEnabled(LogLevel.Warning)) {
+            _loggerService.LogWarning("File not opened: {FileHandle}", fileHandle);
+        }
+        return DosFileOperationResult.LogError(DosErrorCode.InvalidHandle);
+    }
+
+    private int? FindNextFreeFileIndex() {
+        for (int i = 0; i < OpenFiles.Length; i++) {
+            if (OpenFiles[i] == null) {
+                return i;
+            }
+        }
+
+        return null;
+    }
+
+    private DosFileOperationResult? OpenMemoryDriveFile(string dosFileName, FileAccessMode accessMode) {
+        MemoryDrivePathContext? context = GetMemoryDrivePathContext(dosFileName);
+        if (context == null) {
+            return null;
+        }
+
+        if (accessMode != FileAccessMode.ReadOnly) {
+            return DosFileOperationResult.LogError(DosErrorCode.AccessDenied);
+        }
+
+        if (!context.Value.MemoryDrive.FileExists(context.Value.RelativePath)) {
+            return FileNotFoundError($"'{dosFileName}'");
+        }
+
+        int? freeIndex = FindNextFreeFileIndex();
+        if (freeIndex == null) {
+            return NoFreeHandleError();
+        }
+
+        ushort dosIndex = (ushort)freeIndex.Value;
+        MemoryStream stream = new(context.Value.MemoryDrive.GetFile(context.Value.RelativePath), writable: false);
+        DosFile dosFile = new(context.Value.FullDosPath, dosIndex, stream) {
+            Drive = (byte)DosDriveManager.GetDriveIndex(context.Value.MemoryDrive.DriveLetter)
+        };
+        dosFile.DeviceInformation = ComputeDefaultDeviceInformation(dosFile);
+        SetOpenFile(dosIndex, dosFile);
+        return DosFileOperationResult.Value16(dosIndex);
+    }
+
+    private MemoryDrivePathContext? GetMemoryDrivePathContext(string dosPath) {
+        string? fullDosPath = _driveManager.GetFullDosPathIncludingRoot(dosPath);
+        if (string.IsNullOrWhiteSpace(fullDosPath) || fullDosPath.Length <= 3) {
+            return null;
+        }
+
+        if (!_dosDriveManager.TryGetMemoryDrive(fullDosPath[0], out MemoryDrive? resolvedMemoryDrive)) {
+            return null;
+        }
+
+        string relativePath = fullDosPath[3..];
+        return new MemoryDrivePathContext(resolvedMemoryDrive, fullDosPath, relativePath);
+    }
+
+    /// <summary>
+    /// Gets the physical address of the Disk Transfer Area (DTA).
+    /// </summary>
+    /// <returns>The physical address computed from DTA segment and offset.</returns>
+    public uint GetDiskTransferAreaPhysicalAddress() => MemoryUtils.ToPhysicalAddress(
+        _diskTransferAreaAddressSegment, _diskTransferAreaAddressOffset);
+
+    private VirtualFileBase? GetOpenFile(ushort fileHandle) {
+        if (!IsHandleInRange(fileHandle)) {
+            return null;
+        }
+        return OpenFiles[fileHandle];
+    }
+
+    private bool IsHandleInRange(ushort fileHandle) => fileHandle < OpenFiles.Length;
+
+    private DosFileOperationResult NoFreeHandleError() {
+        if (_loggerService.IsEnabled(LogLevel.Warning)) {
+            _loggerService.LogWarning("Could not find a free handle {MethodName}", nameof(NoFreeHandleError));
+        }
+        return DosFileOperationResult.LogError(DosErrorCode.TooManyOpenFiles);
+    }
+
+    internal string? GetFullHostPathFromDos(string dosPath) => _driveManager.
+        GetFullHostPathFromDosOrDefault(dosPath);
+
+    internal string? TryGetFullHostPathFromDos(string dosPath) => _driveManager.
+        GetFullHostPathFromDosOrDefault(dosPath);
+
+    internal string? GetFullHostExecutablePathFromDos(string dosPath) => _driveManager.
+        GetFullHostExecutablePathFromDosOrDefault(dosPath);
+
+    internal string? TryGetFullHostExecutablePathFromDos(string dosPath) => _driveManager.
+        GetFullHostExecutablePathFromDosOrDefault(dosPath);
+
+    internal bool FileOrDeviceExists(string dosPath) {
+        CharacterDevice? device = _dosVirtualDevices.OfType<CharacterDevice>()
+            .FirstOrDefault(characterDevice => characterDevice.IsName(dosPath));
+        if (device is not null) {
+            return true;
+        }
+
+        MemoryDrivePathContext? memoryDriveContext = GetMemoryDrivePathContext(dosPath);
+        if (memoryDriveContext != null) {
+            return memoryDriveContext.Value.MemoryDrive.FileExists(memoryDriveContext.Value.RelativePath);
+        }
+
+        if (_dosDriveManager.TryGetContentEntry(dosPath, out DosContentEntry? contentEntry)) {
+            return contentEntry is not null;
+        }
+
+        string? hostFileName = _driveManager.GetFullHostPathFromDosOrDefault(dosPath);
+        return !string.IsNullOrWhiteSpace(hostFileName) && File.Exists(hostFileName);
+    }
+
+    internal string[] FindMatchingFileNames(string dosFileSpec) {
+        if (!GetSearchFolder(dosFileSpec, out string? searchFolder)) {
+            return Array.Empty<string>();
+        }
+
+        string searchPattern = GetFileSpecWithoutSubFolderOrDriveInIt(dosFileSpec) ?? dosFileSpec;
+        // DOS convention: bare * (no dot) is equivalent to *.* — match all files
+        if (string.Equals(searchPattern, "*", StringComparison.Ordinal)) {
+            searchPattern = "*.*";
+        }
+
+        EnumerationOptions options = new() { MatchCasing = MatchCasing.CaseInsensitive };
+        string[] matchingPaths = _driveManager.FindFilesUsingWildCmp(searchFolder, searchPattern, options).ToArray();
+        string[] fileNames = new string[matchingPaths.Length];
+        for (int i = 0; i < matchingPaths.Length; i++) {
+            fileNames[i] = Path.GetFileName(matchingPaths[i]).ToUpperInvariant();
+        }
+
+        Array.Sort(fileNames, StringComparer.OrdinalIgnoreCase);
+        return fileNames;
+    }
+
+    /// <summary>
+    /// Converts a DateTime to DOS packed date format.
+    /// DOS date format: bits 15-9=year-1980, bits 8-5=month, bits 4-0=day.
+    /// </summary>
+    public static ushort ToDosDate(DateTime localDate) {
+        int day = localDate.Day;
+        int month = localDate.Month;
+        int dosYear = localDate.Year - 1980;
+        return (ushort)((day & 0b11111) | (month & 0b1111) << 5 | (dosYear & 0b1111111) << 9);
+    }
+
+    /// <summary>
+    /// Converts a DateTime to DOS packed time format.
+    /// DOS time format: bits 15-11=hour, bits 10-5=minute, bits 4-0=seconds/2.
+    /// </summary>
+    public static ushort ToDosTime(DateTime localTime) {
+        int dosSeconds = localTime.Second / 2;
+        int minutes = localTime.Minute;
+        int hours = localTime.Hour;
+        return (ushort)((dosSeconds & 0b11111) | (minutes & 0b111111) << 5 | (hours & 0b11111) << 11);
+    }
+
+    private ushort ComputeDefaultDeviceInformation(DosFile dosFile) {
+        byte driveIndex = dosFile.Drive == 0xff ? _dosDriveManager.CurrentDriveIndex : dosFile.Drive;
+        bool isRemovable = driveIndex <= 1;
+        bool isRemote = false;
+        if (_dosDriveManager.TryGetDriveAtIndex(driveIndex, out DosDriveBase? drive)) {
+            isRemovable = drive.IsRemovable;
+            isRemote = drive.IsRemote;
+        }
+
+        ushort info = (ushort)(driveIndex & 0x3F);
+        if (!isRemovable) {
+            info |= 0x0800;
+        }
+
+        if (isRemote) {
+            info |= 0x1000;
+            info |= 0x8000;
+        }
+
+        return info;
+    }
+
+    private readonly struct MemoryDrivePathContext {
+        public MemoryDrivePathContext(MemoryDrive memoryDrive, string fullDosPath, string relativePath) {
+            MemoryDrive = memoryDrive;
+            FullDosPath = fullDosPath;
+            RelativePath = relativePath;
+        }
+
+        public MemoryDrive MemoryDrive { get; }
+        public string FullDosPath { get; }
+        public string RelativePath { get; }
+    }
+
+    private DosFileOperationResult OpenFileInternal(string dosFileName, string? hostFileName, FileAccessMode openMode) {
+        if (string.IsNullOrWhiteSpace(hostFileName)) {
+            // Not found
+            return FileNotFoundError(dosFileName);
+        }
+
+        if (openMode != FileAccessMode.ReadOnly && IsReadOnlyDosPath(dosFileName)) {
+            return DosFileOperationResult.LogError(DosErrorCode.AccessDenied);
+        }
+
+        int? freeIndex = FindNextFreeFileIndex();
+        if (freeIndex == null) {
+            return NoFreeHandleError();
+        }
+
+        ushort dosIndex = (ushort)freeIndex.Value;
+        try {
+            Stream? randomAccessFile = null;
+            switch (openMode) {
+                case FileAccessMode.ReadOnly: {
+                        if (File.Exists(hostFileName)) {
+                            randomAccessFile = File.Open(hostFileName,
+                                FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                        } else {
+                            return FileNotFoundError(dosFileName);
+                        }
+
+                        break;
+                    }
+                case FileAccessMode.WriteOnly:
+                    randomAccessFile = File.Open(hostFileName, FileMode.OpenOrCreate,
+                        FileAccess.Write, FileShare.ReadWrite);
+                    break;
+                case FileAccessMode.ReadWrite: {
+                        if (File.Exists(hostFileName)) {
+                            randomAccessFile = File.Open(hostFileName, FileMode.Open,
+                                FileAccess.ReadWrite, FileShare.ReadWrite);
+                        } else {
+                            return FileNotFoundError(dosFileName);
+                        }
+                        break;
+                    }
+            }
+
+            if (randomAccessFile != null) {
+                byte driveIndex = _dosDriveManager.CurrentDriveIndex;
+                DosFile dosFile = new(dosFileName, dosIndex, randomAccessFile) {
+                    Drive = driveIndex
+                };
+                dosFile.DeviceInformation = ComputeDefaultDeviceInformation(dosFile);
+                SetOpenFile(dosIndex, dosFile);
+            }
+        } catch (FileNotFoundException) {
+            return FileNotFoundError(dosFileName);
+        } catch (IOException) {
+            return FileAccessDeniedError(dosFileName);
+        }
+
+        return DosFileOperationResult.Value16(dosIndex);
+    }
+
+    private void SetOpenFile(ushort fileHandle, VirtualFileBase? openFile) {
+        OpenFiles[fileHandle] = openFile;
+        _jobFileTableReferenceCounts[fileHandle] = openFile is null ? (byte)0 : (byte)1;
+    }
+
+    /// <summary>
+    /// Gets how many job file table entries reference a system file table entry.
+    /// </summary>
+    /// <param name="systemFileTableIndex">The index in <see cref="OpenFiles"/>.</param>
+    /// <returns>0 when the entry is not open, at least 1 otherwise.</returns>
+    public byte GetHandleReferenceCount(byte systemFileTableIndex) {
+        if (!IsHandleInRange(systemFileTableIndex) || OpenFiles[systemFileTableIndex] is null) {
+            return 0;
+        }
+        return Math.Max(_jobFileTableReferenceCounts[systemFileTableIndex], (byte)1);
+    }
+
+    /// <summary>
+    /// Adds a job file table reference to an open system file table entry, as done by handle duplication and process inheritance.
+    /// </summary>
+    /// <param name="systemFileTableIndex">The index in <see cref="OpenFiles"/>.</param>
+    /// <returns><c>true</c> when the entry is open and the reference was added.</returns>
+    public bool AddHandleReference(byte systemFileTableIndex) {
+        byte referenceCount = GetHandleReferenceCount(systemFileTableIndex);
+        if (referenceCount is 0 or byte.MaxValue) {
+            return false;
+        }
+        _jobFileTableReferenceCounts[systemFileTableIndex] = (byte)(referenceCount + 1);
+        return true;
+    }
+
+    /// <summary>
+    /// Releases a job file table reference to a system file table entry. The entry is closed when its last reference is released.
+    /// </summary>
+    /// <param name="systemFileTableIndex">The index in <see cref="OpenFiles"/>.</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> holding the remaining reference count.</returns>
+    public DosFileOperationResult ReleaseHandleReference(byte systemFileTableIndex) {
+        byte referenceCount = GetHandleReferenceCount(systemFileTableIndex);
+        if (referenceCount == 0) {
+            return FileNotOpenedError(systemFileTableIndex);
+        }
+        if (referenceCount > 1) {
+            _jobFileTableReferenceCounts[systemFileTableIndex] = (byte)(referenceCount - 1);
+            return DosFileOperationResult.NoValueWithRefCount((byte)(referenceCount - 1));
+        }
+        if (OpenFiles[systemFileTableIndex] is DosFile) {
+            return CloseFileOrDevice(systemFileTableIndex);
+        }
+        SetOpenFile(systemFileTableIndex, null);
+        return DosFileOperationResult.NoValueWithRefCount(0);
+    }
+
+    private void UpdateDosTransferAreaWithFileMatch(DosDiskTransferArea dta, string fileSpec,
+        string matchingFileSystemEntry, string searchFolder) {
+        if (_loggerService.IsEnabled(LogLevel.Trace)) {
+            _loggerService.LogTrace("Found matching file {MatchingFileSystemEntry}", matchingFileSystemEntry);
+        }
+
+        FileSystemInfo entryInfo = Directory.Exists(matchingFileSystemEntry) ?
+            new DirectoryInfo(matchingFileSystemEntry) : new FileInfo(matchingFileSystemEntry);
+        DateTime creationZonedDateTime = entryInfo.CreationTimeUtc;
+        DateTime creationLocalDate = creationZonedDateTime.ToLocalTime();
+        DateTime creationLocalTime = creationZonedDateTime.ToLocalTime();
+        DosFileAttributes dosAttributes = (DosFileAttributes)entryInfo.Attributes;
+        dta.FileAttributes = (byte)dosAttributes;
+        dta.FileDate = ToDosDate(creationLocalDate);
+        dta.FileTime = ToDosTime(creationLocalTime);
+        if (entryInfo is FileInfo fileInfo) {
+            dta.FileSize = (uint)fileInfo.Length;
+        } else {
+            // The FAT node entry size for a directory
+            dta.FileSize = 4096;
+        }
+        dta.FileName = DosDriveManager.GetShortFileName(Path.GetFileName(matchingFileSystemEntry), searchFolder);
+    }
+
+    /// <summary>
+    /// Extracts the drive letter from a DOS file specification and returns the corresponding
+    /// <see cref="FolderDrive"/>. Falls back to <see cref="DosDriveManager.CurrentDrive"/>
+    /// if no drive letter is present or the specified drive is not mounted.
+    /// </summary>
+    private DosDriveBase ResolveDriveFromFileSpec(string fileSpec) {
+        if (fileSpec.Length >= 2 && fileSpec[1] == DosDriveManager.VolumeSeparatorChar) {
+            char driveLetter = fileSpec[0];
+            if (_dosDriveManager.TryGetDrive(driveLetter, out DosDriveBase? drive)) {
+                return drive;
+            }
+        }
+        return _dosDriveManager.CurrentDrive;
+    }
+
+    private DosFileOperationResult FindVolumeLabel(DosDiskTransferArea dta, string fileSpec,
+        ushort searchAttributes, bool isFcbSearch) {
+        DosDriveBase targetDrive = ResolveDriveFromFileSpec(fileSpec);
+        string driveLabel = targetDrive.Label.ToUpperInvariant();
+        if (isFcbSearch) {
+            byte driveIndex = (byte)DosDriveManager.GetDriveIndexOrThrow(targetDrive.DriveLetter, nameof(fileSpec));
+            WriteFcbVolumeLabelToDta(dta, driveLabel, driveIndex);
+        } else {
+            WriteExtendedVolumeLabelToDta(dta, driveLabel);
+        }
+        _activeFileSearches.Add(dta.SearchId, new(fileSpec, 1, searchAttributes, isFcbSearch));
+        return DosFileOperationResult.NoValue();
+    }
+
+    /// <summary>
+    /// Writes a volume label to the DTA in FCB format using the specified zero-based drive index.
+    /// The drive index is converted to a one-based drive number for the FCB structure (0=A: becomes 1).
+    /// </summary>
+    private static void WriteFcbVolumeLabelToDta(DosDiskTransferArea dta, string driveLabel, byte driveIndex) {
+        SplitLabelToFcbFields(driveLabel, out string name, out string ext);
+        byte driveNumber = (byte)(driveIndex + 1);
+        UpdateDosTransferAreaWithFcbResult(dta, name, ext,
+            (byte)DosFileAttributes.VolumeId, 0, 0, 0, driveNumber);
+    }
+
+    private static void WriteExtendedVolumeLabelToDta(DosDiskTransferArea dta, string driveLabel) {
+        dta.FileAttributes = (byte)DosFileAttributes.VolumeId;
+        dta.FileDate = 0;
+        dta.FileTime = 0;
+        dta.FileSize = 0;
+        dta.FileName = PackNameFromLabel(driveLabel);
+    }
+
+    /// <summary>
+    /// Formats a volume label into 8.3 ASCIIZ format using the same PackName logic
+    /// as MS-DOS uses for extended find (AH=4Eh). The first 8 bytes are treated as
+    /// the filename portion and bytes 8-10 as the extension portion.
+    /// </summary>
+    internal static string PackNameFromLabel(string label) {
+        string padded = label.PadRight(11);
+        string namePart = padded[..8].TrimEnd();
+        string extPart = padded[8..11].TrimEnd();
+        if (extPart.Length > 0) {
+            return $"{namePart}.{extPart}";
+        }
+        return namePart;
+    }
+
+    /// <summary>
+    /// Splits a volume label into FCB name (8 chars) and extension (3 chars) fields,
+    /// both space-padded. The first 8 characters become the name, the rest become the extension.
+    /// </summary>
+    internal static void SplitLabelToFcbFields(string label, out string name, out string ext) {
+        string padded = label.PadRight(11);
+        name = padded[..8];
+        ext = padded[8..11];
+    }
+
+    private void UpdateDosTransferAreaWithFcbFileMatch(DosDiskTransferArea dta,
+        string matchingFileSystemEntry, string searchFolder, string fileSpec) {
+        if (_loggerService.IsEnabled(LogLevel.Trace)) {
+            _loggerService.LogTrace("FCB: Found matching file {MatchingFileSystemEntry}", matchingFileSystemEntry);
+        }
+
+        DosFileEntryInfo entryInfo = _driveManager.GetDosFileEntryInfo(matchingFileSystemEntry, searchFolder);
+        DateTime creationLocalDate = entryInfo.CreationTimeUtc.ToLocalTime();
+
+        string nameOnly = Path.GetFileNameWithoutExtension(entryInfo.ShortName);
+        string extOnly = Path.GetExtension(entryInfo.ShortName).TrimStart('.');
+
+        DosDriveBase targetDrive = ResolveDriveFromFileSpec(fileSpec);
+        byte driveNumber = (byte)(DosDriveManager.GetDriveIndexOrThrow(targetDrive.DriveLetter, nameof(fileSpec)) + 1);
+        UpdateDosTransferAreaWithFcbResult(dta, nameOnly, extOnly, (byte)entryInfo.Attributes,
+            ToDosDate(creationLocalDate), ToDosTime(creationLocalDate), entryInfo.FileSize, driveNumber);
+    }
+
+    private static void UpdateDosTransferAreaWithFcbResult(DosDiskTransferArea dta,
+        string fileName, string fileExtension, byte attributes,
+        ushort dosDate, ushort dosTime, uint fileSize, byte driveNumber) {
+        DosFileControlBlock resultFcb = new(dta.ByteReaderWriter, dta.BaseAddress);
+        resultFcb.DriveNumber = driveNumber;
+        resultFcb.FileName = fileName.ToUpperInvariant().PadRight(DosFileControlBlock.FileNameSize);
+        resultFcb.FileExtension = fileExtension.ToUpperInvariant().PadRight(DosFileControlBlock.FileExtensionSize);
+        resultFcb.CurrentBlock = 0;
+        resultFcb.RecordSize = 0;
+        resultFcb.FileSize = fileSize;
+        resultFcb.Date = dosDate;
+        resultFcb.Time = dosTime;
+    }
+
+    private static void UpdateDosTransferAreaWithFcbResult(DosDiskTransferArea dta,
+        string dosFileName, byte attributes, ushort dosDate, ushort dosTime, uint fileSize) {
+        string nameOnly = Path.GetFileNameWithoutExtension(dosFileName);
+        string extOnly = Path.GetExtension(dosFileName).TrimStart('.');
+        UpdateDosTransferAreaWithFcbResult(dta, nameOnly, extOnly, attributes, dosDate, dosTime, fileSize, 0);
+    }
+
+    private DosDiskTransferArea GetDosDiskTransferArea() {
+        uint diskTransferAreaPhysicalAddress = GetDiskTransferAreaPhysicalAddress();
+        DosDiskTransferArea dosDiskTransferArea = new(_memory, diskTransferAreaPhysicalAddress);
+        return dosDiskTransferArea;
+    }
+
+    /// <summary>
+    /// Creates a directory on disk.
+    /// </summary>
+    /// <param name="dosDirectory">The directory name to create</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult CreateDirectory(string dosDirectory) {
+        if (IsReadOnlyDosPath(dosDirectory)) {
+            return DosFileOperationResult.LogError(DosErrorCode.AccessDenied);
+        }
+
+        string? parentFolder = _driveManager.GetFullHostParentPathFromDosOrDefault(dosDirectory);
+        if (string.IsNullOrWhiteSpace(parentFolder)) {
+            return PathNotFoundError(dosDirectory);
+        }
+
+        if (_driveManager.AnyDosDirectoryOrFileWithTheSameName(dosDirectory, new DirectoryInfo(parentFolder))) {
+            return FileAccessDeniedError(dosDirectory);
+        }
+
+        string? prefixedDosDirectory = _driveManager.PrefixWithHostDirectory(dosDirectory);
+        if (prefixedDosDirectory is null) {
+            return PathNotFoundError(dosDirectory);
+        }
+
+        try {
+            Directory.CreateDirectory(prefixedDosDirectory);
+            if (_loggerService.IsEnabled(LogLevel.Information)) {
+                _loggerService.LogInformation("Created dir: {CreatedDirPath}", prefixedDosDirectory);
+            }
+            return DosFileOperationResult.NoValue();
+        } catch (IOException e) {
+            if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                _loggerService.LogWarning(e, "Error while creating directory {CaseInsensitivePath}: {Exception}",
+                    prefixedDosDirectory, e);
+            }
+        }
+
+        return PathNotFoundError(dosDirectory);
+    }
+
+    /// <summary>
+    /// Removes a file on disk.
+    /// </summary>
+    /// <param name="dosFile">The file name to delete</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult RemoveFile(string dosFile) {
+        if (IsReadOnlyDosPath(dosFile)) {
+            return DosFileOperationResult.LogError(DosErrorCode.AccessDenied);
+        }
+
+        string? fullHostPath = _driveManager.GetFullHostPathFromDosOrDefault(dosFile);
+        if (string.IsNullOrWhiteSpace(fullHostPath)) {
+            return PathNotFoundError(dosFile);
+        }
+
+        try {
+            FileAttributes attrs = File.GetAttributes(fullHostPath);
+            if ((attrs & FileAttributes.ReadOnly) != 0) {
+                return DosFileOperationResult.LogError(DosErrorCode.AccessDenied);
+            }
+
+            File.Delete(fullHostPath);
+            if (_loggerService.IsEnabled(LogLevel.Information)) {
+                _loggerService.LogInformation("Deleted file: {DeletedFilePath}", fullHostPath);
+            }
+
+            return DosFileOperationResult.NoValue();
+        } catch (UnauthorizedAccessException e) {
+            if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                _loggerService.LogWarning(e, "Access denied while deleting file {Path}", fullHostPath);
+            }
+            return DosFileOperationResult.LogError(DosErrorCode.AccessDenied);
+        } catch (IOException e) {
+            if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                _loggerService.LogWarning(e, "Error while deleting file {CaseInsensitivePath}: {Exception}",
+                    fullHostPath, e);
+            }
+        }
+
+        return PathNotFoundError(dosFile);
+    }
+
+    /// <summary>
+    /// Renames a file on disk.
+    /// </summary>
+    /// <param name="oldDosPath">The existing DOS file path to rename.</param>
+    /// <param name="newDosName">The new file name (may be just a name, or a full path).</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult RenameFile(string oldDosPath, string newDosName) {
+        if (IsReadOnlyDosPath(oldDosPath) || IsReadOnlyDosPath(newDosName)) {
+            return DosFileOperationResult.LogError(DosErrorCode.AccessDenied);
+        }
+
+        string? fullOldHostPath = _driveManager.GetFullHostPathFromDosOrDefault(oldDosPath);
+        if (string.IsNullOrWhiteSpace(fullOldHostPath) || !File.Exists(fullOldHostPath)) {
+            return PathNotFoundError(oldDosPath);
+        }
+
+        string? parentDir = Path.GetDirectoryName(fullOldHostPath);
+        if (string.IsNullOrWhiteSpace(parentDir)) {
+            return PathNotFoundError(oldDosPath);
+        }
+
+        // Extract only the file name from the DOS path using DOS-aware parsing.
+        // Path.GetFileName does not treat '\' as a separator on Linux, so we
+        // normalise separators first and take the segment after the last backslash.
+        string normalizedNewDosName = newDosName.Replace('/', '\\');
+        int lastSepIndex = normalizedNewDosName.LastIndexOf('\\');
+        string newFileName = lastSepIndex >= 0
+            ? normalizedNewDosName[(lastSepIndex + 1)..]
+            : normalizedNewDosName;
+        string fullNewHostPath = Path.Join(parentDir, newFileName);
+
+        try {
+            File.Move(fullOldHostPath, fullNewHostPath);
+            if (_loggerService.IsEnabled(LogLevel.Information)) {
+                _loggerService.LogInformation("Renamed file: {OldPath} -> {NewPath}", fullOldHostPath, fullNewHostPath);
+            }
+
+            return DosFileOperationResult.NoValue();
+        } catch (IOException e) {
+            if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                _loggerService.LogWarning(e, "Error while renaming file {OldPath} to {NewPath}: {Exception}",
+                    fullOldHostPath, fullNewHostPath, e);
+            }
+        }
+
+        return FileAccessDeniedError(oldDosPath);
+    }
+
+    /// <summary>
+    /// Moves a file to a new DOS path (supports cross-directory moves).
+    /// </summary>
+    /// <param name="oldDosPath">The existing DOS file path to move.</param>
+    /// <param name="newDosPath">The full destination DOS path.</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult MoveFile(string oldDosPath, string newDosPath) {
+        if (IsReadOnlyDosPath(oldDosPath) || IsReadOnlyDosPath(newDosPath)) {
+            return DosFileOperationResult.LogError(DosErrorCode.AccessDenied);
+        }
+
+        string? fullOldHostPath = _driveManager.GetFullHostPathFromDosOrDefault(oldDosPath);
+        if (string.IsNullOrWhiteSpace(fullOldHostPath) || !File.Exists(fullOldHostPath)) {
+            return PathNotFoundError(oldDosPath);
+        }
+
+        string? fullNewHostPath = _driveManager.ResolveNewFilePath(newDosPath);
+        if (string.IsNullOrWhiteSpace(fullNewHostPath)) {
+            return PathNotFoundError(newDosPath);
+        }
+
+        try {
+            File.Move(fullOldHostPath, fullNewHostPath);
+            if (_loggerService.IsEnabled(LogLevel.Information)) {
+                _loggerService.LogInformation("Moved file: {OldPath} -> {NewPath}", fullOldHostPath, fullNewHostPath);
+            }
+
+            return DosFileOperationResult.NoValue();
+        } catch (IOException e) {
+            if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                _loggerService.LogWarning(e, "Error while moving file {OldPath} to {NewPath}: {Exception}",
+                    fullOldHostPath, fullNewHostPath, e);
+            }
+        }
+
+        return FileAccessDeniedError(oldDosPath);
+    }
+
+    /// <summary>
+    /// Removes a directory on disk.
+    /// </summary>
+    /// <param name="dosDirectory">The directory name to delete</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult RemoveDirectory(string dosDirectory) {
+        if (IsReadOnlyDosPath(dosDirectory)) {
+            return DosFileOperationResult.LogError(DosErrorCode.AccessDenied);
+        }
+
+        string? hostDirToDelete = _driveManager.GetFullHostPathFromDosOrDefault(dosDirectory);
+
+        if (string.IsNullOrWhiteSpace(hostDirToDelete) ||
+            !Directory.Exists(hostDirToDelete)) {
+            return PathNotFoundError(dosDirectory);
+        }
+
+        _driveManager.GetCurrentDosDirectory(_dosDriveManager.CurrentDriveIndex, out string currentDir);
+        string? currentHostPath = _driveManager.GetFullHostPathFromDosOrDefault(currentDir);
+
+        if (!string.IsNullOrWhiteSpace(currentHostPath) &&
+            currentHostPath.StartsWith(hostDirToDelete, StringComparison.OrdinalIgnoreCase)) {
+            return RemoveCurrentDirError(dosDirectory);
+        }
+
+        try {
+            Directory.Delete(hostDirToDelete);
+            if (_loggerService.IsEnabled(LogLevel.Information)) {
+                _loggerService.LogInformation("Deleted dir: {DeletedDirPath}", hostDirToDelete);
+            }
+
+            return DosFileOperationResult.NoValue();
+        } catch (IOException e) {
+            if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                _loggerService.LogWarning(e, "Error while deleting directory {CaseInsensitivePath}: {Exception}",
+                    hostDirToDelete, e);
+            }
+        }
+
+        return PathNotFoundError(dosDirectory);
+    }
+
+    /// <summary>
+    /// Gets the current DOS directory.
+    /// </summary>
+    /// <param name="driveNumber">The drive number (0x0: default, 0x1: A:, 0x2: B:, 0x3: C:, ...)</param>
+    /// <param name="currentDir">The string variable receiving the current DOS directory.</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult GetCurrentDir(byte driveNumber, out string currentDir) =>
+        _driveManager.GetCurrentDosDirectory(driveNumber, out currentDir);
+
+    /// <summary>
+    /// Tells whether an INT 21h AH=44h subfunction takes a file handle in BX.
+    /// </summary>
+    /// <param name="subfunction">The IOCTL subfunction in AL.</param>
+    public static bool IsIoctlHandleSubfunction(byte subfunction) {
+        return (IoctlSubfunction)subfunction is < IoctlSubfunction.ReadBlockControlChannel or
+            IoctlSubfunction.GetInputStatus or IoctlSubfunction.GetOutputStatus or
+            IoctlSubfunction.IsHandleRemote or IoctlSubfunction.GenericCharDeviceRequest or
+            IoctlSubfunction.QueryIoctlHandle;
+    }
+
+    /// <summary>
+    /// Executes an INT 21h AH=44h IOCTL subfunction. Handle subfunctions take a system file table index in BX.
+    /// </summary>
+    /// <param name="state">The CPU state holding the IOCTL registers.</param>
+    /// <returns>A <see cref="DosFileOperationResult"/> with details about the result of the operation.</returns>
+    public DosFileOperationResult IoControl(State state) {
+        byte handle = 0;
+        byte drive = 0;
+        string operationName = $"IOCTL function 0x{state.AL:X2}";
+
+        IoctlSubfunction subfunction = (IoctlSubfunction)state.AL;
+
+        if (IsIoctlHandleSubfunction(state.AL)) {
+            handle = (byte)state.BX;
+            if (handle >= OpenFiles.Length || OpenFiles[handle] == null) {
+                if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                    _loggerService.LogWarning("IOCTL: Invalid handle {Handle} for {Operation}", handle, operationName);
+                }
+                return DosFileOperationResult.LogError(DosErrorCode.InvalidHandle);
+            }
+        } else if (subfunction <= IoctlSubfunction.QueryIoctlDevice) {
+            if (subfunction != IoctlSubfunction.SetSharingRetryCount) {
+                drive = (byte)(state.BX == 0 ? _dosDriveManager.CurrentDriveIndex : (state.BX - 1));
+                if (drive >= DosDriveManager.MaxDriveCount ||
+                    (drive >= 2 && !_dosDriveManager.TryGetDriveAtIndex(drive, out _))) {
+                    if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                        _loggerService.LogWarning("IOCTL: Invalid drive {Drive} for {Operation}",
+                            drive, operationName);
+                    }
+                    return DosFileOperationResult.LogError(DosErrorCode.InvalidDrive);
+                }
+            }
+        } else {
+            if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                _loggerService.LogWarning("IOCTL: Function number 0x{Function:X2} is invalid or unsupported", state.AL);
+            }
+            return DosFileOperationResult.LogError(DosErrorCode.FunctionNumberInvalid);
+        }
+
+        DosDriveBase? mountedDrive;
+        switch (subfunction) {
+            case IoctlSubfunction.GetDeviceInformation:
+                VirtualFileBase? fileOrDevice = OpenFiles[handle];
+                if (fileOrDevice is IVirtualDevice virtualDevice) {
+                    state.DX = (ushort)(virtualDevice.Information & ~ExtDeviceBit);
+                } else if (fileOrDevice is DosFile dosFile) {
+                    if (dosFile.Drive == 0xff) {
+                        _loggerService.LogWarning("IOCTL: No drive set for file handle {FileHandle}, defaulting to C:",
+                            handle);
+                        dosFile.Drive = 0x2;
+                    }
+
+                    if (dosFile.DeviceInformation == 0) {
+                        dosFile.DeviceInformation = ComputeDefaultDeviceInformation(dosFile);
+                    }
+
+                    state.DX = dosFile.DeviceInformation;
+                    return DosFileOperationResult.Value16(dosFile.DeviceInformation);
+                }
+                return DosFileOperationResult.Value16(state.DX);
+
+            case IoctlSubfunction.SetDeviceInformation:
+                if (state.DH != 0) {
+                    if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                        _loggerService.LogWarning("IOCTL: Invalid data for Set Device Information - DH={DH:X2}", state.DH);
+                    }
+                    return DosFileOperationResult.LogError(DosErrorCode.DataInvalid);
+                } else {
+                    if (OpenFiles[handle] is IVirtualDevice device && (device.Information & 0x8000) > 0) {
+                        state.AL = device.GetStatus(true);
+                    } else {
+                        if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                            _loggerService.LogWarning("IOCTL: Device for handle {Handle} doesn't support Set Device Information", handle);
+                        }
+                        return DosFileOperationResult.LogError(DosErrorCode.FunctionNumberInvalid);
+                    }
+                }
+                return DosFileOperationResult.NoValue();
+
+            case IoctlSubfunction.ReadControlChannel:
+                if (OpenFiles[handle] is IVirtualDevice readDevice &&
+                    (readDevice.Information & 0xc000) > 0) {
+                    if (readDevice is PrinterDevice printer && !printer.CanRead) {
+                        if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                            _loggerService.LogWarning("IOCTL: Printer device {Device} doesn't support reading", printer.Name);
+                        }
+                        return DosFileOperationResult.LogError(DosErrorCode.AccessDenied);
+                    }
+                    uint buffer = MemoryUtils.ToPhysicalAddress(state.DS, state.DX);
+                    if (readDevice.TryReadFromControlChannel(buffer, state.CX, out ushort? returnCode)) {
+                        state.AX = returnCode.Value;
+                        return DosFileOperationResult.NoValue();
+                    }
+                }
+                if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                    _loggerService.LogWarning("IOCTL: Device for handle {Handle} doesn't support reading from control channel", handle);
+                }
+                return DosFileOperationResult.LogError(DosErrorCode.FunctionNumberInvalid);
+
+            case IoctlSubfunction.WriteControlChannel:
+                if (OpenFiles[handle] is IVirtualDevice writtenDevice &&
+                    (writtenDevice.Information & 0xc000) > 0) {
+                    /* is character device with IOCTL support */
+                    if (writtenDevice is PrinterDevice printer && !printer.CanWrite) {
+                        if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                            _loggerService.LogWarning("IOCTL: Printer device {Device} doesn't support writing", printer.Name);
+                        }
+                        return DosFileOperationResult.LogError(DosErrorCode.AccessDenied);
+                    }
+                    uint buffer = MemoryUtils.ToPhysicalAddress(state.DS, state.DX);
+                    if (writtenDevice.TryWriteToControlChannel(buffer, state.CX, out ushort? returnCode)) {
+                        state.AX = returnCode.Value;
+                        return DosFileOperationResult.NoValue();
+                    }
+                }
+                if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                    _loggerService.LogWarning("IOCTL: Device for handle {Handle} doesn't support writing to control channel", handle);
+                }
+                return DosFileOperationResult.LogError(DosErrorCode.FunctionNumberInvalid);
+
+            case IoctlSubfunction.GetInputStatus:
+                if (OpenFiles[handle] is IVirtualDevice inputDevice) {
+                    if ((inputDevice.Information & 0x8000) > 0) {
+                        if (((inputDevice.Information & 0x40) > 0)) {
+                            state.AL = 0;
+                        } else {
+                            state.AL = 0xFF;
+                        }
+                    }
+                } else if (OpenFiles[handle] is VirtualFileBase file) {
+                    long oldLocation = file.Position;
+                    file.Seek(0, SeekOrigin.End);
+                    long endLocation = file.Position;
+                    if (oldLocation < endLocation) { //Still data available
+                        state.AL = 0xff;
+                    } else {
+                        state.AL = 0x0; //EOF or beyond
+                    }
+                    file.Seek(oldLocation, SeekOrigin.Begin); //restore filelocation
+                    if (_loggerService.IsEnabled(LogLevel.Trace)) {
+                        _loggerService.LogTrace("IOCTL: Get input status on regular file with handle {Handle}, available={Available}",
+                            handle, state.AL != 0);
+                    }
+                }
+                return DosFileOperationResult.NoValue();
+
+            case IoctlSubfunction.GetOutputStatus:
+                if (OpenFiles[handle] is IVirtualDevice outputDevice &&
+                    (outputDevice.Information & ExtDeviceBit) > 0) {
+                    state.AL = outputDevice.GetStatus(false);
+                    return DosFileOperationResult.NoValue();
+                }
+                if (_loggerService.IsEnabled(LogLevel.Trace)) {
+                    _loggerService.LogTrace("IOCTL: Get output status for handle {Handle}, reporting ready (0xFF)", handle);
+                }
+                state.AL = 0xFF;
+                return DosFileOperationResult.NoValue();
+
+            case IoctlSubfunction.IsDeviceRemovable:
+                //* cdrom drives and drive A and B are removable */
+                if (drive < 2) {
+                    state.AX = 0;
+                } else {
+                    if (!_dosDriveManager.TryGetDriveAtIndex(drive, out mountedDrive)) {
+                        if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                            _loggerService.LogWarning("IOCTL: Unable to determine if drive {Drive} is removable", drive);
+                        }
+                        return DosFileOperationResult.LogError(DosErrorCode.FunctionNumberInvalid);
+                    }
+
+                    if (!mountedDrive.IsRemovable) {
+                        state.AX = 1;
+                    } else {
+                        if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                            _loggerService.LogWarning("IOCTL: Removable drive {Drive} does not support IsDeviceRemovable", drive);
+                        }
+                        return DosFileOperationResult.LogError(DosErrorCode.FunctionNumberInvalid);
+                    }
+                }
+                return DosFileOperationResult.NoValue();
+
+            case IoctlSubfunction.IsDeviceRemote:
+                if ((drive >= 2) && _dosDriveManager.TryGetDriveAtIndex(drive, out mountedDrive) && mountedDrive.IsRemote) {
+                    state.DX = 0x1000;  // device is remote
+                                        // undocumented bits always clear
+                } else {
+                    state.DX = 0x0802;  // Open/Close supported; 32bit access supported (any use? fixes Fable installer)
+                                        // undocumented bits from device attribute word
+                                        // TODO Set bit 9 on drives that don't support direct I/O
+                }
+                state.AX = 0x0300;
+                return DosFileOperationResult.NoValue();
+
+            case IoctlSubfunction.SetSharingRetryCount:
+                if (state.DX == 0) {
+                    if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                        _loggerService.LogWarning("IOCTL: Invalid retry count 0 for Set sharing retry count");
+                    }
+                    return DosFileOperationResult.LogError(DosErrorCode.FunctionNumberInvalid);
+                }
+                return DosFileOperationResult.NoValue();
+
+            case IoctlSubfunction.GenericBlockDeviceRequest:
+                if (!_dosDriveManager.TryGetDriveAtIndex(drive, out mountedDrive)) {
+                    if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                        _loggerService.LogWarning("IOCTL: Access denied for drive {Drive} - drive not available", drive);
+                    }
+                    return DosFileOperationResult.LogError(DosErrorCode.AccessDenied);
+                }
+                if (state.CH != 0x08 || mountedDrive.IsRemovable) {
+                    if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                        _loggerService.LogWarning("IOCTL: Invalid or unsupported command 0x{Command:X2} for drive {Drive}",
+                            state.CH, drive);
+                    }
+                    return DosFileOperationResult.LogError(DosErrorCode.FunctionNumberInvalid);
+                }
+
+                SegmentedAddress parameterBlock = new(state.DS, state.DX);
+
+                switch ((IoctlGenericBlockCommand)state.CL) {
+                    case IoctlGenericBlockCommand.GetDeviceParameters:
+                        DosDeviceParameterBlock dosDeviceParameterBlock = new(_memory, parameterBlock.Linear);
+                        dosDeviceParameterBlock.DeviceType = (byte)(drive >= 2 ? 0x05 : 0x07);
+                        dosDeviceParameterBlock.DeviceAttributes = (ushort)(drive >= 2 ? 0x01 : 0x00);
+                        dosDeviceParameterBlock.Cylinders = 0;
+                        dosDeviceParameterBlock.MediaType = 0;
+                        dosDeviceParameterBlock.BiosParameterBlock.BytesPerSector = 0x0200; // (Win3 File Mgr. uses it)
+                        break;
+
+                    case IoctlGenericBlockCommand.SetVolumeSerialNumber:
+                        // TODO: pull new serial from DS:DX buffer and store it somewhere
+                        if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                            _loggerService.LogWarning("IOCTL: Set Volume Serial Number called but not yet implemented for drive {Drive}", drive);
+                        }
+                        break;
+
+                    case IoctlGenericBlockCommand.GetVolumeInformation: {
+                            DosVolumeInfo dosVolumeInfo = new(_memory, parameterBlock.Linear);
+                            dosVolumeInfo.SerialNumber = 0x1234;
+                            dosVolumeInfo.VolumeLabel = mountedDrive.Label.ToUpperInvariant();
+                            dosVolumeInfo.FileSystemType = drive < 2 ? "FAT12" : "FAT16";
+                            break;
+                        }
+
+                    default:
+                        if (_loggerService.IsEnabled(LogLevel.Error)) {
+                            _loggerService.LogError(
+                              "IOCTL: Unhandled Generic Block Device request CL=0x{Command:X2} for drive {Drive}",
+                              state.CL, drive);
+                        }
+                        return DosFileOperationResult.LogError(DosErrorCode.FunctionNumberInvalid);
+                }
+                state.AX = 0;
+                return DosFileOperationResult.NoValue();
+
+            case IoctlSubfunction.GetLogicalDriveMap:
+                state.AH = 0x07;
+                if (drive < 2) {
+                    if (_dosDriveManager.HasDriveAtIndex(drive)) {
+                        state.AL = (byte)(drive + 1);
+                    } else {
+                        state.AL = 1;
+                    }
+                } else if (_dosDriveManager.TryGetDriveAtIndex(drive, out mountedDrive) && mountedDrive.IsRemovable) {
+                    if (_loggerService.IsEnabled(LogLevel.Warning)) {
+                        _loggerService.LogWarning("IOCTL: Get Logical Drive Map not supported for removable drive {Drive}", drive);
+                    }
+                    return DosFileOperationResult.LogError(DosErrorCode.FunctionNumberInvalid);
+                } else { /* Only 1 logical drive assigned */
+                    state.AL = 0;
+                }
+                return DosFileOperationResult.NoValue();
+
+            default:
+                if (_loggerService.IsEnabled(LogLevel.Error)) {
+                    _loggerService.LogError("IOCTL: Invalid function number 0x{FunctionCode:X2}", state.AL);
+                }
+                return DosFileOperationResult.LogError(DosErrorCode.FunctionNumberInvalid);
+        }
+    }
+
+    /// <summary>
+    /// Gets the proper DOS path for the emulated program.
+    /// </summary>
+    /// <param name="programPath">The absolute host path to the executable file.</param>
+    /// <returns>A properly formatted DOS absolute path for the PSP env block.</returns>
+    internal string GetDosProgramPath(string programPath) {
+        // Extract just the filename without path if it's a full path
+        string fileName = Path.GetFileName(programPath);
+
+        // Create a DOS path using the current drive and directory
+        string currentDrive = _dosDriveManager.CurrentDrive.DosVolume;
+        string currentDir = _dosDriveManager.CurrentDrive.CurrentDosDirectory;
+
+        // Ensure current directory has trailing backslash
+        if (!string.IsNullOrEmpty(currentDir) && !currentDir.EndsWith('\\')) {
+            currentDir += '\\';
+        }
+
+        // Build the full DOS path
+        string dosPath = $"{currentDrive}\\{currentDir}{fileName}";
+
+        // Replace slashes and standardize
+        dosPath = dosPath.Replace('/', '\\').ToUpperInvariant();
+
+        // Clean up any double backslashes
+        while (dosPath.Contains("\\\\")) {
+            dosPath = dosPath.Replace("\\\\", "\\");
+        }
+
+        return dosPath;
+    }
+}

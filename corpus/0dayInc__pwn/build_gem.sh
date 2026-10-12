@@ -1,0 +1,45 @@
+#!/bin/bash --login
+set -eo pipefail
+shopt -s nullglob
+export rvmsudo_secure_path=1
+
+if [[ -d '/opt/pwn' ]]; then
+  pwn_root='/opt/pwn' 
+else
+  pwn_root="${PWN_ROOT}"
+fi
+
+for previous_gem in pkg/*.gem; do
+  rvmsudo rm "$previous_gem"
+done
+old_ruby_version=`cat ${pwn_root}/.ruby-version`
+# Default Strategy is to merge codebase
+sudo chown -R $USER:$USER $pwn_root
+git config pull.rebase false 
+# Sync fork with upstream to avoid merge conflicts and ensure we are building the latest codebase
+git remote -v | grep 'upstream' || git remote add upstream https://github.com/0dayinc/pwn.git
+git fetch upstream
+git checkout master
+git merge upstream/master
+git pull
+new_ruby_version=`cat ${pwn_root}/.ruby-version`
+
+rvmsudo gem update --system
+
+if [[ $old_ruby_version == $new_ruby_version ]]; then
+  export rvmsudo_secure_path=1
+  rvmsudo /bin/bash --login -c "cd ${pwn_root} && ./reinstall_gemset.sh"
+  cd /tmp && cd "$pwn_root"
+  rvmsudo /bin/bash --login -c "cd ${pwn_root} && bundle exec rake"
+  rvmsudo /bin/bash --login -c "cd ${pwn_root} && bundle exec rake install"
+  rvmsudo /bin/bash --login -c "cd ${pwn_root} && bundle exec rake rerdoc"
+  echo "Invoking bundle-audit Gemfile Scanner..."
+  rvmsudo /bin/bash --login -c "cd ${pwn_root} && bundle exec bundle-audit"
+  # Restore ownership of artifacts (rdoc/, pkg/, Gemfile.lock, etc.) generated
+  # under rvmsudo above so a subsequent unprivileged `rake` / `git` can operate.
+  sudo chown -R $USER:$USER "$pwn_root"
+else
+  cd $pwn_root && ./upgrade_ruby.sh $new_ruby_version $old_ruby_version
+fi
+
+cd $pwn_root && pwn setup --migrate && bundle fund | grep -A 1 pwn

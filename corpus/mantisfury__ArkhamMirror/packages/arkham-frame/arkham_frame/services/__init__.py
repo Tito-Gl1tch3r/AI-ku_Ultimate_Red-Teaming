@@ -1,0 +1,283 @@
+"""
+ArkhamMirror Shattered Frame - Services
+
+Core services that Frame provides to shards.
+"""
+
+from .config import ConfigService
+from .database import (
+    DatabaseService,
+    DatabaseError,
+    SchemaNotFoundError,
+    SchemaExistsError,
+    QueryExecutionError,
+)
+from .documents import (
+    DocumentService,
+    DocumentNotFoundError,
+    DocumentError,
+    DocumentStatus,
+    Document,
+    Chunk,
+    Page,
+    SearchResult,
+    BatchResult,
+)
+from .entities import (
+    EntityService,
+    EntityNotFoundError,
+    CanonicalNotFoundError,
+    RelationshipNotFoundError,
+    EntityError,
+    Entity,
+    CanonicalEntity,
+    EntityRelationship,
+    CoOccurrence,
+    EntityType,
+    RelationshipType,
+)
+from .projects import (
+    ProjectService,
+    ProjectNotFoundError,
+    ProjectExistsError,
+    ProjectError,
+    Project,
+    ProjectStats,
+)
+from .vectors import (
+    VectorService,
+    VectorServiceError,
+    VectorStoreUnavailableError,
+    CollectionNotFoundError,
+    CollectionExistsError,
+    EmbeddingError,
+    VectorDimensionError,
+    VectorPoint,
+    CollectionInfo,
+    SearchResult as VectorSearchResult,
+    DistanceMetric,
+    EMBEDDING_DIMENSIONS,
+)
+from .llm import (
+    LLMService,
+    LLMError,
+    LLMUnavailableError,
+    LLMRequestError,
+    JSONExtractionError,
+    PromptNotFoundError,
+    LLMResponse,
+    StreamChunk,
+    PromptTemplate,
+)
+from .chunks import (
+    ChunkService,
+    ChunkServiceError,
+    TokenizerError,
+    TextChunk,
+    ChunkConfig,
+    ChunkStrategy,
+)
+from .events import EventBus, EventValidationError, EventDeliveryError
+from .workers import WorkerService, WorkerError, WorkerNotFoundError, QueueUnavailableError
+from .resources import (
+    ResourceService,
+    ResourceError,
+    GPUMemoryError,
+    CPUAllocationError,
+    ResourceTier,
+    SystemResources,
+    PoolConfig,
+)
+from .storage import (
+    StorageService,
+    StorageError,
+    FileNotFoundError as StorageFileNotFoundError,
+    StorageFullError,
+    InvalidPathError,
+    FileInfo,
+    StorageStats,
+)
+from .export import (
+    ExportService,
+    ExportError,
+    ExportFormatError,
+    ExportRenderError,
+    TemplateNotFoundError as ExportTemplateNotFoundError,
+    ExportFormat,
+    ExportOptions,
+    ExportResult,
+)
+from .templates import (
+    TemplateService,
+    TemplateError,
+    TemplateNotFoundError,
+    TemplateRenderError,
+    TemplateSyntaxError,
+    Template,
+    RenderResult,
+)
+from .notifications import (
+    NotificationService,
+    NotificationError,
+    DeliveryError,
+    ConfigurationError,
+    ChannelNotFoundError,
+    NotificationType,
+    ChannelType,
+    DeliveryStatus,
+    Notification,
+)
+from .scheduler import (
+    SchedulerService,
+    SchedulerError,
+    JobNotFoundError,
+    JobExecutionError,
+    InvalidScheduleError,
+    JobStatus,
+    TriggerType,
+    ScheduledJob,
+    JobResult,
+)
+from .ai_analyst import (
+    AIJuniorAnalystService,
+    AnalysisRequest,
+    AnalysisResponse,
+    AnalysisDepth,
+    Message as AnalystMessage,
+)
+
+__all__ = [
+    # Services
+    "ConfigService",
+    "DatabaseService",
+    "DocumentService",
+    "EntityService",
+    "ProjectService",
+    "VectorService",
+    "LLMService",
+    "ChunkService",
+    "EventBus",
+    "WorkerService",
+    "ResourceService",
+    "StorageService",
+    "ExportService",
+    "TemplateService",
+    "NotificationService",
+    "SchedulerService",
+    "AIJuniorAnalystService",
+    # Entity types and enums
+    "EntityType",
+    "RelationshipType",
+    "Entity",
+    "CanonicalEntity",
+    "EntityRelationship",
+    "CoOccurrence",
+    # Vector types
+    "VectorPoint",
+    "CollectionInfo",
+    "VectorSearchResult",
+    "DistanceMetric",
+    "EMBEDDING_DIMENSIONS",
+    # LLM types
+    "LLMResponse",
+    "StreamChunk",
+    "PromptTemplate",
+    # Chunk types
+    "TextChunk",
+    "ChunkConfig",
+    "ChunkStrategy",
+    # Resource types
+    "ResourceTier",
+    "SystemResources",
+    "PoolConfig",
+    # Storage types
+    "FileInfo",
+    "StorageStats",
+    # Document types
+    "DocumentStatus",
+    "Document",
+    "Chunk",
+    "Page",
+    "SearchResult",
+    "BatchResult",
+    # Project types
+    "Project",
+    "ProjectStats",
+    # Exceptions
+    "DatabaseError",
+    "SchemaNotFoundError",
+    "SchemaExistsError",
+    "QueryExecutionError",
+    "DocumentNotFoundError",
+    "DocumentError",
+    "EntityNotFoundError",
+    "CanonicalNotFoundError",
+    "RelationshipNotFoundError",
+    "EntityError",
+    "ProjectNotFoundError",
+    "ProjectExistsError",
+    "ProjectError",
+    "VectorServiceError",
+    "VectorStoreUnavailableError",
+    "CollectionNotFoundError",
+    "CollectionExistsError",
+    "EmbeddingError",
+    "VectorDimensionError",
+    "LLMError",
+    "LLMUnavailableError",
+    "LLMRequestError",
+    "JSONExtractionError",
+    "PromptNotFoundError",
+    "ChunkServiceError",
+    "TokenizerError",
+    "EventValidationError",
+    "EventDeliveryError",
+    "WorkerError",
+    "WorkerNotFoundError",
+    "QueueUnavailableError",
+    "ResourceError",
+    "GPUMemoryError",
+    "CPUAllocationError",
+    "StorageError",
+    "StorageFileNotFoundError",
+    "StorageFullError",
+    "InvalidPathError",
+    # Export types
+    "ExportFormat",
+    "ExportOptions",
+    "ExportResult",
+    "ExportError",
+    "ExportFormatError",
+    "ExportRenderError",
+    "ExportTemplateNotFoundError",
+    # Template types
+    "Template",
+    "RenderResult",
+    "TemplateError",
+    "TemplateNotFoundError",
+    "TemplateRenderError",
+    "TemplateSyntaxError",
+    # Notification types
+    "NotificationType",
+    "ChannelType",
+    "DeliveryStatus",
+    "Notification",
+    "NotificationError",
+    "DeliveryError",
+    "ConfigurationError",
+    "ChannelNotFoundError",
+    # Scheduler types
+    "JobStatus",
+    "TriggerType",
+    "ScheduledJob",
+    "JobResult",
+    "SchedulerError",
+    "JobNotFoundError",
+    "JobExecutionError",
+    "InvalidScheduleError",
+    # AI Analyst types
+    "AnalysisRequest",
+    "AnalysisResponse",
+    "AnalysisDepth",
+    "AnalystMessage",
+]

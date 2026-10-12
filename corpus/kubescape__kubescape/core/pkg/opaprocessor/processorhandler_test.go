@@ -1,0 +1,1191 @@
+package opaprocessor
+
+import (
+	"archive/zip"
+	"context"
+	_ "embed"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"reflect"
+	"runtime"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/armosec/armoapi-go/armotypes"
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/mocks"
+	"github.com/kubescape/kubescape/v4/core/pkg/opaprocessor/cel"
+	"github.com/kubescape/opa-utils/objectsenvelopes"
+	"github.com/kubescape/opa-utils/reporthandling"
+	"github.com/kubescape/opa-utils/reporthandling/apis"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/resourcesresults"
+	reporthandlingv2 "github.com/kubescape/opa-utils/reporthandling/v2"
+	"github.com/kubescape/opa-utils/resources"
+	"github.com/open-policy-agent/opa/v1/ast"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+var (
+	//go:embed testdata/opaSessionObjMock.json
+	opaSessionObjMockData string
+	//go:embed testdata/opaSessionObjMock1.json
+	opaSessionObjMockData1 string
+	//go:embed testdata/opaSessionObjMock2.json
+	opaSessionObjMockData2 string
+	//go:embed testdata/regoDependenciesDataMock.json
+	regoDependenciesData string
+
+	allResourcesMockData []byte
+	//go:embed testdata/resourcesMock1.json
+	resourcesMock1 []byte
+	//go:embed testdata/resourcesMock2.json
+	resourcesMock2 []byte
+)
+
+func unzipAllResourcesTestDataAndSetVar(zipFilePath, destFilePath string) error {
+	archive, err := zip.OpenReader(zipFilePath)
+	if err != nil {
+		return err
+	}
+	defer archive.Close()
+
+	os.RemoveAll(destFilePath)
+
+	if len(archive.File) == 0 {
+		return fmt.Errorf("archive contains no files")
+	}
+
+	f := archive.File[0]
+
+	fileInArchive, err := f.Open()
+	if err != nil {
+		return err
+	}
+
+	dstFile, err := os.OpenFile(
+		destFilePath,
+		os.O_WRONLY|os.O_CREATE|os.O_TRUNC,
+		f.Mode(),
+	)
+	if err != nil {
+		fileInArchive.Close()
+		return err
+	}
+	defer dstFile.Close()
+	const maxUncompressedTestDataSize = 500 * 1024 * 1024 // 500 MB
+
+	limitedReader := io.LimitReader(fileInArchive, maxUncompressedTestDataSize+1)
+
+	written, err := io.Copy(dstFile, limitedReader)
+	if err != nil {
+		return err
+	}
+
+	if written > maxUncompressedTestDataSize {
+		return fmt.Errorf("test archive exceeds maximum allowed size")
+	}
+	fileInArchive.Close()
+
+	file, err := os.Open(destFilePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	allResourcesMockData, err = io.ReadAll(file)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func NewOPAProcessorMock(opaSessionObjMock string, resourcesMock []byte) *OPAProcessor {
+	opap := &OPAProcessor{
+		compiledModules: make(map[string]compiledRule),
+	}
+	if err := json.Unmarshal([]byte(regoDependenciesData), &opap.regoDependenciesData); err != nil {
+		panic(err)
+	}
+	// no err check because Unmarshal will fail on AllResources field (expected)
+	json.Unmarshal([]byte(opaSessionObjMock), &opap.OPASessionObj)
+	opap.AllResources = make(map[string]workloadinterface.IMetadata)
+
+	allResources := make(map[string]map[string]any)
+	if err := json.Unmarshal(resourcesMock, &allResources); err != nil {
+		panic(err)
+	}
+	for i := range allResources {
+		opap.AllResources[i] = workloadinterface.NewWorkloadObj(allResources[i])
+	}
+	// mirror NewOPAProcessor: freeze the bucketing input after AllResources is populated
+	opap.initialResourceCount = len(opap.AllResources)
+
+	return opap
+}
+
+func TestSortedPolicyControls(t *testing.T) {
+	controls := map[string]reporthandling.Control{
+		"control-c": {
+			ControlID: "C-0003",
+		},
+		"control-a": {
+			ControlID: "C-0001",
+		},
+		"fallback-id": {},
+		"control-b": {
+			ControlID: "C-0002",
+		},
+	}
+
+	got := sortedPolicyControls(controls)
+
+	require.Len(t, got, 4)
+	assert.Equal(t, "C-0001", got[0].control.ControlID)
+	assert.Equal(t, "C-0002", got[1].control.ControlID)
+	assert.Equal(t, "C-0003", got[2].control.ControlID)
+	assert.Equal(t, "fallback-id", got[3].key)
+	assert.Empty(t, got[3].control.ControlID)
+	assert.Empty(t, controls["fallback-id"].ControlID, "sorting must not mutate the source controls map")
+}
+
+type recordingProgressListener struct {
+	started  int
+	messages []string
+	stopped  bool
+}
+
+func (r *recordingProgressListener) Start(allSteps int) {
+	r.started = allSteps
+}
+
+func (r *recordingProgressListener) ProgressJob(_ int, message string) {
+	r.messages = append(r.messages, message)
+}
+
+func (r *recordingProgressListener) Stop() {
+	r.stopped = true
+}
+
+func TestProcessReportsControls(t *testing.T) {
+	opaSessionObj := cautils.NewOPASessionObjMock()
+	opap := NewOPAProcessor(opaSessionObj, resources.NewRegoDependenciesDataMock(), "test", "", "", false, nil)
+
+	policies := &cautils.Policies{
+		Controls: map[string]reporthandling.Control{
+			"C-0003": {ControlID: "C-0003"},
+			"C-0001": {ControlID: "C-0001"},
+			"C-0002": {ControlID: "C-0002"},
+		},
+	}
+	opap.AllPolicies = policies
+
+	progress := &recordingProgressListener{}
+	err := opap.Process(context.Background(), policies, progress)
+
+	require.NoError(t, err)
+	assert.Equal(t, 3, progress.started)
+	assert.True(t, progress.stopped)
+	assert.ElementsMatch(t, []string{
+		"Control: C-0001",
+		"Control: C-0002",
+		"Control: C-0003",
+	}, progress.messages)
+}
+
+func monitorHeapSpace(maxHeap *uint64, quitChan chan bool) {
+	for {
+		select {
+		case <-quitChan:
+			return
+		default:
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			heapSpace := m.HeapAlloc
+			if heapSpace > *maxHeap {
+				*maxHeap = heapSpace
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+}
+
+/*
+goarch: arm64
+pkg: github.com/kubescape/kubescape/v4/core/pkg/opaprocessor
+
+BenchmarkProcess/opaprocessor.Process_1-8         	       1	29714096083 ns/op	22309913416 B/op	498183685 allocs/op
+--- BENCH: BenchmarkProcess/opaprocessor.Process_1-8
+
+	processorhandler_test.go:178: opaprocessor.Process_1_max_heap_space_gb:  2.85
+	processorhandler_test.go:179: opaprocessor.Process_1_execution_time_sec: 29.714054
+
+BenchmarkProcess/opaprocessor.Process_4-8         	       1	25574892875 ns/op	22037035032 B/op	498167263 allocs/op
+--- BENCH: BenchmarkProcess/opaprocessor.Process_4-8
+
+	processorhandler_test.go:178: opaprocessor.Process_4_max_heap_space_gb:  6.76
+	processorhandler_test.go:179: opaprocessor.Process_4_execution_time_sec: 25.574884
+
+BenchmarkProcess/opaprocessor.Process_8-8         	       1	16534461291 ns/op	22308814384 B/op	498167171 allocs/op
+--- BENCH: BenchmarkProcess/opaprocessor.Process_8-8
+
+	processorhandler_test.go:178: opaprocessor.Process_8_max_heap_space_gb:  9.47
+	processorhandler_test.go:179: opaprocessor.Process_8_execution_time_sec: 16.534455
+
+BenchmarkProcess/opaprocessor.Process_16-8        	       1	18924050500 ns/op	22179562272 B/op	498167367 allocs/op
+--- BENCH: BenchmarkProcess/opaprocessor.Process_16-8
+
+		processorhandler_test.go:178: opaprocessor.Process_16_max_heap_space_gb: 11.69
+	    processorhandler_test.go:179: opaprocessor.Process_16_execution_time_sec: 16.321493
+*/
+func BenchmarkProcess(b *testing.B) {
+	b.SetParallelism(1)
+
+	// since all resources JSON is a large file, we need to unzip it and set the variable before running the benchmark
+	unzipAllResourcesTestDataAndSetVar("testdata/allResourcesMock.json.zip", "testdata/allResourcesMock.json")
+
+	maxGoRoutinesArr := []int{1, 4, 8, 16}
+	for _, maxGoRoutines := range maxGoRoutinesArr {
+		testName := fmt.Sprintf("opaprocessor.Process_%d", maxGoRoutines)
+		b.Run(testName, func(b *testing.B) {
+			// setup
+			opap := NewOPAProcessorMock(opaSessionObjMockData, allResourcesMockData)
+			b.ResetTimer()
+			var maxHeap uint64
+			quitChan := make(chan bool)
+			go monitorHeapSpace(&maxHeap, quitChan)
+
+			// test
+			opap.Process(context.Background(), opap.AllPolicies, nil)
+
+			// teardown
+			quitChan <- true
+			b.Logf("%s_max_heap_space_gb:  %.2f", testName, float64(maxHeap)/(1024*1024*1024))
+			b.Logf("%s_execution_time_sec: %f", testName, b.Elapsed().Seconds())
+		})
+	}
+}
+
+func TestProcessResourcesResult(t *testing.T) {
+
+	// set k8s
+	k8sResources := make(cautils.K8SResources)
+
+	deployment := mocks.MockDevelopmentWithHostpath()
+	frameworks := []reporthandling.Framework{*mocks.MockFramework_0006_0013()}
+
+	k8sResources["apps/v1/deployments"] = workloadinterface.ListMetaIDs([]workloadinterface.IMetadata{deployment})
+
+	// set opaSessionObj
+	opaSessionObj := cautils.NewOPASessionObjMock()
+	opaSessionObj.Policies = frameworks
+
+	scanningScope := reporthandling.ScopeCluster
+	policies := convertFrameworksToPolicies(opaSessionObj.Policies, nil, scanningScope)
+	ConvertFrameworksToSummaryDetails(&opaSessionObj.Report.SummaryDetails, opaSessionObj.Policies, policies)
+
+	opaSessionObj.K8SResources = k8sResources
+	opaSessionObj.AllResources[deployment.GetID()] = deployment
+
+	opap := NewOPAProcessor(opaSessionObj, resources.NewRegoDependenciesDataMock(), "test", "", "", false, nil)
+	opap.AllPolicies = policies
+	opap.Process(context.Background(), policies, nil)
+
+	assert.Equal(t, 1, len(opaSessionObj.ResourcesResult))
+	res := opaSessionObj.ResourcesResult[deployment.GetID()]
+	assert.Equal(t, 2, res.ListControlsIDs(nil).Len())
+	assert.Equal(t, 1, res.ListControlsIDs(nil).Failed())
+	assert.Equal(t, 1, res.ListControlsIDs(nil).Passed())
+	assert.True(t, res.GetStatus(nil).IsFailed())
+	assert.False(t, res.GetStatus(nil).IsPassed())
+	assert.Equal(t, deployment.GetID(), opaSessionObj.ResourcesResult[deployment.GetID()].ResourceID)
+
+	opap.updateResults(context.Background())
+	res = opaSessionObj.ResourcesResult[deployment.GetID()]
+	assert.Equal(t, 2, res.ListControlsIDs(nil).Len())
+	assert.Equal(t, 1, res.ListControlsIDs(nil).Failed())
+	assert.Equal(t, 1, res.ListControlsIDs(nil).Passed())
+	assert.True(t, res.GetStatus(nil).IsFailed())
+	assert.False(t, res.GetStatus(nil).IsPassed())
+	assert.Equal(t, deployment.GetID(), opaSessionObj.ResourcesResult[deployment.GetID()].ResourceID)
+
+	// test resource counters
+	summaryDetails := opaSessionObj.Report.SummaryDetails
+	assert.Equal(t, 1, summaryDetails.NumberOfResources().All())
+	assert.Equal(t, 1, summaryDetails.NumberOfResources().Failed())
+	assert.Equal(t, 0, summaryDetails.NumberOfResources().Passed())
+	assert.Equal(t, 0, summaryDetails.NumberOfResources().Skipped())
+
+	// test resource listing
+	assert.Equal(t, 1, summaryDetails.ListResourcesIDs(nil).Len())
+	assert.Equal(t, 1, summaryDetails.ListResourcesIDs(nil).Failed())
+	assert.Equal(t, 0, summaryDetails.ListResourcesIDs(nil).Passed())
+	assert.Equal(t, 0, summaryDetails.ListResourcesIDs(nil).Skipped())
+
+	// test control listing
+	assert.Equal(t, res.ListControlsIDs(nil).Len(), summaryDetails.NumberOfControls().All())
+	assert.Equal(t, res.ListControlsIDs(nil).Passed(), summaryDetails.NumberOfControls().Passed())
+	assert.Equal(t, res.ListControlsIDs(nil).Skipped(), summaryDetails.NumberOfControls().Skipped())
+	assert.Equal(t, res.ListControlsIDs(nil).Failed(), summaryDetails.NumberOfControls().Failed())
+	assert.True(t, summaryDetails.GetStatus().IsFailed())
+
+	opaSessionObj.Exceptions = []armotypes.PostureExceptionPolicy{*mocks.MockExceptionAllKinds(&armotypes.PosturePolicy{FrameworkName: frameworks[0].Name})}
+	opap.updateResults(context.Background())
+
+	res = opaSessionObj.ResourcesResult[deployment.GetID()]
+	assert.Equal(t, 2, res.ListControlsIDs(nil).Len())
+	assert.Equal(t, 2, res.ListControlsIDs(nil).Passed())
+	assert.True(t, res.GetStatus(nil).IsPassed())
+	assert.False(t, res.GetStatus(nil).IsFailed())
+	assert.Equal(t, deployment.GetID(), opaSessionObj.ResourcesResult[deployment.GetID()].ResourceID)
+
+	// test resource listing
+	summaryDetails = opaSessionObj.Report.SummaryDetails
+	assert.Equal(t, 1, summaryDetails.ListResourcesIDs(nil).Len())
+	assert.Equal(t, 1, summaryDetails.ListResourcesIDs(nil).Failed())
+	assert.Equal(t, 0, summaryDetails.ListResourcesIDs(nil).Passed())
+	assert.Equal(t, 0, summaryDetails.ListResourcesIDs(nil).Skipped())
+}
+
+// don't parallelize this test because it uses a global variable - allResourcesMockData
+func TestProcessRule(t *testing.T) {
+	testCases := []struct {
+		name              string
+		rule              reporthandling.PolicyRule
+		resourcesMock     []byte
+		opaSessionObjMock string
+		expectedResult    map[string]*resourcesresults.ResourceAssociatedRule
+	}{
+		{
+			name: "TestRelatedResourcesIDs",
+			rule: reporthandling.PolicyRule{
+				PortalBase: armotypes.PortalBase{
+					Name:       "exposure-to-internet",
+					Attributes: map[string]any{},
+				},
+				Rule: "package armo_builtins\nimport rego.v1\n\n# Checks if NodePort or LoadBalancer is connected to a workload to expose something\ndeny contains msga if {\n    service := input[_]\n    service.kind == \"Service\"\n    is_exposed_service(service)\n    \n    wl := input[_]\n    spec_template_spec_patterns := {\"Deployment\", \"ReplicaSet\", \"DaemonSet\", \"StatefulSet\", \"Pod\", \"Job\", \"CronJob\"}\n    spec_template_spec_patterns[wl.kind]\n    wl_connected_to_service(wl, service)\n    failPath := [\"spec.type\"]\n    msga := {\n        \"alertMessage\": sprintf(\"workload '%v' is exposed through service '%v'\", [wl.metadata.name, service.metadata.name]),\n        \"packagename\": \"armo_builtins\",\n        \"alertScore\": 7,\n        \"fixPaths\": [],\n        \"failedPaths\": [],\n        \"alertObject\": {\n            \"k8sApiObjects\": [wl]\n        },\n        \"relatedObjects\": [{\n            \"object\": service,\n            \"failedPaths\": failPath,\n   \"reviewPaths\": failPath,\n      }]\n    }\n}\n\n# Checks if Ingress is connected to a service and a workload to expose something\ndeny contains msga if {\n    ingress := input[_]\n    ingress.kind == \"Ingress\"\n    \n    svc := input[_]\n    svc.kind == \"Service\"\n    # avoid duplicate alerts\n    # if service is already exposed through NodePort or LoadBalancer workload will fail on that\n    not is_exposed_service(svc)\n\n    wl := input[_]\n    spec_template_spec_patterns := {\"Deployment\", \"ReplicaSet\", \"DaemonSet\", \"StatefulSet\", \"Pod\", \"Job\", \"CronJob\"}\n    spec_template_spec_patterns[wl.kind]\n    wl_connected_to_service(wl, svc)\n\n    result := svc_connected_to_ingress(svc, ingress)\n    \n    msga := {\n        \"alertMessage\": sprintf(\"workload '%v' is exposed through ingress '%v'\", [wl.metadata.name, ingress.metadata.name]),\n        \"packagename\": \"armo_builtins\",\n        \"failedPaths\": [],\n        \"fixPaths\": [],\n        \"alertScore\": 7,\n        \"alertObject\": {\n            \"k8sApiObjects\": [wl]\n        },\n        \"relatedObjects\": [{\n            \"object\": ingress,\n            \"failedPaths\": result,\n     \"reviewPaths\": result,\n    }]\n    }\n} \n\n# ====================================================================================\n\nis_exposed_service(svc) if {\n    svc.spec.type == \"NodePort\"\n}\n\nis_exposed_service(svc) if {\n    svc.spec.type == \"LoadBalancer\"\n}\n\nwl_connected_to_service(wl, svc) if {\n    count({x | svc.spec.selector[x] == wl.metadata.labels[x]}) == count(svc.spec.selector)\n}\n\nwl_connected_to_service(wl, svc) if {\n    wl.spec.selector.matchLabels == svc.spec.selector\n}\n\n# check if service is connected to ingress\nsvc_connected_to_ingress(svc, ingress) = result if {\n    rule := ingress.spec.rules[i]\n    paths := rule.http.paths[j]\n    svc.metadata.name == paths.backend.service.name\n    result := [sprintf(\"ingress.spec.rules[%d].http.paths[%d].backend.service.name\", [i,j])]\n}\n\n",
+				Match: []reporthandling.RuleMatchObjects{
+					{
+						APIGroups:   []string{""},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"Pod", "Service"},
+					},
+					{
+						APIGroups:   []string{"apps"},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"Deployment", "ReplicaSet", "DaemonSet", "StatefulSet"},
+					},
+					{
+						APIGroups:   []string{"batch"},
+						APIVersions: []string{"*"},
+						Resources:   []string{"Job", "CronJob"},
+					},
+					{
+						APIGroups:   []string{"extensions", "networking.k8s.io"},
+						APIVersions: []string{"v1beta1", "v1"},
+						Resources:   []string{"Ingress"},
+					},
+				},
+				Description:  "fails in case the running workload has binded Service or Ingress that are exposing it on Internet.",
+				Remediation:  "",
+				RuleQuery:    "armo_builtins",
+				RuleLanguage: reporthandling.RegoLanguage,
+			},
+			resourcesMock:     resourcesMock1,
+			opaSessionObjMock: opaSessionObjMockData1,
+			expectedResult: map[string]*resourcesresults.ResourceAssociatedRule{
+				"/v1/default/Pod/fake-pod-1-22gck": {
+					Name:                  "exposure-to-internet",
+					ControlConfigurations: map[string][]string{},
+					Status:                "failed",
+					SubStatus:             "",
+					Paths: []armotypes.PosturePaths{
+						{ResourceID: "/v1/default/Service/fake-service-1", ReviewPath: "spec.type"},
+					},
+					Exception: nil,
+					RelatedResourcesIDs: []string{
+						"/v1/default/Service/fake-service-1",
+					},
+				},
+				"/v1/default/Service/fake-service-1": {
+					Name:                  "exposure-to-internet",
+					ControlConfigurations: map[string][]string{},
+					Status:                "passed",
+					SubStatus:             "",
+					Paths:                 nil,
+					Exception:             nil,
+					RelatedResourcesIDs:   nil,
+				},
+			},
+		},
+		{
+			name: "TestMultipleRelatedResources",
+			rule: reporthandling.PolicyRule{
+				PortalBase: armotypes.PortalBase{
+					Name:       "exposure-to-internet",
+					Attributes: map[string]any{},
+				},
+				Rule: "\npackage armo_builtins\nimport rego.v1\n\n# Checks if NodePort or LoadBalancer is connected to a workload to expose something\ndeny contains msga if {\n    service := input[_]\n    service.kind == \"Service\"\n    is_exposed_service(service)\n    \n    wl := input[_]\n    spec_template_spec_patterns := {\"Deployment\", \"ReplicaSet\", \"DaemonSet\", \"StatefulSet\", \"Pod\", \"Job\", \"CronJob\"}\n    spec_template_spec_patterns[wl.kind]\n    wl_connected_to_service(wl, service)\n    failPath := [\"spec.type\"]\n    msga := {\n        \"alertMessage\": sprintf(\"workload '%v' is exposed through service '%v'\", [wl.metadata.name, service.metadata.name]),\n        \"packagename\": \"armo_builtins\",\n        \"alertScore\": 7,\n        \"fixPaths\": [],\n        \"failedPaths\": [],\n        \"alertObject\": {\n            \"k8sApiObjects\": [wl]\n        },\n        \"relatedObjects\": [{\n            \"object\": service,\n\t\t    \"reviewPaths\": failPath,\n            \"failedPaths\": failPath,\n        }]\n    }\n}\n\n# Checks if Ingress is connected to a service and a workload to expose something\ndeny contains msga if {\n    ingress := input[_]\n    ingress.kind == \"Ingress\"\n    \n    svc := input[_]\n    svc.kind == \"Service\"\n\n    # Make sure that they belong to the same namespace\n    svc.metadata.namespace == ingress.metadata.namespace\n\n    # avoid duplicate alerts\n    # if service is already exposed through NodePort or LoadBalancer workload will fail on that\n    not is_exposed_service(svc)\n\n    wl := input[_]\n    spec_template_spec_patterns := {\"Deployment\", \"ReplicaSet\", \"DaemonSet\", \"StatefulSet\", \"Pod\", \"Job\", \"CronJob\"}\n    spec_template_spec_patterns[wl.kind]\n    wl_connected_to_service(wl, svc)\n\n    result := svc_connected_to_ingress(svc, ingress)\n    \n    msga := {\n        \"alertMessage\": sprintf(\"workload '%v' is exposed through ingress '%v'\", [wl.metadata.name, ingress.metadata.name]),\n        \"packagename\": \"armo_builtins\",\n        \"failedPaths\": [],\n        \"fixPaths\": [],\n        \"alertScore\": 7,\n        \"alertObject\": {\n            \"k8sApiObjects\": [wl]\n        },\n        \"relatedObjects\": [\n\t\t{\n\t            \"object\": ingress,\n\t\t    \"reviewPaths\": result,\n\t            \"failedPaths\": result,\n\t        },\n\t\t{\n\t            \"object\": svc,\n\t\t}\n        ]\n    }\n} \n\n# ====================================================================================\n\nis_exposed_service(svc) if {\n    svc.spec.type == \"NodePort\"\n}\n\nis_exposed_service(svc) if {\n    svc.spec.type == \"LoadBalancer\"\n}\n\nwl_connected_to_service(wl, svc) if {\n    count({x | svc.spec.selector[x] == wl.metadata.labels[x]}) == count(svc.spec.selector)\n}\n\nwl_connected_to_service(wl, svc) if {\n    wl.spec.selector.matchLabels == svc.spec.selector\n}\n\n# check if service is connected to ingress\nsvc_connected_to_ingress(svc, ingress) = result if {\n    rule := ingress.spec.rules[i]\n    paths := rule.http.paths[j]\n    svc.metadata.name == paths.backend.service.name\n    result := [sprintf(\"spec.rules[%d].http.paths[%d].backend.service.name\", [i,j])]\n}\n\n",
+				Match: []reporthandling.RuleMatchObjects{
+					{
+						APIGroups:   []string{""},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"Pod", "Service"},
+					},
+					{
+						APIGroups:   []string{"apps"},
+						APIVersions: []string{"v1"},
+						Resources:   []string{"Deployment", "ReplicaSet", "DaemonSet", "StatefulSet"},
+					},
+					{
+						APIGroups:   []string{"batch"},
+						APIVersions: []string{"*"},
+						Resources:   []string{"Job", "CronJob"},
+					},
+					{
+						APIGroups:   []string{"extensions", "networking.k8s.io"},
+						APIVersions: []string{"v1beta1", "v1"},
+						Resources:   []string{"Ingress"},
+					},
+				},
+				Description:  "fails in case the running workload has binded Service or Ingress that are exposing it on Internet.",
+				Remediation:  "",
+				RuleQuery:    "armo_builtins",
+				RuleLanguage: reporthandling.RegoLanguage,
+			},
+			resourcesMock:     resourcesMock2,
+			opaSessionObjMock: opaSessionObjMockData2,
+			expectedResult: map[string]*resourcesresults.ResourceAssociatedRule{
+				"apps/v1/default/Deployment/my-app": {
+					Name:                  "exposure-to-internet",
+					ControlConfigurations: map[string][]string{},
+					Status:                "failed",
+					SubStatus:             "",
+					Paths: []armotypes.PosturePaths{
+						{ResourceID: "networking.k8s.io/v1/default/Ingress/my-ingress1", ReviewPath: "spec.rules[0].http.paths[0].backend.service.name"},
+						{ResourceID: "networking.k8s.io/v1/default/Ingress/my-ingress2", ReviewPath: "spec.rules[0].http.paths[0].backend.service.name"},
+					},
+					Exception: nil,
+					RelatedResourcesIDs: []string{
+						"networking.k8s.io/v1/default/Ingress/my-ingress1",
+						"/v1/default/Service/my-service",
+						"networking.k8s.io/v1/default/Ingress/my-ingress2",
+					},
+				},
+				"networking.k8s.io/v1/default/Ingress/my-ingress1": {
+					Name:                  "exposure-to-internet",
+					ControlConfigurations: map[string][]string{},
+					Status:                "passed",
+					SubStatus:             "",
+					Paths:                 nil,
+					Exception:             nil,
+					RelatedResourcesIDs:   nil,
+				},
+				"networking.k8s.io/v1/default/Ingress/my-ingress2": {
+					Name:                  "exposure-to-internet",
+					ControlConfigurations: map[string][]string{},
+					Status:                "passed",
+					SubStatus:             "",
+					Paths:                 nil,
+					Exception:             nil,
+					RelatedResourcesIDs:   nil,
+				},
+				"/v1/default/Service/my-service": {
+					Name:                  "exposure-to-internet",
+					ControlConfigurations: map[string][]string{},
+					Status:                "passed",
+					SubStatus:             "",
+					Paths:                 nil,
+					Exception:             nil,
+					RelatedResourcesIDs:   nil,
+				},
+			},
+		},
+	}
+	for _, tc := range testCases {
+		// since all resources JSON is a large file, we need to unzip it and set the variable before running the benchmark
+		unzipAllResourcesTestDataAndSetVar("testdata/allResourcesMock.json.zip", "testdata/allResourcesMock.json")
+		opap := NewOPAProcessorMock(tc.opaSessionObjMock, tc.resourcesMock)
+		resources, err := opap.processRule(context.Background(), &tc.rule, nil, evaluationScope{}, &reporthandling.Control{})
+		assert.NoError(t, err)
+		assert.Equal(t, tc.expectedResult, resources, t.Name)
+	}
+}
+
+func TestAppendPaths(t *testing.T) {
+	tests := []struct {
+		name                string
+		paths               []armotypes.PosturePaths
+		assistedRemediation reporthandling.AssistedRemediation
+		resourceID          string
+		expected            []armotypes.PosturePaths
+	}{
+		{
+			name: "Only FixPaths",
+			assistedRemediation: reporthandling.AssistedRemediation{
+				FixPaths: []armotypes.FixPath{
+					{Path: "path2", Value: "command2"},
+					{Path: "path3", Value: "command3"},
+				},
+			},
+			resourceID: "2",
+			expected: []armotypes.PosturePaths{
+				{ResourceID: "2", FixPath: armotypes.FixPath{Path: "path2", Value: "command2"}},
+				{ResourceID: "2", FixPath: armotypes.FixPath{Path: "path3", Value: "command3"}},
+			},
+		},
+		{
+			name: "Only FixCommand",
+			assistedRemediation: reporthandling.AssistedRemediation{
+				FixCommand: "fix command",
+			},
+			resourceID: "2",
+			expected: []armotypes.PosturePaths{
+				{ResourceID: "2", FixCommand: "fix command"},
+			},
+		},
+		{
+			name: "Only DeletePaths",
+			assistedRemediation: reporthandling.AssistedRemediation{
+				DeletePaths: []string{"path2", "path3"},
+			},
+			resourceID: "2",
+			expected: []armotypes.PosturePaths{
+				{ResourceID: "2", DeletePath: "path2"},
+				{ResourceID: "2", DeletePath: "path3"},
+			},
+		},
+		{
+			name: "Only ReviewPaths",
+			assistedRemediation: reporthandling.AssistedRemediation{
+				ReviewPaths: []string{"path2", "path3"},
+			},
+			resourceID: "2",
+			expected: []armotypes.PosturePaths{
+				{ResourceID: "2", ReviewPath: "path2"},
+				{ResourceID: "2", ReviewPath: "path3"},
+			},
+		},
+		{
+			name: "All types of paths",
+			assistedRemediation: reporthandling.AssistedRemediation{
+
+				DeletePaths: []string{"path4", "path5"},
+				ReviewPaths: []string{"path6", "path7"},
+				FixPaths: []armotypes.FixPath{
+					{Path: "path3", Value: "command3"},
+				},
+				FixCommand: "fix command",
+			},
+			resourceID: "2",
+			expected: []armotypes.PosturePaths{
+
+				{ResourceID: "2", DeletePath: "path4"},
+				{ResourceID: "2", DeletePath: "path5"},
+				{ResourceID: "2", ReviewPath: "path6"},
+				{ResourceID: "2", ReviewPath: "path7"},
+				{ResourceID: "2", FixPath: armotypes.FixPath{Path: "path3", Value: "command3"}},
+				{ResourceID: "2", FixCommand: "fix command"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := appendPaths(tt.paths, tt.assistedRemediation, tt.resourceID)
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Errorf("Expected %v, but got %v", tt.expected, result)
+			}
+		})
+	}
+}
+
+func TestSkipNamespace(t *testing.T) {
+	tests := []struct {
+		name              string
+		includeNamespaces []string
+		excludeNamespaces []string
+		namespace         string
+		expectedSkip      bool
+	}{
+		{
+			name:              "included namespace is not skipped",
+			includeNamespaces: []string{"default"},
+			namespace:         "default",
+			expectedSkip:      false,
+		},
+		{
+			name:              "non included namespace is skipped",
+			includeNamespaces: []string{"default"},
+			namespace:         "kube-system",
+			expectedSkip:      true,
+		},
+		{
+			name:              "cluster scoped resources are not skipped when include namespaces are set",
+			includeNamespaces: []string{"default"},
+			namespace:         "",
+			expectedSkip:      false,
+		},
+		{
+			name:              "excluded namespace is skipped",
+			excludeNamespaces: []string{"kube-system"},
+			namespace:         "kube-system",
+			expectedSkip:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opap := &OPAProcessor{
+				includeNamespaces: tt.includeNamespaces,
+				excludeNamespaces: tt.excludeNamespaces,
+			}
+			assert.Equal(t, tt.expectedSkip, opap.skipNamespace(tt.namespace))
+		})
+	}
+}
+
+func TestSplit(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected []string
+	}{
+		{
+			name:     "removes empty entries",
+			input:    "default,,kube-system,",
+			expected: []string{"default", "kube-system"},
+		},
+		{
+			name:     "only commas",
+			input:    ",,",
+			expected: []string{},
+		},
+		{
+			name:     "trims whitespace",
+			input:    " default , kube-system ",
+			expected: []string{"default", "kube-system"},
+		},
+		{
+			name:     "empty string",
+			input:    "",
+			expected: []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := split(tt.input)
+
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Fatalf("split(%q) = %v, want %v", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestMakeRegoDeps_InputIsolation(t *testing.T) {
+	regoDeps := resources.NewRegoDependenciesDataMock()
+
+	regoDeps.PostureControlInputs = map[string][]string{
+		"severity": {"high"},
+	}
+
+	opap := &OPAProcessor{
+		OPASessionObj: &cautils.OPASessionObj{
+			Report: &reporthandlingv2.PostureReport{
+				ClusterCloudProvider: "aws",
+			},
+		},
+		regoDependenciesData: regoDeps,
+	}
+
+	deps := opap.makeRegoDeps(nil, map[string][]string{
+		"runtime": {"enabled"},
+	})
+
+	deps.PostureControlInputs["runtime"][0] = "disabled"
+
+	_, runtimeExists := opap.regoDependenciesData.PostureControlInputs["runtime"]
+
+	assert.False(t, runtimeExists)
+	assert.Equal(t, "aws", deps.DataControlInputs["cloudProvider"])
+}
+
+func TestRunOPAOnSingleRuleDispatch(t *testing.T) {
+	opap := &OPAProcessor{}
+	getRuleData := func(r *reporthandling.PolicyRule) string { return r.Rule }
+
+	t.Run("CEL language routes to runCELOnK8s and loads by control ID", func(t *testing.T) {
+		rule := &reporthandling.PolicyRule{
+			PortalBase:   armotypes.PortalBase{Name: "cel-test-rule"},
+			RuleLanguage: reporthandling.CELLanguage,
+		}
+		// A control absent from the embedded bundle must surface the loader's
+		// lookup error, which proves dispatch went through the CEL path and the
+		// exported facade rather than the Rego path. An object is required
+		// because runCELOnK8s only loads the policy once it has a resource to
+		// evaluate.
+		obj := map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Pod",
+			"metadata":   map[string]any{"name": "p", "namespace": "default"},
+			"spec":       map[string]any{},
+		}
+		_, _, err := opap.runOPAOnSingleRule(context.Background(), rule, []map[string]any{obj}, getRuleData, resources.RegoDependenciesData{}, "C-9999")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cel-test-rule")
+		assert.Contains(t, err.Error(), "C-9999")
+	})
+
+	t.Run("unknown language returns not-supported error", func(t *testing.T) {
+		rule := &reporthandling.PolicyRule{
+			PortalBase:   armotypes.PortalBase{Name: "mystery-rule"},
+			RuleLanguage: reporthandling.RuleLanguages("Mystery"),
+		}
+		_, _, err := opap.runOPAOnSingleRule(context.Background(), rule, nil, getRuleData, resources.RegoDependenciesData{}, "")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "not supported")
+		assert.Contains(t, err.Error(), "mystery-rule")
+	})
+}
+
+// TestGetCompiledRule_RegoV0Fallback locks in backward compatibility for
+// policy sources that predate the regolibrary/opa-utils Rego v1 migration:
+// a pinned --controls-version release, a --use-from/--use-default air-gapped
+// bundle, or a tenant-authored custom control from the cloud backend. None
+// of those are guaranteed to carry "import rego.v1", so getCompiledRule must
+// fall back to the v0 parser instead of failing the whole scan.
+func TestGetCompiledRule_RegoV0Fallback(t *testing.T) {
+	opap := &OPAProcessor{compiledModules: make(map[string]compiledRule)}
+
+	t.Run("v1 rule compiles as v1", func(t *testing.T) {
+		v1Rule := `package armo_builtins
+import rego.v1
+
+deny contains msga if {
+	input.kind == "Pod"
+	msga := {"alertMessage": "test", "alertScore": 1, "failedPaths": [], "fixPaths": [], "alertObject": {"k8sApiObjects": [input]}}
+}
+`
+		compiled, version, err := opap.getCompiledRule(context.Background(), "v1-rule", v1Rule, false)
+		require.NoError(t, err)
+		assert.Equal(t, ast.RegoV1, version)
+		assert.NotNil(t, compiled)
+	})
+
+	t.Run("legacy v0 rule with no import rego.v1 falls back instead of failing", func(t *testing.T) {
+		v0Rule := `package armo_builtins
+
+deny[msga] {
+	input.kind == "Pod"
+	msga := {"alertMessage": "test", "alertScore": 1, "failedPaths": [], "fixPaths": [], "alertObject": {"k8sApiObjects": [input]}}
+}
+`
+		compiled, version, err := opap.getCompiledRule(context.Background(), "v0-rule", v0Rule, false)
+		require.NoError(t, err, "a legacy v0 rule must still compile via the v0 fallback, not fail the scan")
+		assert.Equal(t, ast.RegoV0, version)
+		assert.NotNil(t, compiled)
+	})
+
+	t.Run("genuinely invalid rego fails under both versions", func(t *testing.T) {
+		broken := `package armo_builtins
+
+this is not valid rego at all {{{
+`
+		_, _, err := opap.getCompiledRule(context.Background(), "broken-rule", broken, false)
+		assert.Error(t, err)
+	})
+}
+
+// TestRunOPAOnSingleRule_RegoV0FallbackEvaluates proves the fallback isn't
+// just a compile-time formality: a legacy v0 rule must actually evaluate
+// and produce a result, which requires regoEval to run at the same Rego
+// version the rule was compiled under (not hardcode v1 independently).
+func TestRunOPAOnSingleRule_RegoV0FallbackEvaluates(t *testing.T) {
+	opap := &OPAProcessor{compiledModules: make(map[string]compiledRule)}
+	getRuleData := func(r *reporthandling.PolicyRule) string { return r.Rule }
+
+	rule := &reporthandling.PolicyRule{
+		PortalBase:   armotypes.PortalBase{Name: "legacy-v0-rule"},
+		RuleLanguage: reporthandling.RegoLanguage,
+		Rule: `package armo_builtins
+
+deny[msga] {
+	pod := input[_]
+	pod.kind == "Pod"
+	msga := {
+		"alertMessage": "pod found",
+		"packagename": "armo_builtins",
+		"alertScore": 1,
+		"failedPaths": [],
+		"fixPaths": [],
+		"alertObject": {"k8sApiObjects": [pod]}
+	}
+}
+`,
+	}
+	obj := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Pod",
+		"metadata":   map[string]any{"name": "p", "namespace": "default"},
+	}
+
+	responses, _, err := opap.runOPAOnSingleRule(context.Background(), rule, []map[string]any{obj}, getRuleData, resources.RegoDependenciesData{}, "")
+	require.NoError(t, err)
+	require.Len(t, responses, 1)
+}
+
+func TestCELRemediation(t *testing.T) {
+	remediation := celRemediation([]cel.PathHint{
+		{Path: "spec.hostNetwork", Value: "false"},
+		{Path: "spec.containers[0].image"},
+		// The bundle guards each kind with its own validation, so the same
+		// path can arrive from more than one of them.
+		{Path: "spec.hostNetwork", Value: "false"},
+		{Path: "spec.containers[0].image"},
+	})
+
+	assert.Equal(t, []armotypes.FixPath{{Path: "spec.hostNetwork", Value: "false"}}, remediation.FixPaths,
+		"a hint with a value is a fix kubescape fix can write")
+	assert.Equal(t, []string{"spec.containers[0].image"}, remediation.ReviewPaths,
+		"a hint without a value names the field but not what to put there")
+}
+
+func TestCELRemediationSamePathValuedAndBare(t *testing.T) {
+	// The same path can be read as a bare presence test by one validation and as
+	// an equality by another. It must land in exactly one bucket: the valued
+	// hint wins, so it is a FixPath and never also a ReviewPath. Order of arrival
+	// must not matter.
+	valuedFirst := celRemediation([]cel.PathHint{
+		{Path: "spec.hostNetwork", Value: "false"},
+		{Path: "spec.hostNetwork"},
+	})
+	bareFirst := celRemediation([]cel.PathHint{
+		{Path: "spec.hostNetwork"},
+		{Path: "spec.hostNetwork", Value: "false"},
+	})
+
+	want := reporthandling.AssistedRemediation{FixPaths: []armotypes.FixPath{{Path: "spec.hostNetwork", Value: "false"}}}
+	assert.Equal(t, want, valuedFirst)
+	assert.Equal(t, want, bareFirst)
+	assert.Empty(t, valuedFirst.ReviewPaths, "a path that has a fix value must not also be listed for review")
+	assert.Empty(t, bareFirst.ReviewPaths)
+}
+
+func TestRunCELOnK8s(t *testing.T) {
+	opap := &OPAProcessor{}
+	rule := &reporthandling.PolicyRule{
+		PortalBase:   armotypes.PortalBase{Name: "cel-c-0017"},
+		RuleLanguage: reporthandling.CELLanguage,
+	}
+
+	// C-0017 flags containers without a read-only root filesystem.
+	violatingPod := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Pod",
+		"metadata":   map[string]any{"name": "mutable", "namespace": "default"},
+		"spec": map[string]any{
+			"containers": []any{map[string]any{"name": "c", "image": "nginx"}},
+		},
+	}
+	compliantPod := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Pod",
+		"metadata":   map[string]any{"name": "readonly", "namespace": "default"},
+		"spec": map[string]any{
+			"containers": []any{map[string]any{
+				"name":            "c",
+				"image":           "nginx",
+				"securityContext": map[string]any{"readOnlyRootFilesystem": true},
+			}},
+		},
+	}
+
+	// brokenPod has no spec, so object.spec.containers errors at eval time: its
+	// verdict is unknown.
+	brokenPod := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Pod",
+		"metadata":   map[string]any{"name": "broken", "namespace": "default"},
+	}
+	// configMap is outside C-0017's matchConstraints.
+	configMap := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   map[string]any{"name": "cm", "namespace": "default"},
+		"data":       map[string]any{"k": "v"},
+	}
+
+	t.Run("violation produces a failure response carrying the object", func(t *testing.T) {
+		responses, outcome, err := opap.runCELOnK8s(context.Background(), rule, []map[string]any{violatingPod}, nil, "C-0017")
+		require.NoError(t, err)
+		require.Len(t, responses, 1)
+		assert.Empty(t, outcome.skipped)
+		assert.Empty(t, outcome.excluded)
+
+		assert.Equal(t, rule.Name, responses[0].Rulename)
+		assert.NotEmpty(t, responses[0].AlertMessage)
+		failed := responses[0].GetFailedResources()
+		require.Len(t, failed, 1)
+		assert.Equal(t, "mutable", failed[0]["metadata"].(map[string]any)["name"])
+	})
+
+	t.Run("failure carries the remediation paths appendPaths needs", func(t *testing.T) {
+		// The gap this closes: without paths on the response, appendPaths has
+		// nothing to contribute and the finding reaches the printers and
+		// `kubescape fix` with an empty Paths list.
+		responses, _, err := opap.runCELOnK8s(context.Background(), rule, []map[string]any{violatingPod}, nil, "C-0017")
+		require.NoError(t, err)
+		require.Len(t, responses, 1)
+
+		assert.Equal(t, []armotypes.FixPath{
+			{Path: "spec.containers[0].securityContext.readOnlyRootFilesystem", Value: "true"},
+		}, responses[0].FixPaths)
+
+		paths := appendPaths(nil, responses[0].AssistedRemediation, "resource-id")
+		require.Len(t, paths, 1)
+		assert.Equal(t, "spec.containers[0].securityContext.readOnlyRootFilesystem", paths[0].FixPath.Path)
+		assert.Equal(t, "resource-id", paths[0].ResourceID)
+	})
+
+	t.Run("compliant object produces no response and no skip", func(t *testing.T) {
+		responses, outcome, err := opap.runCELOnK8s(context.Background(), rule, []map[string]any{compliantPod}, nil, "C-0017")
+		require.NoError(t, err)
+		assert.Empty(t, responses)
+		assert.Empty(t, outcome.skipped)
+		assert.Empty(t, outcome.excluded)
+	})
+
+	// Blocker 1: a single object whose expression errors must NOT bury a
+	// confirmed violation on another object in the same batch.
+	t.Run("a broken object does not erase a sibling violation", func(t *testing.T) {
+		responses, outcome, err := opap.runCELOnK8s(context.Background(), rule, []map[string]any{violatingPod, brokenPod}, nil, "C-0017")
+		require.NoError(t, err, "an eval error on one object must not fail the whole rule")
+		require.Len(t, responses, 2, "the confirmed violation must survive alongside the eval-error deny")
+		assert.Empty(t, outcome.skipped, "an eval error under failurePolicy Fail is a deny, not a skip")
+
+		byName := map[string]reporthandling.RuleResponse{}
+		for _, r := range responses {
+			byName[r.GetFailedResources()[0]["metadata"].(map[string]any)["name"].(string)] = r
+		}
+		require.Contains(t, byName, "mutable", "the confirmed violation must survive")
+		assert.Contains(t, byName, "broken", "the eval-error object must be denied, matching admission")
+	})
+
+	// An eval error alone is a deny under failurePolicy Fail, not a skip.
+	t.Run("an eval error is denied under failurePolicy Fail", func(t *testing.T) {
+		responses, outcome, err := opap.runCELOnK8s(context.Background(), rule, []map[string]any{brokenPod}, nil, "C-0017")
+		require.NoError(t, err)
+		require.Len(t, responses, 1)
+		assert.Empty(t, outcome.skipped)
+
+		failed := responses[0].GetFailedResources()
+		require.Len(t, failed, 1)
+		assert.Equal(t, "broken", failed[0]["metadata"].(map[string]any)["name"])
+		assert.NotEmpty(t, responses[0].AlertMessage)
+	})
+
+	// Blocker 2: an out-of-scope object must be excluded, not left to be
+	// inferred as passed.
+	t.Run("out-of-scope object is excluded, not passed", func(t *testing.T) {
+		responses, outcome, err := opap.runCELOnK8s(context.Background(), rule, []map[string]any{configMap}, nil, "C-0017")
+		require.NoError(t, err)
+		assert.Empty(t, responses)
+		assert.Empty(t, outcome.skipped)
+
+		id := objectsenvelopes.NewObject(configMap).GetID()
+		_, excluded := outcome.excluded[id]
+		assert.True(t, excluded, "a ConfigMap must be excluded from C-0017")
+	})
+
+	t.Run("unknown control skips the whole rule via an error", func(t *testing.T) {
+		_, _, err := opap.runCELOnK8s(context.Background(), rule, []map[string]any{violatingPod}, nil, "C-9999")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cel-c-0017")
+		assert.Contains(t, err.Error(), "C-9999")
+	})
+
+	t.Run("empty batch is a clean no-op", func(t *testing.T) {
+		responses, outcome, err := opap.runCELOnK8s(context.Background(), rule, nil, nil, "C-0017")
+		require.NoError(t, err)
+		assert.Empty(t, responses)
+		assert.Empty(t, outcome.skipped)
+		assert.Empty(t, outcome.excluded)
+	})
+}
+
+// TestCELNamespaceObjectFor covers the resolver behind the evaluator's
+// namespaceObject binding: the scanned resource's Namespace object out of the
+// scan's collected resources, and nil on every path where the scan cannot
+// know it (cluster-scoped resource, uncollected namespace, no session at
+// all) — the evaluator then binds null, which is the pre-wiring behaviour.
+func TestCELNamespaceObjectFor(t *testing.T) {
+	nsObject := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Namespace",
+		"metadata": map[string]any{
+			"name":   "prod",
+			"labels": map[string]any{"pod-security.kubernetes.io/enforce": "restricted"},
+		},
+	}
+	nsMeta := objectsenvelopes.NewObject(nsObject)
+	require.NotNil(t, nsMeta)
+
+	// A namespaced resource whose NAME matches a namespace must not be mistaken
+	// for the Namespace object itself.
+	decoy := objectsenvelopes.NewObject(map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   map[string]any{"name": "prod", "namespace": "prod"},
+	})
+	require.NotNil(t, decoy)
+
+	// Built through the constructor on purpose: that is where the index is
+	// snapshotted, so this also pins that NewOPAProcessor wires it.
+	opap := NewOPAProcessor(&cautils.OPASessionObj{
+		AllResources: map[string]workloadinterface.IMetadata{
+			nsMeta.GetID(): nsMeta,
+			decoy.GetID():  decoy,
+		},
+	}, &resources.RegoDependenciesData{}, "", "", "", false, nil)
+
+	podIn := func(namespace string) map[string]any {
+		metadata := map[string]any{"name": "p"}
+		if namespace != "" {
+			metadata["namespace"] = namespace
+		}
+		return map[string]any{"apiVersion": "v1", "kind": "Pod", "metadata": metadata, "spec": map[string]any{}}
+	}
+
+	t.Run("resolves the collected Namespace object", func(t *testing.T) {
+		got := opap.celNamespaceObjectFor(podIn("prod"))
+		require.NotNil(t, got)
+		assert.Equal(t, "Namespace", got["kind"])
+		labels := got["metadata"].(map[string]any)["labels"].(map[string]any)
+		assert.Equal(t, "restricted", labels["pod-security.kubernetes.io/enforce"],
+			"the binding must carry the real Namespace object, labels included")
+	})
+
+	t.Run("uncollected namespace resolves to nil", func(t *testing.T) {
+		assert.Nil(t, opap.celNamespaceObjectFor(podIn("staging")))
+	})
+
+	t.Run("cluster-scoped resource resolves to nil", func(t *testing.T) {
+		assert.Nil(t, opap.celNamespaceObjectFor(podIn("")))
+	})
+
+	t.Run("enveloped resource resolves through object metadata accessors", func(t *testing.T) {
+		enveloped := objectsenvelopes.NewRegoResponseVectorObject(map[string]any{
+			"apiVersion":     "v1",
+			"kind":           "Pod",
+			"name":           "p",
+			"namespace":      "prod",
+			"relatedObjects": []map[string]any{},
+		})
+		got := opap.celNamespaceObjectFor(enveloped.GetObject())
+		require.NotNil(t, got)
+		assert.Equal(t, "prod", got["metadata"].(map[string]any)["name"])
+	})
+
+	t.Run("no session resolves to nil without panicking", func(t *testing.T) {
+		// Both the zero value and a constructor call with no session: the second
+		// is the one a caller can actually reach.
+		assert.Nil(t, (&OPAProcessor{}).celNamespaceObjectFor(podIn("prod")))
+		assert.Nil(t, NewOPAProcessor(nil, nil, "", "", "", false, nil).celNamespaceObjectFor(podIn("prod")))
+	})
+}
+
+// TestHasUnreachableDependency_GVRPullFailureGuard pins the mixed-purpose
+// InfoMap guard: only a whole-GVR pull failure (keyed by GVR string AND
+// listed in the control's dependency set) counts as an unreachable
+// dependency; per-resource eval skips keyed by resource ID must not match.
+func TestHasUnreachableDependency_GVRPullFailureGuard(t *testing.T) {
+	opap := NewOPAProcessor(&cautils.OPASessionObj{
+		InfoMap: map[string]apis.StatusInfo{
+			"apps/v1/deployments": {InnerStatus: apis.StatusSkipped},
+			"/v1/pods":            {InnerStatus: apis.StatusSkipped},
+		},
+		ResourceToControlsMap: map[string][]string{
+			"apps/v1/deployments": {"C-0001"},
+			"/v1/secrets":         {"C-0002"},
+		},
+	}, nil, "test", "", "", false, nil)
+
+	assert.True(t, opap.hasUnreachableDependency("C-0001"),
+		"control depending on a skipped GVR must report an unreachable dependency")
+	assert.False(t, opap.hasUnreachableDependency("C-0002"),
+		"a per-resource skip keyed by resource ID must not be mistaken for a GVR pull failure")
+	assert.False(t, opap.hasUnreachableDependency("C-9999"),
+		"control with no dependencies must report no unreachable dependency")
+}
+
+// TestHasUnreachableDependency_ConcurrentWithSkipWrites is a -race regression
+// test for #3562: hasUnreachableDependency used to read opap.InfoMap without
+// holding opap.mu while concurrent processScope workers wrote that same map
+// through markResourcesSkipped/seedCELSkips on the rule-error path, aborting
+// scans with "fatal error: concurrent map read and map write". The test
+// hammers exactly that read/write pair concurrently — wide write windows
+// (many resources per markResourcesSkipped call) and frequent reads — so a
+// run under -race trips quickly if the read ever loses its guard again.
+func TestHasUnreachableDependency_ConcurrentWithSkipWrites(t *testing.T) {
+	opap := NewOPAProcessor(&cautils.OPASessionObj{
+		InfoMap:               make(map[string]apis.StatusInfo),
+		ResourceToControlsMap: make(map[string][]string),
+	}, nil, "test", "", "", false, nil)
+
+	// Seed several dependency mappings so every reader iteration does real
+	// map work rather than falling out of the loop immediately.
+	for i := 0; i < 8; i++ {
+		gvr := fmt.Sprintf("apps/v1/deployments-set%d", i)
+		opap.ResourceToControlsMap[gvr] = []string{"C-0001", "C-0002"}
+	}
+
+	// Many input resources per call widens the write window: each
+	// markResourcesSkipped call takes and releases mu once per resource.
+	const resourcesPerWrite = 200
+	inputResources := make([]workloadinterface.IMetadata, 0, resourcesPerWrite)
+	for i := 0; i < resourcesPerWrite; i++ {
+		inputResources = append(inputResources, workloadinterface.NewWorkloadObj(map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Pod",
+			"metadata": map[string]any{
+				"name":      fmt.Sprintf("pod-%d", i),
+				"namespace": "default",
+			},
+		}))
+	}
+	erroringRule := &reporthandling.PolicyRule{PortalBase: armotypes.PortalBase{Name: "simulated-erroring-rule"}}
+
+	var wg sync.WaitGroup
+	const writers = 4
+	const readers = 4
+
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			out := make(map[string]*resourcesresults.ResourceAssociatedRule)
+			for i := 0; i < 25; i++ {
+				opap.markResourcesSkipped(out, erroringRule, resources.RegoDependenciesData{}, inputResources, errors.New("simulated evaluation failure"))
+			}
+		}()
+	}
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 500; i++ {
+				opap.hasUnreachableDependency("C-0001")
+				opap.hasUnreachableDependency("C-0002")
+			}
+		}()
+	}
+	wg.Wait()
+}

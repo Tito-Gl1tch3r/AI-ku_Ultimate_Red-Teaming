@@ -1,0 +1,36 @@
+namespace Spice86.Core.Emulator.OperatingSystem;
+
+using Microsoft.Extensions.Logging;
+
+using Spice86.Core.CLI.RuntimeOptions;
+using Spice86.Core.Emulator.CPU;
+using Spice86.Core.Emulator.InterruptHandlers.Dos;
+using Spice86.Core.Emulator.Memory;
+using Spice86.Core.Emulator.OperatingSystem.Batch;
+using Spice86.Core.Emulator.OperatingSystem.Structures;
+
+internal sealed class DosBatchProgramLoader : DosProgramLoader {
+    public DosBatchProgramLoader(ProgramLoadOptions options, IMemory memory,
+        State state, DosInt21Handler int21Handler,
+        ILogger loggerService)
+        : base(options, memory, state, int21Handler, loggerService) {
+    }
+
+    protected override DosExecResult LoadLaunchRequest(LaunchRequest launchRequest,
+        DosExecParameterBlock paramBlock) {
+        if (launchRequest is BootLaunchRequest bootLaunchRequest) {
+            return _processManager.LoadInitialBootProgram(bootLaunchRequest.DriveLetter);
+        }
+
+        if (launchRequest is InternalProgramLaunchRequest internalProgramLaunchRequest) {
+            return _processManager.LoadInitialProgramFromBytes(internalProgramLaunchRequest.ComProgramBytes);
+        }
+
+        if (launchRequest is ProgramLaunchRequest programLaunchRequest) {
+            return _processManager.LoadInitialProgram(programLaunchRequest.ProgramName, paramBlock,
+                programLaunchRequest.CommandTail, paramBlock.EnvironmentSegment);
+        }
+
+        return base.LoadLaunchRequest(launchRequest, paramBlock);
+    }
+}

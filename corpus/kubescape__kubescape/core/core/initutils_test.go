@@ -1,0 +1,879 @@
+package core
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/armosec/armoapi-go/armotypes"
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	"github.com/kubescape/k8s-interface/k8sinterface"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/cautils/getter"
+	"github.com/kubescape/kubescape/v4/core/pkg/hostsensorutils"
+	apisv1 "github.com/kubescape/opa-utils/httpserver/apis/v1"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	fakeclientset "k8s.io/client-go/kubernetes/fake"
+	restclient "k8s.io/client-go/rest"
+)
+
+type TenantConfigMock struct {
+	clusterName    string
+	accountID      string
+	accessKey      string
+	cloudReportURL string
+}
+
+func (tcm *TenantConfigMock) UpdateCachedConfig() error {
+	return nil
+}
+func (tcm *TenantConfigMock) DeleteCachedConfig(ctx context.Context) error {
+	return nil
+}
+func (tcm *TenantConfigMock) GetContextName() string {
+	return tcm.clusterName
+}
+func (tcm *TenantConfigMock) GetAccountID() string {
+	return tcm.accountID
+}
+func (tcm *TenantConfigMock) IsStorageEnabled() bool {
+	return true
+}
+func (tcm *TenantConfigMock) GetConfigObj() *cautils.ConfigObj {
+	return &cautils.ConfigObj{
+		AccountID:   tcm.accountID,
+		ClusterName: tcm.clusterName,
+	}
+}
+func (tcm *TenantConfigMock) GetCloudReportURL() string {
+	return tcm.cloudReportURL
+}
+func (tcm *TenantConfigMock) GetCloudAPIURL() string {
+	return ""
+}
+
+func (tcm *TenantConfigMock) GenerateAccountID() (string, error) {
+	//tcm.accountID = "6a1ff233-5297-4193-bb51-5d67bc841cbf"
+	return tcm.accountID, nil
+}
+
+func (tcm *TenantConfigMock) DeleteCredentials() error {
+	tcm.accountID = ""
+	tcm.accessKey = ""
+	return nil
+}
+
+func (tcm *TenantConfigMock) GetAccessKey() string {
+	return tcm.accessKey
+}
+
+func TestGetExceptionsGetter(t *testing.T) {
+	type args struct {
+		ctx                    context.Context
+		useExceptions          string
+		accountID              string
+		downloadReleasedPolicy *getter.DownloadReleasedPolicy
+	}
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{
+			name: "Test GetExceptionsGetter all empty",
+			args: args{
+				ctx:                    context.Background(),
+				useExceptions:          "",
+				accountID:              "",
+				downloadReleasedPolicy: nil,
+			},
+			want: "*getter.MergedExceptionsGetter",
+		},
+		{
+			name: "Test GetExceptionsGetter empty useExceptions",
+			args: args{
+				ctx:                    context.Background(),
+				useExceptions:          "",
+				accountID:              "",
+				downloadReleasedPolicy: getter.NewDownloadReleasedPolicy(),
+			},
+			want: "*getter.MergedExceptionsGetter",
+		},
+		{
+			name: "Test GetExceptionsGetter with useExceptions and empty accountID",
+			args: args{
+				ctx:                    context.Background(),
+				useExceptions:          "true",
+				accountID:              "",
+				downloadReleasedPolicy: getter.NewDownloadReleasedPolicy(),
+			},
+			want: "*getter.MergedExceptionsGetter",
+		},
+		{
+			name: "Test GetExceptionsGetter with useExceptions and filled accountID",
+			args: args{
+				ctx:                    context.Background(),
+				useExceptions:          "true",
+				accountID:              "123456789012",
+				downloadReleasedPolicy: getter.NewDownloadReleasedPolicy(),
+			},
+			want: "*getter.MergedExceptionsGetter",
+		},
+		{
+			name: "Test GetExceptionsGetter with accountID",
+			args: args{
+				ctx:                    context.Background(),
+				useExceptions:          "",
+				accountID:              "123456789012",
+				downloadReleasedPolicy: getter.NewDownloadReleasedPolicy(),
+			},
+			want: "*getter.MergedExceptionsGetter",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, _, err := getExceptionsGetter(tt.args.ctx, tt.args.useExceptions, tt.args.accountID, tt.args.downloadReleasedPolicy, false)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, reflect.TypeOf(got).String())
+		})
+	}
+}
+
+type releasedExceptionsGetterStub struct {
+	fallback bool
+	err      error
+}
+
+func (s *releasedExceptionsGetterStub) SetRegoObjectsWithFallback() (bool, error) {
+	return s.fallback, s.err
+}
+
+func (s *releasedExceptionsGetterStub) GetExceptions(context.Context, string) ([]armotypes.PostureExceptionPolicy, error) {
+	return nil, nil
+}
+
+func TestGetReleasedExceptionsGetterReportsCacheFallback(t *testing.T) {
+	t.Run("fresh release", func(t *testing.T) {
+		got, fromCache, err := getReleasedExceptionsGetter(context.Background(), &releasedExceptionsGetterStub{})
+		require.NoError(t, err)
+		assert.False(t, fromCache)
+		assert.Equal(t, "*getter.MergedExceptionsGetter", reflect.TypeOf(got).String())
+	})
+
+	t.Run("local cache fallback", func(t *testing.T) {
+		originalStore := getter.DefaultLocalStore
+		getter.DefaultLocalStore = t.TempDir()
+		t.Cleanup(func() { getter.DefaultLocalStore = originalStore })
+
+		want := []armotypes.PostureExceptionPolicy{{PortalBase: armotypes.PortalBase{Name: "cached-exception"}}}
+		require.NoError(t, getter.SaveInFile(want, getter.GetDefaultPath(cautils.LocalExceptionsFilename)))
+
+		got, fromCache, err := getReleasedExceptionsGetter(context.Background(), &releasedExceptionsGetterStub{fallback: true})
+		require.NoError(t, err)
+		assert.True(t, fromCache)
+		assert.Equal(t, "*getter.MergedExceptionsGetter", reflect.TypeOf(got).String())
+
+		loaded, err := got.GetExceptions(context.Background(), "cluster")
+		require.NoError(t, err)
+		assert.Equal(t, want, loaded)
+	})
+
+	t.Run("hard error", func(t *testing.T) {
+		wantErr := errors.New("release unavailable")
+		got, fromCache, err := getReleasedExceptionsGetter(context.Background(), &releasedExceptionsGetterStub{err: wantErr})
+		require.ErrorIs(t, err, wantErr)
+		assert.False(t, fromCache)
+		assert.Nil(t, got)
+	})
+}
+
+func TestGettersAirGappedUseCache(t *testing.T) {
+	ctx := context.Background()
+	for _, accountID := range []string{"", "123456789012"} {
+		t.Run("accountID="+accountID, func(t *testing.T) {
+			policyGetter, err := getPolicyGetter(ctx, nil, accountID, true, nil, true)
+			assert.NoError(t, err)
+			assert.Equal(t, "*getter.LoadPolicy", reflect.TypeOf(policyGetter).String())
+			configInputsGetter, _, err := getConfigInputsGetter(ctx, "", accountID, nil, false, true)
+			assert.NoError(t, err)
+			assert.Equal(t, "*getter.LoadPolicy", reflect.TypeOf(configInputsGetter).String())
+			attackTracksGetter, err := getAttackTracksGetter(ctx, "", accountID, nil, true)
+			assert.NoError(t, err)
+			assert.Equal(t, "*getter.LoadPolicy", reflect.TypeOf(attackTracksGetter).String())
+			exceptionsGetter, fromCache, err := getExceptionsGetter(ctx, "", accountID, nil, true)
+			assert.NoError(t, err)
+			assert.False(t, fromCache)
+			assert.Equal(t, "*getter.MergedExceptionsGetter", reflect.TypeOf(exceptionsGetter).String())
+		})
+	}
+}
+
+func TestResolveDefaultScanAllPolicies(t *testing.T) {
+	nativeIdentifiers := func() []cautils.PolicyIdentifier {
+		return cautils.BuildPolicyIdentifiers(getter.NativeFrameworks, apisv1.KindFramework)
+	}
+
+	tests := []struct {
+		name              string
+		scanInfo          *cautils.ScanInfo
+		policyIdentifiers []cautils.PolicyIdentifier
+		want              []cautils.PolicyIdentifier
+	}{
+		{
+			name:     "ScanAll with UseDefault expands an empty list to the default frameworks",
+			scanInfo: &cautils.ScanInfo{ScanAll: true, UseDefault: true, FrameworkScan: true},
+			want:     nativeIdentifiers(),
+		},
+		{
+			name:              "ScanAll with UseDefault keeps the requested frameworks first",
+			scanInfo:          &cautils.ScanInfo{ScanAll: true, UseDefault: true, FrameworkScan: true},
+			policyIdentifiers: cautils.BuildPolicyIdentifiers([]string{"cis-v1.23-t1.0.1"}, apisv1.KindFramework),
+			want: append(
+				cautils.BuildPolicyIdentifiers([]string{"cis-v1.23-t1.0.1"}, apisv1.KindFramework),
+				nativeIdentifiers()...,
+			),
+		},
+		{
+			name:              "ScanAll with UseDefault does not re-add differently cased frameworks",
+			scanInfo:          &cautils.ScanInfo{ScanAll: true, UseDefault: true, FrameworkScan: true},
+			policyIdentifiers: cautils.BuildPolicyIdentifiers([]string{"NSA", "MITRE"}, apisv1.KindFramework),
+			want: append(
+				cautils.BuildPolicyIdentifiers([]string{"NSA", "MITRE"}, apisv1.KindFramework),
+				cautils.PolicyIdentifier{Identifier: "allcontrols", Kind: apisv1.KindFramework},
+			),
+		},
+		{
+			name:     "ScanAll without UseDefault is left to the policy getter",
+			scanInfo: &cautils.ScanInfo{ScanAll: true},
+			want:     nil,
+		},
+		{
+			name:              "UseDefault without ScanAll leaves the list untouched",
+			scanInfo:          &cautils.ScanInfo{UseDefault: true},
+			policyIdentifiers: cautils.BuildPolicyIdentifiers([]string{"nsa"}, apisv1.KindFramework),
+			want:              cautils.BuildPolicyIdentifiers([]string{"nsa"}, apisv1.KindFramework),
+		},
+		{
+			// `scan control` with no arguments sets ScanAll but is not a framework scan;
+			// expanding it would populate UseFrom and turn the scan air-gapped.
+			name:     "control scan is not expanded even with ScanAll and UseDefault",
+			scanInfo: &cautils.ScanInfo{ScanAll: true, UseDefault: true, FrameworkScan: false},
+			want:     nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, resolveDefaultScanAllPolicies(tt.scanInfo, tt.policyIdentifiers))
+		})
+	}
+}
+
+// TestScanAllWithUseDefaultResolvesCachePaths is the regression test for the ordering bug:
+// a ScanAll scan combined with --use-default must reach getPolicyGetter with every framework
+// already resolved to a cache path, so the scan loads locally instead of reaching the network.
+func TestScanAllWithUseDefaultResolvesCachePaths(t *testing.T) {
+	scanInfo := &cautils.ScanInfo{ScanAll: true, UseDefault: true, FrameworkScan: true}
+
+	policyIdentifiers := resolveDefaultScanAllPolicies(scanInfo, nil)
+	require.NoError(t, scanInfo.Init(context.Background(), policyIdentifiers))
+
+	wantPaths := getDefaultFrameworksPaths()
+	assert.ElementsMatch(t, wantPaths, scanInfo.UseFrom)
+	assert.True(t, isAirGappedMode(scanInfo), "cached paths must put the scan in air-gapped mode")
+
+	policyGetter, err := getPolicyGetter(context.Background(), scanInfo.UseFrom, "123456789012", scanInfo.FrameworkScan, nil, isAirGappedMode(scanInfo))
+	require.NoError(t, err)
+	assert.Equal(t, "*getter.LoadPolicy", reflect.TypeOf(policyGetter).String())
+}
+
+// TestScanAllControlScanWithUseDefaultStaysOnline guards the FrameworkScan gate: `scan control`
+// with no arguments sets ScanAll, and expanding it would resolve cache paths into UseFrom and
+// flip the scan air-gapped, cutting off the download fallback for control inputs, exceptions
+// and attack tracks on a cold cache.
+func TestScanAllControlScanWithUseDefaultStaysOnline(t *testing.T) {
+	scanInfo := &cautils.ScanInfo{ScanAll: true, UseDefault: true, FrameworkScan: false}
+
+	policyIdentifiers := resolveDefaultScanAllPolicies(scanInfo, nil)
+	require.NoError(t, scanInfo.Init(context.Background(), policyIdentifiers))
+
+	assert.Empty(t, policyIdentifiers, "a control scan must not gain framework identifiers")
+	assert.Empty(t, scanInfo.UseFrom)
+	assert.False(t, isAirGappedMode(scanInfo), "control scans must keep the download fallback")
+}
+
+func TestPolicyIdentifierIdentities(t *testing.T) {
+	type args struct {
+		pi []cautils.PolicyIdentifier
+	}
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{
+			name: "Test PolicyIdentifierIdentities",
+			args: args{
+				pi: []cautils.PolicyIdentifier{
+					{Identifier: "policy1"},
+					{Identifier: "policy2"},
+					{Identifier: "policy3"},
+				},
+			},
+			want: "policy1,policy2,policy3",
+		},
+		{
+			name: "Test PolicyIdentifierIdentities Empty",
+			args: args{
+				pi: []cautils.PolicyIdentifier{},
+			},
+			want: "all",
+		},
+		{
+			name: "Test PolicyIdentifierIdentities nil",
+			args: args{
+				pi: nil,
+			},
+			want: "all",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := policyIdentifierIdentities(tt.args.pi)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func Test_getUIPrinter(t *testing.T) {
+	scanInfo := &cautils.ScanInfo{
+		FormatVersion: "v2",
+		VerboseMode:   true,
+		View:          "control",
+	}
+	type args struct {
+		ctx           context.Context
+		formatVersion string
+		viewType      cautils.ViewTypes
+		verboseMode   bool
+		printAttack   bool
+		loggerLevel   helpers.Level
+	}
+	type wantTypes struct {
+		structType    string
+		formatVersion string
+		viewType      cautils.ViewTypes
+		verboseMode   bool
+	}
+	tests := []struct {
+		name          string
+		args          args
+		want          wantTypes
+		testAllFields bool
+	}{
+		{
+			name: "Test getUIPrinter PrettyPrinter",
+			args: args{
+				ctx:           context.Background(),
+				verboseMode:   scanInfo.VerboseMode,
+				formatVersion: scanInfo.FormatVersion,
+				printAttack:   scanInfo.PrintAttackTree,
+				viewType:      cautils.ViewTypes(scanInfo.View),
+				loggerLevel:   helpers.InfoLevel,
+			},
+			want: wantTypes{
+				structType:    "*printer.PrettyPrinter",
+				formatVersion: scanInfo.FormatVersion,
+				verboseMode:   scanInfo.VerboseMode,
+				viewType:      cautils.ViewTypes(scanInfo.View),
+			},
+			testAllFields: true,
+		},
+		{
+			name: "Test getUIPrinter SilentPrinter",
+			args: args{
+				ctx:           context.Background(),
+				verboseMode:   scanInfo.VerboseMode,
+				formatVersion: scanInfo.FormatVersion,
+				printAttack:   scanInfo.PrintAttackTree,
+				viewType:      cautils.ViewTypes(scanInfo.View),
+				loggerLevel:   helpers.WarningLevel,
+			},
+			want: wantTypes{
+				structType:    "*printer.SilentPrinter",
+				formatVersion: "",
+				verboseMode:   false,
+				viewType:      cautils.ViewTypes(""),
+			},
+			testAllFields: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger.L().SetLevel(tt.args.loggerLevel.String())
+			scanInfo := &cautils.ScanInfo{
+				FormatVersion:   tt.args.formatVersion,
+				VerboseMode:     tt.args.verboseMode,
+				PrintAttackTree: tt.args.printAttack,
+				View:            string(tt.args.viewType),
+			}
+
+			got := GetUIPrinter(tt.args.ctx, scanInfo, "test-cluster")
+
+			assert.Equal(t, tt.want.structType, reflect.TypeOf(got).String())
+
+			if !tt.testAllFields {
+				return
+			}
+
+			gotValue := reflect.ValueOf(got).Elem()
+			gotFormatVersion := gotValue.FieldByName("formatVersion").String()
+			gotVerboseMode := gotValue.FieldByName("verboseMode").Bool()
+			gotViewType := cautils.ViewTypes(gotValue.FieldByName("viewType").String())
+
+			if gotFormatVersion != tt.want.formatVersion {
+				t.Errorf("Got: %s, want: %s", gotFormatVersion, tt.want.formatVersion)
+			}
+
+			if gotVerboseMode != tt.want.verboseMode {
+				t.Errorf("Got: %t, want: %t", gotVerboseMode, tt.want.verboseMode)
+			}
+
+			if gotViewType != tt.want.viewType {
+				t.Errorf("Got: %v, want: %v", gotViewType, tt.want.viewType)
+			}
+		})
+	}
+}
+
+func TestGetSensorHandler(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	t.Run("should return mock sensor if not k8s interface is provided", func(t *testing.T) {
+		t.Parallel()
+
+		scanInfo := &cautils.ScanInfo{}
+		var k8s *k8sinterface.KubernetesApi
+
+		sensor := getHostSensorHandler(ctx, scanInfo, k8s)
+		require.NotNil(t, sensor)
+
+		_, isMock := sensor.(*hostsensorutils.HostSensorHandlerMock)
+		require.True(t, isMock)
+	})
+
+	t.Run("should return mock sensor if the sensor is not enabled", func(t *testing.T) {
+		t.Parallel()
+
+		scanInfo := &cautils.ScanInfo{}
+		k8s := &k8sinterface.KubernetesApi{}
+
+		sensor := getHostSensorHandler(ctx, scanInfo, k8s)
+		require.NotNil(t, sensor)
+
+		_, isMock := sensor.(*hostsensorutils.HostSensorHandlerMock)
+		require.True(t, isMock)
+	})
+
+	t.Run("should return mock sensor if the default sensor is not enabled", func(t *testing.T) {
+		t.Parallel()
+
+		falseVal := false
+		scanInfo := &cautils.ScanInfo{
+			HostSensorEnabledDefault: &falseVal,
+		}
+		k8s := &k8sinterface.KubernetesApi{}
+
+		sensor := getHostSensorHandler(ctx, scanInfo, k8s)
+		require.NotNil(t, sensor)
+
+		_, isMock := sensor.(*hostsensorutils.HostSensorHandlerMock)
+		require.True(t, isMock)
+	})
+
+	t.Run("should return mock sensor if the sensor is disabled", func(t *testing.T) {
+		t.Parallel()
+
+		falseFlag := cautils.NewBoolPtr(nil)
+		falseFlag.SetBool(false)
+		scanInfo := &cautils.ScanInfo{
+			HostSensorEnabled: falseFlag,
+		}
+		k8s := &k8sinterface.KubernetesApi{}
+
+		sensor := getHostSensorHandler(ctx, scanInfo, k8s)
+		require.NotNil(t, sensor)
+
+		_, isMock := sensor.(*hostsensorutils.HostSensorHandlerMock)
+		require.True(t, isMock)
+	})
+
+	t.Run("should return mock sensor if the sensor is enabled, but can't deploy (nil)", func(t *testing.T) {
+		t.Parallel()
+
+		falseFlag := cautils.NewBoolPtr(nil)
+		falseFlag.SetBool(true)
+		scanInfo := &cautils.ScanInfo{
+			HostSensorEnabled: falseFlag,
+		}
+		var k8s *k8sinterface.KubernetesApi
+
+		sensor := getHostSensorHandler(ctx, scanInfo, k8s)
+		require.NotNil(t, sensor)
+
+		_, isMock := sensor.(*hostsensorutils.HostSensorHandlerMock)
+		require.True(t, isMock)
+	})
+
+	t.Run("should disable HostSensorEnabled if explicitly enabled but construction fails", func(t *testing.T) {
+		originalK8SConfig := k8sinterface.K8SConfig
+		t.Cleanup(func() { k8sinterface.K8SConfig = originalK8SConfig })
+		k8sinterface.K8SConfig = &restclient.Config{}
+
+		trueFlag := cautils.NewBoolPtr(nil)
+		trueFlag.SetBool(true)
+		scanInfo := &cautils.ScanInfo{
+			HostSensorEnabled: trueFlag,
+		}
+		// A client with no nodes makes NewHostSensorHandler fail its liveness check.
+		k8s := &k8sinterface.KubernetesApi{
+			KubernetesClient: fakeclientset.NewClientset(),
+			Context:          ctx,
+		}
+
+		sensor := getHostSensorHandler(ctx, scanInfo, k8s)
+		require.NotNil(t, sensor)
+
+		_, isMock := sensor.(*hostsensorutils.HostSensorHandlerMock)
+		require.True(t, isMock)
+		assert.False(t, scanInfo.HostSensorEnabled.GetBool(),
+			"a failed explicit host-scan request must not leave HostSensorEnabled true, or the collector will treat the mock's empty result as a clean scan")
+	})
+
+	// TODO(fredbi): need to share the k8s client mock to test a happy path / deployment failure path
+}
+
+func TestSetSubmitBehavior(t *testing.T) {
+	type args struct {
+		scanInfo                *cautils.ScanInfo
+		tenantConfig            *TenantConfigMock
+		isScanTypeForSubmission bool
+		isLocal                 bool
+	}
+	tests := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{
+			name: "Test SetSubmitBehavior !setSubmitBehavior and keep-local",
+			args: args{
+				scanInfo: &cautils.ScanInfo{
+					ScanType: cautils.ScanTypeControl,
+					Local:    true,
+				},
+				tenantConfig: &TenantConfigMock{
+					clusterName: "test",
+					accountID:   "",
+					accessKey:   "",
+				},
+				isScanTypeForSubmission: false,
+				isLocal:                 true,
+			},
+			want: false,
+		},
+		{
+			name: "Test SetSubmitBehavior !setSubmitBehavior and !keep-local",
+			args: args{
+				scanInfo: &cautils.ScanInfo{
+					ScanType: cautils.ScanTypeControl,
+					Local:    false,
+				},
+				tenantConfig: &TenantConfigMock{
+					clusterName: "test",
+					accountID:   "",
+					accessKey:   "",
+				},
+				isScanTypeForSubmission: false,
+				isLocal:                 false,
+			},
+			want: false,
+		},
+		{
+			name: "Test SetSubmitBehavior setSubmitBehavior and keep-local",
+			args: args{
+				scanInfo: &cautils.ScanInfo{
+					ScanType: cautils.ScanTypeCluster,
+					Local:    true,
+				},
+				tenantConfig: &TenantConfigMock{
+					clusterName: "test",
+					accountID:   "",
+					accessKey:   "",
+				},
+				isScanTypeForSubmission: true,
+				isLocal:                 true,
+			},
+			want: false,
+		},
+		{
+			name: "Test SetSubmitBehavior !keep-local and setSubmitBehavior",
+			args: args{
+				scanInfo: &cautils.ScanInfo{
+					ScanType: cautils.ScanTypeCluster,
+					Local:    false,
+				},
+				tenantConfig: &TenantConfigMock{
+					clusterName: "test",
+					accountID:   "",
+					accessKey:   "",
+				},
+				isScanTypeForSubmission: true,
+				isLocal:                 false,
+			},
+			want: false,
+		}, // TODO: Add test "If CloudReportURL is set"
+		{
+			name: "Test SetSubmitBehavior CloudReportURL is set, no AccountID",
+			args: args{
+				scanInfo: &cautils.ScanInfo{
+					ScanType: cautils.ScanTypeCluster,
+					Local:    false,
+				},
+				tenantConfig: &TenantConfigMock{
+					clusterName:    "test",
+					accountID:      "",
+					accessKey:      "",
+					cloudReportURL: "https://example.kubescape.com",
+				},
+				isScanTypeForSubmission: true,
+				isLocal:                 false,
+			},
+			want: true,
+		},
+		{
+			name: "Test SetSubmitBehavior CloudReportURL is set, Invalid AccountID",
+			args: args{
+				scanInfo: &cautils.ScanInfo{
+					ScanType: cautils.ScanTypeCluster,
+					Local:    false,
+				},
+				tenantConfig: &TenantConfigMock{
+					clusterName:    "test",
+					accountID:      "123456789012",
+					accessKey:      "",
+					cloudReportURL: "https://example.kubescape.com",
+				},
+				isScanTypeForSubmission: true,
+				isLocal:                 false,
+			},
+			want: false,
+		},
+		{
+			name: "Test SetSubmitBehavior CloudReportURL is set, Valid AccountID",
+			args: args{
+				scanInfo: &cautils.ScanInfo{
+					ScanType: cautils.ScanTypeCluster,
+					Local:    false,
+				},
+				tenantConfig: &TenantConfigMock{
+					clusterName:    "test",
+					accountID:      "6a1ff233-5297-4193-bb51-5d67bc841cbf",
+					accessKey:      "",
+					cloudReportURL: "https://example.kubescape.com",
+				},
+				isScanTypeForSubmission: true,
+				isLocal:                 false,
+			},
+			want: true,
+		},
+		{
+			// Regression test for https://github.com/kubescape/kubescape/issues/2555:
+			// an explicit opt-out must not be silently overridden by auto-detection,
+			// even when a CloudReportURL is present and no account is set (the
+			// scenario that would otherwise force Submit=true).
+			name: "Test SetSubmitBehavior explicit opt-out is respected despite CloudReportURL and no AccountID",
+			args: args{
+				scanInfo: &cautils.ScanInfo{
+					ScanType: cautils.ScanTypeCluster,
+					Local:    false,
+					Submit:   cautils.NewBoolPtr(new(false)),
+				},
+				tenantConfig: &TenantConfigMock{
+					clusterName:    "test",
+					accountID:      "",
+					accessKey:      "",
+					cloudReportURL: "https://example.kubescape.com",
+				},
+				isScanTypeForSubmission: true,
+				isLocal:                 false,
+			},
+			want: false,
+		},
+		{
+			// An explicit opt-in must still go through the normal auto-detection -
+			// it does not bypass the "no backend configured" safety check.
+			name: "Test SetSubmitBehavior explicit opt-in does not bypass missing CloudReportURL",
+			args: args{
+				scanInfo: &cautils.ScanInfo{
+					ScanType: cautils.ScanTypeCluster,
+					Local:    false,
+					Submit:   cautils.NewBoolPtr(new(true)),
+				},
+				tenantConfig: &TenantConfigMock{
+					clusterName: "test",
+					accountID:   "",
+					accessKey:   "",
+				},
+				isScanTypeForSubmission: true,
+				isLocal:                 false,
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.args.isScanTypeForSubmission, isScanTypeForSubmission(tt.args.scanInfo.ScanType))
+			require.Equal(t, tt.args.isLocal, tt.args.scanInfo.Local)
+
+			setSubmitBehavior(tt.args.scanInfo, tt.args.tenantConfig)
+
+			assert.Equal(t, tt.want, tt.args.scanInfo.Submit.GetBool())
+		})
+	}
+}
+
+func TestIsScanTypeForSubmission(t *testing.T) {
+	test := []struct {
+		name     string
+		scanType cautils.ScanTypes
+		want     bool
+	}{
+		{
+			name:     "cluster scan",
+			scanType: cautils.ScanTypeCluster,
+			want:     true,
+		},
+		{
+			name:     "repo scan",
+			scanType: cautils.ScanTypeRepo,
+			want:     true,
+		},
+		{
+			name:     "workload scan",
+			scanType: cautils.ScanTypeWorkload,
+			want:     false,
+		},
+		{
+			name:     "control scan",
+			scanType: cautils.ScanTypeControl,
+			want:     false,
+		},
+		{
+			name:     "framework scan",
+			scanType: cautils.ScanTypeFramework,
+			want:     true,
+		},
+		{
+			name:     "image scan",
+			scanType: cautils.ScanTypeImage,
+			want:     true,
+		},
+	}
+
+	for _, tt := range test {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isScanTypeForSubmission(tt.scanType)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestGetDefaultFrameworksPaths(t *testing.T) {
+	result := getDefaultFrameworksPaths()
+
+	assert.NotEmpty(t, result)
+	for _, path := range result {
+		assert.NotEmpty(t, path)
+		assert.True(t, strings.HasSuffix(path, ".json"))
+	}
+}
+
+// getDownloadReleasedPolicy should always have a non-nil result
+func TestGetDownloadReleasedPolicy(t *testing.T) {
+	ctx := context.Background()
+	downloadReleasedPolicy := getter.NewDownloadReleasedPolicy()
+
+	result, err := getDownloadReleasedPolicy(ctx, downloadReleasedPolicy)
+
+	require.NoError(t, err)
+	assert.NotNil(t, result)
+}
+
+// With a pinned --controls-version whose release does not exist, the download
+// fails and each getter must propagate a hard error (returning nil, err) rather
+// than logging Fatal and falling through with an empty getter. Fatal is a no-op
+// under --logger none, so only real error propagation halts the scan.
+func TestPinnedVersionGettersReturnHardError(t *testing.T) {
+	ctx := context.Background()
+	const pinnedVersion = "v0.0.0-does-not-exist"
+
+	newPinned := func() *getter.DownloadReleasedPolicy {
+		return getter.NewDownloadReleasedPolicyWithVersion(pinnedVersion)
+	}
+
+	t.Run("getPolicyGetter", func(t *testing.T) {
+		g, err := getPolicyGetter(ctx, nil, "", true, newPinned(), false)
+		require.Error(t, err)
+		require.Nil(t, g)
+	})
+
+	t.Run("getConfigInputsGetter", func(t *testing.T) {
+		g, _, err := getConfigInputsGetter(ctx, "", "", newPinned(), false, false)
+		require.Error(t, err)
+		require.Nil(t, g)
+	})
+
+	t.Run("getExceptionsGetter", func(t *testing.T) {
+		g, fromCache, err := getExceptionsGetter(ctx, "", "", newPinned(), false)
+		require.Error(t, err)
+		require.False(t, fromCache)
+		require.Nil(t, g)
+	})
+
+	t.Run("getAttackTracksGetter", func(t *testing.T) {
+		g, err := getAttackTracksGetter(ctx, "", "", newPinned(), false)
+		require.Error(t, err)
+		require.Nil(t, g)
+	})
+}
+
+func TestClusterConnectionError_CarriesTheReason(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	kubeconfig := "apiVersion: v1\nkind: Config\ncontexts:\n- name: orphan\n  context:\n    cluster: no-such-cluster\n    user: u\ncurrent-context: orphan\nusers:\n- name: u\n  user:\n    token: t\n"
+	require.NoError(t, os.WriteFile(path, []byte(kubeconfig), 0o600))
+	t.Setenv("KUBECONFIG", path)
+	k8sinterface.SetClusterContextName("orphan")
+	t.Cleanup(func() { k8sinterface.SetClusterContextName("") })
+
+	require.Nil(t, getKubernetesApi(), "a context whose cluster entry is missing cannot produce a client")
+
+	loadErr := k8sinterface.LoadK8sConfig()
+	require.Error(t, loadErr)
+
+	err := clusterConnectionError()
+	require.ErrorIs(t, err, ErrClusterConnection)
+	assert.Contains(t, err.Error(), loadErr.Error(), "the reason the kubeconfig could not be loaded has to reach the operator")
+}

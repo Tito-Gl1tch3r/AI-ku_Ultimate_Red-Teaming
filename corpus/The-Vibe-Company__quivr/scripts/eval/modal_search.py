@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""Measure public campaign-dev search configurations on Modal, with shared caps."""
+import argparse
+import copy
+import decimal
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+
+import control_store
+import direct_bakeoff
+import embeddings
+import gates
+import public_sets
+import results
+import search_trial
+import private_working
+import network_recovery
+
+import ci_guard
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+COMPUTE_NOTICE = ('The compute cap covers compute reserved by this runner, not the full Modal invoice; '
+                  'builds, storage and other account charges need separate operator budgeting.')
+MODAL_SHUTDOWN_SECONDS = 2
+INCOMPLETE_MEASUREMENT = 'measurement failed or incomplete; no quality verdict is available'
+DIAGNOSTIC = {'mldr-fr': 'joint baseline saturation above 80%',
+              'webfaq-fr': 'joint baseline saturation above 80%',
+              'trec-covid': 'small query sample', 'mkqa-fr': 'short-answer proxy'}
+PRIVATE_FAILURE_MESSAGES = frozenset({
+    'provider omitted confirmed usage; measurement rejected',
+    'provider transport failed after 8 attempts',
+    'provider response exceeds size limit', 'invalid provider response',
+    'invalid provider embeddings',
+} | {f'provider HTTP {code}' for code in (400, 401, 403, 404, 408, 413, 422, 429, 500, 502, 503, 504)})
+# Keyed by (module, class name), not class objects: Modal pickles remote_trial's
+# globals by value, and an eval-module class would be unresolvable remotely.
+PRIVATE_FAILURES = {
+    ('builtins', 'RuntimeError'): PRIVATE_FAILURE_MESSAGES,
+    ('protected_inputs', 'DecryptionError'): frozenset({'protected input identity or ciphertext rejected'}),
+    ('protected_inputs', 'DecryptionTimeout'): frozenset({'protected input decryption timed out'}),
+}
+
+
+def failure_summary(error, *, private=False):
+    """Short diagnostics without reflected credentials or endpoint URLs."""
+    if private:
+        # Only our exact fixed diagnostics and a fixed exception type escape.
+        # Neither provider suffixes nor arbitrary exception class names are safe.
+        cls = type(error)
+        messages = PRIVATE_FAILURES.get((cls.__module__, cls.__qualname__), frozenset())
+        message = str(error) if messages else ''
+        if message in messages:
+            return cls.__qualname__, message
+        return 'RuntimeError', 'protected measurement failed'
+    message = str(error)
+    credentials = [value for name, value in os.environ.items() if value and
+                   re.search(r'KEY|TOKEN|SECRET|PASSWORD|DSN|DATABASE_URL|ENDPOINT|CREDENTIAL|AUTH', name, re.I)]
+    for value in sorted(credentials, key=len, reverse=True):
+        message = message.replace(value, '[redacted]')
+    message = re.sub(r'\b[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"\']+', '[url]', message)
+    message = re.sub(r'(?i)\bBearer\s+\S+', 'Bearer [redacted]', message)
+    message = re.sub(r'(?i)\b([\w-]*(?:key|token|secret|password|authorization|credential)[\w-]*)\b[\"\']?\s*[:=]\s*'
+                     r'(?:\"[^\"]*\"|\'[^\']*\'|[^\s,;]+)', r'\1=[redacted]', message)
+    message = re.sub(r'\b(?:sk-|armada_launch_|armada_)[A-Za-z0-9_-]+', '[redacted]', message)
+    return type(error).__name__, ' '.join(message.split())[:160]
+
+
+def policy(value):
+    defaults = {'profile': 'default', 'provider_daily_usd': 1000, 'modal_daily_usd': 1000,
+                'max_seconds': 3600, 'startup_seconds': 300, 'baseline': {},
+                'prices': {**direct_bakeoff.PRICES, 'jev-1.13.0': .042}, 'gates': {},
+                'agent_token_usage': None, 'quality_concurrency': 8,
+                'modal_cpu': 2, 'modal_memory_mib': 4096,
+                'modal_cpu_usd_per_second': .0000131, 'modal_gib_usd_per_second': .00000222}
+    allowed = set(defaults) | {'experiment', 'sets', 'modal_usd_per_second', 'price_revision',
+                               'provider_total_usd', 'modal_total_usd', 'end_at', 'confirmation_limit', 'reuse_campaign'}
+    if not isinstance(value, dict) or set(value) - allowed:
+        raise ValueError('unknown campaign policy fields')
+    cfg = {**defaults, **value}
+    if 'reuse_campaign' in cfg and (not isinstance(cfg['reuse_campaign'], str)
+                                   or not re.fullmatch(r'[A-Za-z0-9_.-]+', cfg['reuse_campaign'])):
+        raise ValueError('reuse campaign must be a plain campaign identifier')
+    if not re.fullmatch(r'public/[A-Za-z0-9/_.-]+', cfg['experiment']):
+        raise ValueError('tier 1 requires a public aggregate experiment')
+    if cfg['profile'] not in ('default', 'deep') or not re.fullmatch(r'[A-Za-z0-9_.-]+', cfg['price_revision']):
+        raise ValueError('invalid profile or pricing revision')
+    cfg['baseline'] = search_trial.configuration(cfg['baseline'])
+    for field, maximum in (('quality_concurrency', 32), ('modal_cpu', 64), ('modal_memory_mib', 262144)):
+        minimum = 128 if field == 'modal_memory_mib' else 1
+        if type(cfg[field]) is not int or not minimum <= cfg[field] <= maximum:
+            raise ValueError('invalid quality concurrency or Modal resource bound')
+    rates = [control_store.money(cfg[field]) for field in ('modal_cpu_usd_per_second', 'modal_gib_usd_per_second')]
+    if any(rate <= 0 for rate in rates):
+        raise ValueError('Modal unit prices must be positive')
+    derived = cfg['modal_cpu'] * rates[0] + decimal.Decimal(cfg['modal_memory_mib']) / 1024 * rates[1]
+    # Existing policies may keep a conservative aggregate override. Never
+    # silently lower their budget estimate, or accept an underpriced size.
+    if 'modal_usd_per_second' in value and control_store.money(value['modal_usd_per_second']) < derived:
+        raise ValueError('Modal compute rate is below the configured resource price')
+    cfg['modal_usd_per_second'] = float(control_store.money(value.get('modal_usd_per_second', derived)))
+    for field in ('provider_daily_usd', 'modal_daily_usd', 'modal_usd_per_second'):
+        if control_store.money(cfg[field]) <= 0:
+            raise ValueError('daily caps and conservative compute rate must be positive')
+    for field, maximum in (('max_seconds', 86400), ('startup_seconds', 3600)):
+        if type(cfg[field]) is not int or not 1 <= cfg[field] <= maximum:
+            raise ValueError('invalid bounded invocation lifetime')
+    if cfg['max_seconds'] < 30:
+        raise ValueError('maximum invocation must allow at least 30 seconds')
+    if cfg['max_seconds'] + cfg['startup_seconds'] > 86400:
+        raise ValueError('total invocation lifetime must fit the maximum lease lifetime')
+    if set(cfg['prices']) != set(defaults['prices']):
+        raise ValueError('provide all supported provider prices')
+    for rate in cfg['prices'].values():
+        control_store.money(rate)
+    if set(cfg['gates']) - {'min_gain', 'latency_ratio', 'index_usd', 'search_usd'}:
+        raise ValueError('unknown gate thresholds')
+    for threshold in cfg['gates'].values():
+        if control_store.money(threshold) <= 0:
+            raise ValueError('gate thresholds must be positive')
+    if not isinstance(cfg['sets'], dict) or not cfg['sets']:
+        raise ValueError('campaign requires a complete dataset family')
+    cfg['sets'] = json.loads(results.encode(cfg['sets']))
+    for name, entry in cfg['sets'].items():
+        if not isinstance(entry, dict) or set(entry) - {'split', 'diagnostic', 'reason', 'input'}:
+            raise ValueError('unknown dataset policy fields')
+        if entry.get('split') != 'dev':
+            raise PermissionError('tier 1 cannot read campaign-heldout/test data')
+        if 'input' in entry:
+            private_working.descriptor(name, entry['input'])
+        elif name not in public_sets.SETS:
+            raise ValueError('tier 1 requires a registered public dataset or private working descriptor')
+        mandatory = DIAGNOSTIC.get(name)
+        if 'input' not in entry and not public_sets.SETS[name]['promotion_eligible']:
+            mandatory = 'restricted licence; diagnostic only'
+        if type(entry.get('diagnostic', False)) is not bool:
+            raise ValueError('diagnostic must be boolean')
+        entry['diagnostic'] = bool(mandatory) or entry.get('diagnostic', False)
+        entry['reason'] = mandatory or entry.get('reason')
+        if entry['diagnostic'] and (not isinstance(entry['reason'], str) or not entry['reason'].strip()):
+            raise ValueError('diagnostic datasets require an explicit reason')
+        if entry['reason'] is not None and not re.fullmatch(r'[A-Za-z0-9 .;%-]+', entry['reason']):
+            raise ValueError('diagnostic reason must be plain words, without secrets')
+    for field in ('provider_total_usd', 'modal_total_usd'):
+        if field in cfg and control_store.money(cfg[field]) <= 0:
+            raise ValueError('total caps must be positive')
+    if 'end_at' in cfg:
+        cfg['end_at'] = control_store.end_timestamp(cfg['end_at'])
+    if 'confirmation_limit' in cfg and (type(cfg['confirmation_limit']) is not int
+                                      or not 1 <= cfg['confirmation_limit'] <= 10):
+        raise ValueError('confirmation limit must be 1..10')
+    usage = cfg['agent_token_usage']
+    if usage is not None and (not isinstance(usage, dict) or set(usage) != {'input_tokens', 'output_tokens'}
+            or any(type(v) is not int or v < 0 for v in usage.values())):
+        raise ValueError('agent usage requires exact reported input/output token integers')
+    return cfg
+
+
+def frozen_policy(policy, sha, scorer_digest, fresh_latency=True, parallelism=1):
+    return {**policy, 'git_sha': sha, 'scorer_digest': scorer_digest,
+            'registry_digest': search_trial.digest(public_sets.SETS), 'fresh_latency': fresh_latency, 'trial_parallelism': parallelism}
+
+
+def compute_seconds(policy, execution=None):
+    """Container execution (including remote waits), startup and shutdown bound."""
+    execution = policy['max_seconds'] if execution is None else control_store.money(execution)
+    return execution + policy['startup_seconds'] + MODAL_SHUTDOWN_SECONDS
+
+
+def dispatch(store, campaign, policy, cfg, name, sha, scorer_digest, invoke, outbox, fresh_latency, *, measurement_slot=None, parallelism=1):
+    frozen = frozen_policy(policy, sha, scorer_digest, fresh_latency, parallelism)
+    store.campaign(campaign, frozen)
+    key = search_trial.digest({'config': cfg, 'dataset': name, 'registry': policy['sets'][name].get('input', public_sets.SETS.get(name)),
+                              'tier': 'direct', 'sha': sha, 'scorer': scorer_digest, 'fresh_latency': fresh_latency})
+    claim = store.claim(campaign, key, policy['max_seconds'] + policy['startup_seconds'])
+    tracking = results.Results(directory=outbox)
+    if claim['status'] == 'done':
+        return completed(store, campaign, key, claim['payload'], tracking, 'reused')
+    if claim['status'] == 'leased':
+        return {'status': 'leased', 'reason': 'another worker owns this measurement'}
+    owner, reservation = claim['owner'], None
+    request = {'campaign': campaign, 'policy': frozen, 'config': cfg, 'dataset': name,
+               'lease_key': key, 'owner': owner, 'git_sha': sha,
+               'scorer_digest': scorer_digest, 'fresh_latency': fresh_latency}
+    if policy.get('reuse_campaign'):
+        try:
+            source = policy['reuse_campaign']
+            row = store.reusable_evidence(campaign, source, key)
+            if row is not None:
+                row = reuse_measurement(store, request, source, row)
+                return completed(store, campaign, key, row, tracking, 'reused')
+        except network_recovery.Outage:
+            raise  # Publication is uncertain; do not compensate after the outage window.
+        except Exception:
+            try:
+                store.abandon(campaign, key, owner, 'failed')
+            except control_store.LeaseLost:
+                pass  # Already canonical; preserve it for replay.
+            raise
+    if 'input' in policy['sets'][name]:
+        request['working_runtime'] = private_working.runtime(name)
+    try:
+        reservation = store.reserve(campaign, 'modal',
+            compute_seconds(policy) * control_store.money(policy['modal_usd_per_second']),
+            {'measurement_key': key, 'max_seconds': policy['max_seconds'], 'startup_seconds': policy['startup_seconds'],
+             'extra_leases': [measurement_slot] if measurement_slot else []}, (key, owner),
+            extra_leases=[measurement_slot] if measurement_slot else [])
+        request['modal_reservation'] = reservation
+        response = invoke(request)
+        row = response.get('row', response)
+        compute = response.get('compute')
+        exceeded = False
+        if compute is not None:
+            # Queueing and client retrieval/reconnect waits do not run in the
+            # container. Missing receipts retain the full unknown reservation.
+            seconds = compute_seconds(policy, compute['execution_seconds'])
+            try:
+                store.settle(compute['reservation'], seconds * control_store.money(policy['modal_usd_per_second']),
+                    {'modal_seconds_upper_bound': float(seconds), 'basis': 'container execution + startup + shutdown'})
+            except embeddings.BudgetExceeded:
+                exceeded = True
+        if row.get('status') in ('capped', 'failed'):
+            return {**row, 'status': 'capped',
+                    'reason': 'confirmed usage exceeded reservation; campaign stopped'} if exceeded else row
+        # Remote publication must be canonical before any MLflow upload.
+        canonical = store.claim(campaign, key)
+        if canonical['status'] != 'done':
+            raise RuntimeError('remote measurement did not publish canonical evidence')
+        row = canonical['payload']
+        output = completed(store, campaign, key, row, tracking, 'capped' if exceeded else 'complete')
+        if exceeded:
+            output['reason'] = 'confirmed usage exceeded reservation; campaign stopped'
+        return output
+    except embeddings.BudgetExceeded:
+        status, reason = 'capped', 'daily reservation cap reached or usage bound exceeded'
+    except (network_recovery.Outage, control_store.LeaseLost, control_store.Unavailable, control_store.Contention):
+        # The same invocation may still be running. Keep its reservation and
+        # measurement lease until the watchdog acknowledges app termination.
+        raise
+    except Exception:
+        status, reason = 'failed', 'measurement or evidence publication failed; uncertain charges retained'
+    try:
+        store.abandon(campaign, key, owner, status)
+    except control_store.LeaseLost:
+        pass  # A canonical result or replacement exists; never change it.
+    return {'status': status, 'reason': reason}
+
+
+def completed(store, campaign, key, row, tracking, status):
+    output = {'status': status, 'record': row, 'receipt': tracking.log(row)}
+    if row['dataset']['private'] or 'public_pair' in row.get('provenance', {}):
+        kind = 'private_pair' if row['dataset']['private'] else 'public_pair'
+        baseline_key = row['provenance'][kind]['baseline_lease_key']
+        baseline = store.evidence(campaign, [baseline_key])[baseline_key]
+        output.update(baseline_record=baseline, baseline_receipt=tracking.log(baseline))
+    return output
+
+
+def reuse_measurement(store, request, source, original):
+    """Bind unchanged measurements to the new campaign; preserve source lineage."""
+    def bind(row, key):
+        row = copy.deepcopy(row)
+        row['config'].update(campaign=request['campaign'], campaign_policy_hash=search_trial.digest(request['policy']))
+        row.setdefault('provenance', {})['measurement_reuse'] = {'campaign': source, 'lease_key': key}
+        return row
+    row = bind(original, request['lease_key'])
+    kind = 'private_pair' if row['dataset']['private'] else 'public_pair'
+    pair = row.get('provenance', {}).get(kind)
+    if pair:
+        old_key = pair['baseline_lease_key']
+        baseline = bind(store.evidence(source, [old_key])[old_key], old_key)
+        pair['baseline_lease_key'] = request['lease_key'] + '/' + request['owner'] + '/baseline'
+        if kind == 'private_pair':
+            pair.update(baseline_result_key=results.record(baseline)['result_key'],
+                        candidate_result_key=results.record(row)['result_key'],
+                        baseline_payload_digest=search_trial.digest(baseline),
+                        candidate_payload_digest=search_trial.digest({k: v for k, v in row.items() if k != 'provenance'}))
+        return search_trial.publish_pair(store, request, {'baseline': baseline, 'candidate': row})
+    return store.publish(request['campaign'], request['lease_key'], request['owner'], row)
+
+
+def aggregates(pairs):
+    return {name: {side: {key: row.get('metrics', {}).get(key.replace('_at_', '@'), row.get('metrics', {}).get(key))
+                         for key in ('ndcg_at_10', 'latency_p95_ms', 'cost_per_search_usd', 'cost_per_1000_documents_usd')}
+                  for side, row in pair.items()} for name, pair in pairs.items()}
+
+
+def metered_trial(request):
+    """Ship a compute receipt separately from immutable measurement evidence."""
+    import os
+    import sys
+    import time
+    started = time.monotonic()
+    sys.path.insert(0, '/repo/scripts/eval')
+    import control_store
+    store = control_store.Store(os.environ['EVAL_CONTROL_DATABASE_URL'])
+    reservation = store.start_modal_attempt(request['modal_reservation'],
+        (request['lease_key'], request['owner']))
+    row = remote_trial(request)
+    return {'row': row, 'compute': {'reservation': reservation,
+                                   'execution_seconds': time.monotonic() - started}}
+
+
+def remote_trial(request):
+    """Serialized Modal function. Imports and data access happen inside admission."""
+    import logging
+    import os
+    import pathlib
+    import sys
+    import time
+    sys.path.insert(0, '/repo/scripts/eval')
+    import modal
+    import control_store
+    import direct_bakeoff
+    import embeddings
+    import public_sets
+    import private_working
+    import results
+    import search_trial
+    import trec
+    import network_recovery
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
+    log = logging.getLogger(__name__)
+    log.info('trial started')
+    cfg, policy = request['config'], request['policy']
+    # Guard before even preparing/downloading a dataset.
+    if policy['sets'][request['dataset']]['split'] != 'dev':
+        raise PermissionError('tier 1 refuses campaign-heldout data')
+    store = control_store.Store(os.environ['EVAL_CONTROL_DATABASE_URL'])
+    store.campaign(request['campaign'], policy)
+    lease = request['lease_key'], request['owner']
+    store.renew(request['campaign'], *lease, ttl=policy['max_seconds'])
+    budget = control_store.Budget(store, request['campaign'], lease, ttl=policy['max_seconds'])
+    volume = modal.Volume.from_name('quivr-eval-embeddings-cache')
+    volume.reload()
+    # Replay committed evidence even when its originating container has exited.
+    results.Results(directory='/eval-cache/results').sync()
+    started = time.monotonic()
+    try:
+        name = request['dataset']
+        if 'input' in policy['sets'][name]:
+            row = private_working.trial(request, store)
+            results.Results(directory='/eval-cache/results').log(row)
+            volume.commit()
+            return row
+        directory = public_sets.prepare(name, pathlib.Path('/eval-cache/datasets'), include_restricted=True)
+        data = trec.load(directory)
+        log.info('dataset ready documents=%d queries=%d elapsed_seconds=%.3f',
+                 len(data['corpus']), len(data['qrels']), time.monotonic() - started)
+        dataset = {'name': name, 'version': search_trial.digest(public_sets.SETS[name]),
+                   'split': 'dev', 'fingerprint': trec.fingerprint(directory), 'private': False}
+        configs = {'baseline': policy['baseline'], 'candidate': cfg}
+        budgets, clients = {}, {}
+        for side, config in configs.items():
+            budgets[side] = control_store.Budget(store, request['campaign'], lease, ttl=policy['max_seconds'])
+            clients[side] = None if config['model'] == direct_bakeoff.E5_MODEL else direct_bakeoff.Hosted(
+                os.environ['AZURE_FOUNDRY_ENDPOINT'], os.environ['AZURE_FOUNDRY_KEY'],
+                budgets[side], name, policy['prices'])
+            if clients[side] is not None:
+                clients[side].provider_gate = control_store.ProviderAdmission(budgets[side])
+        measurements = search_trial.measure_pair(configs, data, dataset, '/eval-cache/embeddings', budgets, clients,
+            policy['prices'], float(policy['modal_usd_per_second']), request['fresh_latency'],
+            os.environ.get('TYPESAFE_API_KEY', ''), quality_concurrency=policy['quality_concurrency'], flush=volume.commit, refresh=volume.reload,
+            latency_scope=lambda: store.latency_window(request['campaign'], lease, policy['max_seconds']))
+        rows = {}
+        for side, config in configs.items():
+            measured = measurements[side]
+            measured['duration_seconds'] = time.monotonic() - started
+            measured['cost'].update(modal_seconds=measured['duration_seconds'], resource_class=search_trial.resource_class(policy),
+                                    agent_token_usage=policy['agent_token_usage'], compute_cap_notice=COMPUTE_NOTICE)
+            rows[side] = search_trial.record(measured, {**config, 'paired_side': side, 'profile': policy['profile'],
+                'paired_candidate_hash': search_trial.digest(cfg),
+                'campaign': request['campaign'], 'campaign_policy_hash': search_trial.digest(policy),
+                'prices_usd_per_million': policy['prices'], 'modal_usd_per_second': policy['modal_usd_per_second'],
+                'resource_class': search_trial.resource_class(policy), 'quality_concurrency': policy['quality_concurrency'],
+                'price_revision': policy['price_revision'], 'fresh_latency': request['fresh_latency']},
+                policy['experiment'], request['git_sha'], request['scorer_digest'])
+        rows['candidate']['provenance'] = {'public_pair': {
+            'baseline_lease_key': request['lease_key'] + '/' + request['owner'] + '/baseline'}}
+        row = search_trial.publish_pair(store, request, rows)
+        log.info('measurement complete elapsed_seconds=%.3f', measured['duration_seconds'])
+        results.Results(directory='/eval-cache/results').log(row)
+        volume.commit()
+        return row
+    except network_recovery.Outage:
+        raise  # Skip compensating writes after the bounded recovery window.
+    except embeddings.BudgetExceeded:
+        log.info('trial capped elapsed_seconds=%.3f', time.monotonic() - started)
+        store.abandon(request['campaign'], *lease, 'capped')
+        return {'status': 'capped', 'reason': 'provider daily cap reached'}
+    except Exception as error:
+        private = 'input' in policy['sets'][request['dataset']]
+        kind, message = failure_summary(error, private=private)
+        log.info('trial failed error=%s message=%s elapsed_seconds=%.3f',
+                 kind, message, time.monotonic() - started)
+        store.abandon(request['campaign'], *lease, 'failed')
+        return {'status': 'failed', 'reason': 'direct measurement failed; uncertain charges retained',
+                **({'error': {'kind': kind, 'message': message}} if private else {})}
+
+
+def shipped_trial():
+    """remote_trial as Modal must ship it: by value, also when a campaign imports this module.
+
+    A by-reference payload names this module, which the container cannot import
+    before remote_trial adds the evaluation directory to sys.path.
+    """
+    from modal._vendor import cloudpickle
+    cloudpickle.register_pickle_by_value(sys.modules[__name__])
+    return metered_trial
+
+
+def invoke(remote, request, check):
+    """Spawn once; result retries attach to the acknowledged call identity."""
+    import modal
+    check()  # reservation reconnects may have outlasted the supervisor lease
+    try:
+        call_id = remote.spawn(request).object_id
+    except Exception as error:
+        if not network_recovery.modal_unreachable(error):
+            raise
+        raise network_recovery.Outage('Modal spawn acknowledgement unavailable; reconcile before retrying') from None
+    def retrieve():
+        check()  # recover ownership before any following paid invocation
+        return modal.FunctionCall.from_id(call_id).get(timeout=10)
+    while True:
+        try:
+            return network_recovery.retry(retrieve, network_recovery.modal_unreachable,
+                                          campaign=request['campaign'])
+        except TimeoutError:
+            # A reachable server with an unfinished trial is not an outage.
+            continue
+
+
+def launch(policy, candidate, campaign, outbox, fresh_latency, *, app_name='quivr-search-measurement',
+           on_app=lambda identity: None, on_launch=lambda: None, on_report=lambda report: None,
+           check=lambda: None, parallelism=1):
+    import modal
+    if subprocess.run(['git', 'diff', '--quiet', 'HEAD'], cwd=ROOT).returncode:
+        raise ValueError('measurement code must be committed before live dispatch')
+    tracked = set(subprocess.check_output(['git', 'ls-files', '-z'], cwd=ROOT).decode().split('\0'))
+    def ignored(path):
+        path = pathlib.Path(path)
+        relative = str(path.relative_to(ROOT)) if path.is_absolute() else str(path)
+        return relative not in tracked and not any(name.startswith(relative.rstrip('/') + '/') for name in tracked)
+    store = control_store.Store(os.environ['EVAL_CONTROL_DATABASE_URL'])
+    sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    scorer_digest = 'sha256:' + search_trial.digest({name: (ROOT / 'scripts/eval' / name).read_text()
+        for name in ('scoring.py', 'gates.py', 'search_trial.py', 'embeddings.py', 'direct_bakeoff.py', 'private_working.py', 'protected_inputs.py')})
+    if type(parallelism) is not int or not 1 <= parallelism <= 16:
+        raise ValueError('trial parallelism must be 1..16')
+    store.campaign(campaign, frozen_policy(policy, sha, scorer_digest, fresh_latency, parallelism))
+    ttl = policy['max_seconds'] + policy['startup_seconds']
+    # Retain one slot per admitted app until acknowledged termination. Latency
+    # has its own remote window; indexing and quality may overlap across slots.
+    gate = network_recovery.admission(campaign)
+    while True:
+        try:
+            slot_identity = store.claim_slot(campaign, 'campaign-measurement-slot', parallelism, ttl, gate=gate)
+            break
+        except network_recovery.AdmissionPaused:
+            gate.wait()  # Rollback precedes waiting; no unused trial slot remains.
+    if slot_identity is None:
+        return {'status': 'leased', 'reason': 'all campaign trial slots are busy', 'work': {}}
+    slot_key, slot_owner = slot_identity
+    slot = {'owner': slot_owner}
+    def slot_check():
+        check()
+        store.renew(campaign, slot_key, slot['owner'], ttl)
+    # Ambiguous detached calls retain the slot until their bounded lifetime expires.
+    completed, launch_attempted = False, False
+    try:
+        image = (modal.Image.debian_slim(python_version='3.12')
+                 .apt_install('age')
+                 .pip_install_from_requirements(str(ROOT / 'scripts/eval/requirements-modal.txt'))
+                 .add_local_dir(ROOT, '/repo', ignore=ignored))
+        slot_check()
+        app = modal.App(app_name((slot_key, slot['owner'])) if callable(app_name) else app_name)
+        secrets = [modal.Secret.from_name('quivr-eval-results'), modal.Secret.from_name('quivr-eval-embeddings')]
+        if any(c['reranker'] == 'jev' for c in (candidate, policy['baseline'])):
+            secrets.append(modal.Secret.from_name('quivr-eval-rerank'))
+        private_volumes, private_secrets = private_working.mounts(policy)
+        secrets.extend(modal.Secret.from_name(name) for name in private_secrets)
+        remote = app.function(image=image, cpu=(policy['modal_cpu'], policy['modal_cpu']),
+            memory=(policy['modal_memory_mib'], policy['modal_memory_mib']),
+            timeout=policy['max_seconds'], startup_timeout=policy['startup_seconds'],
+            retries=0, max_containers=4, scaledown_window=MODAL_SHUTDOWN_SECONDS, single_use_containers=True,
+            include_source=False, serialized=True, secrets=secrets,
+            volumes={'/eval-cache': modal.Volume.from_name('quivr-eval-embeddings-cache', create_if_missing=True),
+                     **{mount: modal.Volume.from_name(name) for mount, name in private_volumes.items()}})(shipped_trial())
+        pairs, work = {}, {}
+        slot_check()
+        on_launch()
+        launch_attempted = True
+        with app.run(detach=True):
+            on_app(app.app_id)
+            for name in policy['sets']:
+                pair = {}
+                slot_check()
+                outcome = dispatch(store, campaign, policy, candidate, name, sha, scorer_digest,
+                                   lambda request: invoke(remote, request, slot_check), outbox, fresh_latency,
+                                   measurement_slot=(slot_key, slot['owner']), parallelism=parallelism)
+                work[name + '/candidate'] = {k: v for k, v in outcome.items() if k not in ('record', 'baseline_record', 'baseline_receipt')}
+                if 'record' in outcome:
+                    row = outcome['record']
+                    if 'baseline_record' in outcome:
+                        baseline = outcome['baseline_record']
+                        pair['baseline'] = {**baseline,
+                            'per_query': {key.replace('_at_', '@'): values for key, values in baseline['per_query'].items()},
+                            'metrics': {key.replace('_at_', '@'): value for key, value in baseline['metrics'].items()}}
+                        work[name + '/baseline'] = {'receipt': outcome['baseline_receipt']}
+                    pair['candidate'] = {**row, 'per_query': {key.replace('_at_', '@'): values for key, values in row['per_query'].items()},
+                                  'metrics': {key.replace('_at_', '@'): value for key, value in row['metrics'].items()}}
+                if pair:
+                    pairs[name] = pair
+                if outcome['status'] in ('capped', 'leased'):
+                    report = {'status': outcome['status'], 'reason': outcome['reason'], 'work': work,
+                              'aggregate_sets': aggregates(pairs),
+                              'ledger': store.summary(campaign), 'compute_cap_notice': COMPUTE_NOTICE}
+                    on_report(report)
+                    completed = True
+                    return report
+        decision = (gates.evaluate(pairs, policy) if set(pairs) == set(policy['sets']) and all(len(pair) == 2 for pair in pairs.values()) else
+                    {'status': 'failed', 'reason': INCOMPLETE_MEASUREMENT})
+        verdict = {**decision, 'work': work, 'aggregate_sets': aggregates(pairs), 'ledger': store.summary(campaign),
+                   'agent_token_usage': policy['agent_token_usage'], 'compute_cap_notice': COMPUTE_NOTICE}
+        # Durable campaign publication precedes every slot/app cleanup finalizer.
+        on_report(verdict)
+        completed = True
+        return verdict
+
+    finally:
+        if completed or (not launch_attempted and not isinstance(sys.exc_info()[1], network_recovery.Outage)):
+            store.release_slot(campaign, (slot_key, slot['owner']))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--policy', required=True, type=pathlib.Path)
+    parser.add_argument('--candidate', required=True, type=pathlib.Path)
+    parser.add_argument('--campaign', default='')
+    parser.add_argument('--outbox', type=pathlib.Path, default=ROOT / '.scratch/eval/results')
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--cached-exploration', action='store_true', help='no fresh query embedding calls; latency gate stays unmeasured')
+    parser.add_argument('--allow-paid', action='store_true', help='coordinator-only live dispatch; never in CI')
+    args = parser.parse_args(argv)
+    cfg = policy(json.loads(args.policy.read_text()))
+    candidate = search_trial.configuration(json.loads(args.candidate.read_text()))
+    if args.dry_run:
+        print(results.encode({'policy': cfg, 'candidate': candidate,
+            'modal_reservation_usd_per_invocation': float(compute_seconds(cfg)) * float(cfg['modal_usd_per_second']),
+            'provider_estimator': 'shared UTF-8 byte + eight special tokens per input',
+            'confirmation_available': False, 'compute_cap_notice': COMPUTE_NOTICE}))
+        return 0
+    if ci_guard.in_ci():
+        parser.error('CI measurements are refused')
+    if not args.allow_paid or not args.campaign or not re.fullmatch(r'[A-Za-z0-9_.-]+', args.campaign):
+        parser.error('live dispatch requires --allow-paid and a plain campaign identifier')
+    if not os.environ.get('EVAL_CONTROL_DATABASE_URL'):
+        parser.error('coordinator must supply EVAL_CONTROL_DATABASE_URL')
+    try:
+        report = launch(cfg, candidate, args.campaign, args.outbox, not args.cached_exploration)
+    except Exception:
+        report = {'status': 'failed', 'reason': 'measurement admission or dispatch failed; no local budget fallback',
+                  'compute_cap_notice': COMPUTE_NOTICE}
+    print(results.encode(report))
+    return 0 if report['status'] == 'exploration_finalist' else 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

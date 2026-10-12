@@ -1,0 +1,542 @@
+package software.coley.recaf.ui.pane;
+
+import atlantafx.base.controls.Popover;
+import atlantafx.base.theme.Styles;
+import jakarta.annotation.Nonnull;
+import jakarta.enterprise.context.Dependent;
+import jakarta.enterprise.inject.Instance;
+import jakarta.inject.Inject;
+import javafx.beans.binding.StringBinding;
+import javafx.collections.ObservableList;
+import javafx.geometry.Insets;
+import javafx.geometry.Orientation;
+import javafx.geometry.Pos;
+import javafx.scene.Node;
+import javafx.scene.Scene;
+import javafx.scene.control.Button;
+import javafx.scene.control.Label;
+import javafx.scene.control.ScrollPane;
+import javafx.scene.control.Separator;
+import javafx.scene.layout.BorderPane;
+import javafx.scene.layout.HBox;
+import javafx.scene.layout.StackPane;
+import javafx.scene.layout.VBox;
+import javafx.scene.paint.Color;
+import javafx.stage.FileChooser;
+import org.kordamp.ikonli.carbonicons.CarbonIcons;
+import org.slf4j.Logger;
+import software.coley.recaf.analytics.logging.Logging;
+import software.coley.recaf.services.cell.CellConfigurationService;
+import software.coley.recaf.services.compile.CompilerDiagnostic;
+import software.coley.recaf.services.file.RecafDirectoriesConfig;
+import software.coley.recaf.services.info.association.FileTypeSyntaxAssociationService;
+import software.coley.recaf.services.script.ScriptEngine;
+import software.coley.recaf.services.script.ScriptFile;
+import software.coley.recaf.services.script.ScriptManager;
+import software.coley.recaf.services.script.ScriptManagerConfig;
+import software.coley.recaf.services.script.ScriptRunController;
+import software.coley.recaf.services.window.WindowFactory;
+import software.coley.recaf.ui.config.KeybindingConfig;
+import software.coley.recaf.ui.control.ActionButton;
+import software.coley.recaf.ui.control.FontIconView;
+import software.coley.recaf.ui.control.richtext.Editor;
+import software.coley.recaf.ui.control.richtext.ScrollbarPaddingUtil;
+import software.coley.recaf.ui.control.richtext.bracket.SelectedBracketTracking;
+import software.coley.recaf.ui.control.richtext.problem.Problem;
+import software.coley.recaf.ui.control.richtext.problem.ProblemPhase;
+import software.coley.recaf.ui.control.richtext.problem.ProblemTracking;
+import software.coley.recaf.ui.control.richtext.search.SearchBar;
+import software.coley.recaf.ui.control.richtext.suggest.TabCompletionConfig;
+import software.coley.recaf.ui.control.richtext.suggest.java.JavaTabCompleter;
+import software.coley.recaf.ui.control.richtext.suggest.java.typeindex.JavaTypeIndexService;
+import software.coley.recaf.ui.control.richtext.suggest.java.ScriptJavaCompletionSupport;
+import software.coley.recaf.ui.window.RecafScene;
+import software.coley.recaf.util.Animations;
+import software.coley.recaf.util.DesktopUtil;
+import software.coley.recaf.util.EscapeUtil;
+import software.coley.recaf.util.FileChooserBuilder;
+import software.coley.recaf.util.FxThreadUtil;
+import software.coley.recaf.util.Lang;
+import software.coley.recaf.util.StringUtil;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.TreeSet;
+
+import static software.coley.recaf.util.Lang.getBinding;
+
+/**
+ * Pane to display available scripts.
+ *
+ * @author Matt Coley
+ * @author yapht
+ * @see ScriptManager Source of scripts to pull from.
+ */
+@Dependent
+public class ScriptManagerPane extends BorderPane {
+	private static final Logger logger = Logging.get(ScriptManagerPane.class);
+	private final VBox scriptList = new VBox();
+	private final ScriptManager scriptManager;
+	private final ScriptManagerConfig config;
+	private final ScriptEngine engine;
+	private final ScriptRunController scriptRunController;
+	private final FileTypeSyntaxAssociationService languageAssociation;
+	private final WindowFactory windowFactory;
+	private final RecafDirectoriesConfig directories;
+	private final KeybindingConfig keys;
+	private final Instance<SearchBar> searchBarProvider;
+	private final Instance<ScriptJavaCompletionSupport> scriptCompletionSupportProvider;
+	private final CellConfigurationService cellConfigurationService;
+	private final JavaTypeIndexService javaTypeIndexService;
+	private final TabCompletionConfig tabCompletionConfig;
+
+	@Inject
+	public ScriptManagerPane(@Nonnull ScriptManagerConfig config,
+	                         @Nonnull ScriptManager scriptManager,
+	                         @Nonnull ScriptEngine engine,
+	                         @Nonnull ScriptRunController scriptRunController,
+	                         @Nonnull FileTypeSyntaxAssociationService languageAssociation,
+	                         @Nonnull WindowFactory windowFactory,
+	                         @Nonnull CellConfigurationService cellConfigurationService,
+	                         @Nonnull JavaTypeIndexService javaTypeIndexService,
+	                         @Nonnull TabCompletionConfig tabCompletionConfig,
+	                         @Nonnull RecafDirectoriesConfig directories,
+	                         @Nonnull KeybindingConfig keys,
+	                         @Nonnull Instance<SearchBar> searchBarProvider,
+	                         @Nonnull Instance<ScriptJavaCompletionSupport> scriptCompletionSupportProvider
+	) {
+		this.windowFactory = windowFactory;
+		this.scriptManager = scriptManager;
+		this.config = config;
+		this.engine = engine;
+		this.scriptRunController = scriptRunController;
+		this.languageAssociation = languageAssociation;
+		this.cellConfigurationService = cellConfigurationService;
+		this.javaTypeIndexService = javaTypeIndexService;
+		this.tabCompletionConfig = tabCompletionConfig;
+		this.directories = directories;
+		this.keys = keys;
+		this.searchBarProvider = searchBarProvider;
+		this.scriptCompletionSupportProvider = scriptCompletionSupportProvider;
+
+		scriptManager.getScriptFiles().addChangeListener((ob, old, cur) -> refreshScripts());
+		refreshScripts();
+
+		scriptList.setFillWidth(true);
+		scriptList.setSpacing(10);
+		scriptList.setPadding(new Insets(10));
+
+		ScrollPane scroll = new ScrollPane(scriptList);
+		scroll.getStyleClass().add("dark-scroll-pane");
+		scroll.setFitToWidth(true);
+		setCenter(scroll);
+
+		HBox controls = new HBox();
+		controls.setStyle("""
+				-fx-background-color: -color-bg-default;
+				-fx-border-color: -color-border-default;
+				-fx-border-width: 1 0 0 0;
+				""");
+		controls.setPadding(new Insets(10));
+		controls.setSpacing(10);
+		controls.getChildren().addAll(
+				new ActionButton(CarbonIcons.EDIT, getBinding("menu.scripting.new"), this::newScript),
+				new ActionButton(CarbonIcons.FOLDER, getBinding("menu.scripting.browse"), this::browse)
+		);
+		controls.getChildren().forEach(b -> b.getStyleClass().add("muted"));
+		setBottom(controls);
+	}
+
+	/**
+	 * Repopulate the script list.
+	 */
+	private void refreshScripts() {
+		FxThreadUtil.run(() -> {
+			scriptList.getChildren().clear();
+			for (ScriptFile scriptFile : new TreeSet<>(scriptManager.getScriptFiles())) {
+				scriptList.getChildren().add(new ScriptEntry(scriptFile));
+			}
+		});
+	}
+
+	/**
+	 * @param script
+	 * 		Script to edit.
+	 */
+	private void editScript(@Nonnull ScriptFile script) {
+		ScriptEditor scriptEditor = new ScriptEditor(languageAssociation, script.source(), searchBarProvider.get())
+				.withPath(script.path());
+		Scene scene = new RecafScene(scriptEditor, 750, 400);
+		windowFactory.createAnonymousStage(scene, getBinding("menu.scripting.editor"), 750, 400).show();
+	}
+
+	/**
+	 * Opens a new script editor.
+	 */
+	public void newScript() {
+		String template = """
+				// ==Metadata==
+				// @name Name
+				// @description Description
+				// @version 1.0.0
+				// @author Author
+				// ==/Metadata==
+				
+				@Dependent
+				class MyScript {
+				    WorkspaceManager wm;
+				
+				    @Inject
+				    MyScript(WorkspaceManager wm) {
+				        // Inject any services you need here.
+				        // See: https://recaf.coley.software/dev/services/index.html
+				        this.wm = wm;
+				    }
+				
+				    void run() {
+				        if (!wm.hasCurrentWorkspace()) return;
+				
+				        // Do any script work here.
+				        Workspace workspace = wm.getCurrent();
+				    }
+				}
+				""";
+
+		ScriptEditor scriptEditor = new ScriptEditor(languageAssociation, template, searchBarProvider.get());
+		Scene scene = new RecafScene(scriptEditor, 750, 400);
+		windowFactory.createAnonymousStage(scene, getBinding("menu.scripting.editor"), 750, 400).show();
+	}
+
+	/**
+	 * Opens the local scripts directory.
+	 */
+	private void browse() {
+		try {
+			DesktopUtil.showDocument(config.getScriptsDirectory().toUri());
+		} catch (IOException ex) {
+			logger.error("Failed to show scripts directory", ex);
+		}
+	}
+
+	/**
+	 * Editor for scripts.
+	 */
+	private class ScriptEditor extends BorderPane {
+		private final ProblemTracking problemTracking = new ProblemTracking();
+		private final Editor editor = new Editor();
+		private final ScriptJavaCompletionSupport completionSupport;
+		private Path scriptPath;
+
+		private ScriptEditor(@Nonnull FileTypeSyntaxAssociationService associationService, @Nonnull String initialText, @Nonnull SearchBar searchBar) {
+			completionSupport = scriptCompletionSupportProvider.get();
+			editor.setText(initialText);
+			editor.getCodeArea().getUndoManager().forgetHistory();
+			associationService.configureEditorSyntax("java", editor);
+			editor.setSelectedBracketTracking(new SelectedBracketTracking());
+			editor.setProblemTracking(problemTracking);
+			editor.getRootLineGraphicFactory().addDefaultCodeGraphicFactories();
+			completionSupport.install(editor);
+			if (tabCompletionConfig.isEnabledInJavaSource())
+				editor.setTabCompleter(new JavaTabCompleter(completionSupport,
+						cellConfigurationService, javaTypeIndexService, tabCompletionConfig));
+
+			// Add extra components
+			searchBar.install(editor);
+			editor.getPrimaryStack().getChildren().add(new RunScriptComponent());
+
+			// Setup keybindings
+			setOnKeyPressed(e -> {
+				if (keys.getSave().match(e))
+					save();
+			});
+
+			// Layout
+			setCenter(editor);
+
+			// When this editor is closed, ensure we clean up editor resources
+			sceneProperty().addListener((ob, old, cur) -> {
+				if (cur != null) {
+					cur.windowProperty().addListener((windowOb, oldWindow, newWindow) -> {
+						if (newWindow != null) {
+							newWindow.setOnHidden(e -> {
+								editor.close();
+								completionSupport.close();
+							});
+						}
+					});
+				}
+			});
+		}
+
+		/**
+		 * @param scriptPath
+		 * 		Location on disk to save to path to.
+		 *
+		 * @return Self.
+		 */
+		@Nonnull
+		public ScriptEditor withPath(@Nonnull Path scriptPath) {
+			this.scriptPath = scriptPath;
+			return this;
+		}
+
+		/**
+		 * Save the script to {@link #scriptPath}.
+		 */
+		private void save() {
+			// Clear old errors emitted by compilation.
+			problemTracking.removeByPhase(ProblemPhase.BUILD);
+
+			// Invoke compiler with data.
+			engine.compile(editor.getText()).whenCompleteAsync((result, throwable) -> {
+				if (result != null && result.wasSuccess()) {
+					// Don't care about compilation, just wanted to validate it was valid semantics.
+					Animations.animateSuccess(this, 1000);
+				} else {
+					// Handle compile-result failure, or uncaught thrown exception.
+					if (result != null) {
+						for (CompilerDiagnostic diagnostic : result.diagnostics())
+							problemTracking.addItem(Problem.fromDiagnostic(diagnostic));
+					} else {
+						logger.error("Compilation encountered an error", throwable);
+					}
+					Animations.animateFailure(this, 1000);
+				}
+
+				// Write to disk regardless, if path is given. If not given, prompt user for it.
+				if (scriptPath == null) {
+					FileChooser chooser = new FileChooserBuilder()
+							.setInitialDirectory(directories.getScriptsDirectory())
+							.setTitle(Lang.get("dialog.file.save"))
+							.build();
+
+					File selected = chooser.showSaveDialog(getScene().getWindow());
+					if (selected != null)
+						scriptPath = selected.toPath();
+				}
+				if (scriptPath != null) {
+					try {
+						Files.writeString(scriptPath, editor.getText());
+					} catch (IOException ex) {
+						logger.error("Failed to write to script file", ex);
+					}
+				}
+
+				// Redraw paragraph graphics to update things like in-line problem graphics.
+				editor.redrawParagraphGraphics();
+			}, FxThreadUtil.executor());
+		}
+
+		/**
+		 * Editor component to call {@link ScriptEngine#run(String)}.
+		 */
+		private class RunScriptComponent extends ActionButton {
+			private final Node GRAPHIC_EXEC = new FontIconView(CarbonIcons.PLAY_FILLED, Color.LIME);
+			private final Node GRAPHIC_STOP = new FontIconView(CarbonIcons.STOP_FILLED, Color.RED);
+
+			private RunScriptComponent() {
+				setOnAction(e -> wrap(e, () -> {
+					if (scriptRunController.isRunning(getScriptKey()))
+						stop();
+					else if (!scriptRunController.isRunning())
+						execute();
+				}));
+				scriptRunController.executionStateVersionProperty()
+						.addListener((ob, old, cur) -> updateDisplay());
+				updateDisplay();
+
+				// Layout tweaks
+				StackPane.setAlignment(this, Pos.BOTTOM_RIGHT);
+				StackPane.setMargin(this, new Insets(7));
+				editor.getVerticalScrollbar().visibleProperty()
+						.addListener((ob, old, cur) -> ScrollbarPaddingUtil.handleScrollbarVisibility(this, cur));
+			}
+
+			private void execute() {
+				problemTracking.removeByPhase(ProblemPhase.BUILD);
+				scriptRunController.start(getScriptKey(), editor.getText()).whenCompleteAsync((result, error) -> {
+					if (result != null && result.wasCancelled())
+						return;
+
+					if (result != null && result.wasSuccess()) {
+						// Don't care about compilation, just wanted to validate it was valid semantics.
+						Animations.animateSuccess(editor, 1000);
+					} else {
+						// Handle compile-result failure, or uncaught thrown exception.
+						if (result != null) {
+							for (CompilerDiagnostic diagnostic : result.getCompileDiagnostics())
+								problemTracking.addItem(Problem.fromDiagnostic(diagnostic));
+
+							// Display runtime error if given.
+							Throwable runtimeThrowable = result.getRuntimeThrowable();
+							if (runtimeThrowable != null) {
+								Label traceString = new Label(StringUtil.traceToString(runtimeThrowable));
+								traceString.setGraphic(new FontIconView(CarbonIcons.ERROR, Color.RED));
+
+								Popover popover = new Popover();
+								popover.setArrowLocation(Popover.ArrowLocation.BOTTOM_RIGHT);
+								popover.setContentNode(traceString);
+
+								// Hack to get self
+								ObservableList<Node> children = editor.getPrimaryStack().getChildrenUnmodifiable();
+								popover.show(children.getLast());
+							}
+						} else {
+							logger.error("Compilation encountered an error", error);
+						}
+						Animations.animateFailure(editor, 1000);
+					}
+
+					// Redraw paragraph graphics to update things like in-line problem graphics.
+					editor.redrawParagraphGraphics();
+				}, FxThreadUtil.executor());
+			}
+
+			private void stop() {
+				scriptRunController.requestStop(getScriptKey());
+			}
+
+			@Nonnull
+			private Object getScriptKey() {
+				Path path = scriptPath;
+				return path == null ? ScriptEditor.this : path;
+			}
+
+			private void updateDisplay() {
+				boolean activeScript = scriptRunController.isRunning(getScriptKey());
+				boolean otherScriptActive = scriptRunController.isRunning() && !activeScript;
+				setGraphic(activeScript ? GRAPHIC_STOP : GRAPHIC_EXEC);
+				setText(Lang.get(activeScript ? "menu.scripting.stop" : "menu.scripting.execute"));
+				setDisable(otherScriptActive);
+			}
+		}
+	}
+
+	/**
+	 * Entry showing the script details + run/edit action buttons.
+	 */
+	private class ScriptEntry extends BorderPane {
+		private ScriptEntry(ScriptFile script) {
+			setPadding(new Insets(10));
+			getStyleClass().add("tooltip");
+
+			Label nameLabel = new Label(script.name());
+			nameLabel.setWrapText(true);
+			nameLabel.setMinSize(350, 20);
+			nameLabel.setMaxWidth(550);
+			nameLabel.getStyleClass().add(Styles.TITLE_3);
+
+			VBox info = new VBox();
+			info.getChildren().add(nameLabel);
+
+			String description = script.description();
+			String author = script.author();
+			String version = script.version();
+			String url = script.getTagValue("url");
+
+			if (!description.isBlank())
+				info.getChildren().add(makeAttribLabel(null, EscapeUtil.unescapeStandard(description)));
+			if (!author.isBlank())
+				info.getChildren().add(makeAttribLabel(getBinding("menu.scripting.author"), author));
+			if (!version.isBlank())
+				info.getChildren().add(makeAttribLabel(getBinding("menu.scripting.version"), version));
+			if (!url.isBlank()) {
+				info.getChildren().add(makeAttribLabel(new StringBinding() {
+					@Override
+					protected String computeValue() {
+						return "URL";
+					}
+				}, url));
+			}
+
+			VBox actions = new VBox();
+			actions.setSpacing(4);
+			actions.setAlignment(Pos.CENTER_RIGHT);
+
+			ScriptEntry entry = this;
+			Path scriptKey = script.path();
+			Button executeButton = new ActionButton();
+			executeButton.setOnAction(e -> {
+				e.consume();
+
+				// The controller intentionally allows one active run atm, so only the owning row can stop it.
+				if (scriptRunController.isRunning(scriptKey)) {
+					scriptRunController.requestStop(scriptKey);
+				} else if (!scriptRunController.isRunning()) {
+					scriptRunController.start(scriptKey, script.source())
+							.whenCompleteAsync((result, error) -> {
+								if (result != null && result.wasCancelled())
+									return;
+								if (result != null && result.wasSuccess()) {
+									Animations.animateSuccess(entry, 1000);
+								} else {
+									if (error != null)
+										logger.error("Script execution encountered an error", error);
+									Animations.animateFailure(entry, 1000);
+								}
+							}, FxThreadUtil.executor());
+				}
+			});
+			scriptRunController.executionStateVersionProperty()
+					.addListener((ob, old, cur) -> updateExecuteButton(executeButton, scriptKey));
+			updateExecuteButton(executeButton, scriptKey);
+			executeButton.setAlignment(Pos.CENTER_LEFT);
+			executeButton.setPrefSize(130, 30);
+
+			Button editButton = new ActionButton(CarbonIcons.EDIT, getBinding("menu.scripting.edit"), () -> editScript(script));
+			editButton.setAlignment(Pos.CENTER_LEFT);
+			editButton.setPrefSize(130, 30);
+
+			actions.getChildren().addAll(executeButton, editButton);
+
+			Separator separator = new Separator(Orientation.HORIZONTAL);
+			separator.prefWidthProperty().bind(scriptList.widthProperty());
+
+			setLeft(info);
+			setRight(actions);
+
+			prefWidthProperty().bind(widthProperty());
+		}
+
+		private void updateExecuteButton(@Nonnull Button button, @Nonnull Object scriptKey) {
+			boolean activeScript = scriptRunController.isRunning(scriptKey);
+			boolean otherScriptActive = scriptRunController.isRunning() && !activeScript;
+			// Non-owning rows remain execute buttons, but are disabled while another script owns the run handle.
+			button.setGraphic(new FontIconView(activeScript ? CarbonIcons.STOP_FILLED : CarbonIcons.PLAY_FILLED_ALT,
+					activeScript ? Color.RED : Color.LIME));
+			button.setText(Lang.get(activeScript ? "menu.scripting.stop" : "menu.scripting.execute"));
+			button.setDisable(otherScriptActive);
+		}
+
+		/**
+		 * Used to display bullet point format.
+		 *
+		 * @param langBinding
+		 * 		Language binding for label display.
+		 * @param secondaryText
+		 * 		Text to appear after the initial binding text.
+		 *
+		 * @return Label bound to translatable text.
+		 */
+		private static Label makeAttribLabel(StringBinding langBinding, String secondaryText) {
+			Label label = new Label(secondaryText);
+			label.setWrapText(true);
+			label.setMaxWidth(550);
+			if (langBinding != null) {
+				label.textProperty().bind(new StringBinding() {
+					{
+						bind(langBinding);
+					}
+
+					@Override
+					protected String computeValue() {
+						return String.format("  • %s: %s", langBinding.get(), secondaryText);
+					}
+				});
+			}
+			return label;
+		}
+	}
+}

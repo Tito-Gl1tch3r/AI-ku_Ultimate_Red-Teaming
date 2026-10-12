@@ -1,0 +1,177 @@
+using Microsoft.Extensions.Logging;
+namespace Spice86.Core.Emulator.InterruptHandlers.Dos;
+
+
+using Spice86.Core.Emulator.CPU;
+using Spice86.Core.Emulator.Function;
+using Spice86.Core.Emulator.InterruptHandlers;
+using Spice86.Core.Emulator.InterruptHandlers.Dos.Xms;
+using Spice86.Core.Emulator.InterruptHandlers.Mscdex;
+using Spice86.Core.Emulator.Memory;
+using Spice86.Shared.Emulator.Memory;
+using Spice86.Shared.Interfaces;
+
+/// <summary>
+/// Handles DOS multiplex interrupt <c>INT 2Fh</c> services used by DOS extenders,
+/// memory managers, ANSI drivers, MSCDEX, and Windows compatibility checks.
+/// </summary>
+/// <remarks>
+/// Supported <c>AH</c> services currently include:
+/// <list type="bullet">
+/// <item><description><c>10h</c>: SHARE.EXE installation check (<c>AL=00h</c> returns installed).</description></item>
+/// <item><description><c>15h</c>: MSCDEX dispatcher passthrough.</description></item>
+/// <item><description><c>16h</c>: DOS virtual machine service placeholder.</description></item>
+/// <item><description><c>1Ah</c>: ANSI console installation check (<c>AL=00h</c> returns installed).</description></item>
+/// <item><description><c>43h</c>: XMS installation check and callback address query.</description></item>
+/// <item><description><c>46h</c>: Windows virtual machine installation check compatibility.</description></item>
+/// <item><description><c>4Ah</c>: High Memory Area query/allocation compatibility response.</description></item>
+/// </list>
+/// </remarks>
+public class DosInt2fHandler : InterruptHandler {
+    private readonly ExtendedMemoryManager? _xms;
+    private readonly Mscdex _mscdexService;
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="DosInt2fHandler"/> class.
+    /// </summary>
+    /// <param name="memory">The memory bus.</param>
+    /// <param name="functionHandlerProvider">Provides current call flow handler to peek call stack.</param>
+    /// <param name="stack">The CPU stack.</param>
+    /// <param name="state">The CPU state.</param>
+    /// <param name="loggerService">The logger service implementation.</param>
+    /// <param name="mscdexService">The MSCDEX handler owned by the <c>Dos</c> class.</param>
+    /// <param name="xms">The extended memory manager. Can be <c>null</c> if XMS was not enabled.</param>
+    public DosInt2fHandler(IMemory memory,
+        IFunctionHandlerProvider functionHandlerProvider, Stack stack,
+        State state, ILogger loggerService, Mscdex mscdexService,
+        ExtendedMemoryManager? xms = null)
+        : base(memory, functionHandlerProvider, stack, state, loggerService) {
+        _xms = xms;
+        _mscdexService = mscdexService;
+        FillDispatchTable();
+    }
+
+    /// <inheritdoc />
+    public override byte VectorNumber => 0x2f;
+
+    /// <inheritdoc />
+    public override void Run() {
+        byte multiplexServiceId = State.AH;
+
+        if (!HasRunnable(multiplexServiceId)) {
+            if (LoggerService.IsEnabled(LogLevel.Warning)) {
+                LoggerService.LogWarning("Unhandled INT2F call: {Operation:X2}", multiplexServiceId);
+            }
+            //Moving on...
+            return;
+        }
+
+        Run(multiplexServiceId);
+    }
+
+    private void FillDispatchTable() {
+        AddAction(0x10, ShareExeServices);
+        AddAction(0x1A, AnsiConsoleServices);
+        AddAction(0x16, DosVirtualMachineServices);
+        AddAction(0x15, () => MscdexServices(true));
+        AddAction(0x43, () => XmsServices(true));
+        AddAction(0x46, WindowsVirtualMachineServices);
+        AddAction(0x4A, HighMemoryAreaServices);
+    }
+
+    public void ShareExeServices() {
+        switch (State.AL) {
+            case 0x0:
+                //report SHARE.EXE as installed...
+                State.AL = 0xFF;
+                break;
+            default:
+                if (LoggerService.IsEnabled(LogLevel.Warning)) {
+                    LoggerService.LogWarning("{MethodName}: value {AX:X2} not supported", nameof(ShareExeServices), State.AX);
+                }
+                break;
+        }
+    }
+
+    public void AnsiConsoleServices() {
+        switch (State.AL) {
+            case 0x0:
+                //Our ANSI console driver is installed
+                State.AL = 0xFF;
+                break;
+            default:
+                if (LoggerService.IsEnabled(LogLevel.Warning)) {
+                    LoggerService.LogWarning("{MethodName}: value {AX:X2} not supported", nameof(AnsiConsoleServices), State.AX);
+                }
+                break;
+        }
+    }
+
+    public void XmsServices(bool calledFromVm) {
+        switch (State.AL) {
+            //Is XMS Driver installed
+            case (byte)XmsInt2FFunctionsCodes.InstallationCheck:
+                State.AL = (byte)(_xms is null ? 0x0 : 0x80);
+                break;
+            //Get XMS Control Function Address
+            case (byte)XmsInt2FFunctionsCodes.GetCallbackAddress:
+                SegmentedAddress segmentedAddress = _xms?.CallbackAddress ?? new(0, 0);
+                State.ES = segmentedAddress.Segment;
+                State.BX = segmentedAddress.Offset;
+                break;
+            default:
+                if (LoggerService.IsEnabled(LogLevel.Warning)) {
+                    LoggerService.LogWarning("{MethodName}: value {AL} not supported", nameof(XmsServices), State.AL);
+                }
+                break;
+        }
+        SetCarryFlag(false, calledFromVm);
+    }
+
+    public void HighMemoryAreaServices() {
+        switch (State.AL) {
+            case 0x1 or 0x2: // Query Free HMA Space or Allocate HMA Space
+                State.BX = 0; // Number of bytes available / Amount allocated
+                State.ES = A20Gate.SegmentStartOfHighMemoryArea;
+                State.DI = 0xFFFF; // Amount of allocated HMA memory
+                break;
+            default:
+                if (LoggerService.IsEnabled(LogLevel.Warning)) {
+                    LoggerService.LogWarning("Unhandled INT2F HMA subfunction: {AX:X2}", State.AX);
+                }
+                break;
+        }
+    }
+
+    /// <summary>
+    /// A service that does nothing.
+    /// </summary>
+    public void DosVirtualMachineServices() {
+        //Do nothing,not even set CX or CF...
+        if (LoggerService.IsEnabled(LogLevel.Warning)) {
+            LoggerService.LogWarning("Unhandled INT2F DOS VM subfunction: {AX:X2}", State.AX);
+        }
+    }
+
+    public void WindowsVirtualMachineServices() {
+        switch (State.AL) {
+            case 0x80: //MS Windows v3.0 - INSTALLATION CHECK {undocumented} (AX: 4680h)
+                State.AX = 1; //We are not Windows, but plain ol' MS-DOS.
+                break;
+            default:
+                if (LoggerService.IsEnabled(LogLevel.Warning)) {
+                    LoggerService.LogWarning("Unhandled INT2F Windows VM subfunction: {AX:X2}", State.AX);
+                }
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Handles MSCDEX INT 2Fh AH=15h subfunctions. Delegates to <see cref="Mscdex"/>.
+    /// </summary>
+    public void MscdexServices(bool calledFromVm) {
+        if (_mscdexService.Dispatch()) {
+            SetCarryFlag(true, calledFromVm);
+        }
+    }
+}

@@ -1,0 +1,158 @@
+package printer
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"unicode/utf8"
+
+	"github.com/kubescape/kubescape/v4/internal/testutils"
+	"github.com/kubescape/opa-utils/reporthandling/apis"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/reportsummary"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func Test_generateRowPdf(t *testing.T) {
+
+	mockSummary, err := mockSummaryDetails()
+	if err != nil {
+		t.Errorf("Error in creating mock summary %s", err)
+	}
+
+	infoToPrintInfoMap := mapInfoToPrintInfo(mockSummary.Controls)
+	sortedControlIDs := getSortedControlsIDs(mockSummary.Controls)
+
+	var rows []TableRow
+
+	for _, sortedControlID := range slices.Backward(sortedControlIDs) {
+		for _, c := range sortedControlID {
+			row := *generateTableRow(mockSummary.Controls.GetControl(reportsummary.EControlCriteriaID, c), infoToPrintInfoMap)
+			rows = append(rows, row)
+		}
+	}
+
+	for _, row := range rows {
+		//validating severity column
+		if row.severity != "Low" && row.severity != "Medium" && row.severity != "High" && row.severity != "Critical" {
+			t.Errorf("got %s, want either of these: %s", row.severity, "Low, Medium, High, Critical")
+		}
+
+		// Validating length of control ID
+		if len(row.ref) > 6 {
+			t.Errorf("got %s, want %s", row.ref, "less than 7 characters")
+		}
+
+		// Validating length of control name
+		if len(row.name) > controlNameMaxLength {
+			t.Errorf("got %s, want %s", row.name, fmt.Sprintf("less than %d characters", controlNameMaxLength))
+		}
+
+		// Validating numeric fields
+		_, err := strconv.Atoi(row.counterFailed)
+		if err != nil {
+			t.Errorf("got %s, want an integer %s", row.counterFailed, err)
+		}
+
+		_, err = strconv.Atoi(row.counterAll)
+		if err != nil {
+			t.Errorf("got %s, want an integer %s", row.counterAll, err)
+		}
+
+		assert.NotEmpty(t, row.complianceScore, "expected a non-empty string")
+
+	}
+
+}
+
+func TestGetComplianceScoreColumnDoesNotRoundFractionalScoreToPerfect(t *testing.T) {
+	score := float32(99.5)
+	controlSummary := &reportsummary.ControlSummary{
+		ComplianceScore: &score,
+	}
+
+	assert.Equal(t, "99%", getComplianceScoreColumn(controlSummary, nil))
+}
+
+func Test_generateTableRow_UTF8(t *testing.T) {
+	name := strings.Repeat("a", 69) + "é" + strings.Repeat("b", 20)
+	ctrl := &reportsummary.ControlSummary{
+		ControlID:      "C-1234",
+		Name:           name,
+		StatusInfo:     apis.StatusInfo{InnerStatus: apis.StatusPassed},
+		StatusCounters: reportsummary.StatusCounters{PassedResources: 1, FailedResources: 1},
+	}
+
+	row := generateTableRow(ctrl, nil)
+
+	assert.True(t, utf8.ValidString(row.name), "truncated control name must be valid UTF-8")
+}
+
+func TestGetSortedControlsIDs_OutOfBoundsScoreFactorDoesNotPanic(t *testing.T) {
+	controls := reportsummary.ControlSummaries{
+		"C-0001": reportsummary.ControlSummary{ControlID: "C-0001", Name: "LowControl", ScoreFactor: 1.0},
+		"C-0002": reportsummary.ControlSummary{ControlID: "C-0002", Name: "CriticalControl", ScoreFactor: 9.0},
+		"C-0003": reportsummary.ControlSummary{ControlID: "C-0003", Name: "NegativeScoreFactor", ScoreFactor: -50.0},
+		"C-0004": reportsummary.ControlSummary{ControlID: "C-0004", Name: "ExcessiveScoreFactor", ScoreFactor: 999.0},
+		"C-0005": reportsummary.ControlSummary{ControlID: "C-0005", Name: "ZeroScoreFactor", ScoreFactor: 0.0},
+	}
+
+	var sortedIDs [][]string
+	assert.NotPanics(t, func() {
+		sortedIDs = getSortedControlsIDs(controls)
+	}, "getSortedControlsIDs must not panic on out-of-bounds score factors")
+
+	require.Len(t, sortedIDs, 5)
+	// Bucket 0 should contain unknown/out-of-bounds controls
+	assert.Contains(t, sortedIDs[0], "C-0003")
+	assert.Contains(t, sortedIDs[0], "C-0005")
+	assert.Contains(t, sortedIDs[apis.SeverityCritical], "C-0002")
+}
+
+func TestGetSortedControlsIDs_Empty(t *testing.T) {
+	sortedIDs := getSortedControlsIDs(reportsummary.ControlSummaries{})
+	require.Len(t, sortedIDs, 5)
+	for i := range sortedIDs {
+		assert.Empty(t, sortedIDs[i])
+	}
+}
+
+func TestGetColor_AllSeverities(t *testing.T) {
+	severities := []int{
+		apis.SeverityCritical,
+		apis.SeverityHigh,
+		apis.SeverityMedium,
+		apis.SeverityLow,
+		apis.SeverityUnknown,
+		-1,
+		99,
+	}
+
+	for _, s := range severities {
+		t.Run(fmt.Sprintf("severity_%d", s), func(t *testing.T) {
+			fn := getColor(s)
+			assert.NotNil(t, fn)
+			assert.NotEmpty(t, fn("TEST"))
+		})
+	}
+}
+
+func mockSummaryDetails() (*reportsummary.SummaryDetails, error) {
+	data, err := os.ReadFile(filepath.Join(testutils.CurrentDir(), "testdata", "mock_summaryDetails.json"))
+	if err != nil {
+		return nil, err
+	}
+
+	var v *reportsummary.SummaryDetails
+
+	if err := json.Unmarshal(data, &v); err != nil {
+		return nil, err
+	}
+
+	return v, nil
+}

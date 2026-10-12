@@ -1,0 +1,372 @@
+# frozen_string_literal: true
+
+require 'cgi'
+require 'metasm'
+require 'tempfile'
+
+module PWN
+  module Plugins
+    # This plugin provides methods for converting between hex escaped opcodes and assembly instructions using the Metasm library.
+    module Assembly
+      # Supported Method Parameters::
+      # PWN::Plugins::Assembly.opcodes_to_asm(
+      #   opcodes: 'required - hex escaped opcode(s) (e.g. "\x90\x90\x90")',
+      #   opcodes_always_string_obj: 'optional - always interpret opcodes passed in as a string object (defaults to false)',
+      #   arch: 'optional - architecture returned from objdump --info (defaults to PWN::Plugins::DetectOS.arch)',
+      #   endian: 'optional - endianess :big|:little (defaults to current system endianess)'
+      # )
+
+      public_class_method def self.opcodes_to_asm(opts = {})
+        opcodes = opts[:opcodes]
+        opcodes_always_string_obj = opts[:opcodes_always_string_obj] ||= false
+        arch = opts[:arch] ||= PWN::Plugins::DetectOS.arch
+        endian = opts[:endian] ||= PWN::Plugins::DetectOS.endian
+        endian = endian.to_sym if opts[:endian]
+
+        raise 'ERROR: opcodes parameter is required.' if opcodes.nil?
+
+        ai_analysis = PWN::AI::Agent::Assembly.analyze(
+          request: opcodes,
+          type: :opcodes_to_asm,
+          arch: arch,
+          endian: endian
+        )
+
+        case arch.to_s.downcase
+        when 'i386', 'i686', 'x86'
+          arch_obj = Metasm::Ia32.new(endian)
+        when 'amd64', 'x86_64'
+          arch_obj = Metasm::X86_64.new(endian)
+        when 'arc'
+          arch_obj = Metasm::ARC.new(endian)
+        when 'armv4l', 'armv4b', 'armv5l', 'armv5b', 'armv6l', 'armv6b', 'armv7b', 'armv7l', 'arm', 'armhf'
+          arch_obj = Metasm::ARM.new(endian)
+        when 'aarch64', 'arm64'
+          arch_obj = Metasm::ARM64.new(endian)
+        when 'bpf'
+          arch_obj = Metasm::BPF.new(endian)
+        when 'cy16'
+          arch_obj = Metasm::CY16.new(endian)
+        when 'dalvik'
+          arch_obj = Metasm::Dalvik.new(endian)
+        when 'ebpf'
+          arch_obj = Metasm::EBPF.new(endian)
+        when 'mcs51'
+          arch_obj = Metasm::MCS51.new(endian)
+        when 'mips'
+          arch_obj = Metasm::MIPS.new(endian)
+        when 'mips64'
+          arch_obj = Metasm::MIPS64.new(endian)
+        when 'msp430'
+          arch_obj = Metasm::MSP430.new(endian)
+        when 'openrisc'
+          arch_obj = Metasm::OpenRisc.new(endian)
+        when 'ppc'
+          arch_obj = Metasm::PPC.new(endian)
+        when 'sh4'
+          arch_obj = Metasm::SH4.new(endian)
+        when 'st20'
+          arch_obj = Metasm::ST20.new(endian)
+        when 'webasm'
+          arch_obj = Metasm::WebAsm.new(endian)
+        when 'z80'
+          arch_obj = Metasm::Z80.new(endian)
+        else
+          raise "Unsupported architecture: #{arch}"
+        end
+
+        # TOOD: Still needs a fix if opcodes are passed in as:
+        # '\x90\x90\x90' (not to be confused w/ "\x90\x90\x90")
+        # '909090'
+        opcodes_orig_len = opcodes.length
+        opcodes = opcodes.join(',') if opcodes.is_a?(Array)
+        # puts opcodes.inspect
+        opcodes = CGI.escape(opcodes)
+        # puts opcodes.inspect
+        # known to work (when method is called directly) with:
+        # 'ffe4'
+        # 'ff,e4'
+        # 'ff e4'
+        # "ff,e4"
+        # "ff e4"
+        # ['ff', 'e4']
+        # ["ff", "e4"]
+        # '\xff\xe4'
+        # "\xff\xe4"
+        # "'ff', 'e4'"
+        # '"ff", "e4"'
+        # only known to work in pwn REPL driver with:
+        # ffe4
+        # ff e4
+        # puts opcodes.inspect
+        #  More stripping if passed in via pwn REPL driver
+        # if opcodes_always_string_obj
+        # end
+
+        opcodes.delete!('%5B')
+        opcodes.delete!('%5D')
+        opcodes.delete!('%5Cx')
+        opcodes.delete!('%2C')
+        opcodes.delete!('%22')
+        opcodes.delete!('%27')
+        opcodes.delete!('+')
+        opcodes.delete!('%')
+
+        # puts opcodes.inspect
+        opcodes = [opcodes].pack('H*')
+        # puts opcodes.inspect
+
+        "#{ai_analysis}\n\n* Assembly Instructions >>>#{Metasm::Shellcode.disassemble(arch_obj, opcodes).to_s.squeeze("\n")}\n"
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # PWN::Plugins::Assembly.asm_to_opcodes(
+      #   asm: 'required - assembly instruction(s) (e.g. 'nop\nnop\nnop\njmp rsp\n)',
+      #   arch: 'optional - architecture returned from objdump --info (defaults to PWN::Plugins::DetectOS.arch)',
+      #   endian: 'optional - endianess :big|:little (defaults to current system endianess)'
+      # )
+
+      public_class_method def self.asm_to_opcodes(opts = {})
+        asm = opts[:asm]
+        arch = opts[:arch] ||= PWN::Plugins::DetectOS.arch
+        endian = opts[:endian] ||= PWN::Plugins::DetectOS.endian
+        endian = endian.to_sym if opts[:endian]
+
+        asm_tmp = Tempfile.new('pwn_asm')
+
+        raise 'ERROR: asm parameter is required.' if asm.nil?
+
+        ai_analysis = PWN::AI::Agent::Assembly.analyze(
+          request: asm,
+          type: :asm_to_opcodes,
+          arch: arch,
+          endian: endian
+        )
+
+        case arch.to_s.downcase
+        when 'i386', 'i686', 'x86'
+          arch_obj = Metasm::Ia32.new(endian)
+        when 'amd64', 'x86_64'
+          arch_obj = Metasm::X86_64.new(endian)
+        when 'arc'
+          arch_obj = Metasm::ARC.new(endian)
+        when 'armv4l', 'armv4b', 'armv5l', 'armv5b', 'armv6l', 'armv6b', 'armv7b', 'armv7l', 'arm', 'armhf'
+          arch_obj = Metasm::ARM.new(endian)
+        when 'aarch64', 'arm64'
+          arch_obj = Metasm::ARM64.new(endian)
+        when 'bpf'
+          arch_obj = Metasm::BPF.new(endian)
+        when 'cy16'
+          arch_obj = Metasm::CY16.new(endian)
+        when 'dalvik'
+          arch_obj = Metasm::Dalvik.new(endian)
+        when 'ebpf'
+          arch_obj = Metasm::EBPF.new(endian)
+        when 'mcs51'
+          arch_obj = Metasm::MCS51.new(endian)
+        when 'mips'
+          arch_obj = Metasm::MIPS.new(endian)
+        when 'mips64'
+          arch_obj = Metasm::MIPS64.new(endian)
+        when 'msp430'
+          arch_obj = Metasm::MSP430.new(endian)
+        when 'openrisc'
+          arch_obj = Metasm::OpenRisc.new(endian)
+        when 'ppc'
+          arch_obj = Metasm::PPC.new(endian)
+        when 'sh4'
+          arch_obj = Metasm::SH4.new(endian)
+        when 'st20'
+          arch_obj = Metasm::ST20.new(endian)
+        when 'webasm'
+          arch_obj = Metasm::WebAsm.new(endian)
+        when 'z80'
+          arch_obj = Metasm::Z80.new(endian)
+        else
+          raise "Unsupported architecture: #{arch}"
+        end
+
+        opcodes = Metasm::Shellcode.assemble(arch_obj, asm).encode_string
+
+        "#{ai_analysis}\n\n* Hex-Escaped Opcodes >>>\n#{opcodes.bytes.map { |b| format('\x%02x', b) }.join}\n"
+      rescue Metasm::ParseError
+        puts "Invalid assembly instruction(s) provided:\n#{asm}"
+        # Should we try to call opcode_to_asm here or just raise the error?
+      rescue StandardError => e
+        raise e
+      end
+
+      public_class_method def self.assemble(opts = {})
+        asm = opts[:asm].to_s
+        raise 'ERROR: asm is required' if asm.empty?
+
+        if opts[:engine].to_s != 'metasm' && PWN::FFI.available?(mod: :Keystone)
+          begin
+            row = PWN::FFI::Keystone.assemble(opts)
+            return row if assembled_matches?(bytes: row[:bytes], asm: asm, arch: opts[:arch])
+          rescue StandardError
+            nil
+          end
+        end
+
+        arch_obj = arch_object(opts)
+        bytes = Metasm::Shellcode.assemble(arch_obj, asm).encode_string
+        { engine: 'metasm', bytes: bytes, hex: bytes.unpack1('H*'), count: bytes.bytesize }
+      end
+
+      public_class_method def self.disassemble(opts = {})
+        raw = opts[:bytes] || opts[:opcodes]
+        raise 'ERROR: bytes is required' if raw.to_s.empty?
+
+        if opts[:engine].to_s != 'metasm' && PWN::FFI.available?(mod: :Capstone)
+          begin
+            row = PWN::FFI::Capstone.disassemble(opts)
+            return row if plausible_insns?(insns: row[:insns])
+          rescue StandardError
+            nil
+          end
+        end
+
+        arch_obj = arch_object(opts)
+        text = Metasm::Shellcode.disassemble(arch_obj, raw.to_s.b).to_s
+        insns = text.lines.filter_map do |line|
+          if (match = line.match(/^\s*([A-Za-z][A-Za-z0-9.]*)\s*(.*?)\s*;\s*@([0-9a-f]+)/))
+            { address: match[3].to_i(16), mnemonic: match[1], op_str: match[2].to_s.strip }
+          elsif (match = line.match(/^\s*(?:0x)?([0-9a-f]+)\s+(\S+)\s*(.*)$/i))
+            { address: match[1].to_i(16), mnemonic: match[2], op_str: match[3].to_s.strip }
+          end
+        end
+        { engine: 'metasm', insns: insns, count: insns.length, text: text }
+      end
+
+      # A mis-laid-out libcapstone still returns rows. Reject those and use Metasm.
+      private_class_method def self.plausible_insns?(opts = {})
+        insns = Array(opts[:insns])
+        return false if insns.empty?
+
+        insns.all? do |insn|
+          insn[:mnemonic].to_s.match?(/\A[A-Za-z][A-Za-z0-9.]{0,15}\z/) && insn[:size].to_i.between?(1, 15)
+        end
+      end
+
+      # Keystone ABI mismatches can return bytes that are not the requested instructions.
+      private_class_method def self.assembled_matches?(opts = {})
+        token = opts[:asm].to_s.lines.filter_map { |line| line.strip.split(/\s+/, 2).first }.find { |word| !word.end_with?(':') }
+        return false if token.to_s.empty?
+
+        dis = disassemble(bytes: opts[:bytes], arch: opts[:arch], engine: 'metasm')
+        Array(dis[:insns]).any? { |insn| insn[:mnemonic].to_s.casecmp?(token) }
+      end
+
+      public_class_method def self.list_supported_archs
+        [
+          { name: 'i386', endian: 'little' },
+          { name: 'i686', endian: 'little' },
+          { name: 'x86', endian: 'little' },
+          { name: 'amd64', endian: 'little' },
+          { name: 'x86_64', endian: 'little' },
+          { name: 'arc', endian: 'little' },
+          { name: 'armv4l', endian: 'little' },
+          { name: 'armv4b', endian: 'big' },
+          { name: 'armv5l', endian: 'little' },
+          { name: 'armv5b', endian: 'big' },
+          { name: 'armv6l', endian: 'little' },
+          { name: 'armv6b', endian: 'big' },
+          { name: 'armv7b', endian: 'big' },
+          { name: 'armv7l', endian: 'little' },
+          { name: 'arm', endian: 'little' },
+          { name: 'armhf', endian: 'little' },
+          { name: 'aarch64', endian: 'little' },
+          { name: 'arm64', endian: 'little' },
+          { name: 'bpf', endian: 'little' },
+          { name: 'cy16', endian: 'little' },
+          { name: 'dalvik', endian: 'little' },
+          { name: 'ebpf', endian: 'little' },
+          { name: 'mcs51', endian: 'little' },
+          { name: 'mips', endian: 'little' },
+          { name: 'mips64', endian: 'little' },
+          { name: 'msp430', endian: 'little' },
+          { name: 'openrisc', endian: 'little' },
+          { name: 'ppc', endian: 'little' },
+          { name: 'sh4', endian: 'little' },
+          { name: 'st20', endian: 'little' },
+          { name: 'webasm', endian: 'little' },
+          { name: 'z80', endian: 'little' }
+        ]
+      rescue StandardError => e
+        raise e
+      end
+
+      # Author(s):: 0day Inc. <support@0dayinc.com>
+
+      public_class_method def self.authors
+        "AUTHOR(S):
+          0day Inc. <support@0dayinc.com>
+        "
+      end
+
+      # Display Usage for this Module
+
+      public_class_method def self.help
+        puts "USAGE:
+          # Run opcodes to asm and return its result
+          #{self}.opcodes_to_asm(
+            opcodes: 'required - hex escaped opcode(s) (e.g. \\x90\\x90\\x90)',
+            opcodes_always_string_obj: 'optional - always interpret opcodes passed in as a string object (defaults to false)',
+            arch: 'optional - architecture returned from objdump --info (defaults to PWN::Plugins::DetectOS.arch)',
+            endian: 'optional - endianess :big|:little (defaults to current system endianess)'
+          )
+
+          # Run asm to opcodes and return its result
+          #{self}.asm_to_opcodes(
+            asm: 'required - assembly instruction(s) (e.g. nop\\nnop\\nnop\\njmp rsp\\n)',
+            arch: 'optional - architecture returned from objdump --info (defaults to PWN::Plugins::DetectOS.arch)',
+            endian: 'optional - endianess :big|:little (defaults to current system endianess)'
+          )
+
+          # Assemble instructions via Keystone FFI when present, else Metasm.
+          #{self}.assemble(
+            asm: 'required - assembly source (one instruction per line)',
+            arch: 'optional - architecture string (as from objdump --info)',
+            endian: 'optional - :little or :big byte order',
+            engine: 'optional - assembler backend keystone when libkeystone loads, otherwise metasm',
+            address: 'optional - start address'
+          )
+
+          # Disassemble bytes via Capstone FFI when present, else Metasm.
+          #{self}.disassemble(
+            bytes: 'required - raw machine-code bytes',
+            opcodes: 'optional - alias for bytes',
+            arch: 'optional - architecture string (as from objdump --info)',
+            endian: 'optional - :little or :big byte order',
+            engine: 'optional - disassembler backend capstone when libcapstone loads, otherwise metasm',
+            address: 'optional - start address'
+          )
+
+          # Run list supported archs and return its result
+          #{self}.list_supported_archs
+
+          # Print the AUTHOR(S) string for this module.
+          #{self}.authors
+        "
+        constants.sort
+      end
+
+      private_class_method def self.arch_object(opts = {})
+        arch = (opts[:arch] || PWN::Plugins::DetectOS.arch).to_s
+        endian = opts[:endian] || PWN::Plugins::DetectOS.endian
+        endian = endian.to_sym
+        case arch.downcase
+        when 'i386', 'i686', 'x86' then Metasm::Ia32.new(endian)
+        when 'amd64', 'x86_64' then Metasm::X86_64.new(endian)
+        when 'aarch64', 'arm64' then Metasm::ARM64.new(endian)
+        when /arm/ then Metasm::ARM.new(endian)
+        else
+          raise "Unsupported architecture: #{arch}"
+        end
+      end
+    end
+  end
+end

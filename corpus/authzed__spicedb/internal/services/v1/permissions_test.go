@@ -1,0 +1,2883 @@
+package v1_test
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"math/rand"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/ccoveille/go-safecast/v2"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/prototext"
+	"google.golang.org/protobuf/types/known/structpb"
+
+	"github.com/authzed/authzed-go/pkg/requestmeta"
+	"github.com/authzed/authzed-go/pkg/responsemeta"
+	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+	"github.com/authzed/grpcutil"
+
+	"github.com/authzed/spicedb/internal/datastore/memdb"
+	"github.com/authzed/spicedb/internal/namespace"
+	"github.com/authzed/spicedb/internal/services/shared"
+	v1svc "github.com/authzed/spicedb/internal/services/v1"
+	tf "github.com/authzed/spicedb/internal/testfixtures"
+	"github.com/authzed/spicedb/internal/testserver"
+	"github.com/authzed/spicedb/pkg/datalayer"
+	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/datastore/options"
+	"github.com/authzed/spicedb/pkg/genutil/mapz"
+	pgraph "github.com/authzed/spicedb/pkg/graph"
+	core "github.com/authzed/spicedb/pkg/proto/core/v1"
+	"github.com/authzed/spicedb/pkg/schemadsl/compiler"
+	"github.com/authzed/spicedb/pkg/schemadsl/input"
+	"github.com/authzed/spicedb/pkg/spiceerrors"
+	"github.com/authzed/spicedb/pkg/testutil"
+	"github.com/authzed/spicedb/pkg/tuple"
+	"github.com/authzed/spicedb/pkg/zedtoken"
+)
+
+var testTimedeltas = []time.Duration{0, 1 * time.Second}
+
+func obj(objType, objID string) *v1.ObjectReference {
+	return &v1.ObjectReference{
+		ObjectType: objType,
+		ObjectId:   objID,
+	}
+}
+
+func sub(subType string, subID string, subRel string) *v1.SubjectReference {
+	return &v1.SubjectReference{
+		Object:           obj(subType, subID),
+		OptionalRelation: subRel,
+	}
+}
+
+func TestCheckPermissions(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+
+	testCases := []struct {
+		resource       *v1.ObjectReference
+		permission     string
+		subject        *v1.SubjectReference
+		expected       v1.CheckPermissionResponse_Permissionship
+		expectedStatus codes.Code
+	}{
+		{
+			obj("document", "masterplan"),
+			"view",
+			sub("user", "eng_lead", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "masterplan"),
+			"view",
+			sub("user", "product_manager", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "masterplan"),
+			"view",
+			sub("user", "chief_financial_officer", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "healthplan"),
+			"view",
+			sub("user", "chief_financial_officer", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "masterplan"),
+			"view",
+			sub("user", "auditor", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "companyplan"),
+			"view",
+			sub("user", "auditor", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "masterplan"),
+			"view",
+			sub("user", "vp_product", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "masterplan"),
+			"view",
+			sub("user", "legal", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "companyplan"),
+			"view",
+			sub("user", "legal", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "masterplan"),
+			"view",
+			sub("user", "owner", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "companyplan"),
+			"view",
+			sub("user", "owner", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "masterplan"),
+			"view",
+			sub("user", "villain", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "masterplan"),
+			"view",
+			sub("user", "unknowngal", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "masterplan"),
+			"view_and_edit",
+			sub("user", "eng_lead", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "specialplan"),
+			"view_and_edit",
+			sub("user", "multiroleguy", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "masterplan"),
+			"view_and_edit",
+			sub("user", "missingrolegal", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "masterplan"),
+			"invalidrelation",
+			sub("user", "missingrolegal", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_UNSPECIFIED,
+			codes.FailedPrecondition,
+		},
+		{
+			obj("document", "masterplan"),
+			"view_and_edit",
+			sub("user", "someuser", "invalidrelation"),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_UNSPECIFIED,
+			codes.FailedPrecondition,
+		},
+		{
+			obj("invalidnamespace", "masterplan"),
+			"view_and_edit",
+			sub("user", "someuser", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_UNSPECIFIED,
+			codes.FailedPrecondition,
+		},
+		{
+			obj("document", "masterplan"),
+			"view_and_edit",
+			sub("invalidnamespace", "someuser", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_UNSPECIFIED,
+			codes.FailedPrecondition,
+		},
+		{
+			obj("document", "*"),
+			"view_and_edit",
+			sub("invalidnamespace", "someuser", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_UNSPECIFIED,
+			codes.InvalidArgument,
+		},
+		{
+			obj("document", "something"),
+			"view",
+			sub("user", "*", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_UNSPECIFIED,
+			codes.InvalidArgument,
+		},
+		{
+			obj("document", "something"),
+			"unknown",
+			sub("user", "foo", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_UNSPECIFIED,
+			codes.FailedPrecondition,
+		},
+		{
+			obj("document", "-base64YWZzZGZh-ZHNmZHPwn5iK8J+YivC/fmIrwn5iK=="),
+			"view",
+			sub("user", "unkn-base64YWZzZGZh-ZHNmZHPwn5iK8J+YivC/fmIrwn5iK==owngal", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION,
+			codes.OK,
+		},
+		{
+			obj("document", "foo"),
+			"*",
+			sub("user", "bar", ""),
+			v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION,
+			codes.InvalidArgument,
+		},
+	}
+
+	for _, delta := range testTimedeltas {
+		t.Run(fmt.Sprintf("fuzz%d", delta/time.Millisecond), func(t *testing.T) {
+			for _, debug := range []bool{false, true} {
+				t.Run(fmt.Sprintf("debug%v", debug), func(t *testing.T) {
+					for _, tc := range testCases {
+						t.Run(fmt.Sprintf(
+							"%s:%s#%s@%s:%s#%s",
+							tc.resource.ObjectType,
+							tc.resource.ObjectId,
+							tc.permission,
+							tc.subject.Object.ObjectType,
+							tc.subject.Object.ObjectId,
+							tc.subject.OptionalRelation,
+						), func(t *testing.T) {
+							require := require.New(t)
+							conn, _, revision := testserver.NewTestServerWithConfig(t, delta, memdb.DisableGC, true,
+								testserver.DefaultTestServerConfig,
+								tf.StandardDatastoreWithData)
+							client := v1.NewPermissionsServiceClient(conn)
+
+							ctx := t.Context()
+							if debug {
+								ctx = requestmeta.AddRequestHeaders(ctx, requestmeta.RequestDebugInformation)
+							}
+
+							var trailer metadata.MD
+							checkResp, err := client.CheckPermission(ctx, &v1.CheckPermissionRequest{
+								Consistency: &v1.Consistency{
+									Requirement: &v1.Consistency_AtLeastAsFresh{
+										AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+									},
+								},
+								Resource:   tc.resource,
+								Permission: tc.permission,
+								Subject:    tc.subject,
+							}, grpc.Trailer(&trailer))
+
+							if tc.expectedStatus == codes.OK {
+								require.NoError(err)
+								require.Equal(tc.expected, checkResp.Permissionship)
+
+								dispatchCount, err := responsemeta.GetIntResponseTrailerMetadata(trailer, responsemeta.DispatchedOperationsCount)
+								require.NoError(err)
+								require.GreaterOrEqual(dispatchCount, 0)
+
+								encodedDebugInfo, err := responsemeta.GetResponseTrailerMetadataOrNil(trailer, responsemeta.DebugInformation)
+								require.NoError(err)
+
+								if debug {
+									require.Nil(encodedDebugInfo)
+
+									debugInfo := checkResp.DebugTrace
+									require.NotNil(debugInfo.Check)
+									require.NotNil(debugInfo.Check.Duration)
+									require.Equal(tuple.V1StringObjectRef(tc.resource), tuple.V1StringObjectRef(debugInfo.Check.Resource))
+									require.Equal(tc.permission, debugInfo.Check.Permission)
+									require.Equal(tuple.V1StringSubjectRef(tc.subject), tuple.V1StringSubjectRef(debugInfo.Check.Subject))
+									require.NotEmpty(debugInfo.Check.Source, "source in debug trace is empty")
+								} else {
+									require.Nil(encodedDebugInfo)
+								}
+							} else {
+								grpcutil.RequireStatus(t, tc.expectedStatus, err)
+							}
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestCheckPermissionSchemaLoadedOnce(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+
+	counter := &readStoredSchemaCounter{}
+	conn, _, _ := testserver.NewTestServerWithConfig(
+		t,
+		0,
+		memdb.DisableGC,
+		true,
+		testserver.ServerConfig{
+			MaxUpdatesPerWrite:    1000,
+			MaxPreconditionsCount: 1000,
+			StreamingAPITimeout:   30 * time.Second,
+			DataLayerOpts: []datalayer.DataLayerOption{
+				datalayer.WithSchemaMode(datalayer.SchemaModeReadNewWriteBoth),
+				datalayer.WithSchemaCache(&simpleSchemaCache{items: make(map[datalayer.SchemaCacheKey]*datastore.ReadOnlyStoredSchema)}),
+			},
+		},
+		func(t testing.TB, ds datastore.Datastore) (datastore.Datastore, datastore.Revision) {
+			wrapped := counter.wrap(ds)
+			rev, err := wrapped.HeadRevision(t.Context())
+			require.NoError(t, err)
+			return wrapped, rev.Revision
+		},
+	)
+
+	schemaClient := v1.NewSchemaServiceClient(conn)
+	permClient := v1.NewPermissionsServiceClient(conn)
+
+	// Write schema and a relationship through the API so it goes through the DataLayer.
+	_, err := schemaClient.WriteSchema(t.Context(), &v1.WriteSchemaRequest{
+		Schema: `definition user {}
+
+		definition document {
+			relation viewer: user
+			permission view = viewer
+		}`,
+	})
+	require.NoError(t, err)
+
+	_, err = permClient.WriteRelationships(t.Context(), &v1.WriteRelationshipsRequest{
+		Updates: []*v1.RelationshipUpdate{tuple.MustUpdateToV1RelationshipUpdate(tuple.Create(
+			tuple.MustParse("document:doc1#viewer@user:tom#..."),
+		))},
+	})
+	require.NoError(t, err)
+
+	// Reset the counter after setup. The cache was warmed by WriteSchema.
+	counter.reset()
+
+	// Make a CheckPermission call — schema should come from the cache.
+	checkResp, err := permClient.CheckPermission(t.Context(), &v1.CheckPermissionRequest{
+		Consistency: &v1.Consistency{
+			Requirement: &v1.Consistency_FullyConsistent{FullyConsistent: true},
+		},
+		Resource:   obj("document", "doc1"),
+		Permission: "view",
+		Subject:    sub("user", "tom", ""),
+	})
+	require.NoError(t, err)
+	require.Equal(t, v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION, checkResp.Permissionship)
+
+	// With caching, the schema written via WriteSchema is already cached, so
+	// ReadStoredSchema on the underlying datastore should not be called.
+	require.Equal(t, 0, counter.count(), "ReadStoredSchema should not be called when schema is cached")
+
+	// Make several more CheckPermission calls with different resources so the
+	// dispatch cache doesn't short-circuit the schema load path.
+	for i := range 5 {
+		checkResp, err = permClient.CheckPermission(t.Context(), &v1.CheckPermissionRequest{
+			Consistency: &v1.Consistency{
+				Requirement: &v1.Consistency_FullyConsistent{FullyConsistent: true},
+			},
+			Resource:   obj("document", fmt.Sprintf("doc-%d", i)),
+			Permission: "view",
+			Subject:    sub("user", "tom", ""),
+		})
+		require.NoError(t, err)
+		require.Equal(t, v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION, checkResp.Permissionship)
+	}
+
+	require.Equal(t, 0, counter.count(), "ReadStoredSchema should not be called across multiple CheckPermission calls")
+
+	// Sanity-check the counter: call ReadStoredSchema directly on the wrapped
+	// datastore (bypassing the DataLayer's schema cache entirely) and confirm
+	// the counter increments. This ensures the zero counts above reflect cache
+	// hits, not a broken counter.
+	counter.reset()
+	headRev, err := counter.HeadRevision(t.Context())
+	require.NoError(t, err)
+	_, err = counter.SnapshotReader(headRev.Revision).ReadStoredSchema(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, 1, counter.count(), "counter should increment when ReadStoredSchema is called directly")
+}
+
+func TestCheckPermissionSchemaLoadedOnceMinLatency(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	counter := &readStoredSchemaCounter{}
+	conn, _, _ := testserver.NewTestServerWithConfig(
+		t,
+		time.Nanosecond, // effectively no quantization, but non-zero to avoid memdb divide-by-zero
+		memdb.DisableGC,
+		true,
+		testserver.ServerConfig{
+			MaxUpdatesPerWrite:    1000,
+			MaxPreconditionsCount: 1000,
+			StreamingAPITimeout:   30 * time.Second,
+			DataLayerOpts: []datalayer.DataLayerOption{
+				datalayer.WithSchemaMode(datalayer.SchemaModeReadNewWriteBoth),
+				datalayer.WithSchemaCache(&simpleSchemaCache{items: make(map[datalayer.SchemaCacheKey]*datastore.ReadOnlyStoredSchema)}),
+			},
+		},
+		func(t testing.TB, ds datastore.Datastore) (datastore.Datastore, datastore.Revision) {
+			wrapped := counter.wrap(ds)
+			rev, err := wrapped.HeadRevision(t.Context())
+			require.NoError(t, err)
+			return wrapped, rev.Revision
+		},
+	)
+
+	schemaClient := v1.NewSchemaServiceClient(conn)
+	permClient := v1.NewPermissionsServiceClient(conn)
+
+	_, err := schemaClient.WriteSchema(t.Context(), &v1.WriteSchemaRequest{
+		Schema: `definition user {}
+
+		definition document {
+			relation viewer: user
+			permission view = viewer
+		}`,
+	})
+	require.NoError(t, err)
+
+	_, err = permClient.WriteRelationships(t.Context(), &v1.WriteRelationshipsRequest{
+		Updates: []*v1.RelationshipUpdate{tuple.MustUpdateToV1RelationshipUpdate(tuple.Create(
+			tuple.MustParse("document:doc1#viewer@user:tom#..."),
+		))},
+	})
+	require.NoError(t, err)
+
+	// Reset the counter after setup. The cache was warmed by WriteSchema.
+	counter.reset()
+
+	// CheckPermission with MinimizeLatency exercises the OptimizedRevision
+	// path in the consistency middleware. For the cache to be hit, the
+	// datastore's OptimizedRevision must return the current schema hash.
+	for i := range 5 {
+		checkResp, err := permClient.CheckPermission(t.Context(), &v1.CheckPermissionRequest{
+			Consistency: &v1.Consistency{
+				Requirement: &v1.Consistency_MinimizeLatency{MinimizeLatency: true},
+			},
+			Resource:   obj("document", fmt.Sprintf("doc-min-%d", i)),
+			Permission: "view",
+			Subject:    sub("user", "tom", ""),
+		})
+		require.NoError(t, err)
+		require.Equal(t, v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION, checkResp.Permissionship)
+	}
+
+	require.Equal(t, 0, counter.count(), "ReadStoredSchema should not be called with MinimizeLatency when schema is cached")
+}
+
+// readStoredSchemaCounter wraps a datastore and counts ReadStoredSchema calls.
+type readStoredSchemaCounter struct {
+	ds        datastore.Datastore
+	callCount atomic.Int32
+}
+
+func (c *readStoredSchemaCounter) wrap(ds datastore.Datastore) datastore.Datastore {
+	c.ds = ds
+	return c
+}
+
+func (c *readStoredSchemaCounter) reset() {
+	c.callCount.Store(0)
+}
+
+func (c *readStoredSchemaCounter) count() int {
+	return int(c.callCount.Load())
+}
+
+func (c *readStoredSchemaCounter) SnapshotReader(rev datastore.Revision) datastore.Reader {
+	return &countingReader{
+		Reader:  c.ds.SnapshotReader(rev),
+		counter: c,
+	}
+}
+
+func (c *readStoredSchemaCounter) ReadWriteTx(ctx context.Context, fn datastore.TxUserFunc, opts ...options.RWTOptionsOption) (datastore.Revision, error) {
+	return c.ds.ReadWriteTx(ctx, fn, opts...)
+}
+
+func (c *readStoredSchemaCounter) OptimizedRevision(ctx context.Context) (datastore.RevisionWithSchemaHashAndValidity, error) {
+	return c.ds.OptimizedRevision(ctx)
+}
+
+func (c *readStoredSchemaCounter) HeadRevision(ctx context.Context) (datastore.RevisionWithSchemaHash, error) {
+	return c.ds.HeadRevision(ctx)
+}
+
+func (c *readStoredSchemaCounter) CheckRevision(ctx context.Context, revision datastore.Revision) error {
+	return c.ds.CheckRevision(ctx, revision)
+}
+
+func (c *readStoredSchemaCounter) RevisionFromString(serialized string) (datastore.Revision, error) {
+	return c.ds.RevisionFromString(serialized)
+}
+
+func (c *readStoredSchemaCounter) Watch(ctx context.Context, afterRevision datastore.Revision, opts datastore.WatchOptions) (<-chan datastore.RevisionChanges, <-chan error) {
+	return c.ds.Watch(ctx, afterRevision, opts)
+}
+
+func (c *readStoredSchemaCounter) ReadyState(ctx context.Context) (datastore.ReadyState, error) {
+	return c.ds.ReadyState(ctx)
+}
+
+func (c *readStoredSchemaCounter) Features(ctx context.Context) (*datastore.Features, error) {
+	return c.ds.Features(ctx)
+}
+
+func (c *readStoredSchemaCounter) OfflineFeatures() (*datastore.Features, error) {
+	return c.ds.OfflineFeatures()
+}
+
+func (c *readStoredSchemaCounter) Statistics(ctx context.Context) (datastore.Stats, error) {
+	return c.ds.Statistics(ctx)
+}
+
+func (c *readStoredSchemaCounter) UniqueID(ctx context.Context) (string, error) {
+	return c.ds.UniqueID(ctx)
+}
+
+func (c *readStoredSchemaCounter) MetricsID() (string, error) {
+	return c.ds.MetricsID()
+}
+
+func (c *readStoredSchemaCounter) Close() error {
+	return c.ds.Close()
+}
+
+func (c *readStoredSchemaCounter) Unwrap() datastore.Datastore {
+	return c.ds
+}
+
+// countingReader wraps a datastore.Reader and counts ReadStoredSchema calls.
+type countingReader struct {
+	datastore.Reader
+	counter *readStoredSchemaCounter
+}
+
+func (r *countingReader) ReadStoredSchema(ctx context.Context) (*datastore.ReadOnlyStoredSchema, error) {
+	r.counter.callCount.Add(1)
+	return r.Reader.ReadStoredSchema(ctx)
+}
+
+// simpleSchemaCache is a minimal SchemaCache for testing.
+type simpleSchemaCache struct {
+	mu    sync.Mutex
+	items map[datalayer.SchemaCacheKey]*datastore.ReadOnlyStoredSchema // GUARDED_BY(mu)
+}
+
+func (c *simpleSchemaCache) Get(key datalayer.SchemaCacheKey) (*datastore.ReadOnlyStoredSchema, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v, ok := c.items[key]
+	return v, ok
+}
+
+func (c *simpleSchemaCache) Set(key datalayer.SchemaCacheKey, entry *datastore.ReadOnlyStoredSchema, _ int64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.items[key] = entry
+	return true
+}
+
+func (c *simpleSchemaCache) Wait() {}
+
+func TestCheckPermissionWithWildcardSubject(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+
+	require := require.New(t)
+	conn, _, revision := testserver.NewTestServerWithConfig(t, testTimedeltas[0], memdb.DisableGC, true,
+		testserver.DefaultTestServerConfig,
+		tf.StandardDatastoreWithData)
+	client := v1.NewPermissionsServiceClient(conn)
+
+	ctx := t.Context()
+	ctx = requestmeta.AddRequestHeaders(ctx, requestmeta.RequestDebugInformation)
+
+	_, err := client.CheckPermission(ctx, &v1.CheckPermissionRequest{
+		Consistency: &v1.Consistency{
+			Requirement: &v1.Consistency_AtLeastAsFresh{
+				AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+			},
+		},
+		Resource:   obj("document", "masterplan"),
+		Permission: "view",
+		Subject:    sub("user", "*", ""),
+	})
+
+	require.Error(err)
+	require.ErrorContains(err, "invalid argument: cannot perform check on wildcard subject")
+	grpcutil.RequireStatus(t, codes.InvalidArgument, err)
+}
+
+func TestCheckPermissionWithDebugInfo(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	require := require.New(t)
+	conn, _, revision := testserver.NewTestServerWithConfig(t, testTimedeltas[0], memdb.DisableGC, true,
+		testserver.DefaultTestServerConfig,
+		tf.StandardDatastoreWithData)
+	client := v1.NewPermissionsServiceClient(conn)
+
+	ctx := t.Context()
+	ctx = requestmeta.AddRequestHeaders(ctx, requestmeta.RequestDebugInformation)
+
+	var trailer metadata.MD
+	checkResp, err := client.CheckPermission(ctx, &v1.CheckPermissionRequest{
+		Consistency: &v1.Consistency{
+			Requirement: &v1.Consistency_AtLeastAsFresh{
+				AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+			},
+		},
+		Resource:   obj("document", "masterplan"),
+		Permission: "view",
+		Subject:    sub("user", "auditor", ""),
+	}, grpc.Trailer(&trailer))
+
+	require.NoError(err)
+	require.Equal(v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION, checkResp.Permissionship)
+
+	encodedDebugInfo, err := responsemeta.GetResponseTrailerMetadataOrNil(trailer, responsemeta.DebugInformation)
+	require.NoError(err)
+
+	// debug info is returned empty to make sure clients are not broken with backward incompatible payloads
+	require.Nil(encodedDebugInfo)
+
+	debugInfo := checkResp.DebugTrace
+	require.GreaterOrEqual(len(debugInfo.Check.GetSubProblems().Traces), 1)
+	require.NotEmpty(debugInfo.SchemaUsed)
+
+	// Compile the schema into the namespace definitions.
+	compiled, err := compiler.Compile(compiler.InputSchema{
+		Source:       input.Source("schema"),
+		SchemaString: debugInfo.SchemaUsed,
+	}, compiler.AllowUnprefixedObjectType())
+	require.NoError(err, "Invalid schema: %s", debugInfo.SchemaUsed)
+	require.Len(compiled.OrderedDefinitions, 4)
+}
+
+func TestCheckPermissionWithDebugInfoInError(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	req := require.New(t)
+	conn, _, revision := testserver.NewTestServerWithConfig(t, testTimedeltas[0], memdb.DisableGC, true,
+		testserver.DefaultTestServerConfig,
+		func(t testing.TB, ds datastore.Datastore) (datastore.Datastore, datastore.Revision) {
+			return tf.DatastoreFromSchemaAndTestRelationships(
+				t,
+				ds,
+				`definition user {}
+		
+						 definition document {
+							relation viewer: user | document#view
+							permission view = viewer
+						 }
+						`,
+				[]tuple.Relationship{
+					tuple.MustParse("document:doc1#viewer@user:tom"),
+					tuple.MustParse("document:doc1#viewer@document:doc2#view"),
+					tuple.MustParse("document:doc2#viewer@document:doc3#view"),
+					tuple.MustParse("document:doc3#viewer@document:doc1#view"),
+				},
+			)
+		})
+	client := v1.NewPermissionsServiceClient(conn)
+
+	ctx := t.Context()
+	ctx = requestmeta.AddRequestHeaders(ctx, requestmeta.RequestDebugInformation)
+
+	_, err := client.CheckPermission(ctx, &v1.CheckPermissionRequest{
+		Consistency: &v1.Consistency{
+			Requirement: &v1.Consistency_AtLeastAsFresh{
+				AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+			},
+		},
+		Resource:   obj("document", "doc1"),
+		Permission: "view",
+		Subject:    sub("user", "fred", ""),
+	})
+
+	req.Error(err)
+	grpcutil.RequireStatus(t, codes.FailedPrecondition, err)
+
+	s, ok := status.FromError(err)
+	req.True(ok)
+
+	foundDebugInfo := false
+	for _, d := range s.Details() {
+		if errInfo, ok := d.(*errdetails.ErrorInfo); ok {
+			req.NotNil(errInfo.Metadata)
+			req.NotNil(errInfo.Metadata[string(spiceerrors.DebugTraceErrorDetailsKey)])
+			req.NotEmpty(errInfo.Metadata[string(spiceerrors.DebugTraceErrorDetailsKey)])
+
+			debugInfo := &v1.DebugInformation{}
+			err = prototext.Unmarshal([]byte(errInfo.Metadata[string(spiceerrors.DebugTraceErrorDetailsKey)]), debugInfo)
+			req.NoError(err)
+
+			req.Len(debugInfo.Check.GetSubProblems().Traces, 1)
+			req.Len(debugInfo.Check.GetSubProblems().Traces[0].GetSubProblems().Traces, 1)
+
+			foundDebugInfo = true
+		}
+	}
+
+	req.True(foundDebugInfo)
+}
+
+func TestLookupResources(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	testCases := []struct {
+		objectType           string
+		permission           string
+		subject              *v1.SubjectReference
+		expectedObjectIds    []string
+		expectedErrorCode    codes.Code
+		minimumDispatchCount int
+		maximumDispatchCount int
+	}{
+		{
+			"document", "viewer",
+			sub("user", "eng_lead", ""),
+			[]string{"masterplan"},
+			codes.OK,
+			1,
+			1,
+		},
+		{
+			"document", "view",
+			sub("user", "eng_lead", ""),
+			[]string{"masterplan"},
+			codes.OK,
+			2,
+			2,
+		},
+		{
+			"document", "view",
+			sub("user", "product_manager", ""),
+			[]string{"masterplan"},
+			codes.OK,
+			3,
+			3,
+		},
+		{
+			"document", "view",
+			sub("user", "chief_financial_officer", ""),
+			[]string{"masterplan", "healthplan"},
+			codes.OK,
+			3,
+			3,
+		},
+		{
+			"document", "view",
+			sub("user", "auditor", ""),
+			[]string{"masterplan", "companyplan"},
+			codes.OK,
+			5,
+			5,
+		},
+		{
+			"document", "view",
+			sub("user", "vp_product", ""),
+			[]string{"masterplan"},
+			codes.OK,
+			4,
+			4,
+		},
+		{
+			"document", "view",
+			sub("user", "legal", ""),
+			[]string{"masterplan", "companyplan"},
+			codes.OK,
+			4,
+			4,
+		},
+		{
+			"document", "view",
+			sub("user", "owner", ""),
+			[]string{"masterplan", "companyplan", "ownerplan"},
+			codes.OK,
+			6,
+			6,
+		},
+		{
+			"document", "view",
+			sub("user", "villain", ""),
+			nil,
+			codes.OK,
+			1,
+			1,
+		},
+		{
+			"document", "view",
+			sub("user", "unknowngal", ""),
+			nil,
+			codes.OK,
+			1,
+			1,
+		},
+		{
+			"document", "view_and_edit",
+			sub("user", "eng_lead", ""),
+			nil,
+			codes.OK,
+			1,
+			1,
+		},
+		{
+			"document", "view_and_edit",
+			sub("user", "multiroleguy", ""),
+			[]string{"specialplan"},
+			codes.OK,
+			6,
+			8,
+		},
+		{
+			"document", "view_and_edit",
+			sub("user", "missingrolegal", ""),
+			nil,
+			codes.OK,
+			1,
+			1,
+		},
+		{
+			"document", "invalidrelation",
+			sub("user", "missingrolegal", ""),
+			[]string{},
+			codes.FailedPrecondition,
+			1,
+			1,
+		},
+		{
+			"document", "view_and_edit",
+			sub("user", "someuser", "invalidrelation"),
+			[]string{},
+			codes.FailedPrecondition,
+			0,
+			0,
+		},
+		{
+			"invalidnamespace", "view_and_edit",
+			sub("user", "someuser", ""),
+			[]string{},
+			codes.FailedPrecondition,
+			0,
+			0,
+		},
+		{
+			"document", "view_and_edit",
+			sub("invalidnamespace", "someuser", ""),
+			[]string{},
+			codes.FailedPrecondition,
+			0,
+			0,
+		},
+		{
+			"document", "view_and_edit",
+			sub("user", "*", ""),
+			[]string{},
+			codes.InvalidArgument,
+			0,
+			0,
+		},
+		{
+			"document", "*",
+			sub("user", "someuser", ""),
+			[]string{},
+			codes.InvalidArgument,
+			0,
+			0,
+		},
+	}
+
+	for _, delta := range testTimedeltas {
+		t.Run(fmt.Sprintf("fuzz%d", delta/time.Millisecond), func(t *testing.T) {
+			for _, tc := range testCases {
+				t.Run(fmt.Sprintf("%s::%s from %s:%s#%s", tc.objectType, tc.permission, tc.subject.Object.ObjectType, tc.subject.Object.ObjectId, tc.subject.OptionalRelation), func(t *testing.T) {
+					for _, useV2 := range []bool{false, true} {
+						t.Run(fmt.Sprintf("v2:%v", useV2), func(t *testing.T) {
+							require := require.New(t)
+							conn, _, revision := testserver.NewTestServerWithConfig(
+								t,
+								delta,
+								memdb.DisableGC,
+								true,
+								testserver.ServerConfig{
+									MaxUpdatesPerWrite:         1000,
+									MaxPreconditionsCount:      1000,
+									StreamingAPITimeout:        30 * time.Second,
+									MaxRelationshipContextSize: 25000,
+								},
+								tf.StandardDatastoreWithData,
+							)
+							client := v1.NewPermissionsServiceClient(conn)
+							var trailer metadata.MD
+							lookupClient, err := client.LookupResources(t.Context(), &v1.LookupResourcesRequest{
+								ResourceObjectType: tc.objectType,
+								Permission:         tc.permission,
+								Subject:            tc.subject,
+								Consistency: &v1.Consistency{
+									Requirement: &v1.Consistency_AtLeastAsFresh{
+										AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+									},
+								},
+							}, grpc.Trailer(&trailer))
+
+							require.NoError(err)
+							if tc.expectedErrorCode == codes.OK {
+								var resolvedObjectIds []string
+								for {
+									resp, err := lookupClient.Recv()
+									if errors.Is(err, io.EOF) {
+										break
+									}
+
+									require.NoError(err)
+
+									resolvedObjectIds = append(resolvedObjectIds, resp.ResourceObjectId)
+								}
+
+								slices.Sort(tc.expectedObjectIds)
+								slices.Sort(resolvedObjectIds)
+
+								require.Equal(tc.expectedObjectIds, resolvedObjectIds)
+
+								dispatchCount, err := responsemeta.GetIntResponseTrailerMetadata(trailer, responsemeta.DispatchedOperationsCount)
+								require.NoError(err)
+								require.GreaterOrEqual(dispatchCount, 0)
+								require.LessOrEqual(dispatchCount, tc.maximumDispatchCount)
+								require.GreaterOrEqual(dispatchCount, tc.minimumDispatchCount)
+							} else {
+								_, err := lookupClient.Recv()
+								grpcutil.RequireStatus(t, tc.expectedErrorCode, err)
+							}
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestExpand(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	testCases := []struct {
+		startObjectType    string
+		startObjectID      string
+		startPermission    string
+		expandRelatedCount int
+		expectedErrorCode  codes.Code
+	}{
+		{"document", "masterplan", "owner", 1, codes.OK},
+		{"document", "masterplan", "view", 7, codes.OK},
+		{"document", "masterplan", "fakerelation", 0, codes.FailedPrecondition},
+		{"fake", "masterplan", "owner", 0, codes.FailedPrecondition},
+		{"document", "", "owner", 1, codes.InvalidArgument},
+		{"document", "somedoc", "*", 1, codes.InvalidArgument},
+	}
+
+	for _, delta := range testTimedeltas {
+		t.Run(fmt.Sprintf("fuzz%d", delta/time.Millisecond), func(t *testing.T) {
+			for _, tc := range testCases {
+				t.Run(fmt.Sprintf("%s:%s#%s", tc.startObjectType, tc.startObjectID, tc.startPermission), func(t *testing.T) {
+					require := require.New(t)
+					conn, _, revision := testserver.NewTestServerWithConfig(t, delta, memdb.DisableGC, true,
+						testserver.DefaultTestServerConfig,
+						tf.StandardDatastoreWithData)
+					client := v1.NewPermissionsServiceClient(conn)
+
+					var trailer metadata.MD
+					expanded, err := client.ExpandPermissionTree(t.Context(), &v1.ExpandPermissionTreeRequest{
+						Resource: &v1.ObjectReference{
+							ObjectType: tc.startObjectType,
+							ObjectId:   tc.startObjectID,
+						},
+						Permission: tc.startPermission,
+						Consistency: &v1.Consistency{
+							Requirement: &v1.Consistency_AtLeastAsFresh{
+								AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+							},
+						},
+					}, grpc.Trailer(&trailer))
+					if tc.expectedErrorCode == codes.OK {
+						require.NoError(err)
+						require.Equal(tc.expandRelatedCount, countLeafs(expanded.TreeRoot))
+
+						dispatchCount, err := responsemeta.GetIntResponseTrailerMetadata(trailer, responsemeta.DispatchedOperationsCount)
+						require.NoError(err)
+						require.GreaterOrEqual(dispatchCount, 0)
+					} else {
+						grpcutil.RequireStatus(t, tc.expectedErrorCode, err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func countLeafs(node *v1.PermissionRelationshipTree) int {
+	switch t := node.TreeType.(type) {
+	case *v1.PermissionRelationshipTree_Leaf:
+		return len(t.Leaf.Subjects)
+
+	case *v1.PermissionRelationshipTree_Intermediate:
+		count := 0
+		for _, child := range t.Intermediate.Children {
+			count += countLeafs(child)
+		}
+		return count
+
+	default:
+		panic("Unknown node type")
+	}
+}
+
+func DS(objectType string, objectID string, objectRelation string) *core.DirectSubject {
+	return &core.DirectSubject{
+		Subject: tuple.CoreONR(objectType, objectID, objectRelation),
+	}
+}
+
+func TestTranslateExpansionTree(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+
+	table := []struct {
+		name  string
+		input *core.RelationTupleTreeNode
+	}{
+		{"simple leaf", pgraph.Leaf(nil, DS("user", "user1", "..."))},
+		{
+			"simple union",
+			pgraph.Union(nil,
+				pgraph.Leaf(nil, DS("user", "user1", "...")),
+				pgraph.Leaf(nil, DS("user", "user2", "...")),
+				pgraph.Leaf(nil, DS("user", "user3", "...")),
+			),
+		},
+		{
+			"simple intersection",
+			pgraph.Intersection(nil,
+				pgraph.Leaf(nil,
+					DS("user", "user1", "..."),
+					DS("user", "user2", "..."),
+				),
+				pgraph.Leaf(nil,
+					DS("user", "user2", "..."),
+					DS("user", "user3", "..."),
+				),
+				pgraph.Leaf(nil,
+					DS("user", "user2", "..."),
+					DS("user", "user4", "..."),
+				),
+			),
+		},
+		{
+			"empty intersection",
+			pgraph.Intersection(nil,
+				pgraph.Leaf(nil,
+					DS("user", "user1", "..."),
+					DS("user", "user2", "..."),
+				),
+				pgraph.Leaf(nil,
+					DS("user", "user3", "..."),
+					DS("user", "user4", "..."),
+				),
+			),
+		},
+		{
+			"simple exclusion",
+			pgraph.Exclusion(nil,
+				pgraph.Leaf(nil,
+					DS("user", "user1", "..."),
+					DS("user", "user2", "..."),
+				),
+				pgraph.Leaf(nil, DS("user", "user2", "...")),
+				pgraph.Leaf(nil, DS("user", "user3", "...")),
+			),
+		},
+		{
+			"empty exclusion",
+			pgraph.Exclusion(nil,
+				pgraph.Leaf(nil,
+					DS("user", "user1", "..."),
+					DS("user", "user2", "..."),
+				),
+				pgraph.Leaf(nil, DS("user", "user1", "...")),
+				pgraph.Leaf(nil, DS("user", "user2", "...")),
+			),
+		},
+	}
+
+	for _, tt := range table {
+		t.Run(tt.name, func(t *testing.T) {
+			out := v1svc.TranslateRelationshipTree(v1svc.TranslateExpansionTree(tt.input))
+			require.Equal(t, tt.input, out)
+		})
+	}
+}
+
+func TestLookupSubjectsWithConcreteLimit(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	conn, _, revision := testserver.NewTestServerWithConfig(t, testTimedeltas[0], memdb.DisableGC, true,
+		testserver.DefaultTestServerConfig,
+		tf.StandardDatastoreWithData)
+	client := v1.NewPermissionsServiceClient(conn)
+
+	ctx := t.Context()
+
+	lsClient, err := client.LookupSubjects(ctx, &v1.LookupSubjectsRequest{
+		Resource: &v1.ObjectReference{
+			ObjectType: "document",
+			ObjectId:   "masterplan",
+		},
+		Permission:        "view",
+		SubjectObjectType: "user",
+		Consistency: &v1.Consistency{
+			Requirement: &v1.Consistency_AtLeastAsFresh{
+				AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+			},
+		},
+		OptionalConcreteLimit: 2,
+	})
+	require.NoError(t, err)
+	for {
+		_, err := lsClient.Recv()
+		require.Error(t, err)
+		grpcutil.RequireStatus(t, codes.Unimplemented, err)
+		return
+	}
+}
+
+func TestLookupSubjects(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	testCases := []struct {
+		resource        *v1.ObjectReference
+		permission      string
+		subjectType     string
+		subjectRelation string
+
+		expectedSubjectIds []string
+		expectedErrorCode  codes.Code
+	}{
+		{
+			obj("document", "companyplan"),
+			"view",
+			"user",
+			"",
+			[]string{"auditor", "legal", "owner"},
+			codes.OK,
+		},
+		{
+			obj("document", "healthplan"),
+			"view",
+			"user",
+			"",
+			[]string{"chief_financial_officer"},
+			codes.OK,
+		},
+		{
+			obj("document", "masterplan"),
+			"view",
+			"user",
+			"",
+			[]string{"auditor", "chief_financial_officer", "eng_lead", "legal", "owner", "product_manager", "vp_product"},
+			codes.OK,
+		},
+		{
+			obj("document", "masterplan"),
+			"view_and_edit",
+			"user",
+			"",
+			nil,
+			codes.OK,
+		},
+		{
+			obj("document", "specialplan"),
+			"view_and_edit",
+			"user",
+			"",
+			[]string{"multiroleguy"},
+			codes.OK,
+		},
+		{
+			obj("document", "unknownobj"),
+			"view",
+			"user",
+			"",
+			nil,
+			codes.OK,
+		},
+		{
+			obj("document", "masterplan"),
+			"invalidperm",
+			"user",
+			"",
+			nil,
+			codes.FailedPrecondition,
+		},
+		{
+			obj("document", "masterplan"),
+			"view",
+			"invalidsubtype",
+			"",
+			nil,
+			codes.FailedPrecondition,
+		},
+		{
+			obj("unknown", "masterplan"),
+			"view",
+			"user",
+			"",
+			nil,
+			codes.FailedPrecondition,
+		},
+		{
+			obj("document", "masterplan"),
+			"view",
+			"user",
+			"invalidrel",
+			nil,
+			codes.FailedPrecondition,
+		},
+		{
+			obj("document", "specialplan"),
+			"*",
+			"user",
+			"",
+			nil,
+			codes.InvalidArgument,
+		},
+	}
+
+	for _, delta := range testTimedeltas {
+		t.Run(fmt.Sprintf("fuzz%d", delta/time.Millisecond), func(t *testing.T) {
+			for _, tc := range testCases {
+				t.Run(fmt.Sprintf("%s:%s#%s for %s#%s", tc.resource.ObjectType, tc.resource.ObjectId, tc.permission, tc.subjectType, tc.subjectRelation), func(t *testing.T) {
+					require := require.New(t)
+					conn, _, revision := testserver.NewTestServerWithConfig(t, delta, memdb.DisableGC, true,
+						testserver.DefaultTestServerConfig,
+						tf.StandardDatastoreWithData)
+					client := v1.NewPermissionsServiceClient(conn)
+
+					var trailer metadata.MD
+					lookupClient, err := client.LookupSubjects(t.Context(), &v1.LookupSubjectsRequest{
+						Resource:                tc.resource,
+						Permission:              tc.permission,
+						SubjectObjectType:       tc.subjectType,
+						OptionalSubjectRelation: tc.subjectRelation,
+						Consistency: &v1.Consistency{
+							Requirement: &v1.Consistency_AtLeastAsFresh{
+								AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+							},
+						},
+					}, grpc.Trailer(&trailer))
+
+					require.NoError(err)
+					if tc.expectedErrorCode == codes.OK {
+						var resolvedObjectIds []string
+						for {
+							resp, err := lookupClient.Recv()
+							if errors.Is(err, io.EOF) {
+								break
+							}
+
+							require.NoError(err)
+
+							resolvedObjectIds = append(resolvedObjectIds, resp.Subject.SubjectObjectId)
+						}
+
+						slices.Sort(tc.expectedSubjectIds)
+						slices.Sort(resolvedObjectIds)
+
+						require.Equal(tc.expectedSubjectIds, resolvedObjectIds)
+
+						dispatchCount, err := responsemeta.GetIntResponseTrailerMetadata(trailer, responsemeta.DispatchedOperationsCount)
+						require.NoError(err)
+						require.GreaterOrEqual(dispatchCount, 0)
+					} else {
+						_, err := lookupClient.Recv()
+						grpcutil.RequireStatus(t, tc.expectedErrorCode, err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestCheckWithCaveats(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	req := require.New(t)
+	conn, _, revision := testserver.NewTestServerWithConfig(t, testTimedeltas[0], memdb.DisableGC, true,
+		testserver.DefaultTestServerConfig,
+		tf.StandardDatastoreWithCaveatedData)
+	client := v1.NewPermissionsServiceClient(conn)
+
+	ctx := t.Context()
+
+	request := &v1.CheckPermissionRequest{
+		Consistency: &v1.Consistency{
+			Requirement: &v1.Consistency_AtLeastAsFresh{
+				AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+			},
+		},
+		Resource:   obj("document", "caveatedplan"),
+		Permission: "caveated_viewer",
+		Subject:    sub("user", "caveatedguy", ""),
+	}
+
+	// caveat evaluated and returned false
+	var err error
+	request.Context, err = structpb.NewStruct(map[string]any{"secret": "incorrect_value"})
+	req.NoError(err)
+
+	checkResp, err := client.CheckPermission(ctx, request)
+	req.NoError(err)
+	req.Equal(v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION, checkResp.Permissionship)
+
+	// caveat evaluated and returned true
+	request.Context, err = structpb.NewStruct(map[string]any{"secret": "1234"})
+	req.NoError(err)
+
+	checkResp, err = client.CheckPermission(ctx, request)
+	req.NoError(err)
+	req.Equal(v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION, checkResp.Permissionship)
+
+	// caveat evaluated but context variable was missing
+	request.Context = nil
+	checkResp, err = client.CheckPermission(ctx, request)
+	req.NoError(err)
+	req.Equal(v1.CheckPermissionResponse_PERMISSIONSHIP_CONDITIONAL_PERMISSION, checkResp.Permissionship)
+	req.Equal([]string{"secret"}, checkResp.PartialCaveatInfo.MissingRequiredContext)
+
+	// context exceeds length limit
+	request.Context, err = structpb.NewStruct(generateMap(64))
+	req.NoError(err)
+
+	_, err = client.CheckPermission(ctx, request)
+	grpcutil.RequireStatus(t, codes.InvalidArgument, err)
+}
+
+func TestCheckWithCaveatErrors(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	req := require.New(t)
+	conn, _, revision := testserver.NewTestServerWithConfig(t, testTimedeltas[0], memdb.DisableGC, true,
+		testserver.DefaultTestServerConfig,
+		func(t testing.TB, ds datastore.Datastore) (datastore.Datastore, datastore.Revision) {
+			return tf.DatastoreFromSchemaAndTestRelationships(
+				t,
+				ds,
+				`definition user {}
+		
+						 caveat somecaveat(somemap map<any>) {
+							  somemap.first == 42 && somemap.second < 56
+						 }
+		
+						 definition document {
+							relation viewer: user with somecaveat
+							permission view = viewer
+						 }
+						`,
+				[]tuple.Relationship{tuple.MustParse("document:firstdoc#viewer@user:tom[somecaveat]")},
+			)
+		})
+
+	client := v1.NewPermissionsServiceClient(conn)
+
+	ctx := t.Context()
+
+	tcs := []struct {
+		name          string
+		context       map[string]any
+		expectedError string
+		expectedCode  codes.Code
+	}{
+		{
+			"nil map in context",
+			map[string]any{
+				"somemap": nil,
+			},
+			"type error for parameters for caveat `somecaveat`: could not convert context parameter `somemap`: for map<any>: map requires a map, found: <nil>",
+			codes.InvalidArgument,
+		},
+		{
+			"empty map in context",
+			map[string]any{
+				"somemap": map[string]any{},
+			},
+			"evaluation error for caveat somecaveat: no such key: first",
+			codes.InvalidArgument,
+		},
+		{
+			"wrong value in map",
+			map[string]any{
+				"somemap": map[string]any{
+					"first":  42,
+					"second": "hello",
+				},
+			},
+			"evaluation error for caveat somecaveat: no such overload",
+			codes.InvalidArgument,
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			request := &v1.CheckPermissionRequest{
+				Consistency: &v1.Consistency{
+					Requirement: &v1.Consistency_AtLeastAsFresh{
+						AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+					},
+				},
+				Resource:   obj("document", "firstdoc"),
+				Permission: "view",
+				Subject:    sub("user", "tom", ""),
+			}
+
+			var err error
+			request.Context, err = structpb.NewStruct(tc.context)
+			req.NoError(err)
+
+			_, err = client.CheckPermission(ctx, request)
+			req.Error(err)
+			req.Contains(err.Error(), tc.expectedError)
+			grpcutil.RequireStatus(t, tc.expectedCode, err)
+		})
+	}
+}
+
+func TestLookupResourcesWithCaveats(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	req := require.New(t)
+	conn, _, revision := testserver.NewTestServerWithConfig(t, testTimedeltas[0], memdb.DisableGC, true,
+		testserver.DefaultTestServerConfig,
+		func(t testing.TB, ds datastore.Datastore) (datastore.Datastore, datastore.Revision) {
+			return tf.DatastoreFromSchemaAndTestRelationships(t, ds, `
+						definition user {}
+		
+						caveat testcaveat(somecondition int) {
+							somecondition == 42
+						}
+		
+						definition document {
+							relation viewer: user | user with testcaveat
+							permission view = viewer
+						}
+					`, []tuple.Relationship{
+				tuple.MustParse("document:first#viewer@user:tom"),
+				tuple.MustWithCaveat(tuple.MustParse("document:second#viewer@user:tom"), "testcaveat"),
+			})
+		})
+
+	client := v1.NewPermissionsServiceClient(conn)
+
+	ctx := t.Context()
+
+	// Run with empty context.
+	caveatContext, err := structpb.NewStruct(map[string]any{})
+	require.NoError(t, err)
+
+	request := &v1.LookupResourcesRequest{
+		Consistency: &v1.Consistency{
+			Requirement: &v1.Consistency_AtLeastAsFresh{
+				AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+			},
+		},
+		ResourceObjectType: "document",
+		Permission:         "view",
+		Subject:            sub("user", "tom", ""),
+		Context:            caveatContext,
+	}
+
+	cli, err := client.LookupResources(ctx, request)
+	req.NoError(err)
+
+	var responses []*v1.LookupResourcesResponse
+	for {
+		res, err := cli.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		require.NoError(t, err)
+		responses = append(responses, res)
+	}
+
+	slices.SortFunc(responses, byIDAndPermission)
+
+	// NOTE: due to the order of the deduplication of dispatching in reachable resources, this can return the conditional
+	// result more than once, as per cursored LR. Therefore, filter in that case.
+	require.GreaterOrEqual(t, 3, len(responses))
+	require.LessOrEqual(t, 2, len(responses))
+
+	require.Equal(t, "first", responses[0].ResourceObjectId)
+	require.Equal(t, v1.LookupPermissionship_LOOKUP_PERMISSIONSHIP_HAS_PERMISSION, responses[0].Permissionship)
+
+	require.Equal(t, "second", responses[1].ResourceObjectId)
+	require.Equal(t, v1.LookupPermissionship_LOOKUP_PERMISSIONSHIP_CONDITIONAL_PERMISSION, responses[1].Permissionship)
+	require.Equal(t, []string{"somecondition"}, responses[1].PartialCaveatInfo.MissingRequiredContext)
+
+	// Run with full context.
+	caveatContext, err = structpb.NewStruct(map[string]any{
+		"somecondition": 42,
+	})
+	require.NoError(t, err)
+
+	request = &v1.LookupResourcesRequest{
+		Consistency: &v1.Consistency{
+			Requirement: &v1.Consistency_AtLeastAsFresh{
+				AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+			},
+		},
+		ResourceObjectType: "document",
+		Permission:         "view",
+		Subject:            sub("user", "tom", ""),
+		Context:            caveatContext,
+	}
+
+	cli, err = client.LookupResources(ctx, request)
+	req.NoError(err)
+
+	responses = make([]*v1.LookupResourcesResponse, 0)
+	for {
+		res, err := cli.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		require.NoError(t, err)
+		responses = append(responses, res)
+	}
+
+	require.Len(t, responses, 2)
+	slices.SortFunc(responses, byIDAndPermission)
+
+	require.Equal(t, "first", responses[0].ResourceObjectId)                                                    // nolint: gosec
+	require.Equal(t, v1.LookupPermissionship_LOOKUP_PERMISSIONSHIP_HAS_PERMISSION, responses[0].Permissionship) // nolint: gosec
+
+	require.Equal(t, "second", responses[1].ResourceObjectId)                                                   // nolint: gosec
+	require.Equal(t, v1.LookupPermissionship_LOOKUP_PERMISSIONSHIP_HAS_PERMISSION, responses[1].Permissionship) // nolint: gosec
+}
+
+func byIDAndPermission(a, b *v1.LookupResourcesResponse) int {
+	return strings.Compare(
+		fmt.Sprintf("%s:%v", a.ResourceObjectId, a.Permissionship),
+		fmt.Sprintf("%s:%v", b.ResourceObjectId, b.Permissionship),
+	)
+}
+
+func TestLookupSubjectsWithCaveats(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	req := require.New(t)
+	conn, _, revision := testserver.NewTestServerWithConfig(t, testTimedeltas[0], memdb.DisableGC, true,
+		testserver.DefaultTestServerConfig,
+		func(t testing.TB, ds datastore.Datastore) (datastore.Datastore, datastore.Revision) {
+			return tf.DatastoreFromSchemaAndTestRelationships(t, ds, `
+						definition user {}
+		
+						caveat testcaveat(somecondition int) {
+							somecondition == 42
+						}
+		
+						definition document {
+							relation viewer: user | user with testcaveat
+							permission view = viewer
+						}
+					`, []tuple.Relationship{
+				tuple.MustParse("document:first#viewer@user:tom"),
+				tuple.MustWithCaveat(tuple.MustParse("document:first#viewer@user:sarah"), "testcaveat"),
+			})
+		})
+
+	client := v1.NewPermissionsServiceClient(conn)
+
+	ctx := t.Context()
+
+	// Call with empty context.
+	caveatContext, err := structpb.NewStruct(map[string]any{})
+	req.NoError(err)
+
+	request := &v1.LookupSubjectsRequest{
+		Consistency: &v1.Consistency{
+			Requirement: &v1.Consistency_AtLeastAsFresh{
+				AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+			},
+		},
+		Resource:          obj("document", "first"),
+		Permission:        "view",
+		SubjectObjectType: "user",
+		Context:           caveatContext,
+	}
+
+	lookupClient, err := client.LookupSubjects(ctx, request)
+	req.NoError(err)
+
+	var resolvedSubjects []expectedSubject
+	for {
+		resp, err := lookupClient.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		require.NoError(t, err)
+		resolvedSubjects = append(resolvedSubjects, expectedSubject{
+			resp.Subject.SubjectObjectId,
+			resp.Subject.Permissionship == v1.LookupPermissionship_LOOKUP_PERMISSIONSHIP_CONDITIONAL_PERMISSION,
+		})
+	}
+
+	expectedSubjects := []expectedSubject{
+		{"sarah", true},
+		{"tom", false},
+	}
+
+	slices.SortFunc(resolvedSubjects, bySubjectID)
+	slices.SortFunc(expectedSubjects, bySubjectID)
+
+	req.Equal(expectedSubjects, resolvedSubjects)
+
+	// Call with proper context.
+	caveatContext, err = structpb.NewStruct(map[string]any{
+		"somecondition": 42,
+	})
+	req.NoError(err)
+
+	request = &v1.LookupSubjectsRequest{
+		Consistency: &v1.Consistency{
+			Requirement: &v1.Consistency_AtLeastAsFresh{
+				AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+			},
+		},
+		Resource:          obj("document", "first"),
+		Permission:        "view",
+		SubjectObjectType: "user",
+		Context:           caveatContext,
+	}
+
+	lookupClient, err = client.LookupSubjects(ctx, request)
+	req.NoError(err)
+
+	resolvedSubjects = []expectedSubject{}
+	for {
+		resp, err := lookupClient.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		require.NoError(t, err)
+		resolvedSubjects = append(resolvedSubjects, expectedSubject{
+			resp.Subject.SubjectObjectId,
+			resp.Subject.Permissionship == v1.LookupPermissionship_LOOKUP_PERMISSIONSHIP_CONDITIONAL_PERMISSION,
+		})
+	}
+
+	expectedSubjects = []expectedSubject{
+		{"sarah", false},
+		{"tom", false},
+	}
+
+	slices.SortFunc(resolvedSubjects, bySubjectID)
+	slices.SortFunc(expectedSubjects, bySubjectID)
+
+	req.Equal(expectedSubjects, resolvedSubjects)
+
+	// Call with negative context.
+	caveatContext, err = structpb.NewStruct(map[string]any{
+		"somecondition": 32,
+	})
+	req.NoError(err)
+
+	request = &v1.LookupSubjectsRequest{
+		Consistency: &v1.Consistency{
+			Requirement: &v1.Consistency_AtLeastAsFresh{
+				AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+			},
+		},
+		Resource:          obj("document", "first"),
+		Permission:        "view",
+		SubjectObjectType: "user",
+		Context:           caveatContext,
+	}
+
+	lookupClient, err = client.LookupSubjects(ctx, request)
+	req.NoError(err)
+
+	resolvedSubjects = []expectedSubject{}
+	for {
+		resp, err := lookupClient.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		require.NoError(t, err)
+		resolvedSubjects = append(resolvedSubjects, expectedSubject{
+			resp.Subject.SubjectObjectId,
+			resp.Subject.Permissionship == v1.LookupPermissionship_LOOKUP_PERMISSIONSHIP_CONDITIONAL_PERMISSION,
+		})
+	}
+
+	expectedSubjects = []expectedSubject{
+		{"tom", false},
+	}
+
+	slices.SortFunc(resolvedSubjects, bySubjectID)
+	slices.SortFunc(expectedSubjects, bySubjectID)
+
+	req.Equal(expectedSubjects, resolvedSubjects)
+}
+
+func TestLookupSubjectsWithCaveatedWildcards(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	req := require.New(t)
+	conn, _, revision := testserver.NewTestServerWithConfig(t, testTimedeltas[0], memdb.DisableGC, true,
+		testserver.DefaultTestServerConfig,
+		func(t testing.TB, ds datastore.Datastore) (datastore.Datastore, datastore.Revision) {
+			return tf.DatastoreFromSchemaAndTestRelationships(t, ds, `
+						definition user {}
+		
+						caveat testcaveat(somecondition int) {
+							somecondition == 42
+						}
+		
+						caveat anothercaveat(anothercondition int) {
+							anothercondition == 42
+						}
+		
+						definition document {
+							relation viewer: user:* with testcaveat
+							relation banned: user with testcaveat
+							permission view = viewer - banned
+						}
+					`, []tuple.Relationship{
+				tuple.MustWithCaveat(tuple.MustParse("document:first#viewer@user:*"), "testcaveat"),
+				tuple.MustWithCaveat(tuple.MustParse("document:first#banned@user:bannedguy"), "anothercaveat"),
+			})
+		})
+
+	client := v1.NewPermissionsServiceClient(conn)
+
+	ctx := t.Context()
+
+	// Call with empty context.
+	caveatContext, err := structpb.NewStruct(map[string]any{})
+	req.NoError(err)
+
+	request := &v1.LookupSubjectsRequest{
+		Consistency: &v1.Consistency{
+			Requirement: &v1.Consistency_AtLeastAsFresh{
+				AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+			},
+		},
+		Resource:          obj("document", "first"),
+		Permission:        "view",
+		SubjectObjectType: "user",
+		Context:           caveatContext,
+	}
+
+	lookupClient, err := client.LookupSubjects(ctx, request)
+	req.NoError(err)
+
+	found := false
+	for {
+		resp, err := lookupClient.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		found = true
+		require.NoError(t, err)
+		require.Equal(t, "*", resp.Subject.SubjectObjectId)
+		require.Equal(t, v1.LookupPermissionship_LOOKUP_PERMISSIONSHIP_CONDITIONAL_PERMISSION, resp.Subject.Permissionship)
+		require.Len(t, resp.ExcludedSubjects, 1)
+
+		require.Equal(t, "bannedguy", resp.ExcludedSubjects[0].SubjectObjectId)
+		require.Equal(t, v1.LookupPermissionship_LOOKUP_PERMISSIONSHIP_CONDITIONAL_PERMISSION, resp.ExcludedSubjects[0].Permissionship)
+	}
+	require.True(t, found)
+
+	// Call with negative context.
+	caveatContext, err = structpb.NewStruct(map[string]any{
+		"anothercondition": 41,
+	})
+	req.NoError(err)
+
+	request = &v1.LookupSubjectsRequest{
+		Consistency: &v1.Consistency{
+			Requirement: &v1.Consistency_AtLeastAsFresh{
+				AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+			},
+		},
+		Resource:          obj("document", "first"),
+		Permission:        "view",
+		SubjectObjectType: "user",
+		Context:           caveatContext,
+	}
+
+	lookupClient, err = client.LookupSubjects(ctx, request)
+	req.NoError(err)
+
+	found = false
+	for {
+		resp, err := lookupClient.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		found = true
+		require.NoError(t, err)
+		require.Equal(t, "*", resp.Subject.SubjectObjectId)
+		require.Equal(t, v1.LookupPermissionship_LOOKUP_PERMISSIONSHIP_CONDITIONAL_PERMISSION, resp.Subject.Permissionship)
+		require.Empty(t, resp.ExcludedSubjects)
+	}
+	require.True(t, found)
+}
+
+type expectedSubject struct {
+	subjectID     string
+	isConditional bool
+}
+
+func bySubjectID(a, b expectedSubject) int {
+	return cmp.Compare(a.subjectID, b.subjectID)
+}
+
+func generateMap(length int) map[string]any {
+	output := make(map[string]any, length)
+	for range length {
+		random := randString(32)
+		output[random] = random
+	}
+	return output
+}
+
+var randInput = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+func randString(length int) string {
+	b := make([]rune, length)
+	for i := range b {
+		b[i] = randInput[rand.Intn(len(randInput))] //nolint:gosec
+	}
+	return string(b)
+}
+
+func TestGetCaveatContext(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+
+	strct, err := structpb.NewStruct(map[string]any{"foo": "bar"})
+	require.NoError(t, err)
+
+	_, err = v1svc.GetCaveatContext(t.Context(), strct, 1)
+	require.ErrorContains(t, err, "request caveat context should have less than 1 bytes")
+
+	caveatMap, err := v1svc.GetCaveatContext(t.Context(), strct, 0)
+	require.NoError(t, err)
+	require.Contains(t, caveatMap, "foo")
+
+	caveatMap, err = v1svc.GetCaveatContext(t.Context(), strct, -1)
+	require.NoError(t, err)
+	require.Contains(t, caveatMap, "foo")
+}
+
+func TestLookupResourcesWithCursors(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	testCases := []struct {
+		objectType        string
+		permission        string
+		subject           *v1.SubjectReference
+		expectedObjectIds []string
+	}{
+		{
+			"document", "view",
+			sub("user", "eng_lead", ""),
+			[]string{"masterplan"},
+		},
+		{
+			"document", "view",
+			sub("user", "product_manager", ""),
+			[]string{"masterplan"},
+		},
+		{
+			"document", "view",
+			sub("user", "chief_financial_officer", ""),
+			[]string{"masterplan", "healthplan"},
+		},
+		{
+			"document", "view",
+			sub("user", "auditor", ""),
+			[]string{"masterplan", "companyplan"},
+		},
+		{
+			"document", "view",
+			sub("user", "vp_product", ""),
+			[]string{"masterplan"},
+		},
+		{
+			"document", "view",
+			sub("user", "legal", ""),
+			[]string{"masterplan", "companyplan"},
+		},
+		{
+			"document", "view",
+			sub("user", "owner", ""),
+			[]string{"masterplan", "companyplan", "ownerplan"},
+		},
+	}
+
+	for _, delta := range testTimedeltas {
+		t.Run(fmt.Sprintf("fuzz%d", delta/time.Millisecond), func(t *testing.T) {
+			for _, limit := range []int{1, 2, 5, 10, 100} {
+				t.Run(fmt.Sprintf("limit%d", limit), func(t *testing.T) {
+					for _, tc := range testCases {
+						t.Run(fmt.Sprintf("%s::%s from %s:%s#%s", tc.objectType, tc.permission, tc.subject.Object.ObjectType, tc.subject.Object.ObjectId, tc.subject.OptionalRelation), func(t *testing.T) {
+							require := require.New(t)
+							conn, _, revision := testserver.NewTestServerWithConfig(t, delta, memdb.DisableGC, true,
+								testserver.DefaultTestServerConfig,
+								tf.StandardDatastoreWithData)
+							client := v1.NewPermissionsServiceClient(conn)
+
+							var currentCursor *v1.Cursor
+							foundObjectIds := mapz.NewSet[string]()
+
+							for range 5 {
+								var trailer metadata.MD
+								uintLimit, err := safecast.Convert[uint32](limit)
+								require.NoError(err)
+								lookupClient, err := client.LookupResources(t.Context(), &v1.LookupResourcesRequest{
+									ResourceObjectType: tc.objectType,
+									Permission:         tc.permission,
+									Subject:            tc.subject,
+									Consistency: &v1.Consistency{
+										Requirement: &v1.Consistency_AtLeastAsFresh{
+											AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+										},
+									},
+									OptionalLimit:  uintLimit,
+									OptionalCursor: currentCursor,
+								}, grpc.Trailer(&trailer))
+
+								require.NoError(err)
+
+								var locallyResolvedObjectIds []string
+								for {
+									resp, err := lookupClient.Recv()
+									if errors.Is(err, io.EOF) {
+										break
+									}
+
+									require.NoError(err)
+
+									locallyResolvedObjectIds = append(locallyResolvedObjectIds, resp.ResourceObjectId)
+									foundObjectIds.Add(resp.ResourceObjectId)
+									currentCursor = resp.AfterResultCursor
+								}
+
+								require.LessOrEqual(len(locallyResolvedObjectIds), limit)
+								if len(locallyResolvedObjectIds) < limit {
+									break
+								}
+							}
+
+							resolvedObjectIds := foundObjectIds.AsSlice()
+							slices.Sort(tc.expectedObjectIds)
+							slices.Sort(resolvedObjectIds)
+
+							require.Equal(tc.expectedObjectIds, resolvedObjectIds)
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestLookupResourcesDeduplication(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+
+	conn, _, revision := testserver.NewTestServerWithConfig(t, testTimedeltas[0], memdb.DisableGC, true,
+		testserver.DefaultTestServerConfig,
+		func(t testing.TB, ds datastore.Datastore) (datastore.Datastore, datastore.Revision) {
+			return tf.DatastoreFromSchemaAndTestRelationships(t, ds, `
+						definition user {}
+		
+						definition document {
+							relation viewer: user
+							relation editor: user
+							permission view = viewer + editor
+						}
+					`, []tuple.Relationship{
+				tuple.MustParse("document:first#viewer@user:tom"),
+				tuple.MustParse("document:first#editor@user:tom"),
+			})
+		})
+
+	client := v1.NewPermissionsServiceClient(conn)
+
+	lookupClient, err := client.LookupResources(t.Context(), &v1.LookupResourcesRequest{
+		ResourceObjectType: "document",
+		Permission:         "view",
+		Subject:            sub("user", "tom", ""),
+		Consistency: &v1.Consistency{
+			Requirement: &v1.Consistency_AtLeastAsFresh{
+				AtLeastAsFresh: zedtoken.MustNewFromRevisionForTesting(revision, datalayer.NoSchemaHashInLegacyZedToken),
+			},
+		},
+	})
+
+	require.NoError(t, err)
+
+	foundObjectIds := mapz.NewSet[string]()
+	for {
+		resp, err := lookupClient.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		require.NoError(t, err)
+		require.True(t, foundObjectIds.Add(resp.ResourceObjectId))
+	}
+
+	require.Equal(t, []string{"first"}, foundObjectIds.AsSlice())
+}
+
+func TestLookupResourcesBeyondAllowedLimit(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	require := require.New(t)
+
+	conn, _, _ := testserver.NewTestServerWithConfig(t, 0, memdb.DisableGC, true,
+		testserver.DefaultTestServerConfig,
+		tf.StandardDatastoreWithData)
+	client := v1.NewPermissionsServiceClient(conn)
+
+	resp, err := client.LookupResources(t.Context(), &v1.LookupResourcesRequest{
+		ResourceObjectType: "document",
+		Permission:         "view",
+		Subject:            sub("user", "tom", ""),
+		OptionalLimit:      1005,
+	})
+	require.NoError(err)
+
+	_, err = resp.Recv()
+	require.Error(err)
+	require.Contains(err.Error(), "provided limit 1005 is greater than maximum allowed of 1000")
+}
+
+func TestCheckBulkPermissions(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+
+	conn, _, _ := testserver.NewTestServerWithConfig(t, 0, memdb.DisableGC, true,
+		testserver.DefaultTestServerConfig,
+		tf.StandardDatastoreWithCaveatedData)
+	client := v1.NewPermissionsServiceClient(conn)
+
+	testCases := []struct {
+		name     string
+		requests []string
+		response []bulkCheckTest
+	}{
+		{
+			name: "same resource and permission, different subjects",
+			requests: []string{
+				`document:masterplan#view@user:eng_lead[test:{"secret": "1234"}]`,
+				`document:masterplan#view@user:product_manager[test:{"secret": "1234"}]`,
+				`document:masterplan#view@user:villain[test:{"secret": "1234"}]`,
+			},
+			response: []bulkCheckTest{
+				{
+					req:  `document:masterplan#view@user:eng_lead[test:{"secret": "1234"}]`,
+					resp: v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+				},
+				{
+					req:  `document:masterplan#view@user:product_manager[test:{"secret": "1234"}]`,
+					resp: v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+				},
+				{
+					req:  `document:masterplan#view@user:villain[test:{"secret": "1234"}]`,
+					resp: v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION,
+				},
+			},
+		},
+		{
+			name: "different resources, same permission and subject",
+			requests: []string{
+				`document:masterplan#view@user:eng_lead[test:{"secret": "1234"}]`,
+				`document:companyplan#view@user:eng_lead[test:{"secret": "1234"}]`,
+				`document:healthplan#view@user:eng_lead[test:{"secret": "1234"}]`,
+			},
+			response: []bulkCheckTest{
+				{
+					req:  `document:masterplan#view@user:eng_lead[test:{"secret": "1234"}]`,
+					resp: v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+				},
+				{
+					req:  `document:companyplan#view@user:eng_lead[test:{"secret": "1234"}]`,
+					resp: v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION,
+				},
+				{
+					req:  `document:healthplan#view@user:eng_lead[test:{"secret": "1234"}]`,
+					resp: v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION,
+				},
+			},
+		},
+		{
+			name: "some items fail",
+			requests: []string{
+				`document:masterplan#view@user:eng_lead[test:{"secret": "1234"}]`,
+				"fake:fake#fake@fake:fake",
+				"superfake:plan#view@user:eng_lead",
+			},
+			response: []bulkCheckTest{
+				{
+					req:  `document:masterplan#view@user:eng_lead[test:{"secret": "1234"}]`,
+					resp: v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+				},
+				{
+					req: "fake:fake#fake@fake:fake",
+					err: namespace.NewNamespaceNotFoundErr("fake"),
+				},
+				{
+					req: "superfake:plan#view@user:eng_lead",
+					err: namespace.NewNamespaceNotFoundErr("superfake"),
+				},
+			},
+		},
+		{
+			name: "different caveat context is not clustered",
+			requests: []string{
+				`document:caveatedplan#caveated_viewer@user:caveatedguy[test:{"secret": "1234"}]`,
+				`document:caveatedplan#caveated_viewer@user:caveatedguy[test:{"secret": "4321"}]`,
+				`document:caveatedplan#caveated_viewer@user:caveatedguy`,
+			},
+			response: []bulkCheckTest{
+				{
+					req:  `document:caveatedplan#caveated_viewer@user:caveatedguy[test:{"secret": "1234"}]`,
+					resp: v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+				},
+				{
+					req:  `document:caveatedplan#caveated_viewer@user:caveatedguy[test:{"secret": "4321"}]`,
+					resp: v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION,
+				},
+				{
+					req:     `document:caveatedplan#caveated_viewer@user:caveatedguy`,
+					resp:    v1.CheckPermissionResponse_PERMISSIONSHIP_CONDITIONAL_PERMISSION,
+					partial: []string{"secret"},
+				},
+			},
+		},
+		{
+			name: "namespace validation",
+			requests: []string{
+				"document:masterplan#view@fake:fake",
+				"fake:fake#fake@user:eng_lead",
+			},
+			response: []bulkCheckTest{
+				{
+					req: "document:masterplan#view@fake:fake",
+					err: namespace.NewNamespaceNotFoundErr("fake"),
+				},
+				{
+					req: "fake:fake#fake@user:eng_lead",
+					err: namespace.NewNamespaceNotFoundErr("fake"),
+				},
+			},
+		},
+		{
+			name: "chunking test",
+			requests: func() []string {
+				toReturn := make([]string, 0, defaultFilterMaximumIDCountForTest+5)
+				for i := range int(defaultFilterMaximumIDCountForTest + 5) {
+					toReturn = append(toReturn, fmt.Sprintf(`document:masterplan-%d#view@user:eng_lead`, i))
+				}
+
+				return toReturn
+			}(),
+			response: func() []bulkCheckTest {
+				toReturn := make([]bulkCheckTest, 0, defaultFilterMaximumIDCountForTest+5)
+				for i := range int(defaultFilterMaximumIDCountForTest + 5) {
+					toReturn = append(toReturn, bulkCheckTest{
+						req:  fmt.Sprintf(`document:masterplan-%d#view@user:eng_lead`, i),
+						resp: v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION,
+					})
+				}
+
+				return toReturn
+			}(),
+		},
+		{
+			name: "chunking test with errors",
+			requests: func() []string {
+				toReturn := make([]string, 0, defaultFilterMaximumIDCountForTest+6)
+				toReturn = append(toReturn, `nondoc:masterplan#view@user:eng_lead`)
+
+				for i := range int(defaultFilterMaximumIDCountForTest + 5) {
+					toReturn = append(toReturn, fmt.Sprintf(`document:masterplan-%d#view@user:eng_lead`, i))
+				}
+
+				return toReturn
+			}(),
+			response: func() []bulkCheckTest {
+				toReturn := make([]bulkCheckTest, 0, defaultFilterMaximumIDCountForTest+6)
+				toReturn = append(toReturn, bulkCheckTest{
+					req: `nondoc:masterplan#view@user:eng_lead`,
+					err: namespace.NewNamespaceNotFoundErr("nondoc"),
+				})
+
+				for i := range int(defaultFilterMaximumIDCountForTest + 5) {
+					toReturn = append(toReturn, bulkCheckTest{
+						req:  fmt.Sprintf(`document:masterplan-%d#view@user:eng_lead`, i),
+						resp: v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION,
+					})
+				}
+
+				return toReturn
+			}(),
+		},
+		{
+			name: "same resource and permission with same subject, repeated",
+			requests: []string{
+				`document:masterplan#view@user:eng_lead[test:{"secret": "1234"}]`,
+				`document:masterplan#view@user:eng_lead[test:{"secret": "1234"}]`,
+			},
+			response: []bulkCheckTest{
+				{
+					req:  `document:masterplan#view@user:eng_lead[test:{"secret": "1234"}]`,
+					resp: v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+				},
+				{
+					req:  `document:masterplan#view@user:eng_lead[test:{"secret": "1234"}]`,
+					resp: v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION,
+				},
+			},
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, withTracing := range []bool{true, false} {
+				t.Run(fmt.Sprintf("withTracing=%t", withTracing), func(t *testing.T) {
+					req := v1.CheckBulkPermissionsRequest{
+						Consistency: &v1.Consistency{
+							Requirement: &v1.Consistency_FullyConsistent{FullyConsistent: true},
+						},
+						Items:       make([]*v1.CheckBulkPermissionsRequestItem, 0, len(tt.requests)),
+						WithTracing: withTracing,
+					}
+
+					for _, r := range tt.requests {
+						req.Items = append(req.Items, mustRelToCheckBulkRequestItem(r))
+					}
+
+					expected := make([]*v1.CheckBulkPermissionsPair, 0, len(tt.response))
+					for _, r := range tt.response {
+						reqRel, err := tuple.ParseV1Rel(r.req)
+						require.NoError(t, err)
+
+						resp := &v1.CheckBulkPermissionsPair_Item{
+							Item: &v1.CheckBulkPermissionsResponseItem{
+								Permissionship: r.resp,
+							},
+						}
+						pair := &v1.CheckBulkPermissionsPair{
+							Request: &v1.CheckBulkPermissionsRequestItem{
+								Resource:   reqRel.Resource,
+								Permission: reqRel.Relation,
+								Subject:    reqRel.Subject,
+							},
+							Response: resp,
+						}
+						if reqRel.OptionalCaveat != nil {
+							pair.Request.Context = reqRel.OptionalCaveat.Context
+						}
+						if len(r.partial) > 0 {
+							resp.Item.PartialCaveatInfo = &v1.PartialCaveatInfo{
+								MissingRequiredContext: r.partial,
+							}
+						}
+
+						if r.err != nil {
+							rewritten := shared.RewriteError(t.Context(), r.err, &shared.ConfigForErrors{})
+							s, ok := status.FromError(rewritten)
+							require.True(t, ok, "expected provided error to be status")
+							pair.Response = &v1.CheckBulkPermissionsPair_Error{
+								Error: s.Proto(),
+							}
+						}
+						expected = append(expected, pair)
+					}
+
+					var trailer metadata.MD
+					actual, err := client.CheckBulkPermissions(t.Context(), &req, grpc.Trailer(&trailer))
+					require.NoError(t, err)
+
+					if withTracing {
+						for index, pair := range actual.Pairs {
+							if pair.GetItem() != nil {
+								parsed := tuple.MustParse(tt.requests[index])
+								require.NotNil(t, pair.GetItem().DebugTrace, "missing debug trace in response for item %v", pair.GetItem())
+								require.NotNil(t, pair.GetItem().DebugTrace.Check, "missing check trace in response for item %v", pair.GetItem())
+								require.Equal(t, parsed.Resource.ObjectID, pair.GetItem().DebugTrace.Check.Resource.ObjectId, "resource in debug trace does not match")
+								require.NotEmpty(t, pair.GetItem().DebugTrace.Check.TraceOperationId, "trace operation ID in debug trace is empty")
+								require.NotEmpty(t, pair.GetItem().DebugTrace.Check.Source, "source in debug trace is empty")
+							}
+						}
+					} else {
+						testutil.RequireProtoSlicesEqual(t, expected, actual.Pairs, nil, "response bulk check pairs did not match")
+					}
+				})
+			}
+		})
+	}
+}
+
+func mustRelToCheckBulkRequestItem(rel string) *v1.CheckBulkPermissionsRequestItem {
+	r, err := tuple.ParseV1Rel(rel)
+	if err != nil {
+		panic(err)
+	}
+
+	item := &v1.CheckBulkPermissionsRequestItem{
+		Resource:   r.Resource,
+		Permission: r.Relation,
+		Subject:    r.Subject,
+	}
+	if r.OptionalCaveat != nil {
+		item.Context = r.OptionalCaveat.Context
+	}
+	return item
+}
+
+func TestImportBulkRelationships(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	testCases := []struct {
+		name       string
+		batchSize  func() uint64
+		numBatches int
+	}{
+		{"one small batch", constBatch(1), 1},
+		{"one big batch", constBatch(10_000), 1},
+		{"many small batches", constBatch(5), 1_000},
+		{"one empty batch", constBatch(0), 1},
+		{"small random batches", randomBatch(1, 10), 100},
+		{"big random batches", randomBatch(1_000, 3_000), 50},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, withTrait := range []string{"", "caveated_viewer", "expiring_viewer"} {
+				t.Run(fmt.Sprintf("withTrait=%s", withTrait), func(t *testing.T) {
+					require := require.New(t)
+
+					conn, _, _ := testserver.NewTestServerWithConfig(t, 0, memdb.DisableGC, true,
+						testserver.DefaultTestServerConfig,
+						tf.StandardDatastoreWithSchema)
+					client := v1.NewPermissionsServiceClient(conn)
+
+					ctx := t.Context()
+
+					writer, err := client.ImportBulkRelationships(ctx)
+					require.NoError(err)
+
+					var expectedTotal uint64
+					for batchNum := 0; batchNum < tc.numBatches; batchNum++ {
+						batchSize := tc.batchSize()
+						batch := make([]*v1.Relationship, 0, batchSize)
+
+						for i := range batchSize {
+							switch withTrait {
+							case "caveated_viewer":
+								batch = append(batch, mustRelWithCaveatAndContext(
+									tf.DocumentNS.Name,
+									strconv.Itoa(batchNum)+"_"+strconv.FormatUint(i, 10),
+									"caveated_viewer",
+									tf.UserNS.Name,
+									strconv.FormatUint(i, 10),
+									"",
+									"test",
+									map[string]any{"secret": strconv.FormatUint(i, 10)},
+								))
+							case "expiring_viewer":
+								batch = append(batch, relWithExpiration(
+									tf.DocumentNS.Name,
+									strconv.Itoa(batchNum)+"_"+strconv.FormatUint(i, 10),
+									"expiring_viewer",
+									tf.UserNS.Name,
+									strconv.FormatUint(i, 10),
+									"",
+									time.Date(2300, 1, 1, 0, 0, 0, 0, time.UTC),
+								))
+							default:
+								batch = append(batch, rel(
+									tf.DocumentNS.Name,
+									strconv.Itoa(batchNum)+"_"+strconv.FormatUint(i, 10),
+									"viewer",
+									tf.UserNS.Name,
+									strconv.FormatUint(i, 10),
+									"",
+								))
+							}
+						}
+
+						err := writer.Send(&v1.ImportBulkRelationshipsRequest{
+							Relationships: batch,
+						})
+						require.NoError(err)
+
+						expectedTotal += batchSize
+					}
+
+					resp, err := writer.CloseAndRecv()
+					require.NoError(err)
+					require.Equal(expectedTotal, resp.NumLoaded)
+
+					readerClient := v1.NewPermissionsServiceClient(conn)
+					stream, err := readerClient.ReadRelationships(ctx, &v1.ReadRelationshipsRequest{
+						RelationshipFilter: &v1.RelationshipFilter{
+							ResourceType: tf.DocumentNS.Name,
+						},
+						Consistency: &v1.Consistency{
+							Requirement: &v1.Consistency_FullyConsistent{FullyConsistent: true},
+						},
+					})
+					require.NoError(err)
+
+					var readBack uint64
+					var res *v1.ReadRelationshipsResponse
+					for _, err = stream.Recv(); err == nil; res, err = stream.Recv() {
+						readBack++
+						if res == nil {
+							continue
+						}
+
+						switch withTrait {
+						case "caveated_viewer":
+							require.NotNil(res.Relationship.OptionalCaveat)
+							require.Equal("test", res.Relationship.OptionalCaveat.CaveatName)
+						case "expiring_viewer":
+							require.NotNil(res.Relationship.OptionalExpiresAt)
+						default:
+							require.Nil(res.Relationship.OptionalCaveat)
+						}
+					}
+					require.ErrorIs(err, io.EOF)
+					require.Equal(expectedTotal, readBack)
+				})
+			}
+		})
+	}
+}
+
+func TestExportBulkRelationshipsBeyondAllowedLimit(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	require := require.New(t)
+
+	conn, _, _ := testserver.NewTestServerWithConfig(t, 0, memdb.DisableGC, true,
+		testserver.DefaultTestServerConfig,
+		tf.StandardDatastoreWithData)
+	client := v1.NewPermissionsServiceClient(conn)
+
+	resp, err := client.ExportBulkRelationships(t.Context(), &v1.ExportBulkRelationshipsRequest{
+		OptionalLimit: 10000005,
+	})
+	require.NoError(err)
+
+	_, err = resp.Recv()
+	require.Error(err)
+	require.Contains(err.Error(), "provided limit 10000005 is greater than maximum allowed of 10000")
+}
+
+func TestExportBulkRelationships(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+
+	conn, _, _ := testserver.NewTestServerWithConfig(t, 0, memdb.DisableGC, true,
+		testserver.DefaultTestServerConfig,
+		tf.StandardDatastoreWithSchema)
+	client := v1.NewPermissionsServiceClient(conn)
+
+	nsAndRels := []struct {
+		namespace string
+		relation  string
+	}{
+		{tf.DocumentNS.Name, "viewer"},
+		{tf.FolderNS.Name, "viewer"},
+		{tf.DocumentNS.Name, "owner"},
+		{tf.FolderNS.Name, "owner"},
+		{tf.DocumentNS.Name, "editor"},
+		{tf.FolderNS.Name, "editor"},
+		{tf.DocumentNS.Name, "caveated_viewer"},
+		{tf.DocumentNS.Name, "expiring_viewer"},
+	}
+
+	totalToWrite := 1_000
+	expectedRels := mapz.NewSet[string]()
+	batch := make([]*v1.Relationship, totalToWrite)
+	for i := range batch {
+		nsAndRel := nsAndRels[i%len(nsAndRels)]
+		v1rel := relationshipForBulkTesting(nsAndRel, i)
+		batch[i] = v1rel
+		expectedRels.Add(tuple.MustV1RelString(v1rel))
+	}
+
+	ctx := t.Context()
+	writer, err := client.ImportBulkRelationships(ctx)
+	require.NoError(t, err)
+
+	require.NoError(t, writer.Send(&v1.ImportBulkRelationshipsRequest{
+		Relationships: batch,
+	}))
+
+	resp, err := writer.CloseAndRecv()
+	require.NoError(t, err)
+	numLoaded, err := safecast.Convert[int](resp.NumLoaded)
+	require.NoError(t, err)
+	require.Equal(t, totalToWrite, numLoaded)
+
+	testCases := []struct {
+		batchSize      uint32
+		paginateEveryN int
+	}{
+		{1_000, math.MaxInt},
+		{10, math.MaxInt},
+		{1_000, 1},
+		{100, 5},
+		{97, 7},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%d-%d", tc.batchSize, tc.paginateEveryN), func(t *testing.T) {
+			require := require.New(t)
+
+			var totalRead int
+			remainingRels := expectedRels.Copy()
+			require.Equal(totalToWrite, expectedRels.Len())
+			var cursor *v1.Cursor
+
+			var done bool
+			for !done {
+				streamCtx, cancel := context.WithCancel(ctx)
+
+				stream, err := client.ExportBulkRelationships(streamCtx, &v1.ExportBulkRelationshipsRequest{
+					OptionalLimit:  tc.batchSize,
+					OptionalCursor: cursor,
+				})
+				require.NoError(err)
+
+				for i := 0; i < tc.paginateEveryN; i++ {
+					batch, err := stream.Recv()
+					if errors.Is(err, io.EOF) {
+						done = true
+						break
+					}
+
+					require.NoError(err)
+					require.LessOrEqual(uint64(len(batch.Relationships)), uint64(tc.batchSize))
+					require.NotNil(batch.AfterResultCursor)
+					require.NotEmpty(batch.AfterResultCursor.Token)
+
+					cursor = batch.AfterResultCursor
+					totalRead += len(batch.Relationships)
+
+					for _, rel := range batch.Relationships {
+						remainingRels.Delete(tuple.MustV1RelString(rel))
+					}
+				}
+
+				cancel()
+			}
+
+			require.Equal(totalToWrite, totalRead)
+			require.True(remainingRels.IsEmpty(), "rels were not exported %#v", remainingRels.AsSlice())
+		})
+	}
+}
+
+func TestExportBulkRelationshipsWithFilter(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	testCases := []struct {
+		name          string
+		filter        *v1.RelationshipFilter
+		expectedCount int
+	}{
+		{
+			"basic filter",
+			&v1.RelationshipFilter{
+				ResourceType: tf.DocumentNS.Name,
+			},
+			625,
+		},
+		{
+			"filter by resource ID",
+			&v1.RelationshipFilter{
+				OptionalResourceId: "12",
+			},
+			1,
+		},
+		{
+			"filter by resource ID prefix",
+			&v1.RelationshipFilter{
+				OptionalResourceIdPrefix: "1",
+			},
+			111,
+		},
+		{
+			"filter by resource ID prefix and resource type",
+			&v1.RelationshipFilter{
+				ResourceType:             tf.DocumentNS.Name,
+				OptionalResourceIdPrefix: "1",
+			},
+			69,
+		},
+		{
+			"filter by invalid resource type",
+			&v1.RelationshipFilter{
+				ResourceType: "invalid",
+			},
+			0,
+		},
+	}
+
+	batchSize := uint32(14)
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+
+			conn, _, _ := testserver.NewTestServerWithConfig(t, 0, memdb.DisableGC, true,
+				testserver.DefaultTestServerConfig,
+				tf.StandardDatastoreWithSchema)
+			client := v1.NewPermissionsServiceClient(conn)
+
+			nsAndRels := []struct {
+				namespace string
+				relation  string
+			}{
+				{tf.DocumentNS.Name, "viewer"},
+				{tf.FolderNS.Name, "viewer"},
+				{tf.DocumentNS.Name, "owner"},
+				{tf.FolderNS.Name, "owner"},
+				{tf.DocumentNS.Name, "editor"},
+				{tf.FolderNS.Name, "editor"},
+				{tf.DocumentNS.Name, "caveated_viewer"},
+				{tf.DocumentNS.Name, "expiring_viewer"},
+			}
+
+			expectedRels := mapz.NewSet[string]()
+			batch := make([]*v1.Relationship, 1000)
+			for i := range batch {
+				nsAndRel := nsAndRels[i%len(nsAndRels)]
+				v1rel := relationshipForBulkTesting(nsAndRel, i)
+				batch[i] = v1rel
+
+				if tc.filter != nil {
+					filter, err := datastore.RelationshipsFilterFromPublicFilter(tc.filter)
+					require.NoError(err)
+					if !filter.Test(tuple.FromV1Relationship(v1rel)) {
+						continue
+					}
+				}
+
+				expectedRels.Add(tuple.MustV1RelString(v1rel))
+			}
+
+			require.Equal(tc.expectedCount, expectedRels.Len())
+
+			ctx := t.Context()
+			writer, err := client.ImportBulkRelationships(ctx)
+			require.NoError(err)
+
+			require.NoError(writer.Send(&v1.ImportBulkRelationshipsRequest{
+				Relationships: batch,
+			}))
+
+			_, err = writer.CloseAndRecv()
+			require.NoError(err)
+
+			var totalRead uint64
+			remainingRels := expectedRels.Copy()
+			var cursor *v1.Cursor
+
+			foundRels := mapz.NewSet[string]()
+			for {
+				streamCtx, cancel := context.WithCancel(ctx)
+
+				stream, err := client.ExportBulkRelationships(streamCtx, &v1.ExportBulkRelationshipsRequest{
+					OptionalRelationshipFilter: tc.filter,
+					OptionalLimit:              batchSize,
+					OptionalCursor:             cursor,
+				})
+				require.NoError(err)
+
+				batch, err := stream.Recv()
+				if errors.Is(err, io.EOF) {
+					cancel()
+					break
+				}
+
+				require.NoError(err)
+				relLength, err := safecast.Convert[uint32](len(batch.Relationships))
+				require.NoError(err)
+				require.LessOrEqual(relLength, batchSize)
+				require.NotNil(batch.AfterResultCursor)
+				require.NotEmpty(batch.AfterResultCursor.Token)
+
+				cursor = batch.AfterResultCursor
+				totalRead += uint64(len(batch.Relationships))
+
+				for _, rel := range batch.Relationships {
+					if tc.filter != nil {
+						filter, err := datastore.RelationshipsFilterFromPublicFilter(tc.filter)
+						require.NoError(err)
+						require.True(filter.Test(tuple.FromV1Relationship(rel)), "relationship did not match filter: %s", rel)
+					}
+
+					require.True(remainingRels.Has(tuple.MustV1RelString(rel)), "relationship was not expected or was repeated: %s", rel)
+					remainingRels.Delete(tuple.MustV1RelString(rel))
+					foundRels.Add(tuple.MustV1RelString(rel))
+				}
+
+				cancel()
+			}
+
+			expectedCount := safecast.RequireConvert[uint64](t, tc.expectedCount)
+			require.Equal(expectedCount, totalRead, "found: %v", foundRels.AsSlice())
+			require.True(remainingRels.IsEmpty(), "rels were not exported %#v", remainingRels.AsSlice())
+		})
+	}
+}
+
+// TestBulkCheckCaveatContextCollision is a regression test for an issue with
+// caveat hash collision.
+func TestBulkCheckCaveatContextCollision(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, testutil.GoLeakIgnores()...)
+	})
+	dsInit := func(t testing.TB, ds datastore.Datastore) (datastore.Datastore, datastore.Revision) {
+		schema := `
+		definition user {}
+		caveat shape(x list<any>) {
+			x == [["a"], "b"]
+		}
+		definition document {
+			relation viewer: user with shape
+			permission view = viewer
+		}`
+		rels := []tuple.Relationship{
+			tuple.MustParse(`document:doc#viewer@user:alice[shape]`),
+		}
+		return tf.DatastoreFromSchemaAndTestRelationships(t, ds, schema, rels)
+	}
+
+	conn, _, _ := testserver.NewTestServerWithConfig(t, 0, memdb.DisableGC, true,
+		testserver.DefaultTestServerConfig,
+		dsInit)
+
+	client := v1.NewPermissionsServiceClient(conn)
+
+	goodStruct, err := structpb.NewStruct(map[string]any{"x": []any{[]any{"a"}, "b"}})
+	require.NoError(t, err)
+	good := &v1.CheckBulkPermissionsRequestItem{
+		Resource:   &v1.ObjectReference{ObjectType: "document", ObjectId: "doc"},
+		Permission: "view",
+		Subject:    &v1.SubjectReference{Object: &v1.ObjectReference{ObjectType: "user", ObjectId: "alice"}},
+		Context:    goodStruct,
+	}
+
+	badStruct, err := structpb.NewStruct(map[string]any{"x": []any{"a", []any{}, "b"}})
+	require.NoError(t, err)
+	bad := &v1.CheckBulkPermissionsRequestItem{
+		Resource:   &v1.ObjectReference{ObjectType: "document", ObjectId: "doc"},
+		Permission: "view",
+		Subject:    &v1.SubjectReference{Object: &v1.ObjectReference{ObjectType: "user", ObjectId: "alice"}},
+		Context:    badStruct,
+	}
+
+	singleBad, err := client.CheckPermission(t.Context(), &v1.CheckPermissionRequest{
+		Resource:    bad.Resource,
+		Permission:  bad.Permission,
+		Subject:     bad.Subject,
+		Context:     bad.Context,
+		Consistency: &v1.Consistency{Requirement: &v1.Consistency_FullyConsistent{FullyConsistent: true}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION, singleBad.Permissionship)
+
+	bulk, err := client.CheckBulkPermissions(t.Context(), &v1.CheckBulkPermissionsRequest{
+		Consistency: &v1.Consistency{Requirement: &v1.Consistency_FullyConsistent{FullyConsistent: true}},
+		Items:       []*v1.CheckBulkPermissionsRequestItem{good, bad},
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION, bulk.Pairs[0].GetItem().Permissionship)
+	require.Equal(
+		t,
+		v1.CheckPermissionResponse_PERMISSIONSHIP_NO_PERMISSION,
+		bulk.Pairs[1].GetItem().Permissionship,
+		"the bad request should have a no permission result",
+	)
+}

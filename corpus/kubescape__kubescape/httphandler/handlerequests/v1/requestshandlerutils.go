@@ -1,0 +1,884 @@
+package v1
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/armosec/utils-go/boolutils"
+	"github.com/kubescape/backend/pkg/versioncheck"
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/cautils/getter"
+	"github.com/kubescape/kubescape/v4/core/core"
+	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling"
+	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling/printer"
+	"github.com/kubescape/kubescape/v4/httphandler/config"
+	"github.com/kubescape/kubescape/v4/httphandler/storage"
+	utilsapisv1 "github.com/kubescape/opa-utils/httpserver/apis/v1"
+	utilsmetav1 "github.com/kubescape/opa-utils/httpserver/meta/v1"
+	reporthandlingv2 "github.com/kubescape/opa-utils/reporthandling/v2"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+)
+
+var scanImpl = scan // Override for testing
+
+// runKubescapeScan is the scanner construction seam used by lifecycle tests.
+var runKubescapeScan = func(ctx context.Context, scanInfo *cautils.ScanInfo, policyIdentifiers []cautils.PolicyIdentifier) (*resultshandling.ResultsHandler, error) {
+	return core.NewKubescape(ctx).Scan(scanInfo, policyIdentifiers)
+}
+
+// canonicalResultPersistenceKey marks scans submitted through /v1/scan. The
+// metrics endpoint shares scan(), but owns the extensionless output path for
+// its Prometheus response and must not have that file replaced with JSON.
+type canonicalResultPersistenceKey struct{}
+
+func withCanonicalResultPersistence(ctx context.Context) context.Context {
+	return context.WithValue(ctx, canonicalResultPersistenceKey{}, true)
+}
+
+// deliverScanCallback makes one best-effort completion-signal attempt when
+// callbackURL is set. Every terminal path with a callbackURL (success,
+// failure, queued-cancel, panic) funnels through here so none can silently
+// skip the at-least-once signal. Failures beyond postScanCallback's own retry
+// bounds are logged, not re-queued. Safe on nil scanReq/ctx.
+func deliverScanCallback(scanReq *scanRequestParams, status, errMsg string) {
+	if scanReq == nil || scanReq.callbackURL == "" {
+		return
+	}
+	payload := scanCallbackPayload{ID: scanReq.scanID, Status: status, Error: errMsg}
+	cbCtx := context.Background()
+	if scanReq.ctx != nil {
+		cbCtx = context.WithoutCancel(scanReq.ctx)
+	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.L().Ctx(cbCtx).Error("scan completion callback panicked", helpers.String("ID", scanReq.scanID), helpers.Error(fmt.Errorf("%v", r)))
+			}
+		}()
+		if cbErr := postScanCallback(cbCtx, scanReq.callbackURL, payload); cbErr != nil {
+			logger.L().Ctx(cbCtx).Error("failed to deliver scan completion callback", helpers.String("ID", scanReq.scanID), helpers.Error(cbErr))
+		}
+	}()
+}
+
+// feedScanResponse forwards response to a waiter without blocking. It is a
+// no-op when nobody is listening (nil channel); callers never need to check.
+func feedScanResponse(scanReq *scanRequestParams, response *utilsmetav1.Response) {
+	if scanReq == nil || scanReq.resp == nil {
+		return
+	}
+	select {
+	case scanReq.resp <- response:
+	default:
+	}
+}
+
+// feedPanicResponse preserves the panic path's original contract: only feed
+// waiters that asked for results.
+func feedPanicResponse(scanReq *scanRequestParams, response *utilsmetav1.Response) {
+	if scanReq == nil || scanReq.scanQueryParams == nil || !scanReq.scanQueryParams.ReturnResults {
+		return
+	}
+	feedScanResponse(scanReq, response)
+}
+
+// panicLog returns a context-bound logger when the request carries one,
+// otherwise the background logger. A nil ctx is a supported path, so
+// failure-path logging must never assume scanReq.ctx is usable.
+func panicLog(scanReq *scanRequestParams) helpers.ILogger {
+	if scanReq != nil && scanReq.ctx != nil {
+		return logger.L().Ctx(scanReq.ctx)
+	}
+	return logger.L()
+}
+
+// runGuarded runs fn, recording any panic on log instead of swallowing it.
+// State release and callback delivery always proceed after it returns.
+func runGuarded(log helpers.ILogger, op, scanID string, fn func()) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Error("recovered while "+op+" after panic",
+				helpers.String("ID", scanID), helpers.Error(fmt.Errorf("%v", rec)))
+		}
+	}()
+	fn()
+}
+
+func (handler *HTTPHandler) executeScan(scanReq *scanRequestParams) {
+	response := &utilsmetav1.Response{ID: scanReq.scanID}
+
+	defer func() {
+		if r := recover(); r != nil {
+			err := fmt.Errorf("scan panicked: %v", r)
+			scanID := ""
+			if scanReq != nil {
+				scanID = scanReq.scanID
+			}
+			panicLog(scanReq).Error("scan panic recovered", helpers.String("ID", scanID), helpers.Error(err))
+			responseMsg := err.Error()
+			// Remove any partial results artifact FIRST so /v1/results can
+			// never serve truncated output from the panicked scan (mirrors
+			// cancel). removeResultsFile also covers FailedOutputDir, so this
+			// must precede the error-file write below.
+			runGuarded(panicLog(scanReq), "removing partial results", scanID, func() {
+				_ = removeResultsFile(scanID)
+			})
+			runGuarded(panicLog(scanReq), "persisting panic error", scanID, func() {
+				if persistErr := writeScanErrorToFile(err, scanID); persistErr != nil {
+					panicLog(scanReq).Error("failed to persist panic error to file",
+						helpers.String("ID", scanID), helpers.Error(persistErr))
+					responseMsg = persistErr.Error()
+				}
+			})
+			handler.state.releaseCancel(scanReq.scanID)
+			handler.state.setNotBusy(scanReq.scanID)
+			response.Type = utilsapisv1.ErrorScanResponseType
+			response.Response = responseMsg
+			feedPanicResponse(scanReq, response)
+			deliverScanCallback(scanReq, callbackStatusFailed, callbackErrPanicked)
+		}
+	}()
+
+	logger.L().Info("scan triggered", helpers.String("ID", scanReq.scanID))
+	scanCtx := scanReq.ctx
+	if scanReq.isUserScan {
+		scanCtx = withCanonicalResultPersistence(scanCtx)
+	}
+	_, err := scanImpl(scanCtx, scanReq.scanInfo, scanReq.policyIdentifiers, scanReq.scanID, scanReq.scanQueryParams.SkipPersistence)
+	if err != nil {
+		if errors.Is(scanReq.ctx.Err(), context.Canceled) {
+			logger.L().Ctx(scanReq.ctx).Info("scan cancelled", helpers.String("ID", scanReq.scanID))
+			removeResultsFile(scanReq.scanID)
+			if scanReq.scanQueryParams.ReturnResults {
+				response.Type = utilsapisv1.ErrorScanResponseType
+				response.Response = fmt.Sprintf("scan '%s' was cancelled", scanReq.scanID)
+			}
+		} else {
+			logger.L().Ctx(scanReq.ctx).Error("scanning failed", helpers.String("ID", scanReq.scanID), helpers.Error(err))
+			if scanReq.scanQueryParams.ReturnResults {
+				response.Type = utilsapisv1.ErrorScanResponseType
+				response.Response = err.Error()
+			}
+		}
+	} else {
+		logger.L().Ctx(scanReq.ctx).Success("done scanning", helpers.String("ID", scanReq.scanID))
+		if scanReq.scanQueryParams.ReturnResults {
+			response.Type = utilsapisv1.ResultsV1ScanResponseType
+		}
+	}
+
+	handler.state.releaseCancel(scanReq.scanID)
+	handler.state.setNotBusy(scanReq.scanID)
+
+	// return results, if someone's waiting for them; never block.
+	feedScanResponse(scanReq, response)
+
+	if err != nil {
+		deliverScanCallback(scanReq, callbackStatusFailed, "scan failed")
+	} else {
+		deliverScanCallback(scanReq, callbackStatusCompleted, "")
+	}
+}
+
+// watchForScan dequeues scan requests and executes them, honoring
+// cancellation that happened while a request was still queued.
+func (handler *HTTPHandler) watchForScan() {
+	for scanReq := range handler.scanRequestChan {
+		logger.L().Info("triggering scan", helpers.String("scanID", scanReq.scanID))
+		if scanReq.isUserScan {
+			handler.state.setRunningUserScanID(scanReq.scanID)
+		}
+		if handler.state.isCancelled(scanReq.scanID) {
+			logger.L().Info("skipping cancelled scan", helpers.String("scanID", scanReq.scanID))
+			if scanReq.resp != nil {
+				select {
+				case scanReq.resp <- &utilsmetav1.Response{
+					ID:       scanReq.scanID,
+					Type:     utilsapisv1.ErrorScanResponseType,
+					Response: fmt.Sprintf("scan '%s' was cancelled", scanReq.scanID),
+				}:
+				default:
+				}
+			}
+			deliverScanCallback(scanReq, callbackStatusFailed, "scan cancelled")
+			handler.state.releaseCancel(scanReq.scanID)
+			handler.state.setNotBusy(scanReq.scanID)
+			continue
+		}
+		handler.executeScan(scanReq)
+	}
+}
+func scan(ctx context.Context, scanInfo *cautils.ScanInfo, policyIdentifiers []cautils.PolicyIdentifier, scanID string, skipPersistence bool) (*reporthandlingv2.PostureReport, error) {
+	ctx, spanScan := otel.Tracer("").Start(ctx, "kubescape.scan")
+	defer spanScan.End()
+
+	spanScan.AddEvent("scanning metadata",
+		trace.WithAttributes(attribute.String("version", versioncheck.BuildNumber)),
+		trace.WithAttributes(attribute.String("build", versioncheck.Client)),
+		trace.WithAttributes(attribute.String("scanID", scanInfo.ScanID)),
+		trace.WithAttributes(attribute.Bool("scanAll", scanInfo.ScanAll)),
+		trace.WithAttributes(attribute.Bool("HostSensorEnabled", scanInfo.HostSensorEnabled.GetBool())),
+		trace.WithAttributes(attribute.String("excludedNamespaces", scanInfo.ExcludedNamespaces)),
+		trace.WithAttributes(attribute.String("includeNamespaces", scanInfo.IncludeNamespaces)),
+		trace.WithAttributes(attribute.String("hostSensorYamlPath", scanInfo.HostSensorYamlPath)),
+	)
+
+	result, err := runKubescapeScan(ctx, scanInfo, policyIdentifiers)
+	if err != nil {
+		return nil, writeScanErrorToFile(err, scanID)
+	}
+	if err := result.HandleResults(ctx, scanInfo); err != nil {
+		return nil, writeScanErrorToFile(err, scanID)
+	}
+	// Non-JSON printers write format-specific sidecars (for example .yaml or
+	// .pdf), while /v1/results reads JSON. Keep the requested sidecars and add
+	// the extensionless canonical JSON that the results API reads first.
+	if shouldPersistCanonicalResult(ctx, scanInfo) {
+		if err := persistCanonicalResult(result, scanID); err != nil {
+			return nil, writeScanErrorToFile(err, scanID)
+		}
+	}
+
+	if !skipPersistence {
+		store := storage.GetStorage()
+		// do not store results locally when we are sending them
+		if store != nil && config.GetAccount() == "" {
+			pr := result.GetResults()
+
+			// StorePostureReportResults persists to the operator storage backend
+			// (CRD/ConfigMap). This runs after HandleResults has already written
+			// the valid JSON to OutputDir, so a failure here is a persistence
+			// problem, not a scan failure. Log it and let the poller read the
+			// valid result rather than overwriting it with a failed artifact.
+			if err := store.StorePostureReportResults(ctx, pr); err != nil {
+				logger.L().Ctx(ctx).Error("failed to persist scan results to storage", helpers.String("scanID", scanID), helpers.Error(err))
+			}
+		} else {
+			logger.L().Debug("storage is not initialized - skipping storing results")
+		}
+	} else {
+		logger.L().Info("skipPersistence=true, skipping storing results")
+	}
+
+	return nil, nil
+}
+
+func shouldPersistCanonicalResult(ctx context.Context, scanInfo *cautils.ScanInfo) bool {
+	persist, _ := ctx.Value(canonicalResultPersistenceKey{}).(bool)
+	if !persist {
+		return false
+	}
+	for _, format := range scanInfo.Formats() {
+		if format == printer.JsonFormat {
+			return false
+		}
+	}
+	return true
+}
+
+func persistCanonicalResult(result *resultshandling.ResultsHandler, scanID string) (err error) {
+	parsedUUID, parseErr := uuid.Parse(scanID)
+	if parseErr != nil {
+		return fmt.Errorf("failed to persist canonical scan results: invalid scan ID: %w", parseErr)
+	}
+	f, createErr := os.OpenFile(filepath.Join(OutputDir, parsedUUID.String()), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if createErr != nil {
+		return fmt.Errorf("failed to create canonical scan results file: %w", createErr)
+	}
+	defer func() {
+		closeErr := f.Close()
+		if err == nil && closeErr != nil {
+			err = fmt.Errorf("failed to close canonical scan results file: %w", closeErr)
+		}
+	}()
+	if writeErr := result.WriteJson(f); writeErr != nil {
+		return fmt.Errorf("failed to persist canonical scan results: %w", writeErr)
+	}
+	return nil
+}
+
+// ScanFailedError carries the plaintext error written by writeScanErrorToFile.
+// readResultsFile returns this when the only artifact for a scan ID is under
+// FailedOutputDir, so the Results handler can surface the real scan failure
+// instead of a JSON parse error.
+type ScanFailedError struct {
+	Message string
+}
+
+func (e *ScanFailedError) Error() string {
+	return e.Message
+}
+
+func readResultsFile(fileID string) (json.RawMessage, error) {
+	parsedUUID, err := uuid.Parse(fileID)
+	if err != nil {
+		logger.L().Warning("invalid scan ID requested", helpers.String("ID", fileID), helpers.Error(err))
+		return nil, fmt.Errorf("invalid scan ID format")
+	}
+	cleanID := parsedUUID.String()
+
+	extensions := []string{"", ".json"}
+
+	// Failed artifacts win over success artifacts. HandleResults writes the
+	// JSON output before later failure points (e.g. StorePostureReportResults),
+	// so when both files exist the failed one is the source of truth and the
+	// success file is stale data that must not mask the failure.
+	for _, ext := range extensions {
+		path := filepath.Join(FailedOutputDir, cleanID+ext)
+		f, err := os.ReadFile(path)
+		if err == nil {
+			return nil, &ScanFailedError{Message: string(f)}
+		}
+	}
+
+	for _, ext := range extensions {
+		path := filepath.Join(OutputDir, cleanID+ext)
+		f, err := os.ReadFile(path)
+		if err == nil {
+			// Retain the existing structural validation against PostureReport,
+			// then return the original JSON so additive output fields survive.
+			var postureReport reporthandlingv2.PostureReport
+			if err := json.Unmarshal(f, &postureReport); err != nil {
+				return nil, err
+			}
+			return json.RawMessage(f), nil
+		}
+	}
+
+	return nil, fmt.Errorf("file %s not found", cleanID)
+}
+
+func removeResultDirs() {
+	if err := os.RemoveAll(OutputDir); err != nil {
+		logger.L().Error("failed to remove output directory", helpers.String("path", OutputDir), helpers.Error(err))
+	}
+	if err := os.RemoveAll(FailedOutputDir); err != nil {
+		logger.L().Error("failed to remove failed output directory", helpers.String("path", FailedOutputDir), helpers.Error(err))
+	}
+}
+
+func removeResultsFile(fileID string) error {
+	parsedUUID, err := uuid.Parse(fileID)
+	if err != nil {
+		logger.L().Warning("invalid scan ID requested", helpers.String("ID", fileID), helpers.Error(err))
+		return nil // Invalid ID means no file to delete
+	}
+	cleanID := parsedUUID.String()
+
+	dirs := []string{OutputDir, FailedOutputDir}
+	// Exact suffixes that printers can append to the extensionless HTTP output
+	// base. Do not glob cleanID+".*": UUID-adjacent files may be unrelated.
+	extensions := []string{
+		"",
+		printer.JsonOutputExt,
+		printer.JunitOutputExt,
+		printer.SARIFOutputExt,
+		printer.HtmlOutputExt,
+		printer.PdfOutputExt,
+		printer.PrometheusOutputExt,
+		printer.YamlOutputExt,
+		printer.CsvOutputExt,
+		printer.CycloneDXOutputExt,
+		printer.SPDXOutputExt,
+	}
+
+	for _, dir := range dirs {
+		for _, ext := range extensions {
+			path := filepath.Join(dir, cleanID+ext)
+			err := os.Remove(path)
+			if err != nil && !os.IsNotExist(err) {
+				logger.L().Warning("failed to remove result file", helpers.String("path", path), helpers.Error(err))
+			}
+		}
+	}
+	return nil
+}
+
+func getScanCommand(scanRequest *utilsmetav1.PostScanRequest, scanID string) (*cautils.ScanInfo, []cautils.PolicyIdentifier) {
+
+	scanInfo, policyIdentifiers := ToScanInfo(scanRequest)
+	scanInfo.ScanID = scanID
+
+	// *** start ***
+	// Set default format
+	if scanInfo.Format == "" {
+		scanInfo.Format = "json"
+	}
+	scanInfo.FormatVersion = "v2" // latest version
+	// *** end ***
+
+	// *** start ***
+	// DO NOT CHANGE
+	scanInfo.Output = filepath.Join(OutputDir, scanID)
+	// *** end ***
+
+	return scanInfo, policyIdentifiers
+}
+
+func defaultScanInfo() *cautils.ScanInfo {
+	scanInfo := &cautils.ScanInfo{}
+	scanInfo.FailThreshold = 100
+	scanInfo.ComplianceThreshold = 0
+	scanInfo.AccountID = envToString("KS_ACCOUNT_ID", config.GetAccount())   // publish results to Kubescape SaaS
+	scanInfo.AccessKey = envToString("KS_ACCESS_KEY", config.GetAccessKey()) // publish results to Kubescape SaaS
+	scanInfo.ExcludedNamespaces = envToString("KS_EXCLUDE_NAMESPACES", "")   // namespaces to exclude
+	scanInfo.IncludeNamespaces = envToString("KS_INCLUDE_NAMESPACES", "")    // namespaces to include
+	scanInfo.HostSensorYamlPath = envToString("KS_HOST_SCAN_YAML", "")       // path to host scan YAML
+	scanInfo.FormatVersion = envToString("KS_FORMAT_VERSION", "v2")          // output format version
+	scanInfo.Format = envToString("KS_FORMAT", "json")                       // default output should be json
+
+	if filters, enabled := config.GetNamespaceFilters(); enabled {
+		scanInfo.IncludeNamespaces = filters.Include
+		scanInfo.ExcludedNamespaces = filters.Exclude
+	}
+	// KS_SUBMIT is presence-checked (not just envToBool'd): its mere presence
+	// marks Submit as explicitly requested, so an unparsable value (including
+	// "", which Helm commonly renders for an unset value) must not silently
+	// become a permanent, unoverridable opt-out - warn and leave it unset instead.
+	if raw, ok := os.LookupEnv("KS_SUBMIT"); ok {
+		if v, err := strconv.ParseBool(strings.TrimSpace(raw)); err == nil {
+			scanInfo.Submit.SetBool(v)
+		} else {
+			logger.L().Warning("ignoring unparsable KS_SUBMIT value", helpers.String("value", raw))
+		}
+	}
+	scanInfo.Local = envToBool("KS_KEEP_LOCAL", false)           // do not publish results to Kubescape SaaS
+	scanInfo.EnableRegoPrint = envToBool("KS_REGO_PRINT", false) // print rego rules
+	// Only set HostSensorEnabled when explicitly configured; leaving it nil allows
+	// auto-detection of node-agent CRDs in getHostSensorHandler.
+	if val, ok := os.LookupEnv("KS_ENABLE_HOST_SCANNER"); ok {
+		scanInfo.HostSensorEnabled.SetBool(boolutils.StringToBool(val))
+	}
+	if !envToBool("KS_DOWNLOAD_ARTIFACTS", false) {
+		scanInfo.UseArtifactsFrom = getter.DefaultLocalStore // Load files from cache (this will prevent kubescape fom downloading the artifacts every time)
+	}
+
+	return scanInfo
+}
+
+func envToBool(env string, defaultValue bool) bool {
+	if d, ok := os.LookupEnv(env); ok {
+		return boolutils.StringToBool(d)
+	}
+	return defaultValue
+}
+
+func envToString(env string, defaultValue string) string {
+	if d, ok := os.LookupEnv(env); ok {
+		return d
+	}
+	return defaultValue
+}
+
+// absPathRe matches absolute filesystem paths in error text: Unix paths,
+// Windows drive paths (C:\...) and UNC paths (\\server\share\...). Inner
+// path components may contain spaces; the last one may not, so trailing
+// words after a path are kept.
+var absPathRe = regexp.MustCompile(`(?:\b[A-Za-z]:)?[/\\]{1,2}(?:[^/\\\s:'"]+(?: [^/\\\s:'"]+)*[/\\])*[^/\\\s:'"]+`)
+
+// quotedRe matches double-quoted Go strings, as written by %q.
+var quotedRe = regexp.MustCompile(`"(?:[^"\\]|\\.)*"`)
+
+// redactQuotedPaths replaces quoted strings that hold a path, such as the
+// file names the manifest loader writes with %q. The whole quoted value is
+// replaced, so spaces and apostrophes in a file name are covered too.
+func redactQuotedPaths(msg string) string {
+	return quotedRe.ReplaceAllStringFunc(msg, func(quoted string) string {
+		s, err := strconv.Unquote(quoted)
+		if err != nil || !strings.ContainsAny(s, `/\`) || strings.Contains(s, "://") {
+			return quoted
+		}
+		return `"<path>"`
+	})
+}
+
+// redactScanError hides filesystem paths so the message is safe to serve.
+// Paths known from filesystem errors are replaced exactly (this also covers
+// paths with spaces), then quoted paths; the regexp catches paths only
+// present as plain text.
+func redactScanError(err error) string {
+	msg := err.Error()
+	var paths []string
+	for _, e := range unwrapAll(err) {
+		switch t := e.(type) {
+		case *fs.PathError:
+			paths = append(paths, t.Path)
+		case *os.LinkError:
+			paths = append(paths, t.Old, t.New)
+		}
+	}
+	// replace longer paths first so a prefix does not leave a partial path
+	sort.Slice(paths, func(i, j int) bool { return len(paths[i]) > len(paths[j]) })
+	for _, p := range paths {
+		if p != "" {
+			msg = strings.ReplaceAll(msg, p, "<path>")
+		}
+	}
+	return absPathRe.ReplaceAllString(redactQuotedPaths(msg), "<path>")
+}
+
+// unwrapAll returns err and every error it wraps.
+func unwrapAll(err error) []error {
+	var out []error
+	queue := []error{err}
+	for len(queue) > 0 {
+		e := queue[0]
+		queue = queue[1:]
+		if e == nil {
+			continue
+		}
+		out = append(out, e)
+		switch u := e.(type) {
+		case interface{ Unwrap() error }:
+			queue = append(queue, u.Unwrap())
+		case interface{ Unwrap() []error }:
+			queue = append(queue, u.Unwrap()...)
+		}
+	}
+	return out
+}
+
+// redactedError keeps the original error for errors.Is/As but only exposes
+// the redacted message, because executeScan copies it into the HTTP response.
+type redactedError struct {
+	msg string
+	err error
+}
+
+func (r *redactedError) Error() string { return r.msg }
+func (r *redactedError) Unwrap() error { return r.err }
+
+// chmodScanErrorFile is a test hook for permission-tightening failures.
+var chmodScanErrorFile = (*os.File).Chmod
+
+func writeScanErrorToFile(err error, scanID string) (e error) {
+	// the full error, paths included, stays in the server log; only the
+	// redacted message is stored and returned to the client
+	logger.L().Error("scan failed", helpers.String("ID", scanID), helpers.Error(err))
+	reason := redactScanError(err)
+	if _, e = uuid.Parse(scanID); e != nil {
+		return fmt.Errorf("failed to scan. reason: '%s'. failed to save error in file - invalid scan ID. reason: %s", reason, redactScanError(e))
+	}
+	if e = os.MkdirAll(FailedOutputDir, outputDirPerm); e != nil {
+		return fmt.Errorf("failed to scan. reason: '%s'. failed to save error in file - failed to create directory. reason: %s", reason, redactScanError(e))
+	}
+	var f *os.File
+	path := filepath.Join(FailedOutputDir, scanID)
+	f, e = os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0o600)
+	if e != nil {
+		return fmt.Errorf("failed to scan. reason: '%s'. failed to save error in file - failed to open file for writing. reason: %s", reason, redactScanError(e))
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			e = fmt.Errorf("%w; failed to close scan error file: %s", e, redactScanError(cerr))
+		}
+	}()
+	// tighten a pre-existing file that was created with looser permissions;
+	// if that fails, leave it as it was and do not write into a file others
+	// may read. Only a tightened file is truncated.
+	if e = chmodScanErrorFile(f, 0o600); e != nil {
+		return fmt.Errorf("failed to scan. reason: '%s'. failed to save error in file - failed to restrict file permissions. reason: %s", reason, redactScanError(e))
+	}
+	if e = f.Truncate(0); e != nil {
+		return fmt.Errorf("failed to scan. reason: '%s'. failed to save error in file - failed to truncate. reason: %s", reason, redactScanError(e))
+	}
+
+	if _, e = f.Write([]byte(reason)); e != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("failed to scan. reason: '%s'. failed to save error in file - failed to write. reason: %s", reason, redactScanError(e))
+	}
+	return &redactedError{msg: "failed to scan. reason: " + reason, err: err}
+}
+
+// responseToBytes convert response object to bytes
+func responseToBytes(res *utilsmetav1.Response) []byte {
+	b, err := json.Marshal(res)
+	if err != nil {
+		logger.L().Error("failed to marshal response", helpers.Error(err))
+		return []byte(`{"response":"internal error: failed to marshal response","type":"error"}`)
+	}
+	return b
+}
+
+const (
+	callbackStatusCompleted = "completed"
+	callbackStatusFailed    = "failed"
+
+	// callbackErrPanicked is the generic webhook error for the scan-panic
+	// path. Generic by design: the full panic value stays in server logs
+	// (mirroring how the failure path redacts scan internals).
+	callbackErrPanicked = "scan panicked"
+
+	// callbackAllowlistEnv, when set, is an authoritative comma-separated list of
+	// CIDRs (or bare IPs) the resolved callback host must fall within.
+	callbackAllowlistEnv = "KS_CALLBACK_ALLOWED_CIDRS"
+	// callbackEnabledEnv opts callbacks in when no allowlist is configured;
+	// without either, callbacks are disabled so the server cannot be used as an
+	// arbitrary outbound-request emitter.
+	callbackEnabledEnv = "KS_CALLBACK_ENABLED"
+
+	callbackRequestTimeout = 5 * time.Second
+	callbackWallTime       = 20 * time.Second
+	callbackBackoff        = 2 * time.Second
+	callbackMaxAttempts    = 3
+)
+
+// scanCallbackPayload is the completion signal POSTed to a caller-supplied
+// callback URL. It is intentionally a signal only - it carries the scan ID, not
+// the PostureReport, and receivers must GET /v1/results for the data. Delivery
+// is at-least-once and best-effort with no durability across server restarts,
+// so receivers must dedup on ID and keep a poll/reconcile fallback.
+type scanCallbackPayload struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+// ipResolver is the subset of net.Resolver used for callback host screening;
+// it is a package var so tests can simulate DNS responses.
+type ipResolver interface {
+	LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error)
+}
+
+// callbackResolver is the resolver used for callback host screening; it is a
+// package var so tests can simulate DNS responses.
+var callbackResolver ipResolver = net.DefaultResolver
+
+// callbackEnabled reports whether scan-completion callbacks are turned on,
+// either explicitly via KS_CALLBACK_ENABLED or implicitly by configuring an
+// allowlist.
+func callbackEnabled() bool {
+	return envToString(callbackAllowlistEnv, "") != "" || boolutils.StringToBool(envToString(callbackEnabledEnv, ""))
+}
+
+// validateCallbackURL enforces the parse-time callback contract: callbacks must
+// be enabled, and the URL must be http/https with no embedded credentials.
+// Network-level SSRF screening happens later, at dial time, in postScanCallback.
+func validateCallbackURL(rawURL string) (*url.URL, error) {
+	if !callbackEnabled() {
+		return nil, fmt.Errorf("scan completion callbacks are disabled; set %s=true or configure %s", callbackEnabledEnv, callbackAllowlistEnv)
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid callback URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("callback URL scheme must be http or https")
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("callback URL must not contain userinfo")
+	}
+	if u.Hostname() == "" {
+		return nil, fmt.Errorf("callback URL must contain a host")
+	}
+	return u, nil
+}
+
+// postScanCallback delivers payload to rawURL, screening and pinning the
+// resolved IP against SSRF and retrying transport and 5xx failures within a
+// bounded wall-time deadline.
+func postScanCallback(ctx context.Context, rawURL string, payload scanCallbackPayload) error {
+	u, err := validateCallbackURL(rawURL)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, callbackWallTime)
+	defer cancel()
+
+	// Resolve and screen once, then dial that exact IP, so the address vetted
+	// here is the address connected to - closing the DNS-rebinding window.
+	ip, err := screenCallbackHost(ctx, u.Hostname())
+	if err != nil {
+		return err
+	}
+
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	pinnedAddr := net.JoinHostPort(ip.String(), port)
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	client := &http.Client{
+		Timeout: callbackRequestTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{Timeout: callbackRequestTimeout}).DialContext(ctx, network, pinnedAddr)
+			},
+		},
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < callbackMaxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("callback delivery deadline exceeded: %w", ctx.Err())
+			case <-time.After(callbackBackoff * time.Duration(attempt)):
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return nil
+		}
+		lastErr = fmt.Errorf("callback endpoint returned status %d", resp.StatusCode)
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			return lastErr
+		}
+	}
+	return lastErr
+}
+
+// screenCallbackHost resolves host and returns one IP that is permitted to be
+// dialed. When callbackAllowlistEnv is set it is authoritative (the IP must fall
+// inside it); otherwise loopback, link-local, private and other non-routable
+// ranges are denied.
+func screenCallbackHost(ctx context.Context, host string) (net.IP, error) {
+	allowlist, err := callbackAllowlist()
+	if err != nil {
+		return nil, err
+	}
+
+	var candidates []net.IP
+	if literal := net.ParseIP(host); literal != nil {
+		candidates = []net.IP{literal}
+	} else {
+		addrs, err := callbackResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve callback host: %w", err)
+		}
+		for i := range addrs {
+			candidates = append(candidates, addrs[i].IP)
+		}
+	}
+
+	for _, ip := range candidates {
+		if len(allowlist) > 0 {
+			if allowlistContains(allowlist, ip) {
+				return ip, nil
+			}
+			continue
+		}
+		if !isBlockedCallbackIP(ip) {
+			return ip, nil
+		}
+	}
+
+	if len(allowlist) > 0 {
+		return nil, fmt.Errorf("callback host is not within the configured allowlist")
+	}
+	return nil, fmt.Errorf("callback host resolves to a disallowed (loopback, link-local or private) address")
+}
+
+// extraBlockedCallbackCIDRs are non-routable ranges with no net.IP predicate:
+// CGNAT, the "this host" block, and the IPv4 limited broadcast address.
+var extraBlockedCallbackCIDRs = func() []*net.IPNet {
+	nets := make([]*net.IPNet, 0, 3)
+	for _, c := range []string{"100.64.0.0/10", "0.0.0.0/8", "255.255.255.255/32"} {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			nets = append(nets, n)
+		}
+	}
+	return nets
+}()
+
+// isBlockedCallbackIP reports whether ip falls in a loopback, link-local,
+// private, or otherwise non-routable range that must never be dialed by default.
+func isBlockedCallbackIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsPrivate() ||
+		ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	for _, n := range extraBlockedCallbackCIDRs {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// callbackAllowlist parses callbackAllowlistEnv into networks; bare IPs are
+// treated as single-host CIDRs. It returns nil when the env var is unset.
+func callbackAllowlist() ([]*net.IPNet, error) {
+	raw := envToString(callbackAllowlistEnv, "")
+	if raw == "" {
+		return nil, nil
+	}
+	var nets []*net.IPNet
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if !strings.Contains(entry, "/") {
+			if ip := net.ParseIP(entry); ip != nil && ip.To4() != nil {
+				entry += "/32"
+			} else {
+				entry += "/128"
+			}
+		}
+		_, n, err := net.ParseCIDR(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s entry %q: %w", callbackAllowlistEnv, entry, err)
+		}
+		nets = append(nets, n)
+	}
+	return nets, nil
+}
+
+// allowlistContains reports whether ip is inside any of the given networks.
+func allowlistContains(nets []*net.IPNet, ip net.IP) bool {
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}

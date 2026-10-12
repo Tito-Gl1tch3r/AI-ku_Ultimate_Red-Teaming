@@ -1,0 +1,1008 @@
+package cautils
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/kubescape/backend/pkg/versioncheck"
+	giturl "github.com/kubescape/go-git-url"
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	"github.com/kubescape/k8s-interface/k8sinterface"
+	"github.com/kubescape/kubescape/v4/core/cautils/getter"
+	apisv1 "github.com/kubescape/opa-utils/httpserver/apis/v1"
+	"github.com/kubescape/opa-utils/objectsenvelopes"
+	"github.com/kubescape/opa-utils/reporthandling"
+	reporthandlingv2 "github.com/kubescape/opa-utils/reporthandling/v2"
+	"k8s.io/client-go/tools/clientcmd"
+)
+
+type ScanningContext string
+
+const (
+	ContextCluster   ScanningContext = "cluster"
+	ContextFile      ScanningContext = "single-file"
+	ContextDir       ScanningContext = "local-dir"
+	ContextGitLocal  ScanningContext = "git-local"
+	ContextGitRemote ScanningContext = "git-remote"
+)
+
+const ( // deprecated
+	ScopeCluster = "cluster"
+)
+const (
+	LocalControlInputsFilename string = "controls-inputs.json"
+	LocalExceptionsFilename    string = "exceptions.json"
+	LocalAttackTracksFilename  string = "attack-tracks.json"
+)
+
+type BoolPtrFlag struct {
+	valPtr *bool
+}
+
+func NewBoolPtr(b *bool) BoolPtrFlag {
+	return BoolPtrFlag{valPtr: b}
+}
+
+func (bpf *BoolPtrFlag) Type() string {
+	return "bool"
+}
+
+func (bpf *BoolPtrFlag) String() string {
+	if bpf.valPtr != nil {
+		return fmt.Sprintf("%v", *bpf.valPtr)
+	}
+	return ""
+}
+func (bpf *BoolPtrFlag) Get() *bool {
+	return bpf.valPtr
+}
+func (bpf *BoolPtrFlag) GetBool() bool {
+	if bpf.valPtr == nil {
+		return false
+	}
+	return *bpf.valPtr
+}
+
+func (bpf *BoolPtrFlag) SetBool(val bool) {
+	bpf.valPtr = &val
+}
+
+func (bpf *BoolPtrFlag) Set(val string) error {
+	parsed, err := strconv.ParseBool(val)
+	if err != nil {
+		return err
+	}
+	bpf.SetBool(parsed)
+	return nil
+}
+
+// ViewTypes specifies how scan results are presented by the default (pretty) printer.
+type ViewTypes string
+
+const (
+	// ResourceViewType prints one section per failed resource, listing the
+	// controls that failed it. It only takes effect in verbose mode; passed
+	// resources are not shown.
+	ResourceViewType ViewTypes = "resource"
+
+	// SecurityViewType is the default view (see the --view flag). Rather than
+	// changing how results are grouped, it selects a security-oriented set of
+	// frameworks to scan with — workloadscan+allcontrols for a repository or
+	// directory target, clusterscan+mitre+nsa for a cluster — and prints the
+	// standard posture summary without per-control or per-resource detail.
+	// Note: the `scan framework` subcommand rewrites this to ResourceViewType.
+	SecurityViewType ViewTypes = "security"
+
+	// ControlViewType groups results by control, showing the compliance status
+	// of every control and the resources that failed it. Failed and
+	// action-required resources are always listed, and passed resources are
+	// listed in verbose mode.
+	ControlViewType ViewTypes = "control"
+
+	// NamespaceViewType prints the per-namespace compliance rollup: every
+	// control in the scan's policy set is counted toward each namespace's
+	// score, so namespaces are ranked worst-first and stay comparable to one
+	// another and to the cluster-wide score.
+	NamespaceViewType ViewTypes = "namespace"
+)
+
+type PolicyIdentifier struct {
+	Identifier string                        // policy Identifier e.g. c-0012 for control, nsa,mitre for frameworks
+	Kind       apisv1.NotificationPolicyKind // policy kind e.g. Framework,Control,Rule
+}
+
+type ScanInfo struct {
+	UseExceptions             string                                 // Load file with exceptions configuration
+	AuditExceptions           bool                                   // Include exception usage audit in supported scan outputs
+	HonorInlineExceptions     BoolPtrFlag                            // Honor kubescape.io/skip-* annotations as inline exception policies
+	CustomRules               string                                 // Path to a directory of custom *.rego rules
+	ControlsInputs            string                                 // Load file with inputs for controls
+	AttackTracks              string                                 // Load file with attack tracks
+	UseFrom                   []string                               // Load framework from local file (instead of download). Use when running offline
+	UseDefault                bool                                   // Load framework from cached file (instead of download). Use when running offline
+	UseArtifactsFrom          string                                 // Load artifacts from local path. Use when running offline
+	ControlsVersion           string                                 // Pin the regolibrary release used to download policies (e.g. "v2.0.301"). Empty uses the latest release
+	ScanContract              *reporthandlingv2.ScanContractMetadata // Selected repository scan contract provenance, populated only when --scan-contract is used
+	VerboseMode               bool                                   // Display all the input resources and not only failed resources
+	Hide                      bool                                   // Hide sensitive identifiers (names, namespaces, images) in results
+	EncryptionEnabled         bool
+	View                      string                       //
+	Format                    string                       // Format results (table, json, junit ...)
+	Output                    string                       // Store results in an output file, Output file name
+	NotifyURLs                []string                     // Webhook destinations that receive a formatted posture summary
+	FormatVersion             string                       // Output object can be different between versions, this is for testing and backward compatibility
+	CustomClusterName         string                       // Set the custom name of the cluster
+	ExcludedNamespaces        string                       // used for host scanner namespace
+	IncludeNamespaces         string                       //
+	ExcludeControls           []string                     // control IDs, or legacy CIS section numbers, to leave out of the scan (case-insensitive)
+	IncludeKinds              string                       // comma-separated Kubernetes kinds to include (case-insensitive, Kind name only); e.g. "Deployment,DaemonSet"
+	ExcludeKinds              string                       // comma-separated Kubernetes kinds to exclude (case-insensitive, Kind name only); e.g. "Job,CronJob"
+	LabelSelector             string                       // filter collected resources by Kubernetes label selector (e.g. "app=nginx,env!=dev")
+	ExcludePaths              []string                     // gitignore-style patterns excluding paths from file, directory and repository scans
+	NoIgnoreFile              bool                         // do not read the .kubescapeignore file at the scan root
+	Namespace                 string                       // target namespace for workload scans
+	NamespaceDefaulted        bool                         // true when target namespace for workload scans was defaulted to "default"
+	InputPatterns             []string                     // Yaml files input patterns
+	Silent                    bool                         // Silent mode - Do not print progress logs
+	FailThreshold             float32                      // DEPRECATED - Failure score threshold
+	ComplianceThreshold       float32                      // Compliance score threshold
+	FailThresholdSeverity     string                       // Severity at and above which the command should fail
+	OnlyFixable               bool                         // Gate the severity threshold to only count CVEs that have an available fix
+	FailCoverageThreshold     float32                      // Coverage threshold below which the command fails (0 = disabled)
+	FailOnDegradedConfig      bool                         // Fail the scan if control inputs or exceptions could not be loaded and a fallback was used
+	Submit                    BoolPtrFlag                  // Submit results to Kubescape Cloud BE. Get() is nil unless explicitly set by the caller (flag/env/request field)
+	ScanID                    string                       // Report id of the current scan
+	HostSensorEnabled         BoolPtrFlag                  // Deploy Kubescape K8s host scanner to collect data from certain controls
+	HostSensorEnabledDefault  *bool                        // Default fallback when HostSensorEnabled is unset (injected via ScanInfo defaults)
+	HostSensorYamlPath        string                       // Path to hostsensor file
+	Local                     bool                         // Do not submit results
+	AccountID                 string                       // account ID
+	AccessKey                 string                       // access key
+	FrameworkScan             bool                         // false if scanning control
+	ScanAll                   bool                         // true if scan all frameworks
+	OmitRawResources          bool                         // true if omit raw resources from the output
+	ShowEvidence              bool                         // Show evidence paths with current field values in pretty-printer output (-E / --show-evidence)
+	ShowSecrets               bool                         // Show secret field values in evidence output; redacted by default (--show-secrets)
+	PrintAttackTree           bool                         // true if print attack tree
+	EnableRegoPrint           bool                         // true if print rego
+	ScanObject                *objectsenvelopes.ScanObject // identifies a single resource (k8s object) to be scanned
+	IsDeletedScanObject       bool                         // indicates whether the ScanObject is a deleted K8S resource
+	TriggeredByCLI            bool                         // indicates whether the scan was triggered by the CLI
+	ScanType                  ScanTypes
+	ScanImages                bool
+	UseDefaultMatchers        bool
+	ScanTimeout               time.Duration // Maximum duration for the entire scan (0 = no timeout)
+	ControlTimeout            time.Duration // Maximum duration for evaluating a single control (0 = no timeout)
+	EnableStreaming           bool          // Enable resource streaming for large clusters to keep the evaluation input bounded
+	Incremental               bool          // Cache verdicts per resource, keyed by resource hash + controls-config version, and skip re-evaluating unchanged resources
+	DryRun                    bool          // Check RBAC access for the resources the scan would need, without collecting or evaluating anything
+	OtelEndpoint              string        // OTLP collector endpoint for exporting scan traces and metrics (empty = telemetry disabled)
+	ChartPath                 string
+	FilePath                  string
+	HelmValueFiles            []string // -f / --values: paths to Helm values YAML files (repeatable)
+	HelmSetValues             []string // --set: Helm value overrides as key=value (repeatable)
+	HelmSetStringValues       []string // --set-string: forced-string Helm value overrides
+	HelmSetFileValues         []string // --set-file: Helm value overrides whose value is read from a file
+	HelmReleaseName           string   // --release-name: Helm release name made available as .Release.Name during render
+	HelmReleaseNamespace      string   // --release-namespace: Helm release namespace made available as .Release.Namespace
+	LabelsToCopy              []string // Labels to copy from workloads to scan reports
+	SkipControls              string   // Control IDs to skip, e.g. "C-0001,C-0020"
+	IncludeControls           string   // Control IDs to include (all others skipped), e.g. "C-0001,C-0002"
+	scanningContext           *ScanningContext
+	kubeconfigPath            string
+	kubeContextOverride       string
+	clusterContextName        string
+	contextResolved           bool
+	cleanups                  []func()
+	ListingURL                string                      //Grype vulnerability database URL
+	SkipDBUpdate              bool                        // Do not update the vulnerability database before image scanning
+	FailOnStaleDB             bool                        // Fail image scans when the vulnerability DB is older than MaxDBAge (default: warn only)
+	FailOnStaleDBSet          bool                        // True when --fail-on-stale-db was explicitly passed (even false); the CLI populates this via Cobra Changed so explicit values win over KS_FAIL_ON_STALE_DB. Programmatic setters must set it alongside FailOnStaleDB.
+	MaxDBAge                  time.Duration               // Max allowed vulnerability DB age (default 120h); <=0 selects the default
+	MaxDBAgeSet               bool                        // True when --max-db-age was explicitly passed (even 0); the CLI populates this via Cobra Changed so explicit values win over KS_MAX_DB_AGE. Programmatic setters must set it alongside MaxDBAge.
+	RegistryMapping           map[string]string           // Map internal registry URLs to external ones
+	RegistryAuthority         string                      // Registry host[:port] explicit credentials apply to
+	RegistryUsername          string                      // Username for workload image registry authentication
+	RegistryPassword          string                      // Password for workload image registry authentication
+	RegistryToken             string                      // Bearer token for workload image registry authentication
+	ImageScanConcurrency      int                         // Number of concurrent workers for image scanning
+	ImagePlatform             string                      // OCI platform used for image scanning (os/architecture[/variant])
+	MinSeverity               string                      // Only include controls at or above this severity in the output
+	MaxSeverity               string                      // Only include controls at or below this severity in the output
+	Baseline                  string                      // Path to a saved JSON scan report; when set, the fresh scan is diffed against it
+	BaselineFailOnNew         bool                        // Exit with code 1 when the baseline diff finds new or incomparable failures
+	BaselineSeverityThreshold string                      // Only count new/incomparable baseline failures at or above this severity when enforcing BaselineFailOnNew
+	BaselineGranularity       string                      // Comparison unit for the baseline diff: "evidence" (default) or "control"
+	KubeContexts              []string                    // --kube-contexts: scan each of these kube contexts sequentially, one report per context (fleet mode)
+	FleetReport               string                      // --fleet-report: with --kube-contexts, also write one combined JSON report across every context to this path
+	ReferenceCluster          string                      // --reference-cluster: with --fleet-report, the kube context whose findings the other clusters are read against
+	WholeClusterPolicy        WholeClusterExecutionPolicy // Execution policy for whole-cluster controls (projected, fallback, skip, verify)
+}
+
+type WholeClusterExecutionPolicy string
+
+const (
+	// WholeClusterPolicyProjected accumulates only resources matching whole-cluster controls
+	// across batches, maintaining cross-namespace join correctness while keeping peak memory bounded.
+	WholeClusterPolicyProjected WholeClusterExecutionPolicy = "projected"
+
+	// WholeClusterPolicyFallback materializes all resources across the entire cluster into memory
+	// for whole-cluster control evaluation.
+	WholeClusterPolicyFallback WholeClusterExecutionPolicy = "fallback"
+
+	// WholeClusterPolicySkip bypasses whole-cluster controls entirely, marking them as skipped
+	// in scan coverage for strict memory bounds.
+	WholeClusterPolicySkip WholeClusterExecutionPolicy = "skip"
+
+	// WholeClusterPolicyVerify evaluates whole-cluster controls using both projected and fallback scopes
+	// and diffs verdicts across all evaluated resources (debug/cross-check mode).
+	WholeClusterPolicyVerify WholeClusterExecutionPolicy = "verify"
+)
+
+// ValidateWholeClusterPolicy validates that the policy is one of the supported values.
+func ValidateWholeClusterPolicy(policy WholeClusterExecutionPolicy) error {
+	switch policy {
+	case WholeClusterPolicyProjected, WholeClusterPolicyFallback, WholeClusterPolicySkip, WholeClusterPolicyVerify:
+		return nil
+	default:
+		return fmt.Errorf("invalid whole-cluster policy %q: supported policies are %q, %q, %q, %q",
+			policy, WholeClusterPolicyProjected, WholeClusterPolicyFallback, WholeClusterPolicySkip, WholeClusterPolicyVerify)
+	}
+}
+
+// ResolveWholeClusterPolicy determines the effective WholeClusterExecutionPolicy:
+// explicit string if provided, then KUBESCAPE_WHOLE_CLUSTER_POLICY, then KUBESCAPE_WHOLE_CLUSTER_PARITY_CHECK,
+// defaulting to WholeClusterPolicyProjected.
+func ResolveWholeClusterPolicy(explicitPolicy string) (WholeClusterExecutionPolicy, error) {
+	if explicitPolicy != "" {
+		p := WholeClusterExecutionPolicy(strings.ToLower(strings.TrimSpace(explicitPolicy)))
+		if err := ValidateWholeClusterPolicy(p); err != nil {
+			return "", err
+		}
+		return p, nil
+	}
+	if envVal := os.Getenv("KUBESCAPE_WHOLE_CLUSTER_POLICY"); envVal != "" {
+		p := WholeClusterExecutionPolicy(strings.ToLower(strings.TrimSpace(envVal)))
+		if err := ValidateWholeClusterPolicy(p); err != nil {
+			return "", err
+		}
+		return p, nil
+	}
+	if strings.EqualFold(os.Getenv("KUBESCAPE_WHOLE_CLUSTER_PARITY_CHECK"), "true") {
+		return WholeClusterPolicyVerify, nil
+	}
+	return WholeClusterPolicyProjected, nil
+}
+
+// GetWholeClusterPolicy returns the resolved WholeClusterExecutionPolicy for scanInfo.
+func (scanInfo *ScanInfo) GetWholeClusterPolicy() WholeClusterExecutionPolicy {
+	if scanInfo == nil || scanInfo.WholeClusterPolicy == "" {
+		p, _ := ResolveWholeClusterPolicy("")
+		return p
+	}
+	p, err := ResolveWholeClusterPolicy(string(scanInfo.WholeClusterPolicy))
+	if err != nil {
+		return WholeClusterPolicyProjected
+	}
+	return p
+}
+
+type Getters struct {
+	ExceptionsGetter     getter.IExceptionsGetter
+	ControlsInputsGetter getter.IControlsInputsGetter
+	PolicyGetter         getter.IPolicyGetter
+	AttackTracksGetter   getter.IAttackTracksGetter
+}
+
+func (scanInfo *ScanInfo) Init(ctx context.Context, policyIdentifiers []PolicyIdentifier) error {
+	scanInfo.setUseFrom(policyIdentifiers)
+	if err := scanInfo.setUseArtifactsFrom(ctx); err != nil {
+		return err
+	}
+	// setUseFrom and setUseArtifactsFrom can resolve to the same file - --use-default and
+	// --use-artifacts-from both point at the local store on the offline HTTP handler path -
+	// and a repeated path costs an extra read and unmarshal per policy load.
+	scanInfo.UseFrom = unique(scanInfo.UseFrom)
+	if scanInfo.ScanID == "" {
+		scanInfo.ScanID = uuid.NewString()
+	}
+	if err := scanInfo.MaterializeRemoteInputs(ctx); err != nil {
+		return err
+	}
+
+	if scanInfo.HostSensorEnabledDefault == nil {
+		// Inject default for host sensor control to enable autodetect
+		defaultHostSensor := true
+		scanInfo.HostSensorEnabledDefault = &defaultHostSensor
+	}
+	return nil
+}
+
+// Cleanup executes all registered cleanup hooks and clears the list so that
+// repeated sequential calls do not run the same hooks twice. This is important
+// because MaterializeRemoteInputs calls Cleanup on failure to roll back
+// partial clones, and the outer scan lifecycle (defer scanInfo.Cleanup()) may
+// call it again on return. This method is not safe for concurrent use.
+func (scanInfo *ScanInfo) Cleanup() {
+	cleanups := scanInfo.cleanups
+	scanInfo.cleanups = nil
+	for _, cleanup := range cleanups {
+		cleanup()
+	}
+}
+
+func (scanInfo *ScanInfo) AddCleanup(cleanup func()) {
+	scanInfo.cleanups = append(scanInfo.cleanups, cleanup)
+}
+
+func (scanInfo *ScanInfo) setUseArtifactsFrom(ctx context.Context) error {
+	if scanInfo.UseArtifactsFrom == "" {
+		return nil
+	}
+	// UseArtifactsFrom must be a directory. If it points at a single file,
+	// fall back to its parent directory based on the filesystem, not a name
+	// heuristic (a directory named "*.json" is still a directory). A bare
+	// filename with no path separator is left untouched so os.ReadDir below
+	// surfaces the existing clear error instead of silently scanning ".".
+	// An explicit current-directory path like "./<file>" has a separator, so
+	// it falls back to "." as its parent directory.
+	if info, err := os.Stat(scanInfo.UseArtifactsFrom); err == nil && !info.IsDir() {
+		if filepath.Base(scanInfo.UseArtifactsFrom) != scanInfo.UseArtifactsFrom {
+			scanInfo.UseArtifactsFrom = filepath.Dir(scanInfo.UseArtifactsFrom)
+		}
+	}
+	// set frameworks files
+	files, err := os.ReadDir(scanInfo.UseArtifactsFrom)
+	if err != nil {
+		return fmt.Errorf("failed to read files from directory %q: %w", scanInfo.UseArtifactsFrom, err)
+	}
+	framework := &reporthandling.Framework{}
+	for _, f := range files {
+		filePath := filepath.Join(scanInfo.UseArtifactsFrom, f.Name())
+		file, err := os.ReadFile(filepath.Clean(filePath))
+		if err == nil {
+			if err := json.Unmarshal(file, framework); err == nil {
+				scanInfo.UseFrom = append(scanInfo.UseFrom, filepath.Join(scanInfo.UseArtifactsFrom, f.Name()))
+			}
+		}
+	}
+	// set config-inputs file
+	if scanInfo.ControlsInputs == "" {
+		scanInfo.ControlsInputs = filepath.Join(scanInfo.UseArtifactsFrom, LocalControlInputsFilename)
+	}
+	// set exceptions
+	if scanInfo.UseExceptions == "" {
+		scanInfo.UseExceptions = filepath.Join(scanInfo.UseArtifactsFrom, LocalExceptionsFilename)
+	}
+
+	// set attack tracks
+	if scanInfo.AttackTracks == "" {
+		scanInfo.AttackTracks = filepath.Join(scanInfo.UseArtifactsFrom, LocalAttackTracksFilename)
+	}
+	return nil
+}
+
+func (scanInfo *ScanInfo) setUseFrom(policyIdentifiers []PolicyIdentifier) {
+	if scanInfo.UseDefault {
+		for _, policy := range policyIdentifiers {
+			path, err := getter.PolicyCachePath(policy.Identifier)
+			if err != nil {
+				logger.L().Warning("skipping default cache lookup for policy", helpers.String("identifier", policy.Identifier), helpers.Error(err))
+				continue
+			}
+			scanInfo.UseFrom = append(scanInfo.UseFrom, path)
+		}
+	}
+}
+
+// Formats returns a slice of output formats that have been requested for a given scan.
+// Empty entries and surrounding whitespace are dropped so that inputs like
+// "json,,pdf" or "json, ,pdf" do not produce blank format strings.
+func (scanInfo *ScanInfo) Formats() []string {
+	if scanInfo.Format == "" {
+		return []string{}
+	}
+
+	var cleaned []string
+	for f := range strings.SplitSeq(scanInfo.Format, ",") {
+		if v := strings.TrimSpace(f); v != "" {
+			cleaned = append(cleaned, v)
+		}
+	}
+
+	return unique(cleaned)
+}
+
+func unique(items []string) []string {
+	seen := map[string]bool{}
+	result := []string{}
+
+	for _, item := range items {
+		if !seen[item] {
+			seen[item] = true
+			result = append(result, item)
+		}
+	}
+
+	return result
+}
+
+func (scanInfo *ScanInfo) SetScanType(scanType ScanTypes) {
+	scanInfo.ScanType = scanType
+}
+
+// BuildPolicyIdentifiers builds a list of policy identifiers from the given
+// string identifiers, adding any new ones that are not already present.
+func BuildPolicyIdentifiers(policies []string, kind apisv1.NotificationPolicyKind) []PolicyIdentifier {
+	return AppendPolicyIdentifiers(nil, policies, kind)
+}
+
+// AppendPolicyIdentifiers appends the given string identifiers to the existing
+// list, adding any new ones that are not already present.
+func AppendPolicyIdentifiers(existing []PolicyIdentifier, policies []string, kind apisv1.NotificationPolicyKind) []PolicyIdentifier {
+	result := append([]PolicyIdentifier(nil), existing...)
+	for _, policy := range policies {
+		if !containsIdentifier(result, policy) {
+			result = append(result, PolicyIdentifier{
+				Kind:       kind,
+				Identifier: policy,
+			})
+		}
+	}
+	return result
+}
+
+// containsIdentifier reports whether the named identifier is already present.
+// The comparison is case-insensitive because a cache round-trip changes the casing:
+// the downloader lists regolibrary's lower case "nsa" and writes a file whose name
+// field is "NSA", so LoadPolicy.ListFrameworks reads back a name that no longer matches
+// the lower case getter.NativeFrameworks entry. Matching exactly would leave both in the
+// list and make downloadScanPolicies fetch and evaluate the same framework twice.
+func containsIdentifier(identifiers []PolicyIdentifier, name string) bool {
+	for _, policy := range identifiers {
+		if strings.EqualFold(policy.Identifier, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitNamespaceList parses a comma-separated namespace list (as accepted by
+// --exclude-namespaces / --include-namespaces) into a clean slice. Empty
+// entries and surrounding whitespace are dropped.
+func splitNamespaceList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	for p := range strings.SplitSeq(s, ",") {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func scanInfoToScanMetadata(ctx context.Context, scanInfo *ScanInfo, policyIdentifiers []PolicyIdentifier) *reporthandlingv2.Metadata {
+	metadata := &reporthandlingv2.Metadata{}
+
+	metadata.ScanMetadata.Formats = scanInfo.Formats()
+	metadata.ScanMetadata.FormatVersion = scanInfo.FormatVersion
+	metadata.ScanMetadata.Submit = scanInfo.Submit.GetBool()
+
+	if ns := splitNamespaceList(scanInfo.ExcludedNamespaces); len(ns) > 0 {
+		metadata.ScanMetadata.ExcludedNamespaces = ns
+	}
+	if ns := splitNamespaceList(scanInfo.IncludeNamespaces); len(ns) > 0 {
+		metadata.ScanMetadata.IncludeNamespaces = ns
+	}
+
+	// scan type
+	if len(policyIdentifiers) > 0 {
+		metadata.ScanMetadata.TargetType = string(policyIdentifiers[0].Kind)
+	}
+	// append frameworks
+	for _, policy := range policyIdentifiers {
+		metadata.ScanMetadata.TargetNames = append(metadata.ScanMetadata.TargetNames, policy.Identifier)
+	}
+
+	metadata.ScanMetadata.KubescapeVersion = versioncheck.BuildNumber
+	metadata.ScanMetadata.VerboseMode = scanInfo.VerboseMode
+	metadata.ScanMetadata.FailThreshold = scanInfo.FailThreshold
+	metadata.ScanMetadata.ComplianceThreshold = scanInfo.ComplianceThreshold
+	metadata.ScanMetadata.HostScanner = scanInfo.HostSensorEnabled.GetBool()
+	metadata.ScanMetadata.VerboseMode = scanInfo.VerboseMode
+	metadata.ScanMetadata.ControlsInputs = scanInfo.ControlsInputs
+	metadata.ScanMetadata.ScanContract = finalizeScanContractMetadata(scanInfo, policyIdentifiers)
+
+	switch scanInfo.GetScanningContext() {
+	case ContextCluster:
+		// cluster
+		metadata.ScanMetadata.ScanningTarget = reporthandlingv2.Cluster
+	case ContextFile:
+		// local file
+		metadata.ScanMetadata.ScanningTarget = reporthandlingv2.File
+	case ContextGitLocal:
+		// local-git
+		metadata.ScanMetadata.ScanningTarget = reporthandlingv2.GitLocal
+	case ContextGitRemote:
+		// remote
+		metadata.ScanMetadata.ScanningTarget = reporthandlingv2.Repo
+	case ContextDir:
+		// directory
+		metadata.ScanMetadata.ScanningTarget = reporthandlingv2.Directory
+
+	}
+
+	scanInfo.setContextMetadata(ctx, &metadata.ContextMetadata)
+
+	return metadata
+}
+
+func (scanInfo *ScanInfo) GetInputFiles() string {
+	if len(scanInfo.InputPatterns) > 0 {
+		return scanInfo.InputPatterns[0]
+	}
+	return ""
+}
+
+func (scanInfo *ScanInfo) GetScanningContext() ScanningContext {
+	if scanInfo.scanningContext == nil {
+		input := scanInfo.GetInputFiles()
+		scanningContext := scanInfo.getScanningContext(input)
+		scanInfo.scanningContext = &scanningContext
+	}
+	return *scanInfo.scanningContext
+}
+
+// SetKubeconfigSelection records the CLI kubeconfig selection without loading
+// it. Loading is deferred until Kubescape knows that the target is a live
+// cluster, so an irrelevant kubeconfig cannot break an offline manifest scan.
+func (scanInfo *ScanInfo) SetKubeconfigSelection(path, contextName string) {
+	scanInfo.kubeconfigPath = path
+	scanInfo.kubeContextOverride = contextName
+	scanInfo.clusterContextName = ""
+	scanInfo.contextResolved = false
+}
+
+// CloneForContext returns a copy of scanInfo prepared for scanning one kube
+// context as part of a multi-context ("fleet") scan, reusing the same
+// kubeconfig file the parent ScanInfo was configured with (fleet mode
+// switches context within one kubeconfig, not the file itself) but
+// targeting kubeContext. Every field is copied verbatim except the three
+// that must not be shared across sibling scans sharing one parent ScanInfo:
+//   - ScanID: cleared, so Init generates a fresh one for this context instead
+//     of reusing whichever sibling happened to run first.
+//   - cleanups: dropped, so this context's Cleanup() doesn't re-invoke
+//     closures another sibling already ran (or hasn't registered yet).
+//   - Output: replaced with the caller-supplied path (fleet mode gives each
+//     context its own report file; see cmd/scan/fleetscan.go).
+//
+// SetKubeconfigSelection also resets clusterContextName/contextResolved so
+// each clone re-resolves its own context rather than inheriting the
+// parent's.
+func (scanInfo *ScanInfo) CloneForContext(kubeContext, output string) *ScanInfo {
+	clone := *scanInfo
+
+	// Fleet contexts are initialized independently. A struct assignment is not
+	// enough here because slices, maps and pointer-backed flags would still
+	// alias the parent and every sibling clone. Init and the policy getters
+	// legitimately update several of these values, most notably UseFrom and
+	// ScanContract.RunnerInputs. Give each context ownership of its mutable
+	// configuration before any of those updates can happen.
+	clone.UseFrom = slices.Clone(scanInfo.UseFrom)
+	clone.NotifyURLs = slices.Clone(scanInfo.NotifyURLs)
+	clone.ExcludeControls = slices.Clone(scanInfo.ExcludeControls)
+	clone.ExcludePaths = slices.Clone(scanInfo.ExcludePaths)
+	clone.InputPatterns = slices.Clone(scanInfo.InputPatterns)
+	clone.HelmValueFiles = slices.Clone(scanInfo.HelmValueFiles)
+	clone.HelmSetValues = slices.Clone(scanInfo.HelmSetValues)
+	clone.HelmSetStringValues = slices.Clone(scanInfo.HelmSetStringValues)
+	clone.HelmSetFileValues = slices.Clone(scanInfo.HelmSetFileValues)
+	clone.LabelsToCopy = slices.Clone(scanInfo.LabelsToCopy)
+	clone.KubeContexts = slices.Clone(scanInfo.KubeContexts)
+	clone.RegistryMapping = maps.Clone(scanInfo.RegistryMapping)
+	clone.HonorInlineExceptions = scanInfo.HonorInlineExceptions.clone()
+	clone.Submit = scanInfo.Submit.clone()
+	clone.HostSensorEnabled = scanInfo.HostSensorEnabled.clone()
+	clone.HostSensorEnabledDefault = clonePtr(scanInfo.HostSensorEnabledDefault)
+	clone.ScanContract = cloneScanContractMetadata(scanInfo.ScanContract)
+
+	clone.ScanID = ""
+	clone.cleanups = nil
+	clone.Output = output
+	clone.SetKubeconfigSelection(scanInfo.kubeconfigPath, kubeContext)
+	return &clone
+}
+
+func (bpf BoolPtrFlag) clone() BoolPtrFlag {
+	return BoolPtrFlag{valPtr: clonePtr(bpf.valPtr)}
+}
+
+func clonePtr[T any](value *T) *T {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func cloneSlicePtr[T any](value *[]T) *[]T {
+	if value == nil {
+		return nil
+	}
+	clone := slices.Clone(*value)
+	return &clone
+}
+
+// cloneScanContractMetadata isolates every mutable part of report provenance.
+// The metadata is enriched while a scan runs, so sharing even a nested slice
+// would let one fleet context change the digest and audit trail of another.
+func cloneScanContractMetadata(metadata *reporthandlingv2.ScanContractMetadata) *reporthandlingv2.ScanContractMetadata {
+	if metadata == nil {
+		return nil
+	}
+
+	clone := *metadata
+	clone.AllowedSections = slices.Clone(metadata.AllowedSections)
+	clone.DeniedSections = slices.Clone(metadata.DeniedSections)
+	clone.RunnerInputs = slices.Clone(metadata.RunnerInputs)
+	clone.Effective = cloneEffectiveSettings(metadata.Effective)
+
+	if metadata.GateResolution != nil {
+		resolution := *metadata.GateResolution
+		resolution.SeverityAtLeast.Contract = clonePtr(metadata.GateResolution.SeverityAtLeast.Contract)
+		resolution.SeverityAtLeast.RunnerFloor = clonePtr(metadata.GateResolution.SeverityAtLeast.RunnerFloor)
+		resolution.SeverityAtLeast.Effective = clonePtr(metadata.GateResolution.SeverityAtLeast.Effective)
+		resolution.ComplianceBelow.Contract = clonePtr(metadata.GateResolution.ComplianceBelow.Contract)
+		resolution.ComplianceBelow.RunnerFloor = clonePtr(metadata.GateResolution.ComplianceBelow.RunnerFloor)
+		resolution.ComplianceBelow.Effective = clonePtr(metadata.GateResolution.ComplianceBelow.Effective)
+		resolution.CoverageBelow.Contract = clonePtr(metadata.GateResolution.CoverageBelow.Contract)
+		resolution.CoverageBelow.RunnerFloor = clonePtr(metadata.GateResolution.CoverageBelow.RunnerFloor)
+		resolution.CoverageBelow.Effective = clonePtr(metadata.GateResolution.CoverageBelow.Effective)
+		resolution.DegradedPolicyInput.Contract = clonePtr(metadata.GateResolution.DegradedPolicyInput.Contract)
+		resolution.DegradedPolicyInput.RunnerFloor = clonePtr(metadata.GateResolution.DegradedPolicyInput.RunnerFloor)
+		resolution.DegradedPolicyInput.Effective = clonePtr(metadata.GateResolution.DegradedPolicyInput.Effective)
+		clone.GateResolution = &resolution
+	}
+
+	if metadata.OrdinaryCLIOverrides != nil {
+		overrides := *metadata.OrdinaryCLIOverrides
+		if metadata.OrdinaryCLIOverrides.Policy != nil {
+			policy := *metadata.OrdinaryCLIOverrides.Policy
+			policy.Frameworks = cloneSlicePtr(policy.Frameworks)
+			policy.Controls = cloneSlicePtr(policy.Controls)
+			policy.ControlsVersion = clonePtr(policy.ControlsVersion)
+			overrides.Policy = &policy
+		}
+		if metadata.OrdinaryCLIOverrides.Scope != nil {
+			scope := *metadata.OrdinaryCLIOverrides.Scope
+			scope.IncludeNamespaces = cloneSlicePtr(scope.IncludeNamespaces)
+			scope.ExcludeNamespaces = cloneSlicePtr(scope.ExcludeNamespaces)
+			overrides.Scope = &scope
+		}
+		if metadata.OrdinaryCLIOverrides.Evaluation != nil {
+			evaluation := *metadata.OrdinaryCLIOverrides.Evaluation
+			evaluation.ScanTimeout = clonePtr(evaluation.ScanTimeout)
+			evaluation.ControlTimeout = clonePtr(evaluation.ControlTimeout)
+			overrides.Evaluation = &evaluation
+		}
+		if metadata.OrdinaryCLIOverrides.Output != nil {
+			outputSettings := *metadata.OrdinaryCLIOverrides.Output
+			outputSettings.Formats = cloneSlicePtr(outputSettings.Formats)
+			outputSettings.OmitRawResources = clonePtr(outputSettings.OmitRawResources)
+			overrides.Output = &outputSettings
+		}
+		clone.OrdinaryCLIOverrides = &overrides
+	}
+
+	return &clone
+}
+
+// ResolveClusterContextName resolves the context from the same kubeconfig
+// loading rules selected for the Kubernetes REST client. When neither an
+// explicit path nor a context override is configured, the existing
+// k8s-interface loading and in-cluster behavior is retained.
+func (scanInfo *ScanInfo) ResolveClusterContextName() error {
+	if scanInfo.kubeconfigPath == "" && scanInfo.kubeContextOverride == "" {
+		return nil
+	}
+
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	if scanInfo.kubeconfigPath != "" {
+		loadingRules.ExplicitPath = scanInfo.kubeconfigPath
+	}
+
+	kubeconfig, err := loadingRules.Load()
+	if err != nil {
+		if scanInfo.kubeconfigPath != "" {
+			return fmt.Errorf("failed to load kubeconfig %q: %w", scanInfo.kubeconfigPath, err)
+		}
+		return fmt.Errorf("failed to load kubeconfig: %w", err)
+	}
+
+	contextName := kubeconfig.CurrentContext
+	if scanInfo.kubeContextOverride != "" {
+		contextName = scanInfo.kubeContextOverride
+	}
+	if _, ok := kubeconfig.Contexts[contextName]; !ok {
+		if scanInfo.kubeconfigPath != "" {
+			return fmt.Errorf("context %q does not exist in kubeconfig %q", contextName, scanInfo.kubeconfigPath)
+		}
+		return fmt.Errorf("context %q does not exist in kubeconfig", contextName)
+	}
+
+	scanInfo.clusterContextName = contextName
+	scanInfo.contextResolved = true
+	return nil
+}
+
+// GetClusterContextName returns the context resolved from the CLI kubeconfig
+// and context selection, falling back to k8s-interface when neither was
+// resolved by this scan.
+func (scanInfo *ScanInfo) GetClusterContextName() string {
+	if scanInfo.contextResolved {
+		return scanInfo.clusterContextName
+	}
+	return k8sinterface.GetContextName()
+}
+
+// getScanningContext classifies the scan target type from the input string.
+// Remote URL classification (ContextGitRemote) is purely syntactic and performs
+// no network or disk I/O — in particular, it no longer clones the repository.
+// Local-path classification still inspects the filesystem (os.Getwd,
+// NewLocalGitRepository, isFile) to distinguish directories, files, and local
+// git repositories.
+func (scanInfo *ScanInfo) getScanningContext(input string) ScanningContext {
+	//  cluster
+	if input == "" {
+		return ContextCluster
+	}
+
+	// Check if input is a URL (http:// or https://)
+	isURL := isHTTPURL(input)
+
+	// git remote url
+	if _, err := giturl.NewGitURL(input); err == nil {
+		return ContextGitRemote
+	}
+
+	// If it looks like a URL but wasn't recognized as a git URL, still don't treat it as a local path
+	if isURL {
+		logger.L().Error("URL provided but not recognized as a valid git repository. Ensure the URL is correct and accessible", helpers.String("url", input))
+		return ContextDir
+	}
+
+	if !filepath.IsAbs(input) { // parse path
+		if o, err := os.Getwd(); err == nil {
+			input = filepath.Join(o, input)
+		}
+	}
+
+	// local git repo
+	if _, err := NewLocalGitRepository(input); err == nil {
+		return ContextGitLocal
+	}
+
+	//  single file
+	if isFile(input) {
+		return ContextFile
+	}
+
+	//  dir/glob
+	return ContextDir
+}
+
+// MaterializeRemoteInputs clones all remote git repositories declared in
+// InputPatterns, registers their cleanup hooks with ScanInfo, and returns
+// an error immediately if cloning fails.
+//
+// The ctx parameter provides pre-clone cancellation: if the context is
+// cancelled or expired, no further clones are attempted and any already-
+// cloned workspaces are cleaned up. Note that CloneGitRepo itself does
+// not accept a context (it delegates to git.PlainClone, not
+// git.PlainCloneContext), so an in-progress clone cannot be interrupted
+// mid-operation. Making the underlying clone context-aware is a possible
+// future improvement outside the scope of this refactor.
+func (scanInfo *ScanInfo) MaterializeRemoteInputs(ctx context.Context) error {
+	for _, candidate := range scanInfo.InputPatterns {
+		if err := ctx.Err(); err != nil {
+			scanInfo.Cleanup()
+			return err
+		}
+		if _, err := giturl.NewGitURL(candidate); err != nil {
+			continue
+		}
+
+		originalInput := candidate
+		clonedDir, err := CloneGitRepo(&candidate)
+		if err != nil {
+			scanInfo.Cleanup()
+			return fmt.Errorf("failed to clone remote git repository %q: %w", originalInput, err)
+		}
+
+		if _, err := NewLocalGitRepository(clonedDir); err != nil {
+			if releaseErr := ReleaseClonedRepo(originalInput); releaseErr != nil {
+				logger.L().Warning("failed to clean up invalid cloned repository", helpers.String("url", originalInput), helpers.Error(releaseErr))
+			}
+			scanInfo.Cleanup()
+			return fmt.Errorf("cloned repository %q is not a valid git repository: %w", originalInput, err)
+		}
+
+		scanInfo.AddCleanup(func() {
+			if err := ReleaseClonedRepo(originalInput); err != nil {
+				logger.L().Warning("failed to clean up cloned repository", helpers.String("url", originalInput), helpers.Error(err))
+			}
+		})
+	}
+	return nil
+}
+
+func (scanInfo *ScanInfo) setContextMetadata(ctx context.Context, contextMetadata *reporthandlingv2.ContextMetadata) {
+	input := scanInfo.GetInputFiles()
+	switch scanInfo.GetScanningContext() {
+	case ContextCluster:
+		contextMetadata.ClusterContextMetadata = &reporthandlingv2.ClusterMetadata{
+			ContextName: scanInfo.GetClusterContextName(),
+		}
+	case ContextDir:
+		// the base path must be the root the file loader anchored the resources'
+		// relative paths on, or the two no longer compose for anyone joining them
+		basePath := ScanRootPath(input)
+		contextMetadata.DirectoryContextMetadata = &reporthandlingv2.DirectoryContextMetadata{
+			BasePath: basePath,
+			HostName: getHostname(),
+		}
+		// add repo context for submitting
+		contextMetadata.RepoContextMetadata = &reporthandlingv2.RepoContextMetadata{
+			Provider:      "none",
+			Repo:          fmt.Sprintf("path@%s", getAbsPath(input)),
+			Owner:         getHostname(),
+			Branch:        "none",
+			DefaultBranch: "none",
+			LocalRootPath: basePath,
+		}
+
+	case ContextFile:
+		contextMetadata.FileContextMetadata = &reporthandlingv2.FileContextMetadata{
+			FilePath: getAbsPath(input),
+			HostName: getHostname(),
+		}
+		// add repo context for submitting
+		contextMetadata.RepoContextMetadata = &reporthandlingv2.RepoContextMetadata{
+			Provider:      "none",
+			Repo:          fmt.Sprintf("file@%s", getAbsPath(input)),
+			Owner:         getHostname(),
+			Branch:        "none",
+			DefaultBranch: "none",
+			LocalRootPath: ScanRootPath(input),
+		}
+	case ContextGitLocal:
+		// local
+		repoContext, err := metadataGitLocal(input)
+		if err != nil {
+			logger.L().Ctx(ctx).Warning("in setContextMetadata", helpers.Interface("case", ContextGitLocal), helpers.Error(err))
+		}
+		contextMetadata.RepoContextMetadata = repoContext
+	case ContextGitRemote:
+		// remote
+		repoContext, err := metadataGitLocal(GetClonedPath(input))
+		if err != nil {
+			logger.L().Ctx(ctx).Warning("in setContextMetadata", helpers.Interface("case", ContextGitRemote), helpers.Error(err))
+		}
+		contextMetadata.RepoContextMetadata = repoContext
+	}
+}
+
+func metadataGitLocal(input string) (*reporthandlingv2.RepoContextMetadata, error) {
+	repoContext := &reporthandlingv2.RepoContextMetadata{
+		Branch:        "none",
+		DefaultBranch: "none",
+		LocalRootPath: getAbsPath(input),
+	}
+	gitParser, err := NewLocalGitRepository(input)
+	if err != nil {
+		return repoContext, fmt.Errorf("%w", err)
+	}
+	if root, rootErr := gitParser.GetRootDir(); rootErr == nil {
+		repoContext.LocalRootPath = root
+	}
+	remoteURL, err := gitParser.GetRemoteUrl()
+	if err != nil {
+		return repoContext, fmt.Errorf("%w", err)
+	}
+	gitParserURL, err := giturl.NewGitURL(remoteURL)
+	if err != nil {
+		return repoContext, fmt.Errorf("%w", err)
+	}
+	branchName := gitParser.GetBranchName()
+	if branchName != "" {
+		gitParserURL.SetBranchName(branchName)
+		repoContext.Branch = branchName
+		repoContext.DefaultBranch = ""
+	}
+
+	repoContext.Provider = gitParserURL.GetProvider()
+	repoContext.Repo = gitParserURL.GetRepoName()
+	repoContext.Owner = gitParserURL.GetOwnerName()
+	repoContext.RemoteURL = gitParserURL.GetURL().String()
+
+	commit, err := gitParser.GetLastCommit()
+	if err != nil {
+		return repoContext, fmt.Errorf("%w", err)
+	}
+	repoContext.LastCommit = reporthandling.LastCommit{
+		Hash:          commit.SHA,
+		Date:          commit.Committer.Date,
+		CommitterName: commit.Committer.Name,
+	}
+	return repoContext, nil
+}
+func getHostname() string {
+	if h, e := os.Hostname(); e == nil {
+		return h
+	}
+	return ""
+}
+
+func getAbsPath(p string) string {
+	if !filepath.IsAbs(p) { // parse path
+		if o, err := os.Getwd(); err == nil {
+			return filepath.Join(o, p)
+		}
+	}
+	return p
+}
+
+// isHTTPURL checks if the input string is an HTTP or HTTPS URL
+func isHTTPURL(input string) bool {
+	return strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://")
+}
+
+// EvidenceFlagWarnings returns what --show-evidence cannot deliver alongside
+// the other flags this scan was given, one message per combination.
+//
+// Neither combination is an error: each flag still does what it says, and
+// refusing the scan over a weaker evidence column would be worse than running
+// it. What the user cannot be left to discover is the part that silently does
+// not happen - a missing line number, or a value printed by one flag that
+// another asked to keep out of the output.
+func (scanInfo *ScanInfo) EvidenceFlagWarnings() []string {
+	if !scanInfo.ShowEvidence {
+		return nil
+	}
+
+	var warnings []string
+
+	// --hide and --encrypt replace every source path with a pseudonym before
+	// the report is printed, so the manifest a finding came from can no longer
+	// be opened to find its line. Paths and values are still shown.
+	if scanInfo.Hide || scanInfo.EncryptionEnabled {
+		flag := "--hide"
+		if scanInfo.EncryptionEnabled {
+			flag = "--encrypt"
+		}
+		warnings = append(warnings,
+			"--show-evidence cannot resolve line numbers with "+flag+": source paths are anonymized, so the manifests cannot be read")
+	}
+
+	// --omit-raw-resources keeps the scanned resources out of the report, but
+	// evidence reads those same resources to show each failing field's current
+	// value, so the values still reach the terminal.
+	if scanInfo.OmitRawResources {
+		warnings = append(warnings,
+			"--show-evidence still prints field values read from the scanned resources, which --omit-raw-resources keeps out of the report")
+	}
+
+	return warnings
+}

@@ -1,0 +1,1296 @@
+package printer
+
+import (
+	"context"
+	"encoding/csv"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/armosec/armoapi-go/armotypes"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/opa-utils/objectsenvelopes/localworkload"
+	reporthandling "github.com/kubescape/opa-utils/reporthandling"
+	"github.com/kubescape/opa-utils/reporthandling/apis"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/reportsummary"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/resourcesresults"
+	reporthandlingv2 "github.com/kubescape/opa-utils/reporthandling/v2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const (
+	testControlID1  = "C-0057"
+	testControlID2  = "C-0058"
+	testResourceID1 = "apps/v1/Deployment/default/demo"
+	testResourceID2 = "apps/v1/Deployment/default/absent"
+)
+
+func csvSessionFixture() *cautils.OPASessionObj {
+	obj := map[string]interface{}{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata": map[string]interface{}{
+			"name":      "demo",
+			"namespace": "default",
+		},
+		"spec": map[string]interface{}{},
+	}
+	lw := localworkload.NewLocalWorkload(obj)
+
+	ac1 := resourcesresults.ResourceAssociatedControl{
+		ControlID: testControlID1,
+		Name:      "Privileged container",
+		Status:    apis.StatusInfo{InnerStatus: apis.StatusFailed},
+	}
+
+	ac2 := resourcesresults.ResourceAssociatedControl{
+		ControlID: testControlID2,
+		Name:      "Run as root",
+		Status:    apis.StatusInfo{InnerStatus: apis.StatusPassed},
+	}
+
+	session := cautils.NewOPASessionObjMock()
+	session.ResourcesResult[testResourceID1] = resourcesresults.Result{
+		ResourceID:         testResourceID1,
+		AssociatedControls: []resourcesresults.ResourceAssociatedControl{ac1, ac2},
+	}
+	session.ResourcesResult[testResourceID2] = resourcesresults.Result{
+		ResourceID:         testResourceID2,
+		AssociatedControls: []resourcesresults.ResourceAssociatedControl{ac1},
+	}
+	session.AllResources[testResourceID1] = lw
+
+	session.Report = &reporthandlingv2.PostureReport{
+		SummaryDetails: reportsummary.SummaryDetails{
+			Controls: reportsummary.ControlSummaries{
+				testControlID1: reportsummary.ControlSummary{
+					ControlID:   testControlID1,
+					Name:        "Privileged container",
+					ScoreFactor: 9.0,
+				},
+				testControlID2: reportsummary.ControlSummary{
+					ControlID:   testControlID2,
+					Name:        "Run as root",
+					ScoreFactor: 5.0,
+				},
+			},
+		},
+	}
+
+	return session
+}
+
+func csvSessionFixtureWithPaths() *cautils.OPASessionObj {
+	session := csvSessionFixture()
+
+	ac1WithPaths := resourcesresults.ResourceAssociatedControl{
+		ControlID: testControlID1,
+		Name:      "Privileged container",
+		Status:    apis.StatusInfo{InnerStatus: apis.StatusFailed},
+		ResourceAssociatedRules: []resourcesresults.ResourceAssociatedRule{
+			{
+				Paths: []armotypes.PosturePaths{
+					{
+						ReviewPath: "spec.containers[0].securityContext.privileged",
+						FixPath: armotypes.FixPath{
+							Path:  "spec.containers[0].securityContext.privileged",
+							Value: "false",
+						},
+					},
+					{
+						ReviewPath: "spec.initContainers[0].securityContext.privileged",
+					},
+				},
+			},
+		},
+	}
+
+	ac2NoPath := resourcesresults.ResourceAssociatedControl{
+		ControlID: testControlID2,
+		Name:      "Run as root",
+		Status:    apis.StatusInfo{InnerStatus: apis.StatusPassed},
+	}
+
+	session.ResourcesResult[testResourceID1] = resourcesresults.Result{
+		ResourceID:         testResourceID1,
+		AssociatedControls: []resourcesresults.ResourceAssociatedControl{ac1WithPaths, ac2NoPath},
+	}
+
+	session.ResourceSource = make(map[string]reporthandling.Source)
+	session.ResourceSource[testResourceID1] = reporthandling.Source{
+		RelativePath: "manifests/deployment.yaml",
+		Path:         "/home/user/project/manifests/deployment.yaml",
+	}
+
+	session.Report.SummaryDetails.Controls[testControlID1] = reportsummary.ControlSummary{
+		ControlID:   testControlID1,
+		Name:        "Privileged container",
+		ScoreFactor: 9.0,
+		Remediation: "remove privilegedContainer: True flag from your pod spec",
+	}
+
+	return session
+}
+
+// csvSessionFixtureManyRows builds a session with n associated controls on a
+// single resource, producing enough CSV row data to overflow the csv.Writer's
+// internal buffer mid-loop rather than only at the final Flush.
+func csvSessionFixtureManyRows(n int) *cautils.OPASessionObj {
+	obj := map[string]interface{}{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata": map[string]interface{}{
+			"name":      "demo",
+			"namespace": "default",
+		},
+		"spec": map[string]interface{}{},
+	}
+	lw := localworkload.NewLocalWorkload(obj)
+
+	controls := make([]resourcesresults.ResourceAssociatedControl, 0, n)
+	for i := 0; i < n; i++ {
+		controls = append(controls, resourcesresults.ResourceAssociatedControl{
+			ControlID: fmt.Sprintf("C-%04d", i),
+			Name:      fmt.Sprintf("control-%d", i),
+			Status:    apis.StatusInfo{InnerStatus: apis.StatusFailed},
+		})
+	}
+
+	session := cautils.NewOPASessionObjMock()
+	session.ResourcesResult[testResourceID1] = resourcesresults.Result{
+		ResourceID:         testResourceID1,
+		AssociatedControls: controls,
+	}
+	session.AllResources[testResourceID1] = lw
+	session.Report = &reporthandlingv2.PostureReport{
+		SummaryDetails: reportsummary.SummaryDetails{
+			Controls: reportsummary.ControlSummaries{},
+		},
+	}
+
+	return session
+}
+
+// openDevFull opens /dev/full, a device whose Write always fails with
+// ENOSPC, to deterministically simulate an underlying I/O write failure.
+// Tests using it are skipped on platforms where the device doesn't exist.
+func openDevFull(t *testing.T) *os.File {
+	t.Helper()
+	if _, err := os.Stat("/dev/full"); err != nil {
+		t.Skip("/dev/full not available on this platform")
+	}
+	f, err := os.OpenFile("/dev/full", os.O_WRONLY, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = f.Close() })
+	return f
+}
+
+func TestActionPrint_Csv_WriteFailureIsReported(t *testing.T) {
+	// A small fixture whose rows all fit comfortably inside the csv.Writer's
+	// internal buffer: no row write ever touches the underlying file, so the
+	// only write attempt happens on the final Flush.
+	cp := NewCsvPrinter(false)
+	cp.writer = openDevFull(t)
+
+	err := cp.ActionPrint(context.TODO(), csvSessionFixture(), nil)
+	require.Error(t, err, "ActionPrint must surface a failed flush instead of silently returning nil")
+}
+
+func TestActionPrint_Csv_MidLoopWriteFailureIsReported(t *testing.T) {
+	// Enough rows to overflow the csv.Writer's internal 4KB buffer mid-loop,
+	// forcing a real write to the underlying file (and a resulting error)
+	// before the loop even finishes, exercising the early-return path that
+	// used to skip the final Flush() entirely.
+	cp := NewCsvPrinter(false)
+	cp.writer = openDevFull(t)
+
+	err := cp.ActionPrint(context.TODO(), csvSessionFixtureManyRows(200), nil)
+	require.Error(t, err, "ActionPrint must surface a mid-loop write failure instead of silently returning nil")
+}
+
+func TestNewCsvPrinter(t *testing.T) {
+	cp := NewCsvPrinter(false)
+	assert.NotNil(t, cp)
+}
+
+func TestSetWriter_Csv(t *testing.T) {
+	cp := NewCsvPrinter(false)
+	assert.NotNil(t, cp)
+
+	cp.SetWriter(context.TODO(), "")
+	assert.NotNil(t, cp.writer)
+	cp.CloseWriter()
+}
+
+func TestScore_Csv(t *testing.T) {
+	tests := []struct {
+		name  string
+		score float32
+		want  string
+	}{
+		{
+			name:  "Score not an integer",
+			score: 20.7,
+			want:  "\nOverall compliance-score (100- Excellent, 0- All failed): 21\n",
+		},
+		{
+			name:  "Perfect Score",
+			score: 100,
+			want:  "\nOverall compliance-score (100- Excellent, 0- All failed): 100\n",
+		},
+	}
+
+	cp := NewCsvPrinter(false)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f, err := os.CreateTemp("", "csvPrinter-score-output")
+			if err != nil {
+				panic(err)
+			}
+			defer func() {
+				_ = f.Close()
+			}()
+
+			oldStderr := os.Stderr
+			defer func() {
+				os.Stderr = oldStderr
+			}()
+			os.Stderr = f
+
+			cp.Score(tt.score)
+
+			f.Seek(0, 0)
+			got, err := io.ReadAll(f)
+			if err != nil {
+				panic(err)
+			}
+			assert.Equal(t, tt.want, string(got))
+		})
+	}
+}
+
+func TestActionPrint_Csv(t *testing.T) {
+	session := csvSessionFixture()
+
+	tmpCsv, err := os.CreateTemp("", "csv-regression-*.csv")
+	assert.NoError(t, err)
+	defer func() {
+		_ = os.Remove(tmpCsv.Name())
+	}()
+
+	cp := NewCsvPrinter(false)
+	cp.writer = tmpCsv
+	cp.ActionPrint(context.TODO(), session, nil)
+	cp.CloseWriter()
+
+	f, err := os.Open(tmpCsv.Name())
+	assert.NoError(t, err)
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	records, err := r.ReadAll()
+	assert.NoError(t, err)
+
+	assert.Equal(t, 4, len(records))
+
+	expectedHeader := []string{
+		"Control Name",
+		"Control ID",
+		"Severity",
+		"Status",
+		"Resource Name",
+		"Resource Kind",
+		"Resource Namespace",
+		"API Version",
+		"Failed Paths",
+		"Fix Paths",
+		"Remediation",
+		"Control URL",
+		"Source Path",
+	}
+	assert.Equal(t, expectedHeader, records[0], "Header should match expected")
+	assert.Equal(t, 13, len(records[0]), "Header should have 13 columns")
+
+	var failedDemo, passedDemo, failedAbsent bool
+	for _, row := range records[1:] {
+		require.Equal(t, 13, len(row), "every data row must have 13 columns")
+		if row[0] == "Privileged container" && row[1] == testControlID1 && row[3] == "failed" {
+			if row[4] == "demo" && row[5] == "Deployment" && row[6] == "default" && row[7] == "apps/v1" {
+				failedDemo = true
+			} else if row[4] == "" && row[5] == "" && row[6] == "" && row[7] == "" {
+				failedAbsent = true
+			}
+		} else if row[0] == "Run as root" && row[1] == testControlID2 && row[3] == "passed" {
+			if row[4] == "demo" {
+				passedDemo = true
+			}
+		}
+	}
+
+	assert.True(t, failedDemo, "expected failed control row for demo resource")
+	assert.True(t, passedDemo, "expected passed control row for demo resource")
+	assert.True(t, failedAbsent, "expected failed control row for absent resource")
+}
+
+func TestActionPrint_Csv_WithPaths(t *testing.T) {
+	session := csvSessionFixtureWithPaths()
+
+	tmpCsv, err := os.CreateTemp("", "csv-paths-*.csv")
+	require.NoError(t, err)
+	defer os.Remove(tmpCsv.Name())
+
+	cp := NewCsvPrinter(false)
+	cp.writer = tmpCsv
+	cp.ActionPrint(context.TODO(), session, nil)
+	cp.CloseWriter()
+
+	f, err := os.Open(tmpCsv.Name())
+	require.NoError(t, err)
+	defer f.Close()
+
+	records, err := csv.NewReader(f).ReadAll()
+	require.NoError(t, err)
+	require.Greater(t, len(records), 1)
+
+	var foundRow []string
+	for _, row := range records[1:] {
+		if row[1] == testControlID1 && row[4] == "demo" {
+			foundRow = row
+			break
+		}
+	}
+	require.NotNil(t, foundRow, "should find C-0057 row for demo resource")
+
+	assert.Contains(t, foundRow[8], "spec.containers[0].securityContext.privileged", "Failed Paths column")
+	assert.Contains(t, foundRow[8], "spec.initContainers[0].securityContext.privileged", "Failed Paths column second path")
+	assert.Contains(t, foundRow[9], "spec.containers[0].securityContext.privileged=false", "Fix Paths column")
+	assert.Equal(t, "remove privilegedContainer: True flag from your pod spec", foundRow[10], "Remediation column")
+	assert.NotEmpty(t, foundRow[11], "Control URL column should not be empty")
+	assert.Equal(t, "manifests/deployment.yaml", foundRow[12], "Source Path column uses RelativePath")
+}
+
+// TestActionPrint_Csv_MissingAllResourcesEntryFailsClosed is a regression
+// test: when a resource's ResourcesResult entry has no corresponding
+// AllResources entry (a partial/degraded collection, or ordering the
+// printer has no control over), resKind in ActionPrint stays "". Before the
+// kind == "" fail-closed check in csvControlPaths, this resource's fix
+// values were written to the CSV unredacted regardless of --show-secrets,
+// since the Secret-kind check in isSensitivePath never got a chance to
+// fire.
+func TestActionPrint_Csv_MissingAllResourcesEntryFailsClosed(t *testing.T) {
+	const missingResourceID = "v1/Secret/default/orphaned"
+	session := cautils.NewOPASessionObjMock()
+	session.ResourcesResult[missingResourceID] = resourcesresults.Result{
+		ResourceID: missingResourceID,
+		AssociatedControls: []resourcesresults.ResourceAssociatedControl{
+			{
+				ControlID: "C-0012",
+				Name:      "Credentials in env var",
+				Status:    apis.StatusInfo{InnerStatus: apis.StatusFailed},
+				ResourceAssociatedRules: []resourcesresults.ResourceAssociatedRule{
+					{
+						Paths: []armotypes.PosturePaths{
+							{FixPath: armotypes.FixPath{Path: "data.password", Value: "s3cr3t-plaintext-password"}},
+						},
+					},
+				},
+			},
+		},
+	}
+	// Deliberately no session.AllResources[missingResourceID] entry.
+	session.Report = &reporthandlingv2.PostureReport{
+		SummaryDetails: reportsummary.SummaryDetails{
+			Controls: reportsummary.ControlSummaries{
+				"C-0012": reportsummary.ControlSummary{ControlID: "C-0012", Name: "Credentials in env var", ScoreFactor: 8.0},
+			},
+		},
+	}
+
+	tmpCsv, err := os.CreateTemp("", "csv-missing-resource-*.csv")
+	require.NoError(t, err)
+	defer os.Remove(tmpCsv.Name())
+
+	cp := NewCsvPrinter(false)
+	cp.writer = tmpCsv
+	require.NoError(t, cp.ActionPrint(context.TODO(), session, nil))
+	require.NoError(t, cp.CloseWriter())
+
+	f, err := os.Open(tmpCsv.Name())
+	require.NoError(t, err)
+	defer f.Close()
+
+	records, err := csv.NewReader(f).ReadAll()
+	require.NoError(t, err)
+
+	var foundRow []string
+	for _, row := range records[1:] {
+		if row[1] == "C-0012" {
+			foundRow = row
+			break
+		}
+	}
+	require.NotNil(t, foundRow, "should find the C-0012 row even though the resource is unresolved")
+	assert.Empty(t, foundRow[5], "Resource Kind column is empty: the AllResources lookup missed")
+	assert.NotContains(t, foundRow[9], "s3cr3t-plaintext-password", "Fix Paths column must not leak the value when kind is unresolved")
+	assert.Contains(t, foundRow[9], "[redacted]", "Fix Paths column must fail closed to redacted")
+}
+
+func TestActionPrint_Csv_NilSession(t *testing.T) {
+	cp := NewCsvPrinter(false)
+	cp.writer = os.Stdout
+	cp.ActionPrint(context.TODO(), nil, nil)
+}
+
+// TestCsvControlPaths verifies the Failed Paths and Fix Paths cells. It covers
+// delete paths, review paths, legacy failed paths, duplicate locations, and
+// fix-value redaction.
+func TestCsvControlPaths(t *testing.T) {
+	makeResult := func(controlID string, rules []resourcesresults.ResourceAssociatedRule) resourcesresults.Result {
+		return resourcesresults.Result{
+			AssociatedControls: []resourcesresults.ResourceAssociatedControl{
+				{
+					ControlID:               controlID,
+					ResourceAssociatedRules: rules,
+				},
+			},
+		}
+	}
+
+	cases := []struct {
+		name       string
+		result     resourcesresults.Result
+		controlID  string
+		kind       string
+		wantFailed string
+		wantFix    string
+	}{
+		{
+			name: "single failed path with fix",
+			result: makeResult("C-0057", []resourcesresults.ResourceAssociatedRule{
+				{
+					Paths: []armotypes.PosturePaths{
+						{
+							ReviewPath: "spec.containers[0].securityContext.privileged",
+							FixPath:    armotypes.FixPath{Path: "spec.containers[0].securityContext.privileged", Value: "false"},
+						},
+					},
+				},
+			}),
+			controlID:  "C-0057",
+			kind:       "Deployment",
+			wantFailed: "spec.containers[0].securityContext.privileged",
+			wantFix:    "spec.containers[0].securityContext.privileged=false",
+		},
+		{
+			name: "multiple failed paths joined by semicolon",
+			result: makeResult("C-0057", []resourcesresults.ResourceAssociatedRule{
+				{
+					Paths: []armotypes.PosturePaths{
+						{ReviewPath: "spec.containers[0].securityContext.privileged"},
+						{ReviewPath: "spec.initContainers[0].securityContext.privileged"},
+					},
+				},
+			}),
+			controlID:  "C-0057",
+			wantFailed: "spec.containers[0].securityContext.privileged; spec.initContainers[0].securityContext.privileged",
+			wantFix:    "",
+		},
+		{
+			name: "delete path is reported as a failed path",
+			result: makeResult("C-0041", []resourcesresults.ResourceAssociatedRule{
+				{
+					Paths: []armotypes.PosturePaths{
+						{DeletePath: "spec.hostNetwork"},
+					},
+				},
+			}),
+			controlID:  "C-0041",
+			kind:       "Pod",
+			wantFailed: "spec.hostNetwork",
+			wantFix:    "",
+		},
+		{
+			name: "delete and review paths are both listed",
+			result: makeResult("C-0041", []resourcesresults.ResourceAssociatedRule{
+				{
+					Paths: []armotypes.PosturePaths{
+						{DeletePath: "spec.hostNetwork"},
+						{ReviewPath: "spec.hostPID"},
+					},
+				},
+			}),
+			controlID:  "C-0041",
+			kind:       "Pod",
+			wantFailed: "spec.hostNetwork; spec.hostPID",
+			wantFix:    "",
+		},
+		{
+			name: "duplicate delete and review path is listed once",
+			result: makeResult("C-0041", []resourcesresults.ResourceAssociatedRule{
+				{
+					Paths: []armotypes.PosturePaths{
+						{DeletePath: "spec.hostPID", ReviewPath: "spec.hostPID"},
+					},
+				},
+			}),
+			controlID:  "C-0041",
+			kind:       "Pod",
+			wantFailed: "spec.hostPID",
+			wantFix:    "",
+		},
+		{
+			name: "legacy failed path is included",
+			result: makeResult("C-0041", []resourcesresults.ResourceAssociatedRule{
+				{
+					Paths: []armotypes.PosturePaths{
+						{FailedPath: "spec.hostIPC"},
+					},
+				},
+			}),
+			controlID:  "C-0041",
+			kind:       "Pod",
+			wantFailed: "spec.hostIPC",
+			wantFix:    "",
+		},
+		{
+			name: "legacy failed path matching the review path is listed once",
+			result: makeResult("C-0041", []resourcesresults.ResourceAssociatedRule{
+				{
+					Paths: []armotypes.PosturePaths{
+						{FailedPath: "spec.hostIPC", ReviewPath: "spec.hostIPC"},
+					},
+				},
+			}),
+			controlID:  "C-0041",
+			kind:       "Pod",
+			wantFailed: "spec.hostIPC",
+			wantFix:    "",
+		},
+		{
+			name: "fix path without failed path",
+			result: makeResult("C-0057", []resourcesresults.ResourceAssociatedRule{
+				{
+					Paths: []armotypes.PosturePaths{
+						{FixPath: armotypes.FixPath{Path: "spec.hostNetwork", Value: "false"}},
+					},
+				},
+			}),
+			controlID:  "C-0057",
+			kind:       "Deployment",
+			wantFailed: "",
+			wantFix:    "spec.hostNetwork=false",
+		},
+		{
+			name: "control not in result returns empty strings",
+			result: makeResult("C-0057", []resourcesresults.ResourceAssociatedRule{
+				{
+					Paths: []armotypes.PosturePaths{
+						{ReviewPath: "spec.containers[0].securityContext.privileged"},
+					},
+				},
+			}),
+			controlID:  "C-9999",
+			wantFailed: "",
+			wantFix:    "",
+		},
+		{
+			name:       "result with no rules returns empty strings",
+			result:     makeResult("C-0057", nil),
+			controlID:  "C-0057",
+			wantFailed: "",
+			wantFix:    "",
+		},
+		{
+			name: "multiple rules paths concatenated",
+			result: makeResult("C-0057", []resourcesresults.ResourceAssociatedRule{
+				{
+					Paths: []armotypes.PosturePaths{
+						{ReviewPath: "spec.containers[0].securityContext.privileged"},
+					},
+				},
+				{
+					Paths: []armotypes.PosturePaths{
+						{ReviewPath: "spec.containers[1].securityContext.privileged"},
+					},
+				},
+			}),
+			controlID:  "C-0057",
+			wantFailed: "spec.containers[0].securityContext.privileged; spec.containers[1].securityContext.privileged",
+			wantFix:    "",
+		},
+		{
+			name: "empty result returns empty strings",
+			result: resourcesresults.Result{
+				AssociatedControls: nil,
+			},
+			controlID:  "C-0057",
+			wantFailed: "",
+			wantFix:    "",
+		},
+		{
+			// kind: "Pod" matters here: automountServiceAccountToken is a
+			// secret-shaped field name ("...Token"), but it's an allowlisted
+			// safe field on a Pod spec (see matchesSafeField) -- an empty
+			// kind would fall through to the generic name-pattern check and
+			// wrongly redact a boolean toggle that never holds a secret.
+			name: "fix path with empty value emits bare path without equals",
+			result: makeResult("C-0057", []resourcesresults.ResourceAssociatedRule{
+				{
+					Paths: []armotypes.PosturePaths{
+						{FixPath: armotypes.FixPath{Path: "spec.automountServiceAccountToken", Value: ""}},
+					},
+				},
+			}),
+			controlID:  "C-0057",
+			kind:       "Pod",
+			wantFailed: "",
+			wantFix:    "spec.automountServiceAccountToken",
+		},
+		{
+			name: "sensitive Secret.data fix path is redacted by default",
+			result: makeResult("C-0012", []resourcesresults.ResourceAssociatedRule{
+				{
+					Paths: []armotypes.PosturePaths{
+						{FixPath: armotypes.FixPath{Path: "data.password", Value: "s3cr3t-plaintext-password"}},
+					},
+				},
+			}),
+			controlID:  "C-0012",
+			kind:       "Secret",
+			wantFailed: "",
+			wantFix:    "data.password=[redacted]",
+		},
+		{
+			// Regression: an unresolved kind ("" -- the caller's
+			// AllResources lookup missed) must redact regardless of
+			// whether the field name itself looks credential-shaped.
+			// isSensitivePath("", "data.customKey") is false on its own --
+			// the Secret.data/stringData check requires kind == "Secret" to
+			// fire, and "customKey" matches none of the generic
+			// secretFieldPatterns -- so without the explicit kind == ""
+			// fail-closed check, this exact case would leak.
+			name: "unresolved kind fails closed even for a non-pattern-matching field name",
+			result: makeResult("C-0012", []resourcesresults.ResourceAssociatedRule{
+				{
+					Paths: []armotypes.PosturePaths{
+						{FixPath: armotypes.FixPath{Path: "data.customKey", Value: "s3cr3t-plaintext-value"}},
+					},
+				},
+			}),
+			controlID:  "C-0012",
+			kind:       "",
+			wantFailed: "",
+			wantFix:    "data.customKey=[redacted]",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotFailed, gotFix := csvControlPaths(tc.result, tc.controlID, tc.kind, false)
+			assert.Equal(t, tc.wantFailed, gotFailed, "failed paths mismatch")
+			assert.Equal(t, tc.wantFix, gotFix, "fix paths mismatch")
+		})
+	}
+}
+
+func TestCsvSourcePath(t *testing.T) {
+	cases := []struct {
+		name string
+		src  reporthandling.Source
+		want string
+	}{
+		{
+			name: "relative path preferred over absolute",
+			src:  reporthandling.Source{RelativePath: "manifests/deploy.yaml", Path: "/abs/path/deploy.yaml"},
+			want: "manifests/deploy.yaml",
+		},
+		{
+			name: "absolute path used when relative is empty",
+			src:  reporthandling.Source{RelativePath: "", Path: "/abs/path/deploy.yaml"},
+			want: "/abs/path/deploy.yaml",
+		},
+		{
+			name: "both empty returns empty string",
+			src:  reporthandling.Source{},
+			want: "",
+		},
+		{
+			name: "only relative path set",
+			src:  reporthandling.Source{RelativePath: "k8s/namespace.yaml"},
+			want: "k8s/namespace.yaml",
+		},
+		{
+			name: "helm template path with relative",
+			src:  reporthandling.Source{RelativePath: "templates/deployment.yaml", HelmTemplateLine: 12},
+			want: "templates/deployment.yaml",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, csvSourcePath(tc.src))
+		})
+	}
+}
+
+// TestCsvPrinter_IncludesSkippedAndUnevaluatedControls tests that skipped and unevaluated controls,
+// missing GVRs, and scope-level timeouts are emitted in CSV output with proper diagnostic reasons,
+// while avoiding redundant summary rows when an existing resource row already represents the skip.
+func TestCsvPrinter_IncludesSkippedAndUnevaluatedControls(t *testing.T) {
+	session := csvSessionFixture()
+
+	// 1. Add a skipped control from SummaryDetails.Controls (e.g. configuration skip)
+	const skippedControlID = "C-0099"
+	skippedStatus := &apis.StatusInfo{
+		InnerStatus: apis.StatusSkipped,
+		SubStatus:   apis.SubStatusConfiguration,
+		InnerInfo:   "missing required cluster role permissions",
+	}
+	session.Report.SummaryDetails.Controls[skippedControlID] = reportsummary.ControlSummary{
+		ControlID:   skippedControlID,
+		Name:        "RBAC least privilege",
+		ScoreFactor: 7.0,
+		StatusInfo:  *skippedStatus,
+	}
+
+	// 2. Add an unevaluated control via ScanCoverage.NotEvaluatedControls (e.g. missing GVR)
+	const notEvalControlID = "C-0100"
+	session.ScanCoverage.NotEvaluatedControls = []cautils.NotEvaluatedControl{
+		{
+			ControlID: notEvalControlID,
+			Reason:    "missing: batch/v1/cronjobs",
+		},
+	}
+	session.AllPolicies = &cautils.Policies{
+		Controls: map[string]reporthandling.Control{
+			notEvalControlID: {
+				PortalBase: armotypes.PortalBase{
+					Name: "CronJob security",
+				},
+				Control_ID: notEvalControlID,
+				BaseScore:  5.0,
+			},
+		},
+	}
+
+	// 3. Add a skipped control with empty reason/substatus/info but having policy remediation
+	const emptyReasonControlID = "C-0101"
+	session.Report.SummaryDetails.Controls[emptyReasonControlID] = reportsummary.ControlSummary{
+		ControlID:   emptyReasonControlID,
+		Name:        "No reason control",
+		ScoreFactor: 3.0,
+		StatusInfo:  apis.StatusInfo{InnerStatus: apis.StatusSkipped},
+		Description: "A control with no skip reason",
+	}
+	if session.AllPolicies == nil {
+		session.AllPolicies = &cautils.Policies{Controls: make(map[string]reporthandling.Control)}
+	}
+	session.AllPolicies.Controls[emptyReasonControlID] = reporthandling.Control{
+		PortalBase:  armotypes.PortalBase{Name: "No reason control"},
+		Control_ID:  emptyReasonControlID,
+		BaseScore:   3.0,
+		Remediation: "policy fix instruction",
+	}
+
+	// 4. Add an emitted resource row whose associated control is skipped with a diagnostic reason
+	const resourceSkippedControlID = "C-0102"
+	session.Report.SummaryDetails.Controls[resourceSkippedControlID] = reportsummary.ControlSummary{
+		ControlID:   resourceSkippedControlID,
+		Name:        "Resource level skipped control",
+		ScoreFactor: 8.0,
+		StatusInfo: apis.StatusInfo{
+			InnerStatus: apis.StatusSkipped,
+			SubStatus:   apis.SubStatusIrrelevant,
+			InnerInfo:   "not applicable to this workload type",
+		},
+	}
+	resID := testResourceID1
+	res := session.ResourcesResult[resID]
+	res.AssociatedControls = append(res.AssociatedControls, resourcesresults.ResourceAssociatedControl{
+		ControlID: resourceSkippedControlID,
+		Name:      "Resource level skipped control",
+		Status: apis.StatusInfo{
+			InnerStatus: apis.StatusSkipped,
+			SubStatus:   apis.SubStatusIrrelevant,
+			InnerInfo:   "not applicable to this workload type",
+		},
+	})
+	session.ResourcesResult[resID] = res
+
+	// 5. Add a control with an earlier resource row (passed) but summary-level skipped (e.g. timeout in later scope)
+	const timedOutControlID = "C-0103"
+	session.Report.SummaryDetails.Controls[timedOutControlID] = reportsummary.ControlSummary{
+		ControlID:   timedOutControlID,
+		Name:        "Timed out in second scope",
+		ScoreFactor: 6.0,
+		StatusInfo: apis.StatusInfo{
+			InnerStatus: apis.StatusSkipped,
+			SubStatus:   apis.SubStatusConfiguration,
+			InnerInfo:   "context deadline exceeded in cluster scope",
+		},
+	}
+	res = session.ResourcesResult[resID]
+	res.AssociatedControls = append(res.AssociatedControls, resourcesresults.ResourceAssociatedControl{
+		ControlID: timedOutControlID,
+		Name:      "Timed out in second scope",
+		Status:    apis.StatusInfo{InnerStatus: apis.StatusPassed},
+	})
+	session.ResourcesResult[resID] = res
+
+	// 6. Add a control with both a resource-level skip AND a distinct summary-level skip (e.g. timeout in another scope)
+	const distinctSkipControlID = "C-0104"
+	session.Report.SummaryDetails.Controls[distinctSkipControlID] = reportsummary.ControlSummary{
+		ControlID:   distinctSkipControlID,
+		Name:        "Multi-scope skip control",
+		ScoreFactor: 7.0,
+		StatusInfo: apis.StatusInfo{
+			InnerStatus: apis.StatusSkipped,
+			SubStatus:   apis.SubStatusConfiguration,
+			InnerInfo:   "control evaluation timed out after 30s in cluster scope",
+		},
+	}
+	res = session.ResourcesResult[resID]
+	res.AssociatedControls = append(res.AssociatedControls, resourcesresults.ResourceAssociatedControl{
+		ControlID: distinctSkipControlID,
+		Name:      "Multi-scope skip control",
+		Status: apis.StatusInfo{
+			InnerStatus: apis.StatusSkipped,
+			SubStatus:   apis.SubStatusIrrelevant,
+			InnerInfo:   "not applicable to this workload type",
+		},
+	})
+	session.ResourcesResult[resID] = res
+
+	// 7. Add a control with earlier resource row skipped (no skip detail, inheriting coverage reason) AND not evaluated status from coverage
+	const overlapControlID = "C-0105"
+	session.ScanCoverage.NotEvaluatedControls = append(session.ScanCoverage.NotEvaluatedControls, cautils.NotEvaluatedControl{
+		ControlID: overlapControlID,
+		Reason:    "cluster scope evaluation timed out after 30s",
+	})
+	session.Report.SummaryDetails.Controls[overlapControlID] = reportsummary.ControlSummary{
+		ControlID:   overlapControlID,
+		Name:        "Scope overlap timeout control",
+		ScoreFactor: 7.0,
+	}
+	res = session.ResourcesResult[resID]
+	res.AssociatedControls = append(res.AssociatedControls, resourcesresults.ResourceAssociatedControl{
+		ControlID: overlapControlID,
+		Name:      "Scope overlap timeout control",
+		Status: apis.StatusInfo{
+			InnerStatus: apis.StatusSkipped,
+		},
+	})
+	session.ResourcesResult[resID] = res
+
+	tmpFile, err := os.CreateTemp("", "test-skipped-*.csv")
+	require.NoError(t, err)
+	defer os.Remove(tmpFile.Name())
+
+	cp := NewCsvPrinter(false)
+	cp.writer = tmpFile
+
+	err = cp.ActionPrint(context.Background(), session, nil)
+	require.NoError(t, err)
+	require.NoError(t, cp.CloseWriter())
+
+	content, err := os.ReadFile(tmpFile.Name())
+	require.NoError(t, err)
+
+	reader := csv.NewReader(strings.NewReader(string(content)))
+	records, err := reader.ReadAll()
+	require.NoError(t, err)
+
+	require.GreaterOrEqual(t, len(records), 7)
+
+	var foundSkipped, foundNotEval, foundEmptyReason, foundResourceSkipped bool
+	var foundTimedOutPassed, foundTimedOutSummary, foundResourceSkippedSummary bool
+	var foundDistinctResourceSkipped, foundDistinctSummarySkipped bool
+	var foundOverlapResourceSkipped, foundOverlapSummaryNotEval bool
+	for _, row := range records {
+		if row[1] == skippedControlID {
+			foundSkipped = true
+			assert.Equal(t, "RBAC least privilege", row[0])
+			assert.Equal(t, "High", row[2])
+			assert.Equal(t, "skipped", row[3])
+			assert.Equal(t, "N/A", row[4])
+			assert.Equal(t, "N/A", row[5])
+			assert.Equal(t, "N/A", row[6])
+			assert.Equal(t, "N/A", row[7])
+			assert.Empty(t, row[8])
+			assert.Empty(t, row[9])
+			assert.Contains(t, row[10], "missing required cluster role permissions")
+			assert.Equal(t, cautils.GetControlLink(skippedControlID), row[11])
+			assert.Empty(t, row[12])
+		}
+		if row[1] == notEvalControlID {
+			foundNotEval = true
+			assert.Equal(t, "CronJob security", row[0])
+			assert.Equal(t, "Medium", row[2])
+			assert.Equal(t, "not evaluated", row[3])
+			assert.Equal(t, "N/A", row[4])
+			assert.Equal(t, "N/A", row[5])
+			assert.Equal(t, "N/A", row[6])
+			assert.Equal(t, "N/A", row[7])
+			assert.Empty(t, row[8])
+			assert.Empty(t, row[9])
+			assert.Contains(t, row[10], "missing: batch/v1/cronjobs")
+			assert.Equal(t, cautils.GetControlLink(notEvalControlID), row[11])
+			assert.Empty(t, row[12])
+		}
+		if row[1] == emptyReasonControlID {
+			foundEmptyReason = true
+			assert.Equal(t, "No reason control", row[0])
+			assert.Equal(t, "skipped", row[3])
+			assert.Equal(t, "reason unavailable", row[10])
+		}
+		if row[1] == resourceSkippedControlID {
+			if row[4] != "N/A" {
+				foundResourceSkipped = true
+				assert.Equal(t, "skipped", row[3])
+				assert.Contains(t, row[10], "not applicable to this workload type")
+			} else {
+				foundResourceSkippedSummary = true
+			}
+		}
+		if row[1] == timedOutControlID {
+			if row[4] != "N/A" {
+				foundTimedOutPassed = true
+				assert.Equal(t, "passed", row[3])
+			} else {
+				foundTimedOutSummary = true
+				assert.Equal(t, "skipped", row[3])
+				assert.Contains(t, row[10], "context deadline exceeded in cluster scope")
+			}
+		}
+		if row[1] == distinctSkipControlID {
+			if row[4] != "N/A" {
+				foundDistinctResourceSkipped = true
+				assert.Equal(t, "skipped", row[3])
+				assert.Contains(t, row[10], "not applicable to this workload type")
+			} else {
+				foundDistinctSummarySkipped = true
+				assert.Equal(t, "skipped", row[3])
+				assert.Contains(t, row[10], "control evaluation timed out after 30s in cluster scope")
+			}
+		}
+		if row[1] == overlapControlID {
+			if row[4] != "N/A" {
+				foundOverlapResourceSkipped = true
+				assert.Equal(t, "skipped", row[3])
+				assert.Equal(t, "cluster scope evaluation timed out after 30s", row[10])
+			} else {
+				foundOverlapSummaryNotEval = true
+				assert.Equal(t, "not evaluated", row[3])
+				assert.Equal(t, "cluster scope evaluation timed out after 30s", row[10])
+			}
+		}
+	}
+	assert.True(t, foundSkipped, "skipped control row should be present in CSV output")
+	assert.True(t, foundNotEval, "coverage-only unevaluated control row should be present in CSV output")
+	assert.True(t, foundEmptyReason, "empty reason skipped control should use 'reason unavailable'")
+	assert.True(t, foundResourceSkipped, "emitted resource row for skipped control should preserve skip reason")
+	assert.False(t, foundResourceSkippedSummary, "redundant N/A summary row should be suppressed when resource row already represented the skip")
+	assert.True(t, foundTimedOutPassed, "earlier resource row with passed status should be preserved")
+	assert.True(t, foundTimedOutSummary, "summary-level skip should be emitted when no resource row represents the skip")
+	assert.True(t, foundDistinctResourceSkipped, "resource-level skip row should be emitted with workload diagnostic")
+	assert.True(t, foundDistinctSummarySkipped, "distinct summary-level skip row should also be emitted when its diagnostic is not represented by resource rows")
+	assert.True(t, foundOverlapResourceSkipped, "resource-level skipped row with inherited coverage reason should be emitted")
+	assert.True(t, foundOverlapSummaryNotEval, "not evaluated control row should be preserved and not suppressed by earlier resource skip")
+}
+
+func TestActionPrint_Csv_UnevaluatedControlsIncluded(t *testing.T) {
+	session := csvSessionFixture()
+	session.ScanCoverage = cautils.ScanCoverage{
+		CoverageScore:     66.0,
+		EvaluatedControls: 2,
+		TotalControls:     3,
+		Degraded:          true,
+		NotEvaluatedControls: []cautils.NotEvaluatedControl{
+			{
+				ControlID:   "C-0099",
+				MissingGVRs: []string{"apps/v1/daemonsets"},
+			},
+		},
+	}
+
+	tmpCsv, err := os.CreateTemp("", "csv-unevaluated-*.csv")
+	require.NoError(t, err)
+	defer os.Remove(tmpCsv.Name())
+
+	cp := NewCsvPrinter(false)
+	cp.writer = tmpCsv
+	err = cp.ActionPrint(context.TODO(), session, nil)
+	require.NoError(t, err)
+	require.NoError(t, cp.CloseWriter())
+
+	f, err := os.Open(tmpCsv.Name())
+	require.NoError(t, err)
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	records, err := r.ReadAll()
+	require.NoError(t, err)
+
+	var foundUnevaluated bool
+	for _, row := range records[1:] {
+		require.Equal(t, 13, len(row), "every row must have 13 columns")
+		if row[1] == "C-0099" {
+			foundUnevaluated = true
+			assert.Equal(t, "C-0099", row[0], "name should fallback to control ID when not in summary")
+			assert.Equal(t, "not evaluated", row[3], "status must be 'not evaluated'")
+			assert.Equal(t, "N/A", row[4], "resource name must be 'N/A'")
+			assert.Equal(t, "N/A", row[5], "resource kind must be 'N/A'")
+			assert.Equal(t, "N/A", row[6], "resource namespace must be 'N/A'")
+			assert.Equal(t, "N/A", row[7], "api version must be 'N/A'")
+			assert.Equal(t, "", row[8], "failed paths must be empty")
+			assert.Equal(t, "", row[9], "fix paths must be empty")
+			assert.Equal(t, "missing: apps/v1/daemonsets", row[10], "remediation should contain skip reason")
+			assert.Contains(t, row[11], "c-0099", "control URL should link to control")
+			assert.Equal(t, "", row[12], "source path must be empty")
+		}
+	}
+	assert.True(t, foundUnevaluated, "expected unevaluated control C-0099 in CSV output")
+}
+
+func TestActionPrint_Csv_UnevaluatedControlsNotDuplicated(t *testing.T) {
+	session := csvSessionFixture()
+	session.ScanCoverage = cautils.ScanCoverage{
+		CoverageScore:     50.0,
+		EvaluatedControls: 1,
+		TotalControls:     2,
+		Degraded:          true,
+		NotEvaluatedControls: []cautils.NotEvaluatedControl{
+			{
+				ControlID: "C-0099",
+				Reason:    "evaluation timed out",
+			},
+			{
+				ControlID: "C-0099",
+				Reason:    "evaluation timed out",
+			},
+		},
+	}
+
+	tmpCsv, err := os.CreateTemp("", "csv-dup-*.csv")
+	require.NoError(t, err)
+	defer os.Remove(tmpCsv.Name())
+
+	cp := NewCsvPrinter(false)
+	cp.writer = tmpCsv
+	err = cp.ActionPrint(context.TODO(), session, nil)
+	require.NoError(t, err)
+	require.NoError(t, cp.CloseWriter())
+
+	f, err := os.Open(tmpCsv.Name())
+	require.NoError(t, err)
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	records, err := r.ReadAll()
+	require.NoError(t, err)
+
+	unevaluatedCount := 0
+	for _, row := range records[1:] {
+		if row[1] == "C-0099" && row[3] == "not evaluated" {
+			unevaluatedCount++
+		}
+	}
+	assert.Equal(t, 1, unevaluatedCount, "unevaluated control should only be emitted once as not evaluated even if duplicated in input")
+}
+
+func TestActionPrint_Csv_PreserveUnevaluatedDiagnosticWhenResourceRowsExist(t *testing.T) {
+	session := csvSessionFixture()
+	session.ScanCoverage = cautils.ScanCoverage{
+		CoverageScore:     50.0,
+		EvaluatedControls: 1,
+		TotalControls:     2,
+		Degraded:          true,
+		NotEvaluatedControls: []cautils.NotEvaluatedControl{
+			{
+				ControlID: testControlID1,
+				Reason:    "evaluation timed out",
+			},
+		},
+	}
+
+	tmpCsv, err := os.CreateTemp("", "csv-preserve-diag-*.csv")
+	require.NoError(t, err)
+	defer os.Remove(tmpCsv.Name())
+
+	cp := NewCsvPrinter(false)
+	cp.writer = tmpCsv
+	err = cp.ActionPrint(context.TODO(), session, nil)
+	require.NoError(t, err)
+	require.NoError(t, cp.CloseWriter())
+
+	f, err := os.Open(tmpCsv.Name())
+	require.NoError(t, err)
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	records, err := r.ReadAll()
+	require.NoError(t, err)
+
+	var resourceRows [][]string
+	var diagRows [][]string
+	for _, row := range records[1:] {
+		if row[1] == testControlID1 {
+			if row[3] == "not evaluated" {
+				diagRows = append(diagRows, row)
+			} else {
+				resourceRows = append(resourceRows, row)
+			}
+		}
+	}
+
+	// Resource rows from earlier scopes are retained
+	assert.Len(t, resourceRows, 2, "resource result rows should be retained")
+	var foundDemo bool
+	for _, row := range resourceRows {
+		assert.Equal(t, "failed", row[3])
+		if row[4] == "demo" {
+			foundDemo = true
+		}
+	}
+	assert.True(t, foundDemo, "resource demo should be present in resource rows")
+
+	// Diagnostic row for timeout is preserved alongside existing results
+	require.Len(t, diagRows, 1, "exactly one control-level not-evaluated diagnostic row should be emitted alongside results")
+	diag := diagRows[0]
+	assert.Equal(t, "Privileged container", diag[0], "control name should come from summary")
+	assert.Equal(t, testControlID1, diag[1])
+	assert.Equal(t, "Critical", diag[2], "severity should match control score factor")
+	assert.Equal(t, "not evaluated", diag[3])
+	assert.Equal(t, "N/A", diag[4], "resource name should be 'N/A' on diagnostic row")
+	assert.Equal(t, "N/A", diag[5], "resource kind should be 'N/A' on diagnostic row")
+	assert.Equal(t, "N/A", diag[6], "resource namespace should be 'N/A' on diagnostic row")
+	assert.Equal(t, "N/A", diag[7], "api version should be 'N/A' on diagnostic row")
+	assert.Empty(t, diag[8], "failed paths should be empty on diagnostic row")
+	assert.Empty(t, diag[9], "fix paths should be empty on diagnostic row")
+	assert.Equal(t, "evaluation timed out", diag[10], "remediation should contain timeout reason")
+	assert.Contains(t, diag[11], "c-0057")
+	assert.Empty(t, diag[12], "source path should be empty on diagnostic row")
+}
+
+func TestActionPrint_Csv_SkippedControlFromSummaryIncluded(t *testing.T) {
+	session := csvSessionFixture()
+	skippedStatus := &apis.StatusInfo{
+		InnerStatus: apis.StatusSkipped,
+		SubStatus:   apis.SubStatusIrrelevant,
+		InnerInfo:   "no matching resources",
+	}
+	ctrlSkipped := &reportsummary.ControlSummary{
+		ControlID:   "C-0070",
+		Name:        "Host IPC",
+		ScoreFactor: 6.0,
+		StatusInfo:  *skippedStatus,
+	}
+	session.Report.SummaryDetails.Controls["C-0070"] = *ctrlSkipped
+
+	tmpCsv, err := os.CreateTemp("", "csv-skipped-summary-*.csv")
+	require.NoError(t, err)
+	defer os.Remove(tmpCsv.Name())
+
+	cp := NewCsvPrinter(false)
+	cp.writer = tmpCsv
+	err = cp.ActionPrint(context.TODO(), session, nil)
+	require.NoError(t, err)
+	require.NoError(t, cp.CloseWriter())
+
+	f, err := os.Open(tmpCsv.Name())
+	require.NoError(t, err)
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	records, err := r.ReadAll()
+	require.NoError(t, err)
+
+	var foundSkipped bool
+	for _, row := range records[1:] {
+		if row[1] == "C-0070" {
+			foundSkipped = true
+			assert.Equal(t, "Host IPC", row[0])
+			assert.Equal(t, "skipped", row[3])
+			assert.Equal(t, "Medium", row[2])
+			assert.Equal(t, "irrelevant: no matching resources", row[10])
+		}
+	}
+	assert.True(t, foundSkipped, "expected skipped control C-0070 in CSV output")
+}
+
+func TestActionPrint_Csv_PreserveNotEvaluatedWhenResourceRowSkippedWithInheritedReason(t *testing.T) {
+	// Tests regression where an earlier scope leaves a resource-level skipped row
+	// without skip detail, inheriting the coverage reason at lines 155-166.
+	// When a later scope times out, the control is recorded in ScanCoverage.NotEvaluatedControls.
+	// CSV output must preserve BOTH:
+	// - The resource-level skipped finding (status "skipped")
+	// - The control-level not evaluated diagnostic row (status "not evaluated")
+	session := csvSessionFixture()
+	const overlapControlID = "C-0105"
+	session.ScanCoverage = cautils.ScanCoverage{
+		CoverageScore:     50.0,
+		EvaluatedControls: 1,
+		TotalControls:     2,
+		Degraded:          true,
+		NotEvaluatedControls: []cautils.NotEvaluatedControl{
+			{
+				ControlID: overlapControlID,
+				Reason:    "control evaluation timed out in cluster scope",
+			},
+		},
+	}
+	session.Report.SummaryDetails.Controls[overlapControlID] = reportsummary.ControlSummary{
+		ControlID:   overlapControlID,
+		Name:        "Overlap timeout control",
+		ScoreFactor: 8.0,
+	}
+
+	resID := testResourceID1
+	res := session.ResourcesResult[resID]
+	res.AssociatedControls = append(res.AssociatedControls, resourcesresults.ResourceAssociatedControl{
+		ControlID: overlapControlID,
+		Name:      "Overlap timeout control",
+		Status: apis.StatusInfo{
+			InnerStatus: apis.StatusSkipped,
+		},
+	})
+	session.ResourcesResult[resID] = res
+
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+
+	cp := NewCsvPrinter(false)
+	cp.writer = w
+
+	err = cp.ActionPrint(context.Background(), session, nil)
+	require.NoError(t, err)
+	require.NoError(t, cp.CloseWriter())
+
+	reader := csv.NewReader(r)
+	records, err := reader.ReadAll()
+	require.NoError(t, err)
+	_ = r.Close()
+
+	var resourceSkippedCount, notEvaluatedCount int
+	for _, row := range records[1:] {
+		if row[1] == overlapControlID {
+			switch row[3] {
+			case "skipped":
+				resourceSkippedCount++
+				assert.Equal(t, "demo", row[4], "resource row must have resource name")
+				assert.Equal(t, "control evaluation timed out in cluster scope", row[10], "resource row inherits coverage reason")
+			case "not evaluated":
+				notEvaluatedCount++
+				assert.Equal(t, "N/A", row[4], "control-level row must have N/A for resource")
+				assert.Equal(t, "control evaluation timed out in cluster scope", row[10])
+				assert.Equal(t, "High", row[2], "severity should match score factor")
+			}
+		}
+	}
+
+	assert.Equal(t, 1, resourceSkippedCount, "expected exactly one resource-level skipped row")
+	assert.Equal(t, 1, notEvaluatedCount, "expected exactly one control-level not evaluated row")
+}

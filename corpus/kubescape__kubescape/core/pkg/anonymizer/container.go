@@ -1,0 +1,891 @@
+package anonymizer
+
+import (
+	"strings"
+
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	corev1 "k8s.io/api/core/v1"
+)
+
+// TransformContainerMetadata applies the supplied Transformer to
+// sensitive container-related metadata contained within a workload.
+//
+// The traversal logic is shared across all transformation modes,
+// allowing callers to perform deterministic pseudonymization,
+// reversible encryption, or decryption using different Transformer
+// implementations.
+
+// knownRefNames maps a container's name to the names of that container's
+// env vars that had a ValueFrom reference before removeData cleared it (see
+// removeData's doc comment in processorhandlerutils.go). It is keyed by
+// container name, not merged across the pod, because two containers in the
+// same pod can share an env var name where only one of them is
+// reference-backed — anonymizing the other would anonymize an ordinary env
+// var, which the anonymizer must never do.
+func transformContainerMetadata(resource workloadinterface.IMetadata, knownRefNames map[string]map[string]struct{}, transformer Transformer) error {
+
+	if resource == nil {
+		return nil
+	}
+
+	obj := resource.GetObject()
+	if obj == nil {
+		return nil
+	}
+
+	if err := transformPodSpecs(obj, knownRefNames, transformer); err != nil {
+		return err
+	}
+
+	resource.SetObject(obj)
+
+	return nil
+}
+
+func transformTypedContainerList(containers []corev1.Container, knownRefNames map[string]map[string]struct{}, transformer Transformer) error {
+	var err error
+
+	for i := range containers {
+		// Captured before the name itself is transformed below, so the
+		// lookup uses the real container name the scrub pass recorded
+		// against, not its anonymized replacement.
+		containerRefNames := knownRefNames[containers[i].Name]
+
+		if containers[i].Name != "" {
+			containers[i].Name, err = transformValue(transformer, "ctr", containers[i].Name)
+			if err != nil {
+				return err
+			}
+		}
+
+		if containers[i].Image != "" {
+			containers[i].Image, err = transformValue(transformer, "img", containers[i].Image)
+			if err != nil {
+				return err
+			}
+		}
+
+		if err := transformTypedEnv(containers[i].Env, containerRefNames, transformer); err != nil {
+			return err
+		}
+
+		if err := transformTypedEnvFrom(containers[i].EnvFrom, transformer); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func transformTypedEphemeralContainerList(containers []corev1.EphemeralContainer, knownRefNames map[string]map[string]struct{}, transformer Transformer) error {
+	var err error
+
+	for i := range containers {
+		containerRefNames := knownRefNames[containers[i].Name]
+
+		if containers[i].Name != "" {
+			containers[i].Name, err = transformValue(transformer, "ctr", containers[i].Name)
+			if err != nil {
+				return err
+			}
+		}
+
+		if containers[i].Image != "" {
+			containers[i].Image, err = transformValue(transformer, "img", containers[i].Image)
+			if err != nil {
+				return err
+			}
+		}
+
+		if err := transformTypedEnv(containers[i].Env, containerRefNames, transformer); err != nil {
+			return err
+		}
+
+		if err := transformTypedEnvFrom(containers[i].EnvFrom, transformer); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// transformPodSpecs recursively traverses workload objects looking for
+// pod-spec-shaped sections where sensitive container metadata may exist.
+//
+// Kubernetes resources may reach this layer as either typed objects converted
+// into generic maps or as fully unstructured manifests depending on the scan
+// source, so traversal stays representation-agnostic and delegates
+// shape-specific transformations to dedicated helpers.
+func transformPodSpecs(node any, knownRefNames map[string]map[string]struct{}, transformer Transformer) error {
+
+	switch v := node.(type) {
+	case map[string]any:
+		if err := transformContainerList(
+			v,
+			"containers",
+			knownRefNames,
+			transformer,
+		); err != nil {
+			return err
+		}
+
+		if err := transformContainerList(
+			v,
+			"initContainers",
+			knownRefNames,
+			transformer,
+		); err != nil {
+			return err
+		}
+
+		if err := transformEphemeralContainerList(
+			v,
+			"ephemeralContainers",
+			knownRefNames,
+			transformer,
+		); err != nil {
+			return err
+		}
+
+		if err := transformImagePullSecrets(
+			v,
+			transformer,
+		); err != nil {
+			return err
+		}
+
+		if err := transformServiceAccountName(
+			v,
+			transformer,
+		); err != nil {
+			return err
+		}
+
+		if err := transformVolumes(
+			v,
+			transformer,
+		); err != nil {
+			return err
+		}
+
+		for _, child := range v {
+			if err := transformPodSpecs(
+				child,
+				knownRefNames,
+				transformer,
+			); err != nil {
+				return err
+			}
+		}
+
+	case []any:
+		for _, item := range v {
+			if err := transformPodSpecs(
+				item,
+				knownRefNames,
+				transformer,
+			); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// transformContainerFields applies the supplied Transformer to sensitive
+// fields within an unstructured container represented as a
+// map[string]any.
+
+// This helper preserves the existing traversal behavior while delegating
+// sensitive value transformation to the supplied Transformer.
+//
+// Different Transformer implementations can provide pseudonymization,
+// encryption, or decryption while sharing the same traversal logic.
+
+func transformContainerFields(container map[string]any, knownRefNames map[string]map[string]struct{}, transformer Transformer) error {
+
+	var err error
+
+	// Looked up before the name field is overwritten below, same reason as
+	// the typed path in transformTypedContainerList.
+	containerName, _ := container["name"].(string)
+	containerRefNames := knownRefNames[containerName]
+
+	if name, ok := container["name"].(string); ok && name != "" {
+		name, err = transformValue(transformer, "ctr", name)
+		if err != nil {
+			return err
+		}
+
+		container["name"] = name
+	}
+
+	if image, ok := container["image"].(string); ok && image != "" {
+		image, err = transformValue(transformer, "img", image)
+		if err != nil {
+			return err
+		}
+
+		container["image"] = image
+	}
+
+	if err := transformUnstructuredEnv(container, containerRefNames, transformer); err != nil {
+		return err
+	}
+
+	if err := transformUnstructuredEnvFrom(container, transformer); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// transformContainerList applies the supplied Transformer to all
+// containers contained within a typed or unstructured pod specification.
+//
+// Container names, image references, environment variables, and
+// referenced Kubernetes resources are transformed while preserving the
+// original workload structure.
+
+func transformContainerList(obj map[string]any, key string, knownRefNames map[string]map[string]struct{}, transformer Transformer) error {
+
+	rawContainers, ok := obj[key]
+	if !ok || rawContainers == nil {
+		return nil
+	}
+
+	switch containers := rawContainers.(type) {
+	case []any:
+		for _, item := range containers {
+			container, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			if err := transformContainerFields(container, knownRefNames, transformer); err != nil {
+				return err
+			}
+		}
+
+		obj[key] = containers
+	case []corev1.Container:
+		if err := transformTypedContainerList(containers, knownRefNames, transformer); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// transformEphemeralContainerList applies the supplied Transformer to
+// ephemeral container metadata across both typed and unstructured
+// workload representations.
+//
+// Container identifiers, image references, environment variables, and
+// referenced Kubernetes resources are transformed while preserving the
+// original workload structure.
+func transformEphemeralContainerList(obj map[string]any, key string, knownRefNames map[string]map[string]struct{}, transformer Transformer) error {
+
+	rawContainers, ok := obj[key]
+	if !ok || rawContainers == nil {
+		return nil
+	}
+
+	switch containers := rawContainers.(type) {
+	case []any:
+		for _, item := range containers {
+			container, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			if err := transformContainerFields(container, knownRefNames, transformer); err != nil {
+				return err
+			}
+		}
+
+		obj[key] = containers
+	case []corev1.EphemeralContainer:
+		if err := transformTypedEphemeralContainerList(containers, knownRefNames, transformer); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// transformTypedEnv applies the supplied Transformer to sensitive
+// environment variable values and referenced Kubernetes resources.
+//
+// Literal environment values are transformed only when they appear
+// sensitive, while Secret and ConfigMap references are always
+// transformed when present.
+//
+// knownRefNames carries the env var names that a caller earlier upstream
+// (processorhandlerutils.removeData) already found to have a ValueFrom
+// reference, before that reference was cleared. It exists because this
+// function normally runs after that clearing, so envVar.ValueFrom is nil by
+// the time it gets here for every reference-backed env var, and there is no
+// longer anything on envVar itself to detect that from. When ValueFrom is
+// still present (for example a direct, isolated call to this function),
+// that takes precedence and knownRefNames is not consulted.
+func transformTypedEnv(envVars []corev1.EnvVar, knownRefNames map[string]struct{}, transformer Transformer) error {
+	var err error
+
+	for i := range envVars {
+		envVar := &envVars[i]
+
+		if envVar.Value != "" &&
+			(isSensitiveEnvName(envVar.Name) ||
+				isSensitiveEnvValue(envVar.Value)) {
+
+			envVar.Value, err = transformValue(
+				transformer,
+				"env",
+				envVar.Value,
+			)
+			if err != nil {
+				return err
+			}
+		}
+
+		hasRef := false
+
+		if envVar.ValueFrom != nil {
+			if secretRef := envVar.ValueFrom.SecretKeyRef; secretRef != nil &&
+				secretRef.Name != "" {
+
+				secretRef.Name, err = transformValue(transformer, "ref", secretRef.Name)
+				if err != nil {
+					return err
+				}
+				hasRef = true
+			}
+
+			if configMapRef := envVar.ValueFrom.ConfigMapKeyRef; configMapRef != nil &&
+				configMapRef.Name != "" {
+
+				configMapRef.Name, err = transformValue(transformer, "ref", configMapRef.Name)
+				if err != nil {
+					return err
+				}
+				hasRef = true
+			}
+
+			if envVar.ValueFrom.FieldRef != nil {
+				hasRef = true
+			}
+			if envVar.ValueFrom.ResourceFieldRef != nil {
+				hasRef = true
+			}
+		} else if _, known := knownRefNames[envVar.Name]; known {
+			hasRef = true
+		}
+
+		if hasRef && envVar.Name != "" {
+			envVar.Name, err = transformValue(transformer, "env", envVar.Name)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// transformUnstructuredEnv applies the supplied Transformer to sensitive
+// environment variable values and referenced Kubernetes resources within
+// unstructured container definitions.
+// Literal environment values are transformed only when they appear
+// sensitive, while SecretKeyRef and ConfigMapKeyRef references are
+// transformed whenever present.
+
+// transformUnstructuredEnv mirrors transformTypedEnv for the unstructured
+// representation. See transformTypedEnv's doc comment for why
+// knownRefNames exists: valueFrom is normally already cleared by the time
+// this runs, so it is the only surviving signal for a reference-backed env
+// var name.
+func transformUnstructuredEnv(container map[string]any, knownRefNames map[string]struct{}, transformer Transformer) error {
+
+	rawEnv, exists := container["env"]
+	if !exists || rawEnv == nil {
+		return nil
+	}
+
+	envVars, ok := rawEnv.([]any)
+	if !ok {
+		return nil
+	}
+
+	var err error
+
+	for _, item := range envVars {
+		envVar, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		name, _ := envVar["name"].(string)
+
+		if value, ok := envVar["value"].(string); ok &&
+			value != "" &&
+			(isSensitiveEnvName(name) ||
+				isSensitiveEnvValue(value)) {
+
+			value, err = transformValue(transformer, "env", value)
+			if err != nil {
+				return err
+			}
+
+			envVar["value"] = value
+		}
+
+		hasRef := false
+
+		rawValueFrom, exists := envVar["valueFrom"]
+		if exists && rawValueFrom != nil {
+			if valueFrom, ok := rawValueFrom.(map[string]any); ok {
+				if err := transformUnstructuredReference(valueFrom, "secretKeyRef", transformer); err != nil {
+					return err
+				}
+				if _, ok := valueFrom["secretKeyRef"]; ok {
+					hasRef = true
+				}
+
+				if err := transformUnstructuredReference(valueFrom, "configMapKeyRef", transformer); err != nil {
+					return err
+				}
+				if _, ok := valueFrom["configMapKeyRef"]; ok {
+					hasRef = true
+				}
+				if _, ok := valueFrom["fieldRef"]; ok {
+					hasRef = true
+				}
+				if _, ok := valueFrom["resourceFieldRef"]; ok {
+					hasRef = true
+				}
+			}
+		} else if _, known := knownRefNames[name]; known {
+			hasRef = true
+		}
+
+		if hasRef {
+			if name, ok := envVar["name"].(string); ok && name != "" {
+				transformedName, err := transformValue(transformer, "env", name)
+				if err != nil {
+					return err
+				}
+				envVar["name"] = transformedName
+			}
+		}
+	}
+
+	return nil
+}
+
+// transformTypedEnvFrom applies the supplied Transformer to resource
+// references contained in typed EnvFromSource definitions.
+//
+// Secret and ConfigMap references are transformed when present while
+// preserving the original workload structure.
+func transformTypedEnvFrom(envFrom []corev1.EnvFromSource, transformer Transformer) error {
+	var err error
+
+	for i := range envFrom {
+		source := &envFrom[i]
+
+		if source.SecretRef != nil && source.SecretRef.Name != "" {
+			source.SecretRef.Name, err = transformValue(transformer, "ref", source.SecretRef.Name)
+			if err != nil {
+				return err
+			}
+		}
+
+		if source.ConfigMapRef != nil && source.ConfigMapRef.Name != "" {
+			source.ConfigMapRef.Name, err = transformValue(transformer, "ref", source.ConfigMapRef.Name)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// transformUnstructuredEnvFrom applies the supplied Transformer to
+// resource references contained in unstructured envFrom definitions.
+//
+// Secret and ConfigMap references are transformed while preserving the
+// original workload structure.
+func transformUnstructuredEnvFrom(container map[string]any, transformer Transformer) error {
+
+	rawEnvFrom, ok := container["envFrom"].([]any)
+	if !ok {
+		return nil
+	}
+
+	for _, item := range rawEnvFrom {
+		envFrom, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if err := transformUnstructuredReference(envFrom, "secretRef", transformer); err != nil {
+			return err
+		}
+
+		if err := transformUnstructuredReference(envFrom, "configMapRef", transformer); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// transformUnstructuredReference applies the supplied Transformer to the
+// name field of an unstructured Kubernetes object reference.
+//
+// References that do not contain a name are left unchanged.
+func transformUnstructuredReference(obj map[string]any, key string, transformer Transformer) error {
+	ref, ok := obj[key].(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	name, ok := ref["name"].(string)
+	if !ok || name == "" {
+		return nil
+	}
+
+	transformedName, err := transformValue(transformer, "ref", name)
+	if err != nil {
+		return err
+	}
+
+	ref["name"] = transformedName
+
+	return nil
+}
+
+// isSensitiveEnvValue reports whether an env var value looks like a secret.
+func isSensitiveEnvValue(value string) bool {
+	value = strings.ToLower(value)
+
+	sensitivePatterns := []string{
+		"://", // postgres:// redis:// mongodb:// etc
+		"password=",
+		"pwd=",
+		"user id=",
+		"userid=",
+		"dsn=",
+		"sslmode=",
+	}
+
+	for _, pattern := range sensitivePatterns {
+		if strings.Contains(value, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isSensitiveEnvName reports whether an env var name looks like a credential.
+func isSensitiveEnvName(name string) bool {
+	name = strings.ToLower(name)
+
+	// strip common separators so APIKEY matches api_key
+	normalized := name
+	for _, sep := range []string{"_", "-", ".", " "} {
+		normalized = strings.ReplaceAll(normalized, sep, "")
+	}
+
+	sensitivePatterns := []string{
+		"password",
+		"passwd",
+		"pwd",
+		"secret",
+		"token",
+		"apikey",
+		"accesskey",
+		"privatekey",
+		"credential",
+		"databaseurl",
+		"dburl",
+		"redisurl",
+		"mongouri",
+		"mongodburi",
+		"dsn",
+		"connectionstring",
+	}
+
+	for _, pattern := range sensitivePatterns {
+		if strings.Contains(normalized, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// transformImagePullSecrets applies the supplied Transformer to pod image
+// pull secret references across both typed and unstructured workload
+// representations.
+//
+// Image pull secret names are transformed while preserving the original
+// workload structure.
+
+func transformImagePullSecrets(obj map[string]any, transformer Transformer) error {
+
+	rawRefs, ok := obj["imagePullSecrets"]
+	if !ok || rawRefs == nil {
+		return nil
+	}
+
+	var err error
+
+	// Typed Kubernetes objects (manifest decoding path)
+	if refs, ok := rawRefs.([]corev1.LocalObjectReference); ok {
+		for i := range refs {
+			if refs[i].Name != "" {
+				refs[i].Name, err = transformValue(
+					transformer,
+					"ref",
+					refs[i].Name,
+				)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		obj["imagePullSecrets"] = refs
+		return nil
+	}
+
+	// Unstructured objects (runtime / normalized object path)
+	if refs, ok := rawRefs.([]any); ok {
+		for _, item := range refs {
+			ref, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			name, ok := ref["name"].(string)
+			if !ok || name == "" {
+				continue
+			}
+
+			name, err = transformValue(
+				transformer,
+				"ref",
+				name,
+			)
+			if err != nil {
+				return err
+			}
+
+			ref["name"] = name
+		}
+
+		obj["imagePullSecrets"] = refs
+	}
+
+	return nil
+}
+
+// transformServiceAccountName applies the supplied Transformer to pod-level
+// service account references across both typed and unstructured workload
+// representations.
+//
+// Service account names are transformed while preserving the workload
+// structure.
+
+func transformServiceAccountName(obj map[string]any, transformer Transformer) error {
+
+	var err error
+
+	for _, key := range []string{
+		"serviceAccountName",
+		"serviceAccount",
+	} {
+		rawName, ok := obj[key]
+		if !ok || rawName == nil {
+			continue
+		}
+
+		name, ok := rawName.(string)
+		if !ok || name == "" {
+			continue
+		}
+
+		name, err = transformValue(transformer, "sa", name)
+		if err != nil {
+			return err
+		}
+
+		obj[key] = name
+	}
+
+	return nil
+}
+
+// transformVolumes applies the supplied Transformer to Secret/ConfigMap/PVC
+// names referenced by a pod's volumes, across both typed and unstructured
+// workload representations.
+//
+// A Secret/ConfigMap name referenced only here (not via envFrom or
+// imagePullSecrets) previously stayed in cleartext even with --hide/--encrypt
+// enabled. Per Mapping.GetOrCreate's doc comment (mapping.go), that is worse
+// than a field-local leak: because a pseudonym's suffix is derived from the
+// raw value alone, one cleartext occurrence anywhere in the report
+// de-anonymizes every pseudonym sharing that value's suffix, not just the
+// field it leaked from.
+func transformVolumes(obj map[string]any, transformer Transformer) error {
+	rawVolumes, ok := obj["volumes"]
+	if !ok || rawVolumes == nil {
+		return nil
+	}
+
+	switch volumes := rawVolumes.(type) {
+	case []corev1.Volume:
+		if err := transformTypedVolumes(volumes, transformer); err != nil {
+			return err
+		}
+	case []any:
+		for _, item := range volumes {
+			volume, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if err := transformUnstructuredVolume(volume, transformer); err != nil {
+				return err
+			}
+		}
+		obj["volumes"] = volumes
+	}
+
+	return nil
+}
+
+// transformTypedVolumes covers every volume source that names a Secret,
+// ConfigMap, or PersistentVolumeClaim: the direct secret/configMap volume
+// sources, a projected volume's secret/configMap sources, a CSI volume's
+// nodePublishSecretRef, and a PVC volume's claimName.
+func transformTypedVolumes(volumes []corev1.Volume, transformer Transformer) error {
+	var err error
+
+	for i := range volumes {
+		v := &volumes[i]
+
+		if v.Secret != nil && v.Secret.SecretName != "" {
+			v.Secret.SecretName, err = transformValue(transformer, "ref", v.Secret.SecretName)
+			if err != nil {
+				return err
+			}
+		}
+		if v.ConfigMap != nil && v.ConfigMap.Name != "" {
+			v.ConfigMap.Name, err = transformValue(transformer, "ref", v.ConfigMap.Name)
+			if err != nil {
+				return err
+			}
+		}
+		if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName != "" {
+			v.PersistentVolumeClaim.ClaimName, err = transformValue(transformer, "ref", v.PersistentVolumeClaim.ClaimName)
+			if err != nil {
+				return err
+			}
+		}
+		if v.CSI != nil && v.CSI.NodePublishSecretRef != nil && v.CSI.NodePublishSecretRef.Name != "" {
+			v.CSI.NodePublishSecretRef.Name, err = transformValue(transformer, "ref", v.CSI.NodePublishSecretRef.Name)
+			if err != nil {
+				return err
+			}
+		}
+		if v.Projected != nil {
+			for j := range v.Projected.Sources {
+				src := &v.Projected.Sources[j]
+				if src.Secret != nil && src.Secret.Name != "" {
+					src.Secret.Name, err = transformValue(transformer, "ref", src.Secret.Name)
+					if err != nil {
+						return err
+					}
+				}
+				if src.ConfigMap != nil && src.ConfigMap.Name != "" {
+					src.ConfigMap.Name, err = transformValue(transformer, "ref", src.ConfigMap.Name)
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// transformUnstructuredVolume mirrors transformTypedVolumes for one volume
+// represented as a map[string]any.
+func transformUnstructuredVolume(volume map[string]any, transformer Transformer) error {
+	if secret, ok := volume["secret"].(map[string]any); ok {
+		if err := transformUnstructuredNamedField(secret, "secretName", transformer); err != nil {
+			return err
+		}
+	}
+
+	if err := transformUnstructuredReference(volume, "configMap", transformer); err != nil {
+		return err
+	}
+
+	if pvc, ok := volume["persistentVolumeClaim"].(map[string]any); ok {
+		if err := transformUnstructuredNamedField(pvc, "claimName", transformer); err != nil {
+			return err
+		}
+	}
+
+	if csi, ok := volume["csi"].(map[string]any); ok {
+		if err := transformUnstructuredReference(csi, "nodePublishSecretRef", transformer); err != nil {
+			return err
+		}
+	}
+
+	if projected, ok := volume["projected"].(map[string]any); ok {
+		if sources, ok := projected["sources"].([]any); ok {
+			for _, item := range sources {
+				source, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				if err := transformUnstructuredReference(source, "secret", transformer); err != nil {
+					return err
+				}
+				if err := transformUnstructuredReference(source, "configMap", transformer); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// transformUnstructuredNamedField applies the supplied Transformer to one
+// string field on an unstructured object. Unlike transformUnstructuredReference
+// (which always reads the "name" field of a reference object), the
+// volume-level Secret/PersistentVolumeClaim sources this covers use their own
+// field name (secretName/claimName) directly on the volume source itself.
+func transformUnstructuredNamedField(obj map[string]any, field string, transformer Transformer) error {
+	value, ok := obj[field].(string)
+	if !ok || value == "" {
+		return nil
+	}
+
+	transformed, err := transformValue(transformer, "ref", value)
+	if err != nil {
+		return err
+	}
+
+	obj[field] = transformed
+	return nil
+}

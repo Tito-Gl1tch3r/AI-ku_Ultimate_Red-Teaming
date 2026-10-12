@@ -1,0 +1,512 @@
+package resourcehandler
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/kubescape/k8s-interface/k8sinterface"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/pkg/hostsensorutils"
+	"github.com/kubescape/opa-utils/objectsenvelopes/hostsensor"
+	"github.com/kubescape/opa-utils/reporthandling"
+	"github.com/kubescape/opa-utils/reporthandling/apis"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+)
+
+type mockDynamicClient struct {
+	dynamic.Interface
+	listFunc func(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error)
+	getFunc  func(ctx context.Context, namespace, name string, opts metav1.GetOptions, subresources ...string) (*unstructured.Unstructured, error)
+}
+
+func (m *mockDynamicClient) Resource(resource schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	return &mockNamespaceableResourceClient{listFunc: m.listFunc, getFunc: m.getFunc}
+}
+
+type mockNamespaceableResourceClient struct {
+	dynamic.NamespaceableResourceInterface
+	namespace string
+	listFunc  func(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error)
+	getFunc   func(ctx context.Context, namespace, name string, opts metav1.GetOptions, subresources ...string) (*unstructured.Unstructured, error)
+}
+
+func (m *mockNamespaceableResourceClient) Namespace(s string) dynamic.ResourceInterface {
+	clone := *m
+	clone.namespace = s
+	return &clone
+}
+
+func (m *mockNamespaceableResourceClient) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	return m.listFunc(ctx, opts)
+}
+
+func (m *mockNamespaceableResourceClient) Get(ctx context.Context, name string, opts metav1.GetOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	if m.getFunc != nil {
+		return m.getFunc(ctx, m.namespace, name, opts, subresources...)
+	}
+	if m.listFunc != nil {
+		list, err := m.listFunc(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, err
+		}
+		for i := range list.Items {
+			if list.Items[i].GetName() == name && (m.namespace == "" || list.Items[i].GetNamespace() == "" || list.Items[i].GetNamespace() == m.namespace) {
+				return &list.Items[i], nil
+			}
+		}
+	}
+	return nil, apierrors.NewNotFound(schema.GroupResource{}, name)
+}
+
+func TestPullResources_PartialFailureSurface(t *testing.T) {
+	mockErr := errors.New("simulated API failure")
+	mockClient := &mockDynamicClient{
+		listFunc: func(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+			if opts.FieldSelector == "metadata.name=fail" {
+				return nil, mockErr
+			}
+			return &unstructured.UnstructuredList{
+				Items: []unstructured.Unstructured{
+					{
+						Object: map[string]any{
+							"apiVersion": "v1",
+							"kind":       "Pod",
+							"metadata": map[string]any{
+								"name":      "test-pod",
+								"namespace": "default",
+							},
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	k8sApi := &k8sinterface.KubernetesApi{
+		DynamicClient: mockClient,
+	}
+
+	handler := &K8sResourceHandler{
+		k8s: k8sApi,
+	}
+
+	queryableResources := QueryableResources{
+		"//v1/configmaps/metadata.name=ok": QueryableResource{
+			GroupVersionResourceTriplet: "//v1/configmaps",
+			FieldSelectors:              "metadata.name=ok",
+		},
+		"//v1/configmaps/metadata.name=fail": QueryableResource{
+			GroupVersionResourceTriplet: "//v1/configmaps",
+			FieldSelectors:              "metadata.name=fail",
+		},
+	}
+
+	k8sResourcesMap, allResources, failedQueries := handler.pullResources(context.Background(), queryableResources, &EmptySelector{}, "")
+
+	// Verify that the successful selector populated the shared raw-GVR bucket.
+	assert.Len(t, allResources, 1)
+	assert.Len(t, k8sResourcesMap["//v1/configmaps"], 1)
+
+	// Verify that the failed selector is retained under its selector-qualified key.
+	assert.Len(t, failedQueries, 1)
+	fq, ok := failedQueries["//v1/configmaps/metadata.name=fail"]
+	assert.True(t, ok, "expected failed query key to include the field selector")
+	assert.Equal(t, "//v1/configmaps", fq.gvr)
+	assert.ErrorContains(t, fq.err, "simulated API failure")
+}
+
+// A namespace filter naming no namespace must not silence collection. The
+// selector emitted no query for it, so pullSingleResource never listed the
+// resource and left no selectorFailure behind, which reads downstream as a GVR
+// that was collected and came back empty rather than one that was skipped.
+func TestPullResources_NamespaceFilterNamingNoNamespaceStillCollects(t *testing.T) {
+	k8sinterface.InitializeMapResourcesMock()
+
+	for _, value := range []string{" ", ",", ", ,"} {
+		t.Run(value, func(t *testing.T) {
+			var selectors []string
+			mockClient := &mockDynamicClient{
+				listFunc: func(_ context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+					selectors = append(selectors, opts.FieldSelector)
+					return &unstructured.UnstructuredList{Items: []unstructured.Unstructured{{
+						Object: map[string]any{
+							"apiVersion": "v1",
+							"kind":       "Pod",
+							"metadata":   map[string]any{"name": "test-pod", "namespace": "default"},
+						},
+					}}}, nil
+				},
+			}
+
+			handler := &K8sResourceHandler{k8s: &k8sinterface.KubernetesApi{DynamicClient: mockClient}}
+			queryableResources := QueryableResources{
+				"//v1/pods": QueryableResource{GroupVersionResourceTriplet: "//v1/pods"},
+			}
+
+			k8sResources, allResources, failedQueries := handler.pullResources(context.Background(), queryableResources, NewIncludeSelector(value), "")
+
+			assert.Equal(t, []string{""}, selectors, "expected one unfiltered LIST")
+			assert.Len(t, allResources, 1)
+			assert.Len(t, k8sResources["//v1/pods"], 1)
+			assert.Empty(t, failedQueries)
+		})
+	}
+}
+
+func TestGetResources_SurfacesMissingGVRFailuresInInfoMap(t *testing.T) {
+	k8sinterface.InitializeMapResourcesMock()
+	handler := getResourceHandlerMock()
+
+	handler.k8s.DynamicClient = &mockDynamicClient{
+		listFunc: func(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+			if opts.FieldSelector != "" {
+				return nil, errors.New("simulated API failure")
+			}
+			return &unstructured.UnstructuredList{
+				Items: []unstructured.Unstructured{{
+					Object: map[string]any{
+						"apiVersion": "v1",
+						"kind":       "Namespace",
+						"metadata": map[string]any{
+							"name": "default",
+						},
+					},
+				}},
+			}, nil
+		},
+	}
+
+	rule := mockRule("rule-a", nil, "")
+	rule.Match = append(rule.Match, mockMatch(6), mockMatch(4))
+	control := mockControl("control-1", nil)
+	control.Rules = append(control.Rules, rule)
+	framework := mockFramework("test", nil)
+	framework.Controls = append(framework.Controls, control)
+
+	scanInfo := &cautils.ScanInfo{}
+	sessionObj := cautils.NewOPASessionObj(context.Background(), nil, nil, scanInfo, nil)
+	sessionObj.Policies = append(sessionObj.Policies, *framework)
+
+	_, _, _, _, err := handler.GetResources(context.Background(), sessionObj, scanInfo)
+	assert.NoError(t, err)
+
+	info, ok := sessionObj.InfoMap["/v1/secrets"]
+	assert.True(t, ok, "expected missing secrets GVR to be surfaced in InfoMap")
+	assert.Contains(t, info.InnerInfo, "simulated API failure")
+}
+
+func TestGetResources_FailsWhenAllQueriesFail(t *testing.T) {
+	k8sinterface.InitializeMapResourcesMock()
+	handler := getResourceHandlerMock()
+
+	handler.k8s.DynamicClient = &mockDynamicClient{
+		listFunc: func(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+			return nil, errors.New("simulated API failure")
+		},
+	}
+
+	rule := mockRule("rule-a", nil, "")
+	rule.Match = append(rule.Match, mockMatch(4))
+	control := mockControl("control-1", nil)
+	control.Rules = append(control.Rules, rule)
+	framework := mockFramework("test", nil)
+	framework.Controls = append(framework.Controls, control)
+
+	scanInfo := &cautils.ScanInfo{}
+	sessionObj := cautils.NewOPASessionObj(context.Background(), nil, nil, scanInfo, nil)
+	sessionObj.Policies = append(sessionObj.Policies, *framework)
+
+	_, _, _, _, err := handler.GetResources(context.Background(), sessionObj, scanInfo)
+	assert.ErrorContains(t, err, "failed to pull any Kubernetes resources")
+	assert.ErrorContains(t, err, "simulated API failure")
+}
+
+func TestGetResources_AllQueriesFailedKeepsEachQueryError(t *testing.T) {
+	k8sinterface.InitializeMapResourcesMock()
+	handler := getResourceHandlerMock()
+
+	refused := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+	handler.k8s.DynamicClient = &mockDynamicClient{
+		listFunc: func(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+			return nil, refused
+		},
+	}
+
+	rule := mockRule("rule-a", nil, "")
+	rule.Match = append(rule.Match, mockMatch(4))
+	control := mockControl("control-1", nil)
+	control.Rules = append(control.Rules, rule)
+	framework := mockFramework("test", nil)
+	framework.Controls = append(framework.Controls, control)
+
+	scanInfo := &cautils.ScanInfo{}
+	sessionObj := cautils.NewOPASessionObj(context.Background(), nil, nil, scanInfo, nil)
+	sessionObj.Policies = append(sessionObj.Policies, *framework)
+
+	_, _, _, _, err := handler.GetResources(context.Background(), sessionObj, scanInfo)
+	require.ErrorIs(t, err, ErrNoResourcesCollected)
+	var opErr *net.OpError
+	require.ErrorAs(t, err, &opErr, "the network error behind each failed query must stay reachable")
+	assert.Same(t, refused, opErr)
+	assert.False(t, apiServerAnswered(t, err), "no query got a response")
+}
+
+// apiServerAnswered reads the answer evidence the fleet classifier relies on,
+// through the same method it uses.
+func apiServerAnswered(t *testing.T, err error) bool {
+	t.Helper()
+	var answers interface{ APIServerAnswered() bool }
+	require.ErrorAs(t, err, &answers)
+	return answers.APIServerAnswered()
+}
+
+// answerFirstRefuseRest answers the first List call with answer and refuses
+// every later one, so a collection sees one response among network failures
+// whatever order its queries run in.
+func answerFirstRefuseRest(calls *atomic.Int32, answer func() (*unstructured.UnstructuredList, error)) func(context.Context, metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	return func(context.Context, metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+		if calls.Add(1) == 1 {
+			return answer()
+		}
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+	}
+}
+
+func TestGetResources_AnsweredQueryIsNotLostAmongNetworkFailures(t *testing.T) {
+	answers := map[string]func() (*unstructured.UnstructuredList, error){
+		"empty list": func() (*unstructured.UnstructuredList, error) { return &unstructured.UnstructuredList{}, nil },
+		"not found": func() (*unstructured.UnstructuredList, error) {
+			return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "deployments"}, "")
+		},
+	}
+
+	for name, answer := range answers {
+		t.Run(name, func(t *testing.T) {
+			k8sinterface.InitializeMapResourcesMock()
+			handler := getResourceHandlerMock()
+			var calls atomic.Int32
+			handler.k8s.DynamicClient = &mockDynamicClient{listFunc: answerFirstRefuseRest(&calls, answer)}
+
+			rule := mockRule("rule-a", nil, "")
+			rule.Match = append(rule.Match, mockMatch(2))
+			control := mockControl("control-1", nil)
+			control.Rules = append(control.Rules, rule)
+			framework := mockFramework("test", nil)
+			framework.Controls = append(framework.Controls, control)
+			scanInfo := &cautils.ScanInfo{}
+			sessionObj := cautils.NewOPASessionObj(context.Background(), nil, nil, scanInfo, nil)
+			sessionObj.Policies = append(sessionObj.Policies, *framework)
+
+			_, _, _, _, err := handler.GetResources(context.Background(), sessionObj, scanInfo)
+			require.GreaterOrEqual(t, calls.Load(), int32(2), "the collection must make more than one query for this to mean anything")
+			require.ErrorIs(t, err, ErrNoResourcesCollected)
+			assert.True(t, apiServerAnswered(t, err), "a query got a response, so the API server answered")
+		})
+	}
+}
+
+func TestGetResources_AnswerEvidenceDoesNotCarryAcrossCollections(t *testing.T) {
+	k8sinterface.InitializeMapResourcesMock()
+	handler := getResourceHandlerMock()
+	refuseAll := false
+	handler.k8s.DynamicClient = &mockDynamicClient{
+		listFunc: func(context.Context, metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+			if refuseAll {
+				return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+			}
+			return &unstructured.UnstructuredList{}, nil
+		},
+	}
+
+	rule := mockRule("rule-a", nil, "")
+	rule.Match = append(rule.Match, mockMatch(4))
+	control := mockControl("control-1", nil)
+	control.Rules = append(control.Rules, rule)
+	framework := mockFramework("test", nil)
+	framework.Controls = append(framework.Controls, control)
+	scanInfo := &cautils.ScanInfo{}
+	sessionObj := cautils.NewOPASessionObj(context.Background(), nil, nil, scanInfo, nil)
+	sessionObj.Policies = append(sessionObj.Policies, *framework)
+
+	_, _, _, _, _ = handler.GetResources(context.Background(), sessionObj, scanInfo)
+
+	refuseAll = true
+	_, _, _, _, err := handler.GetResources(context.Background(), sessionObj, scanInfo)
+	require.ErrorIs(t, err, ErrNoResourcesCollected)
+	assert.False(t, apiServerAnswered(t, err), "an answer from an earlier collection says nothing about this one")
+}
+
+func TestAPIServerResponded(t *testing.T) {
+	notFound := apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, "")
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "result", err: nil, want: true},
+		{name: "not found", err: notFound, want: true},
+		{name: "forbidden", err: apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "", errors.New("rbac")), want: true},
+		{name: "wrapped status", err: fmt.Errorf("list: %w", notFound), want: true},
+		{name: "connection refused", err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}, want: false},
+		{name: "plain error", err: errors.New("boom"), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, apiServerResponded(tt.err))
+		})
+	}
+}
+
+func TestNewAllQueriesFailedError(t *testing.T) {
+	podsFailure := errors.New("pods failed")
+	single := newAllQueriesFailedError(map[string]queryFailure{
+		"/v1/pods": {gvr: "/v1/pods", err: podsFailure},
+	}, false)
+	require.EqualError(t, single, "failed to pull any Kubernetes resources: /v1/pods: pods failed",
+		"the message must stay exactly as it was")
+	require.ErrorIs(t, single, podsFailure)
+	require.ErrorIs(t, single, ErrNoResourcesCollected)
+	assert.False(t, apiServerAnswered(t, single))
+
+	secretsFailure := errors.New("secrets failed")
+	several := newAllQueriesFailedError(map[string]queryFailure{
+		"/v1/pods":    {gvr: "/v1/pods", err: podsFailure},
+		"/v1/secrets": {gvr: "/v1/secrets", err: secretsFailure},
+	}, true)
+	require.ErrorIs(t, several, podsFailure)
+	require.ErrorIs(t, several, secretsFailure)
+	assert.Contains(t, several.Error(), "/v1/pods: pods failed")
+	assert.Contains(t, several.Error(), "/v1/secrets: secrets failed")
+	assert.Contains(t, several.Error(), "; ")
+	assert.True(t, apiServerAnswered(t, several))
+}
+
+// TestGetResources_ScanAbortedOnContextCancellation verifies that when the
+// scan context is cancelled (e.g. by a --scan-timeout expiry), GetResources
+// returns a "scan aborted" error that explicitly wraps the context error.
+// This gives users a clear, actionable message instead of a confusing
+// "failed to pull any Kubernetes resources" message.
+func TestGetResources_ScanAbortedOnContextCancellation(t *testing.T) {
+	k8sinterface.InitializeMapResourcesMock()
+	handler := getResourceHandlerMock()
+
+	// List function blocks until its context is done, simulating a slow API.
+	hangForever := make(chan struct{})
+	handler.k8s.DynamicClient = &mockDynamicClient{
+		listFunc: func(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+			select {
+			case <-hangForever:
+				return &unstructured.UnstructuredList{}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+
+	rule := mockRule("rule-a", nil, "")
+	rule.Match = append(rule.Match, mockMatch(4))
+	control := mockControl("control-1", nil)
+	control.Rules = append(control.Rules, rule)
+	framework := mockFramework("test", nil)
+	framework.Controls = append(framework.Controls, control)
+
+	scanInfo := &cautils.ScanInfo{}
+	sessionObj := cautils.NewOPASessionObj(context.Background(), nil, nil, scanInfo, nil)
+	sessionObj.Policies = append(sessionObj.Policies, *framework)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, _, _, _, err := handler.GetResources(ctx, sessionObj, scanInfo)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "scan aborted",
+		"timeout error should say 'scan aborted', not 'failed to pull any Kubernetes resources'")
+	assert.True(t,
+		errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled),
+		"error should wrap the context error so callers can use errors.Is(err, context.DeadlineExceeded)")
+}
+
+type stubHostSensor struct {
+	infoMap  map[string]apis.StatusInfo
+	partials []cautils.PartialGVRPull
+}
+
+func (s *stubHostSensor) Init(_ context.Context) error { return nil }
+func (s *stubHostSensor) TearDown() error              { return nil }
+func (s *stubHostSensor) CollectResources(_ context.Context) ([]hostsensor.HostSensorDataEnvelope, map[string]apis.StatusInfo, []cautils.PartialGVRPull, error) {
+	return nil, s.infoMap, s.partials, nil
+}
+
+func (s *stubHostSensor) StreamTelemetry(_ context.Context) (<-chan hostsensorutils.SyscallEvent, error) {
+	events := make(chan hostsensorutils.SyscallEvent)
+	close(events)
+	return events, nil
+}
+
+// TestGetResources_HostSensorInfoMapMerged is a regression test for the bug
+// where the host-sensor infoMap replaced sessionObj.InfoMap wholesale instead
+// of being merged into it, silently discarding GVR pull-failure entries that
+// recordFailedQueryStatuses had written earlier.
+func TestGetResources_HostSensorInfoMapMerged(t *testing.T) {
+	k8sinterface.InitializeMapResourcesMock()
+	handler := getResourceHandlerMock()
+	handler.k8s.DynamicClient = &mockDynamicClient{
+		listFunc: func(_ context.Context, _ metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+			return &unstructured.UnstructuredList{}, nil
+		},
+	}
+	handler.hostSensorHandler = &stubHostSensor{
+		infoMap: map[string]apis.StatusInfo{
+			"KubeletInfo": {InnerStatus: apis.StatusSkipped, InnerInfo: "node-1: connection refused"},
+		},
+		partials: []cautils.PartialGVRPull{
+			{GVR: "hostdata.kubescape.cloud/v1beta0/KubeletInfo", Selector: "conversion", Error: "node-agent reported 2 KubeletInfo but only 1 could be read"},
+		},
+	}
+
+	rule := mockRule("host-sensor-rule", nil, "")
+	rule.Match = []reporthandling.RuleMatchObjects{{
+		APIGroups:   []string{""},
+		APIVersions: []string{"v1"},
+		Resources:   []string{"KubeletInfo"},
+	}}
+	control := mockControl("host-control", nil)
+	control.Rules = []reporthandling.PolicyRule{rule}
+	framework := mockFramework("host-framework", nil)
+	framework.Controls = []reporthandling.Control{control}
+
+	scanInfo := &cautils.ScanInfo{}
+	scanInfo.HostSensorEnabled.SetBool(true)
+	sessionObj := cautils.NewOPASessionObj(context.Background(), nil, nil, scanInfo, nil)
+	sessionObj.Policies = append(sessionObj.Policies, *framework)
+
+	const preSeededGVR = "/v1/networkpolicies"
+	sessionObj.InfoMap[preSeededGVR] = apis.StatusInfo{
+		InnerInfo:   "networkpolicies is forbidden",
+		InnerStatus: apis.StatusSkipped,
+		SubStatus:   apis.SubStatusNotEvaluated,
+	}
+
+	_, _, _, _, _ = handler.GetResources(context.Background(), sessionObj, scanInfo)
+
+	_, ok := sessionObj.InfoMap[preSeededGVR]
+	assert.True(t, ok, "GVR pull-failure entry must survive host-sensor collection; host infoMap must be merged, not replace sessionObj.InfoMap")
+
+	_, ok = sessionObj.InfoMap["KubeletInfo"]
+	assert.True(t, ok, "host-sensor infoMap entries must be present in sessionObj.InfoMap after merge")
+
+	require.Len(t, sessionObj.PartialGVRFailures, 1, "host-sensor partial gaps must reach the session")
+	assert.Equal(t, "hostdata.kubescape.cloud/v1beta0/KubeletInfo", sessionObj.PartialGVRFailures[0].GVR)
+	assert.Equal(t, "conversion", sessionObj.PartialGVRFailures[0].Selector)
+}

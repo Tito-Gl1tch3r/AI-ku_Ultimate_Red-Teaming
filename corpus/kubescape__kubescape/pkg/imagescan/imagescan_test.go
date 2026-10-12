@@ -1,0 +1,997 @@
+package imagescan
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/adrg/xdg"
+
+	"github.com/anchore/grype/grype/db/v6/distribution"
+	"github.com/anchore/grype/grype/db/v6/installation"
+	"github.com/anchore/grype/grype/match"
+	grypepkg "github.com/anchore/grype/grype/pkg"
+	"github.com/anchore/grype/grype/vulnerability"
+	"github.com/anchore/stereoscope/pkg/image"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type thresholdStubVulnerabilityProvider struct {
+	metadataByID map[string]*vulnerability.Metadata
+	errByID      map[string]error
+}
+
+func (s thresholdStubVulnerabilityProvider) PackageSearchNames(grypepkg.Package) []string {
+	return nil
+}
+
+func (s thresholdStubVulnerabilityProvider) FindVulnerabilities(...vulnerability.Criteria) ([]vulnerability.Vulnerability, error) {
+	return nil, nil
+}
+
+func (s thresholdStubVulnerabilityProvider) VulnerabilityMetadata(ref vulnerability.Reference) (*vulnerability.Metadata, error) {
+	if err, ok := s.errByID[ref.ID]; ok {
+		return nil, err
+	}
+
+	if metadata, ok := s.metadataByID[ref.ID]; ok {
+		return metadata, nil
+	}
+
+	return nil, errors.New("metadata not found")
+}
+
+func (s thresholdStubVulnerabilityProvider) Close() error {
+	return nil
+}
+
+func makeThresholdTestMatch(id string) match.Match {
+	return match.Match{
+		Vulnerability: vulnerability.Vulnerability{
+			Reference: vulnerability.Reference{
+				ID:        id,
+				Namespace: "nvd",
+			},
+		},
+		Package: grypepkg.Package{
+			ID:      grypepkg.ID("pkg-" + id),
+			Name:    "pkg-" + id,
+			Version: "1.0.0",
+		},
+	}
+}
+
+func makeThresholdTestMatchWithFixState(id string, state vulnerability.FixState) match.Match {
+	m := makeThresholdTestMatch(id)
+	m.Vulnerability.Fix.State = state
+	return m
+}
+
+func makeThresholdTestMatchWithMetadata(id, severity string) match.Match {
+	m := makeThresholdTestMatch(id)
+	m.Vulnerability.Metadata = &vulnerability.Metadata{Severity: severity}
+	return m
+}
+
+type stubVulnerabilityProvider struct {
+	metadataByID map[string]*vulnerability.Metadata
+	errByID      map[string]error
+}
+
+func (s stubVulnerabilityProvider) PackageSearchNames(grypepkg.Package) []string {
+	return nil
+}
+
+func (s stubVulnerabilityProvider) FindVulnerabilities(...vulnerability.Criteria) ([]vulnerability.Vulnerability, error) {
+	return nil, nil
+}
+
+func (s stubVulnerabilityProvider) VulnerabilityMetadata(ref vulnerability.Reference) (*vulnerability.Metadata, error) {
+	if err, ok := s.errByID[ref.ID]; ok {
+		return nil, err
+	}
+
+	if metadata, ok := s.metadataByID[ref.ID]; ok {
+		return metadata, nil
+	}
+
+	return nil, errors.New("metadata not found")
+}
+
+func (s stubVulnerabilityProvider) Close() error {
+	return nil
+}
+
+func makeTestMatch(id string) match.Match {
+	return match.Match{
+		Vulnerability: vulnerability.Vulnerability{
+			Reference: vulnerability.Reference{
+				ID:        id,
+				Namespace: "nvd",
+			},
+		},
+		Package: grypepkg.Package{
+			ID:      grypepkg.ID("pkg-" + id),
+			Name:    "pkg-" + id,
+			Version: "1.0.0",
+		},
+	}
+}
+
+func matchIDs(matches match.Matches) []string {
+	ids := make([]string, 0, matches.Count())
+	for m := range matches.Enumerate() {
+		ids = append(ids, m.Vulnerability.ID)
+	}
+	return ids
+}
+
+func TestApplyDBFreshness(t *testing.T) {
+	builtAt := time.Now().Add(-48 * time.Hour).Truncate(time.Second)
+
+	tests := []struct {
+		name    string
+		status  *vulnerability.ProviderStatus
+		wantSet bool
+	}{
+		{
+			name:    "nil status leaves field unset",
+			status:  nil,
+			wantSet: false,
+		},
+		{
+			name:    "zero Built leaves field unset",
+			status:  &vulnerability.ProviderStatus{},
+			wantSet: false,
+		},
+		{
+			name: "Built is surfaced",
+			status: &vulnerability.ProviderStatus{
+				Built: builtAt,
+			},
+			wantSet: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pb := &cautils.ImageScanData{}
+			applyDBFreshness(pb, tt.status)
+			if tt.wantSet {
+				require.NotNil(t, pb.VulnDBBuilt)
+				assert.Equal(t, builtAt, *pb.VulnDBBuilt)
+			} else {
+				assert.Nil(t, pb.VulnDBBuilt)
+			}
+		})
+	}
+}
+
+func TestParseSeverity(t *testing.T) {
+	tests := []struct {
+		name string
+		want vulnerability.Severity
+	}{
+		{
+			name: "",
+			want: vulnerability.UnknownSeverity,
+		},
+		{
+			name: "unknown",
+			want: vulnerability.UnknownSeverity,
+		},
+		{
+			name: "important",
+			want: vulnerability.UnknownSeverity,
+		},
+		{
+			name: "negligible",
+			want: vulnerability.NegligibleSeverity,
+		},
+		{
+			name: "low",
+			want: vulnerability.LowSeverity,
+		},
+		{
+			name: "medium",
+			want: vulnerability.MediumSeverity,
+		},
+		{
+			name: "high",
+			want: vulnerability.HighSeverity,
+		},
+		{
+			name: "critical",
+			want: vulnerability.CriticalSeverity,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ParseSeverity(tt.name)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestGetProviderConfig(t *testing.T) {
+	tests := []struct {
+		name      string
+		creds     RegistryCredentials
+		wantCreds []image.RegistryCredentials
+	}{
+		{
+			name: "Both Non Empty",
+			creds: RegistryCredentials{
+				Username: "username",
+				Password: "password",
+			},
+			wantCreds: []image.RegistryCredentials{{Username: "username", Password: "password"}},
+		},
+		{
+			name: "Password Empty",
+			creds: RegistryCredentials{
+				Username: "username",
+				Password: "",
+			},
+			wantCreds: nil,
+		},
+		{
+			name: "Username Empty",
+			creds: RegistryCredentials{
+				Username: "",
+				Password: "password",
+			},
+			wantCreds: nil,
+		},
+		{
+			name: "Both empty",
+			creds: RegistryCredentials{
+				Username: "",
+				Password: "",
+			},
+			wantCreds: nil,
+		},
+		{
+			name: "Token with authority",
+			creds: RegistryCredentials{
+				Authority: "registry.example.com",
+				Token:     "token",
+			},
+			wantCreds: []image.RegistryCredentials{{Authority: "registry.example.com", Token: "token"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			providerConfig := getProviderConfig(tt.creds, nil, ScanOptions{}, nil)
+			assert.NotNil(t, providerConfig)
+			assert.Equal(t, true, providerConfig.GenerateMissingCPEs)
+			assert.Equal(t, tt.wantCreds, providerConfig.RegistryOptions.Credentials)
+		})
+	}
+}
+
+func TestNewScanServiceWithDefaultMatchers(t *testing.T) {
+	// Test the Service struct creation with different useDefaultMatchers values
+	// This test doesn't require a real database
+
+	// Test with default matchers enabled
+	svcWithDefault := &Service{
+		useDefaultMatchers: true,
+	}
+	assert.True(t, svcWithDefault.useDefaultMatchers)
+
+	// Test with default matchers disabled
+	svcWithoutDefault := &Service{
+		useDefaultMatchers: false,
+	}
+	assert.False(t, svcWithoutDefault.useDefaultMatchers)
+}
+
+func TestNewScanServiceWithMatchers(t *testing.T) {
+	// Test the Service struct creation with different useDefaultMatchers values
+	// This test doesn't require a real database
+
+	// Test with default matchers enabled
+	svcWithDefault := &Service{
+		useDefaultMatchers: true,
+	}
+	assert.True(t, svcWithDefault.useDefaultMatchers)
+
+	// Test with default matchers disabled
+	svcWithoutDefault := &Service{
+		useDefaultMatchers: false,
+	}
+	assert.False(t, svcWithoutDefault.useDefaultMatchers)
+}
+
+func TestNewScanServiceWithMatchersIntegration(t *testing.T) {
+	if testing.Short() || os.Getenv("KUBESCAPE_INTEGRATION_TESTS") != "1" {
+		t.Skip("skipping integration test; set KUBESCAPE_INTEGRATION_TESTS=1 to run")
+	}
+	// Test the actual NewScanServiceWithMatchers function
+	distCfg, installCfg, _, _ := NewDefaultDBConfig("", false, false)
+
+	// Test with default matchers enabled
+	svcWithDefault, err := NewScanServiceWithMatchers(distCfg, installCfg, true)
+	require.NoError(t, err)
+	defer svcWithDefault.Close()
+	assert.True(t, svcWithDefault.useDefaultMatchers)
+	// The registry keychain fallback (docker config, then any cloud-provider
+	// keychains such as Azure's) must be wired in for every Service the
+	// constructor produces, or image pulls silently lose that fallback.
+	assert.NotNil(t, svcWithDefault.keychain)
+
+	// Test with default matchers disabled
+	svcWithoutDefault, err := NewScanServiceWithMatchers(distCfg, installCfg, false)
+	require.NoError(t, err)
+	defer svcWithoutDefault.Close()
+	assert.False(t, svcWithoutDefault.useDefaultMatchers)
+}
+
+func TestExceedsSeverityThreshold(t *testing.T) {
+	provider := thresholdStubVulnerabilityProvider{
+		metadataByID: map[string]*vulnerability.Metadata{
+			"CVE-high":         {Severity: vulnerability.HighSeverity.String()},
+			"CVE-low":          {Severity: vulnerability.LowSeverity.String()},
+			"CVE-high-fixed":   {Severity: vulnerability.HighSeverity.String()},
+			"CVE-high-unfixed": {Severity: vulnerability.HighSeverity.String()},
+		},
+		errByID: map[string]error{
+			"CVE-error": errors.New("lookup failed"),
+		},
+	}
+
+	tests := []struct {
+		name        string
+		threshold   vulnerability.Severity
+		matches     match.Matches
+		onlyFixable bool
+		want        bool
+	}{
+		{
+			name:      "unknown threshold never fails the scan",
+			threshold: vulnerability.UnknownSeverity,
+			matches: match.NewMatches(
+				makeThresholdTestMatch("CVE-high"),
+			),
+			onlyFixable: false,
+			want:        false,
+		},
+		{
+			name:      "match equal to threshold fails the scan",
+			threshold: vulnerability.HighSeverity,
+			matches: match.NewMatches(
+				makeThresholdTestMatch("CVE-high"),
+				makeThresholdTestMatch("CVE-low"),
+			),
+			onlyFixable: false,
+			want:        true,
+		},
+		{
+			name:      "metadata errors fail closed when no remaining match exceeds threshold",
+			threshold: vulnerability.MediumSeverity,
+			matches: match.NewMatches(
+				makeThresholdTestMatch("CVE-error"),
+				makeThresholdTestMatch("CVE-low"),
+			),
+			onlyFixable: false,
+			want:        true,
+		},
+		{
+			name:      "embedded metadata gates when provider lookup fails",
+			threshold: vulnerability.HighSeverity,
+			matches: match.NewMatches(
+				makeThresholdTestMatchWithMetadata("CVE-error", vulnerability.CriticalSeverity.String()),
+			),
+			onlyFixable: false,
+			want:        true,
+		},
+		{
+			name:      "empty embedded severity falls back to provider metadata",
+			threshold: vulnerability.HighSeverity,
+			matches: match.NewMatches(
+				makeThresholdTestMatchWithMetadata("CVE-high", ""),
+			),
+			onlyFixable: false,
+			want:        true,
+		},
+		{
+			name:      "unrecognized embedded severity falls back to provider metadata",
+			threshold: vulnerability.HighSeverity,
+			matches: match.NewMatches(
+				makeThresholdTestMatchWithMetadata("CVE-high", "important"),
+			),
+			onlyFixable: false,
+			want:        true,
+		},
+		{
+			name:      "explicit unknown embedded severity falls back to provider metadata",
+			threshold: vulnerability.HighSeverity,
+			matches: match.NewMatches(
+				makeThresholdTestMatchWithMetadata("CVE-high", vulnerability.UnknownSeverity.String()),
+			),
+			onlyFixable: false,
+			want:        true,
+		},
+		{
+			name:      "onlyFixable ignores an unfixable CVE at or above threshold",
+			threshold: vulnerability.HighSeverity,
+			matches: match.NewMatches(
+				makeThresholdTestMatchWithFixState("CVE-high-unfixed", vulnerability.FixStateNotFixed),
+			),
+			onlyFixable: true,
+			want:        false,
+		},
+		{
+			name:      "onlyFixable still fails on a fixable CVE at or above threshold",
+			threshold: vulnerability.HighSeverity,
+			matches: match.NewMatches(
+				makeThresholdTestMatchWithFixState("CVE-high-fixed", vulnerability.FixStateFixed),
+			),
+			onlyFixable: true,
+			want:        true,
+		},
+		{
+			name:      "unknown severity fails closed on a set threshold",
+			threshold: vulnerability.LowSeverity,
+			matches: match.NewMatches(
+				makeThresholdTestMatch("CVE-error"),
+			),
+			onlyFixable: false,
+			want:        true,
+		},
+		{
+			name:      "unknown severity with unresolvable provider entry fails closed",
+			threshold: vulnerability.LowSeverity,
+			matches: match.NewMatches(
+				makeThresholdTestMatch("CVE-unknown-no-provider"),
+			),
+			onlyFixable: false,
+			want:        true,
+		},
+		{
+			name:      "unknown severity respects onlyFixable for definitively unfixable CVEs",
+			threshold: vulnerability.LowSeverity,
+			matches: match.NewMatches(
+				makeThresholdTestMatchWithFixState("CVE-error", vulnerability.FixStateNotFixed),
+			),
+			onlyFixable: true,
+			want:        false,
+		},
+		{
+			name:      "unknown severity with unknown fix state still fails when onlyFixable",
+			threshold: vulnerability.LowSeverity,
+			matches: match.NewMatches(
+				makeThresholdTestMatch("CVE-error"),
+			),
+			onlyFixable: true,
+			want:        true,
+		},
+		{
+			name:      "negligible severity still passes a low threshold",
+			threshold: vulnerability.LowSeverity,
+			matches: match.NewMatches(
+				makeThresholdTestMatchWithMetadata("CVE-negligible", vulnerability.NegligibleSeverity.String()),
+			),
+			onlyFixable: false,
+			want:        false,
+		},
+		{
+			name:      "negligible threshold with unknown severity fails closed",
+			threshold: vulnerability.NegligibleSeverity,
+			matches: match.NewMatches(
+				makeThresholdTestMatch("CVE-error"),
+			),
+			onlyFixable: false,
+			want:        true,
+		},
+	}
+
+	svc := &Service{vp: provider}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, svc.ExceedsSeverityThreshold(tt.threshold, tt.matches, tt.onlyFixable))
+		})
+	}
+}
+
+// countingThresholdProvider counts provider lookups to prove the gate visits
+// every match: matches.Enumerate() is fed by a goroutine over an unbuffered
+// channel, so stopping early would strand the producer and leak a goroutine.
+type countingThresholdProvider struct {
+	thresholdStubVulnerabilityProvider
+	calls *int
+}
+
+func (s countingThresholdProvider) VulnerabilityMetadata(ref vulnerability.Reference) (*vulnerability.Metadata, error) {
+	(*s.calls)++
+	return s.thresholdStubVulnerabilityProvider.VulnerabilityMetadata(ref)
+}
+
+func TestExceedsSeverityThresholdDrainsAllMatches(t *testing.T) {
+	var calls int
+	provider := countingThresholdProvider{
+		thresholdStubVulnerabilityProvider: thresholdStubVulnerabilityProvider{},
+		calls:                              &calls,
+	}
+	const n = 25
+	ms := make([]match.Match, 0, n)
+	for i := 0; i < n; i++ {
+		// No embedded metadata and no stub entry: every match needs a
+		// (failing) provider lookup, so each must be visited.
+		ms = append(ms, makeThresholdTestMatch(fmt.Sprintf("CVE-unknown-%d", i)))
+	}
+	svc := &Service{vp: provider}
+	assert.True(t, svc.ExceedsSeverityThreshold(vulnerability.LowSeverity, match.NewMatches(ms...), false))
+	assert.Equal(t, n, calls, "every unknown match must be visited; stopping early leaks the Enumerate producer goroutine")
+}
+
+func TestExceedsSeverityThresholdNilProvider(t *testing.T) {
+	svc := &Service{}
+	matches := match.NewMatches(makeThresholdTestMatch("CVE-anything"))
+	assert.True(t, svc.ExceedsSeverityThreshold(vulnerability.LowSeverity, matches, false),
+		"nil provider with unknown severity must fail closed")
+}
+
+func TestMatchSeverity(t *testing.T) {
+	provider := thresholdStubVulnerabilityProvider{
+		metadataByID: map[string]*vulnerability.Metadata{
+			"CVE-high": {Severity: vulnerability.HighSeverity.String()},
+		},
+		errByID: map[string]error{
+			"CVE-error": errors.New("lookup failed"),
+		},
+	}
+
+	t.Run("embedded known severity wins without provider", func(t *testing.T) {
+		sev, unknown := MatchSeverity(makeThresholdTestMatchWithMetadata("CVE-x", vulnerability.CriticalSeverity.String()), nil)
+		assert.False(t, unknown)
+		assert.Equal(t, vulnerability.CriticalSeverity, sev)
+	})
+	t.Run("nil metadata with nil provider is unknown", func(t *testing.T) {
+		_, unknown := MatchSeverity(makeThresholdTestMatch("CVE-x"), nil)
+		assert.True(t, unknown)
+	})
+	t.Run("provider fallback resolves", func(t *testing.T) {
+		sev, unknown := MatchSeverity(makeThresholdTestMatch("CVE-high"), provider)
+		assert.False(t, unknown)
+		assert.Equal(t, vulnerability.HighSeverity, sev)
+	})
+	t.Run("provider error is unknown", func(t *testing.T) {
+		_, unknown := MatchSeverity(makeThresholdTestMatch("CVE-error"), provider)
+		assert.True(t, unknown)
+	})
+	t.Run("provider unknown severity is unknown", func(t *testing.T) {
+		p := thresholdStubVulnerabilityProvider{
+			metadataByID: map[string]*vulnerability.Metadata{
+				"CVE-u": {Severity: vulnerability.UnknownSeverity.String()},
+			},
+		}
+		_, unknown := MatchSeverity(makeThresholdTestMatch("CVE-u"), p)
+		assert.True(t, unknown)
+	})
+	t.Run("negligible is determinate", func(t *testing.T) {
+		sev, unknown := MatchSeverity(makeThresholdTestMatchWithMetadata("CVE-n", vulnerability.NegligibleSeverity.String()), nil)
+		assert.False(t, unknown)
+		assert.Equal(t, vulnerability.NegligibleSeverity, sev)
+	})
+}
+
+func TestValidateDBLoad(t *testing.T) {
+	tests := []struct {
+		name    string
+		loadErr error
+		status  *vulnerability.ProviderStatus
+		wantErr string
+	}{
+		{
+			name:    "load error is wrapped",
+			loadErr: errors.New("boom"),
+			wantErr: "failed to load vulnerability db: boom",
+		},
+		{
+			name:    "nil status is rejected",
+			wantErr: "unable to determine the status of the vulnerability db",
+		},
+		{
+			name: "status error is wrapped",
+			status: &vulnerability.ProviderStatus{
+				Error: errors.New("status failure"),
+			},
+			wantErr: "db could not be loaded: status failure",
+		},
+		{
+			name:   "valid status passes",
+			status: &vulnerability.ProviderStatus{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateDBLoad(tt.loadErr, tt.status)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+
+			require.Error(t, err)
+			assert.EqualError(t, err, tt.wantErr)
+		})
+	}
+}
+
+func TestNewDefaultDBConfig(t *testing.T) {
+	tests := []struct {
+		name             string
+		grypeURL         string
+		skipDBUpdate     bool
+		failOnStale      bool
+		wantURL          string
+		wantErr          string
+		wantDir          string
+		wantUpdate       bool
+		wantRequireCheck bool
+	}{
+		{
+			name:       "default config uses bundled database URL",
+			wantURL:    defaultGrypeListingURL,
+			wantDir:    filepath.Join(xdg.CacheHome, defaultDBDirName),
+			wantUpdate: true,
+		},
+		{
+			name:         "skip database update sets shouldUpdate to false",
+			skipDBUpdate: true,
+			wantURL:      defaultGrypeListingURL,
+			wantDir:      filepath.Join(xdg.CacheHome, defaultDBDirName),
+			wantUpdate:   false,
+		},
+		{
+			name:             "strict gate requires the update check when updating",
+			failOnStale:      true,
+			wantURL:          defaultGrypeListingURL,
+			wantDir:          filepath.Join(xdg.CacheHome, defaultDBDirName),
+			wantUpdate:       true,
+			wantRequireCheck: true,
+		},
+		{
+			name:         "strict gate without update requires nothing",
+			skipDBUpdate: true,
+			failOnStale:  true,
+			wantURL:      defaultGrypeListingURL,
+			wantDir:      filepath.Join(xdg.CacheHome, defaultDBDirName),
+			wantUpdate:   false,
+		},
+		{
+			name:       "custom http URL overrides default",
+			grypeURL:   "http://example.com/custom-db/listing.json",
+			wantURL:    "http://example.com/custom-db/listing.json",
+			wantDir:    filepath.Join(xdg.CacheHome, defaultDBDirName),
+			wantUpdate: true,
+		},
+		{
+			name:     "custom URL without host is rejected",
+			grypeURL: "http:///custom-db/listing.json",
+			wantErr:  "invalid grype DB URL: missing host",
+		},
+		{
+			name:     "unsupported URL scheme is rejected",
+			grypeURL: "ftp://example.com/custom-db/listing.json",
+			wantErr:  "invalid scheme: ftp",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			distCfg, installCfg, shouldUpdate, err := NewDefaultDBConfig(tt.grypeURL, tt.skipDBUpdate, tt.failOnStale)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.EqualError(t, err, tt.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantURL, distCfg.LatestURL)
+			assert.Equal(t, tt.wantDir, installCfg.DBRootDir)
+			assert.Equal(t, tt.wantUpdate, shouldUpdate)
+			assert.Equal(t, tt.wantRequireCheck, distCfg.RequireUpdateCheck)
+		})
+	}
+}
+
+func TestDefaultMatcherConfig(t *testing.T) {
+	cfg := defaultMatcherConfig()
+	assert.Equal(t, "https://search.maven.org/solrsearch/select", cfg.Java.MavenBaseURL)
+	assert.False(t, cfg.Java.UseCPEs)
+	assert.False(t, cfg.Ruby.UseCPEs)
+	assert.False(t, cfg.Python.UseCPEs)
+	assert.False(t, cfg.Dotnet.UseCPEs)
+	assert.False(t, cfg.Javascript.UseCPEs)
+	assert.False(t, cfg.Golang.UseCPEs)
+	assert.True(t, cfg.Golang.AlwaysUseCPEForStdlib)
+	assert.False(t, cfg.Golang.AllowMainModulePseudoVersionComparison)
+	assert.True(t, cfg.Stock.UseCPEs)
+}
+
+func TestNewDefaultDBConfig_SanitizationHarden(t *testing.T) {
+	tests := []struct {
+		name        string
+		inputURL    string
+		wantHost    string
+		wantDefault bool
+		wantErr     bool
+	}{
+		{
+			name:        "valid URL with leading trailing spaces",
+			inputURL:    "  https://custom-registry.io/db   ",
+			wantHost:    "custom-registry.io",
+			wantDefault: false,
+			wantErr:     false,
+		},
+		{
+			name:        "valid URL with trailing newline",
+			inputURL:    "https://custom-registry.io/db\n",
+			wantHost:    "custom-registry.io",
+			wantDefault: false,
+			wantErr:     false,
+		},
+		{
+			name:        "whitespace only input falls back to default",
+			inputURL:    "   ",
+			wantDefault: true,
+			wantErr:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			distCfg, _, _, err := NewDefaultDBConfig(tt.inputURL, false, false)
+
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("NewDefaultDBConfig() error = %v, wantErr %v", err, tt.wantErr)
+			}
+
+			if tt.wantDefault {
+				if distCfg.LatestURL != defaultGrypeListingURL {
+					t.Fatalf("expected default URL %q, got %q", defaultGrypeListingURL, distCfg.LatestURL)
+				}
+				return
+			}
+
+			if !strings.Contains(distCfg.LatestURL, tt.wantHost) {
+				t.Fatalf("expected URL to contain host %q, got %q", tt.wantHost, distCfg.LatestURL)
+			}
+		})
+	}
+}
+
+func TestFilterMatchesBasedOnSeverity(t *testing.T) {
+	provider := stubVulnerabilityProvider{
+		metadataByID: map[string]*vulnerability.Metadata{
+			"CVE-high": {
+				Severity: "high",
+			},
+			"CVE-medium": {
+				Severity: "medium",
+			},
+		},
+		errByID: map[string]error{
+			"CVE-error": errors.New("lookup failed"),
+		},
+	}
+
+	remainingMatches := match.NewMatches(
+		makeTestMatch("CVE-high"),
+		makeTestMatch("CVE-medium"),
+		makeTestMatch("CVE-error"),
+	)
+
+	t.Run("nil severity exceptions keep all matches", func(t *testing.T) {
+		filtered := filterMatchesBasedOnSeverity(nil, remainingMatches, provider)
+		assert.ElementsMatch(t, []string{"CVE-high", "CVE-medium", "CVE-error"}, matchIDs(filtered))
+	})
+
+	t.Run("empty severity exceptions keep all matches", func(t *testing.T) {
+		filtered := filterMatchesBasedOnSeverity([]string{}, remainingMatches, provider)
+		assert.ElementsMatch(t, []string{"CVE-high", "CVE-medium", "CVE-error"}, matchIDs(filtered))
+	})
+
+	t.Run("metadata lookup errors preserve matches", func(t *testing.T) {
+		filtered := filterMatchesBasedOnSeverity([]string{"HIGH"}, remainingMatches, provider)
+		assert.ElementsMatch(t, []string{"CVE-medium", "CVE-error"}, matchIDs(filtered))
+	})
+}
+
+func TestGetMatchers(t *testing.T) {
+	t.Run("default matchers", func(t *testing.T) {
+		matchers := getMatchers(true)
+		assert.NotNil(t, matchers)
+		assert.NotEmpty(t, matchers)
+	})
+
+	t.Run("custom matchers", func(t *testing.T) {
+		matchers := getMatchers(false)
+		assert.NotNil(t, matchers)
+		assert.NotEmpty(t, matchers)
+	})
+}
+
+func TestNewScanServiceIntegration(t *testing.T) {
+	if testing.Short() || os.Getenv("KUBESCAPE_INTEGRATION_TESTS") != "1" {
+		t.Skip("skipping integration test; set KUBESCAPE_INTEGRATION_TESTS=1 to run")
+	}
+	distCfg, installCfg, _, _ := NewDefaultDBConfig("", false, false)
+
+	svc, err := NewScanService(distCfg, installCfg)
+	require.NoError(t, err)
+	defer svc.Close()
+	assert.True(t, svc.useDefaultMatchers)
+}
+
+func TestWrapDBLoadError(t *testing.T) {
+	baseErr := errors.New("failed to load vulnerability db: boom")
+	t.Run("update enabled returns original error", func(t *testing.T) {
+		assert.Equal(t, baseErr, wrapDBLoadError(baseErr, true))
+	})
+	t.Run("skip update adds actionable hint", func(t *testing.T) {
+		got := wrapDBLoadError(baseErr, false)
+		assert.ErrorIs(t, got, baseErr)
+		assert.ErrorContains(t, got, "local vulnerability database could not be used")
+		assert.ErrorContains(t, got, "--skip-db-update")
+	})
+}
+
+func TestCheckDBAge(t *testing.T) {
+	fixedNow := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	oldNow := dbNowFunc
+	dbNowFunc = func() time.Time { return fixedNow }
+	defer func() { dbNowFunc = oldNow }()
+
+	maxAge := 5 * 24 * time.Hour
+	tests := []struct {
+		name      string
+		status    *vulnerability.ProviderStatus
+		maxAge    time.Duration
+		wantWarn  bool
+		wantStale bool
+	}{
+		{"nil status is fresh", nil, maxAge, false, false},
+		{"zero Built warns but never fails", &vulnerability.ProviderStatus{}, maxAge, true, false},
+		{"fresh DB is silent", &vulnerability.ProviderStatus{Built: fixedNow.Add(-24 * time.Hour)}, maxAge, false, false},
+		{"boundary is fresh", &vulnerability.ProviderStatus{Built: fixedNow.Add(-maxAge)}, maxAge, false, false},
+		{"stale DB warns and flags", &vulnerability.ProviderStatus{Built: fixedNow.Add(-10 * 24 * time.Hour)}, maxAge, true, true},
+		{"future Built warns but never fails", &vulnerability.ProviderStatus{Built: fixedNow.Add(time.Hour)}, maxAge, true, false},
+		{"custom max age honored", &vulnerability.ProviderStatus{Built: fixedNow.Add(-8 * 24 * time.Hour)}, 10 * 24 * time.Hour, false, false},
+		{"non-positive max age selects default", &vulnerability.ProviderStatus{Built: fixedNow.Add(-10 * 24 * time.Hour)}, 0, true, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			warn, stale := CheckDBAge(tt.status, tt.maxAge)
+			assert.Equal(t, tt.wantStale, stale)
+			if tt.wantWarn {
+				assert.NotEmpty(t, warn)
+			} else {
+				assert.Empty(t, warn)
+			}
+		})
+	}
+}
+
+func TestEnforceDBAge(t *testing.T) {
+	fixedNow := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	oldNow := dbNowFunc
+	dbNowFunc = func() time.Time { return fixedNow }
+	defer func() { dbNowFunc = oldNow }()
+
+	stale := &vulnerability.ProviderStatus{Built: fixedNow.Add(-30 * 24 * time.Hour)}
+	fresh := &vulnerability.ProviderStatus{Built: fixedNow.Add(-time.Hour)}
+
+	t.Run("nil service is a no-op", func(t *testing.T) {
+		assert.NoError(t, EnforceDBAge(nil, false, true, 0))
+	})
+	t.Run("fresh DB never errors", func(t *testing.T) {
+		assert.NoError(t, EnforceDBAge(&Service{dbStatus: fresh}, false, true, 0))
+	})
+	t.Run("stale DB warns only by default", func(t *testing.T) {
+		assert.NoError(t, EnforceDBAge(&Service{dbStatus: stale}, false, false, 0))
+	})
+	t.Run("stale DB with skipped update and flag fails", func(t *testing.T) {
+		err := EnforceDBAge(&Service{dbStatus: stale}, false, true, 0)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "--max-db-age")
+	})
+	t.Run("stale DB that was just updated warns only even with flag", func(t *testing.T) {
+		assert.NoError(t, EnforceDBAge(&Service{dbStatus: stale}, true, true, 0))
+	})
+	t.Run("unknown build time never fails", func(t *testing.T) {
+		assert.NoError(t, EnforceDBAge(&Service{dbStatus: &vulnerability.ProviderStatus{}}, false, true, 0))
+	})
+}
+
+func TestResolveDBAgeGate(t *testing.T) {
+	t.Run("flags pass through", func(t *testing.T) {
+		fail, maxAge := ResolveDBAgeGate(true, true, time.Hour, true)
+		assert.True(t, fail)
+		assert.Equal(t, time.Hour, maxAge)
+	})
+	t.Run("env fallback applies when flags unset", func(t *testing.T) {
+		t.Setenv("KS_FAIL_ON_STALE_DB", "true")
+		t.Setenv("KS_MAX_DB_AGE", "72h")
+		fail, maxAge := ResolveDBAgeGate(false, false, 0, false)
+		assert.True(t, fail)
+		assert.Equal(t, 72*time.Hour, maxAge)
+	})
+	t.Run("explicit false beats env true", func(t *testing.T) {
+		t.Setenv("KS_FAIL_ON_STALE_DB", "true")
+		fail, _ := ResolveDBAgeGate(false, true, 0, false)
+		assert.False(t, fail)
+	})
+	t.Run("explicit zero beats env duration", func(t *testing.T) {
+		t.Setenv("KS_MAX_DB_AGE", "2160h")
+		_, maxAge := ResolveDBAgeGate(false, false, 0, true)
+		assert.Equal(t, time.Duration(0), maxAge)
+	})
+	t.Run("invalid env is ignored", func(t *testing.T) {
+		t.Setenv("KS_FAIL_ON_STALE_DB", "notabool")
+		t.Setenv("KS_MAX_DB_AGE", "bogus")
+		fail, maxAge := ResolveDBAgeGate(false, false, 0, false)
+		assert.False(t, fail)
+		assert.Equal(t, time.Duration(0), maxAge)
+	})
+}
+
+func TestLoadVulnerabilityDBStrictFailsOnCheckError(t *testing.T) {
+	unreachable := distribution.Config{
+		LatestURL:          "http://127.0.0.1:9/definitely-not-here",
+		RequireUpdateCheck: true,
+	}
+	installCfg := installation.Config{DBRootDir: t.TempDir()}
+
+	// Strict gate: a failed update check surfaces as a load error instead of
+	// silently serving the (absent/stale) cache.
+	_, _, err := NewVulnerabilityDB(unreachable, installCfg, true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unable to update db")
+
+	// Lenient default: the same failure is swallowed by grype and surfaces
+	// later as a missing/unusable local database, never as an update error.
+	unreachable.RequireUpdateCheck = false
+	_, _, err = NewVulnerabilityDB(unreachable, installCfg, true)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "unable to update db")
+}
+
+// TestPatchBoundaryStaysWarnOnly replays patch's exact boundary contract: it
+// pins fail=false as if explicitly passed (so even KS_FAIL_ON_STALE_DB=true
+// cannot enable strictness), builds the DB config without the update check,
+// and enforces warn-only on a stale cache. A transient mirror failure must
+// therefore never abort patching when a usable cache exists.
+func TestPatchBoundaryStaysWarnOnly(t *testing.T) {
+	t.Setenv("KS_FAIL_ON_STALE_DB", "true")
+	t.Setenv("KS_MAX_DB_AGE", "72h")
+
+	fixedNow := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	oldNow := dbNowFunc
+	dbNowFunc = func() time.Time { return fixedNow }
+	defer func() { dbNowFunc = oldNow }()
+
+	// Patch boundary: strict pinned off, warning threshold still env-resolved.
+	fail, maxDBAge := ResolveDBAgeGate(false, true, 0, false)
+	assert.False(t, fail)
+	assert.Equal(t, 72*time.Hour, maxDBAge)
+
+	distCfg, _, shouldUpdate, err := NewDefaultDBConfig("", false, fail)
+	require.NoError(t, err)
+	assert.True(t, shouldUpdate)
+	assert.False(t, distCfg.RequireUpdateCheck)
+
+	// Usable-but-stale cache under a failed refresh: warn-only, never fatal.
+	stale := &vulnerability.ProviderStatus{Built: fixedNow.Add(-30 * 24 * time.Hour)}
+	assert.NoError(t, EnforceDBAge(&Service{dbStatus: stale}, shouldUpdate, fail, maxDBAge))
+}

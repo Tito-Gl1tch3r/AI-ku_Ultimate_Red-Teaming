@@ -1,0 +1,103 @@
+package software.coley.recaf.services.compile.stub;
+
+import jakarta.annotation.Nonnull;
+import jakarta.annotation.Nullable;
+import org.objectweb.asm.Type;
+import software.coley.recaf.info.InnerClassInfo;
+import software.coley.recaf.info.member.FieldMember;
+import software.coley.recaf.info.member.MethodMember;
+import software.coley.recaf.services.assembler.ExpressionCompileException;
+import software.coley.recaf.services.inheritance.InheritanceGraph;
+import software.coley.recaf.util.AccessFlag;
+import software.coley.recaf.workspace.model.Workspace;
+
+import java.util.List;
+
+/**
+ * Class stub generator which emits classes under the assumption they are inner classes of an outer class.
+ *
+ * @author Matt Coley
+ */
+public class InnerClassStubGenerator extends ClassStubGenerator {
+	/**
+	 * @param workspace
+	 * 		Workspace to pull class information from.
+	 * @param inheritanceGraph
+	 * 		Inheritance graph of the workspace.
+	 * @param classAccess
+	 * 		Host class access modifiers.
+	 * @param className
+	 * 		Host class name.
+	 * @param superName
+	 * 		Host class super name.
+	 * @param implementing
+	 * 		Host class interfaces implemented.
+	 * @param fields
+	 * 		Host class declared fields.
+	 * @param methods
+	 * 		Host class declared methods.
+	 * @param innerClasses
+	 * 		Host class declared inner classes.
+	 * @param classSignature
+	 * 		Host class generic signature, if any.
+	 */
+	public InnerClassStubGenerator(@Nonnull Workspace workspace,
+	                               @Nonnull InheritanceGraph inheritanceGraph,
+	                               int classAccess,
+	                               @Nonnull String className,
+	                               @Nullable String superName,
+	                               @Nonnull List<String> implementing,
+	                               @Nonnull List<FieldMember> fields,
+	                               @Nonnull List<MethodMember> methods,
+	                               @Nonnull List<InnerClassInfo> innerClasses,
+	                               @Nullable String classSignature) {
+		super(workspace, inheritanceGraph, classAccess, className, superName, implementing, fields, methods, innerClasses, classSignature);
+	}
+
+	@Nonnull
+	@Override
+	protected String getLocalName() {
+		// Will be "OuterClass$TheInner"
+		String localName = super.getLocalName();
+
+		// We just want "TheInner"
+		int innerSplit = localName.lastIndexOf('$');
+		if (innerSplit > 0)
+			localName = localName.substring(innerSplit + 1);
+
+		return localName;
+	}
+
+	@Nonnull
+	@Override
+	public String getLocalModifier() {
+		StringBuilder sb = new StringBuilder();
+
+		// I've seen this happen in Recaf but cannot reproduce a case outside.
+		// https://stackoverflow.com/questions/19481680/error-illegal-static-declaration-in-inner-class
+		if (AccessFlag.isStatic(classAccess))
+			sb.append("static");
+		if (AccessFlag.isAbstract(classAccess))
+			sb.append(" abstract");
+
+		// If the inner class (this context) is not abstract, we do not want to force
+		// it to be abstract in order to allow expressions to do "new Inner()" and stuff.
+		return sb.toString().trim();
+	}
+
+	@Override
+	public String generate() throws ExpressionCompileException {
+		StringBuilder code = new StringBuilder();
+
+		appendClassStructure(code);
+		appendClassContents(code, true);
+
+		return code.toString();
+	}
+
+	@Override
+	protected boolean doSkipMethod(@Nonnull String name, @Nonnull Type type) {
+		// Do not skip any methods
+		return false;
+	}
+}

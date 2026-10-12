@@ -1,0 +1,1496 @@
+package printer
+
+import (
+	"bytes"
+	"context"
+	"encoding/xml"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/anchore/grype/grype/match"
+	grypepkg "github.com/anchore/grype/grype/pkg"
+	"github.com/anchore/grype/grype/vulnerability"
+	"github.com/armosec/armoapi-go/armotypes"
+	"github.com/armosec/armoapi-go/identifiers"
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling/printer/v2/prettyprinter/tableprinter/imageprinter"
+	"github.com/kubescape/opa-utils/reporthandling"
+	"github.com/kubescape/opa-utils/reporthandling/apis"
+	helpersv1 "github.com/kubescape/opa-utils/reporthandling/helpers/v1"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/reportsummary"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/resourcesresults"
+	reporthandlingv2 "github.com/kubescape/opa-utils/reporthandling/v2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+var updateGolden = flag.Bool("update-golden", false, "regenerate JUnit golden fixture under testdata/")
+
+func TestJunitPrinter(t *testing.T) {
+	// Verbose mode off
+	jp := NewJunitPrinter(false)
+	assert.NotNil(t, jp)
+	assert.Equal(t, false, jp.verbose)
+
+	// Verbose mode on
+	jp = NewJunitPrinter(true)
+	assert.NotNil(t, jp)
+	assert.Equal(t, true, jp.verbose)
+}
+
+func TestScore_Junit(t *testing.T) {
+	tests := []struct {
+		name  string
+		score float32
+		want  string
+	}{
+		{
+			name:  "Score not an integer",
+			score: 20.7,
+			want:  "\nOverall compliance-score (100- Excellent, 0- All failed): 21\n",
+		},
+		{
+			name:  "Fractional score below perfect",
+			score: 99.5,
+			want:  "\nOverall compliance-score (100- Excellent, 0- All failed): 99\n",
+		},
+		{
+			name:  "Score less than 0",
+			score: -20.0,
+			want:  "\nOverall compliance-score (100- Excellent, 0- All failed): 0\n",
+		},
+		{
+			name:  "Score greater than 100",
+			score: 120.0,
+			want:  "\nOverall compliance-score (100- Excellent, 0- All failed): 100\n",
+		},
+		{
+			name:  "Score 50",
+			score: 50.0,
+			want:  "\nOverall compliance-score (100- Excellent, 0- All failed): 50\n",
+		},
+		{
+			name:  "Zero Score",
+			score: 0.0,
+			want:  "\nOverall compliance-score (100- Excellent, 0- All failed): 0\n",
+		},
+		{
+			name:  "Perfect Score",
+			score: 100,
+			want:  "\nOverall compliance-score (100- Excellent, 0- All failed): 100\n",
+		},
+	}
+
+	jp := NewJunitPrinter(false)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a temporary file to capture output
+			f, err := os.CreateTemp("", "score-output")
+			if err != nil {
+				panic(err)
+			}
+			defer f.Close()
+
+			// Redirect stderr to the temporary file
+			oldStderr := os.Stderr
+			defer func() {
+				os.Stderr = oldStderr
+			}()
+			os.Stderr = f
+
+			// Print the score using the `Score` function
+			jp.Score(tt.score)
+
+			// Read the contents of the temporary file
+			f.Seek(0, 0)
+			got, err := io.ReadAll(f)
+			if err != nil {
+				panic(err)
+			}
+			assert.Equal(t, tt.want, string(got))
+		})
+	}
+}
+
+func TestTestSuites(t *testing.T) {
+	results := cautils.NewOPASessionObjMock()
+	junitTestSuites := testsSuites(results)
+
+	assert.NotNil(t, junitTestSuites)
+	assert.Equal(t, listTestsSuite(results), junitTestSuites.Suites)
+	assert.Equal(t, results.Report.SummaryDetails.NumberOfControls().All(), junitTestSuites.Tests)
+	assert.Equal(t, "Kubescape Scanning", junitTestSuites.Name)
+}
+
+func TestJunitExceptionActionsPreserveFailureSemantics(t *testing.T) {
+	type finding struct {
+		resourceID  string
+		controlID   string
+		controlName string
+		action      *armotypes.PostureExceptionPolicyActions
+	}
+
+	disable := armotypes.Disable
+	alertOnly := armotypes.AlertOnly
+	findings := []finding{
+		{resourceID: "disabled", controlID: "C-DISABLE", controlName: "Disabled finding", action: &disable},
+		{resourceID: "acknowledged", controlID: "C-ALERT", controlName: "Acknowledged finding", action: &alertOnly},
+		{resourceID: "unrelated", controlID: "C-OTHER", controlName: "Unrelated finding"},
+	}
+
+	session := &cautils.OPASessionObj{
+		Report: &reporthandlingv2.PostureReport{
+			SummaryDetails: reportsummary.SummaryDetails{Controls: reportsummary.ControlSummaries{}},
+		},
+		AllResources: map[string]workloadinterface.IMetadata{},
+	}
+
+	for _, finding := range findings {
+		workload := exceptionsWorkload(t, "Pod", "default", finding.resourceID)
+		result := resourcesresults.Result{
+			ResourceID: finding.resourceID,
+			AssociatedControls: []resourcesresults.ResourceAssociatedControl{
+				{
+					ControlID: finding.controlID,
+					Name:      finding.controlName,
+					Status:    apis.StatusInfo{InnerStatus: apis.StatusFailed},
+					ResourceAssociatedRules: []resourcesresults.ResourceAssociatedRule{
+						{Name: "failed-rule", Status: apis.StatusFailed},
+					},
+				},
+			},
+		}
+
+		if finding.action != nil {
+			policy := armotypes.PostureExceptionPolicy{
+				PortalBase: armotypes.PortalBase{Name: "exception-" + finding.resourceID},
+				Actions:    []armotypes.PostureExceptionPolicyActions{*finding.action},
+				Resources: []identifiers.PortalDesignator{
+					{
+						DesignatorType: identifiers.DesignatorAttributes,
+						Attributes: map[string]string{
+							identifiers.AttributeKind:      "Pod",
+							identifiers.AttributeNamespace: "default",
+							identifiers.AttributeName:      finding.resourceID,
+						},
+					},
+				},
+				PosturePolicies: []armotypes.PosturePolicy{{ControlID: finding.controlID}},
+			}
+			result.SetExceptions(workload, []armotypes.PostureExceptionPolicy{policy}, "", map[string]reporthandling.Control{finding.controlID: {}})
+		}
+
+		session.AllResources[finding.resourceID] = workload
+		session.Report.Results = append(session.Report.Results, result)
+		session.Report.SummaryDetails.Controls[finding.controlID] = reportsummary.ControlSummary{
+			ControlID: finding.controlID,
+			Name:      finding.controlName,
+		}
+	}
+
+	session.Report.InitializeSummary()
+	suites := testsSuites(session)
+	require.Len(t, suites.Suites, 1)
+	assert.Equal(t, 3, suites.Suites[0].Tests)
+	assert.Equal(t, 2, suites.Suites[0].Failures)
+
+	testCases := map[string]JUnitTestCase{}
+	for _, testCase := range suites.Suites[0].TestCases {
+		testCases[testCase.Name] = testCase
+	}
+	require.Contains(t, testCases, "Disabled finding")
+	require.Contains(t, testCases, "Acknowledged finding")
+	require.Contains(t, testCases, "Unrelated finding")
+	assert.Nil(t, testCases["Disabled finding"].Failure, "disable must remove the JUnit failure")
+	assert.NotNil(t, testCases["Acknowledged finding"].Failure, "alertOnly must remain a JUnit failure")
+	assert.NotNil(t, testCases["Unrelated finding"].Failure, "unrelated findings must remain JUnit failures")
+}
+
+func TestJunitActionPrintCombinedScanIncludesPostureAndImages(t *testing.T) {
+	postureControlID := "C-COMBINED"
+	postureSession := cautils.NewOPASessionObjMock()
+	postureSession.Report = &reporthandlingv2.PostureReport{
+		SummaryDetails: reportsummary.SummaryDetails{
+			Controls: reportsummary.ControlSummaries{
+				postureControlID: {
+					ControlID:  postureControlID,
+					Name:       "Combined posture control",
+					Status:     apis.StatusFailed,
+					StatusInfo: apis.StatusInfo{InnerStatus: apis.StatusFailed},
+				},
+			},
+		},
+	}
+
+	imageMatch := func(id, severity string) match.Match {
+		return match.Match{
+			Vulnerability: vulnerability.Vulnerability{
+				Reference: vulnerability.Reference{ID: id, Namespace: "nvd"},
+				Metadata:  &vulnerability.Metadata{ID: id, Severity: severity},
+			},
+			Package: grypepkg.Package{
+				ID:      grypepkg.ID("pkg-" + id),
+				Name:    "pkg-" + id,
+				Version: "1.0.0",
+			},
+		}
+	}
+	imageScanData := []cautils.ImageScanData{
+		{
+			Image:   "combined:first",
+			Matches: match.NewMatches(imageMatch("CVE-COMBINED", "High")),
+		},
+		{
+			Image:    "combined:second",
+			Platform: "linux/arm64",
+			Matches:  match.NewMatches(imageMatch("CVE-COMBINED-SECOND", "Critical")),
+		},
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "combined.xml")
+	jp := NewJunitPrinter(false)
+	require.NoError(t, jp.SetWriter(context.Background(), outputPath))
+	require.NoError(t, jp.ActionPrint(context.Background(), postureSession, imageScanData))
+	require.NoError(t, jp.writer.Close())
+
+	raw, err := os.ReadFile(outputPath)
+	require.NoError(t, err)
+
+	var got JUnitTestSuites
+	require.NoError(t, xml.Unmarshal(raw, &got))
+	require.Len(t, got.Suites, 3)
+	assert.Equal(t, "Kubescape Scanning", got.Name)
+	assert.Equal(t, []string{"kubescape", "combined:first", "combined:second [linux/arm64]"}, []string{
+		got.Suites[0].Name,
+		got.Suites[1].Name,
+		got.Suites[2].Name,
+	})
+	require.Len(t, got.Suites[2].Properties, 2)
+	assert.Equal(t, JUnitProperty{Name: "image", Value: "combined:second"}, got.Suites[2].Properties[0])
+	assert.Equal(t, JUnitProperty{Name: "platform", Value: "linux/arm64"}, got.Suites[2].Properties[1])
+	require.Len(t, got.Suites[2].TestCases, 1)
+	assert.Equal(t, "combined:second [linux/arm64]", got.Suites[2].TestCases[0].Classname)
+	require.NotNil(t, got.Suites[2].TestCases[0].Failure)
+	assert.Contains(t, got.Suites[2].TestCases[0].Failure.Contents, "Platform: linux/arm64")
+	assert.Equal(t, []int{0, 1, 2}, []int{got.Suites[0].ID, got.Suites[1].ID, got.Suites[2].ID})
+	assert.Equal(t, 1, got.Suites[0].Tests)
+	assert.Equal(t, 1, got.Suites[0].Failures)
+	assert.Equal(t, 3, got.Tests)
+	assert.Equal(t, 3, got.Failures)
+	var sumSkipped int
+	for _, suite := range got.Suites {
+		sumSkipped += suite.Skipped
+	}
+	assert.Equal(t, sumSkipped, got.Skipped)
+	assert.Zero(t, got.Errors)
+	assert.Contains(t, string(raw), "Combined posture control")
+	assert.Contains(t, string(raw), "CVE-COMBINED")
+	assert.Contains(t, string(raw), "CVE-COMBINED-SECOND")
+}
+
+func TestImageTestsSuitesUsesPlatformAwareTargets(t *testing.T) {
+	imageMatch := func(id, severity, packageName string) match.Match {
+		return match.Match{
+			Vulnerability: vulnerability.Vulnerability{
+				Reference: vulnerability.Reference{ID: id, Namespace: "nvd"},
+				Metadata:  &vulnerability.Metadata{ID: id, Severity: severity},
+				Fix: vulnerability.Fix{
+					Versions: []string{"2.0.0"},
+					State:    vulnerability.FixStateFixed,
+				},
+			},
+			Package: grypepkg.Package{
+				ID:      grypepkg.ID(packageName),
+				Name:    packageName,
+				Version: "1.0.0",
+			},
+		}
+	}
+
+	imageScanData := []cautils.ImageScanData{
+		{
+			Image:    "registry.example.com/app:v1",
+			Platform: "linux/amd64",
+			Matches:  match.NewMatches(imageMatch("CVE-PLATFORM-AMD64", "High", "openssl")),
+		},
+		{
+			Image:    "registry.example.com/app:v1",
+			Platform: "linux/arm64",
+			Matches:  match.NewMatches(imageMatch("CVE-PLATFORM-ARM64", "Critical", "glibc")),
+		},
+		{
+			Image:   "registry.example.com/sidecar:v1",
+			Matches: match.NewMatches(imageMatch("CVE-SIDECAR", "Low", "busybox")),
+		},
+	}
+
+	got := imageTestsSuites(imageScanData)
+
+	require.Len(t, got.Suites, 3)
+	assert.Equal(t, "Kubescape Image Scanning", got.Name)
+	assert.Equal(t, 3, got.Tests)
+	assert.Equal(t, 3, got.Failures)
+	assert.Zero(t, got.Errors)
+
+	assert.Equal(t, []string{
+		"registry.example.com/app:v1 [linux/amd64]",
+		"registry.example.com/app:v1 [linux/arm64]",
+		"registry.example.com/sidecar:v1",
+	}, []string{
+		got.Suites[0].Name,
+		got.Suites[1].Name,
+		got.Suites[2].Name,
+	})
+	assert.Equal(t, []int{0, 1, 2}, []int{got.Suites[0].ID, got.Suites[1].ID, got.Suites[2].ID})
+
+	require.Len(t, got.Suites[0].Properties, 2)
+	assert.Equal(t, JUnitProperty{Name: "image", Value: "registry.example.com/app:v1"}, got.Suites[0].Properties[0])
+	assert.Equal(t, JUnitProperty{Name: "platform", Value: "linux/amd64"}, got.Suites[0].Properties[1])
+	require.Len(t, got.Suites[1].Properties, 2)
+	assert.Equal(t, JUnitProperty{Name: "image", Value: "registry.example.com/app:v1"}, got.Suites[1].Properties[0])
+	assert.Equal(t, JUnitProperty{Name: "platform", Value: "linux/arm64"}, got.Suites[1].Properties[1])
+	assert.Empty(t, got.Suites[2].Properties)
+
+	for i, suite := range got.Suites {
+		require.Len(t, suite.TestCases, 1, "suite %d", i)
+		assert.Equal(t, suite.Name, suite.TestCases[0].Classname)
+		require.NotNil(t, suite.TestCases[0].Failure)
+	}
+	assert.Contains(t, got.Suites[0].TestCases[0].Failure.Contents, "Platform: linux/amd64")
+	assert.Contains(t, got.Suites[1].TestCases[0].Failure.Contents, "Platform: linux/arm64")
+	assert.NotContains(t, got.Suites[2].TestCases[0].Failure.Contents, "Platform:")
+}
+
+func TestJunitActionPrintImageScanKeepsMultiArchSuitesDistinct(t *testing.T) {
+	imageMatch := func(id, packageName string) match.Match {
+		return match.Match{
+			Vulnerability: vulnerability.Vulnerability{
+				Reference: vulnerability.Reference{ID: id, Namespace: "nvd"},
+				Metadata:  &vulnerability.Metadata{ID: id, Severity: "High"},
+			},
+			Package: grypepkg.Package{
+				ID:      grypepkg.ID(packageName),
+				Name:    packageName,
+				Version: "1.0.0",
+			},
+		}
+	}
+
+	imageScanData := []cautils.ImageScanData{
+		{
+			Image:    "registry.example.com/app:v1",
+			Platform: "linux/amd64",
+			Matches:  match.NewMatches(imageMatch("CVE-A", "openssl")),
+		},
+		{
+			Image:    "registry.example.com/app:v1",
+			Platform: "linux/arm64",
+			Matches:  match.NewMatches(imageMatch("CVE-B", "glibc")),
+		},
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "images.xml")
+	jp := NewJunitPrinter(false)
+	require.NoError(t, jp.SetWriter(context.Background(), outputPath))
+	require.NoError(t, jp.ActionPrint(context.Background(), nil, imageScanData))
+	require.NoError(t, jp.writer.Close())
+
+	raw, err := os.ReadFile(outputPath)
+	require.NoError(t, err)
+
+	var got JUnitTestSuites
+	require.NoError(t, xml.Unmarshal(raw, &got))
+	require.Len(t, got.Suites, 2)
+	assert.Equal(t, "Kubescape Image Scanning", got.Name)
+	assert.Equal(t, 2, got.Tests)
+	assert.Equal(t, 2, got.Failures)
+	var sumSkipped int
+	for _, suite := range got.Suites {
+		sumSkipped += suite.Skipped
+	}
+	assert.Equal(t, sumSkipped, got.Skipped)
+	assert.Equal(t, "registry.example.com/app:v1 [linux/amd64]", got.Suites[0].Name)
+	assert.Equal(t, "registry.example.com/app:v1 [linux/arm64]", got.Suites[1].Name)
+	assert.NotEqual(t, got.Suites[0].Name, got.Suites[1].Name)
+	assert.Contains(t, string(raw), `name="image" value="registry.example.com/app:v1"`)
+	assert.Contains(t, string(raw), `name="platform" value="linux/amd64"`)
+	assert.Contains(t, string(raw), `name="platform" value="linux/arm64"`)
+}
+
+func TestImageTestCasesIncludesVEXDetails(t *testing.T) {
+	cases := imageTestCases([]imageprinter.CVE{
+		{
+			ID:               "CVE-2026-1234",
+			Severity:         "High",
+			Package:          "openssl",
+			Version:          "1.0.0",
+			FixedState:       "not-fixed",
+			Image:            "registry.example.com/app:v1",
+			VexStatus:        "not_affected",
+			VexJustification: "component_not_present",
+		},
+	}, "")
+
+	require.Len(t, cases, 1)
+	require.NotNil(t, cases[0].Failure)
+	assert.Contains(t, cases[0].Failure.Contents, "VEX Status: not_affected")
+	assert.Contains(t, cases[0].Failure.Contents, "VEX Justification: component_not_present")
+}
+
+func TestListTestSuites(t *testing.T) {
+	// Non empty OPASessionObj
+	results := cautils.NewOPASessionObjMock()
+	testsSuites := listTestsSuite(results)
+
+	if assert.Len(t, testsSuites, 1) {
+		// Timestamp is generated from time.Now() when the report has no
+		// generation time set, so just assert it parses as ISO 8601 and zero it
+		// out before comparing the rest of the struct.
+		_, err := time.Parse("2006-01-02T15:04:05Z", testsSuites[0].Timestamp)
+		assert.NoError(t, err, "timestamp should be ISO 8601")
+		testsSuites[0].Timestamp = ""
+	}
+
+	expectedTestSuites := []JUnitTestSuite{
+		{
+			XMLName:  xml.Name{Space: "", Local: ""},
+			Tests:    0,
+			Name:     "kubescape",
+			Errors:   0,
+			Failures: 0,
+			Hostname: "",
+			ID:       0,
+			Skipped:  0,
+			Time:     "",
+			Properties: []JUnitProperty{
+				{Name: "complianceScore", Value: "0.00"},
+			},
+			TestCases: []JUnitTestCase(nil),
+		},
+	}
+
+	assert.Equal(t, expectedTestSuites, testsSuites)
+}
+
+func TestProperties(t *testing.T) {
+	tests := []struct {
+		name             string
+		score            float32
+		expectedProperty []JUnitProperty
+	}{
+		{
+			name:  "Score not an integer",
+			score: 20.7,
+			expectedProperty: []JUnitProperty{
+				{
+					Name:  "complianceScore",
+					Value: fmt.Sprintf("%.2f", 20.7),
+				},
+			},
+		},
+		{
+			name:  "Score less than 0",
+			score: -20.0,
+			expectedProperty: []JUnitProperty{
+				{
+					Name:  "complianceScore",
+					Value: fmt.Sprintf("%.2f", -20.0),
+				},
+			},
+		},
+		{
+			name:  "Score greater than 100",
+			score: 120.0,
+			expectedProperty: []JUnitProperty{
+				{
+					Name:  "complianceScore",
+					Value: fmt.Sprintf("%.2f", 120.0),
+				},
+			},
+		},
+		{
+			name:  "Score 50",
+			score: 50.0,
+			expectedProperty: []JUnitProperty{
+				{
+					Name:  "complianceScore",
+					Value: fmt.Sprintf("%.2f", 50.0),
+				},
+			},
+		},
+		{
+			name:  "Zero Score",
+			score: 0.0,
+			expectedProperty: []JUnitProperty{
+				{
+					Name:  "complianceScore",
+					Value: fmt.Sprintf("%.2f", 0.0),
+				},
+			},
+		},
+		{
+			name:  "Perfect Score",
+			score: 100,
+			expectedProperty: []JUnitProperty{
+				{
+					Name:  "complianceScore",
+					Value: fmt.Sprintf("%.2f", 100.0),
+				},
+			},
+		},
+		{
+			name:  "Score near 100 does not round to 100.00",
+			score: 99.996,
+			expectedProperty: []JUnitProperty{
+				{
+					Name:  "complianceScore",
+					Value: "99.99",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expectedProperty, properties(tt.score))
+		})
+	}
+}
+
+func TestTestCases_SkipMessage(t *testing.T) {
+	tests := []struct {
+		name      string
+		subStatus apis.ScanningSubStatus
+		innerInfo string
+		wantMsg   string
+	}{
+		{
+			name:      "not evaluated",
+			subStatus: apis.SubStatusNotEvaluated,
+			innerInfo: string(apis.SubStatusNotEvaluatedInfo),
+			wantMsg:   "notEvaluated: " + string(apis.SubStatusNotEvaluatedInfo),
+		},
+		{
+			name:      "not evaluated with missing GVRs reason",
+			subStatus: apis.SubStatusNotEvaluated,
+			innerInfo: "missing: apps/v1/deployments",
+			wantMsg:   "notEvaluated: missing: apps/v1/deployments",
+		},
+		{
+			name:      "not evaluated with policy skip reason",
+			subStatus: apis.SubStatusNotEvaluated,
+			innerInfo: "whole-cluster control C-0261 skipped by execution policy (policy: skip)",
+			wantMsg:   "notEvaluated: whole-cluster control C-0261 skipped by execution policy (policy: skip)",
+		},
+		{
+			name:      "configuration",
+			subStatus: apis.SubStatusConfiguration,
+			innerInfo: string(apis.SubStatusConfigurationInfo),
+			wantMsg:   "configuration: " + string(apis.SubStatusConfigurationInfo),
+		},
+		{
+			name:      "manual review",
+			subStatus: apis.SubStatusManualReview,
+			innerInfo: string(apis.SubStatusManualReviewInfo),
+			wantMsg:   "manual review: " + string(apis.SubStatusManualReviewInfo),
+		},
+		{
+			name:      "requires review",
+			subStatus: apis.SubStatusRequiresReview,
+			innerInfo: string(apis.SubStatusRequiresReviewInfo),
+			wantMsg:   "requires review: " + string(apis.SubStatusRequiresReviewInfo),
+		},
+		{
+			name:      "unknown substatus no info",
+			subStatus: apis.SubStatusUnknown,
+			innerInfo: "",
+			wantMsg:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			results := cautils.NewOPASessionObjMock()
+			results.Report.SummaryDetails.Controls = reportsummary.ControlSummaries{
+				"C-0001": reportsummary.ControlSummary{
+					ControlID: "C-0001",
+					Name:      "test-control",
+					StatusInfo: apis.StatusInfo{
+						InnerStatus: apis.StatusSkipped,
+						SubStatus:   tt.subStatus,
+						InnerInfo:   tt.innerInfo,
+					},
+				},
+			}
+
+			cases := testsCases(results, &results.Report.SummaryDetails.Controls, "TestSuite")
+
+			if assert.Len(t, cases, 1) {
+				if tt.wantMsg == "" {
+					if cases[0].SkipMessage != nil {
+						assert.Equal(t, tt.wantMsg, cases[0].SkipMessage.Message)
+					}
+				} else {
+					if assert.NotNil(t, cases[0].SkipMessage) {
+						assert.Equal(t, tt.wantMsg, cases[0].SkipMessage.Message)
+					}
+				}
+				assert.Nil(t, cases[0].Failure)
+			}
+		})
+	}
+}
+
+func TestSetWriter_Junit(t *testing.T) {
+	tests := []struct {
+		name       string
+		outputFile string
+		expected   string
+	}{
+		{
+			name:       "Output file name contains doesn't contain any extension",
+			outputFile: "customFilename",
+			expected:   "customFilename.xml",
+		},
+		{
+			name:       "Output file name contains .xml",
+			outputFile: "customFilename.xml",
+			expected:   "customFilename.xml",
+		},
+		{
+			name:       "Output file name is empty",
+			outputFile: "",
+			expected:   "/dev/stdout",
+		},
+	}
+
+	jp := NewJunitPrinter(false)
+	ctx := context.Background()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			jp.SetWriter(ctx, tt.outputFile)
+			assert.Equal(t, tt.expected, jp.writer.Name())
+		})
+	}
+}
+
+func TestBuildSkipMessage(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   apis.IStatus
+		expected string
+	}{
+		{
+			name:     "nil status returns empty string",
+			status:   nil,
+			expected: "",
+		},
+		{
+			name:     "configuration substatus with InnerInfo",
+			status:   &apis.StatusInfo{InnerStatus: apis.StatusSkipped, SubStatus: apis.SubStatusConfiguration, InnerInfo: "control not configured"},
+			expected: "configuration: control not configured",
+		},
+		{
+			name:     "irrelevant substatus no InnerInfo",
+			status:   &apis.StatusInfo{InnerStatus: apis.StatusSkipped, SubStatus: apis.SubStatusIrrelevant},
+			expected: "irrelevant",
+		},
+		{
+			name:     "manual review substatus with InnerInfo",
+			status:   &apis.StatusInfo{InnerStatus: apis.StatusSkipped, SubStatus: apis.SubStatusManualReview, InnerInfo: "requires manual check"},
+			expected: "manual review: requires manual check",
+		},
+		{
+			name:     "notEvaluated substatus with InnerInfo",
+			status:   &apis.StatusInfo{InnerStatus: apis.StatusSkipped, SubStatus: apis.SubStatusNotEvaluated, InnerInfo: "not evaluated"},
+			expected: "notEvaluated: not evaluated",
+		},
+		{
+			name:     "notEvaluated substatus with missing GVRs",
+			status:   &apis.StatusInfo{InnerStatus: apis.StatusSkipped, SubStatus: apis.SubStatusNotEvaluated, InnerInfo: "missing: apps/v1/deployments"},
+			expected: "notEvaluated: missing: apps/v1/deployments",
+		},
+		{
+			name:     "notEvaluated substatus with policy skip reason",
+			status:   &apis.StatusInfo{InnerStatus: apis.StatusSkipped, SubStatus: apis.SubStatusNotEvaluated, InnerInfo: "whole-cluster control C-0261 skipped by execution policy (policy: skip)"},
+			expected: "notEvaluated: whole-cluster control C-0261 skipped by execution policy (policy: skip)",
+		},
+		{
+			name:     "requires review substatus no InnerInfo",
+			status:   &apis.StatusInfo{InnerStatus: apis.StatusSkipped, SubStatus: apis.SubStatusRequiresReview},
+			expected: "requires review",
+		},
+		{
+			name:     "empty subStatus with InnerInfo returns only InnerInfo",
+			status:   &apis.StatusInfo{InnerStatus: apis.StatusSkipped, SubStatus: "", InnerInfo: "some detail"},
+			expected: "some detail",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildSkipMessage(tt.status)
+			assert.Equal(t, tt.expected, got)
+		})
+	}
+}
+
+func TestCoverageProperties(t *testing.T) {
+	tests := []struct {
+		name     string
+		coverage cautils.ScanCoverage
+		expected []JUnitProperty
+	}{
+		{
+			name:     "Zero total controls returns nil",
+			coverage: cautils.ScanCoverage{TotalControls: 0},
+			expected: nil,
+		},
+		{
+			name: "Full coverage not degraded",
+			coverage: cautils.ScanCoverage{
+				CoverageScore:     100.0,
+				EvaluatedControls: 10,
+				TotalControls:     10,
+				Degraded:          false,
+			},
+			expected: []JUnitProperty{
+				{Name: "coverageScore", Value: "100.00"},
+				{Name: "evaluatedControls", Value: "10"},
+				{Name: "totalControls", Value: "10"},
+				{Name: "degraded", Value: "false"},
+			},
+		},
+		{
+			name: "Degraded coverage with skipped controls",
+			coverage: cautils.ScanCoverage{
+				CoverageScore:     85.5,
+				EvaluatedControls: 17,
+				TotalControls:     20,
+				Degraded:          true,
+			},
+			expected: []JUnitProperty{
+				{Name: "coverageScore", Value: "85.50"},
+				{Name: "evaluatedControls", Value: "17"},
+				{Name: "totalControls", Value: "20"},
+				{Name: "degraded", Value: "true"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := coverageProperties(tt.coverage)
+			assert.Equal(t, tt.expected, got)
+		})
+	}
+}
+
+func TestListTestsSuite_IncludesCoverageProperties(t *testing.T) {
+	results := cautils.NewOPASessionObjMock()
+	results.ScanCoverage = cautils.ScanCoverage{
+		CoverageScore:     85.0,
+		EvaluatedControls: 17,
+		TotalControls:     20,
+		Degraded:          true,
+	}
+
+	suites := listTestsSuite(results)
+	require.NotEmpty(t, suites)
+	suite := suites[0]
+
+	propertyMap := make(map[string]string)
+	for _, prop := range suite.Properties {
+		propertyMap[prop.Name] = prop.Value
+	}
+
+	assert.Equal(t, "85.00", propertyMap["coverageScore"])
+	assert.Equal(t, "17", propertyMap["evaluatedControls"])
+	assert.Equal(t, "20", propertyMap["totalControls"])
+	assert.Equal(t, "true", propertyMap["degraded"])
+	assert.Contains(t, propertyMap, "complianceScore")
+}
+
+// TestListTestsSuite_IncludesNotEvaluatedControls verifies that unevaluated controls
+// from ScanCoverage.NotEvaluatedControls are emitted as skipped testcases in control scans.
+func TestListTestsSuite_IncludesNotEvaluatedControls(t *testing.T) {
+	results := cautils.NewOPASessionObjMock()
+	results.ScanCoverage = cautils.ScanCoverage{
+		CoverageScore:     85.0,
+		EvaluatedControls: 17,
+		TotalControls:     20,
+		Degraded:          true,
+		NotEvaluatedControls: []cautils.NotEvaluatedControl{
+			{
+				ControlID: "C-0172",
+				Reason:    "missing: rbac.authorization.k8s.io/clusterroles",
+			},
+		},
+	}
+
+	suites := listTestsSuite(results)
+	require.NotEmpty(t, suites)
+	suite := suites[0]
+
+	// Find the testcase for C-0172
+	var found bool
+	for _, tc := range suite.TestCases {
+		if tc.Classname == "Kubescape/C-0172" {
+			found = true
+			require.NotNil(t, tc.SkipMessage)
+			assert.Equal(t, "missing: rbac.authorization.k8s.io/clusterroles", tc.SkipMessage.Message)
+		}
+	}
+	assert.True(t, found, "unevaluated control C-0172 must be emitted as a skipped testcase")
+	assert.Equal(t, len(suite.TestCases), suite.Tests, "suite.Tests must equal len(suite.TestCases)")
+
+	var skippedCount int
+	for _, tc := range suite.TestCases {
+		if tc.SkipMessage != nil {
+			skippedCount++
+		}
+	}
+	assert.Equal(t, skippedCount, suite.Skipped, "suite.Skipped must match testcases with SkipMessage")
+}
+
+// TestListTestsSuite_FrameworkScanWithNotEvaluatedControls verifies that unevaluated
+// controls are associated with their framework and emitted with their diagnostic reason.
+func TestListTestsSuite_FrameworkScanWithNotEvaluatedControls(t *testing.T) {
+	session := cautils.NewOPASessionObjMock()
+	session.Policies = []reporthandling.Framework{
+		{
+			PortalBase: armotypes.PortalBase{Name: "NSA"},
+			Controls: []reporthandling.Control{
+				{
+					PortalBase: armotypes.PortalBase{Name: "Anonymous auth"},
+					ControlID:  "C-0001",
+				},
+				{
+					PortalBase: armotypes.PortalBase{Name: "Cluster roles binding"},
+					ControlID:  "C-0172",
+				},
+			},
+		},
+	}
+	session.Report = &reporthandlingv2.PostureReport{
+		SummaryDetails: reportsummary.SummaryDetails{
+			Frameworks: []reportsummary.FrameworkSummary{
+				{
+					Name: "NSA",
+					Controls: reportsummary.ControlSummaries{
+						"C-0001": reportsummary.ControlSummary{
+							ControlID: "C-0001",
+							Name:      "Anonymous auth",
+							Status:    apis.StatusPassed,
+						},
+					},
+				},
+			},
+		},
+	}
+	session.ScanCoverage = cautils.ScanCoverage{
+		CoverageScore:     50.0,
+		EvaluatedControls: 1,
+		TotalControls:     2,
+		Degraded:          true,
+		NotEvaluatedControls: []cautils.NotEvaluatedControl{
+			{
+				ControlID: "C-0172",
+				Reason:    "missing: rbac.authorization.k8s.io/clusterroles",
+			},
+		},
+	}
+
+	suites := listTestsSuite(session)
+	require.Len(t, suites, 1)
+	suite := suites[0]
+	assert.Equal(t, "NSA", suite.Name)
+	assert.Equal(t, 2, suite.Tests)
+	assert.Equal(t, 1, suite.Skipped)
+	assert.Equal(t, 0, suite.Failures)
+
+	var foundSkipped bool
+	for _, tc := range suite.TestCases {
+		if tc.Classname == "NSA/C-0172" {
+			foundSkipped = true
+			assert.Equal(t, "Cluster roles binding", tc.Name)
+			require.NotNil(t, tc.SkipMessage)
+			assert.Equal(t, "missing: rbac.authorization.k8s.io/clusterroles", tc.SkipMessage.Message)
+		}
+	}
+	assert.True(t, foundSkipped, "C-0172 must be emitted in NSA suite with skip reason")
+}
+
+// TestListTestsSuite_MultiFrameworkWithoutPoliciesNoDuplicateFallback verifies that
+// in multi-framework scans where Policies metadata is absent, controls already present
+// in framework cases (e.g. passed in Framework A, skipped in Framework B) are marked
+// as assigned so the suite-0 unassigned fallback does not duplicate them into Framework A.
+func TestListTestsSuite_MultiFrameworkWithoutPoliciesNoDuplicateFallback(t *testing.T) {
+	session := cautils.NewOPASessionObjMock()
+	session.Policies = nil
+	session.Report = &reporthandlingv2.PostureReport{
+		SummaryDetails: reportsummary.SummaryDetails{
+			Frameworks: []reportsummary.FrameworkSummary{
+				{
+					Name: "Framework-A",
+					Controls: reportsummary.ControlSummaries{
+						"C-0001": reportsummary.ControlSummary{
+							ControlID: "C-0001",
+							Name:      "Control 1",
+							Status:    apis.StatusPassed,
+						},
+					},
+				},
+				{
+					Name: "Framework-B",
+					Controls: reportsummary.ControlSummaries{
+						"C-0002": reportsummary.ControlSummary{
+							ControlID: "C-0002",
+							Name:      "Control 2",
+							Status:    apis.StatusSkipped,
+							StatusInfo: apis.StatusInfo{
+								InnerStatus: apis.StatusSkipped,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	root := testsSuites(session)
+	require.Len(t, root.Suites, 2)
+	assert.Equal(t, 2, root.Tests, "total root tests must be 2, without duplicating C-0002 into Framework-A")
+	assert.Equal(t, 1, root.Skipped, "total root skipped must be 1")
+	assert.Equal(t, 0, root.Failures)
+
+	suiteA := root.Suites[0]
+	assert.Equal(t, "Framework-A", suiteA.Name)
+	assert.Equal(t, 1, suiteA.Tests)
+	assert.Equal(t, 0, suiteA.Skipped)
+	require.Len(t, suiteA.TestCases, 1)
+	assert.Equal(t, "Framework-A/C-0001", suiteA.TestCases[0].Classname)
+
+	suiteB := root.Suites[1]
+	assert.Equal(t, "Framework-B", suiteB.Name)
+	assert.Equal(t, 1, suiteB.Tests)
+	assert.Equal(t, 1, suiteB.Skipped)
+	require.Len(t, suiteB.TestCases, 1)
+	assert.Equal(t, "Framework-B/C-0002", suiteB.TestCases[0].Classname)
+}
+
+// TestListTestsSuite_MultiFrameworkPassedControlsWithUnmatchedCoverageControl verifies that
+// when frameworks contain passed controls and ScanCoverage contains an unmatched unevaluated
+// control (with absent Policies metadata), the unevaluated control is still retained by the
+// suite-0 fallback rather than dropped due to map-size comparisons.
+func TestListTestsSuite_MultiFrameworkPassedControlsWithUnmatchedCoverageControl(t *testing.T) {
+	session := cautils.NewOPASessionObjMock()
+	session.Policies = nil
+	session.Report = &reporthandlingv2.PostureReport{
+		SummaryDetails: reportsummary.SummaryDetails{
+			Frameworks: []reportsummary.FrameworkSummary{
+				{
+					Name: "Framework-A",
+					Controls: reportsummary.ControlSummaries{
+						"C-0001": reportsummary.ControlSummary{
+							ControlID: "C-0001",
+							Name:      "Control 1",
+							Status:    apis.StatusPassed,
+						},
+					},
+				},
+				{
+					Name: "Framework-B",
+					Controls: reportsummary.ControlSummaries{
+						"C-0002": reportsummary.ControlSummary{
+							ControlID: "C-0002",
+							Name:      "Control 2",
+							Status:    apis.StatusPassed,
+						},
+					},
+				},
+			},
+		},
+	}
+	session.ScanCoverage = cautils.ScanCoverage{
+		CoverageScore:     66.7,
+		EvaluatedControls: 2,
+		TotalControls:     3,
+		Degraded:          true,
+		NotEvaluatedControls: []cautils.NotEvaluatedControl{
+			{
+				ControlID: "C-0172",
+				Reason:    "missing: rbac.authorization.k8s.io/clusterroles",
+			},
+		},
+	}
+
+	root := testsSuites(session)
+	require.Len(t, root.Suites, 2)
+	assert.Equal(t, 3, root.Tests, "total root tests must be 3 (2 passed + 1 unevaluated)")
+	assert.Equal(t, 1, root.Skipped, "total root skipped must be 1")
+	assert.Equal(t, 0, root.Failures)
+
+	suiteA := root.Suites[0]
+	assert.Equal(t, "Framework-A", suiteA.Name)
+	assert.Equal(t, 2, suiteA.Tests)
+	assert.Equal(t, 1, suiteA.Skipped)
+	require.Len(t, suiteA.TestCases, 2)
+	assert.Equal(t, "Framework-A/C-0001", suiteA.TestCases[0].Classname)
+	assert.Equal(t, "Framework-A/C-0172", suiteA.TestCases[1].Classname)
+	require.NotNil(t, suiteA.TestCases[1].SkipMessage)
+	assert.Equal(t, "missing: rbac.authorization.k8s.io/clusterroles", suiteA.TestCases[1].SkipMessage.Message)
+
+	suiteB := root.Suites[1]
+	assert.Equal(t, "Framework-B", suiteB.Name)
+	assert.Equal(t, 1, suiteB.Tests)
+	assert.Equal(t, 0, suiteB.Skipped)
+	require.Len(t, suiteB.TestCases, 1)
+	assert.Equal(t, "Framework-B/C-0002", suiteB.TestCases[0].Classname)
+}
+
+// TestJunitOutputInvariants is a regression test for the bugs reported in
+// issue #2099: counts mismatch, zero-time timestamps, missing XML prolog,
+// string-typed Skipped attribute, multi-line failure messages, and empty
+// attributes. It exercises the full ActionPrint path against a mock session
+// populated from the shared mock_summaryDetails.json fixture and asserts the
+// invariants standard JUnit parsers depend on.
+func TestJunitOutputInvariants(t *testing.T) {
+	mockSummary, err := mockSummaryDetails()
+	require.NoError(t, err)
+
+	session := cautils.NewOPASessionObjMock()
+	session.Report = &reporthandlingv2.PostureReport{
+		SummaryDetails: *mockSummary,
+	}
+
+	tmp, err := os.CreateTemp("", "junit-regression-*.xml")
+	require.NoError(t, err)
+	defer os.Remove(tmp.Name())
+
+	jp := NewJunitPrinter(false)
+	jp.writer = tmp
+	jp.ActionPrint(context.Background(), session, nil)
+	require.NoError(t, tmp.Close())
+
+	raw, err := os.ReadFile(tmp.Name())
+	require.NoError(t, err)
+
+	// 4c — XML prolog present.
+	assert.True(t, bytes.HasPrefix(raw, []byte("<?xml")), "output must start with XML prolog")
+
+	// Round-trip through encoding/xml to ensure the document is well-formed.
+	var got JUnitXML
+	dec := xml.NewDecoder(bytes.NewReader(raw))
+	require.NoError(t, dec.Decode(&got.TestSuites), "output must round-trip through encoding/xml")
+	require.NotEmpty(t, got.TestSuites.Suites, "expected at least one <testsuite>")
+
+	// 4a — Σ(children) == parent for tests, failures, errors. This is a
+	// structural invariant any conformant JUnit document must satisfy; on the
+	// single-framework fixture used here it is trivially true even under the
+	// pre-fix code, so the *regression* of the deduplicated-parent bug is
+	// covered by TestJunitMultiFrameworkSharedControl below, which fabricates
+	// two frameworks sharing a control and asserts parent counts are derived
+	// from the child suites rather than SummaryDetails.NumberOfControls().
+	var sumTests, sumFailures, sumErrors int
+	for _, s := range got.TestSuites.Suites {
+		sumTests += s.Tests
+		sumFailures += s.Failures
+		sumErrors += s.Errors
+	}
+	assert.Equal(t, sumTests, got.TestSuites.Tests, "parent tests must equal sum of child tests")
+	assert.Equal(t, sumFailures, got.TestSuites.Failures, "parent failures must equal sum of child failures")
+	assert.Equal(t, sumErrors, got.TestSuites.Errors, "parent errors must equal sum of child errors")
+
+	// 4b — Timestamp is ISO 8601, not Go's default zero time.
+	for _, s := range got.TestSuites.Suites {
+		assert.NotContains(t, s.Timestamp, "0001-01-01", "timestamp must not be Go zero time")
+		_, perr := time.Parse("2006-01-02T15:04:05Z", s.Timestamp)
+		assert.NoError(t, perr, "timestamp %q must be ISO 8601", s.Timestamp)
+	}
+
+	// 4d — Skipped is now typed as int; the marshaller no longer emits skipped="".
+	assert.NotContains(t, string(raw), `skipped=""`, "skipped attribute must not be an empty string")
+
+	// 4e — Failure body lives in chardata, not in a multi-line message attribute.
+	for _, s := range got.TestSuites.Suites {
+		for _, tc := range s.TestCases {
+			if tc.Failure == nil {
+				continue
+			}
+			assert.NotContains(t, tc.Failure.Message, "\n", "failure message attribute must not contain newlines")
+			if strings.Contains(tc.Failure.Contents, "Remediation:") {
+				// remediation detail must live in element body, not the attribute
+				assert.NotContains(t, tc.Failure.Message, "Remediation:", "remediation belongs in the element body")
+			}
+		}
+	}
+
+	// 4f — Optional attributes are omitted when empty.
+	assert.NotContains(t, string(raw), `hostname=""`, "empty hostname attribute should be omitted")
+	assert.NotContains(t, string(raw), `time=""`, "empty time attribute should be omitted")
+
+	// Sanity check: golden testdata fixture still exists alongside this test.
+	_, statErr := os.Stat(filepath.Join("testdata", "mock_summaryDetails.json"))
+	assert.NoError(t, statErr)
+}
+
+// TestJunitGoldenFile pins the marshalled JUnit output byte-for-byte against
+// testdata/junit_golden.xml so future regressions of the issue #2099 fixes are
+// caught at review time. A fixed ReportGenerationTime keeps the output
+// deterministic; run with `go test -update-golden` to regenerate the fixture.
+func TestJunitGoldenFile(t *testing.T) {
+	mockSummary, err := mockSummaryDetails()
+	require.NoError(t, err)
+
+	session := cautils.NewOPASessionObjMock()
+	session.Report = &reporthandlingv2.PostureReport{
+		SummaryDetails:       *mockSummary,
+		ReportGenerationTime: time.Date(2024, 3, 14, 9, 15, 26, 0, time.UTC),
+	}
+
+	tmp, err := os.CreateTemp("", "junit-golden-*.xml")
+	require.NoError(t, err)
+	defer os.Remove(tmp.Name())
+
+	jp := NewJunitPrinter(false)
+	jp.writer = tmp
+	jp.ActionPrint(context.Background(), session, nil)
+	require.NoError(t, tmp.Close())
+
+	got, err := os.ReadFile(tmp.Name())
+	require.NoError(t, err)
+
+	goldenPath := filepath.Join("testdata", "junit_golden.xml")
+	if *updateGolden {
+		//nolint:gosec // this is a test file writing a golden file
+		require.NoError(t, os.WriteFile(goldenPath, got, 0o600))
+	}
+
+	want, err := os.ReadFile(goldenPath)
+	require.NoError(t, err, "golden fixture missing — run `go test -update-golden`")
+	wantStr := strings.ReplaceAll(string(want), "\r\n", "\n")
+	assert.Equal(t, wantStr, string(got), "marshalled JUnit output diverged from testdata/junit_golden.xml")
+
+	// Also round-trip the golden file through encoding/xml and re-check the
+	// invariants on the *stored* fixture so a hand-edited golden that breaks
+	// JUnit semantics still fails the test.
+	var doc JUnitXML
+	require.NoError(t, xml.NewDecoder(bytes.NewReader(want)).Decode(&doc.TestSuites))
+	require.True(t, bytes.HasPrefix(want, []byte("<?xml")), "golden must include XML prolog")
+	var sumTests, sumFailures, sumErrors, sumSkipped int
+	for _, s := range doc.TestSuites.Suites {
+		sumTests += s.Tests
+		sumFailures += s.Failures
+		sumErrors += s.Errors
+		sumSkipped += s.Skipped
+		assert.NotContains(t, s.Timestamp, "0001-01-01", "golden timestamp must not be Go zero time")
+	}
+	assert.Equal(t, sumTests, doc.TestSuites.Tests, "golden: Σ child tests must equal parent")
+	assert.Equal(t, sumFailures, doc.TestSuites.Failures, "golden: Σ child failures must equal parent")
+	assert.Equal(t, sumErrors, doc.TestSuites.Errors, "golden: Σ child errors must equal parent")
+	assert.Equal(t, sumSkipped, doc.TestSuites.Skipped, "golden: Σ child skipped must equal parent")
+}
+
+// TestIso8601Timestamp covers the small helper that powers the timestamp fix
+// in 4b — including the fallback when ReportGenerationTime is the zero value.
+func TestIso8601Timestamp(t *testing.T) {
+	fixed := time.Date(2024, 3, 14, 9, 15, 26, 0, time.UTC)
+	assert.Equal(t, "2024-03-14T09:15:26Z", iso8601Timestamp(fixed))
+
+	got := iso8601Timestamp(time.Time{})
+	_, err := time.Parse("2006-01-02T15:04:05Z", got)
+	assert.NoError(t, err, "zero time must fall back to a valid ISO 8601 timestamp, got %q", got)
+}
+
+// TestJunitMultiFrameworkSharedControl directly targets the issue #2099/4a
+// regression: when 2+ frameworks share a control, the parent <testsuites>
+// totals must equal Σ(children), not the deduplicated control count.
+//
+// The single-framework fixture used elsewhere cannot exercise this because the
+// deduplicated SummaryDetails count and the per-framework count happen to be
+// equal. Here we build a synthetic posture with two frameworks that both
+// reference the same failed control, then assert:
+//
+//   - Σ child Tests == 2 (each framework contributes one testcase)
+//   - parent.Tests == Σ child Tests (would be 1 under the old, regressed code)
+//   - parent.Tests != SummaryDetails.NumberOfControls().All() (would be 1)
+//
+// If testsSuites ever regresses to sourcing parent counts from
+// SummaryDetails.NumberOfControls() this test fails.
+func TestJunitMultiFrameworkSharedControl(t *testing.T) {
+	sharedID := "C-9999"
+	failed := apis.StatusInfo{InnerStatus: apis.StatusFailed}
+	sharedCtrl := reportsummary.ControlSummary{
+		ControlID:  sharedID,
+		Name:       "Shared failing control",
+		StatusInfo: failed,
+		Status:     apis.StatusFailed,
+	}
+
+	session := cautils.NewOPASessionObjMock()
+	session.Report = &reporthandlingv2.PostureReport{
+		SummaryDetails: reportsummary.SummaryDetails{
+			// Top-level Controls map is deduplicated — the shared control
+			// appears here exactly once. SummaryDetails.NumberOfControls().All()
+			// will therefore return 1.
+			Controls: reportsummary.ControlSummaries{sharedID: sharedCtrl},
+			Frameworks: []reportsummary.FrameworkSummary{
+				{
+					Name:     "F1",
+					Controls: reportsummary.ControlSummaries{sharedID: sharedCtrl},
+				},
+				{
+					Name:     "F2",
+					Controls: reportsummary.ControlSummaries{sharedID: sharedCtrl},
+				},
+			},
+		},
+	}
+
+	// Sanity-check the assumption that drives the regression: the
+	// deduplicated parent counter and Σ(per-framework counters) disagree.
+	require.Equal(t, 1, session.Report.SummaryDetails.NumberOfControls().All(),
+		"precondition: dedup'd SummaryDetails counts the shared control once")
+	require.Equal(t, 2,
+		session.Report.SummaryDetails.Frameworks[0].NumberOfControls().All()+
+			session.Report.SummaryDetails.Frameworks[1].NumberOfControls().All(),
+		"precondition: per-framework counts double-count the shared control")
+
+	suites := testsSuites(session)
+
+	// Σ(children) must equal 2 — each framework yields a <testsuite> with one
+	// <testcase>. This is the value parsers will see when summing children.
+	var sumTests, sumFailures, sumSkipped int
+	for _, s := range suites.Suites {
+		sumTests += s.Tests
+		sumFailures += s.Failures
+		sumSkipped += s.Skipped
+	}
+	require.Equal(t, 2, sumTests, "Σ child tests should be 2 across the two frameworks")
+	require.Equal(t, 2, sumFailures, "Σ child failures should be 2 across the two frameworks")
+	require.Equal(t, 0, sumSkipped, "Σ child skipped should be 0 across the two frameworks")
+
+	// The fix: parent equals Σ(children). The regression: parent would equal
+	// SummaryDetails.NumberOfControls().All() == 1.
+	assert.Equal(t, sumTests, suites.Tests,
+		"parent Tests must equal Σ child Tests (regressed code returns 1)")
+	assert.Equal(t, sumFailures, suites.Failures,
+		"parent Failures must equal Σ child Failures (regressed code returns 1)")
+	assert.Equal(t, sumSkipped, suites.Skipped,
+		"parent Skipped must equal Σ child Skipped")
+	assert.NotEqual(t, session.Report.SummaryDetails.NumberOfControls().All(), suites.Tests,
+		"parent Tests must NOT be the deduplicated SummaryDetails count")
+}
+
+// TestAggregateSuiteCounts covers the Tests/Failures/Errors/Skipped aggregator
+// directly. The production code path in junit.go never populates child
+// Errors (the printer only emits <failure> and <skipped>), so the multi-
+// framework regression test above cannot exercise the errors branch via
+// testsSuites. This unit test pins the loop itself.
+func TestAggregateSuiteCounts(t *testing.T) {
+	cases := []struct {
+		name                                             string
+		in                                               []JUnitTestSuite
+		wantTests, wantFailures, wantErrors, wantSkipped int
+	}{
+		{
+			name: "empty slice yields zeros",
+		},
+		{
+			name: "errors and skipped aggregate across suites independently of failures",
+			in: []JUnitTestSuite{
+				{Tests: 5, Failures: 1, Errors: 2, Skipped: 1},
+				{Tests: 3, Failures: 0, Errors: 4, Skipped: 2},
+			},
+			wantTests: 8, wantFailures: 1, wantErrors: 6, wantSkipped: 3,
+		},
+		{
+			name: "mixed: errors-only, failures-only, skipped-only, and a clean suite",
+			in: []JUnitTestSuite{
+				{Tests: 4, Errors: 4},
+				{Tests: 2, Failures: 2},
+				{Tests: 3, Skipped: 3},
+				{Tests: 7},
+			},
+			wantTests: 16, wantFailures: 2, wantErrors: 4, wantSkipped: 3,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotTests, gotFailures, gotErrors, gotSkipped := aggregateSuiteCounts(tc.in)
+			assert.Equal(t, tc.wantTests, gotTests, "tests")
+			assert.Equal(t, tc.wantFailures, gotFailures, "failures")
+			assert.Equal(t, tc.wantErrors, gotErrors, "errors")
+			assert.Equal(t, tc.wantSkipped, gotSkipped, "skipped")
+		})
+	}
+}
+
+func TestTestCases_UniqueClassnameForDuplicateNames(t *testing.T) {
+	session := cautils.NewOPASessionObjMock()
+
+	const sharedName = "Minimize the admission of containers wishing to share the host process ID namespace"
+	controls := reportsummary.ControlSummaries{
+		"C-0194": {
+			ControlID:  "C-0194",
+			Name:       sharedName,
+			StatusInfo: apis.StatusInfo{InnerStatus: apis.StatusPassed},
+		},
+		"C-0214": {
+			ControlID:  "C-0214",
+			Name:       sharedName,
+			StatusInfo: apis.StatusInfo{InnerStatus: apis.StatusFailed},
+		},
+	}
+
+	cases := testsCases(session, &controls, "AllControls")
+	require.Len(t, cases, 2)
+
+	seen := make(map[string]struct{}, len(cases))
+	for _, tc := range cases {
+		// JUnit consumers key a test by (classname, name); two same-named
+		// controls must not produce the same identity.
+		key := tc.Classname + "\x00" + tc.Name
+		require.NotContains(t, seen, key, "duplicate (classname, name) identity %q / %q", tc.Classname, tc.Name)
+		seen[key] = struct{}{}
+		assert.Equal(t, sharedName, tc.Name, "name must stay untouched")
+		assert.Contains(t, tc.Classname, "/C-", "classname must embed the control ID")
+	}
+}
+
+func TestTestCases_MissingControl(t *testing.T) {
+	session := cautils.NewOPASessionObjMock()
+	session.Report = &reporthandlingv2.PostureReport{
+		SummaryDetails: reportsummary.SummaryDetails{
+			Controls: reportsummary.ControlSummaries{},
+		},
+	}
+
+	externalControls := reportsummary.ControlSummaries{
+		"C-MISSING": {
+			ControlID:  "C-MISSING",
+			Name:       "missing",
+			StatusInfo: apis.StatusInfo{InnerStatus: apis.StatusPassed},
+		},
+	}
+
+	assert.NotPanics(t, func() {
+		cases := testsCases(session, &externalControls, "TestSuite")
+		if assert.Len(t, cases, 1) {
+			assert.Equal(t, "missing", cases[0].Name)
+			assert.Nil(t, cases[0].Failure)
+		}
+	})
+}
+
+// TestJunitActionPrintComplianceScore is an integration-level regression test
+// for issue #2540. Unlike the unit-level TestListTestsSuiteUsesComplianceScores
+// in junit_compliance_score_test.go, this test exercises the full ActionPrint
+// path and decodes the real marshalled XML to verify the complianceScore
+// property is correct end-to-end.
+func TestJunitActionPrintComplianceScore(t *testing.T) {
+	tests := []struct {
+		name       string
+		frameworks []reportsummary.FrameworkSummary
+		want       string
+	}{
+		{
+			name:       "no frameworks uses summary compliance score",
+			frameworks: []reportsummary.FrameworkSummary{},
+			want:       "87.75",
+		},
+		{
+			name: "frameworks use per-framework compliance score",
+			frameworks: []reportsummary.FrameworkSummary{
+				{Name: "NSA", Score: 10, ComplianceScore: 90},
+			},
+			want: "90.00",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			session := cautils.NewOPASessionObjMock()
+			session.Report = &reporthandlingv2.PostureReport{
+				SummaryDetails: reportsummary.SummaryDetails{
+					Score:           12.25,
+					ComplianceScore: 87.75,
+					Frameworks:      tt.frameworks,
+				},
+			}
+
+			tmp, err := os.CreateTemp("", "junit-integration-*.xml")
+			require.NoError(t, err)
+			defer os.Remove(tmp.Name())
+
+			jp := NewJunitPrinter(false)
+			jp.writer = tmp
+			jp.ActionPrint(context.Background(), session, nil)
+			require.NoError(t, tmp.Close())
+
+			raw, err := os.ReadFile(tmp.Name())
+			require.NoError(t, err)
+
+			var got JUnitXML
+			dec := xml.NewDecoder(bytes.NewReader(raw))
+			require.NoError(t, dec.Decode(&got.TestSuites))
+			require.Len(t, got.TestSuites.Suites, 1)
+			require.GreaterOrEqual(t, len(got.TestSuites.Suites[0].Properties), 1)
+
+			prop := got.TestSuites.Suites[0].Properties[0]
+			assert.Equal(t, "complianceScore", prop.Name)
+			assert.Equal(t, tt.want, prop.Value,
+				"complianceScore must come from ComplianceScore (%s), not Score", tt.want)
+		})
+	}
+}
+
+func TestJunitActionPrintMissingResourceNoPanic(t *testing.T) {
+	session := cautils.NewOPASessionObjMock()
+
+	resourceIDs := helpersv1.AllLists{}
+	resourceIDs.Append(apis.StatusFailed, "r-1")
+
+	control := reportsummary.ControlSummary{
+		ControlID: "C-0001",
+		Name:      "Test Control",
+		Status:    apis.StatusFailed,
+		StatusInfo: apis.StatusInfo{
+			InnerStatus: apis.StatusFailed,
+		},
+		ResourceIDs: resourceIDs,
+	}
+
+	session.Report = &reporthandlingv2.PostureReport{
+		SummaryDetails: reportsummary.SummaryDetails{
+			Controls: reportsummary.ControlSummaries{
+				"C-0001": control,
+			},
+		},
+	}
+
+	tmp, err := os.CreateTemp("", "junit-test-*.xml")
+	require.NoError(t, err)
+	defer os.Remove(tmp.Name())
+
+	jp := NewJunitPrinter(false)
+	jp.writer = tmp
+
+	assert.NotPanics(t, func() {
+		jp.ActionPrint(context.Background(), session, nil)
+	})
+
+	require.NoError(t, tmp.Close())
+}

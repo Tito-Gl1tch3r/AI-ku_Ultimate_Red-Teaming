@@ -1,0 +1,742 @@
+import 'dart:async';
+import 'dart:collection';
+
+import 'package:analyzer/dart/element/element.dart';
+import 'package:collection/collection.dart';
+import 'package:sqlparser/sqlparser.dart';
+import 'package:sqlparser/utils/find_referenced_tables.dart';
+
+import '../driver/driver.dart';
+import '../driver/error.dart';
+import '../driver/state.dart';
+import '../results/element.dart';
+
+import '../serializer.dart';
+import 'dart/accessor.dart' as dart_accessor;
+import 'dart/index.dart' as dart_index;
+import 'dart/table.dart' as dart_table;
+import 'dart/view.dart' as dart_view;
+import 'drift/element_resolver.dart';
+import 'drift/index.dart' as drift_index;
+import 'drift/query.dart' as drift_query;
+import 'drift/table.dart' as drift_table;
+import 'drift/trigger.dart' as drift_trigger;
+import 'drift/view.dart' as drift_view;
+import 'intermediate_state.dart';
+
+/// Analyzes and resolves drift elements.
+final class DriftResolver {
+  final DriftAnalysisDriver driver;
+  final DriftElementId _entrypoint;
+
+  final Map<DriftElementId, _ResolvingOrCachedElement> _involvedElements = {};
+
+  DriftResolver(this.driver, this._entrypoint);
+
+  Future<DriftElement> resolveEntrypoint() async {
+    final resolved = await _restoreOrResolve(_entrypoint);
+
+    // At this stage, all dependencies are part of _involvedElements. Let's
+    // resolve them!
+    final groups = stronglyConnectedComponents(_DependencyGraph(this));
+    for (final group in groups.reversed) {
+      if (group.length > 1) {
+        final resolver = group.map((e) {
+          if (e case _ResolvingElement(
+            singleStageResolver: final SingleStageElementResolver r,
+          )) {
+            return r;
+          }
+          return null;
+        }).firstOrNull;
+
+        if (resolver != null) {
+          final ids = group.map((e) => e.state.ownId).toList();
+          resolver.addInCircularReferenceError(ids);
+        }
+      }
+
+      for (final pending in group) {
+        if (pending is _ResolvingElement) {
+          for (final dep in pending.dependencies) {
+            if (_resolveExisting(dep) case final existing?) {
+              pending.resolvedDependencies.add(existing);
+            }
+          }
+
+          if (pending.singleStageResolver != null) {
+            final createElement = pending.resolveElement!;
+            pending.state.result = await createElement(
+              SingleStageResolvedDependencies._(this),
+            );
+          } else {
+            final intermediate = pending.intermediate!;
+            await intermediate.resolve(ResolvedDependencies._(this));
+          }
+        }
+
+        pending.state.isUpToDate = true;
+      }
+    }
+
+    return resolved.state.result!;
+  }
+
+  Future<_ResolvingOrCachedElement> _restoreOrResolve(
+    DriftElementId element,
+  ) async {
+    if (_involvedElements[element] case final involved?) {
+      return involved;
+    }
+
+    final existing =
+        driver.cache.knownFiles[element.libraryUri]?.analysis[element];
+    if (existing != null && existing.isUpToDate) {
+      final existingElement = existing.result!;
+      final resolving = _AlreadyResolvedElement(
+        token: DependencyToken(existingElement.id, existingElement.kind),
+        state: existing,
+      );
+      _involvedElements[element] = resolving;
+      return resolving;
+    }
+
+    final owningFile = driver.cache.stateForUri(element.libraryUri);
+    final elementState = owningFile.analysis.putIfAbsent(
+      element,
+      () => ElementAnalysisState(element),
+    );
+    elementState.errorsDuringAnalysis.clear();
+
+    try {
+      if (await driver.readStoredAnalysisResult(element.libraryUri)
+          case final restored?) {
+        final deserializer = ElementFileDeserializer(restored);
+        final kind = deserializer.kindFor(element.name);
+        final state = _ResolvingElement(
+          token: DependencyToken(element, kind),
+          state: elementState,
+        );
+        _involvedElements[element] = state;
+        final resolved = await deserializer.deserialize(
+          DependencyAwareResolver._(state, this),
+          kind,
+        );
+        state.intermediate = resolved;
+        elementState.result = resolved.element;
+
+        return state;
+      }
+    } on CouldNotDeserializeException catch (e, s) {
+      driver.backend.log.warning('Could not deserialize $element', e, s);
+      _involvedElements.remove(element);
+      if (driver.isTesting) {
+        rethrow;
+      }
+    }
+
+    // We can't resolve the element from cache, so we need to resolve it.
+
+    await driver.discoverIfNecessary(owningFile);
+    final discovered = owningFile.discovery!.locallyDefinedElements.firstWhere(
+      (e) => e.ownId == element,
+    );
+
+    return await _resolveDependencies(discovered, owningFile, elementState);
+  }
+
+  /// Runs the first step of the two-stage resolving process.
+  Future<_ResolvingElement> _resolveDependencies(
+    DiscoveredElement discovered,
+    FileState fileState,
+    ElementAnalysisState elementState,
+  ) async {
+    final pending = _ResolvingElement(
+      token: DependencyToken(discovered.ownId, discovered.kind),
+      state: elementState,
+    );
+    final dependencyAware = DependencyAwareResolver._(pending, this);
+    _involvedElements[discovered.ownId] = pending;
+
+    final BaseElementResolver resolver = switch (discovered) {
+      DiscoveredDriftTable() => drift_table.DriftTableResolver(
+        fileState,
+        discovered,
+        dependencyAware,
+        elementState,
+      ),
+      DiscoveredDriftIndex() => drift_index.DriftIndexResolver(
+        fileState,
+        discovered,
+        dependencyAware,
+        elementState,
+      ),
+      DiscoveredDriftStatement() => drift_query.DriftQueryResolver(
+        fileState,
+        discovered,
+        dependencyAware,
+        elementState,
+      ),
+      DiscoveredDriftTrigger() => drift_trigger.DriftTriggerResolver(
+        fileState,
+        discovered,
+        dependencyAware,
+        elementState,
+      ),
+      DiscoveredDriftView() => drift_view.DriftViewResolver(
+        fileState,
+        discovered,
+        dependencyAware,
+        elementState,
+      ),
+      DiscoveredDartTable() => dart_table.DartTableResolver(
+        fileState,
+        discovered,
+        dependencyAware,
+        elementState,
+      ),
+      DiscoveredDartView() => dart_view.DartViewResolver(
+        fileState,
+        discovered,
+        dependencyAware,
+        elementState,
+      ),
+      DiscoveredDartIndex() => dart_index.DartIndexResolver(
+        fileState,
+        discovered,
+        dependencyAware,
+        elementState,
+      ),
+      DiscoveredBaseAccessor() => dart_accessor.DartAccessorResolver(
+        fileState,
+        discovered,
+        dependencyAware,
+        elementState,
+      ),
+      _ => throw UnimplementedError('TODO: Handle $discovered'),
+    };
+
+    switch (resolver) {
+      case SingleStageElementResolver():
+        pending.singleStageResolver = resolver;
+        pending.resolveElement = await resolver.resolveDependencies();
+      case TwoStageElementResolver():
+        final intermediate = pending.intermediate = await resolver
+            .buildPending();
+        elementState.result = intermediate.element;
+    }
+
+    return pending;
+  }
+
+  /// Attempts to resolve a dependency for an element if that is allowed.
+  ///
+  /// It usually _is_ allowed, but there could be a forbidden circular reference
+  /// in which case the reference is reported to be unavailable.
+  /// Further, an internal bug in the analyzer could cause a crash analyzing
+  /// the element. To not cause the entire analysis run to fail, this reports
+  /// an error message and otherwise continues analysis of other elements.
+  Future<ResolveReferencedElementResult> resolveReferencedElement(
+    DriftElementId owner,
+    DriftElementId reference,
+  ) async {
+    if (_involvedElements[reference] case final alreadyTracked?) {
+      return ResolvedReferenceFound(alreadyTracked.token);
+    }
+
+    try {
+      final resolved = await _restoreOrResolve(reference);
+      return ResolvedReferenceFound(resolved.token);
+    } catch (e, s) {
+      driver.backend.log.warning('Could not analyze $reference', e, s);
+      return ReferencedElementCouldNotBeResolved();
+    }
+  }
+
+  DriftElement? _resolveExisting(DriftElementId id) {
+    return _involvedElements[id]!.state.result;
+  }
+}
+
+final class DependencyAwareResolver {
+  final _ResolvingElement _ownElement;
+  final DriftResolver _resolver;
+
+  DependencyAwareResolver._(this._ownElement, this._resolver);
+
+  DriftAnalysisDriver get driver => _resolver.driver;
+
+  DriftElementId get ownElementId => _ownElement.token.id;
+
+  /// References tracked by this resolver.
+  ///
+  /// This list will be empty during the first resolve stage, but resolved
+  /// dependencies will be added to this list as part of the second stage.
+  List<DriftElement> get references => _ownElement.resolvedDependencies;
+
+  Future<ResolveReferencedElementResult> resolveReferencedElement(
+    DriftElementId reference,
+  ) async {
+    _ownElement.dependencies.add(reference);
+    final resolved = await _resolver.resolveReferencedElement(
+      _ownElement.token.id,
+      reference,
+    );
+
+    return resolved;
+  }
+
+  /// Resolves a reference in SQL.
+  ///
+  /// This works by looking at known imports of the file defining the [owner]
+  /// and using the results of the discovery step to find a known element with
+  /// the same name. If one exists, it is resolved and returned. Otherwise, an
+  /// error result is returned.
+  Future<ResolveReferencedElementResult> resolveReference(
+    String reference,
+  ) async {
+    final candidates = <DriftElementId>[];
+    final owner = _ownElement.token.id;
+    final file = driver.cache.knownFiles[owner.libraryUri]!;
+
+    for (final available in driver.cache.crawl(file)) {
+      final localElementIds = {
+        ...available.analysis.keys,
+        ...available.definedElements.map((e) => e.ownId),
+      };
+
+      for (final definedLocally in localElementIds) {
+        if (definedLocally.sameName(reference)) {
+          candidates.add(definedLocally);
+        }
+      }
+    }
+
+    if (candidates.isEmpty) {
+      return InvalidReferenceResult(
+        InvalidReferenceError.noElementWithSuchName,
+        '`$reference` could not be found in any import.',
+      );
+    } else if (candidates.length > 1) {
+      final description = candidates
+          .map((c) => '`${c.name}` in `${c.libraryUri}`')
+          .join(', ');
+
+      return InvalidReferenceResult(
+        InvalidReferenceError.ambigiousElements,
+        'Ambigious reference, it could refer to any of: $description',
+      );
+    }
+
+    return resolveReferencedElement(candidates.single);
+  }
+
+  /// Resolves a Dart element reference, if the referenced Dart [element]
+  /// defines an element understood by drift.
+  Future<ResolveReferencedElementResult> resolveDartReference(
+    DriftElementId owner,
+    Element element,
+  ) async {
+    final uri = await driver.backend.uriOfDart(element.library!);
+    final state = driver.cache.stateForUri(uri);
+
+    final existing = state.definedElements.firstWhereOrNull(
+      (existing) => existing.dartElementName == element.name,
+    );
+
+    if (existing != null) {
+      return resolveReferencedElement(existing.ownId);
+    } else {
+      return InvalidReferenceResult(
+        InvalidReferenceError.noElementWithSuchName,
+        'The referenced element, ${element.name}, is not understood by drift.',
+      );
+    }
+  }
+}
+
+final class SingleStageResolvedDependencies {
+  final DriftResolver _resolver;
+
+  SingleStageResolvedDependencies._(this._resolver);
+
+  DriftElement? resolveNullable(DependencyToken? token) {
+    if (token == null) return null;
+
+    return _resolver._resolveExisting(token.id);
+  }
+}
+
+final class ResolvedDependencies extends SingleStageResolvedDependencies {
+  ResolvedDependencies._(super._resolver) : super._();
+
+  DriftElement resolve(DependencyToken token) {
+    return _resolver._involvedElements[token.id]!.state.result!;
+  }
+
+  @override
+  DriftElement? resolveNullable(DependencyToken? token) {
+    return token == null ? null : resolve(token);
+  }
+}
+
+/// A token for a dependency that is guaranteed to be resolvable.
+///
+/// We return this instead of the resolved element to support circular
+/// references in a two-step resolve procedure.
+final class DependencyToken {
+  final DriftElementId id;
+  final DriftElementKind kind;
+
+  DependencyToken(this.id, this.kind);
+}
+
+/// A resolver responsible for analyzing a single element.
+///
+/// Resolvers can either operate in two stages, which allows circular
+/// references, or in a single stage.
+///
+/// Wherever possible, two-stage resolvers should be preferred. Currently, views
+/// require a single stage resolver with all dependencies resolved before we can
+/// analyze the view (as it involves resolving a SQL query).
+sealed class BaseElementResolver<T extends DiscoveredElement> {
+  final FileState file;
+  final T discovered;
+  final DependencyAwareResolver resolver;
+  final ElementAnalysisState state;
+
+  BaseElementResolver(this.file, this.discovered, this.resolver, this.state);
+
+  Future<DependencyToken?> resolveSqlReferenceOrReportError(
+    String reference,
+    DriftAnalysisError Function(String msg) createError, {
+    DriftElementKind? enforceKind,
+  }) async {
+    final result = await resolver.resolveReference(reference);
+    if (result case InvalidReferenceResult(
+      error: InvalidReferenceError.noElementWithSuchName,
+    )) {
+      final knownTables = resolver.driver.options.sqliteOptions?.knownTables;
+      if (knownTables != null && knownTables.any((e) => e.name == reference)) {
+        // This table is external, no need to emit a warning.
+        return null;
+      }
+    }
+
+    return handleReferenceResult(result, createError, enforceKind: enforceKind);
+  }
+
+  Future<DependencyToken?> resolveDartReferenceOrReportError(
+    Element reference,
+    DriftAnalysisError Function(String msg) createError, {
+    DriftElementKind? enforceKind,
+  }) async {
+    final result = await resolver.resolveDartReference(
+      discovered.ownId,
+      reference,
+    );
+    return handleReferenceResult(result, createError, enforceKind: enforceKind);
+  }
+
+  DependencyToken? handleReferenceResult(
+    ResolveReferencedElementResult result,
+    DriftAnalysisError Function(String msg) createError, {
+    DriftElementKind? enforceKind,
+  }) {
+    if (result case ResolvedReferenceFound(:final token)) {
+      if (enforceKind != null && token.kind != enforceKind) {
+        reportError(
+          createError(
+            'Expected a ${enforceKind.name}, but ${token.id.name} is a ${token.kind.name}',
+          ),
+        );
+        return null;
+      }
+
+      return token;
+    } else {
+      reportErrorForUnresolvedReference(result, createError);
+      return null;
+    }
+  }
+
+  void reportErrorForUnresolvedReference(
+    ResolveReferencedElementResult result,
+    DriftAnalysisError Function(String msg) createError,
+  ) {
+    if (result is InvalidReferenceResult) {
+      reportError(createError(result.message));
+    } else if (result is ReferencedElementCouldNotBeResolved) {
+      reportError(
+        createError(
+          'The referenced element could not be analyzed due to a bug in drift.',
+        ),
+      );
+    }
+  }
+
+  Future<SqlEngine Function(SingleStageResolvedDependencies)>
+  newEngineWithTables(Iterable<DependencyToken> references) async {
+    final mapping = await resolver.driver.typeMapping;
+    return (SingleStageResolvedDependencies dependencies) {
+      return mapping.newEngineWithTables([
+        for (final reference in references)
+          ?dependencies.resolveNullable(reference),
+      ]);
+    };
+  }
+
+  Future<List<DependencyToken>> resolveTableReferences(
+    AstNode stmt, {
+    List<ResolvableSqlReference> additional = const [],
+  }) async {
+    final engine = resolver.driver.newSqlEngine();
+    final references = engine.findReferencedSchemaTables(stmt);
+    final found = <DependencyToken>[];
+    final missingNames = <String, ResolveReferencedElementResult>{};
+
+    final entries = references
+        .map<(String, ResolvableSqlReference?)>((e) => (e, null))
+        .followedBy(additional.map((e) => (e.name, e)));
+
+    for (final (table, entry) in entries) {
+      // If this is a reference to a table the empty engine already knows, it
+      // must be a table builtin to sqlite3, not a drift reference.
+      if (engine.knownResultSets.any(
+        (e) => e.name.toLowerCase() == table.toLowerCase(),
+      )) {
+        continue;
+      }
+
+      final result = await resolver.resolveReference(table);
+
+      if (result case ResolvedReferenceFound(:final token)) {
+        entry?.resolved = token;
+        found.add(token);
+      } else {
+        missingNames[table.toLowerCase()] = result;
+      }
+    }
+
+    if (missingNames.isNotEmpty) {
+      // Ok, there are unresolved table references
+      for (final reference in stmt.allDescendants.whereType<TableReference>()) {
+        if (reference.resolved == null) {
+          final unresolvedBecause =
+              missingNames[reference.tableName.toLowerCase()];
+
+          if (unresolvedBecause != null) {
+            reportErrorForUnresolvedReference(
+              unresolvedBecause,
+              (msg) => DriftAnalysisError.inDriftFile(reference, msg),
+            );
+          }
+        }
+      }
+    }
+
+    return found;
+  }
+
+  /// Finds all referenced tables, Dart expressions and Dart types referenced
+  /// in [stmt].
+  Future<FoundReferencesInSql> resolveSqlReferences(AstNode stmt) async {
+    final driftElements = await resolveTableReferences(stmt);
+
+    final identifier = _IdentifyDartElements();
+    stmt.accept(identifier, null);
+
+    return FoundReferencesInSql(
+      referencedElements: driftElements,
+      dartExpressions: identifier.dartExpressions,
+      dartTypes: identifier.dartTypes,
+    );
+  }
+
+  void reportError(DriftAnalysisError error) {
+    state.errorsDuringAnalysis.add(error);
+  }
+}
+
+abstract base class TwoStageElementResolver<T extends DiscoveredElement>
+    extends BaseElementResolver<T> {
+  TwoStageElementResolver(
+    super.file,
+    super.discovered,
+    super.resolver,
+    super.state,
+  );
+
+  /// Performs async resolve work that might discover dependencies, e.g. for
+  /// foreign keys.
+  ///
+  /// Because references can be circular, this first returns an intermediate
+  /// element that is later resolved once all other intermediates are available.
+  Future<PendingDriftElement> buildPending();
+}
+
+abstract base class SingleStageElementResolver<T extends DiscoveredElement>
+    extends BaseElementResolver<T> {
+  SingleStageElementResolver(
+    super.file,
+    super.discovered,
+    super.resolver,
+    super.state,
+  );
+
+  void addInCircularReferenceError(List<DriftElementId> ids);
+
+  Future<Future<DriftElement> Function(SingleStageResolvedDependencies)>
+  resolveDependencies();
+}
+
+/// A [DriftElement] that requires a second [resolve] step to finalize analysis.
+///
+/// When this is constructed, we know about the element's columns and structure.
+/// However, dependencies have not been resolved yet and some information (like
+/// column or table constraints including foreign keys) are finalized once
+/// dependencies are available.
+final class PendingDriftElement {
+  final DriftElement element;
+  final FutureOr<void> Function(ResolvedDependencies) resolve;
+
+  PendingDriftElement({required this.element, required this.resolve});
+
+  PendingDriftElement.fullyResolved(this.element) : resolve = ((_) {});
+}
+
+/// An additional reference to pass into
+/// [BaseElementResolver.resolveTableReferences].
+///
+/// It allows extracting the [resolved] dependency for a table or other element
+/// given its name.
+final class ResolvableSqlReference {
+  final String name;
+  DependencyToken? resolved;
+
+  ResolvableSqlReference(this.name);
+}
+
+sealed class _ResolvingOrCachedElement {
+  final DependencyToken token;
+  final ElementAnalysisState state;
+
+  _ResolvingOrCachedElement({required this.token, required this.state});
+}
+
+/// An element being analyzed by a [BaseElementResolver].
+final class _ResolvingElement extends _ResolvingOrCachedElement {
+  final Set<DriftElementId> dependencies = {};
+  final List<DriftElement> resolvedDependencies = [];
+
+  /// For two-stage resolvers, the pending element.
+  PendingDriftElement? intermediate;
+
+  /// For a single-stage resolver, a function resolving to the element if
+  /// references have been resolved.
+  Future<DriftElement> Function(SingleStageResolvedDependencies)?
+  resolveElement;
+  SingleStageElementResolver? singleStageResolver;
+
+  _ResolvingElement({required super.token, required super.state});
+}
+
+/// An element that has already been fully analyzed and cached in-memory.
+final class _AlreadyResolvedElement extends _ResolvingOrCachedElement {
+  _AlreadyResolvedElement({required super.token, required super.state});
+}
+
+sealed class ResolveReferencedElementResult {
+  const ResolveReferencedElementResult();
+}
+
+final class ResolvedReferenceFound extends ResolveReferencedElementResult {
+  final DependencyToken token;
+
+  ResolvedReferenceFound(this.token);
+}
+
+enum InvalidReferenceError {
+  causesCircularReference,
+
+  /// Reported by [DependencyAwareResolver.resolveReference] when no element
+  /// with the given name exists in transitive imports.
+  noElementWithSuchName,
+
+  /// Reported by [DependencyAwareResolver.resolveReference] when more than one
+  /// element with the queried name was found.
+  ambigiousElements,
+}
+
+final class InvalidReferenceResult extends ResolveReferencedElementResult {
+  final InvalidReferenceError error;
+  final String message;
+
+  InvalidReferenceResult(this.error, this.message);
+}
+
+final class ReferencedElementCouldNotBeResolved
+    extends ResolveReferencedElementResult {}
+
+class _IdentifyDartElements extends RecursiveVisitor<void, void> {
+  final List<String> dartExpressions = [];
+  final Map<SyntacticEntity, String> dartTypes = {};
+
+  @override
+  void visitCastExpression(CastExpression e, void arg) {
+    final match = FoundReferencesInSql.enumRegex.firstMatch(e.typeName);
+
+    if (match != null) {
+      // Found `ENUMNAME(x)`, where `x` is a Dart type that we might want to
+      // resolve later.
+      dartTypes[e] = match.group(2)!;
+    }
+
+    super.visitCastExpression(e, arg);
+  }
+
+  @override
+  void visitColumnConstraint(ColumnConstraint e, void arg) {
+    if (e is MappedBy) {
+      dartExpressions.add(e.mapper.dartCode);
+    } else {
+      super.visitColumnConstraint(e, arg);
+    }
+  }
+}
+
+final class _DependencyGraph
+    extends
+        UnmodifiableMapBase<
+          _ResolvingOrCachedElement,
+          Iterable<_ResolvingOrCachedElement>
+        > {
+  final DriftResolver _resolver;
+
+  _DependencyGraph(this._resolver);
+
+  @override
+  Iterable<_ResolvingOrCachedElement>? operator [](Object? key) {
+    if (key is _ResolvingElement) {
+      return key.dependencies.map((id) {
+        final resolved = _resolver._involvedElements[id];
+        if (resolved == null) {
+          throw StateError(
+            'Broken dependency graph: Reference $id (from '
+            '${key.token.id}) not found',
+          );
+        }
+
+        return resolved;
+      });
+    }
+
+    // Return no dependencies for pre-resolved elements, if they formed a cycle
+    // we'd only see it when resolving that element itself.
+    return const Iterable.empty();
+  }
+
+  @override
+  Iterable<_ResolvingOrCachedElement> get keys =>
+      _resolver._involvedElements.values;
+}

@@ -1,0 +1,387 @@
+# frozen_string_literal: true
+
+require 'ffi'
+
+PubFFI = ::FFI unless defined?(PubFFI) # rubocop:disable Style/RedundantConstantBase
+
+module PWN
+  module FFI
+    # Thin libhackrf binding for inventory / RX of raw I/Q.
+    #
+    # Intentionally control-plane first: init/open/tune/rate/gains + one-shot
+    # sync-style helpers used by Extrospection `probe_rf` and by wideband
+    # PWN::SDR::Decoder::* modules that need real I/Q (not GQRX audio).
+    # Callbacks copy into a bounded nonblocking queue. Ruby callbacks still
+    # acquire the GVL and allocate: this is not a hard-realtime guarantee.
+    module HackRF
+      extend PubFFI::Library
+
+      HACKRF_SUCCESS = 0
+
+      @load_error = nil
+      begin
+        ffi_lib %w[hackrf libhackrf.so.0 libhackrf.so]
+      rescue LoadError => e
+        @load_error = e
+      end
+
+      class << self
+        attr_reader :load_error
+      end
+
+      unless @load_error
+        attach_function :hackrf_init, [], :int
+        attach_function :hackrf_exit, [], :int
+        attach_function :hackrf_library_version, [], :string
+        attach_function :hackrf_library_release, [], :string
+        attach_function :hackrf_error_name, [:int], :string
+
+        attach_function :hackrf_open, [:pointer], :int
+        attach_function :hackrf_open_by_serial, %i[string pointer], :int
+        attach_function :hackrf_close, [:pointer], :int
+
+        attach_function :hackrf_set_freq, %i[pointer uint64], :int
+        attach_function :hackrf_set_sample_rate, %i[pointer double], :int
+        attach_function :hackrf_set_baseband_filter_bandwidth, %i[pointer uint32], :int
+        attach_function :hackrf_set_vga_gain, %i[pointer uint32], :int
+        attach_function :hackrf_set_lna_gain, %i[pointer uint32], :int
+        attach_function :hackrf_set_amp_enable, %i[pointer uint8], :int
+        attach_function :hackrf_is_streaming, [:pointer], :int
+        # int (*hackrf_sample_block_cb_fn)(hackrf_transfer* transfer)
+        callback :hackrf_sample_block_cb_fn, [:pointer], :int
+        attach_function :hackrf_start_rx, %i[pointer hackrf_sample_block_cb_fn pointer], :int
+        attach_function :hackrf_stop_rx, [:pointer], :int, blocking: true
+        attach_function :hackrf_board_id_read, %i[pointer pointer], :int
+        attach_function :hackrf_board_id_name, [:uint8], :string
+        attach_function :hackrf_version_string_read, %i[pointer pointer uint8], :int
+      end
+
+      # Supported Method Parameters::
+      # PWN::FFI::HackRF.available?
+
+      public_class_method def self.available?
+        !@load_error && respond_to?(:hackrf_init, true)
+      rescue StandardError
+        false
+      end
+
+      # Supported Method Parameters::
+      # info = PWN::FFI::HackRF.info
+      # Returns Hash with library_version / library_release / available.
+
+      public_class_method def self.info
+        return { available: false, error: @load_error&.message } unless available?
+
+        {
+          available: true,
+          library_version: hackrf_library_version.to_s,
+          library_release: hackrf_library_release.to_s
+        }
+      end
+
+      # Supported Method Parameters::
+      # dev = PWN::FFI::HackRF.open(serial: nil)
+      # Returns FFI::Pointer (opaque hackrf_device*) or raises.
+
+      public_class_method def self.open(opts = {})
+        raise 'ERROR: libhackrf not available' unless available?
+
+        check!(hackrf_init)
+        dev_ptr = PubFFI::MemoryPointer.new(:pointer)
+        serial = opts[:serial]
+        rc = if serial
+               hackrf_open_by_serial(serial.to_s, dev_ptr)
+             else
+               hackrf_open(dev_ptr)
+             end
+        check!(rc)
+        dev_ptr.read_pointer
+      end
+
+      # Supported Method Parameters::
+      # PWN::FFI::HackRF.close(device: pointer)
+
+      public_class_method def self.close(opts = {})
+        dev = opts[:device]
+        return unless dev && !dev.null?
+
+        check!(hackrf_close(dev))
+        hackrf_exit
+        nil
+      end
+
+      # Supported Method Parameters::
+      # PWN::FFI::HackRF.configure(
+      #   device:     'required - pointer from .open',
+      #   freq_hz:    'required - center frequency Hz',
+      #   rate_hz:    'optional - sample rate (default 10e6)',
+      #   lna_gain:   'optional - 0..40 step 8 (default 16)',
+      #   vga_gain:   'optional - 0..62 step 2 (default 20)',
+      #   amp:        'optional - true/false RF amp (default false)',
+      #   bb_bw_hz:   'optional - baseband filter BW Hz'
+      # )
+
+      public_class_method def self.configure(opts = {}) # rubocop:disable Naming/PredicateMethod
+        dev = opts[:device]
+        raise 'ERROR: :device required' if dev.nil? || dev.null?
+
+        freq = opts[:freq_hz].to_i
+        rate = (opts[:rate_hz] || 10_000_000).to_f
+        lna  = (opts[:lna_gain] || 16).to_i
+        vga  = (opts[:vga_gain] || 20).to_i
+        amp  = opts[:amp] ? 1 : 0
+
+        check!(hackrf_set_freq(dev, freq))
+        check!(hackrf_set_sample_rate(dev, rate))
+        check!(hackrf_set_lna_gain(dev, lna))
+        check!(hackrf_set_vga_gain(dev, vga))
+        check!(hackrf_set_amp_enable(dev, amp))
+        check!(hackrf_set_baseband_filter_bandwidth(dev, opts[:bb_bw_hz].to_i)) if opts[:bb_bw_hz]
+        true
+      end
+
+      # Supported Method Parameters::
+      # meta = PWN::FFI::HackRF.device_info(device: pointer)
+      # Returns { board_id:, board_name:, version: }
+
+      public_class_method def self.device_info(opts = {})
+        dev = opts[:device]
+        raise 'ERROR: :device required' if dev.nil? || dev.null?
+
+        bid_ptr = PubFFI::MemoryPointer.new(:uint8)
+        check!(hackrf_board_id_read(dev, bid_ptr))
+        bid = bid_ptr.read_uint8
+        ver_buf = PubFFI::MemoryPointer.new(:char, 255)
+        check!(hackrf_version_string_read(dev, ver_buf, 255))
+        {
+          board_id: bid,
+          board_name: hackrf_board_id_name(bid).to_s,
+          version: ver_buf.read_string
+        }
+      end
+      # hackrf_transfer as passed to the RX callback.
+      class Transfer < PubFFI::Struct
+        layout :device,        :pointer,
+               :buffer,        :pointer,
+               :buffer_length, :int,
+               :valid_length,  :int,
+               :rx_ctx,        :pointer,
+               :tx_ctx,        :pointer
+      end
+
+      # Supported Method Parameters::
+      # rx = PWN::FFI::HackRF.start_rx(
+      #   device:    'required - pointer from .open',
+      #   max_queue: 'optional - max buffered chunks (default 64)'
+      # )
+      # Returns { device:, queue:, callback:, overruns:, dropped_bytes: }.
+      # Counters cover application queue drops only, not unreported USB/RF loss.
+      # An overrun/error latches :error; read_sync raises until RX is restarted.
+      # libhackrf runs the callback on its own libusb thread; FFI acquires
+      # the GVL for us, so keep the callback body to a bare byte copy.
+
+      public_class_method def self.start_rx(opts = {})
+        raise 'ERROR: libhackrf not available' unless available?
+
+        dev = opts[:device]
+        raise 'ERROR: :device required' if dev.nil? || dev.null?
+
+        max_q = (opts[:max_queue] || 64).to_i
+        raise ArgumentError, 'max_queue must be positive' unless max_q.positive?
+
+        queue = SizedQueue.new(max_q)
+        h = { device: dev, queue: queue, dropped_bytes: 0, overruns: 0 }
+        cb = PubFFI::Function.new(:int, [:pointer]) do |xfer_ptr|
+          begin
+            xfer = Transfer.new(xfer_ptr)
+            len = xfer[:valid_length].to_i
+            raise 'ERROR: invalid HackRF transfer length' if len.negative? || len > xfer[:buffer_length] || len.odd?
+
+            if len.positive?
+              begin
+                queue.push(xfer[:buffer].read_bytes(len), true)
+              rescue ThreadError
+                h[:dropped_bytes] += len
+                h[:overruns] += 1
+                h[:error] = RuntimeError.new('ERROR: HackRF RX overrun: IQ continuity lost')
+              end
+            end
+          rescue StandardError => e
+            h[:error] = e
+          end
+          0
+        end
+        h[:callback] = cb
+        check!(hackrf_start_rx(dev, cb, nil))
+        h
+      end
+
+      # Supported Method Parameters::
+      # data = PWN::FFI::HackRF.read_sync(
+      #   handle:  'required - handle from .start_rx',
+      #   timeout: 'optional - seconds to wait for a chunk (default 1.0)'
+      # )
+      # Returns String of interleaved cs8 I/Q, or nil on timeout/stopped RX.
+      # Raises on callback errors or queue overrun; never bridges lost IQ.
+
+      public_class_method def self.read_sync(opts = {})
+        h = opts[:handle]
+        raise 'ERROR: :handle required (from start_rx)' unless h.is_a?(Hash) && h[:queue]
+
+        raise h[:error] if h[:error]
+
+        q  = h[:queue]
+        to = (opts[:timeout] || 1.0).to_f
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + to
+        loop do
+          raise h[:error] if h[:error]
+          return nil if h[:stopped]
+
+          begin
+            return q.pop(true)
+          rescue ThreadError
+            return nil if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+          end
+          sleep 0.005
+        end
+      end
+
+      # Supported Method Parameters::
+      # PWN::FFI::HackRF.stop_rx(handle: rx)
+
+      public_class_method def self.stop_rx(opts = {})
+        h = opts[:handle]
+        return unless h.is_a?(Hash) && h[:device]
+
+        return if h[:stopped]
+
+        check!(hackrf_stop_rx(h[:device]))
+        h[:stopped] = true
+        h[:queue]&.clear
+        h[:callback] = nil
+        nil
+      end
+
+      # Supported Method Parameters::
+      # data = PWN::FFI::HackRF.capture(
+      #   freq_hz:  'required - center frequency Hz',
+      #   rate_hz:  'optional - sample rate (default 10e6)',
+      #   samples:  'optional - I/Q sample pairs to capture (default 262_144)',
+      #   lna_gain: 'optional', vga_gain: 'optional', amp: 'optional',
+      #   serial:   'optional'
+      # )
+      # One-shot open/configure/start_rx/read/stop_rx/close.
+      # Returns String of interleaved cs8 I/Q.
+
+      public_class_method def self.capture(opts = {})
+        want = (opts[:samples] || 262_144).to_i * 2
+        dev  = self.open(serial: opts[:serial])
+        configure(
+          device: dev,
+          freq_hz: opts[:freq_hz],
+          rate_hz: opts[:rate_hz] || 10_000_000,
+          lna_gain: opts[:lna_gain], vga_gain: opts[:vga_gain], amp: opts[:amp]
+        )
+        rx  = start_rx(device: dev)
+        buf = +''
+        while buf.bytesize < want
+          chunk = read_sync(handle: rx, timeout: 2.0)
+          break unless chunk
+
+          buf << chunk
+        end
+        buf[0, want]
+      ensure
+        stop_rx(handle: rx) if defined?(rx) && rx
+        close(device: dev)  if defined?(dev) && dev
+      end
+
+      # Author(s):: 0day Inc. <support@0dayinc.com>
+
+      public_class_method def self.authors
+        "AUTHOR(S):\n  0day Inc. <support@0dayinc.com>\n"
+      end
+
+      # Display Usage for this Module
+
+      public_class_method def self.help
+        puts "USAGE:
+          # Run available and return its result
+          #{self}.available?
+
+          # Run info and return its result
+          #{self}.info
+
+          # Open a session or connection and return a handle.
+          #{self}.open(
+            serial: 'optional - serial value consumed by #open'
+          )
+
+          # Close a session previously returned by #open.
+          #{self}.close(
+            device: 'optional - device value consumed by #close'
+          )
+
+          # Run configure and return its result
+          #{self}.configure(
+            device: 'required - pointer from .open',
+            freq_hz: 'required - center frequency Hz',
+            rate_hz: 'optional - sample rate (default 10e6)',
+            lna_gain: 'optional - 0..40 step 8 (default 16)',
+            vga_gain: 'optional - 0..62 step 2 (default 20)',
+            amp: 'optional - true/false RF amp (default false)',
+            bb_bw_hz: 'optional - baseband filter BW Hz'
+          )
+
+          # Run device info and return its result
+          #{self}.device_info(
+            device: 'required - device value consumed by #device_info'
+          )
+
+          # Run start rx and return its result
+          #{self}.start_rx(
+            device: 'required - pointer from .open',
+            max_queue: 'optional - max buffered chunks (default 64)'
+          )
+
+          # Run read sync and return its result
+          #{self}.read_sync(
+            handle: 'required - handle from .start_rx',
+            timeout: 'optional - seconds to wait for a chunk (default 1.0)'
+          )
+
+          # Run stop rx and return its result
+          #{self}.stop_rx(
+            handle: 'optional - handle value consumed by #stop_rx'
+          )
+
+          # Run capture and return its result
+          #{self}.capture(
+            freq_hz: 'required - center frequency Hz',
+            rate_hz: 'optional - sample rate (default 10e6)',
+            samples: 'optional - I/Q sample pairs to capture (default 262_144)',
+            lna_gain: 'optional - optional, vga_gain: optional, amp: optional',
+            serial: 'optional - serial value consumed by #capture',
+            vga_gain: 'optional - vga gain value consumed by #capture',
+            amp: 'optional - amp value consumed by #capture'
+          )
+
+          # Print the AUTHOR(S) string for this module.
+          #{self}.authors
+        "
+        constants.sort
+      end
+
+      class << self
+        private
+
+        def check!(code)
+          return if code == HACKRF_SUCCESS
+
+          name = available? ? hackrf_error_name(code).to_s : code.to_s
+          raise "ERROR: libhackrf rc=#{code} (#{name})"
+        end
+      end
+    end
+  end
+end

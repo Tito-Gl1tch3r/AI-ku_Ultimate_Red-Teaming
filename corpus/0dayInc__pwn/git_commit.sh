@@ -1,0 +1,70 @@
+#!/bin/bash --login
+usage() {
+  echo "USAGE: ${0} '<full name>' <email address> '<git commit comments>'"
+  exit 1
+}
+
+if (( $# == 3 )); then
+  # Default Strategy is to merge codebase
+  sudo chown -R $USER:$USER /opt/pwn
+  git config pull.rebase false
+  git config commit.gpgsign true
+  # Sync fork with upstream to avoid merge conflicts and ensure latest code is being worked on
+  git remote -v | grep 'upstream' || git remote add upstream https://github.com/0dayinc/pwn.git
+  git fetch upstream
+  git checkout master
+  git merge upstream/master
+  git pull
+  git add . --all
+  echo 'Updating Gems to Latest Versions in Gemfile...'
+  ./upgrade_Gemfile_gems.sh
+  if [[ $? -ne 0 ]]; then
+    echo 'ERROR: upgrade_Gemfile_gems.sh failed!'
+    exit 1
+  fi
+
+  pwn_autoinc_version
+  if [[ $? -ne 0 ]]; then
+    echo 'ERROR: pwn_autoinc_version failed! Reinstalling pwn gemset...'
+    rvmsudo ./reinstall_pwn_gemset.sh
+    rake
+    rvmsudo rake install
+    if [[ $? -ne 0 ]]; then
+      echo 'ERROR: Attempt to reinstall pwn gemset failed! Please investigate and fix before trying again.'
+      exit 1
+    fi
+    pwn_autoinc_version
+  fi
+
+  # Generate RDoc JSONL for fine-tunning LLMs
+  pwn_rdoc_to_jsonl --rdoc-root-dir '/opt/pwn/rdoc/PWN' --jsonl-results '/opt/pwn/third_party/pwn_rdoc.jsonl'
+
+  # Tag for every 100 commits (i.e. 0.1.100, 0.1.200, etc)
+  tag_this_version_bool=`ruby -r 'pwn' -e 'if (PWN::VERSION.split(".")[-1].to_i + 1) % 100 == 0; then print true; else print false; end'`
+  if [[ $tag_this_version_bool == 'true' ]]; then
+    last_tag=$(git tag | tail -n 1)
+    git log $last_tag.. --oneline > CHANGELOG_BETWEEN_TAGS.txt
+  fi
+
+  git commit -a -S --author="${1} <${2}>" -m "${3}"
+  ./upgrade_pwn.sh
+  if [[ $? -ne 0 ]]; then
+    echo 'ERROR: upgrade_pwn.sh failed!'
+    exit 1
+  fi
+
+  latest_gem=$(ls pkg/*.gem)
+  if [[ $latest_gem != "" ]]; then
+    echo "Pushing ${latest_gem} to RubyGems.org..."
+    rvmsudo gem push $latest_gem
+  fi
+
+  if [[ $tag_this_version_bool == 'true' ]]; then
+    this_version=`ruby -r 'pwn' -e 'print PWN::VERSION'`
+    echo "Tagging: ${this_version}"
+    git tag $this_version
+    git push origin $this_version
+  fi
+else
+  usage
+fi

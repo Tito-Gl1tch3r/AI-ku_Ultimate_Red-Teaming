@@ -1,0 +1,2006 @@
+# frozen_string_literal: true
+
+require 'diffy'
+require 'digest'
+require 'fileutils'
+require 'json'
+require 'em/pure_ruby'
+require 'faye/websocket'
+require 'nokogiri'
+require 'openssl'
+require 'rest-client'
+require 'securerandom'
+require 'selenium/devtools'
+require 'selenium/webdriver'
+require 'socksify'
+require 'time'
+require 'timeout'
+require 'tmpdir'
+require 'watir'
+require 'yaml'
+
+module PWN
+  module Plugins
+    # This plugin rocks. Chrome, Firefox, headless, REST Client,
+    # all from the comfort of one plugin.  Proxy support (e.g. Burp
+    # Suite Professional) is completely available for all browsers
+    # except for limited functionality within IE (IE has interesting
+    # protections in place to prevent this).  This plugin also supports
+    # taking screenshots :)
+    module TransparentBrowser
+      @@logger = PWN::Plugins::PWNLogger.create
+
+      # Supported Method Parameters::
+      # verify_devtools_browser(
+      #   browser_obj: 'required - browser_obj returned from #open method',
+      #   supported: 'optional - array of supported browser types (defaults to [:chrome, :headless_chrome, :firefox, :headless_firefox, :headless])'
+      # )
+      private_class_method def self.verify_devtools_browser(opts = {})
+        browser_obj = opts[:browser_obj]
+        supported = opts[:supported] ||= %i[chrome headless_chrome firefox headless_firefox headless]
+
+        browser_type = browser_obj[:type]
+        verified = false
+        verified = true if supported.include?(browser_type)
+      rescue StandardError => e
+        raise e
+      end
+
+      private_class_method def self.apply_driver_timeouts!(opts = {})
+        browser = opts[:browser_obj].is_a?(Hash) ? opts[:browser_obj][:browser] : nil
+        return unless browser.respond_to?(:driver)
+
+        timeouts = browser.driver.manage.timeouts
+        timeouts.page_load = 45
+        timeouts.script = 30
+      rescue StandardError
+        nil
+      end
+
+      # Supported Method Parameters::
+      # browser_obj1 = PWN::Plugins::TransparentBrowser.open(
+      #   browser_type: 'optional - :firefox|:chrome|:headless|:rest|:websocket (defaults to :chrome)',
+      #   proxy: 'optional - scheme://proxy_host:port || tor (defaults to nil)',
+      #   devtools: 'optional - boolean (defaults to false)',
+      # )
+
+      public_class_method def self.open(opts = {})
+        browser_type = opts[:browser_type] ||= :chrome
+        proxy = opts[:proxy].to_s unless opts[:proxy].nil?
+        capture_proxy = opts[:capture_proxy]
+        if capture_proxy
+          raise ArgumentError, 'capture_proxy requires a MitmProxy.start descriptor' unless capture_proxy.is_a?(Hash) && capture_proxy[:url]
+          raise ArgumentError, 'proxy and capture_proxy are mutually exclusive' if proxy
+
+          proxy = capture_proxy[:url]
+        end
+
+        browser_obj = {}
+        browser_obj[:capture_proxy] = capture_proxy if capture_proxy
+        browser_obj[:type] = browser_type
+
+        tor_obj = nil
+        if opts[:proxy] == 'tor'
+          tor_obj = PWN::Plugins::Tor.start
+          proxy = "socks5://#{tor_obj[:ip]}:#{tor_obj[:port]}"
+          browser_obj[:tor_obj] = tor_obj
+        end
+
+        devtools_supported = %i[chrome headless_chrome firefox headless_firefox headless]
+        devtools = opts[:devtools] ||= false
+        devtools = true if devtools_supported.include?(browser_type) && devtools
+
+        # Element waits (Watir) vs navigation (Selenium page_load) are
+        # separate. 900s element waits made Wix browser.links.map hang for
+        # hours. Keep navigation bounded too.
+        Watir.default_timeout = 15 unless %i[rest websocket].include?(browser_type)
+
+        args = []
+        # args.push('--start-maximized')
+        args.push('--disable-notifications')
+
+        unless browser_type == :rest
+          logger = Selenium::WebDriver.logger
+          logger.level = :error
+        end
+
+        case browser_type
+        when :firefox
+          this_profile = Selenium::WebDriver::Firefox::Profile.new
+
+          # Increase Web Assembly Verbosity
+          this_profile['javascript.options.wasm_verbose'] = true
+
+          # Downloads reside in ~/Downloads
+          this_profile['browser.download.folderList'] = 1
+          this_profile['browser.helperApps.neverAsk.saveToDisk'] = 'application/pdf'
+
+          # disable Firefox's built-in PDF viewer
+          this_profile['pdfjs.disabled'] = true
+
+          # disable Adobe Acrobat PDF preview plugin
+          this_profile['plugin.scan.plid.all'] = false
+          this_profile['plugin.scan.Acrobat'] = '99.0'
+
+          # ensure localhost proxy capabilities are enabled
+          this_profile['network.proxy.no_proxies_on'] = ''
+
+          # allow scripts to run a bit longer
+          # this_profile['dom.max_chrome_script_run_time'] = 180
+          # this_profile['dom.max_script_run_time'] = 180
+
+          # disable browser cache
+          this_profile['browser.cache.disk.enable'] = false
+          this_profile['browser.cache.disk_cache_ssl.enable'] = false
+          this_profile['browser.cache.memory.enable'] = false
+          this_profile['browser.cache.offline.enable'] = false
+          this_profile['devtools.cache.disabled'] = true
+          this_profile['dom.caches.enabled'] = false
+
+          if devtools
+            # args.push('--start-debugger-server')
+            # this_profile['devtools.debugger.remote-enabled'] = true
+            # this_profile['devtools.debugger.remote-host'] = 'localhost'
+            # this_profile['devtools.debugger.remote-port'] = 6000
+
+            # DevTools ToolBox Settings in Firefox about:config
+            this_profile['devtools.f12.enabled'] = true
+            this_profile['devtools.toolbox.host'] = 'right'
+            this_profile['devtools.toolbox.selectedTool'] = 'jsdebugger'
+            this_profile['devtools.toolbox.sidebar.width'] = 1700
+            this_profile['devtools.toolbox.splitconsoleHeight'] = 200
+
+            # DevTools Debugger Settings in Firefox about:config
+            this_profile['devtools.chrome.enabled'] = true
+            this_profile['devtools.debugger.start-panel-size'] = 200
+            this_profile['devtools.debugger.end-panel-size'] = 200
+            this_profile['devtools.debugger.auto-pretty-print'] = true
+            this_profile['devtools.debugger.ui.editor-wrapping'] = true
+            this_profile['devtools.debugger.features.javascript-tracing'] = true
+            this_profile['devtools.debugger.xhr-breakpoints-visible'] = true
+            this_profile['devtools.debugger.expressions-visible'] = true
+            this_profile['devtools.debugger.dom-mutation-breakpoints-visible'] = true
+            this_profile['devtools.debugger.features.async-live-stacks'] = true
+            this_profile['devtools.debugger.features.autocomplete-expressions'] = true
+            this_profile['devtools.debugger.features.code-folding'] = true
+            this_profile['devtools.debugger.features.command-click'] = true
+            this_profile['devtools.debugger.features.component-pane'] = true
+            this_profile['devtools.debugger.map-scopes-enabled'] = true
+
+            # Never optimize out variables in the debugger
+            this_profile['javascript.options.baselinejit'] = false
+            this_profile['javascript.options.ion'] = false
+          end
+
+          # caps = Selenium::WebDriver::Remote::Capabilities.firefox
+          # caps[:acceptInsecureCerts] = true
+
+          if proxy
+            this_profile['network.proxy.type'] = 1
+            this_profile['network.proxy.allow_hijacking_localhost'] = true
+            if tor_obj
+              this_profile['network.proxy.socks_version'] = 5
+              this_profile['network.proxy.socks'] = tor_obj[:ip]
+              this_profile['network.proxy.socks_port'] = tor_obj[:port]
+            else
+              this_profile['network.proxy.ftp'] = URI(proxy).host
+              this_profile['network.proxy.ftp_port'] = URI(proxy).port
+              this_profile['network.proxy.http'] = URI(proxy).host
+              this_profile['network.proxy.http_port'] = URI(proxy).port
+              this_profile['network.proxy.ssl'] = URI(proxy).host
+              this_profile['network.proxy.ssl_port'] = URI(proxy).port
+            end
+          end
+
+          # Private browsing mode
+          args.push('--private')
+          options = Selenium::WebDriver::Firefox::Options.new(
+            args: args,
+            accept_insecure_certs: true
+          )
+
+          # This is required for BiDi support
+          options.web_socket_url = true
+          options.add_preference('remote.active-protocols', 3)
+          options.profile = this_profile
+          driver = Selenium::WebDriver.for(:firefox, options: options)
+          browser_obj[:browser] = Watir::Browser.new(driver)
+
+        when :chrome
+          this_profile = Selenium::WebDriver::Chrome::Profile.new
+          this_profile['download.prompt_for_download'] = false
+          this_profile['download.default_directory'] = '~/Downloads'
+
+          if proxy
+            args.push("--host-resolver-rules='MAP * 0.0.0.0 , EXCLUDE #{tor_obj[:ip]}'") if tor_obj
+            args.push("--proxy-server=#{proxy}")
+            args.push('--proxy-bypass-list=<-loopback>') if capture_proxy
+          end
+
+          # Incognito browsing mode
+          args.push('--incognito')
+          options = Selenium::WebDriver::Chrome::Options.new(
+            args: args,
+            accept_insecure_certs: true
+          )
+
+          if devtools
+            args.push('--auto-open-devtools-for-tabs')
+            args.push('--disable-hang-monitor')
+            options.add_preference('devtools.preferences.enable-ignore-listing', false)
+            options.add_preference('devtools.preferences.default-indentation', '2 spaces')
+          end
+
+          # This is required for BiDi support
+          options.web_socket_url = true
+          options.add_preference('remote.active-protocols', 3)
+          options.profile = this_profile
+          driver = Selenium::WebDriver.for(:chrome, options: options)
+          browser_obj[:browser] = Watir::Browser.new(driver)
+
+        when :headless, :headless_firefox
+          this_profile = Selenium::WebDriver::Firefox::Profile.new
+
+          # Increase Web Assembly Verbosity
+          this_profile['javascript.options.wasm_verbose'] = true
+
+          # Downloads reside in ~/Downloads
+          this_profile['browser.download.folderList'] = 1
+          this_profile['browser.helperApps.neverAsk.saveToDisk'] = 'application/pdf'
+
+          # disable Firefox's built-in PDF viewer
+          this_profile['pdfjs.disabled'] = true
+
+          # disable Adobe Acrobat PDF preview plugin
+          this_profile['plugin.scan.plid.all'] = false
+          this_profile['plugin.scan.Acrobat'] = '99.0'
+
+          # ensure localhost proxy capabilities are enabled
+          this_profile['network.proxy.no_proxies_on'] = ''
+
+          # allow scripts to run a bit longer
+          # this_profile['dom.max_chrome_script_run_time'] = 180
+          # this_profile['dom.max_script_run_time'] = 180
+
+          # disable browser cache
+          this_profile['browser.cache.disk.enable'] = false
+          this_profile['browser.cache.disk_cache_ssl.enable'] = false
+          this_profile['browser.cache.memory.enable'] = false
+          this_profile['browser.cache.offline.enable'] = false
+          this_profile['devtools.cache.disabled'] = true
+          this_profile['dom.caches.enabled'] = false
+
+          if proxy
+            this_profile['network.proxy.type'] = 1
+            this_profile['network.proxy.allow_hijacking_localhost'] = true
+            if tor_obj
+              this_profile['network.proxy.socks_version'] = 5
+              this_profile['network.proxy.socks'] = tor_obj[:ip]
+              this_profile['network.proxy.socks_port'] = tor_obj[:port]
+            else
+              this_profile['network.proxy.ftp'] = URI(proxy).host
+              this_profile['network.proxy.ftp_port'] = URI(proxy).port
+              this_profile['network.proxy.http'] = URI(proxy).host
+              this_profile['network.proxy.http_port'] = URI(proxy).port
+              this_profile['network.proxy.ssl'] = URI(proxy).host
+              this_profile['network.proxy.ssl_port'] = URI(proxy).port
+            end
+          end
+
+          args.push('--headless')
+          # Private browsing mode
+          args.push('--private')
+          options = Selenium::WebDriver::Firefox::Options.new(
+            args: args,
+            accept_insecure_certs: true
+          )
+
+          # This is required for BiDi support
+          options.web_socket_url = true
+          options.add_preference('remote.active-protocols', 3)
+          options.profile = this_profile
+          driver = Selenium::WebDriver.for(:firefox, options: options)
+          browser_obj[:browser] = Watir::Browser.new(driver)
+
+        when :headless_chrome
+          this_profile = Selenium::WebDriver::Chrome::Profile.new
+          this_profile['download.prompt_for_download'] = false
+          this_profile['download.default_directory'] = '~/Downloads'
+
+          if proxy
+            args.push("--host-resolver-rules='MAP * 0.0.0.0 , EXCLUDE #{tor_obj[:ip]}'") if tor_obj
+            args.push("--proxy-server=#{proxy}")
+            args.push('--proxy-bypass-list=<-loopback>') if capture_proxy
+          end
+
+          args.push('--headless')
+          # Incognito browsing mode
+          args.push('--incognito')
+          options = Selenium::WebDriver::Chrome::Options.new(
+            args: args,
+            accept_insecure_certs: true
+          )
+
+          # This is required for BiDi support
+          options.web_socket_url = true
+          options.add_preference('remote.active-protocols', 3)
+          options.profile = this_profile
+          driver = Selenium::WebDriver.for(:chrome, options: options)
+          browser_obj[:browser] = Watir::Browser.new(driver)
+
+        when :rest
+          browser_obj[:browser] = RestClient
+          if proxy
+            if tor_obj
+              TCPSocket.socks_server = tor_obj[:ip]
+              TCPSocket.socks_port = tor_obj[:port]
+            else
+              browser_obj[:browser].proxy = proxy
+            end
+          end
+
+        when :websocket
+          if proxy
+            if tor_obj
+              TCPSocket.socks_server = tor_obj[:ip]
+              TCPSocket.socks_port = tor_obj[:port]
+            end
+            proxy_opts = { origin: proxy }
+            tls_opts = { verify_peer: false }
+            browser_obj[:browser] = Faye::WebSocket::Client.new(
+              '',
+              [],
+              {
+                tls: tls_opts,
+                proxy: proxy_opts
+              }
+            )
+          else
+            browser_obj[:browser] = Faye::WebSocket::Client.new('')
+          end
+        else
+          puts 'Error: browser_type only supports :firefox, :chrome, :headless, :headless_chrome, :headless_firefox, :rest, :websocket'
+          return nil
+        end
+
+        if devtools && devtools_supported.include?(browser_type)
+          chrome_types = %i[chrome headless_chrome]
+          firefox_types = %i[firefox headless_firefox]
+
+          # Switch to the last opened window which should be the active tab
+          # if it doesn't work, try the first window handle.  In chrome they
+          # get reversed sometimes ¯\_(ツ)_/¯
+          target_window_handle = browser_obj[:browser].driver.window_handles.last
+          begin
+            browser_obj[:browser].driver.switch_to.window(target_window_handle)
+
+            url = 'about:about'
+            url = 'chrome://chrome-urls' if chrome_types.include?(browser_type)
+            browser_obj[:browser].goto(url)
+          rescue Selenium::WebDriver::Error::WebDriverError
+            target_window_handle = browser_obj[:browser].driver.window_handles.first
+            retry
+          end
+
+          rand_tab = SecureRandom.hex(8)
+          browser_obj[:browser].execute_script("document.title = 'about:about-#{rand_tab}'")
+
+          browser_obj[:browser].driver.manage.window.maximize
+          toggle_devtools(browser_obj: browser_obj)
+
+          browser_obj[:bidi] = browser_obj[:browser].driver.bidi
+          browser_obj[:devtools] = browser_obj[:browser].driver.devtools if chrome_types.include?(browser_type)
+          browser_obj[:devtools] = browser_obj[:browser].driver.bidi if firefox_types.include?(browser_type)
+        end
+
+        apply_driver_timeouts!(browser_obj: browser_obj)
+        browser_obj
+      rescue StandardError => e
+        puts e.backtrace
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # browser_obj = PWN::Plugins::TransparentBrowser.dump_links(
+      #   browser_obj: browser_obj1
+      # )
+
+      public_class_method def self.dump_links(opts = {})
+        browser_obj = opts[:browser_obj]
+
+        dump_links_arr = []
+        browser_obj[:browser].links.each do |link|
+          link_hash = {}
+
+          link_hash[:text] = link.text
+          link_hash[:href] = link.href
+          link_hash[:id] = link.id
+          link_hash[:name] = link.name
+          link_hash[:class_name] = link.class_name
+          link_hash[:html] = link.html
+          link_hash[:target] = link.target
+          dump_links_arr.push(link_hash)
+
+          yield link if block_given?
+        end
+
+        dump_links_arr
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # browser_obj = PWN::Plugins::TransparentBrowser.find_elements_by_text(
+      #   browser_obj: browser_obj1,
+      #   text: 'required - text to search for in the DOM'
+      # )
+
+      public_class_method def self.find_elements_by_text(opts = {})
+        browser_obj = opts[:browser_obj]
+        text = opts[:text].to_s
+
+        elements = browser_obj[:browser].elements
+        elements_found_arr = []
+        elements.each do |element|
+          begin
+            if element.text == text || element.value == text
+              element_hash = {}
+              element_hash[:tag_name] = element.tag_name
+              element_hash[:html] = element.html
+              elements_found_arr.push(element_hash)
+
+              yield element if block_given?
+            end
+          rescue NoMethodError
+            next
+          end
+        end
+
+        elements_found_arr
+      rescue StandardError => e
+        puts e.backtrace
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # PWN::Plugins::TransparentBrowser.type_as_human(
+      #   string: 'required - string to type as human',
+      #   rand_sleep_float: 'optional - float timing in between keypress (defaults to 0.09)'
+      # )
+
+      public_class_method def self.type_as_human(opts = {})
+        string = opts[:string].to_s
+
+        rand_sleep_float = if opts[:rand_sleep_float]
+                             opts[:rand_sleep_float].to_f
+                           else
+                             0.09
+                           end
+
+        string.each_char do |char|
+          yield char
+
+          sleep Random.rand(rand_sleep_float)
+        end
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # console_resp = PWN::Plugins::TransparentBrowser.console(
+      #   browser_obj: browser_obj1,
+      #   js: 'required - JavaScript expression to evaluate',
+      #   return_to: 'optional - return to :console or :stdout (defaults to :console)'
+      # )
+
+      public_class_method def self.console(opts = {})
+        browser_obj = opts[:browser_obj]
+        verified = verify_devtools_browser(browser_obj: browser_obj)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        js = opts[:js] ||= "alert('ACK from => #{self}')"
+        return_to = opts[:return_to] ||= :console
+        raise 'ERROR: return_to parameter must be :console or :stdout' unless %i[console stdout].include?(return_to.to_s.downcase.to_sym)
+
+        case js
+        when 'clear', 'clear;', 'clear()', 'clear();'
+          script = 'console.clear()'
+        when 'debugger', 'debugger;', 'debugger()', 'debugger();'
+          script = 'debugger'
+        else
+          case return_to.to_s.downcase.to_sym
+          when :stdout
+            script = "return #{js}"
+          when :console
+            script = "console.log(#{js})"
+          end
+        end
+
+        console_resp = nil
+        begin
+          Timeout.timeout(1) { console_resp = browser_obj[:browser].execute_script(script) }
+        rescue Timeout::Error, Timeout::ExitException
+          console_resp
+        rescue Selenium::WebDriver::Error::JavascriptError
+          script = js
+          retry
+        end
+
+        console_resp
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters:
+      # console_resp = PWN::Plugins::TransparentBrowser.view_dom_mutations(
+      #   browser_obj: 'required - browser_obj returned from #open method',
+      #   index: 'optional - index of tab to switch to (defaults to active tab)',
+      #   target: 'optional - target JavaScript node to observe (defaults to document.body)',
+      #   observe_clobbering: 'optional - boolean to enable DOM Clobbering detection (defaults to true)',
+      #   observe_redirects: 'optional - boolean to enable Insecure Redirect detection (defaults to true)',
+      #   observe_resources: 'optional - boolean to enable resource load monitoring (defaults to true)'
+      # )
+
+      public_class_method def self.view_dom_mutations(opts = {})
+        browser_obj = opts[:browser_obj]
+        verified = verify_devtools_browser(browser_obj: browser_obj)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        index = opts[:index]
+        jmp_tab(browser_obj: browser_obj, index: index) if index
+
+        target = opts[:target] ||= 'undefined'
+        observe_clobbering = opts.fetch(:observe_clobbering, true)
+        observe_redirects = opts.fetch(:observe_redirects, true)
+        observe_resources = opts.fetch(:observe_resources, true)
+
+        jmp_devtools_panel(
+          browser_obj: browser_obj,
+          panel: :console
+        )
+
+        js = <<~JAVASCRIPT
+          // Select the target node to observe (default to document.body)
+          const targetNode = document.getElementById(#{target}) || document.body;
+
+          // Configuration for MutationObserver
+          const config = {
+            attributes: true,
+            childList: true,
+            subtree: true,
+            characterData: true,
+            attributeOldValue: true
+          };
+
+          // Exhaustive list of elements that can execute scripts or load resources
+          const xssElements = [
+            'SCRIPT', 'IFRAME', 'FRAME', 'OBJECT', 'EMBED', 'APPLET', 'SVG', 'IMG', 'VIDEO', 'AUDIO', 'LINK', 'META', 'BASE',
+            'INPUT', 'SOURCE', 'TRACK', 'FORM', 'BUTTON', 'AREA', 'NOSCRIPT', 'STYLE', 'HTML', 'BODY'
+          ];
+
+          // Exhaustive list of attributes that can contain URLs, scripts, or event handlers
+          const xssAttributes = [
+            'src', 'href', 'action', 'srcdoc', 'data', 'codebase', 'style', 'manifest', 'poster', 'background', 'lowsrc',
+            'formaction', 'cite', 'ping', 'icon', 'longdesc', 'usemap', 'content', 'value', 'pattern',
+            'onload', 'onerror', 'onclick', 'onmouseover', 'onmouseout', 'onfocus', 'onblur', 'onchange', 'onsubmit', 'onreset',
+            'onselect', 'ondblclick', 'onkeydown', 'onkeypress', 'onkeyup', 'onmousedown', 'onmousemove', 'onmouseup', 'onwheel',
+            'oncontextmenu', 'ondrag', 'ondragend', 'ondragenter', 'ondragleave', 'ondragover', 'ondragstart', 'ondrop', 'onscroll',
+            'ontouchstart', 'ontouchmove', 'ontouchend', 'ontouchcancel', 'onanimationstart', 'onanimationend', 'onanimationiteration',
+            'ontransitionend'
+          ];
+
+          // Attributes that can cause navigation (for insecure redirects)
+          const redirectAttributes = ['href', 'action', 'src', 'formaction', 'content'];
+
+          // Attributes that load resources (for data exfiltration)
+          const resourceAttributes = ['src', 'href', 'poster', 'data', 'background', 'lowsrc', 'cite', 'ping', 'icon', 'longdesc'];
+
+          // Global properties that could be clobbered
+          const globalProperties = [
+            'document', 'window', 'location', 'navigator', 'history', 'screen', 'console', 'alert', 'confirm', 'prompt',
+            'fetch', 'XMLHttpRequest', 'WebSocket', 'localStorage', 'sessionStorage'
+          ];
+
+          // Callback function to handle mutations
+          const callback = (mutationList, observer) => {
+            mutationList.forEach((mutation) => {
+              if (mutation.type === 'childList') {
+                if (mutation.addedNodes.length) {
+                  mutation.addedNodes.forEach((node) => {
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                      const tagName = node.tagName.toUpperCase();
+                      // Check for XSS sinks
+                      if (xssElements.includes(tagName)) {
+                        console.warn('Potential DOM-XSS sink: Added element', {
+                          tagName: tagName,
+                          id: node.id || 'N/A',
+                          classList: node.className || 'N/A',
+                          outerHTML: node.outerHTML
+                        });
+                      }
+                      // Check for DOM Clobbering
+                      if (#{observe_clobbering} && (node.id || node.name) && globalProperties.includes(node.id || node.name)) {
+                        console.warn('Potential DOM Clobbering: Added element with id/name', {
+                          id: node.id || 'N/A',
+                          name: node.name || 'N/A',
+                          tagName: tagName,
+                          outerHTML: node.outerHTML
+                        });
+                      }
+                    }
+                  });
+                }
+              } else if (mutation.type === 'attributes') {
+                const attrName = mutation.attributeName.toLowerCase();
+                const tagName = mutation.target.tagName.toUpperCase();
+                // Check for XSS sinks
+                if (xssAttributes.includes(attrName)) {
+                  console.warn('Potential DOM-XSS sink: Attribute change', {
+                    element: tagName,
+                    id: mutation.target.id || 'N/A',
+                    attribute: attrName,
+                    oldValue: mutation.oldValue,
+                    newValue: mutation.target.getAttribute(attrName),
+                    outerHTML: mutation.target.outerHTML
+                  });
+                }
+                // Check for insecure redirects
+                if (#{observe_redirects} && redirectAttributes.includes(attrName) &&
+                    (tagName === 'A' || tagName === 'FORM' || tagName === 'IFRAME' || tagName === 'BUTTON' || tagName === 'INPUT' ||
+                     (tagName === 'META' && mutation.target.getAttribute('http-equiv') === 'refresh'))) {
+                  console.warn('Potential Insecure Redirect: Attribute change', {
+                    element: tagName,
+                    id: mutation.target.id || 'N/A',
+                    attribute: attrName,
+                    oldValue: mutation.oldValue,
+                    newValue: mutation.target.getAttribute(attrName),
+                    outerHTML: mutation.target.outerHTML
+                  });
+                }
+                // Check for resource loads (data exfiltration)
+                if (#{observe_resources} && resourceAttributes.includes(attrName)) {
+                  console.warn('Potential Resource Load (Data Exfiltration): Attribute change', {
+                    element: tagName,
+                    id: mutation.target.id || 'N/A',
+                    attribute: attrName,
+                    oldValue: mutation.oldValue,
+                    newValue: mutation.target.getAttribute(attrName),
+                    outerHTML: mutation.target.outerHTML
+                  });
+                }
+              } else if (mutation.type === 'characterData') {
+                if (mutation.target.parentElement) {
+                  const parentTag = mutation.target.parentElement.tagName.toUpperCase();
+                  if (parentTag === 'SCRIPT') {
+                    console.warn('Potential DOM-XSS sink: Script content changed', {
+                      scriptId: mutation.target.parentElement.id || 'N/A',
+                      oldValue: mutation.oldValue,
+                      newValue: mutation.target.textContent
+                    });
+                  } else if (parentTag === 'STYLE') {
+                    console.warn('Potential DOM-XSS sink: Style content changed', {
+                      styleId: mutation.target.parentElement.id || 'N/A',
+                      oldValue: mutation.oldValue,
+                      newValue: mutation.target.textContent
+                    });
+                  }
+                }
+              }
+            });
+          };
+
+          // Create and start the MutationObserver
+          const observer = new MutationObserver(callback);
+          observer.observe(targetNode, config);
+
+          // Function to stop the observer
+          window.hide_dom_mutations = () => {
+            observer.disconnect();
+            console.log('MutationObserver stopped.');
+          };
+
+          // Log instructions to console
+          console.log('MutationObserver started for DOM-based vulnerabilities. To stop, run: hide_dom_mutations()');
+        JAVASCRIPT
+
+        console(browser_obj: browser_obj, js: 'clear();')
+        browser_obj[:browser].execute_script(js)
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # console_resp = PWN::Plugins::TransparentBrowser.hide_dom_mutations(
+      #   browser_obj: browser_obj1,
+      #   index: 'optional - index of tab to switch to (defaults to active tab)'
+      # )
+
+      public_class_method def self.hide_dom_mutations(opts = {})
+        browser_obj = opts[:browser_obj]
+        verified = verify_devtools_browser(browser_obj: browser_obj)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        index = opts[:index]
+        jmp_tab(browser_obj: browser_obj, index: index) if index
+
+        jmp_devtools_panel(
+          browser_obj: browser_obj,
+          panel: :console
+        )
+
+        js = <<~JAVASCRIPT
+          if (typeof hide_dom_mutations === 'function') {
+            hide_dom_mutations();
+            console.log('DOM mutation observer and event listeners disabled.');
+          } else {
+            console.log('Error: hide_dom_mutations function not found. DOM mutation observer was not active.');
+          }
+        JAVASCRIPT
+
+        console(browser_obj: browser_obj, js: 'clear();')
+        browser_obj[:browser].execute_script(js)
+      rescue StandardError => e
+        raise e
+      end
+      # Supported Method Parameters::
+      # PWN::Plugins::TransparentBrowser.update_about_config(
+      #   browser_obj: browser_obj1,
+      #   key: 'required - key to update in about:config',
+      #   value: 'required - value to set for key in about:config'
+      # )
+
+      public_class_method def self.update_about_config(opts = {})
+        browser_obj = opts[:browser_obj]
+        supported = %i[firefox headless_firefox]
+        verified = verify_devtools_browser(browser_obj: browser_obj, supported: supported)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        key = opts[:key]
+        raise 'ERROR: key parameter is required' if key.nil?
+
+        value = opts[:value]
+        raise 'ERROR: value parameter is required' if value.nil?
+
+        browser_type = browser_obj[:type]
+        # chrome_types = %i[chrome headless_chrome]
+        firefox_types = %i[firefox headless_firefox]
+
+        browser_obj[:browser].goto('about:config')
+        # Confirmed working in Firefox
+        js = %{Services.prefs.setStringPref("#{key}", "#{value}")} if firefox_types.include?(browser_type)
+        console(browser_obj: browser_obj, js: js)
+        browser_obj[:browser].back
+      rescue Timeout::Error, Timeout::ExitException
+        console_resp
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # tabs = PWN::Plugins::TransparentBrowser.list_tabs(
+      #   browser_obj: 'required - browser_obj returned from #open method)'
+      # )
+
+      public_class_method def self.list_tabs(opts = {})
+        browser_obj = opts[:browser_obj]
+        verified = verify_devtools_browser(browser_obj: browser_obj)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        current_window_handle = browser_obj[:browser].driver.window_handle
+
+        tabs_arr_hash = []
+        browser_obj[:browser].driver.window_handles.each do |window_handle|
+          # Skip DevTools tabs
+          browser_obj[:browser].driver.switch_to.window(window_handle)
+          title = browser_obj[:browser].execute_script('return document.title')
+          url = browser_obj[:browser].execute_script('return document.location.href')
+          next if url.include?('devtools://')
+
+          # Get title and URL without switching tabs
+
+          state = window_handle == current_window_handle ? :active : :inactive
+
+          tabs_arr_hash << { index: window_handle, title: title, url: url, state: state }
+        ensure
+          # Ensure we return to the original active tab
+          browser_obj[:browser].driver.switch_to.window(current_window_handle)
+        end
+
+        # Ensure we have a visible tab that's active
+        active_tab = tabs_arr_hash.find { |tab| tab[:state] == :active } || tabs_arr_hash.first
+        # Switch to the active tab if it exists
+        browser_obj[:browser].driver.switch_to.window(active_tab[:index]) if active_tab
+
+        tabs_arr_hash
+      rescue Selenium::WebDriver::Error::NoSuchWindowError => e
+        puts "Error: No valid window handles available (#{e.message})"
+        [] # Return empty array if no tabs are available
+      rescue StandardError => e
+        raise "Failed to list tabs: #{e.message}"
+      end
+
+      # Supported Method Parameters::
+      # tab = PWN::Plugins::TransparentBrowser.jmp_tab(
+      #   browser_obj: 'required - browser_obj returned from #open method)',
+      #   index: 'optional - index of tab to switch to (defaults to switching to next tab)',
+      #   keyword: 'optional - keyword in title or url used to switch tabs (defaults to switching to next tab)'
+      # )
+
+      public_class_method def self.jmp_tab(opts = {})
+        browser_obj = opts[:browser_obj]
+        verified = verify_devtools_browser(browser_obj: browser_obj)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        index = opts[:index]
+        keyword = opts[:keyword]
+
+        tabs_arr_hash = list_tabs(browser_obj: browser_obj)
+
+        if index.nil? && keyword.nil?
+          # If no keyword is provided, switch to the next tab in the list
+          active_tab_index = tabs_arr_hash.find_index { |tab| tab[:state] == :active }
+          next_tab_index = (active_tab_index + 1) % tabs_arr_hash.size
+          # Find value of :index key from tabs_arr_hash
+          tab_sel = tabs_arr_hash[next_tab_index]
+        elsif index
+          tab_sel = tabs_arr_hash.find { |tab| tab[:index] == index }
+        else
+          tab_sel = tabs_arr_hash.find { |tab| tab[:title].include?(keyword) || tab[:url].include?(keyword) }
+        end
+
+        if tab_sel.is_a?(Hash) && tab_sel[:index]
+          index = tab_sel[:index]
+          browser_obj[:browser].driver.switch_to.window(index)
+        else
+          tab_sel = { index: index, error: 'not found' }
+        end
+
+        tab_sel
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # tab = PWN::Plugins::TransparentBrowser.new_tab(
+      #   browser_obj: 'required - browser_obj returned from #open method)',
+      #   url: 'optional - URL to open in new tab'
+      # )
+
+      public_class_method def self.new_tab(opts = {})
+        browser_obj = opts[:browser_obj]
+        verified = verify_devtools_browser(browser_obj: browser_obj)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        url = opts[:url]
+        chrome_types = %i[chrome headless_chrome]
+        firefox_types = %i[firefox headless_firefox]
+
+        browser_type = browser_obj[:type]
+
+        if url.nil? || url.empty?
+          url = 'about:about' if firefox_types.include?(browser_type)
+          url = 'chrome://chrome-urls/' if chrome_types.include?(browser_type)
+        end
+
+        # Open a new tab
+        console(
+          browser_obj: browser_obj,
+          js: "window.open('#{url}', '_blank')",
+          return_to: :stdout
+        )
+
+        # tabs_arr_hash = list_tabs(browser_obj: browser_obj)
+        # new_tab_index = tabs_arr_hash.find { |tab| tab[:state] == :inactive && tab[:url] == url }[:index]
+        # jmp_tab(browser_obj: browser_obj, index: new_tab_index)
+        jmp_tab(browser_obj: browser_obj)
+        new_tab_index = browser_obj[:browser].driver.window_handles.last
+
+        rand_tab = SecureRandom.hex(8)
+        browser_obj[:browser].execute_script("document.title = 'about:about-#{rand_tab}'")
+        toggle_devtools(browser_obj: browser_obj) if browser_obj[:devtools]
+
+        { index: new_tab_index, title: browser_obj[:browser].title, url: browser_obj[:browser].url, state: :active }
+      rescue StandardError => e
+        puts e.backtrace
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # tab = PWN::Plugins::TransparentBrowser.close_tab(
+      #   browser_obj: 'required - browser_obj returned from #open method)',
+      #   index: 'optional - index of tab to close (defaults to closing active tab)',
+      #   keyword: 'optional - keyword in title or url used to close tabs (defaults to closing active tab)'
+      # )
+
+      public_class_method def self.close_tab(opts = {})
+        browser_obj = opts[:browser_obj]
+        verified = verify_devtools_browser(browser_obj: browser_obj)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        index = opts[:index]
+        keyword = opts[:keyword]
+
+        tabs_arr_hash = list_tabs(browser_obj: browser_obj)
+        browser_ready_to_close = true if tabs_arr_hash.length == 1
+
+        if browser_ready_to_close
+          close(browser_obj: browser_obj)
+          return [{ index: nil, title: nil, url: nil, state: :browser_closed }]
+        elsif index.nil? && keyword.nil?
+          index = browser_obj[:browser].driver.window_handle
+          browser_obj[:browser].driver.switch_to.window(index)
+          browser_obj[:browser].driver.close
+          new_tab_index_arr = browser_obj[:browser].driver.window_handles
+          if new_tab_index_arr.any?
+            new_tab_index = new_tab_index_arr.last
+            browser_obj[:browser].driver.switch_to.window(new_tab_index)
+          end
+        elsif index
+          browser_obj[:browser].driver.switch_to.window(index)
+          browser_obj[:browser].driver.close
+          new_tab_index_arr = browser_obj[:browser].driver.window_handles
+          if new_tab_index_arr.any?
+            new_tab_index = new_tab_index_arr.last
+            browser_obj[:browser].driver.switch_to.window(new_tab_index)
+          end
+        else
+          active_tab = tabs_arr_hash.find { |tab| tab[:state] == :active }
+          if active_tab[:url].include?(keyword)
+            inactive_tabs = tabs_arr_hash.reject { |tab| tab[:url] == browser_obj[:browser].url }
+            if inactive_tabs.any?
+              tab_to_activate = inactive_tabs.last[:url]
+              jmp_tab(browser_obj: browser_obj, keyword: tab_to_activate)
+            end
+          end
+          all_tabs = browser_obj[:browser].windows
+
+          tabs_to_close = all_tabs.select { |tab| tab.title.include?(keyword) || tab.url.include?(keyword) }
+          tabs_to_close.each(&:close)
+        end
+
+        list_tabs(browser_obj: browser_obj)
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # current_dom = PWN::Plugins::TransparentBrowser.dom(
+      #   browser_obj: 'required - browser_obj returned from #open method)'
+      # )
+
+      public_class_method def self.dom(opts = {})
+        browser_obj = opts[:browser_obj]
+        verified = verify_devtools_browser(browser_obj: browser_obj)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        dom_str = console(browser_obj: browser_obj, js: 'document.documentElement.outerHTML', return_to: :stdout)
+        raise 'DOM capture failed: returned nil or empty string. Check DevTools connection.' if dom_str.nil? || dom_str.strip.empty?
+
+        Nokogiri::HTML.parse(dom_str)
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # page_state = PWN::Plugins::TransparentBrowser.get_page_state(
+      #   browser_obj: 'required - browser_obj returned from #open method)'
+      # )
+
+      public_class_method def self.get_page_state(opts = {})
+        browser_obj = opts[:browser_obj]
+        verified = verify_devtools_browser(browser_obj: browser_obj)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        js = <<~JS.strip
+          (function() {
+            try {
+              let ls = {};
+              for (let i = 0; i < localStorage.length; i++) {
+                let key = localStorage.key(i);
+                ls[key] = localStorage.getItem(key);
+              }
+              let ss = {};
+              for (let i = 0; i < sessionStorage.length; i++) {
+                let key = sessionStorage.key(i);
+                ss[key] = sessionStorage.getItem(key);
+              }
+
+              let scripts = Array.from(document.scripts).map(s => ({
+                src: s.src,
+                innerHTML: s.innerHTML
+              })).filter(s => s.src || s.innerHTML);
+
+              let stylesheets = Array.from(document.querySelectorAll('link[rel="stylesheet"]')).map(l => l.href).filter(h => h);
+
+              let inline_styles = Array.from(document.querySelectorAll('style')).map(s => s.innerHTML).filter(c => c);
+
+              let forms = Array.from(document.forms).map(f => ({
+                action: f.action,
+                method: f.method,
+                elements: Array.from(f.elements).map(e => ({
+                  name: e.name,
+                  type: e.type,
+                  value: e.value
+                }))
+              }));
+
+              let iframes = Array.from(document.querySelectorAll('iframe')).map(i => i.src).filter(s => s);
+
+              let csp_meta = document.querySelector('meta[http-equiv="Content-Security-Policy"]');
+              let csp = csp_meta ? csp_meta.content : null;
+
+              let feature_policy = [];
+              if (document.featurePolicy) {
+                feature_policy = document.featurePolicy.allowedFeatures().sort();
+              }
+
+              let is_framed = false;
+              try {
+                if (window.top !== window.self) {
+                  is_framed = true;
+                }
+              } catch (e) {
+                is_framed = true;
+              }
+
+              let resources = window.performance.getEntriesByType('resource').map(e => ({
+                name: e.name,
+                initiatorType: e.initiatorType
+              }));
+
+              // Enhanced globals capture with values
+              let globals = {};
+              let propNames = Object.getOwnPropertyNames(window).sort();
+              const safeStringify = (value, depth = 0) => {
+                if (depth > 5) return '[Max depth exceeded]'; // Prevent deep recursion
+                try {
+                  return JSON.stringify(value, (key, val) => {
+                    if (typeof val === 'function') {
+                      return val.toString(); // Capture function source
+                    } else if (typeof val === 'symbol') {
+                      return val.toString();
+                    } else if (val === window) {
+                      return '[Window reference]'; // Avoid circularity
+                    } else if (val && typeof val === 'object') {
+                      if (depth > 5) return '[Object (depth limit)]';
+                      return val; // Let JSON handle, recurse with depth
+                    }
+                    return val;
+                  });
+                } catch (e) {
+                  return '[Stringify error: ' + e.message + ']';
+                }
+              };
+
+              for (let name of propNames) {
+                try {
+                  let value = window[name];
+                  globals[name] = safeStringify(value);
+                } catch (e) {
+                  globals[name] = '[Access error: ' + e.message + ']';
+                }
+              }
+
+              return JSON.stringify({
+                cookies: document.cookie,
+                localStorage: ls,
+                sessionStorage: ss,
+                globals: globals,  // Now an object with name: stringified_value
+                scripts: scripts,
+                stylesheets: stylesheets,
+                inline_styles: inline_styles,
+                stack: new Error().stack,
+                location: {
+                  href: location.href,
+                  origin: location.origin,
+                  pathname: location.pathname,
+                  search: location.search,
+                  hash: location.hash
+                },
+                referrer: document.referrer,
+                userAgent: navigator.userAgent,
+                html_snapshot: document.documentElement.outerHTML,
+                forms: forms,
+                iframes: iframes,
+                csp: csp,
+                feature_policy: feature_policy,
+                is_framed: is_framed,
+                has_service_worker: 'serviceWorker' in navigator,
+                resources: resources
+              });
+            } catch (e) {
+              return JSON.stringify({
+                error: e.message,
+                stack: e.stack
+              });
+            }
+          })()
+        JS
+
+        browser_obj[:devtools].send_cmd('Console.clearMessages')
+        browser_obj[:devtools].send_cmd('Log.clear')
+        console_events = []
+        browser_obj[:browser].driver.on_log_event(:console) { |event| console_events.push(event) }
+
+        # page_state = console(browser_obj: browser_obj, js: js, return_to: :stdout)
+        console_cmd = { expression: js }
+        runtime_resp = browser_obj[:devtools].send_cmd('Runtime.evaluate', **console_cmd)
+        page_state = runtime_resp['result']['result']['value']
+        JSON.parse(page_state, symbolize_names: true)
+      rescue JSON::ParserError => e
+        raise "Failed to parse state JSON: #{e.message}. Raw output: #{state_json.inspect}"
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # messages = PWN::Plugins::TransparentBrowser.devtools_websocket_messages(
+      #   browser_obj: 'required - browser_obj returned from #open method)'
+      # )
+
+      public_class_method def self.devtools_websocket_messages(opts = {})
+        browser_obj = opts[:browser_obj]
+        verified = verify_devtools_browser(browser_obj: browser_obj)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        devtools = browser_obj[:devtools]
+        websocket = devtools.instance_variable_get(:@ws)
+        websocket.instance_variable_get(:@messages)[nil]
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # PWN::Plugins::TransparentBrowser.debugger(
+      #   browser_obj: 'required - browser_obj returned from #open method)',
+      #   action: 'optional - action to take :enable|:pause|:resume|:disable (Defaults to :enable)',
+      # )
+
+      public_class_method def self.debugger(opts = {})
+        browser_obj = opts[:browser_obj]
+        verified = verify_devtools_browser(browser_obj: browser_obj)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        valid_actions = %i[enable pause resume disable]
+        action = opts[:action] ||= :enable
+        action = action.to_s.downcase.to_sym
+        raise 'ERROR: action parameter must be :enable|:pause|:resume|:disable' unless valid_actions.include?(action)
+
+        devtools = browser_obj[:devtools]
+        debugger_state = devtools.instance_variable_get(:@debugger_state) || {}
+        breakpoint_arr = debugger_state[:breakpoints] || []
+
+        method = nil
+        case action
+        when :enable
+          devtools.dom.enable
+          devtools.log.disable
+          devtools.network.disable
+          devtools.page.disable
+          devtools.runtime.disable
+
+          method = 'Debugger.scriptParsed'
+          callbacks_to_delete = devtools.callbacks.keys.reject { |k| k == 'Target.atta`chedToTarget' }
+          # until devtools.callbacks.keys.include?(method) && breakpoint_arr.any?
+          until breakpoint_arr.any?
+            callbacks_to_delete.each { |method| devtools.callbacks.delete(method) }
+            breakpoint_set = false
+            # devtools.dom.disable
+            devtools.debugger.disable
+            devtools.debugger.on(:script_parsed) do |params|
+              url = params['url']
+              next if breakpoint_set || url.include?('devtools://') || url.empty?
+
+              breakpoint_set = true
+              puts url
+              bcmd = 'Debugger.setBreakpoint'
+              script_id = params['scriptId']
+              line = params['startLine']
+              column = params['startColumn']
+              location = { scriptId: script_id, lineNumber: line, columnNumber: column }
+              breakpoint = devtools.send_cmd(bcmd, location: location)
+              breakpoint['result']['breakpointId'] = "#{bcmd}.#{script_id}.#{line}.#{column}.#{SecureRandom.uuid}"
+              breakpoint['id'] = breakpoint['id'].to_s
+              breakpoint['url'] = url
+              breakpoint['caught'] = false
+              breakpoint_arr.push(breakpoint)
+              debugger_state[:breakpoints] = breakpoint_arr
+              devtools.instance_variable_set(:@debugger_state, debugger_state)
+
+              puts "Breakpoint set in #{url} at line #{line}, column #{column}: #{breakpoint}"
+              puts params.inspect
+            end
+            devtools.debugger.enable
+          end
+          devtools.callbacks.delete(method)
+          method = 'Debugger.enabled'
+        when :pause
+          method = 'Debugger.paused'
+          callbacks_to_delete = devtools.callbacks.keys.reject { |k| k == 'Target.attachedToTarget' }
+          Timeout.timeout(30) { browser_obj[:browser].refresh }
+          until devtools.callbacks.keys.include?(method) && breakpoint_arr.any? { |bp| bp['caught'] == true }
+            devtools.callbacks.delete(method)
+            devtools.debugger.resume
+            devtools.debugger.on(:paused) do |params|
+              breakpoint_id_caught = params['callFrames'].first['location']['scriptId']
+              breakpoint_arr.each_with_index do |bp, idx|
+                next unless  bp['id'] == breakpoint_id_caught
+
+                bp['caught'] = true
+                breakpoint_arr[idx] = bp
+                debugger_state[:breakpoints] = breakpoint_arr
+                devtools.instance_variable_set(:@debugger_state, debugger_state)
+              end
+              # puts "TARGET BREAKPOINTS: #{breakpoint_arr.inspect}"
+              # puts "PARAMS Observerd: #{params.inspect}"
+              debugger_state = devtools.instance_variable_get(:@debugger_state)
+              puts devtools.callbacks.inspect
+              puts debugger_state.inspect
+            end
+            devtools.debugger.pause
+            # browser_obj[:browser].refresh
+            debugger_state = devtools.instance_variable_get(:@debugger_state)
+            breakpoint_arr = debugger_state[:breakpoints]
+          end
+          devtools.callbacks.delete(method)
+        when :resume
+          method = 'Debugger.resumed'
+          callbacks_to_delete = devtools.callbacks.keys.reject { |k| k == 'Target.attachedToTarget' }
+          callbacks_to_delete.each { |method| devtools.callbacks.delete(method) }
+          devtools.debugger.resume until devtools.callbacks.keys.include?(method)
+        when :disable
+          callbacks_to_delete = devtools.callbacks.keys.reject { |k| k == 'Target.attachedToTarget' }
+          callbacks_to_delete.each { |method| devtools.callbacks.delete(method) }
+          devtools.debugger.disable
+          method = 'Debugger.disabled'
+        end
+
+        devtools
+      rescue Selenium::WebDriver::Error::WebDriverError => e
+        puts e.message
+      rescue StandardError => e
+        raise e
+      ensure
+        debugger_state[:method] = method
+        devtools.instance_variable_set(:@debugger_state, debugger_state) if debugger_state.is_a?(Hash)
+      end
+
+      # Supported Method Parameters::
+      # page_state_arr = PWN::Plugins::TransparentBrowser.get_targets(
+      #   browser_obj: 'required - browser_obj returned from #open method)'
+      # )
+
+      public_class_method def self.get_targets(opts = {})
+        browser_obj = opts[:browser_obj]
+        supported = %i[chrome headless_chrome]
+        verified = verify_devtools_browser(browser_obj: browser_obj, supported: supported)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        devtools = browser_obj[:devtools]
+        bcmd = 'Target.getTargets'
+        devtools.send_cmd(bcmd)
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # page_state_arr = PWN::Plugins::TransparentBrowser.breakpoint_locations(
+      #   browser_obj: 'required - browser_obj returned from #open method)'
+      # )
+
+      public_class_method def self.breakpoint_locations(opts = {})
+        browser_obj = opts[:browser_obj]
+        supported = %i[chrome headless_chrome]
+        verified = verify_devtools_browser(browser_obj: browser_obj, supported: supported)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        valid_methods = %w[Debugger.scriptParsed Debugger.paused Debugger.resumed]
+        devtools = browser_obj[:devtools]
+        ws_msg = devtools_websocket_messages(browser_obj: browser_obj)
+        method = ws_msg['method']
+        raise "ERROR: Unsupported method: #{method}" unless valid_methods.include?(method)
+
+        case method
+        when 'Debugger.resumed', 'Debugger.paused'
+          script_id = ws_msg['params']['callFrames'].first['location']['scriptId'].to_s
+        when 'Debugger.scriptParsed'
+          script_id = ws_msg['params']['scriptId'].to_s
+        end
+
+        puts "Method: #{method}"
+        puts "Fetching possible breakpoints for script ID: #{script_id}..."
+        bcmd = 'Debugger.getPossibleBreakpoints'
+        devtools.send_cmd(bcmd, start: { scriptId: script_id, lineNumber: 0, columnNumber: 0 })
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # page_state_arr = PWN::Plugins::TransparentBrowser.step(
+      #   browser_obj: 'required - browser_obj returned from #open method)',
+      #   action: 'optional - action to take :into|:out|:over (Defaults to :into)',
+      #   steps: 'optional - number of steps taken (Defaults to 1)'
+      # )
+
+      public_class_method def self.step(opts = {})
+        browser_obj = opts[:browser_obj]
+        supported = %i[chrome headless_chrome]
+        verified = verify_devtools_browser(browser_obj: browser_obj, supported: supported)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        valid_actions = %i[into out over]
+        action = opts[:action] ||= :into
+        action = action.to_s.downcase.to_sym
+        raise 'ERROR: action parameter must be :into|:out|:over' unless valid_actions.include?(action)
+
+        steps = opts[:steps].to_i
+        steps = 1 if steps.zero? || steps.negative?
+
+        devtools = browser_obj[:devtools]
+        ws_msg = devtools_websocket_messages(browser_obj: browser_obj)
+        method = ws_msg['method']
+
+        debugger_state = devtools.instance_variable_get(:@debugger_state)
+        debugger_state[:method] = method
+        devtools.instance_variable_set(:@debugger_state, debugger_state)
+
+        valid_methods = %w[Debugger.scriptParsed Debugger.paused Debugger.resumed]
+        devtools = browser_obj[:devtools]
+        ws_msg = devtools_websocket_messages(browser_obj: browser_obj)
+        method = ws_msg['method']
+        raise "ERROR: Unsupported method: #{method}" unless valid_methods.include?(method)
+
+        steps_arr = []
+        cursor_termination_chars = %w[; , . ( ) { } = |]
+        steps.times do |s|
+          step_num = s + 1
+          puts "Stepping #{action} (step #{step_num}/#{steps})..."
+
+          method = 'Debugger.resumed'
+          case action
+          when :into
+            devtools.debugger.step_into until devtools.callbacks.keys.include?(method)
+          when :out
+            devtools.debugger.step_out until devtools.callbacks.keys.include?(method)
+          when :over
+            devtools.debugger.step_over until devtools.callbacks.keys.include?(method)
+          end
+          devtools.callbacks.delete(method)
+
+          method = 'Debugger.paused'
+          devtools.debugger.pause until devtools.callbacks.keys.include?(method)
+          devtools.callbacks.delete(method)
+
+          ws_msg = devtools_websocket_messages(browser_obj: browser_obj)
+          ws_msg_params = ws_msg['params']
+          ws_msg_call_frames = ws_msg_params['callFrames'].first
+          ws_msg_scope_chain_local = ws_msg_call_frames['scopeChain'].find { |scope| scope['type'] == 'local' }
+          next unless ws_msg_scope_chain_local.is_a?(Hash)
+
+          ws_msg_scope_chain_block = ws_msg_call_frames['scopeChain'].find { |scope| scope['type'] == 'block' }
+
+          cursor_location = ws_msg_call_frames['location']
+          cursor_line_num = cursor_location['lineNumber']
+          cursor_column_num = cursor_location['columnNumber']
+
+          script_id = cursor_location['scriptId']
+
+          start_location = ws_msg_scope_chain_local['startLocation']
+          start_line_num = start_location['lineNumber']
+          start_column_num = start_location['columnNumber']
+
+          end_location = ws_msg_scope_chain_local['endLocation']
+          # end_location_block = ws_msg_scope_chain_block['endLocation']
+          # puts "TEST: #{end_location - end_location_block}"
+          end_line_num = end_location['lineNumber']
+          end_column_num = end_location['columnNumber']
+
+          source_obj = devtools.debugger.get_script_source(script_id: script_id)
+          full_source_code = source_obj['result']['scriptSource']
+
+          source_lines = full_source_code.split("\n")
+          # puts source_lines.inspect
+          source_lines_range = source_lines[start_line_num..end_line_num]
+          next if source_lines_range.nil?
+
+          source_lines_str = source_lines_range.join("\n")
+          source_to_review = source_lines_str[start_column_num..end_column_num]
+          current_step = source_lines_str[cursor_column_num..end_column_num]
+
+          # TODO: leverage ANSI escape codes to highlight current_step to red
+          # puts ws_msg.inspect
+          # puts "\n"
+          # puts ws_msg_call_frames['scopeChain'].inspect
+          # puts "\n"
+          cursor_terminated = false
+          source_to_review.each_char.with_index do |char, idx|
+            cursor_start_offset = cursor_column_num - start_column_num
+            cursor_end_offset = end_column_num - start_column_num
+
+            if idx >= cursor_start_offset && !cursor_terminated
+              cursor_terminated = true if cursor_termination_chars.include?(char)
+              print char if cursor_terminated
+              print "\001\e[31m\002#{char}\001\e[0m\002" unless cursor_terminated
+            else
+              print char
+            end
+          end
+
+          if current_step.length.positive?
+            ai_analysis = PWN::AI::Agent::TransparentBrowser.analyze(
+              request: current_step,
+              source_to_review: source_to_review
+            )
+            puts "^^^ #{ai_analysis}" unless ai_analysis.nil?
+          end
+          puts "\n" * 3
+
+          step_hash = {
+            step: step_num,
+            action: action,
+            source: current_step
+          }
+
+          steps_arr.push(step_hash)
+        end
+
+        steps_arr
+      rescue Selenium::WebDriver::Error::WebDriverError
+        devtools
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # PWN::Plugins::TransparentBrowser.toggle_devtools(
+      #   browser_obj: 'required - browser_obj returned from #open method)'
+      # )
+
+      public_class_method def self.toggle_devtools(opts = {})
+        browser_obj = opts[:browser_obj]
+        verified = verify_devtools_browser(browser_obj: browser_obj)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        # TODO: Find replacement for hotkey - there must be a better way.
+        browser_obj[:browser].send_keys(:f12)
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # PWN::Plugins::TransparentBrowser.jmp_devtools_panel(
+      #   browser_obj: 'required - browser_obj returned from #open method)',
+      #   panel: 'optional - panel to switch to :elements|:inspector|:console|:debugger|:sources|:network
+      # )
+
+      public_class_method def self.jmp_devtools_panel(opts = {})
+        browser_obj = opts[:browser_obj]
+        verified = verify_devtools_browser(browser_obj: browser_obj)
+        puts 'This browser is not supported for DevTools operations.' unless verified
+        return unless verified
+
+        panel = opts[:panel] ||= :elements
+        browser = browser_obj[:browser]
+        browser_type = browser_obj[:type]
+        firefox_types = %i[firefox headless_firefox]
+        chrome_types = %i[chrome headless_chrome]
+
+        # TODO: Find replacement for hotkey - there must be a better way.
+        hotkey = []
+        case PWN::Plugins::DetectOS.type
+        when :linux, :openbsd, :windows
+          hotkey = %i[control shift]
+        when :macos
+          hotkey = %i[command option]
+        end
+
+        case panel
+        when :elements, :inspector
+          hotkey.push('i') if chrome_types.include?(browser_type)
+          hotkey.push('c') if firefox_types.include?(browser_type)
+        when :console
+          hotkey.push('j') if chrome_types.include?(browser_type)
+          hotkey.push('k') if firefox_types.include?(browser_type)
+        when :debugger, :sources
+          hotkey.push('s') if chrome_types.include?(browser_type)
+          if firefox_types.include?(browser_type)
+            # If we're in the console, we need to switch to the inspector first
+            jmp_devtools_panel(browser_obj: browser_obj, panel: :inspector)
+            sleep 1
+            hotkey.push('z')
+          end
+        when :network
+          hotkey.push('e') if firefox_types.include?(browser_type)
+        else
+          raise 'ERROR: panel parameter must be :elements|:inspector|:console|:debugger|:sources|:network'
+        end
+
+        browser_obj[:browser].send_keys(:escape)
+
+        # Have to call twice for Chrome, otherwise devtools stays closed
+        browser_obj[:browser].send_keys(hotkey)
+        # browser.send_keys(hotkey) if chrome_types.include?(browser_type)
+        browser.send_keys(:escape)
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # browser_obj1 = PWN::Plugins::TransparentBrowser.close(
+      #   browser_obj: 'required - browser_obj returned from #open method)'
+      # )
+
+      public_class_method def self.close(opts = {})
+        browser_obj = opts[:browser_obj]
+
+        return nil unless browser_obj.is_a?(Hash)
+
+        browser = browser_obj[:browser]
+        tor_obj = browser_obj[:tor_obj]
+
+        PWN::Plugins::Tor.stop(tor_obj: browser_obj[:tor_obj]) if tor_obj
+
+        # Close the browser unless browser.nil? (thus the &)
+        browser&.close unless browser == RestClient
+
+        nil
+      rescue StandardError => e
+        raise e
+      end
+
+      # Capture screenshot, DOM snapshot, and HAR into the artifact store.
+      public_class_method def self.evidence!(opts = {})
+        browser_obj = opts[:browser_obj]
+        label = (opts[:label] || 'capture').to_s.gsub(/[^\w.-]+/, '_')
+        sid = (opts[:session_id] || 'web').to_s
+        sid = 'web' if sid.empty?
+        dir = File.join(Dir.home, '.pwn', 'artifacts', sid, 'web', label)
+        FileUtils.mkdir_p(dir)
+        shot = File.join(dir, 'screenshot.png')
+        html_path = File.join(dir, 'dom.html')
+        har_path = File.join(dir, 'har.json')
+        png = png_bytes(opts)
+        html = html_body(opts)
+        har = har_document(opts)
+        har_json = JSON.generate(har)
+        File.binwrite(shot, png)
+        File.write(html_path, html)
+        File.write(har_path, har_json)
+        shot_art = spill_web(bytes: png, session_id: sid)
+        html_art = spill_web(bytes: html, session_id: sid)
+        har_art = spill_web(bytes: har_json, session_id: sid)
+        {
+          screenshot: shot,
+          dom: html_path,
+          har: har_path,
+          dir: dir,
+          screenshot_handle: shot_art[:handle],
+          dom_handle: html_art[:handle],
+          har_handle: har_art[:handle],
+          artifact_handles: [
+            { handle: shot_art[:handle], kind: 'screenshot', label: 'screenshot', sha256: shot_art[:sha256], path: shot_art[:path] },
+            { handle: html_art[:handle], kind: 'evidence', label: 'dom', sha256: html_art[:sha256], path: html_art[:path] },
+            { handle: har_art[:handle], kind: 'evidence', label: 'har', sha256: har_art[:sha256], path: har_art[:path] }
+          ]
+        }
+      end
+
+      # Navigate a page and optionally record screenshot, DOM, HAR, and a finding.
+      public_class_method def self.goto(opts = {})
+        browser_obj = opts[:browser_obj]
+        url = (opts[:url] || opts[:uri]).to_s
+        browser = browser_handle(browser_obj: browser_obj)
+        browser.goto(url) if browser.respond_to?(:goto) && !url.empty?
+        url = browser.url.to_s if url.empty? && browser.respond_to?(:url)
+        finding_opts = opts[:finding]
+        finding_opts = finding_opts.transform_keys(&:to_sym) if finding_opts.is_a?(Hash)
+        title = (opts[:title] || (finding_opts.is_a?(Hash) ? finding_opts[:title] : nil)).to_s
+        capture = opts[:capture]
+        capture = true if capture.nil? && !title.empty?
+        capture = [true, 'true', 1, '1'].include?(capture)
+        pack = nil
+        if capture
+          pack = evidence!(
+            browser_obj: browser_obj,
+            url: url,
+            label: opts[:label],
+            session_id: opts[:session_id],
+            screenshot: opts[:screenshot],
+            html: opts[:html],
+            dom: opts[:dom],
+            har: opts[:har],
+            har_json: opts[:har_json],
+            entries: opts[:entries]
+          )
+        end
+        finding = nil
+        unless title.empty?
+          finding = persist_web_finding(
+            title: title,
+            url: url,
+            severity: opts[:severity] || (finding_opts.is_a?(Hash) ? finding_opts[:severity] : nil),
+            session_id: opts[:session_id],
+            engagement_id: opts[:engagement_id],
+            capture_pack: pack,
+            browser_obj: browser_obj,
+            screenshot: opts[:screenshot],
+            html: opts[:html],
+            har: opts[:har]
+          )
+        end
+        { url: url, evidence: pack, finding: finding }
+      end
+
+      public_class_method def self.intercept(opts = {})
+        browser_obj = opts[:browser_obj]
+        patterns = Array(opts[:patterns] || opts[:urls] || ['*'])
+        @intercepted ||= []
+        begin
+          browser = browser_obj.is_a?(Hash) ? browser_obj[:browser] : browser_obj
+          drv = browser.respond_to?(:driver) ? browser.driver : nil
+          drv.devtools.fetch.enable(patterns: patterns.map { |p| { urlPattern: p.to_s } }) if drv.respond_to?(:devtools)
+        rescue StandardError
+          nil
+        end
+        { enabled: true, patterns: patterns, hook: 'Fetch.enable', buffer: @intercepted }
+      end
+
+      public_class_method def self.har_export(opts = {})
+        sid = (opts[:session_id] || 'default').to_s
+        entries = Array(opts[:entries] || @intercepted)
+        har = { log: { version: '1.2', creator: { name: 'PWN::Plugins::TransparentBrowser', version: '1' }, entries: entries } }
+        stored = PWN::Plugins::ArtifactRegistry.put(bytes: JSON.generate(har), kind: 'har', session_id: sid, tags: ['http'])
+        stored.merge(har: har)
+      end
+
+      public_class_method def self.replay(opts = {})
+        req = opts[:request] || opts[:req] || {}
+        req = JSON.parse(req, symbolize_names: true) if req.is_a?(String) && req.strip.start_with?('{')
+        mutations = opts[:mutations] || {}
+        url = (mutations[:url] || req[:url] || req['url']).to_s
+        method = (mutations[:method] || req[:method] || req['method'] || 'GET').to_s
+        headers = (req[:headers] || req['headers'] || {}).merge(mutations[:headers] || {})
+        body = mutations[:body] || req[:body] || req['body']
+        raise 'ERROR: request url is required' if url.empty?
+
+        require 'net/http'
+        uri = URI.parse(url)
+        klass = Net::HTTP.const_get(method.capitalize)
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = uri.scheme == 'https'
+        r = klass.new(uri.request_uri)
+        headers.each { |k, v| r[k.to_s] = v.to_s }
+        r.body = body.to_s if body
+        resp = http.request(r)
+        { status: resp.code.to_i, headers: resp.to_hash, body: resp.body.to_s[0, 65_536], url: url, method: method }
+      end
+
+      private_class_method def self.browser_handle(opts = {})
+        obj = opts[:browser_obj] || opts[:browser]
+        obj.is_a?(Hash) ? obj[:browser] : obj
+      end
+
+      private_class_method def self.png_bytes(opts = {})
+        src = opts[:screenshot]
+        if src.is_a?(String) && File.file?(src)
+          return File.binread(src)
+        elsif src.is_a?(String) && src.b.start_with?("\x89PNG".b)
+          return src.b
+        end
+
+        browser = browser_handle(opts)
+        if browser.respond_to?(:screenshot)
+          begin
+            path = File.join(Dir.tmpdir, "pwn-tb-#{SecureRandom.hex(4)}.png")
+            browser.screenshot.save(path)
+            return File.binread(path) if File.file?(path)
+          rescue StandardError
+            nil
+          end
+        end
+        "\x89PNG\r\n\x1a\n".b
+      end
+
+      private_class_method def self.html_body(opts = {})
+        src = opts[:html] || opts[:dom]
+        return File.read(src) if src.is_a?(String) && File.file?(src)
+        return src.to_s unless src.nil?
+
+        browser = browser_handle(opts)
+        browser.respond_to?(:html) ? browser.html.to_s : ''
+      end
+
+      private_class_method def self.har_document(opts = {})
+        src = opts[:har] || opts[:har_json]
+        parsed = parse_har(src: src)
+        return parsed if parsed
+
+        entries = Array(opts[:entries])
+        browser_obj = opts[:browser_obj]
+        proxy = browser_obj.is_a?(Hash) ? browser_obj[:capture_proxy] : nil
+        if proxy.is_a?(Hash)
+          path = proxy[:har_path].to_s
+          parsed = parse_har(src: path) if File.file?(path)
+          return parsed if parsed
+
+          entries = Array(proxy[:entries]) if entries.empty?
+        end
+        entries = Array(@intercepted) if entries.empty?
+        url = opts[:url].to_s
+        html = html_body(opts)
+        if entries.empty? && !url.empty?
+          entries = [{
+            'startedDateTime' => Time.now.utc.iso8601,
+            'request' => { 'method' => 'GET', 'url' => url, 'headers' => [] },
+            'response' => { 'status' => 200, 'headers' => [], 'content' => { 'mimeType' => 'text/html', 'text' => html.to_s[0, 65_536] } }
+          }]
+        end
+        { 'log' => { 'version' => '1.2', 'creator' => { 'name' => 'PWN::Plugins::TransparentBrowser', 'version' => '1' }, 'entries' => entries } }
+      end
+
+      private_class_method def self.parse_har(opts = {})
+        src = opts[:src]
+        return nil if src.nil?
+
+        if src.is_a?(Hash)
+          return src['log'] || src[:log] ? src : { 'log' => src }
+        end
+
+        text = src.to_s
+        return nil if text.empty?
+
+        text = File.read(text) if File.file?(text)
+        JSON.parse(text)
+      rescue JSON::ParserError
+        nil
+      end
+
+      private_class_method def self.spill_web(opts = {})
+        bytes = opts[:bytes].to_s
+        sid = opts[:session_id].to_s
+        sid = 'web' if sid.empty?
+        PWN::Plugins::ArtifactRegistry.spill(bytes: bytes, session_id: sid)
+      end
+
+      private_class_method def self.persist_web_finding(opts = {})
+        pack = opts[:capture_pack]
+        pack = evidence!(opts) unless pack.is_a?(Hash)
+        url = opts[:url].to_s
+        arts = [pack[:screenshot], pack[:har], pack[:dom]].select { |path| File.file?(path.to_s) }
+        evidence = "pixel=#{pack[:screenshot]} har=#{pack[:har]} url=#{url} screenshot PNG and HAR log prove the navigation"
+        PWN::Plugins::Findings.record(
+          title: opts[:title].to_s,
+          severity: opts[:severity] || 'info',
+          host: url,
+          url: url,
+          poc_artifacts: arts,
+          evidence: evidence,
+          session_id: opts[:session_id],
+          engagement_id: opts[:engagement_id]
+        )
+      end
+
+      # Author(s):: 0day Inc. <support@0dayinc.com>
+
+      public_class_method def self.authors
+        "AUTHOR(S):
+          0day Inc. <support@0dayinc.com>
+        "
+      end
+
+      # Display Usage for this Module
+
+      public_class_method def self.help
+        puts "USAGE:
+          # Open a session or connection and return a handle.
+          #{self}.open(
+            browser_type: 'optional - :firefox|:chrome|:headless|:rest|:websocket (defaults to :chrome)',
+            proxy: 'optional - scheme://proxy_host:port || tor (defaults to nil)',
+            capture_proxy: 'optional - MitmProxy.start descriptor; caller owns stop lifecycle',
+            devtools: 'optional - boolean (defaults to false)'
+          )
+
+          # Run dump links and return its result
+          #{self}.dump_links(
+            browser_obj: 'optional - browser object returned from #open'
+          )
+
+          # Run find elements by text and return its result
+          #{self}.find_elements_by_text(
+            browser_obj: 'optional - browser object returned from #open',
+            text: 'required - text to search for in the DOM'
+          )
+
+          # Run type as human and return its result
+          #{self}.type_as_human(
+            string: 'required - string to type as human',
+            rand_sleep_float: 'optional - float timing in between keypress (defaults to 0.09)'
+          )
+
+          # Run console and return its result
+          #{self}.console(
+            browser_obj: 'optional - browser object returned from #open',
+            js: 'required - JavaScript expression to evaluate',
+            return_to: 'optional - return to :console or :stdout (defaults to :console)'
+          )
+
+          # Run view dom mutations and return its result
+          #{self}.view_dom_mutations(
+            browser_obj: 'required - browser_obj returned from #open method',
+            index: 'optional - index of tab to switch to (defaults to active tab)',
+            target: 'optional - target JavaScript node to observe (defaults to document.body)',
+            observe_clobbering: 'optional - boolean to enable DOM Clobbering detection (defaults to true)',
+            observe_redirects: 'optional - boolean to enable Insecure Redirect detection (defaults to true)',
+            observe_resources: 'optional - boolean to enable resource load monitoring (defaults to true)'
+          )
+
+          # Run hide dom mutations and return its result
+          #{self}.hide_dom_mutations(
+            browser_obj: 'optional - browser object returned from #open',
+            index: 'optional - index of tab to switch to (defaults to active tab)'
+          )
+
+          # Run update about config and return its result
+          #{self}.update_about_config(
+            browser_obj: 'optional - browser object returned from #open',
+            key: 'required - key to update in about:config',
+            value: 'required - value to set for key in about:config'
+          )
+
+          # Run list tabs and return its result
+          #{self}.list_tabs(
+            browser_obj: 'required - browser_obj returned from #open method)'
+          )
+
+          # Run jmp tab and return its result
+          #{self}.jmp_tab(
+            browser_obj: 'required - browser_obj returned from #open method)',
+            index: 'optional - index of tab to switch to (defaults to switching to next tab)',
+            keyword: 'optional - keyword in title or url used to switch tabs (defaults to switching to next tab)'
+          )
+
+          # Run new tab and return its result
+          #{self}.new_tab(
+            browser_obj: 'required - browser_obj returned from #open method)',
+            url: 'optional - URL to open in new tab'
+          )
+
+          # Run close tab and return its result
+          #{self}.close_tab(
+            browser_obj: 'required - browser_obj returned from #open method)',
+            index: 'optional - index of tab to close (defaults to closing active tab)',
+            keyword: 'optional - keyword in title or url used to close tabs (defaults to closing active tab)'
+          )
+
+          # Run dom and return its result
+          #{self}.dom(
+            browser_obj: 'required - browser_obj returned from #open method)'
+          )
+
+          # Run get page state and return its result
+          #{self}.get_page_state(
+            browser_obj: 'required - browser_obj returned from #open method)'
+          )
+
+          # Run devtools websocket messages and return its result
+          #{self}.devtools_websocket_messages(
+            browser_obj: 'required - browser_obj returned from #open method)'
+          )
+
+          # Run debugger and return its result
+          #{self}.debugger(
+            browser_obj: 'required - browser_obj returned from #open method)',
+            action: 'optional - action to take :enable|:pause|:resume|:disable (Defaults to :enable)'
+          )
+
+          # Run get targets and return its result
+          #{self}.get_targets(
+            browser_obj: 'required - browser_obj returned from #open method)'
+          )
+
+          # Run breakpoint locations and return its result
+          #{self}.breakpoint_locations(
+            browser_obj: 'required - browser_obj returned from #open method)'
+          )
+
+          # Run step and return its result
+          #{self}.step(
+            browser_obj: 'required - browser_obj returned from #open method)',
+            action: 'optional - action to take :into|:out|:over (Defaults to :into)',
+            steps: 'optional - number of steps taken (Defaults to 1)'
+          )
+
+          # Run toggle devtools and return its result
+          #{self}.toggle_devtools(
+            browser_obj: 'required - browser_obj returned from #open method)'
+          )
+
+          # Run jmp devtools panel and return its result
+          #{self}.jmp_devtools_panel(
+            browser_obj: 'required - browser_obj returned from #open method)',
+            panel: 'optional - panel to switch to :elements|:inspector|:console|:debugger|:sources|:network'
+          )
+
+          # Close a session previously returned by #open.
+          #{self}.close(
+            browser_obj: 'required - browser_obj returned from #open method)'
+          )
+
+          # Save screenshot.png, dom.html, and har.json under ~/.pwn/artifacts.
+          #{self}.evidence!(
+            browser_obj: 'optional - browser_obj returned from open; omit when html or har fixtures are supplied',
+            label: 'optional - folder name for this capture (defaults to capture)',
+            session_id: 'optional - artifacts session folder (defaults to web)',
+            screenshot: 'optional - PNG path used when no live screenshot is available',
+            html: 'optional - DOM HTML string or file used when no live browser is available',
+            dom: 'optional - alias for html',
+            har: 'optional - HAR JSON string, Hash, or file used when no live capture is available',
+            har_json: 'optional - alias for har',
+            entries: 'optional - Array of HAR entries used when har is omitted',
+            url: 'optional - navigated URL embedded into a synthetic HAR entry'
+          )
+
+          # Enable CDP Fetch interception (Burp-like hook without Burp).
+          #{self}.intercept(
+            browser_obj: 'optional - browser_obj returned from #open',
+            patterns: 'optional - Array of URL patterns (defaults to *)',
+            urls: 'optional - alias for patterns'
+          )
+
+          # Export intercepted traffic as HAR into the artifact store.
+          #{self}.har_export(
+            session_id: 'optional - pwn-ai session id',
+            entries: 'optional - Array of HAR entries (defaults to intercepted buffer)'
+          )
+
+          # Replay an HTTP request with optional mutations (Repeater-class).
+          #{self}.replay(
+            request: 'required - Hash or JSON of method/url/headers/body',
+            req: 'optional - alias for request',
+            mutations: 'optional - Hash of url/method/headers/body overlays'
+          )
+
+          # Navigate then optionally capture screenshot, DOM, and HAR; record a finding when title is set.
+          #{self}.goto(
+            browser_obj: 'optional - browser_obj returned from open; omit when html or har fixtures are supplied',
+            url: 'optional - HTTP(S) URL to open; required unless uri is set',
+            uri: 'optional - alias for url',
+            capture: 'optional - true spills screenshot DOM HAR (defaults true when title is set)',
+            title: 'optional - finding title; records pixel and HAR proof without a second call',
+            finding: 'optional - Hash with title and severity overlay for the recorded finding',
+            severity: 'optional - finding severity string (defaults to info)',
+            session_id: 'optional - artifact session id (defaults to web)',
+            engagement_id: 'optional - findings engagement id',
+            label: 'optional - capture folder name under the session web dir',
+            screenshot: 'optional - PNG path used when no live screenshot is available',
+            html: 'optional - DOM HTML string or file used when no live browser is available',
+            dom: 'optional - alias for html',
+            har: 'optional - HAR JSON string, Hash, or file used when no live capture is available',
+            har_json: 'optional - alias for har',
+            entries: 'optional - Array of HAR entries used when har is omitted'
+          )
+
+          # Print the AUTHOR(S) string for this module.
+          #{self}.authors
+        "
+        constants.sort
+      end
+    end
+  end
+end

@@ -1,0 +1,787 @@
+package v1
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"buf.build/go/protovalidate"
+	grpcvalidate "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/protovalidate"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
+
+	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+
+	"github.com/authzed/spicedb/internal/dispatch"
+	"github.com/authzed/spicedb/internal/middleware"
+	"github.com/authzed/spicedb/internal/middleware/handwrittenvalidation"
+	"github.com/authzed/spicedb/internal/middleware/interceptorwrapper"
+	"github.com/authzed/spicedb/internal/middleware/perfinsights"
+	"github.com/authzed/spicedb/internal/middleware/streamtimeout"
+	"github.com/authzed/spicedb/internal/middleware/usagemetrics"
+	"github.com/authzed/spicedb/internal/namespace"
+	"github.com/authzed/spicedb/internal/relationships"
+	"github.com/authzed/spicedb/internal/services/shared"
+	"github.com/authzed/spicedb/internal/telemetry/otelconv"
+	caveattypes "github.com/authzed/spicedb/pkg/caveats/types"
+	"github.com/authzed/spicedb/pkg/cursor"
+	"github.com/authzed/spicedb/pkg/datalayer"
+	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/datastore/options"
+	"github.com/authzed/spicedb/pkg/datastore/pagination"
+	"github.com/authzed/spicedb/pkg/datastore/queryshape"
+	"github.com/authzed/spicedb/pkg/genutil"
+	"github.com/authzed/spicedb/pkg/genutil/mapz"
+	"github.com/authzed/spicedb/pkg/middleware/consistency"
+	dispatchv1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
+	"github.com/authzed/spicedb/pkg/query"
+	"github.com/authzed/spicedb/pkg/schema"
+	"github.com/authzed/spicedb/pkg/tuple"
+	"github.com/authzed/spicedb/pkg/zedtoken"
+)
+
+const MaximumTransactionMetadataSize = 65000 // bytes. Limited by the BLOB size used in MySQL driver
+
+// PermissionsServerConfig is configuration for the permissions server.
+type PermissionsServerConfig struct {
+	// MaxUpdatesPerWrite holds the maximum number of updates allowed per
+	// WriteRelationships call.
+	MaxUpdatesPerWrite uint16
+
+	// MaxPreconditionsCount holds the maximum number of preconditions allowed
+	// on a WriteRelationships or DeleteRelationships call.
+	MaxPreconditionsCount uint16
+
+	// MaximumAPIDepth is the default/starting depth remaining for API calls made
+	// to the permissions server.
+	MaximumAPIDepth uint32
+
+	// DispatchChunkSize is the maximum number of elements to dispach in a dispatch call
+	DispatchChunkSize uint16
+
+	// StreamingAPITimeout is the timeout for streaming APIs when no response has been
+	// recently received.
+	StreamingAPITimeout time.Duration
+
+	// MaxCaveatContextSize defines the maximum length of the request caveat context in bytes
+	MaxCaveatContextSize int
+
+	// MaxRelationshipContextSize defines the maximum length of a relationship's context in bytes
+	MaxRelationshipContextSize int
+
+	// MaxDatastoreReadPageSize defines the maximum number of relationships loaded from the
+	// datastore in one query.
+	MaxDatastoreReadPageSize uint64
+
+	// MaxCheckBulkConcurrency defines the maximum number of concurrent checks that can be
+	// made in a single CheckBulkPermissions call.
+	MaxCheckBulkConcurrency uint16
+
+	// MaxReadRelationshipsLimit defines the maximum number of relationships that can be read
+	// in a single ReadRelationships call.
+	MaxReadRelationshipsLimit uint32
+
+	// MaxDeleteRelationshipsLimit defines the maximum number of relationships that can be deleted
+	// in a single DeleteRelationships call.
+	MaxDeleteRelationshipsLimit uint32
+
+	// MaxLookupResourcesLimit defines the maximum number of resources that can be looked up in a
+	// single LookupResources call.
+	MaxLookupResourcesLimit uint32
+
+	// MaxBulkExportRelationshipsLimit defines the maximum number of relationships that can be
+	// exported in a single BulkExportRelationships call.
+	MaxBulkExportRelationshipsLimit uint32
+
+	// ExpiringRelationshipsEnabled defines whether or not expiring relationships are enabled.
+	ExpiringRelationshipsEnabled bool
+
+	// CaveatTypeSet is the set of caveat types to use for caveats. If not specified,
+	// the default type set is used.
+	CaveatTypeSet *caveattypes.TypeSet
+
+	// PerformanceInsightMetricsEnabled defines whether or not performance insight metrics are enabled.
+	PerformanceInsightMetricsEnabled bool
+
+	// EnableExperimentalLookupResources3 is used to enable LookupResources v3 for testing.
+	EnableExperimentalLookupResources3 bool // TODO: remove when LookupResources v3 is fully enabled
+
+	// ExperimentalQueryPlan configures which API operations use the experimental query plan.
+	ExperimentalQueryPlan ExperimentalQueryPlanConfig
+
+	// Metrics holds the metrics shared by the v1 services. It is meant to be
+	// built once (via NewMetrics) when the server is assembled and passed to
+	// every service constructor sharing this config. When nil, a fresh,
+	// unregistered (and therefore unexported) instance is used.
+	Metrics *Metrics
+
+	// QueryPlanMetadata is the shared per-server stats store that drives the
+	// count-based plan advisor. When nil, NewPermissionsServer allocates a fresh
+	// instance. To share stats with a co-located dispatcher (so receiver-side
+	// dispatch can consult and update the same store), construct one externally
+	// and pass it both here and via graph.DispatcherParameters.
+	QueryPlanMetadata *query.QueryPlanMetadata
+}
+
+// ExperimentalQueryPlanConfig controls which API operations are routed through the
+// experimental query plan engine instead of the standard dispatcher.
+type ExperimentalQueryPlanConfig struct {
+	// Check enables the query plan for CheckPermission calls.
+	Check bool
+	// LookupResources enables the query plan for LookupResources calls.
+	LookupResources bool
+	// LookupSubjects enables the query plan for LookupSubjects calls.
+	LookupSubjects bool
+}
+
+// NewPermissionsServer creates a PermissionsServiceServer instance.
+func NewPermissionsServer(
+	dispatch dispatch.Dispatcher,
+	config PermissionsServerConfig,
+	validator protovalidate.Validator,
+) v1.PermissionsServiceServer {
+	configWithDefaults := PermissionsServerConfig{
+		MaxPreconditionsCount:              defaultIfZero(config.MaxPreconditionsCount, 1000),
+		MaxUpdatesPerWrite:                 defaultIfZero(config.MaxUpdatesPerWrite, 1000),
+		MaximumAPIDepth:                    defaultIfZero(config.MaximumAPIDepth, 50),
+		StreamingAPITimeout:                defaultIfZero(config.StreamingAPITimeout, 30*time.Second),
+		MaxCaveatContextSize:               defaultIfZero(config.MaxCaveatContextSize, 4096),
+		MaxRelationshipContextSize:         defaultIfZero(config.MaxRelationshipContextSize, 25_000),
+		MaxDatastoreReadPageSize:           defaultIfZero(config.MaxDatastoreReadPageSize, 1_000),
+		MaxReadRelationshipsLimit:          defaultIfZero(config.MaxReadRelationshipsLimit, 1_000),
+		MaxDeleteRelationshipsLimit:        defaultIfZero(config.MaxDeleteRelationshipsLimit, 1_000),
+		MaxLookupResourcesLimit:            defaultIfZero(config.MaxLookupResourcesLimit, 1_000),
+		MaxBulkExportRelationshipsLimit:    defaultIfZero(config.MaxBulkExportRelationshipsLimit, 10_000),
+		DispatchChunkSize:                  defaultIfZero(config.DispatchChunkSize, 100),
+		MaxCheckBulkConcurrency:            defaultIfZero(config.MaxCheckBulkConcurrency, 50),
+		CaveatTypeSet:                      caveattypes.TypeSetOrDefault(config.CaveatTypeSet),
+		ExpiringRelationshipsEnabled:       config.ExpiringRelationshipsEnabled,
+		PerformanceInsightMetricsEnabled:   config.PerformanceInsightMetricsEnabled,
+		EnableExperimentalLookupResources3: config.EnableExperimentalLookupResources3,
+		ExperimentalQueryPlan:              config.ExperimentalQueryPlan,
+		Metrics:                            config.Metrics,
+		QueryPlanMetadata:                  config.QueryPlanMetadata,
+	}
+	if configWithDefaults.QueryPlanMetadata == nil {
+		configWithDefaults.QueryPlanMetadata = query.NewQueryPlanMetadata()
+	}
+	if configWithDefaults.Metrics == nil {
+		configWithDefaults.Metrics = NewMetrics(nil)
+	}
+	return &permissionServer{
+		dispatch: dispatch,
+		config:   configWithDefaults,
+		WithServiceSpecificInterceptors: shared.WithServiceSpecificInterceptors{
+			Unary: middleware.ChainUnaryServer(
+				interceptorwrapper.WrapUnaryServerInterceptorWithSpans(grpcvalidate.UnaryServerInterceptor(validator), "protovalidate"),
+				handwrittenvalidation.UnaryServerInterceptor,
+				usagemetrics.UnaryServerInterceptor(),
+				perfinsights.UnaryServerInterceptor(configWithDefaults.PerformanceInsightMetricsEnabled),
+			),
+			Stream: middleware.ChainStreamServer(
+				grpcvalidate.StreamServerInterceptor(validator),
+				handwrittenvalidation.StreamServerInterceptor,
+				usagemetrics.StreamServerInterceptor(),
+				streamtimeout.MustStreamServerInterceptor(configWithDefaults.StreamingAPITimeout),
+				perfinsights.StreamServerInterceptor(configWithDefaults.PerformanceInsightMetricsEnabled),
+			),
+		},
+		bulkChecker: &bulkChecker{
+			maxAPIDepth:          configWithDefaults.MaximumAPIDepth,
+			maxCaveatContextSize: configWithDefaults.MaxCaveatContextSize,
+			maxConcurrency:       configWithDefaults.MaxCheckBulkConcurrency,
+			dispatch:             dispatch,
+			dispatchChunkSize:    configWithDefaults.DispatchChunkSize,
+			caveatTypeSet:        configWithDefaults.CaveatTypeSet,
+		},
+		queryPlanMetadata: configWithDefaults.QueryPlanMetadata,
+		metrics:           configWithDefaults.Metrics,
+	}
+}
+
+type permissionServer struct {
+	v1.UnimplementedPermissionsServiceServer
+	shared.WithServiceSpecificInterceptors
+
+	dispatch dispatch.Dispatcher
+	config   PermissionsServerConfig
+
+	bulkChecker       *bulkChecker
+	queryPlanMetadata *query.QueryPlanMetadata
+	metrics           *Metrics
+}
+
+func (ps *permissionServer) ReadRelationships(req *v1.ReadRelationshipsRequest, resp v1.PermissionsService_ReadRelationshipsServer) error {
+	perfinsights.SetInContext(resp.Context(), func() perfinsights.APIShapeLabels {
+		return labelsForFilter(req.RelationshipFilter)
+	})
+
+	if req.OptionalLimit > 0 && req.OptionalLimit > ps.config.MaxReadRelationshipsLimit {
+		return ps.rewriteError(resp.Context(), NewExceedsMaximumLimitErr(uint64(req.OptionalLimit), uint64(ps.config.MaxReadRelationshipsLimit)))
+	}
+
+	ctx := resp.Context()
+	atRevision, schemaHash, revisionReadAt, err := consistency.RevisionFromContext(ctx)
+	if err != nil {
+		return ps.rewriteError(ctx, err)
+	}
+
+	dl := datalayer.MustFromContext(ctx).SnapshotReader(atRevision, schemaHash)
+	sr, err := dl.ReadSchema(ctx)
+	if err != nil {
+		return ps.rewriteError(ctx, err)
+	}
+	if err := validateRelationshipsFilter(ctx, req.RelationshipFilter, sr); err != nil {
+		return ps.rewriteError(ctx, err)
+	}
+
+	// Build the internal filter from the API provided filter.
+	dsFilter, err := datastore.RelationshipsFilterFromPublicFilter(req.RelationshipFilter)
+	if err != nil {
+		return ps.rewriteError(ctx, fmt.Errorf("error filtering: %w", err))
+	}
+	ts := schema.NewTypeSystem(schema.ResolverFor(sr))
+
+	// Determine the traits for the upcoming QueryRelationships call; this also checks
+	// if the filter is *impossible*, in which case an error is returned.
+	traits, err := ts.PossibleTraitsForFilter(ctx, dsFilter)
+	if err != nil {
+		return ps.rewriteError(ctx, err)
+	}
+
+	usagemetrics.SetInContext(ctx, &dispatchv1.ResponseMeta{
+		DispatchCount: 1,
+	})
+
+	limit := uint64(0)
+	var startCursor options.Cursor
+
+	rrRequestHash, err := computeReadRelationshipsRequestHash(req)
+	if err != nil {
+		return ps.rewriteError(ctx, err)
+	}
+
+	if req.OptionalCursor != nil {
+		decodedCursor, _, err := cursor.DecodeToDispatchCursor(req.OptionalCursor, rrRequestHash)
+		if err != nil {
+			return ps.rewriteError(ctx, err)
+		}
+
+		if len(decodedCursor.Sections) != 1 {
+			return ps.rewriteError(ctx, NewInvalidCursorErr("did not find expected resume relationship"))
+		}
+
+		parsed, err := tuple.Parse(decodedCursor.Sections[0])
+		if err != nil {
+			return ps.rewriteError(ctx, NewInvalidCursorErr("could not parse resume relationship"))
+		}
+
+		startCursor = options.ToCursor(parsed)
+	}
+
+	pageSize := ps.config.MaxDatastoreReadPageSize
+	if req.OptionalLimit > 0 {
+		limit = uint64(req.OptionalLimit)
+		if limit < pageSize {
+			pageSize = limit
+		}
+	}
+
+	it, err := pagination.NewPaginatedIterator(
+		ctx,
+		dl,
+		dsFilter,
+		pageSize,
+		options.ChooseEfficient,
+		startCursor,
+		queryshape.Varying,
+		options.WithSkipCaveats(!traits.AllowsCaveats),
+		options.WithSkipExpiration(!traits.AllowsExpiration),
+	)
+	if err != nil {
+		return ps.rewriteError(ctx, err)
+	}
+
+	response := &v1.ReadRelationshipsResponse{
+		ReadAt: revisionReadAt,
+		Relationship: &v1.Relationship{
+			Resource: &v1.ObjectReference{},
+			Subject: &v1.SubjectReference{
+				Object: &v1.ObjectReference{},
+			},
+		},
+	}
+
+	dispatchCursor := &dispatchv1.Cursor{
+		DispatchVersion: 1,
+		Sections:        []string{""},
+	}
+
+	var returnedCount uint64
+	for rel, err := range it {
+		if err != nil {
+			return ps.rewriteError(ctx, fmt.Errorf("error when reading tuples: %w", err))
+		}
+
+		dispatchCursor.Sections[0] = tuple.StringWithoutCaveatOrExpiration(rel)
+		encodedCursor, err := cursor.EncodeFromDispatchCursor(dispatchCursor, rrRequestHash, atRevision, schemaHash, nil)
+		if err != nil {
+			return ps.rewriteError(ctx, err)
+		}
+
+		tuple.CopyToV1Relationship(rel, response.Relationship)
+		response.AfterResultCursor = encodedCursor
+
+		err = resp.Send(response)
+		if err != nil {
+			return ps.rewriteError(ctx, fmt.Errorf("error when streaming tuple: %w", err))
+		}
+		returnedCount++
+
+		// Check and break on returnedCount before restarting the loop
+		// so that we don't overfetch from the iterator
+		if limit > 0 && returnedCount >= limit {
+			break
+		}
+	}
+	return nil
+}
+
+func (ps *permissionServer) WriteRelationships(ctx context.Context, req *v1.WriteRelationshipsRequest) (*v1.WriteRelationshipsResponse, error) {
+	perfinsights.SetInContext(ctx, perfinsights.NoLabels)
+
+	if err := ps.validateTransactionMetadata(req.OptionalTransactionMetadata); err != nil {
+		return nil, ps.rewriteError(ctx, err)
+	}
+
+	dl := datalayer.MustFromContext(ctx)
+
+	span := trace.SpanFromContext(ctx)
+	// Ensure that the updates and preconditions are not over the configured limits.
+	if len(req.Updates) > int(ps.config.MaxUpdatesPerWrite) {
+		return nil, ps.rewriteError(
+			ctx,
+			NewExceedsMaximumUpdatesErr(uint64(len(req.Updates)), uint64(ps.config.MaxUpdatesPerWrite)),
+		)
+	}
+
+	if len(req.OptionalPreconditions) > int(ps.config.MaxPreconditionsCount) {
+		return nil, ps.rewriteError(
+			ctx,
+			NewExceedsMaximumPreconditionsErr(uint64(len(req.OptionalPreconditions)), uint64(ps.config.MaxPreconditionsCount)),
+		)
+	}
+
+	// Check for duplicate updates and create the set of caveat names to load.
+	updateRelationshipSet := mapz.NewSet[string]()
+	for _, update := range req.Updates {
+		// TODO(jschorr): Change to struct-based keys.
+		tupleStr := tuple.V1StringRelationshipWithoutCaveatOrExpiration(update.Relationship)
+		if !updateRelationshipSet.Add(tupleStr) {
+			return nil, ps.rewriteError(
+				ctx,
+				NewDuplicateRelationshipErr(update),
+			)
+		}
+		if proto.Size(update.Relationship.OptionalCaveat) > ps.config.MaxRelationshipContextSize {
+			return nil, ps.rewriteError(
+				ctx,
+				NewMaxRelationshipContextError(update, ps.config.MaxRelationshipContextSize),
+			)
+		}
+
+		if !ps.config.ExpiringRelationshipsEnabled && update.Relationship.OptionalExpiresAt != nil {
+			return nil, ps.rewriteError(
+				ctx,
+				errors.New("support for expiring relationships is not enabled"),
+			)
+		}
+	}
+	span.AddEvent(otelconv.EventRelationshipsMutationsValidated)
+
+	// Execute the write operation(s).
+	relUpdates, err := tuple.UpdatesFromV1RelationshipUpdates(req.Updates)
+	if err != nil {
+		return nil, ps.rewriteError(ctx, err)
+	}
+
+	revision, err := dl.ReadWriteTx(ctx, func(ctx context.Context, rwt datalayer.ReadWriteTransaction) error {
+		// Extract schema reader for validation.
+		sr, err := rwt.ReadSchema(ctx)
+		if err != nil {
+			return err
+		}
+
+		// Validate the preconditions.
+		for _, precond := range req.OptionalPreconditions {
+			if err := validatePrecondition(ctx, precond, sr); err != nil {
+				return err
+			}
+		}
+		span.AddEvent(otelconv.EventRelationshipsPreconditionsValidated)
+
+		// Validate the updates.
+		err = relationships.ValidateRelationshipUpdates(ctx, sr, ps.config.CaveatTypeSet, relUpdates)
+		if err != nil {
+			return ps.rewriteError(ctx, err)
+		}
+		span.AddEvent(otelconv.EventRelationshipsUpdatesValidated)
+
+		dispatchCount, err := genutil.EnsureUInt32(len(req.OptionalPreconditions) + 1)
+		if err != nil {
+			return ps.rewriteError(ctx, err)
+		}
+
+		usagemetrics.SetInContext(ctx, &dispatchv1.ResponseMeta{
+			// One request per precondition and one request for the actual writes.
+			DispatchCount: dispatchCount,
+		})
+
+		span.AddEvent(otelconv.EventRelationshipsPreconditionsValidated)
+		if err := checkPreconditions(ctx, rwt, req.OptionalPreconditions); err != nil {
+			return err
+		}
+
+		errWrite := rwt.WriteRelationships(ctx, relUpdates)
+		span.AddEvent(otelconv.EventRelationshipsWritten)
+		return errWrite
+	}, options.WithMetadata(req.OptionalTransactionMetadata))
+	span.AddEvent(otelconv.EventRelationshipsReadWriteExecuted)
+	if err != nil {
+		return nil, ps.rewriteError(ctx, err)
+	}
+
+	// Log a metric of the counts of the different kinds of update operations.
+	updateCountByOperation := make(map[v1.RelationshipUpdate_Operation]int, 0)
+	for _, update := range req.Updates {
+		updateCountByOperation[update.Operation]++
+	}
+
+	for kind, count := range updateCountByOperation {
+		ps.metrics.RecordWriteRelationshipsUpdates(kind, count)
+	}
+
+	zedToken, err := zedtoken.NewFromRevision(ctx, revision, datalayer.NoSchemaHashInTransaction, dl)
+	if err != nil {
+		return nil, ps.rewriteError(ctx, err)
+	}
+
+	return &v1.WriteRelationshipsResponse{
+		WrittenAt: zedToken,
+	}, nil
+}
+
+func (ps *permissionServer) validateTransactionMetadata(metadata *structpb.Struct) error {
+	if metadata == nil {
+		return nil
+	}
+
+	b, err := metadata.MarshalJSON()
+	if err != nil {
+		return err
+	}
+
+	if len(b) > MaximumTransactionMetadataSize {
+		return NewTransactionMetadataTooLargeErr(len(b), MaximumTransactionMetadataSize)
+	}
+
+	return nil
+}
+
+func (ps *permissionServer) DeleteRelationships(ctx context.Context, req *v1.DeleteRelationshipsRequest) (*v1.DeleteRelationshipsResponse, error) {
+	perfinsights.SetInContext(ctx, func() perfinsights.APIShapeLabels {
+		return labelsForFilter(req.RelationshipFilter)
+	})
+
+	if err := ps.validateTransactionMetadata(req.OptionalTransactionMetadata); err != nil {
+		return nil, ps.rewriteError(ctx, err)
+	}
+
+	if len(req.OptionalPreconditions) > int(ps.config.MaxPreconditionsCount) {
+		return nil, ps.rewriteError(
+			ctx,
+			NewExceedsMaximumPreconditionsErr(uint64(len(req.OptionalPreconditions)), uint64(ps.config.MaxPreconditionsCount)),
+		)
+	}
+
+	if req.OptionalLimit > 0 && req.OptionalLimit > ps.config.MaxDeleteRelationshipsLimit {
+		return nil, ps.rewriteError(ctx, NewExceedsMaximumLimitErr(uint64(req.OptionalLimit), uint64(ps.config.MaxDeleteRelationshipsLimit)))
+	}
+
+	// A cursor enables resumable, cursored deletion. It is only meaningful in the
+	// partial-deletion mode, so it requires a limit and partial deletions. The
+	// request hash namespaces the cursor to this API, so a cursor from
+	// ReadRelationships or LookupResources is rejected here (and vice versa).
+	drRequestHash, err := computeDeleteRelationshipsRequestHash(req)
+	if err != nil {
+		return nil, ps.rewriteError(ctx, err)
+	}
+
+	var startCursor options.Cursor
+	if req.OptionalCursor != nil {
+		if req.OptionalLimit == 0 {
+			return nil, ps.rewriteError(ctx, status.Errorf(codes.InvalidArgument, "optional_cursor requires optional_limit to be set"))
+		}
+		if !req.OptionalAllowPartialDeletions {
+			return nil, ps.rewriteError(ctx, status.Errorf(codes.InvalidArgument, "optional_cursor requires optional_allow_partial_deletions to be true"))
+		}
+
+		decodedCursor, _, err := cursor.DecodeToDispatchCursor(req.OptionalCursor, drRequestHash)
+		if err != nil {
+			return nil, ps.rewriteError(ctx, err)
+		}
+
+		if len(decodedCursor.Sections) != 1 {
+			return nil, ps.rewriteError(ctx, NewInvalidCursorErr("did not find expected resume relationship"))
+		}
+
+		parsed, err := tuple.Parse(decodedCursor.Sections[0])
+		if err != nil {
+			return nil, ps.rewriteError(ctx, NewInvalidCursorErr("could not parse resume relationship"))
+		}
+
+		startCursor = options.ToCursor(parsed)
+	}
+
+	dl := datalayer.MustFromContext(ctx)
+	deletionProgress := v1.DeleteRelationshipsResponse_DELETION_PROGRESS_COMPLETE
+
+	var deletedRelationshipCount uint64
+	var afterDeleteCursor options.Cursor
+	revision, err := dl.ReadWriteTx(ctx, func(ctx context.Context, rwt datalayer.ReadWriteTransaction) error {
+		// Extract schema reader for validation.
+		sr, err := rwt.ReadSchema(ctx)
+		if err != nil {
+			return err
+		}
+
+		if err := validateRelationshipsFilter(ctx, req.RelationshipFilter, sr); err != nil {
+			return err
+		}
+
+		dispatchCount, err := genutil.EnsureUInt32(len(req.OptionalPreconditions) + 1)
+		if err != nil {
+			return ps.rewriteError(ctx, err)
+		}
+
+		usagemetrics.SetInContext(ctx, &dispatchv1.ResponseMeta{
+			// One request per precondition and one request for the actual delete.
+			DispatchCount: dispatchCount,
+		})
+
+		for _, precond := range req.OptionalPreconditions {
+			if err := validatePrecondition(ctx, precond, sr); err != nil {
+				return err
+			}
+		}
+
+		if err := checkPreconditions(ctx, rwt, req.OptionalPreconditions); err != nil {
+			return err
+		}
+
+		// If a limit was specified but partial deletion is not allowed, we need to check if the
+		// number of relationships to be deleted exceeds the limit.
+		if req.OptionalLimit > 0 && !req.OptionalAllowPartialDeletions {
+			limit := uint64(req.OptionalLimit)
+			limitPlusOne := limit + 1
+			filter, err := datastore.RelationshipsFilterFromPublicFilter(req.RelationshipFilter)
+			if err != nil {
+				return ps.rewriteError(ctx, err)
+			}
+
+			it, err := rwt.QueryRelationships(ctx, filter, options.WithLimit(&limitPlusOne), options.WithQueryShape(queryshape.Varying))
+			if err != nil {
+				return ps.rewriteError(ctx, err)
+			}
+
+			counter := uint64(0)
+			for _, err := range it {
+				if err != nil {
+					return ps.rewriteError(ctx, err)
+				}
+
+				if counter == limit {
+					return ps.rewriteError(ctx, NewCouldNotTransactionallyDeleteErr(req.RelationshipFilter, req.OptionalLimit))
+				}
+
+				counter++
+			}
+		}
+
+		// Delete with the specified limit.
+		if req.OptionalLimit > 0 {
+			deleteLimit := uint64(req.OptionalLimit)
+			delOpts := []options.DeleteOptionsOption{options.WithDeleteLimit(&deleteLimit)}
+
+			// Partial deletion is the batched-delete mode; on datastores that
+			// support it, run a cursored delete so each batch resumes after the
+			// previous one instead of rescanning already-deleted relationships.
+			useCursor := req.OptionalAllowPartialDeletions
+			if useCursor {
+				delOpts = append(delOpts, options.WithCursoredDelete(true))
+				if startCursor != nil {
+					delOpts = append(delOpts, options.WithDeleteAfter(startCursor))
+				}
+			}
+
+			result, err := rwt.DeleteRelationships(ctx, req.RelationshipFilter, delOpts...)
+			if err != nil {
+				if useCursor && errors.Is(err, datastore.ErrCursoredDeleteNotSupported) {
+					// The client explicitly supplied a cursor, but this datastore
+					// cannot resume a cursored deletion; surface the error.
+					if req.OptionalCursor != nil {
+						return err
+					}
+
+					// No cursor was supplied: fall back to a non-cursored limited
+					// delete, preserving behavior on datastores without support.
+					result, err = rwt.DeleteRelationships(ctx, req.RelationshipFilter, options.WithDeleteLimit(&deleteLimit))
+				}
+				if err != nil {
+					return err
+				}
+			}
+
+			if result.LimitReached {
+				deletionProgress = v1.DeleteRelationshipsResponse_DELETION_PROGRESS_PARTIAL
+			}
+
+			deletedRelationshipCount = result.NumDeleted
+			afterDeleteCursor = result.Cursor
+			return nil
+		}
+
+		// Otherwise, kick off an unlimited deletion.
+		result, err := rwt.DeleteRelationships(ctx, req.RelationshipFilter)
+		if err != nil {
+			return err
+		}
+		deletedRelationshipCount = result.NumDeleted
+		return nil
+	}, options.WithMetadata(req.OptionalTransactionMetadata))
+	if err != nil {
+		return nil, ps.rewriteError(ctx, err)
+	}
+
+	zedToken, err := zedtoken.NewFromRevision(ctx, revision, datalayer.NoSchemaHashInTransaction, dl)
+	if err != nil {
+		return nil, ps.rewriteError(ctx, err)
+	}
+
+	response := &v1.DeleteRelationshipsResponse{
+		DeletedAt:                 zedToken,
+		DeletionProgress:          deletionProgress,
+		RelationshipsDeletedCount: deletedRelationshipCount,
+	}
+
+	// When a cursored, partial deletion left more relationships to remove, hand
+	// back a cursor so the caller can resume after the last relationship deleted.
+	if deletionProgress == v1.DeleteRelationshipsResponse_DELETION_PROGRESS_PARTIAL && afterDeleteCursor != nil {
+		dispatchCursor := &dispatchv1.Cursor{
+			DispatchVersion: 1,
+			Sections:        []string{tuple.StringWithoutCaveatOrExpiration(*options.ToRelationship(afterDeleteCursor))},
+		}
+
+		encodedCursor, err := cursor.EncodeFromDispatchCursor(dispatchCursor, drRequestHash, revision, datalayer.NoSchemaHashInTransaction, nil)
+		if err != nil {
+			return nil, ps.rewriteError(ctx, err)
+		}
+
+		response.AfterResultCursor = encodedCursor
+	}
+
+	return response, nil
+}
+
+var emptyPrecondition = &v1.Precondition{}
+
+func validatePrecondition(ctx context.Context, precond *v1.Precondition, sr datalayer.SchemaReader) error {
+	if precond.EqualVT(emptyPrecondition) || precond.Filter == nil {
+		return NewEmptyPreconditionErr()
+	}
+
+	return validateRelationshipsFilter(ctx, precond.Filter, sr)
+}
+
+func checkFilterComponent(ctx context.Context, objectType, optionalRelation string, sr datalayer.SchemaReader) error {
+	if objectType == "" {
+		return nil
+	}
+
+	relationToTest := cmp.Or(optionalRelation, datastore.Ellipsis)
+	allowEllipsis := optionalRelation == ""
+	return namespace.CheckNamespaceAndRelation(ctx, objectType, relationToTest, allowEllipsis, sr)
+}
+
+func validateRelationshipsFilter(ctx context.Context, filter *v1.RelationshipFilter, sr datalayer.SchemaReader) error {
+	// ResourceType is optional, so only check the relation if it is specified.
+	if filter.ResourceType != "" {
+		if err := checkFilterComponent(ctx, filter.ResourceType, filter.OptionalRelation, sr); err != nil {
+			return err
+		}
+	}
+
+	// SubjectFilter is optional, so only check if it is specified.
+	if subjectFilter := filter.OptionalSubjectFilter; subjectFilter != nil {
+		subjectRelation := ""
+		if subjectFilter.OptionalRelation != nil {
+			subjectRelation = subjectFilter.OptionalRelation.Relation
+		}
+		if err := checkFilterComponent(ctx, subjectFilter.SubjectType, subjectRelation, sr); err != nil {
+			return err
+		}
+	}
+
+	// Ensure the resource ID and the resource ID prefix are not set at the same time.
+	if filter.OptionalResourceId != "" && filter.OptionalResourceIdPrefix != "" {
+		return NewInvalidFilterErr("resource_id and resource_id_prefix cannot be set at the same time", filter.String())
+	}
+
+	// Ensure that at least one field is set.
+	return checkIfFilterIsEmpty(filter)
+}
+
+func checkIfFilterIsEmpty(filter *v1.RelationshipFilter) error {
+	if filter.ResourceType == "" &&
+		filter.OptionalResourceId == "" &&
+		filter.OptionalResourceIdPrefix == "" &&
+		filter.OptionalRelation == "" &&
+		filter.OptionalSubjectFilter == nil {
+		return NewInvalidFilterErr("at least one field must be set", filter.String())
+	}
+
+	return nil
+}
+
+func labelsForFilter(filter *v1.RelationshipFilter) perfinsights.APIShapeLabels {
+	if filter == nil {
+		return perfinsights.NoLabels()
+	}
+
+	if filter.OptionalSubjectFilter == nil {
+		return perfinsights.APIShapeLabels{
+			perfinsights.ResourceTypeLabel:     filter.ResourceType,
+			perfinsights.ResourceRelationLabel: filter.OptionalRelation,
+		}
+	}
+
+	if filter.OptionalSubjectFilter.OptionalRelation == nil {
+		return perfinsights.APIShapeLabels{
+			perfinsights.ResourceTypeLabel:     filter.ResourceType,
+			perfinsights.ResourceRelationLabel: filter.OptionalRelation,
+			perfinsights.SubjectTypeLabel:      filter.OptionalSubjectFilter.SubjectType,
+		}
+	}
+
+	return perfinsights.APIShapeLabels{
+		perfinsights.ResourceTypeLabel:     filter.ResourceType,
+		perfinsights.ResourceRelationLabel: filter.OptionalRelation,
+		perfinsights.SubjectTypeLabel:      filter.OptionalSubjectFilter.SubjectType,
+		perfinsights.SubjectRelationLabel:  filter.OptionalSubjectFilter.OptionalRelation.Relation,
+	}
+}

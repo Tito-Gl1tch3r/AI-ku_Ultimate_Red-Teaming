@@ -1,0 +1,2754 @@
+package test
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/ccoveille/go-safecast/v2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/codes"
+
+	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+	"github.com/authzed/grpcutil"
+
+	"github.com/authzed/spicedb/internal/datastore/common"
+	"github.com/authzed/spicedb/internal/testfixtures"
+	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/datastore/options"
+	"github.com/authzed/spicedb/pkg/datastore/queryshape"
+	"github.com/authzed/spicedb/pkg/genutil/mapz"
+	"github.com/authzed/spicedb/pkg/tuple"
+)
+
+const (
+	testUserNamespace     = "test/user"
+	testResourceNamespace = "test/resource"
+	testGroupNamespace    = "test/group"
+	testReaderRelation    = "reader"
+	testEditorRelation    = "editor"
+	testMemberRelation    = "member"
+	ellipsis              = "..."
+)
+
+// SimpleTest tests whether or not the requirements for simple reading and
+// writing of relationships hold for a particular datastore.
+func SimpleTest(t *testing.T, tester DatastoreTester) {
+	testCases := []int{1, 2, 4, 32, 256}
+
+	for _, numRels := range testCases {
+		t.Run(strconv.Itoa(numRels), func(t *testing.T) {
+			ds, err := tester.New(t, DefaultRevisionParameters(), 1)
+			require.NoError(t, err)
+			defer ds.Close()
+
+			ctx := t.Context()
+
+			require.EventuallyWithT(t, func(c *assert.CollectT) {
+				r, err := ds.ReadyState(ctx)
+				require.NoError(c, err)
+				require.True(c, r.IsReady, "datastore not ready: %s", r.Message)
+			}, 3*time.Second, 50*time.Millisecond)
+
+			setupDatastore(t, ds)
+
+			tRequire := testfixtures.RelationshipChecker{Require: require.New(t), DS: ds}
+
+			var testRels []tuple.Relationship
+			for i := range numRels {
+				resourceName := fmt.Sprintf("resource%d", i)
+				userName := fmt.Sprintf("user%d", i)
+
+				newRel := makeTestRel(resourceName, userName)
+				testRels = append(testRels, newRel)
+			}
+
+			lastRevision, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, testRels...)
+			require.NoError(t, err)
+
+			for _, toCheck := range testRels {
+				tRequire.RelationshipExists(ctx, toCheck, lastRevision)
+			}
+
+			// Write a duplicate relationship to make sure the datastore rejects it
+			_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, testRels...)
+			require.Error(t, err)
+
+			dsReader := ds.SnapshotReader(lastRevision)
+			for _, relToFind := range testRels {
+				relSubject := relToFind.Subject
+
+				// Check that we can find the relationship a number of ways
+				iter, err := dsReader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+					OptionalResourceType: relToFind.Resource.ObjectType,
+					OptionalResourceIds:  []string{relToFind.Resource.ObjectID},
+				}, options.WithQueryShape(queryshape.Varying))
+				require.NoError(t, err)
+				tRequire.VerifyIteratorResults(iter, relToFind)
+
+				// Check without a resource type.
+				iter, err = dsReader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+					OptionalResourceIds: []string{relToFind.Resource.ObjectID},
+				}, options.WithQueryShape(queryshape.Varying))
+				require.NoError(t, err)
+				tRequire.VerifyIteratorResults(iter, relToFind)
+
+				iter, err = dsReader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+					OptionalResourceType:     relToFind.Resource.ObjectType,
+					OptionalResourceIds:      []string{relToFind.Resource.ObjectID},
+					OptionalResourceRelation: relToFind.Resource.Relation,
+				}, options.WithQueryShape(queryshape.AllSubjectsForResources))
+				require.NoError(t, err)
+				tRequire.VerifyIteratorResults(iter, relToFind)
+
+				iter, err = dsReader.ReverseQueryRelationships(
+					ctx,
+					onrToSubjectsFilter(relSubject),
+					options.WithResRelation(&options.ResourceRelation{
+						Namespace: relToFind.Resource.ObjectType,
+						Relation:  relToFind.Resource.Relation,
+					}),
+					options.WithQueryShapeForReverse(queryshape.Varying),
+				)
+				require.NoError(t, err)
+				tRequire.VerifyIteratorResults(iter, relToFind)
+
+				iter, err = dsReader.ReverseQueryRelationships(
+					ctx,
+					onrToSubjectsFilter(relSubject),
+					options.WithResRelation(&options.ResourceRelation{
+						Namespace: relToFind.Resource.ObjectType,
+						Relation:  relToFind.Resource.Relation,
+					}),
+					options.WithLimitForReverse(options.LimitOne),
+					options.WithQueryShapeForReverse(queryshape.Varying),
+				)
+				require.NoError(t, err)
+				tRequire.VerifyIteratorResults(iter, relToFind)
+
+				// Check that we fail to find the relationship with the wrong filters
+				iter, err = dsReader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+					OptionalResourceType:     relToFind.Resource.ObjectType,
+					OptionalResourceIds:      []string{relToFind.Resource.ObjectID},
+					OptionalResourceRelation: "fake",
+				}, options.WithQueryShape(queryshape.Varying))
+				require.NoError(t, err)
+				tRequire.VerifyIteratorResults(iter)
+
+				incorrectUserset := relSubject.WithRelation("fake")
+
+				iter, err = dsReader.ReverseQueryRelationships(
+					ctx,
+					onrToSubjectsFilter(incorrectUserset),
+					options.WithResRelation(&options.ResourceRelation{
+						Namespace: relToFind.Resource.ObjectType,
+						Relation:  relToFind.Resource.Relation,
+					}),
+					options.WithQueryShapeForReverse(queryshape.Varying),
+				)
+				require.NoError(t, err)
+				tRequire.VerifyIteratorResults(iter)
+			}
+
+			// Check a query that returns a number of relationships
+			iter, err := dsReader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+				OptionalResourceType: testResourceNamespace,
+			}, options.WithQueryShape(queryshape.Varying))
+			require.NoError(t, err)
+			tRequire.VerifyIteratorResults(iter, testRels...)
+
+			// Filter it down to a single relationship with a userset
+			iter, err = dsReader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+				OptionalResourceType: testResourceNamespace,
+				OptionalSubjectsSelectors: []datastore.SubjectsSelector{
+					{
+						OptionalSubjectType: testUserNamespace,
+						OptionalSubjectIds:  []string{"user0"},
+					},
+				},
+			}, options.WithQueryShape(queryshape.Varying))
+			require.NoError(t, err)
+			tRequire.VerifyIteratorResults(iter, testRels[0])
+
+			// Check for larger reverse queries.
+			iter, err = dsReader.ReverseQueryRelationships(ctx, datastore.SubjectsFilter{
+				SubjectType: testUserNamespace,
+			}, options.WithQueryShapeForReverse(queryshape.Varying))
+			require.NoError(t, err)
+			tRequire.VerifyIteratorResults(iter, testRels...)
+
+			// Check limit.
+			if len(testRels) > 1 {
+				limit := safecast.RequireConvert[uint64](t, len(testRels)-1)
+				iter, err := dsReader.ReverseQueryRelationships(ctx, datastore.SubjectsFilter{
+					SubjectType: testUserNamespace,
+				}, options.WithLimitForReverse(&limit), options.WithQueryShapeForReverse(queryshape.Varying))
+				require.NoError(t, err)
+
+				tRequire.VerifyIteratorCount(iter, len(testRels)-1)
+			}
+
+			// Check that we can find the group of relationships too
+			iter, err = dsReader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+				OptionalResourceType: testRels[0].Resource.ObjectType,
+			}, options.WithQueryShape(queryshape.Varying))
+			require.NoError(t, err)
+			tRequire.VerifyIteratorResults(iter, testRels...)
+
+			iter, err = dsReader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+				OptionalResourceType:     testRels[0].Resource.ObjectType,
+				OptionalResourceRelation: testRels[0].Resource.Relation,
+			}, options.WithQueryShape(queryshape.Varying))
+			require.NoError(t, err)
+			tRequire.VerifyIteratorResults(iter, testRels...)
+
+			// Try some bad queries
+			iter, err = dsReader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+				OptionalResourceType: testRels[0].Resource.ObjectType,
+				OptionalResourceIds:  []string{"fakeobectid"},
+			}, options.WithQueryShape(queryshape.Varying))
+			require.NoError(t, err)
+			tRequire.VerifyIteratorResults(iter)
+
+			// Delete the first relationship.
+			deletedAt, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationDelete, testRels[0])
+			require.NoError(t, err)
+
+			// Delete it AGAIN (idempotent delete) and make sure there's no error
+			_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationDelete, testRels[0])
+			require.NoError(t, err)
+
+			// Verify it can still be read at the old revision
+			tRequire.RelationshipExists(ctx, testRels[0], lastRevision)
+
+			// Verify that it does not show up at the new revision
+			tRequire.NoRelationshipExists(ctx, testRels[0], deletedAt)
+			alreadyDeletedIter, err := ds.SnapshotReader(deletedAt).QueryRelationships(
+				ctx,
+				datastore.RelationshipsFilter{
+					OptionalResourceType: testRels[0].Resource.ObjectType,
+				},
+				options.WithQueryShape(queryshape.FindResourceOfType),
+			)
+			require.NoError(t, err)
+			tRequire.VerifyIteratorResults(alreadyDeletedIter, testRels[1:]...)
+
+			// Write it back
+			returnedAt, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, testRels[0])
+			require.NoError(t, err)
+			tRequire.RelationshipExists(ctx, testRels[0], returnedAt)
+
+			// Delete with DeleteRelationship
+			deletedAt, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+				_, err := rwt.DeleteRelationships(ctx, &v1.RelationshipFilter{
+					ResourceType: testResourceNamespace,
+				})
+				require.NoError(t, err)
+				return err
+			})
+			require.NoError(t, err)
+			tRequire.NoRelationshipExists(ctx, testRels[0], deletedAt)
+		})
+	}
+}
+
+func ObjectIDsTest(t *testing.T, tester DatastoreTester) {
+	testCases := []string{
+		"simple",
+		"google|123123123123",
+		"--=base64YWZzZGZh-ZHNmZHPwn5iK8J+YivC/fmIrwn5iK==",
+		"veryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryveryverylong",
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc, func(t *testing.T) {
+			ctx := t.Context()
+			require := require.New(t)
+
+			ds, err := tester.New(t, DefaultRevisionParameters(), 1)
+			require.NoError(err)
+			defer ds.Close()
+
+			rel := makeTestRel(tc, tc)
+
+			// Write the test relationship
+			_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+				return rwt.WriteRelationships(ctx, []tuple.RelationshipUpdate{
+					{
+						Operation:    tuple.UpdateOperationCreate,
+						Relationship: rel,
+					},
+				})
+			})
+			require.NoError(err)
+
+			// Read it back
+			revResult, err := ds.HeadRevision(ctx)
+			require.NoError(err)
+			iter, err := ds.SnapshotReader(revResult.Revision).QueryRelationships(ctx, datastore.RelationshipsFilter{
+				OptionalResourceType: testResourceNamespace,
+				OptionalResourceIds:  []string{tc},
+			}, options.WithQueryShape(queryshape.Varying))
+			require.NoError(err)
+
+			found, err := datastore.IteratorToSlice(iter)
+			require.NoError(err)
+			require.Len(found, 1)
+
+			first := found[0]
+			require.NotNil(first)
+			require.Equal(tc, first.Resource.ObjectID)
+			require.Equal(tc, first.Subject.ObjectID)
+		})
+	}
+}
+
+// CaseSensitivityTest verifies that object IDs are treated as case-sensitive: resources
+// and subjects that differ only in letter case are distinct relationships. This is a
+// regression test for datastores whose default collation is case-insensitive (e.g. MySQL's
+// latin1_swedish_ci), which would otherwise collide "Foo" with "foo".
+func CaseSensitivityTest(t *testing.T, tester DatastoreTester) {
+	ctx := t.Context()
+	require := require.New(t)
+
+	ds, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+	defer ds.Close()
+
+	lower := makeTestRel("caseobject", "caseuser")
+	upper := makeTestRel("CaseObject", "CaseUser")
+
+	// Both relationships are distinct and must both persist in a single write.
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		return rwt.WriteRelationships(ctx, []tuple.RelationshipUpdate{
+			tuple.Create(lower),
+			tuple.Create(upper),
+		})
+	})
+	require.NoError(err)
+
+	revResult, err := ds.HeadRevision(ctx)
+	require.NoError(err)
+	reader := ds.SnapshotReader(revResult.Revision)
+
+	// Filtering by the lowercase resource ID must return ONLY the lowercase relationship.
+	iter, err := reader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+		OptionalResourceType: testResourceNamespace,
+		OptionalResourceIds:  []string{"caseobject"},
+	}, options.WithQueryShape(queryshape.Varying))
+	require.NoError(err)
+	found, err := datastore.IteratorToSlice(iter)
+	require.NoError(err)
+	require.Len(found, 1)
+	require.Equal("caseobject", found[0].Resource.ObjectID)
+	require.Equal("caseuser", found[0].Subject.ObjectID)
+
+	// Filtering by the uppercase resource ID must return ONLY the uppercase relationship.
+	iter, err = reader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+		OptionalResourceType: testResourceNamespace,
+		OptionalResourceIds:  []string{"CaseObject"},
+	}, options.WithQueryShape(queryshape.Varying))
+	require.NoError(err)
+	found, err = datastore.IteratorToSlice(iter)
+	require.NoError(err)
+	require.Len(found, 1)
+	require.Equal("CaseObject", found[0].Resource.ObjectID)
+	require.Equal("CaseUser", found[0].Subject.ObjectID)
+}
+
+// DeleteRelationshipsTest tests whether or not the requirements for deleting
+// relationships hold for a particular datastore.
+func DeleteRelationshipsTest(t *testing.T, tester DatastoreTester) {
+	testRels := make([]tuple.Relationship, 0, 10)
+	for i := range 10 {
+		newRel := makeTestRel(fmt.Sprintf("resource%d", i), fmt.Sprintf("user%d", i%2))
+		testRels = append(testRels, newRel)
+	}
+	testRels[len(testRels)-1].Resource.Relation = "writer"
+
+	table := []struct {
+		name                    string
+		inputRels               []tuple.Relationship
+		filter                  *v1.RelationshipFilter
+		expectedExistingRels    []tuple.Relationship
+		expectedNonExistingRels []tuple.Relationship
+	}{
+		{
+			"resourceID",
+			testRels,
+			&v1.RelationshipFilter{
+				ResourceType:       testResourceNamespace,
+				OptionalResourceId: "resource0",
+			},
+			testRels[1:],
+			testRels[:1],
+		},
+		{
+			"only resourceID",
+			testRels,
+			&v1.RelationshipFilter{
+				OptionalResourceId: "resource0",
+			},
+			testRels[1:],
+			testRels[:1],
+		},
+		{
+			"only relation",
+			testRels,
+			&v1.RelationshipFilter{
+				OptionalRelation: "writer",
+			},
+			testRels[:len(testRels)-1],
+			[]tuple.Relationship{testRels[len(testRels)-1]},
+		},
+		{
+			"relation",
+			testRels,
+			&v1.RelationshipFilter{
+				ResourceType:     testResourceNamespace,
+				OptionalRelation: "writer",
+			},
+			testRels[:len(testRels)-1],
+			[]tuple.Relationship{testRels[len(testRels)-1]},
+		},
+		{
+			"subjectID",
+			testRels,
+			&v1.RelationshipFilter{
+				ResourceType:          testResourceNamespace,
+				OptionalSubjectFilter: &v1.SubjectFilter{SubjectType: testUserNamespace, OptionalSubjectId: "user0"},
+			},
+			[]tuple.Relationship{testRels[1], testRels[3], testRels[5], testRels[7], testRels[9]},
+			[]tuple.Relationship{testRels[0], testRels[2], testRels[4], testRels[6], testRels[8]},
+		},
+		{
+			"subjectID without resource type",
+			testRels,
+			&v1.RelationshipFilter{
+				OptionalSubjectFilter: &v1.SubjectFilter{SubjectType: testUserNamespace, OptionalSubjectId: "user0"},
+			},
+			[]tuple.Relationship{testRels[1], testRels[3], testRels[5], testRels[7], testRels[9]},
+			[]tuple.Relationship{testRels[0], testRels[2], testRels[4], testRels[6], testRels[8]},
+		},
+		{
+			"subjectRelation",
+			testRels,
+			&v1.RelationshipFilter{
+				ResourceType:          testResourceNamespace,
+				OptionalSubjectFilter: &v1.SubjectFilter{SubjectType: testUserNamespace, OptionalRelation: &v1.SubjectFilter_RelationFilter{Relation: ""}},
+			},
+			nil,
+			testRels,
+		},
+	}
+
+	for _, tt := range table {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			ctx := t.Context()
+
+			ds, err := tester.New(t, DefaultRevisionParameters(), 1)
+			require.NoError(err)
+			defer ds.Close()
+
+			setupDatastore(t, ds)
+
+			tRequire := testfixtures.RelationshipChecker{Require: require, DS: ds}
+
+			toTouch := make([]tuple.RelationshipUpdate, 0, len(tt.inputRels))
+			for _, tpl := range tt.inputRels {
+				toTouch = append(toTouch, tuple.Touch(tpl))
+			}
+
+			_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+				return rwt.WriteRelationships(ctx, toTouch)
+			})
+			require.NoError(err)
+
+			deletedAt, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+				_, err := rwt.DeleteRelationships(ctx, tt.filter)
+				require.NoError(err)
+				return err
+			})
+			require.NoError(err)
+
+			for _, tpl := range tt.expectedExistingRels {
+				tRequire.RelationshipExists(ctx, tpl, deletedAt)
+			}
+
+			for _, tpl := range tt.expectedNonExistingRels {
+				tRequire.NoRelationshipExists(ctx, tpl, deletedAt)
+			}
+		})
+	}
+}
+
+// InvalidReadsTest tests whether or not the requirements for reading via
+// invalid revisions hold for a particular datastore.
+func InvalidReadsTest(t *testing.T, tester DatastoreTester) {
+	t.Run("revision expiration", func(t *testing.T) {
+		testGCDuration := 600 * time.Millisecond
+
+		require := require.New(t)
+
+		ds, err := tester.New(t, DefaultRevisionParameters().
+			WithGCRetentionWindow(GCRetentionWindow(testGCDuration)), 1)
+		require.NoError(err)
+		defer ds.Close()
+
+		setupDatastore(t, ds)
+
+		ctx := t.Context()
+
+		// Check that we get an error when there are no revisions
+		err = ds.CheckRevision(ctx, datastore.NoRevision)
+
+		revisionErr := datastore.InvalidRevisionError{}
+		require.ErrorAs(err, &revisionErr)
+
+		newRel := makeTestRel("one", "one")
+		firstWrite, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, newRel)
+		require.NoError(err)
+
+		// Check that we can read at the just written revision
+		err = ds.CheckRevision(ctx, firstWrite)
+		require.NoError(err)
+
+		// Wait the duration required to allow the revision to expire
+		time.Sleep(testGCDuration * 2)
+
+		// Write another relationship which will allow the first revision to expire
+		nextWrite, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, newRel)
+		require.NoError(err)
+
+		// Check that we can read at the just written revision
+		err = ds.CheckRevision(ctx, nextWrite)
+		require.NoError(err)
+
+		// Check that we can no longer read the old revision (now allowed to expire)
+		err = ds.CheckRevision(ctx, firstWrite)
+		require.ErrorAs(err, &revisionErr)
+		require.Equal(datastore.RevisionStale, revisionErr.Reason())
+	})
+}
+
+// DeleteNotExistantTest tests the deletion of a non-existant relationship.
+func DeleteNotExistantTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		err := rwt.WriteRelationships(ctx, []tuple.RelationshipUpdate{
+			tuple.Delete(tuple.MustParse("document:foo#viewer@user:tom#...")),
+		})
+		require.NoError(err)
+
+		return nil
+	})
+	require.NoError(err)
+}
+
+// DeleteAlreadyDeletedTest tests the deletion of an already-deleted relationship.
+func DeleteAlreadyDeletedTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		// Write the relationship.
+		return rwt.WriteRelationships(ctx, []tuple.RelationshipUpdate{
+			tuple.Create(tuple.MustParse("document:foo#viewer@user:tom#...")),
+		})
+	})
+	require.NoError(err)
+
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		// Delete the relationship.
+		return rwt.WriteRelationships(ctx, []tuple.RelationshipUpdate{
+			tuple.Delete(tuple.MustParse("document:foo#viewer@user:tom#...")),
+		})
+	})
+	require.NoError(err)
+
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		// Delete the relationship again.
+		return rwt.WriteRelationships(ctx, []tuple.RelationshipUpdate{
+			tuple.Delete(tuple.MustParse("document:foo#viewer@user:tom#...")),
+		})
+	})
+	require.NoError(err)
+}
+
+// WriteDeleteWriteTest tests writing a relationship, deleting it, and then writing it again.
+func WriteDeleteWriteTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	tpl := makeTestRel("foo", "tom")
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, tpl)
+	require.NoError(err)
+
+	ensureRelationships(ctx, require, ds, tpl)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationDelete, tpl)
+	require.NoError(err)
+
+	ensureNotRelationships(ctx, require, ds, tpl)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, tpl)
+	require.NoError(err)
+
+	ensureRelationships(ctx, require, ds, tpl)
+}
+
+// CreateAlreadyExistingTest tests creating a relationship twice.
+func CreateAlreadyExistingTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	tpl1 := makeTestRel("foo", "tom")
+	tpl2 := makeTestRel("foo", "sarah")
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, tpl1, tpl2)
+	require.NoError(err)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, tpl1)
+	require.ErrorAs(err, &datastore.CreateRelationshipExistsError{})
+	require.Contains(err.Error(), "could not CREATE relationship ")
+	grpcutil.RequireStatus(t, codes.AlreadyExists, err)
+
+	f := func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		_, err := rwt.BulkLoad(ctx, testfixtures.NewBulkRelationshipGenerator(testResourceNamespace, testReaderRelation, testUserNamespace, 1, t))
+		return err
+	}
+	_, _ = ds.ReadWriteTx(ctx, f)
+	_, err = ds.ReadWriteTx(ctx, f)
+	require.Error(err)
+	grpcutil.RequireStatus(t, codes.AlreadyExists, err)
+}
+
+// TouchAlreadyExistingTest tests touching a relationship twice.
+func TouchAlreadyExistingTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	tpl1 := makeTestRel("foo", "tom")
+	tpl2 := makeTestRel("foo", "sarah")
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, tpl1, tpl2)
+	require.NoError(err)
+
+	ensureRelationships(ctx, require, ds, tpl1, tpl2)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, tpl1, tpl2)
+	require.NoError(err)
+
+	ensureRelationships(ctx, require, ds, tpl1, tpl2)
+
+	tpl3 := makeTestRel("foo", "fred")
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, tpl1, tpl3)
+	require.NoError(err)
+
+	ensureRelationships(ctx, require, ds, tpl1, tpl2, tpl3)
+}
+
+// CreateDeleteTouchTest tests writing a relationship, deleting it, and then touching it.
+func CreateDeleteTouchTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	tpl1 := makeTestRel("foo", "tom")
+	tpl2 := makeTestRel("foo", "sarah")
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, tpl1, tpl2)
+	require.NoError(err)
+
+	ensureRelationships(ctx, require, ds, tpl1, tpl2)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationDelete, tpl1, tpl2)
+	require.NoError(err)
+
+	ensureNotRelationships(ctx, require, ds, tpl1, tpl2)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, tpl1, tpl2)
+	require.NoError(err)
+
+	ensureRelationships(ctx, require, ds, tpl1, tpl2)
+}
+
+// DeleteOneThousandIndividualInOneCallTest tests deleting 1000 relationships, individually.
+func DeleteOneThousandIndividualInOneCallTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	// Write the 1000 relationships.
+	relationships := make([]tuple.Relationship, 0, 1000)
+	for i := range 1000 {
+		tpl := makeTestRel("foo", fmt.Sprintf("user%d", i))
+		relationships = append(relationships, tpl)
+	}
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, relationships...)
+	require.NoError(err)
+	ensureRelationships(ctx, require, ds, relationships...)
+
+	// Add an extra relationship.
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, makeTestRel("foo", "extra"))
+	require.NoError(err)
+	ensureRelationships(ctx, require, ds, makeTestRel("foo", "extra"))
+
+	// Delete the first 1000 relationships.
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationDelete, relationships...)
+	require.NoError(err)
+	ensureNotRelationships(ctx, require, ds, relationships...)
+
+	// Ensure the extra relationship is still present.
+	ensureRelationships(ctx, require, ds, makeTestRel("foo", "extra"))
+}
+
+// DeleteWithInvalidPrefixTest tests deleting relationships with an invalid object prefix.
+func DeleteWithInvalidPrefixTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithSchema(t, rawDS)
+	ctx := t.Context()
+
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		_, err := rwt.DeleteRelationships(ctx, &v1.RelationshipFilter{
+			OptionalResourceIdPrefix: "hithere%",
+		})
+		return err
+	})
+	require.Error(err)
+	require.ErrorContains(err, "does not match regex")
+}
+
+// DeleteWithPrefixTest tests deleting relationships with a prefix.
+func DeleteWithPrefixTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithSchema(t, rawDS)
+	ctx := t.Context()
+
+	// Write some relationships.
+	rels := make([]tuple.Relationship, 0, 100)
+	for i := range 100 {
+		rels = append(rels, tuple.Relationship{
+			RelationshipReference: tuple.RelationshipReference{
+				Resource: tuple.ONR("document", "doc"+strconv.Itoa(i), "viewer"),
+				Subject:  tuple.ONR("user", "tom", tuple.Ellipsis),
+			},
+		})
+	}
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, rels...)
+	require.NoError(err)
+	ensureRelationships(ctx, require, ds, rels...)
+
+	// Write some other relationships.
+	otherRels := make([]tuple.Relationship, 0, 100)
+	for i := range 100 {
+		otherRels = append(otherRels, tuple.Relationship{
+			RelationshipReference: tuple.RelationshipReference{
+				Resource: tuple.ONR("document", "otherdoc"+strconv.Itoa(i), "viewer"),
+				Subject:  tuple.ONR("user", "tom", tuple.Ellipsis),
+			},
+		})
+	}
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, otherRels...)
+	require.NoError(err)
+	ensureRelationships(ctx, require, ds, otherRels...)
+
+	// Delete with a valid prefix.
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		_, err := rwt.DeleteRelationships(ctx, &v1.RelationshipFilter{
+			OptionalResourceIdPrefix: "doc",
+		})
+		return err
+	})
+	require.NoError(err)
+	ensureNotRelationships(ctx, require, ds, rels...)
+	ensureRelationships(ctx, require, ds, otherRels...)
+
+	// Write some more relationships, including those with an underscore in the prefix.
+	prefixRels := make([][]tuple.Relationship, 0, 4)
+	for i := range 4 {
+		prefixRels = append(prefixRels, make([]tuple.Relationship, 0, 25))
+		for j := range 25 {
+			prefixRels[i] = append(prefixRels[i], tuple.Relationship{
+				RelationshipReference: tuple.RelationshipReference{
+					Resource: tuple.ONR("document", "pdoc0"+strconv.Itoa(i)+"_"+strconv.Itoa(j), "viewer"),
+					Subject:  tuple.ONR("user", "tom", tuple.Ellipsis),
+				},
+			})
+		}
+	}
+
+	for _, rels := range prefixRels {
+		_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, rels...)
+		require.NoError(err)
+		ensureRelationships(ctx, require, ds, rels...)
+	}
+
+	// Delete with a prefix that does not exist but includes an underscore.
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		_, err := rwt.DeleteRelationships(ctx, &v1.RelationshipFilter{
+			OptionalResourceIdPrefix: "pdoc0_",
+		})
+		return err
+	})
+	require.NoError(err)
+	ensureRelationships(ctx, require, ds, prefixRels[0]...)
+	ensureRelationships(ctx, require, ds, prefixRels[1]...)
+	ensureRelationships(ctx, require, ds, prefixRels[2]...)
+	ensureRelationships(ctx, require, ds, prefixRels[3]...)
+
+	// Delete with a prefix that includes an underscore.
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		_, err := rwt.DeleteRelationships(ctx, &v1.RelationshipFilter{
+			OptionalResourceIdPrefix: "pdoc00_",
+		})
+		return err
+	})
+	require.NoError(err)
+	ensureNotRelationships(ctx, require, ds, prefixRels[0]...)
+	ensureRelationships(ctx, require, ds, prefixRels[1]...)
+	ensureRelationships(ctx, require, ds, prefixRels[2]...)
+	ensureRelationships(ctx, require, ds, prefixRels[3]...)
+
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		_, err := rwt.DeleteRelationships(ctx, &v1.RelationshipFilter{
+			OptionalResourceIdPrefix: "pdoc01_",
+		})
+		return err
+	})
+	require.NoError(err)
+
+	ensureNotRelationships(ctx, require, ds, prefixRels[0]...)
+	ensureNotRelationships(ctx, require, ds, prefixRels[1]...)
+	ensureRelationships(ctx, require, ds, prefixRels[2]...)
+	ensureRelationships(ctx, require, ds, prefixRels[3]...)
+}
+
+// MixedWriteOperationsTest tests a WriteRelationships call with mixed operations.
+func MixedWriteOperationsTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithSchema(t, rawDS)
+	ctx := t.Context()
+
+	// Write the 100 relationships.
+	rels := make([]tuple.Relationship, 0, 100)
+	for i := range 100 {
+		rels = append(rels, tuple.Relationship{
+			RelationshipReference: tuple.RelationshipReference{
+				Resource: tuple.ONR("document", "somedoc", "viewer"),
+				Subject:  tuple.ONR("user", "user-"+strconv.Itoa(i), tuple.Ellipsis),
+			},
+		})
+	}
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, rels...)
+	require.NoError(err)
+	ensureRelationships(ctx, require, ds, rels...)
+
+	// Create a WriteRelationships call with a few CREATEs, TOUCHes and DELETEs.
+	updates := make([]tuple.RelationshipUpdate, 0, 30)
+	expectedRels := make([]tuple.Relationship, 0, 105)
+
+	// Add a CREATE for 10 new relationships.
+	for i := range 10 {
+		newRel := tuple.Relationship{
+			RelationshipReference: tuple.RelationshipReference{
+				Resource: tuple.ONR("document", "somedoc", "viewer"),
+				Subject:  tuple.ONR("user", "user-"+strconv.Itoa(i+100), tuple.Ellipsis),
+			},
+		}
+		expectedRels = append(expectedRels, newRel)
+		updates = append(updates, tuple.Create(newRel))
+	}
+
+	// Add a TOUCH for 5 existing relationships.
+	for i := range 5 {
+		updates = append(updates, tuple.Touch(tuple.Relationship{
+			RelationshipReference: tuple.RelationshipReference{
+				Resource: tuple.ONR("document", "somedoc", "viewer"),
+				Subject:  tuple.ONR("user", "user-"+strconv.Itoa(i+50), tuple.Ellipsis),
+			},
+		}))
+	}
+
+	// Add a TOUCH for 5 new relationships.
+	for i := range 5 {
+		newRel := tuple.Relationship{
+			RelationshipReference: tuple.RelationshipReference{
+				Resource: tuple.ONR("document", "somedoc", "viewer"),
+				Subject:  tuple.ONR("user", "user-"+strconv.Itoa(i+110), tuple.Ellipsis),
+			},
+		}
+		expectedRels = append(expectedRels, newRel)
+		updates = append(updates, tuple.Touch(newRel))
+	}
+
+	// DELETE the first 10 relationships.
+	deletedRels := make([]tuple.Relationship, 0, 10)
+	for i := range 10 {
+		rel := tuple.Relationship{
+			RelationshipReference: tuple.RelationshipReference{
+				Resource: tuple.ONR("document", "somedoc", "viewer"),
+				Subject:  tuple.ONR("user", "user-"+strconv.Itoa(i), tuple.Ellipsis),
+			},
+		}
+		deletedRels = append(deletedRels, rel)
+		updates = append(updates, tuple.Delete(rel))
+	}
+
+	for i := 10; i < 100; i++ {
+		expectedRels = append(expectedRels, rels[i])
+	}
+
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		return rwt.WriteRelationships(ctx, updates)
+	})
+	require.NoError(err)
+
+	// Ensure the expected relationships all exist.
+	ensureRelationships(ctx, require, ds, expectedRels...)
+	ensureNotRelationships(ctx, require, ds, deletedRels...)
+}
+
+// DeleteWithLimitTest tests deleting relationships with a limit.
+func DeleteWithLimitTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithSchema(t, rawDS)
+	ctx := t.Context()
+
+	// Write the 1000 relationships.
+	rels := make([]tuple.Relationship, 0, 1000)
+	for i := range 1000 {
+		rels = append(rels, makeTestRel("foo", fmt.Sprintf("user%d", i)))
+	}
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, rels...)
+	require.NoError(err)
+	ensureRelationships(ctx, require, ds, rels...)
+
+	// Delete 100 rels.
+	var deleteLimit uint64 = 100
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		result, err := rwt.DeleteRelationships(ctx, &v1.RelationshipFilter{
+			ResourceType: testResourceNamespace,
+		}, options.WithDeleteLimit(&deleteLimit))
+		require.NoError(err)
+		require.True(result.LimitReached)
+		require.Equal(deleteLimit, result.NumDeleted)
+		return nil
+	})
+	require.NoError(err)
+
+	// Ensure 900 rels remain.
+	found := countRels(ctx, require, ds, testResourceNamespace)
+	require.Equal(900, found)
+
+	// Delete the remainder.
+	deleteLimit = 1000
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		result, err := rwt.DeleteRelationships(ctx, &v1.RelationshipFilter{
+			ResourceType: testResourceNamespace,
+		}, options.WithDeleteLimit(&deleteLimit))
+		require.NoError(err)
+		require.False(result.LimitReached)
+		require.Equal(uint64(900), result.NumDeleted)
+		return nil
+	})
+	require.NoError(err)
+
+	found = countRels(ctx, require, ds, testResourceNamespace)
+	require.Equal(0, found)
+}
+
+// CursoredDeleteUnsupportedTest verifies that a datastore which does not
+// support cursored deletion rejects the request rather than silently ignoring
+// it. Silently ignoring an unsupported cursor would delete from the top of the
+// range on every batch, deleting rows the caller asked to skip.
+func CursoredDeleteUnsupportedTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithSchema(t, rawDS)
+	ctx := t.Context()
+
+	if cds := datastore.UnwrapAs[datastore.CursoredDeleteDatastore](ds); cds != nil && cds.SupportsCursoredDelete() {
+		t.Skip("datastore supports cursored delete")
+	}
+
+	limit := uint64(10)
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		_, err := rwt.DeleteRelationships(ctx, &v1.RelationshipFilter{
+			ResourceType: testResourceNamespace,
+		}, options.WithDeleteLimit(&limit), options.WithCursoredDelete(true))
+		return err
+	})
+	require.ErrorIs(err, datastore.ErrCursoredDeleteNotSupported)
+
+	// The typed error should also be recoverable and name the datastore engine.
+	var unsupportedErr datastore.CursoredDeleteNotSupportedError
+	require.ErrorAs(err, &unsupportedErr)
+	require.NotEmpty(unsupportedErr.Engine(), "cursored-delete-not-supported error should name the datastore engine")
+}
+
+// CursoredDeleteRequiresLimitTest verifies that a cursored delete without a
+// limit is rejected. An unlimited cursored delete is just an unlimited delete.
+func CursoredDeleteRequiresLimitTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithSchema(t, rawDS)
+	ctx := t.Context()
+
+	if cds := datastore.UnwrapAs[datastore.CursoredDeleteDatastore](ds); cds == nil || !cds.SupportsCursoredDelete() {
+		t.Skip("datastore does not support cursored delete")
+	}
+
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		_, err := rwt.DeleteRelationships(ctx, &v1.RelationshipFilter{
+			ResourceType: testResourceNamespace,
+		}, options.WithCursoredDelete(true))
+		return err
+	})
+	require.ErrorContains(err, "requires a delete limit")
+}
+
+// CursoredDeleteRelationshipsTest verifies that a cursored delete walks the
+// whole matching set across batches without skipping or double-deleting, and
+// leaves non-matching relationships alone.
+func CursoredDeleteRelationshipsTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithSchema(t, rawDS)
+	ctx := t.Context()
+
+	if cds := datastore.UnwrapAs[datastore.CursoredDeleteDatastore](ds); cds == nil || !cds.SupportsCursoredDelete() {
+		t.Skip("datastore does not support cursored delete")
+	}
+
+	const toDelete = 250
+	const toKeep = 50
+
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		if _, err := rwt.BulkLoad(ctx, testfixtures.NewBulkRelationshipGenerator(
+			testResourceNamespace, testReaderRelation, testUserNamespace, toDelete, t)); err != nil {
+			return err
+		}
+
+		// A second relation that must survive the delete.
+		_, err := rwt.BulkLoad(ctx, testfixtures.NewBulkRelationshipGenerator(
+			testResourceNamespace, testEditorRelation, testUserNamespace, toKeep, t))
+		return err
+	})
+	require.NoError(err)
+
+	filter := &v1.RelationshipFilter{
+		ResourceType:     testResourceNamespace,
+		OptionalRelation: testReaderRelation,
+	}
+
+	batchSize := uint64(40)
+	var cursor options.Cursor
+	var deleted uint64
+	batches := 0
+	seen := map[string]struct{}{}
+
+	for {
+		var result datastore.DeleteRelationshipsResult
+		_, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+			opts := []options.DeleteOptionsOption{
+				options.WithDeleteLimit(&batchSize),
+				options.WithCursoredDelete(true),
+			}
+			if cursor != nil {
+				opts = append(opts, options.WithDeleteAfter(cursor))
+			}
+
+			var innerErr error
+			result, innerErr = rwt.DeleteRelationships(ctx, filter, opts...)
+			return innerErr
+		})
+		require.NoError(err)
+
+		if result.NumDeleted == 0 {
+			require.Nil(result.Cursor, "a batch that deleted nothing must not return a cursor")
+			break
+		}
+
+		batches++
+		require.LessOrEqual(result.NumDeleted, batchSize)
+		require.NotNil(result.Cursor, "a batch that deleted rows must return a cursor")
+
+		// The cursor must advance strictly: a repeat means rows are being
+		// rescanned or skipped.
+		key := tuple.MustString(*options.ToRelationship(result.Cursor))
+		_, repeated := seen[key]
+		require.False(repeated, "cursor repeated at batch %d: %s", batches, key)
+		seen[key] = struct{}{}
+
+		cursor = result.Cursor
+		deleted += result.NumDeleted
+
+		require.Less(batches, 100, "cursored delete failed to terminate")
+	}
+
+	require.Equal(uint64(toDelete), deleted)
+
+	// The other relation is untouched.
+	head, err := ds.HeadRevision(ctx)
+	require.NoError(err)
+	iter, err := ds.SnapshotReader(head.Revision).QueryRelationships(ctx, datastore.RelationshipsFilter{
+		OptionalResourceType:     testResourceNamespace,
+		OptionalResourceRelation: testEditorRelation,
+	}, options.WithQueryShape(queryshape.Varying))
+	require.NoError(err)
+	survivors, err := datastore.IteratorToSlice(iter)
+	require.NoError(err)
+	require.Len(survivors, toKeep)
+}
+
+// DeleteCaveatedTupleTest tests deleting a relationship with a caveat.
+func DeleteCaveatedTupleTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	tpl, err := tuple.Parse("test/resource:someresource#viewer@test/user:someuser[somecaveat]")
+	require.NoError(err)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, tpl)
+	require.NoError(err)
+	ensureRelationships(ctx, require, ds, tpl)
+
+	// Delete the tuple.
+	withoutCaveat, err := tuple.Parse("test/resource:someresource#viewer@test/user:someuser")
+	require.NoError(err)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationDelete, withoutCaveat)
+	require.NoError(err)
+	ensureNotRelationships(ctx, require, ds, tpl, withoutCaveat)
+}
+
+// DeleteRelationshipsWithVariousFiltersTest tests deleting relationships with various filters.
+func DeleteRelationshipsWithVariousFiltersTest(t *testing.T, tester DatastoreTester) {
+	tcs := []struct {
+		name            string
+		filter          *v1.RelationshipFilter
+		relationships   []string
+		expectedDeleted []string
+	}{
+		{
+			name: "resource type",
+			filter: &v1.RelationshipFilter{
+				ResourceType: "document",
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@user:tom",
+				"folder:secondfolder#viewer@user:tom",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expectedDeleted: []string{"document:first#viewer@user:tom", "document:second#viewer@user:tom"},
+		},
+		{
+			name: "resource id",
+			filter: &v1.RelationshipFilter{
+				ResourceType:       "document",
+				OptionalResourceId: "first",
+			},
+			relationships:   []string{"document:first#viewer@user:tom", "document:second#viewer@user:tom"},
+			expectedDeleted: []string{"document:first#viewer@user:tom"},
+		},
+		{
+			name: "resource id without resource type",
+			filter: &v1.RelationshipFilter{
+				OptionalResourceId: "first",
+			},
+			relationships:   []string{"document:first#viewer@user:tom", "document:second#viewer@user:tom"},
+			expectedDeleted: []string{"document:first#viewer@user:tom"},
+		},
+		{
+			name: "resource id prefix with resource type",
+			filter: &v1.RelationshipFilter{
+				ResourceType:             "document",
+				OptionalResourceIdPrefix: "f",
+			},
+			relationships:   []string{"document:first#viewer@user:tom", "document:second#viewer@user:tom", "document:fourth#viewer@user:tom", "folder:fsomething#viewer@user:tom"},
+			expectedDeleted: []string{"document:first#viewer@user:tom", "document:fourth#viewer@user:tom"},
+		},
+		{
+			name: "resource id prefix without resource type",
+			filter: &v1.RelationshipFilter{
+				OptionalResourceIdPrefix: "f",
+			},
+			relationships:   []string{"document:first#viewer@user:tom", "document:second#viewer@user:tom", "document:fourth#viewer@user:tom", "folder:fsomething#viewer@user:tom"},
+			expectedDeleted: []string{"document:first#viewer@user:tom", "document:fourth#viewer@user:tom", "folder:fsomething#viewer@user:tom"},
+		},
+		{
+			name: "resource relation",
+			filter: &v1.RelationshipFilter{
+				OptionalRelation: "viewer",
+			},
+			relationships:   []string{"document:first#viewer@user:tom", "document:second#viewer@user:tom", "document:third#editor@user:tom", "folder:fsomething#viewer@user:tom"},
+			expectedDeleted: []string{"document:first#viewer@user:tom", "document:second#viewer@user:tom", "folder:fsomething#viewer@user:tom"},
+		},
+		{
+			name: "subject id",
+			filter: &v1.RelationshipFilter{
+				OptionalSubjectFilter: &v1.SubjectFilter{SubjectType: "user", OptionalSubjectId: "tom"},
+			},
+			relationships:   []string{"document:first#viewer@user:tom", "document:second#viewer@user:tom", "document:third#editor@user:tom", "document:first#viewer@user:alice"},
+			expectedDeleted: []string{"document:first#viewer@user:tom", "document:second#viewer@user:tom", "document:third#editor@user:tom"},
+		},
+		{
+			name: "subject filter with relation",
+			filter: &v1.RelationshipFilter{
+				OptionalSubjectFilter: &v1.SubjectFilter{SubjectType: "user", OptionalRelation: &v1.SubjectFilter_RelationFilter{Relation: "something"}},
+			},
+			relationships:   []string{"document:first#viewer@user:tom", "document:second#viewer@user:tom#something"},
+			expectedDeleted: []string{"document:second#viewer@user:tom#something"},
+		},
+		{
+			name: "full match",
+			filter: &v1.RelationshipFilter{
+				ResourceType:          "document",
+				OptionalResourceId:    "first",
+				OptionalRelation:      "viewer",
+				OptionalSubjectFilter: &v1.SubjectFilter{SubjectType: "user", OptionalSubjectId: "tom"},
+			},
+			relationships:   []string{"document:first#viewer@user:tom", "document:second#viewer@user:tom", "document:first#editor@user:tom", "document:firster#viewer@user:tom"},
+			expectedDeleted: []string{"document:first#viewer@user:tom"},
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, withLimit := range []bool{false, true} {
+				t.Run(fmt.Sprintf("withLimit=%v", withLimit), func(t *testing.T) {
+					require := require.New(t)
+
+					rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+					require.NoError(err)
+
+					// Write the initial relationships.
+					ds, _ := testfixtures.StandardDatastoreWithSchema(t, rawDS)
+					ctx := t.Context()
+
+					allRelationships := mapz.NewSet[string]()
+					for _, rel := range tc.relationships {
+						allRelationships.Add(rel)
+
+						tpl := tuple.MustParse(rel)
+						_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, tpl)
+						require.NoError(err)
+					}
+
+					writtenRevResult, err := ds.HeadRevision(ctx)
+					require.NoError(err)
+					writtenRev := writtenRevResult.Revision
+
+					var delLimit *uint64
+					if withLimit {
+						limit := uint64(len(tc.expectedDeleted))
+						delLimit = &limit
+					}
+
+					// Delete the relationships and ensure matching are no longer found.
+					_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+						_, err := rwt.DeleteRelationships(ctx, tc.filter, options.WithDeleteLimit(delLimit))
+						return err
+					})
+					require.NoError(err)
+
+					// Read the updated relationships and ensure no matching relationships are found.
+					headRevResult, err := ds.HeadRevision(ctx)
+					require.NoError(err)
+
+					filter, err := datastore.RelationshipsFilterFromPublicFilter(tc.filter)
+					require.NoError(err)
+
+					reader := ds.SnapshotReader(headRevResult.Revision)
+					iter, err := reader.QueryRelationships(ctx, filter, options.WithQueryShape(queryshape.Varying))
+					require.NoError(err)
+
+					found, err := datastore.IteratorToSlice(iter)
+					require.NoError(err)
+					require.Empty(found, "got relationships: %v", found)
+
+					// Ensure the expected relationships were deleted.
+					resourceTypes := mapz.NewSet[string]()
+					for _, rel := range tc.relationships {
+						tpl := tuple.MustParse(rel)
+						resourceTypes.Add(tpl.Resource.ObjectType)
+					}
+
+					allRemainingRelationships := mapz.NewSet[string]()
+					for _, resourceType := range resourceTypes.AsSlice() {
+						iter, err := reader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+							OptionalResourceType: resourceType,
+						}, options.WithQueryShape(queryshape.FindResourceOfType))
+						require.NoError(err)
+
+						for rel, err := range iter {
+							require.NoError(err)
+							allRemainingRelationships.Add(tuple.MustString(rel))
+						}
+					}
+
+					deletedRelationships := allRelationships.Subtract(allRemainingRelationships).AsSlice()
+					require.ElementsMatch(tc.expectedDeleted, deletedRelationships)
+
+					// Ensure the initial relationships are still present at the previous revision.
+					allInitialRelationships := mapz.NewSet[string]()
+					olderReader := ds.SnapshotReader(writtenRev)
+					for _, resourceType := range resourceTypes.AsSlice() {
+						iter, err := olderReader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+							OptionalResourceType: resourceType,
+						}, options.WithQueryShape(queryshape.Varying))
+						require.NoError(err)
+
+						for rel, err := range iter {
+							require.NoError(err)
+							allInitialRelationships.Add(tuple.MustString(rel))
+						}
+					}
+
+					require.ElementsMatch(tc.relationships, allInitialRelationships.AsSlice())
+				})
+			}
+		})
+	}
+}
+
+func RecreateRelationshipsAfterDeleteWithFilter(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithSchema(t, rawDS)
+	ctx := t.Context()
+
+	relationships := make([]tuple.Relationship, 100)
+	for i := range 100 {
+		relationships[i] = tuple.MustParse(fmt.Sprintf("document:%d#owner@user:first", i))
+	}
+
+	writeRelationships := func() error {
+		_, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, relationships...)
+		return err
+	}
+
+	deleteRelationships := func() error {
+		_, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+			delLimit := uint64(100)
+			_, err := rwt.DeleteRelationships(ctx, &v1.RelationshipFilter{
+				OptionalRelation: "owner",
+				OptionalSubjectFilter: &v1.SubjectFilter{
+					SubjectType:       "user",
+					OptionalSubjectId: "first",
+				},
+			}, options.WithDeleteLimit(&delLimit))
+			return err
+		})
+		return err
+	}
+
+	// Write the initial relationships.
+	require.NoError(writeRelationships())
+
+	// Delete the relationships.
+	require.NoError(deleteRelationships())
+
+	// Write the same relationships again.
+	require.NoError(writeRelationships())
+}
+
+// QueryRelationshipsWithVariousFiltersTest tests various relationship filters for query relationships.
+func QueryRelationshipsWithVariousFiltersTest(t *testing.T, tester DatastoreTester) {
+	tcs := []struct {
+		name              string
+		filter            datastore.RelationshipsFilter
+		withoutCaveats    bool
+		withoutExpiration bool
+		relationships     []string
+		expected          []string
+	}{
+		{
+			name: "resource type",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceType: "document",
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@user:tom",
+				"folder:secondfolder#viewer@user:tom",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{"document:first#viewer@user:tom", "document:second#viewer@user:tom"},
+		},
+		{
+			name: "nonmatching resource type",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceType: "other",
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@user:tom",
+				"folder:secondfolder#viewer@user:tom",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{},
+		},
+		{
+			name: "resource id",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceIds: []string{"first"},
+			},
+			relationships: []string{"document:first#viewer@user:tom", "document:second#viewer@user:tom"},
+			expected:      []string{"document:first#viewer@user:tom"},
+		},
+		{
+			name: "resource id prefix",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceIDPrefix: "first",
+			},
+			relationships: []string{"document:first#viewer@user:tom", "document:second#viewer@user:tom"},
+			expected:      []string{"document:first#viewer@user:tom"},
+		},
+		{
+			name: "resource id prefix with underscore",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceIDPrefix: "first_",
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:first_foo#viewer@user:tom",
+				"document:first_bar#viewer@user:tom",
+				"document:firstmeh#viewer@user:tom",
+				"document:second#viewer@user:tom",
+			},
+			expected: []string{"document:first_foo#viewer@user:tom", "document:first_bar#viewer@user:tom"},
+		},
+		{
+			name: "resource id prefix with multiple underscores",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceIDPrefix: "first_f_",
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:first_f_oo#viewer@user:tom",
+				"document:first_bar#viewer@user:tom",
+				"document:firstmeh#viewer@user:tom",
+				"document:second#viewer@user:tom",
+			},
+			expected: []string{"document:first_f_oo#viewer@user:tom"},
+		},
+		{
+			name: "resource id different prefix",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceIDPrefix: "s",
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@user:tom",
+				"folder:secondfolder#viewer@user:tom",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{
+				"document:second#viewer@user:tom",
+				"folder:secondfolder#viewer@user:tom",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+		},
+		{
+			name: "resource id different longer prefix",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceIDPrefix: "se",
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@user:tom",
+				"folder:secondfolder#viewer@user:tom",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{
+				"document:second#viewer@user:tom",
+				"folder:secondfolder#viewer@user:tom",
+			},
+		},
+		{
+			name: "resource type and resource id different prefix",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceType:     "folder",
+				OptionalResourceIDPrefix: "s",
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@user:tom",
+				"folder:secondfolder#viewer@user:tom",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{
+				"folder:secondfolder#viewer@user:tom",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+		},
+		{
+			name: "full resource",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceType:     "folder",
+				OptionalResourceIDPrefix: "s",
+				OptionalResourceRelation: "viewer",
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@user:tom",
+				"folder:secondfolder#viewer@user:tom",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{
+				"folder:secondfolder#viewer@user:tom",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+		},
+		{
+			name: "full resource mismatch",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceType:     "folder",
+				OptionalResourceIDPrefix: "s",
+				OptionalResourceRelation: "someotherelation",
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@user:tom",
+				"folder:secondfolder#viewer@user:tom",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{},
+		},
+		{
+			name: "subject type",
+			filter: datastore.RelationshipsFilter{
+				OptionalSubjectsSelectors: []datastore.SubjectsSelector{
+					{
+						OptionalSubjectType: "user",
+					},
+				},
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@anotheruser:tom",
+				"folder:secondfolder#viewer@anotheruser:tom",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{
+				"document:first#viewer@user:tom",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+		},
+		{
+			name: "subject ids",
+			filter: datastore.RelationshipsFilter{
+				OptionalSubjectsSelectors: []datastore.SubjectsSelector{
+					{
+						OptionalSubjectIds: []string{"tom"},
+					},
+				},
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@anotheruser:fred",
+				"folder:secondfolder#viewer@anotheruser:fred",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{
+				"document:first#viewer@user:tom",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+		},
+		{
+			name: "multiple subject ids",
+			filter: datastore.RelationshipsFilter{
+				OptionalSubjectsSelectors: []datastore.SubjectsSelector{
+					{
+						OptionalSubjectIds: []string{"tom", "fred"},
+					},
+				},
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@anotheruser:fred",
+				"folder:secondfolder#viewer@anotheruser:sarah",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@anotheruser:fred",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+		},
+		{
+			name: "non ellipsis subject relation",
+			filter: datastore.RelationshipsFilter{
+				OptionalSubjectsSelectors: []datastore.SubjectsSelector{
+					{
+						RelationFilter: datastore.SubjectRelationFilter{
+							NonEllipsisRelation: "something",
+						},
+					},
+				},
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom#...",
+				"document:second#viewer@anotheruser:fred#something",
+				"folder:secondfolder#viewer@anotheruser:sarah",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{
+				"document:second#viewer@anotheruser:fred#something",
+			},
+		},
+		{
+			name: "specific subject relation and ellipsis",
+			filter: datastore.RelationshipsFilter{
+				OptionalSubjectsSelectors: []datastore.SubjectsSelector{
+					{
+						RelationFilter: datastore.SubjectRelationFilter{
+							NonEllipsisRelation:     "something",
+							IncludeEllipsisRelation: true,
+						},
+					},
+				},
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@anotheruser:fred#something",
+				"folder:secondfolder#viewer@anotheruser:sarah",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@anotheruser:fred#something",
+				"folder:secondfolder#viewer@anotheruser:sarah",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+		},
+		{
+			name: "specific subject relation and no non-ellipsis",
+			filter: datastore.RelationshipsFilter{
+				OptionalSubjectsSelectors: []datastore.SubjectsSelector{
+					{
+						RelationFilter: datastore.SubjectRelationFilter{
+							NonEllipsisRelation:      "something",
+							OnlyNonEllipsisRelations: true,
+						},
+					},
+				},
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@anotheruser:fred#something",
+				"folder:secondfolder#viewer@anotheruser:sarah",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{
+				"document:second#viewer@anotheruser:fred#something",
+			},
+		},
+		{
+			name: "only ellipsis",
+			filter: datastore.RelationshipsFilter{
+				OptionalSubjectsSelectors: []datastore.SubjectsSelector{
+					{
+						RelationFilter: datastore.SubjectRelationFilter{
+							IncludeEllipsisRelation: true,
+						},
+					},
+				},
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@anotheruser:fred#something",
+				"folder:secondfolder#viewer@anotheruser:sarah",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{
+				"document:first#viewer@user:tom",
+				"folder:secondfolder#viewer@anotheruser:sarah",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+		},
+		{
+			name: "multiple subject filters",
+			filter: datastore.RelationshipsFilter{
+				OptionalSubjectsSelectors: []datastore.SubjectsSelector{
+					{
+						RelationFilter: datastore.SubjectRelationFilter{
+							NonEllipsisRelation: "something",
+						},
+					},
+					{
+						OptionalSubjectIds: []string{"tom"},
+					},
+				},
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@anotheruser:fred#something",
+				"folder:secondfolder#viewer@anotheruser:sarah",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@anotheruser:fred#something",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+		},
+		{
+			name: "multiple subject filters and resource ID prefix",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceIDPrefix: "s",
+				OptionalSubjectsSelectors: []datastore.SubjectsSelector{
+					{
+						RelationFilter: datastore.SubjectRelationFilter{
+							NonEllipsisRelation: "something",
+						},
+					},
+					{
+						OptionalSubjectIds: []string{"tom"},
+					},
+				},
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:second#viewer@anotheruser:fred#something",
+				"folder:secondfolder#viewer@anotheruser:sarah",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{
+				"document:second#viewer@anotheruser:fred#something",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+		},
+		{
+			name: "resource type with caveats",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceType: "document",
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom[firstcaveat]",
+				"document:second#viewer@user:tom[secondcaveat]",
+				"folder:secondfolder#viewer@user:tom",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{"document:first#viewer@user:tom[firstcaveat]", "document:second#viewer@user:tom[secondcaveat]"},
+		},
+		{
+			name: "resource type with caveats and context",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceType: "document",
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom[firstcaveat:{\"foo\":\"bar\"}]",
+				"document:second#viewer@user:tom[secondcaveat]",
+				"document:third#viewer@user:tom[secondcaveat:{\"bar\":\"baz\"}]",
+				"folder:secondfolder#viewer@user:tom",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{
+				"document:first#viewer@user:tom[firstcaveat:{\"foo\":\"bar\"}]",
+				"document:second#viewer@user:tom[secondcaveat]",
+				"document:third#viewer@user:tom[secondcaveat:{\"bar\":\"baz\"}]",
+			},
+		},
+		{
+			name: "relationship expiration",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceType: "document",
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:first#expiring_viewer@user:fred[expiration:2021-01-01T00:00:00Z]",
+				"document:first#expiring_viewer@user:sarah[expiration:2900-01-02T01:02:03Z]",
+			},
+			expected: []string{
+				"document:first#viewer@user:tom",
+				"document:first#expiring_viewer@user:sarah[expiration:2900-01-02T01:02:03Z]",
+			},
+		},
+		{
+			name: "relationship expiration filtered by expiration required",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceType:     "document",
+				OptionalExpirationOption: datastore.ExpirationFilterOptionHasExpiration,
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:first#expiring_viewer@user:fred[expiration:2021-01-01T00:00:00Z]",
+				"document:first#expiring_viewer@user:sarah[expiration:2900-01-02T01:02:03Z]",
+			},
+			expected: []string{
+				"document:first#expiring_viewer@user:sarah[expiration:2900-01-02T01:02:03Z]",
+			},
+		},
+		{
+			name: "relationship expiration filtered by expiration disallowed",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceType:     "document",
+				OptionalExpirationOption: datastore.ExpirationFilterOptionNoExpiration,
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:first#expiring_viewer@user:fred[expiration:2021-01-01T00:00:00Z]",
+				"document:first#expiring_viewer@user:sarah[expiration:2900-01-02T01:02:03Z]",
+			},
+			expected: []string{
+				"document:first#viewer@user:tom",
+			},
+		},
+		{
+			name: "no caveats and no expiration",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceType: "document",
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:first#viewer@user:fred",
+				"document:first#viewer@user:sarah",
+			},
+			expected: []string{
+				"document:first#viewer@user:tom",
+				"document:first#viewer@user:fred",
+				"document:first#viewer@user:sarah",
+			},
+			withoutCaveats:    true,
+			withoutExpiration: true,
+		},
+		{
+			name: "multiple subject IDs with subject type",
+			filter: datastore.RelationshipsFilter{
+				OptionalSubjectsSelectors: []datastore.SubjectsSelector{
+					{
+						OptionalSubjectType: "user",
+						OptionalSubjectIds:  []string{"tom", "fred"},
+					},
+				},
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:first#viewer@user:fred",
+				"document:second#viewer@anotheruser:fred#something",
+				"folder:secondfolder#viewer@anotheruser:sarah",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{
+				"document:first#viewer@user:tom",
+				"document:first#viewer@user:fred",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+		},
+		{
+			name: "relationships with expiration",
+			filter: datastore.RelationshipsFilter{
+				OptionalResourceType: "document",
+			},
+			relationships: []string{
+				"document:first#expiring_viewer@user:tom[expiration:2020-01-01T00:00:00Z]",
+				"document:first#expiring_viewer@user:fred[expiration:2321-01-01T00:00:00Z]",
+			},
+			expected: []string{
+				"document:first#expiring_viewer@user:fred[expiration:2321-01-01T00:00:00Z]",
+			},
+		},
+		{
+			name: "multiple subject filters with multiple ids",
+			filter: datastore.RelationshipsFilter{
+				OptionalSubjectsSelectors: []datastore.SubjectsSelector{
+					{
+						OptionalSubjectType: "user",
+						OptionalSubjectIds:  []string{"tom", "fred"},
+					},
+					{
+						OptionalSubjectType: "anotheruser",
+						OptionalSubjectIds:  []string{"tom", "jerry"},
+					},
+				},
+			},
+			relationships: []string{
+				"document:first#viewer@user:tom",
+				"document:first#viewer@user:fred",
+				"document:second#viewer@anotheruser:fred#something",
+				"folder:secondfolder#viewer@anotheruser:tom",
+				"folder:secondfolder#viewer@anotheruser:sarah",
+				"folder:secondfolder#viewer@anotheruser:jerry",
+				"folder:someotherfolder#viewer@user:tom",
+			},
+			expected: []string{
+				"document:first#viewer@user:tom",
+				"document:first#viewer@user:fred",
+				"folder:someotherfolder#viewer@user:tom",
+				"folder:secondfolder#viewer@anotheruser:tom",
+				"folder:secondfolder#viewer@anotheruser:jerry",
+			},
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+
+			rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+			require.NoError(err)
+
+			ds, _ := testfixtures.StandardDatastoreWithSchema(t, rawDS)
+			ctx := t.Context()
+
+			for _, rel := range tc.relationships {
+				tpl := tuple.MustParse(rel)
+				_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, tpl)
+				require.NoError(err)
+			}
+
+			headRevResult, err := ds.HeadRevision(ctx)
+			require.NoError(err)
+
+			reader := ds.SnapshotReader(headRevResult.Revision)
+			iter, err := reader.QueryRelationships(ctx, tc.filter, options.WithSkipCaveats(tc.withoutCaveats), options.WithSkipExpiration(tc.withoutExpiration), options.WithQueryShape(queryshape.Varying))
+			require.NoError(err)
+
+			var results []string //nolint: prealloc  // we don't know the length of this iterator ahead of time
+			for rel, err := range iter {
+				require.NoError(err)
+				results = append(results, tuple.MustString(rel))
+			}
+
+			require.ElementsMatch(tc.expected, results)
+		})
+	}
+}
+
+// RelationshipCaveatFilteringTest tests filtering relationships by caveat.
+func RelationshipCaveatFilteringTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	// Create a relationship without a caveat.
+	rel1, err := tuple.Parse("document:foo#viewer@user:tom")
+	require.NoError(err)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, rel1)
+	require.NoError(err)
+
+	ensureRelationships(ctx, require, ds, rel1)
+	ensureReverseRelationships(ctx, require, ds, rel1)
+	ensureRelationshipWithFilter(ctx, require, ds, datastore.RelationshipsFilter{
+		OptionalResourceType:     "document",
+		OptionalResourceIds:      []string{"foo"},
+		OptionalResourceRelation: "viewer",
+	}, rel1)
+	ensureRelationshipWithFilter(ctx, require, ds, datastore.RelationshipsFilter{
+		OptionalResourceType:     "document",
+		OptionalResourceIds:      []string{"foo"},
+		OptionalResourceRelation: "viewer",
+		OptionalCaveatNameFilter: datastore.WithNoCaveat(),
+	}, rel1)
+	ensureNoRelationshipWithFilter(ctx, require, ds, datastore.RelationshipsFilter{
+		OptionalResourceType:     "document",
+		OptionalResourceIds:      []string{"foo"},
+		OptionalResourceRelation: "viewer",
+		OptionalCaveatNameFilter: datastore.WithCaveatName("test"),
+	})
+
+	// Create a relationship with a caveat.
+	rel1, err = tuple.Parse("document:foo#viewer@user:tom[somecaveat]")
+	require.NoError(err)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, rel1)
+	require.NoError(err)
+
+	ensureRelationships(ctx, require, ds, rel1)
+	ensureReverseRelationships(ctx, require, ds, rel1)
+	ensureRelationshipWithFilter(ctx, require, ds, datastore.RelationshipsFilter{
+		OptionalResourceType:     "document",
+		OptionalResourceIds:      []string{"foo"},
+		OptionalResourceRelation: "viewer",
+	}, rel1)
+	ensureRelationshipWithFilter(ctx, require, ds, datastore.RelationshipsFilter{
+		OptionalResourceType:     "document",
+		OptionalResourceIds:      []string{"foo"},
+		OptionalResourceRelation: "viewer",
+		OptionalCaveatNameFilter: datastore.WithCaveatName("somecaveat"),
+	}, rel1)
+	ensureNoRelationshipWithFilter(ctx, require, ds, datastore.RelationshipsFilter{
+		OptionalResourceType:     "document",
+		OptionalResourceIds:      []string{"foo"},
+		OptionalResourceRelation: "viewer",
+		OptionalCaveatNameFilter: datastore.WithNoCaveat(),
+	})
+	ensureNoRelationshipWithFilter(ctx, require, ds, datastore.RelationshipsFilter{
+		OptionalResourceType:     "document",
+		OptionalResourceIds:      []string{"foo"},
+		OptionalResourceRelation: "viewer",
+		OptionalCaveatNameFilter: datastore.WithCaveatName("anothercaveat"),
+	})
+
+	// Touch the relationship without a caveat to remove it.
+	rel2, err := tuple.Parse("document:foo#viewer@user:tom")
+	require.NoError(err)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, rel2)
+	require.NoError(err)
+
+	ensureRelationships(ctx, require, ds, rel2)
+	ensureReverseRelationships(ctx, require, ds, rel2)
+}
+
+// RelationshipExpirationTest tests expiration on relationships.
+func RelationshipExpirationTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	// Create a relationship that expires in the future.
+	rel1, err := tuple.Parse("document:foo#expiring_viewer@user:tom[expiration:2900-01-01T00:00:00Z]")
+	require.NoError(err)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, rel1)
+	require.NoError(err)
+	ensureRelationships(ctx, require, ds, rel1)
+	ensureReverseRelationships(ctx, require, ds, rel1)
+
+	// Touch the relationship to a different expiration.
+	rel2, err := tuple.Parse("document:foo#expiring_viewer@user:tom[expiration:2800-01-01T00:00:00Z]")
+	require.NoError(err)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, rel2)
+	require.NoError(err)
+	ensureRelationships(ctx, require, ds, rel2)
+	ensureReverseRelationships(ctx, require, ds, rel2)
+
+	// Touch the relationship to a time in the past.
+	rel3, err := tuple.Parse("document:foo#expiring_viewer@user:tom[expiration:2000-01-01T00:00:00Z]")
+	require.NoError(err)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, rel3)
+	require.NoError(err)
+	ensureNotRelationships(ctx, require, ds, rel3)
+	ensureNotReverseRelationships(ctx, require, ds, rel3)
+
+	// Try to recreate the relationship, which should fail even though the expiration has past.
+	relrecreate, err := tuple.Parse("document:foo#expiring_viewer@user:tom[expiration:3000-01-01T00:00:00Z]")
+	require.NoError(err)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, relrecreate)
+	require.Error(err)
+	require.ErrorContains(err, "already existed")
+
+	// Touch the relationship back to the future.
+	rel4, err := tuple.Parse("document:foo#expiring_viewer@user:tom[expiration:3000-01-01T00:00:00Z]")
+	require.NoError(err)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, rel4)
+	require.NoError(err)
+	ensureRelationships(ctx, require, ds, rel4)
+	ensureReverseRelationships(ctx, require, ds, rel4)
+
+	// Touch the relationship without an expiration to remove it.
+	rel5, err := tuple.Parse("document:foo#expiring_viewer@user:tom")
+	require.NoError(err)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, rel5)
+	require.NoError(err)
+	ensureRelationships(ctx, require, ds, rel5)
+	ensureReverseRelationships(ctx, require, ds, rel5)
+}
+
+// TypedTouchAlreadyExistingTest tests touching a relationship twice, when valid type information is provided.
+func TypedTouchAlreadyExistingTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	tpl1, err := tuple.Parse("document:foo#viewer@user:tom")
+	require.NoError(err)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, tpl1)
+	require.NoError(err)
+	ensureRelationships(ctx, require, ds, tpl1)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, tpl1)
+	require.NoError(err)
+	ensureRelationships(ctx, require, ds, tpl1)
+}
+
+// TypedTouchAlreadyExistingWithCaveatTest tests touching the caveat context.
+func TypedTouchAlreadyExistingWithCaveatTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	ctpl1, err := tuple.Parse("document:foo#caveated_viewer@user:tom[test:{\"foo\":\"bar\"}]")
+	require.NoError(err)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, ctpl1)
+	require.NoError(err)
+	ensureRelationships(ctx, require, ds, ctpl1)
+
+	ctpl1Updated, err := tuple.Parse("document:foo#caveated_viewer@user:tom[test:{\"foo\":\"baz\"}]")
+	require.NoError(err)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, ctpl1Updated)
+	require.NoError(err)
+	ensureRelationships(ctx, require, ds, ctpl1Updated)
+}
+
+// CreateTouchDeleteTouchTest tests writing a relationship, touching it, deleting it, and then touching it.
+func CreateTouchDeleteTouchTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	tpl1 := makeTestRel("foo", "tom")
+	tpl2 := makeTestRel("foo", "sarah")
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, tpl1, tpl2)
+	require.NoError(err)
+
+	ensureRelationships(ctx, require, ds, tpl1, tpl2)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, tpl1, tpl2)
+	require.NoError(err)
+
+	ensureRelationships(ctx, require, ds, tpl1, tpl2)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationDelete, tpl1, tpl2)
+	require.NoError(err)
+
+	ensureNotRelationships(ctx, require, ds, tpl1, tpl2)
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, tpl1, tpl2)
+	require.NoError(err)
+
+	ensureRelationships(ctx, require, ds, tpl1, tpl2)
+}
+
+// TouchAlreadyExistingCaveatedTest tests touching the caveat name.
+func TouchAlreadyExistingCaveatedTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	tpl1 := tuple.MustWithCaveat(makeTestRel("foo", "tom"), "formercaveat")
+	tpl2 := makeTestRel("foo", "sarah")
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, tpl1, tpl2)
+	require.NoError(err)
+
+	ensureRelationships(ctx, require, ds, tpl1, tpl2)
+
+	ctpl1 := tuple.MustWithCaveat(makeTestRel("foo", "tom"), "somecaveat")
+	tpl3 := makeTestRel("foo", "fred")
+
+	_, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationTouch, ctpl1, tpl3)
+	require.NoError(err)
+
+	ensureRelationships(ctx, require, ds, tpl2, tpl3, ctpl1)
+}
+
+func MultipleReadsInRWTTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		it, err := rwt.QueryRelationships(ctx, datastore.RelationshipsFilter{
+			OptionalResourceType: "document",
+		}, options.WithQueryShape(queryshape.FindResourceOfType))
+		require.NoError(err)
+
+		for range it {
+			break
+		}
+
+		it, err = rwt.QueryRelationships(ctx, datastore.RelationshipsFilter{
+			OptionalResourceType: "folder",
+		}, options.WithQueryShape(queryshape.FindResourceOfType))
+		require.NoError(err)
+
+		for range it {
+			break
+		}
+
+		return nil
+	})
+	require.NoError(err)
+}
+
+func WriteAndReadInRWT(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		// Write a relationship.
+		rel := makeTestRel("foo", "bar")
+		err := rwt.WriteRelationships(ctx, []tuple.RelationshipUpdate{tuple.Touch(rel)})
+		require.NoError(err)
+
+		// Read the relationship.
+		it, err := rwt.QueryRelationships(ctx, datastore.RelationshipsFilter{
+			OptionalResourceType: testResourceNamespace,
+			OptionalResourceIds:  []string{"foo"},
+		}, options.WithQueryShape(queryshape.Varying))
+		require.NoError(err)
+
+		found, err := datastore.IteratorToSlice(it)
+		require.NoError(err)
+		require.Len(found, 1)
+		return nil
+	})
+	require.NoError(err)
+}
+
+// ConcurrentWriteSerializationTest uses goroutines and channels to deterministically set up a
+// deadlocking dependency between exactly two transactions: one reads a set of resources and then
+// writes, while a second writes an overlapping resource, so the backend must serialize (or abort
+// and retry) one of them. The datastore must resolve the conflict and let both writes complete in
+// bounded time. Unlike ConcurrentWriteDeadlockTest, which floods the same object with many
+// uncoordinated writers to exercise the retry/backoff budget under heavy contention, this test
+// orchestrates a single, precise read-then-write vs. write conflict via channels.
+func ConcurrentWriteSerializationTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	g := errgroup.Group{}
+
+	waitToStart := make(chan struct{})
+	waitToFinish := make(chan struct{})
+	waitToStartCloser := sync.Once{}
+	waitToFinishCloser := sync.Once{}
+
+	startTime := time.Now()
+
+	g.Go(func() error {
+		_, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+			iter, err := rwt.QueryRelationships(ctx, datastore.RelationshipsFilter{
+				OptionalResourceType: testResourceNamespace,
+			}, options.WithQueryShape(queryshape.FindResourceOfType))
+			if err != nil {
+				return err
+			}
+
+			for range iter {
+				break
+			}
+
+			// We do NOT assert the error here because serialization problems can manifest as errors
+			// on the individual writes.
+			rtu := tuple.Touch(makeTestRel("new_resource", "new_user"))
+			err = rwt.WriteRelationships(ctx, []tuple.RelationshipUpdate{rtu})
+
+			waitToStartCloser.Do(func() {
+				close(waitToStart)
+			})
+			<-waitToFinish
+			return err
+		})
+		return err
+	})
+
+	<-waitToStart
+
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		defer waitToFinishCloser.Do(func() {
+			close(waitToFinish)
+		})
+
+		rtu := tuple.Touch(makeTestRel("another_resource", "another_user"))
+		return rwt.WriteRelationships(ctx, []tuple.RelationshipUpdate{rtu})
+	})
+	require.NoError(err)
+	require.NoError(g.Wait())
+	require.Less(time.Since(startTime), 10*time.Second)
+}
+
+// ConcurrentWriteDeadlockTest reproduces https://github.com/authzed/spicedb/issues/3172: many
+// concurrent WriteRelationships targeting the same resource object contend for the same locks and
+// some backends (e.g. MySQL under SERIALIZABLE) abort transactions with a deadlock. The datastore's
+// write retry loop must back off between attempts so the contending writers spread out; otherwise
+// the retries keep re-colliding and exhaust the retry budget. Every writer must eventually succeed.
+func ConcurrentWriteDeadlockTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithData(t, rawDS)
+	ctx := t.Context()
+
+	const concurrency = 50
+
+	// Each goroutine uses the test's context directly (not a shared cancelable group context) so
+	// that one writer giving up does not abort the others; we want to observe every writer's final
+	// outcome.
+	errs := make([]error, concurrency)
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func(i int) {
+			defer wg.Done()
+			rel := tuple.Touch(makeTestRel("shared", fmt.Sprintf("user-%d", i)))
+			_, errs[i] = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+				return rwt.WriteRelationships(ctx, []tuple.RelationshipUpdate{rel})
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		require.NoErrorf(err, "concurrent write %d to the shared resource should eventually succeed", i)
+	}
+}
+
+// ConcurrentWriteRevisionVisibilityTest covers revision visibility when two
+// write transactions overlap: transaction A opens first but is held open while
+// transaction B starts and commits, and only then does A write and commit.
+//   - each transaction's write must be visible when reading at its own
+//     returned revision (read-your-writes)
+//   - when the two revisions are comparable, the later revision must see the
+//     earlier write, and the earlier revision must NOT see the later write
+//   - when the two revisions are concurrent (e.g. Postgres snapshots of
+//     overlapping transactions), neither write may be visible at the other's
+//     revision
+//   - the head revision must see every committed write
+//
+// This test is safe even for datastores that serialize write transactions with
+// a global lock (e.g. memdb): transaction A performs no reads or writes until
+// transaction B has fully committed, so the two never contend for the write
+// lock.
+func ConcurrentWriteRevisionVisibilityTest(t *testing.T, tester DatastoreTester) {
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(t, err)
+
+	ds, _ := testfixtures.StandardDatastoreWithSchema(t, rawDS)
+	ctx := t.Context()
+
+	// docsAt returns which of the given resource object IDs are visible at the
+	// given revision.
+	docsAt := func(rev datastore.Revision, resourceIDs ...string) map[string]bool {
+		reader := ds.SnapshotReader(rev)
+		it, err := reader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+			OptionalResourceType: testResourceNamespace,
+			OptionalResourceIds:  resourceIDs,
+		}, options.WithQueryShape(queryshape.Varying))
+		require.NoError(t, err)
+		rels, err := datastore.IteratorToSlice(it)
+		require.NoError(t, err)
+
+		seen := map[string]bool{}
+		for _, rel := range rels {
+			seen[rel.Resource.ObjectID] = true
+		}
+		return seen
+	}
+
+	// Execute many iterations so that one run is enough to expose ordering problems.
+	const iterations = 1000
+	for i := range iterations {
+		// Unique names per iteration so that visibility assertions cannot be
+		// satisfied by a previous iteration's writes.
+		docA := fmt.Sprintf("doc-a-%d", i)
+		docB := fmt.Sprintf("doc-b-%d", i)
+		relA := tuple.Touch(makeTestRel(docA, "tom"))
+		relB := tuple.Touch(makeTestRel(docB, "tom"))
+
+		var (
+			revA         datastore.Revision
+			errA         error
+			aStarted     = make(chan struct{})
+			aStartedOnce = sync.Once{}
+			bCompleted   = make(chan struct{})
+			aDone        = make(chan struct{})
+		)
+		go func() {
+			defer close(aDone)
+			// The transaction function may be re-run on retryable errors,
+			// either by the datastore's retry loop or by the backend client
+			// itself (e.g. Spanner and CockroachDB re-run on aborts). The
+			// sync.Once and the closed channels make re-runs proceed
+			// immediately instead of hanging.
+			revA, errA = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+				aStartedOnce.Do(func() { close(aStarted) })
+				<-bCompleted // held until B has fully committed below
+				return rwt.WriteRelationships(ctx, []tuple.RelationshipUpdate{relA})
+			})
+		}()
+
+		<-aStarted // A's transaction is now open and blocked
+
+		// Transaction B runs to completion while A remains open.
+		revB, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+			return rwt.WriteRelationships(ctx, []tuple.RelationshipUpdate{relB})
+		})
+		require.NoError(t, err)
+
+		close(bCompleted) // unblocks A
+		<-aDone
+		require.NoError(t, errA)
+
+		require.False(t, revA.Equal(revB), "iteration %d: concurrent transactions must be assigned distinct revisions, both got %v", i, revA)
+
+		// Each transaction's write must be visible at its own returned revision.
+		require.True(t, docsAt(revA, docA)[docA], "iteration %d: A's write is invisible when reading at A's own returned revision %v", i, revA)
+		require.True(t, docsAt(revB, docB)[docB], "iteration %d: B's write is invisible when reading at B's own returned revision %v", i, revB)
+
+		if revA.LessThan(revB) || revB.LessThan(revA) {
+			// The revisions are comparable: the datastore assigned the two
+			// transactions a total order.
+			type write struct {
+				rev datastore.Revision
+				doc string
+			}
+			earlier, later := write{revA, docA}, write{revB, docB}
+			if later.rev.LessThan(earlier.rev) {
+				earlier, later = later, earlier
+			}
+
+			// The write committed at the later revision must not be visible at
+			// the earlier revision.
+			atEarlier := docsAt(earlier.rev, docA, docB)
+			require.True(t, atEarlier[earlier.doc], "iteration %d: %s is invisible at its own revision %v", i, earlier.doc, earlier.rev)
+			require.False(t, atEarlier[later.doc], "iteration %d: %s was committed at later revision %v but is visible at earlier revision %v", i, later.doc, later.rev, earlier.rev)
+
+			// Both writes must be visible at the later revision.
+			atLater := docsAt(later.rev, docA, docB)
+			require.True(t, atLater[earlier.doc], "iteration %d: %s is visible at revision %v but disappears at later revision %v", i, earlier.doc, earlier.rev, later.rev)
+			require.True(t, atLater[later.doc], "iteration %d: %s is invisible at its own revision %v", i, later.doc, later.rev)
+		} else {
+			// The revisions are concurrent (e.g. Postgres snapshots of
+			// overlapping transactions): each transaction's snapshot must
+			// exclude the other's write.
+			require.False(t, docsAt(revA, docB)[docB], "iteration %d: %s was committed by a concurrent transaction at revision %v but is visible at revision %v", i, docB, revB, revA)
+			require.False(t, docsAt(revB, docA)[docA], "iteration %d: %s was committed by a concurrent transaction at revision %v but is visible at revision %v", i, docA, revA, revB)
+		}
+
+		// The head revision must see every committed write.
+		head, err := ds.HeadRevision(ctx)
+		require.NoError(t, err)
+		atHead := docsAt(head.Revision, docA, docB)
+		require.True(t, atHead[docA] && atHead[docB], "iteration %d: head revision %v is missing committed writes: %v", i, head.Revision, atHead)
+	}
+}
+
+func BulkDeleteRelationshipsTest(t *testing.T, tester DatastoreTester) {
+	require := require.New(t)
+
+	rawDS, err := tester.New(t, DefaultRevisionParameters(), 1)
+	require.NoError(err)
+
+	ds, _ := testfixtures.StandardDatastoreWithSchema(t, rawDS)
+	ctx := t.Context()
+
+	// Write a bunch of relationships.
+	t.Log(time.Now(), "starting write")
+	_, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		_, err := rwt.BulkLoad(ctx, testfixtures.NewBulkRelationshipGenerator(testResourceNamespace, testReaderRelation, testUserNamespace, 1000, t))
+		if err != nil {
+			return err
+		}
+
+		_, err = rwt.BulkLoad(ctx, testfixtures.NewBulkRelationshipGenerator(testResourceNamespace, testEditorRelation, testUserNamespace, 1000, t))
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	require.NoError(err)
+
+	// Issue a deletion for the first set of relationships.
+	t.Log(time.Now(), "starting delete")
+	deleteCount := 0
+	deletedRev, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		t.Log(time.Now(), "deleting")
+		deleteCount++
+		_, err := rwt.DeleteRelationships(ctx, &v1.RelationshipFilter{
+			ResourceType:     testResourceNamespace,
+			OptionalRelation: testReaderRelation,
+		})
+		return err
+	})
+	require.NoError(err)
+	require.Equal(1, deleteCount)
+	t.Log(time.Now(), "finished delete")
+
+	// Ensure the relationships were removed.
+	t.Log(time.Now(), "starting check")
+	reader := ds.SnapshotReader(deletedRev)
+	iter, err := reader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+		OptionalResourceType:     testResourceNamespace,
+		OptionalResourceRelation: testReaderRelation,
+	}, options.WithQueryShape(queryshape.Varying))
+	require.NoError(err)
+
+	found, err := datastore.IteratorToSlice(iter)
+	require.NoError(err)
+	require.Empty(found)
+}
+
+func onrToSubjectsFilter(onr tuple.ObjectAndRelation) datastore.SubjectsFilter {
+	return datastore.SubjectsFilter{
+		SubjectType:        onr.ObjectType,
+		OptionalSubjectIds: []string{onr.ObjectID},
+		RelationFilter:     datastore.SubjectRelationFilter{}.WithNonEllipsisRelation(onr.Relation),
+	}
+}
+
+func ensureReverseRelationships(ctx context.Context, require *require.Assertions, ds datastore.Datastore, rels ...tuple.Relationship) {
+	ensureReverseRelationshipsStatus(ctx, require, ds, rels, true)
+}
+
+func ensureNotReverseRelationships(ctx context.Context, require *require.Assertions, ds datastore.Datastore, rels ...tuple.Relationship) {
+	ensureReverseRelationshipsStatus(ctx, require, ds, rels, false)
+}
+
+func ensureReverseRelationshipsStatus(ctx context.Context, require *require.Assertions, ds datastore.Datastore, rels []tuple.Relationship, mustExist bool) {
+	headRevResult, err := ds.HeadRevision(ctx)
+	require.NoError(err)
+
+	reader := ds.SnapshotReader(headRevResult.Revision)
+
+	for _, rel := range rels {
+		filter := datastore.SubjectRelationFilter{
+			NonEllipsisRelation: rel.Subject.Relation,
+		}
+		if rel.Subject.Relation == tuple.Ellipsis {
+			filter.IncludeEllipsisRelation = true
+			filter.NonEllipsisRelation = ""
+		}
+
+		iter, err := reader.ReverseQueryRelationships(ctx, datastore.SubjectsFilter{
+			SubjectType:        rel.Subject.ObjectType,
+			OptionalSubjectIds: []string{rel.Subject.ObjectID},
+			RelationFilter:     filter,
+		}, options.WithQueryShapeForReverse(queryshape.Varying))
+		require.NoError(err)
+
+		found, err := datastore.IteratorToSlice(iter)
+		require.NoError(err)
+
+		if mustExist {
+			require.NotEmpty(found, "expected relationship %s", tuple.MustString(rel))
+		} else {
+			require.Empty(found, "expected relationship %s to not exist", tuple.MustString(rel))
+		}
+
+		if mustExist {
+			require.Len(found, 1)
+			require.Equal(tuple.MustString(rel), tuple.MustString(found[0]))
+		}
+	}
+}
+
+func ensureRelationships(ctx context.Context, require *require.Assertions, ds datastore.Datastore, rels ...tuple.Relationship) {
+	ensureRelationshipsStatus(ctx, require, ds, rels, true)
+}
+
+func ensureNotRelationships(ctx context.Context, require *require.Assertions, ds datastore.Datastore, rels ...tuple.Relationship) {
+	ensureRelationshipsStatus(ctx, require, ds, rels, false)
+}
+
+func ensureRelationshipsStatus(ctx context.Context, require *require.Assertions, ds datastore.Datastore, rels []tuple.Relationship, mustExist bool) {
+	headRevResult, err := ds.HeadRevision(ctx)
+	require.NoError(err)
+
+	reader := ds.SnapshotReader(headRevResult.Revision)
+
+	for _, rel := range rels {
+		iter, err := reader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+			OptionalResourceType:     rel.Resource.ObjectType,
+			OptionalResourceIds:      []string{rel.Resource.ObjectID},
+			OptionalResourceRelation: rel.Resource.Relation,
+			OptionalSubjectsSelectors: []datastore.SubjectsSelector{
+				{
+					OptionalSubjectType: rel.Subject.ObjectType,
+					OptionalSubjectIds:  []string{rel.Subject.ObjectID},
+				},
+			},
+		}, options.WithQueryShape(queryshape.Varying))
+		require.NoError(err)
+
+		found, err := datastore.IteratorToSlice(iter)
+		require.NoError(err)
+
+		if mustExist {
+			require.NotEmpty(found, "expected relationship %s", tuple.MustString(rel))
+		} else {
+			require.Empty(found, "expected relationship %s to not exist", tuple.MustString(rel))
+		}
+
+		if mustExist {
+			require.Len(found, 1)
+			require.Equal(tuple.MustString(rel), tuple.MustString(found[0]))
+		}
+	}
+}
+
+func ensureRelationshipWithFilter(ctx context.Context, require *require.Assertions, ds datastore.Datastore, filter datastore.RelationshipsFilter, rel tuple.Relationship) {
+	headRevResult, err := ds.HeadRevision(ctx)
+	require.NoError(err)
+
+	reader := ds.SnapshotReader(headRevResult.Revision)
+
+	iter, err := reader.QueryRelationships(ctx, filter, options.WithQueryShape(queryshape.Varying))
+	require.NoError(err)
+
+	found, err := datastore.IteratorToSlice(iter)
+	require.NoError(err)
+
+	require.NotEmpty(found, "expected relationship %s", tuple.MustString(rel))
+	require.Len(found, 1)
+	require.Equal(tuple.MustString(rel), tuple.MustString(found[0]))
+}
+
+func ensureNoRelationshipWithFilter(ctx context.Context, require *require.Assertions, ds datastore.Datastore, filter datastore.RelationshipsFilter) {
+	headRevResult, err := ds.HeadRevision(ctx)
+	require.NoError(err)
+
+	reader := ds.SnapshotReader(headRevResult.Revision)
+
+	iter, err := reader.QueryRelationships(ctx, filter, options.WithQueryShape(queryshape.Varying))
+	require.NoError(err)
+
+	found, err := datastore.IteratorToSlice(iter)
+	require.NoError(err)
+
+	require.Empty(found)
+}
+
+func countRels(ctx context.Context, require *require.Assertions, ds datastore.Datastore, resourceType string) int {
+	headRevResult, err := ds.HeadRevision(ctx)
+	require.NoError(err)
+
+	reader := ds.SnapshotReader(headRevResult.Revision)
+
+	iter, err := reader.QueryRelationships(ctx, datastore.RelationshipsFilter{
+		OptionalResourceType: resourceType,
+	}, options.WithQueryShape(queryshape.FindResourceOfType))
+	require.NoError(err)
+
+	counter := 0
+	for _, err := range iter {
+		require.NoError(err)
+		counter++
+	}
+
+	return counter
+}

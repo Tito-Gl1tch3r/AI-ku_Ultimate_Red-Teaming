@@ -1,0 +1,133 @@
+package v1
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+
+	"github.com/gorilla/schema"
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	utilsmetav1 "github.com/kubescape/opa-utils/httpserver/meta/v1"
+)
+
+type ScanQueryParams struct {
+	// Wait for scanning to complete (synchronous request)
+	// default: false
+	ReturnResults bool `schema:"wait" json:"wait"`
+	// Do not delete results after returning (relevant only for synchronous requests)
+	// default: false
+	KeepResults bool `schema:"keep" json:"keep"`
+	// Do not persist data after scanning
+	//default: false
+	SkipPersistence bool `schema:"skipPersistence" json:"skipPersistence"`
+	// URL to POST a scan-completion signal to when the scan finishes.
+	// The callback carries the scan ID only; results must be fetched via GET /v1/results.
+	CallbackURL string `schema:"callback" json:"callback"`
+}
+
+// swagger:parameters getScanResults
+type GetResultsQueryParams struct {
+	// ID of the requested scan. If empty or not provided, defaults to the latest scan.
+	//
+	// in: query
+	ScanID string `schema:"id" json:"id"`
+	// Keep the results in local storage after returning them.
+	//
+	// By default, the Kubescape Microservice will delete scan results.
+	//
+	// in: query
+	// default: false
+	KeepResults bool `schema:"keep" json:"keep"`
+}
+
+// swagger:parameters deleteScanResults
+type ResultsQueryParams struct {
+	GetResultsQueryParams
+	// Whether to delete all results
+	//
+	// in: query
+	// default: false
+	AllResults bool `schema:"all" json:"all"`
+}
+
+// swagger:parameters getStatus
+type StatusQueryParams struct {
+	// ID of the scan to check
+	//
+	// in:query
+	// swagger:strfmt uuid4
+	ScanID string `schema:"id" json:"id"`
+}
+
+// swagger:parameters cancelScan
+type CancelScanQueryParams struct {
+	// ID of the scan to cancel. If empty, the latest scan is cancelled.
+	//
+	// in:query
+	// swagger:strfmt uuid4
+	ScanID string `schema:"id" json:"id"`
+}
+
+// scanRequestParams params passed to channel
+type scanRequestParams struct {
+	scanInfo          *cautils.ScanInfo          // request as received from api
+	policyIdentifiers []cautils.PolicyIdentifier // policies to scan
+	scanQueryParams   *ScanQueryParams           // request as received from api
+	scanID            string                     // generated scan ID
+	ctx               context.Context
+	resp              chan *utilsmetav1.Response // Respose chan; nil if not interested.
+	callbackURL       string                     // validated scan-completion callback URL; empty if not requested.
+	isUserScan        bool                       // true when submitted via the Scan handler, not Metrics
+}
+
+// swagger:parameters triggerScan
+type ScanRequest struct {
+	ScanQueryParams
+	// Scan parameters
+	// in:body
+	Body utilsmetav1.PostScanRequest
+}
+
+func getScanParamsFromRequest(r *http.Request, scanID string) (*scanRequestParams, error) {
+	defer r.Body.Close()
+
+	scanRequest := &utilsmetav1.PostScanRequest{}
+	{
+		readBuffer, err := io.ReadAll(r.Body)
+		if err != nil {
+			// handler.writeError(w, fmt.Errorf("failed to read request body, reason: %w", err), scanID)
+			return nil, fmt.Errorf("failed to read request body: %w", err)
+		}
+		if err := json.Unmarshal(readBuffer, &scanRequest); err != nil {
+			return nil, fmt.Errorf("failed to parse request payload, reason: %w", err)
+		}
+		logger.L().Info("REST API received scan request", helpers.String("scanID", scanID), helpers.String("format", scanRequest.Format))
+	}
+
+	scanInfo, policyIdentifiers := getScanCommand(scanRequest, scanID)
+	p := &scanRequestParams{
+		scanID:            scanID,
+		scanQueryParams:   &ScanQueryParams{},
+		scanInfo:          scanInfo,
+		policyIdentifiers: policyIdentifiers,
+		isUserScan:        true,
+	}
+	if err := schema.NewDecoder().Decode(p.scanQueryParams, r.URL.Query()); err != nil {
+		return p, fmt.Errorf("failed to parse query params, reason: %w", err)
+	}
+	if p.scanQueryParams.ReturnResults {
+		p.resp = make(chan *utilsmetav1.Response, 1)
+	}
+	if p.scanQueryParams.CallbackURL != "" {
+		if _, err := validateCallbackURL(p.scanQueryParams.CallbackURL); err != nil {
+			return p, err
+		}
+		p.callbackURL = p.scanQueryParams.CallbackURL
+	}
+
+	return p, nil
+}

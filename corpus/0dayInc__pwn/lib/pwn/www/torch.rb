@@ -1,0 +1,112 @@
+# frozen_string_literal: true
+
+module PWN
+  module WWW
+    # This plugin supports Torch (Tor Search Engine) actions.
+    module Torch
+      # Supported Method Parameters::
+      # browser_obj = PWN::WWW::Torch.open(
+      #   browser_type: 'optional - :firefox|:chrome|:ie|:headless (Defaults to :firefox)',
+      #   proxy: 'optional - scheme://proxy_host:port || tor'
+      # )
+
+      public_class_method def self.open(opts = {})
+        browser_obj = PWN::Plugins::TransparentBrowser.open(opts)
+
+        browser = browser_obj[:browser]
+        browser.goto('http://www.torchtorsearch.com')
+
+        browser_obj
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # browser_obj = PWN::WWW::Torch.open(
+      #   browser_obj: 'required - browser_obj returned from #open method',
+      #   q: 'required search string'
+      # )
+
+      public_class_method def self.search(opts = {})
+        browser_obj = opts[:browser_obj]
+        q = opts[:q].to_s
+
+        browser = browser_obj[:browser]
+        browser.text_field(name: 'q').wait_until(&:present?).set(q)
+        browser.button(name: 'cmd').click!
+
+        browser_obj
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # browser_obj = PWN::WWW::Torch.onion(
+      #   browser_obj: 'required - browser_obj returned from #open method'
+      # )
+
+      public_class_method def self.onion
+        browser_obj = opts[:browser_obj]
+
+        browser = browser_obj[:browser]
+        browser.goto('http://xmh57jrzrnw6insl.onion')
+
+        browser_obj
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # browser_obj = PWN::WWW::Torch.close(
+      #   browser_obj: 'required - browser_obj returned from #open method'
+      # )
+
+      public_class_method def self.close(opts = {})
+        browser_obj = opts[:browser_obj]
+        PWN::Plugins::TransparentBrowser.close(
+          browser_obj: browser_obj
+        )
+      rescue StandardError => e
+        raise e
+      end
+
+      # Author(s):: 0day Inc. <support@0dayinc.com>
+
+      public_class_method def self.authors
+        "AUTHOR(S):
+          0day Inc. <support@0dayinc.com>
+        "
+      end
+
+      # Display Usage for this Module
+
+      public_class_method def self.help
+        puts "USAGE:
+          # Open a session or connection and return a handle.
+          #{self}.open(
+            browser_type: 'optional - :firefox|:chrome|:ie|:headless (Defaults to :firefox)',
+            proxy: 'optional - scheme://proxy_host:port || tor'
+          )
+
+          # Run a search using the open session.
+          #{self}.search(
+            browser_obj: 'required - browser_obj returned from #open method',
+            q: 'required - required search string'
+          )
+
+          # Run onion and return its result
+          #{self}.onion
+
+          # Close a session previously returned by #open.
+          #{self}.close(
+            browser_obj: 'required - browser_obj returned from #open method'
+          )
+
+          # Print the AUTHOR(S) string for this module.
+          #{self}.authors
+        "
+        constants.sort
+      end
+    end
+  end
+end

@@ -1,0 +1,294 @@
+namespace Spice86.Tests.UI;
+
+using Avalonia.Controls;
+using Avalonia.Headless;
+using Avalonia.Input;
+using Avalonia.Threading;
+
+using AvaloniaHex;
+
+using CommunityToolkit.Mvvm.Messaging;
+
+using FluentAssertions;
+
+using NSubstitute;
+
+using Spice86.Core.CLI.RuntimeOptions;
+using Spice86.Core.Emulator.CPU;
+using Spice86.Core.Emulator.InterruptHandlers.Common.Callback;
+using Spice86.Core.Emulator.Memory;
+using Spice86.Core.Emulator.Memory.Mmu;
+using Spice86.Core.Emulator.StateSerialization;
+using Spice86.Core.Emulator.VM;
+using Spice86.Core.Emulator.VM.Breakpoint;
+using Spice86.Shared.Interfaces;
+using Spice86.ViewModels;
+using Spice86.ViewModels.Services;
+using Spice86.Views;
+
+/// <summary>
+/// Base class for UI breakpoint tests providing shared infrastructure.
+/// Only ILogger and ITextClipboard are mocked; all other components use real implementations.
+/// </summary>
+public abstract class BreakpointUiTestBase : IDisposable {
+    private readonly List<PauseHandler> _pauseHandlers = new();
+
+    /// <summary>
+    /// Creates a mocked logger service. This is the only interface that should be mocked.
+    /// </summary>
+    protected static ILogger CreateMockLoggerService() {
+        return Substitute.For<ILogger>();
+    }
+
+    /// <summary>
+    /// Creates a real pause handler with a mocked logger.
+    /// </summary>
+    protected PauseHandler CreatePauseHandler(ILogger loggerService) {
+        PauseHandler pauseHandler = new(loggerService);
+        _pauseHandlers.Add(pauseHandler);
+        return pauseHandler;
+    }
+
+    /// <summary>
+    /// Creates a CPU State for testing.
+    /// </summary>
+    protected static State CreateState() {
+        return new State(CpuModel.INTEL_80286);
+    }
+
+    /// <summary>
+    /// Creates Memory for testing.
+    /// </summary>
+    protected static (Memory memory, AddressReadWriteBreakpoints memoryBreakpoints, AddressReadWriteBreakpoints ioBreakpoints) CreateMemory() {
+        IMemoryDevice ram = new Ram(A20Gate.EndOfHighMemoryArea);
+        AddressReadWriteBreakpoints memoryBreakpoints = new();
+        AddressReadWriteBreakpoints ioBreakpoints = new();
+        A20Gate a20Gate = new(enabled: false);
+        Memory memory = new(memoryBreakpoints, ram, a20Gate, new RealModeMmu386(), true);
+        return (memory, memoryBreakpoints, ioBreakpoints);
+    }
+
+    /// <summary>
+    /// Creates an EmulatorBreakpointsManager for testing.
+    /// </summary>
+    protected static EmulatorBreakpointsManager CreateBreakpointsManager(
+        IPauseHandler pauseHandler,
+        State state,
+        Memory memory,
+        AddressReadWriteBreakpoints memoryBreakpoints,
+        AddressReadWriteBreakpoints ioBreakpoints) {
+        return new EmulatorBreakpointsManager(pauseHandler, state, memory, memoryBreakpoints, ioBreakpoints);
+    }
+
+    /// <summary>
+    /// Creates a real UIDispatcher using Avalonia's UI thread dispatcher.
+    /// </summary>
+    protected static UIDispatcher CreateUIDispatcher() {
+        return new UIDispatcher(Dispatcher.UIThread);
+    }
+
+    /// <summary>
+    /// Creates a real messenger instance.
+    /// </summary>
+    protected static IMessenger CreateMessenger() {
+        return WeakReferenceMessenger.Default;
+    }
+
+    /// <summary>
+    /// Creates a BreakpointsViewModel for testing.
+    /// Uses real implementations where possible; only ILogger and ITextClipboard are mocked.
+    /// </summary>
+    protected BreakpointsViewModel CreateBreakpointsViewModel(
+        State state,
+        Memory memory,
+        EmulatorBreakpointsManager breakpointsManager,
+        ILogger loggerService) {
+        PauseHandler pauseHandler = CreatePauseHandler(loggerService);
+        UIDispatcher uiDispatcher = CreateUIDispatcher();
+        IMessenger messenger = CreateMessenger();
+
+        // ITextClipboard is mocked because it requires platform-specific clipboard access
+        ITextClipboard textClipboard = Substitute.For<ITextClipboard>();
+
+        return BreakpointsTabPlugin.CreateViewModel(
+            state,
+            pauseHandler,
+            messenger,
+            breakpointsManager,
+            uiDispatcher,
+            textClipboard,
+            memory);
+    }
+
+    /// <summary>
+    /// Processes pending UI events.
+    /// </summary>
+    protected static void ProcessUiEvents() {
+        Dispatcher.UIThread.RunJobs();
+    }
+
+    /// <summary>
+    /// Shows a window and waits for it to be ready.
+    /// </summary>
+    protected static void ShowWindowAndWait(Window window) {
+        window.Show();
+        ProcessUiEvents();
+    }
+
+    /// <summary>
+    /// Closes a window and processes any deferred UI events triggered by the close
+    /// (e.g., window state saving) before the test context is torn down.
+    /// </summary>
+    protected static void CloseWindowAndWait(Window window) {
+        window.Close();
+        ProcessUiEvents();
+    }
+
+    /// <summary>
+    /// Selects a breakpoint type tab by name and processes UI events.
+    /// </summary>
+    /// <param name="viewModel">The BreakpointsViewModel containing the tabs.</param>
+    /// <param name="tabName">The name of the tab to select (e.g., "Execution", "Memory", "Cycles").</param>
+    /// <returns>True if the tab was found and selected, false otherwise.</returns>
+    protected static bool SelectBreakpointTab(BreakpointsViewModel viewModel, string tabName) {
+        BreakpointTypeTabItemViewModel? tab = viewModel.BreakpointTabs.FirstOrDefault(t => t.Header == tabName);
+        if (tab is null) {
+            return false;
+        }
+        viewModel.SelectedBreakpointTypeTab = tab;
+        ProcessUiEvents();
+        return true;
+    }
+
+    /// <summary>
+    /// Creates a BreakpointsView with a properly configured ViewModel.
+    /// Uses real implementations where possible.
+    /// </summary>
+    protected (BreakpointsView view, BreakpointsViewModel viewModel) CreateBreakpointsViewWithViewModel() {
+        State state = CreateState();
+        (Memory memory, AddressReadWriteBreakpoints memoryBreakpoints, AddressReadWriteBreakpoints ioBreakpoints) = CreateMemory();
+        ILogger loggerService = CreateMockLoggerService();
+        PauseHandler pauseHandler = CreatePauseHandler(loggerService);
+        EmulatorBreakpointsManager breakpointsManager = CreateBreakpointsManager(
+            pauseHandler, state, memory, memoryBreakpoints, ioBreakpoints);
+
+        BreakpointsViewModel viewModel = CreateBreakpointsViewModel(
+            state, memory, breakpointsManager, loggerService);
+
+        BreakpointsView view = new() {
+            DataContext = viewModel
+        };
+
+        return (view, viewModel);
+    }
+
+    /// <summary>
+    /// One-shot Arrange helper: creates a view + view model, hosts them in a window, and shows it.
+    /// </summary>
+    protected (BreakpointsView view, BreakpointsViewModel viewModel, Window window) ArrangeBreakpointsView() {
+        (BreakpointsView view, BreakpointsViewModel viewModel) = CreateBreakpointsViewWithViewModel();
+        Window window = new() { Content = view };
+        ShowWindowAndWait(window);
+        return (view, viewModel, window);
+    }
+
+    /// <summary>
+    /// Opens the New... dialog and selects the named breakpoint tab. Asserts that the tab exists.
+    /// </summary>
+    protected static void BeginCreateOnTab(BreakpointsViewModel viewModel, string tabName) {
+        viewModel.BeginCreateBreakpointCommand.Execute(null);
+        ProcessUiEvents();
+        SelectBreakpointTab(viewModel, tabName).Should().BeTrue($"the '{tabName}' tab should exist");
+    }
+
+    /// <summary>
+    /// Aggregates the components produced by <see cref="ArrangeMemoryView"/> for use by MemoryView UI tests.
+    /// </summary>
+    protected sealed record MemoryViewHarness(
+        MemoryView View,
+        MemoryViewModel ViewModel,
+        Window Window,
+        HexEditor HexEditor,
+        State State,
+        Memory Memory);
+
+    /// <summary>
+    /// One-shot Arrange helper for MemoryView UI tests: builds the full DI graph, seeds memory,
+    /// configures the search bar, shows the hosting window, and resolves the HexEditor.
+    /// </summary>
+    protected MemoryViewHarness ArrangeMemoryView(
+        string startAddress,
+        string endAddress,
+        uint searchPayloadAddress,
+        byte[] searchPayload,
+        string memorySearchValue,
+        bool useAsciiSearch) {
+        State state = CreateState();
+        ILogger loggerService = CreateMockLoggerService();
+        PauseHandler pauseHandler = CreatePauseHandler(loggerService);
+        pauseHandler.RequestPause("UI test");
+
+        (Memory memory, AddressReadWriteBreakpoints memoryBreakpoints, AddressReadWriteBreakpoints ioBreakpoints) = CreateMemory();
+
+        CallbackHandler callbackHandler = new(state, loggerService);
+        DosRuntimeState dosRuntimeState = new(installDosServices: false);
+        MemoryDumpOptions memoryDumpOptions = new(dosRuntimeState);
+        MemoryDataExporter memoryDataExporter = new(memory, callbackHandler, memoryDumpOptions);
+
+        EmulatorBreakpointsManager breakpointsManager = CreateBreakpointsManager(
+            pauseHandler, state, memory, memoryBreakpoints, ioBreakpoints);
+        UIDispatcher uiDispatcher = CreateUIDispatcher();
+        IMessenger messenger = CreateMessenger();
+        ITextClipboard textClipboard = Substitute.For<ITextClipboard>();
+        IHostStorageProvider storageProvider = Substitute.For<IHostStorageProvider>();
+        IStructureViewModelFactory structureViewModelFactory = Substitute.For<IStructureViewModelFactory>();
+        BreakpointsViewModel breakpointsViewModel = BreakpointsTabPlugin.CreateViewModel(
+            state, pauseHandler, messenger, breakpointsManager, uiDispatcher, textClipboard, memory);
+
+        memory.WriteRam(searchPayload, searchPayloadAddress);
+
+        MemoryViewModel viewModel = new(
+            memory,
+            memoryDataExporter,
+            state,
+            breakpointsViewModel,
+            pauseHandler,
+            messenger,
+            uiDispatcher,
+            textClipboard,
+            storageProvider,
+            structureViewModelFactory,
+            canCloseTab: false,
+            startAddress: startAddress,
+            endAddress: endAddress);
+        viewModel.MemorySearchValue = memorySearchValue;
+        if (useAsciiSearch) {
+            viewModel.SetSearchDataTypeToAsciiCommand.Execute(null);
+        } else {
+            viewModel.SetSearchDataTypeToBinaryCommand.Execute(null);
+        }
+
+        MemoryView view = new() { DataContext = viewModel };
+        Window window = new() { Content = view };
+        ShowWindowAndWait(window);
+
+        HexEditor? hexEditor = view.FindControl<HexEditor>("HexViewer");
+        hexEditor.Should().NotBeNull();
+        if (hexEditor is null) {
+            throw new InvalidOperationException("HexViewer was not found in MemoryView.");
+        }
+
+        return new MemoryViewHarness(view, viewModel, window, hexEditor, state, memory);
+    }
+
+    /// <summary>
+    /// Disposes of test resources.
+    /// </summary>
+    public void Dispose() {
+        foreach (PauseHandler pauseHandler in _pauseHandlers) {
+            pauseHandler.Dispose();
+        }
+        _pauseHandlers.Clear();
+        GC.SuppressFinalize(this);
+    }
+}

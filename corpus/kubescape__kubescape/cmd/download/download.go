@@ -1,0 +1,115 @@
+package download
+
+import (
+	"fmt"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/core"
+	"github.com/kubescape/kubescape/v4/core/meta"
+	v1 "github.com/kubescape/kubescape/v4/core/meta/datastructures/v1"
+	"github.com/spf13/cobra"
+)
+
+var (
+	downloadExample = fmt.Sprintf(`
+  # Download all artifacts and save them in the default path (~/.kubescape)
+  %[1]s download artifacts
+  
+  # Download all artifacts and save them in /tmp path
+  %[1]s download artifacts --output /tmp
+  
+  # Download the NSA framework. Run '%[1]s list frameworks' for all frameworks names
+  %[1]s download framework nsa
+
+  # Download the "C-0001" control. Run '%[1]s list controls' for all controls ids
+  %[1]s download control C-0001
+
+  # Download the configured exceptions
+  %[1]s download exceptions 
+
+  # Download the configured controls-inputs 
+  %[1]s download controls-inputs 
+`, cautils.ExecName())
+)
+
+// normalizeDownloadTarget maps plurals and common aliases to canonical download targets.
+func normalizeDownloadTarget(target string) string {
+	switch strings.ToLower(target) {
+	case "controls", "control":
+		return core.TargetControl
+	case "frameworks", "framework":
+		return core.TargetFramework
+	case "controls-inputs", "controls-input", "control-inputs", "control-input", "controls-config", "control-config":
+		return core.TargetControlsInputs
+	case "exceptions", "exception":
+		return core.TargetExceptions
+	case "artifacts", "artifact":
+		return core.TargetArtifacts
+	case "attack-tracks", "attack-track", "attacktracks", "attacktrack":
+		return core.TargetAttackTracks
+	default:
+		return target
+	}
+}
+
+// GetDownloadCmd returns the Cobra command for downloading Kubescape policies, frameworks, controls, and artifacts.
+func GetDownloadCmd(ks meta.IKubescape) *cobra.Command {
+	var downloadInfo = v1.DownloadInfo{}
+
+	downloadCmd := &cobra.Command{
+		Use:     "download <policy> <policy name>",
+		Short:   fmt.Sprintf("Download %s", strings.Join(core.DownloadSupportCommands(), ",")),
+		Long:    ``,
+		Example: downloadExample,
+		Args: func(cmd *cobra.Command, args []string) error {
+			supported := strings.Join(core.DownloadSupportCommands(), ",")
+			if len(args) < 1 {
+				return fmt.Errorf("policy type required, supported: %v", supported)
+			}
+			target := normalizeDownloadTarget(args[0])
+			if !slices.Contains(core.DownloadSupportCommands(), target) {
+				return fmt.Errorf("invalid parameter '%s'. Supported parameters: %s", args[0], supported)
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+
+			if err := flagValidationDownload(&downloadInfo); err != nil {
+				return err
+			}
+
+			if filepath.Ext(downloadInfo.Path) == ".json" {
+				downloadInfo.Path, downloadInfo.FileName = filepath.Split(downloadInfo.Path)
+			}
+
+			downloadInfo.Target = normalizeDownloadTarget(args[0])
+			if len(args) >= 2 {
+				if args[1] == "" && (downloadInfo.Target == "framework" || downloadInfo.Target == "control") {
+					return fmt.Errorf("name cannot be empty for %s download", downloadInfo.Target)
+				}
+				downloadInfo.Identifier = args[1]
+			}
+			_, err := ks.Download(&downloadInfo)
+			if err != nil {
+				return err
+			}
+			return nil
+		},
+	}
+
+	downloadCmd.PersistentFlags().StringVarP(&downloadInfo.AccountID, "account", "", "", "Kubescape SaaS account ID. Default will load account ID from cache")
+	downloadCmd.PersistentFlags().StringVarP(&downloadInfo.AccessKey, "access-key", "", "", "Kubescape SaaS access key. Default will load access key from cache")
+	downloadCmd.Flags().StringVarP(&downloadInfo.Path, "output", "o", "", "Output file. If not specified, will save in `~/.kubescape/<policy name>.json`")
+
+	return downloadCmd
+}
+
+// Check if the flag entered are valid
+func flagValidationDownload(downloadInfo *v1.DownloadInfo) error {
+
+	// Validate the user's credentials
+	return cautils.ValidateAccountID(downloadInfo.AccountID)
+}

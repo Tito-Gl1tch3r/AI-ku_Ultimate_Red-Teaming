@@ -1,0 +1,851 @@
+// Same-origin demo entrypoint. Core credentials and corpus scope stay server-side.
+import http from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
+import zlib from "node:zlib";
+import { readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { dirname, extname, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+import { feedGuard, parseSuggestions } from "./feeds.mjs";
+import { createFeed } from "./feed.mjs";
+import { boundsOf, createCatalog, statsQuery, topicsQuery } from "./catalog.mjs";
+import { alertRoutes } from "./alerts.mjs";
+import { createAdmin } from "./admin.mjs";
+import { activePlugins } from "./admin-plugins.mjs";
+import { corporaPicker, createViews } from "./views.mjs";
+import { demoCorpora } from "./corpora.mjs";
+import { createExplorer, createHistory } from "./explore.mjs";
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "dist");
+const core = process.env.QUIVR_API_URL?.replace(/\/$/, "");
+const key = process.env.QUIVR_API_KEY;
+const password = process.env.DEMO_PASSWORD;
+const host = process.env.HOST || "127.0.0.1";
+const port = Number(process.env.PORT || 5183);
+const secure = process.env.DEMO_SECURE_COOKIE === "true";
+// Tests only: how long the Admin tab reuses a read of the engine's rollups.
+const statsMs = Number(process.env.DEMO_STATS_MS);
+if (!core || !key || (!password && host !== "127.0.0.1"))
+  throw new Error(
+    "Configure QUIVR_API_URL, QUIVR_API_KEY and DEMO_PASSWORD for public serving",
+  );
+// The demo corpus, and the other corpora the demo reads (THE-1171): searched,
+// followed in the feed and browsed in the Explorer, never written to. A corpus
+// that stops being read takes its feed, index and Admin view with it.
+const corpora = demoCorpora({
+  upstream: (...args) => upstream(...args),
+  configured: process.env.QUIVR_DEMO_CORPORA,
+  onDropped: (ids) => {
+    for (const id of ids) {
+      liveFeeds.get(id)?.stop();
+      liveFeeds.delete(id);
+      catalogs.delete(id);
+      if (admin?.corpus === id) admin = undefined;
+    }
+  },
+});
+// Sources (THE-732): feed discovery under the private-address refusal,
+// deployment-provided suggestions, and removed sources hidden from lists.
+const feeds = feedGuard({
+  privateOrigins: (process.env.DEMO_FEED_PRIVATE_ORIGINS || "").split(","),
+});
+const suggestions = parseSuggestions(
+  process.env.DEMO_FEED_SUGGESTIONS,
+  console.warn,
+);
+// Source logos: the icon of the site behind each RSS source, fetched under
+// the same refusal and served from this origin (the page's CSP keeps images
+// same-origin). Kept a day once found, an hour when the site has none.
+const LOGO_TTL = 86400000;
+const LOGO_MISS_TTL = 3600000;
+const MAX_LOGOS = 200;
+const MAX_LOGO_CACHE_BYTES = 16 << 20;
+const logos = new Map();
+const cachedBytes = () =>
+  [...logos.values()].reduce((sum, entry) => sum + (entry.logo?.bytes.length || 0), 0);
+function logoFor(feedURL) {
+  const known = logos.get(feedURL);
+  if (known && (known.pending || Date.now() < known.until)) return known.pending || known.logo;
+  const pending = feeds
+    .logo(feedURL)
+    .catch(() => null)
+    .then((logo) => {
+      logos.delete(feedURL);
+      logos.set(feedURL, { logo, until: Date.now() + (logo ? LOGO_TTL : LOGO_MISS_TTL) });
+      // Oldest first, until both the count and the bytes fit.
+      for (const [key, entry] of logos) {
+        if (logos.size <= MAX_LOGOS && cachedBytes() <= MAX_LOGO_CACHE_BYTES) break;
+        if (key !== feedURL && !entry.pending) logos.delete(key);
+      }
+      return logo;
+    });
+  logos.set(feedURL, { pending });
+  return pending;
+}
+const stateFile = process.env.DEMO_STATE_FILE;
+let removed = new Set();
+// Alerts (THE-734) created by the demo, oldest first, and when each was
+// created here: the core does not date Subscriptions.
+let alertIDs = [];
+// Keyed by ids and namespaces people choose: maps without a prototype, so
+// a namespace such as "__proto__" is an ordinary key.
+let alertDates = Object.create(null);
+// Names people gave their sources, by Source Namespace: the core names a
+// source by its namespace only, which Records and alerts already use.
+let sourceNames = Object.create(null);
+if (stateFile)
+  try {
+    const saved = JSON.parse(await readFile(stateFile, "utf8"));
+    removed = new Set(saved.removed || []);
+    alertIDs = Array.isArray(saved.alerts) ? saved.alerts : [];
+    if (saved.created && typeof saved.created === "object")
+      alertDates = Object.assign(Object.create(null), saved.created);
+    if (saved.names && typeof saved.names === "object")
+      sourceNames = Object.assign(Object.create(null), saved.names);
+  } catch (error) {
+    if (error.code !== "ENOENT")
+      console.warn("DEMO_STATE_FILE is unreadable; starting empty.");
+  }
+async function saveState() {
+  if (!stateFile) return;
+  const data = JSON.stringify({
+    removed: [...removed],
+    alerts: alertIDs,
+    created: alertDates,
+    names: sourceNames,
+  });
+  try {
+    await writeFile(stateFile + ".tmp", data);
+    await rename(stateFile + ".tmp", stateFile);
+  } catch {
+    // The removal still holds in memory until the next restart.
+    console.warn("DEMO_STATE_FILE could not be written.");
+  }
+}
+let admin;
+// One feed and one index per corpus read, made on first use.
+const liveFeeds = new Map();
+const catalogs = new Map();
+// The Versions the demo read of each Record, for the Explorer's history.
+const history = createHistory();
+// Every article of a corpus, indexed for the demo's numbers (THE-1038).
+// Alerts watch the demo corpus only.
+const catalogFor = (corpus) => {
+  if (!catalogs.has(corpus))
+    catalogs.set(
+      corpus,
+      createCatalog({
+        upstream,
+        corpus,
+        caught: () => (corpus === corpora.demo() ? alerts.matched(corpus) : {}),
+        ready: () => feedFor(corpus).ready(),
+      }),
+    );
+  return catalogs.get(corpus);
+};
+const feedFor = (corpus) => {
+  if (!liveFeeds.has(corpus))
+    liveFeeds.set(
+      corpus,
+      createFeed({
+        core,
+        key,
+        corpus,
+        upstream,
+        index: catalogFor(corpus),
+        onVersion: history.note,
+      }),
+    );
+  return liveFeeds.get(corpus);
+};
+// The index, with the feed's change stream keeping it current.
+const indexFor = (corpus) => {
+  feedFor(corpus).start();
+  return catalogFor(corpus);
+};
+const readable = (options) => corpora.readable(options);
+const picked = corporaPicker({ readable, demo: corpora.demo });
+const views = createViews({ feedFor, indexFor, upstream });
+const explorer = createExplorer({
+  upstream: (...args) => upstream(...args),
+  readable,
+  picked,
+  demo: corpora.demo,
+  history,
+});
+// The plugins the engine runs, for the Admin tab's Plugins section (THE-797).
+const plugins = activePlugins({ upstream: (...args) => upstream(...args) });
+// The Admin tab (THE-796) follows the Fil's change stream of the demo corpus.
+const adminFor = (corpus) =>
+  (admin ||= {
+    corpus,
+    view: createAdmin({
+      upstream,
+      corpus,
+      follow: (watcher) => feedFor(corpus).watch(watcher),
+      statsMs: statsMs > 0 ? statsMs : undefined,
+    }),
+  }).view;
+const alerts = alertRoutes({
+  upstream: (...args) => upstream(...args),
+  jsonBody: (req) => jsonBody(req),
+  fail: (status, message) => fail(status, message),
+  evaluator: process.env.QUIVR_DEMO_ALERTS_EVALUATOR,
+  owner: "quivr-web-demo",
+  // Described alerts (THE-763) need a classifier behind the alerts plugin; the
+  // deployment says so here rather than the facade probing the core with a
+  // throwaway Subscription.
+  described: ["1", "true"].includes(process.env.DEMO_DESCRIBED_ALERTS || ""),
+  registry: {
+    ids: () => [...alertIDs],
+    created: (id) => alertDates[id],
+    add: async (ids, at) => {
+      alertIDs = [...alertIDs, ...ids.filter((id) => !alertIDs.includes(id))];
+      if (at) for (const id of ids) alertDates[id] ||= at;
+      await saveState();
+    },
+    remove: async (ids) => {
+      alertIDs = alertIDs.filter((id) => !ids.includes(id));
+      for (const id of ids) delete alertDates[id];
+      await saveState();
+    },
+  },
+});
+const equal = (a, b) =>
+  timingSafeEqual(
+    createHash("sha256").update(a).digest(),
+    createHash("sha256").update(b).digest(),
+  );
+const sign = (value) =>
+  createHmac("sha256", key + (password || ""))
+    .update("quivr-demo-session:" + value)
+    .digest("hex");
+const fail = (status, message) => Object.assign(new Error(message), { status });
+// A write for a demo corpus that is no longer the demo's (its databases were
+// reset): the page reloads its session on this code.
+const changed = () =>
+  Object.assign(fail(409, "La démo a été réinitialisée. La page se recharge."), {
+    code: "demo_corpus_changed",
+  });
+// The engine's answer to a write on the demo corpus; a 404 because the
+// corpus is gone forgets it.
+async function written(response) {
+  if (response.status === 404 && !(await corpora.confirm({ fresh: true }))) throw changed();
+  return response;
+}
+async function jsonBody(req) {
+  if (!req.headers["content-type"]?.startsWith("application/json"))
+    throw fail(415, "Requête JSON attendue.");
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > 1 << 20) throw fail(413, "Le texte est trop volumineux.");
+    chunks.push(chunk);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw fail(400, "Requête invalide.");
+  }
+}
+// What the request being answered waited on in the core, for its
+// Server-Timing header: calls made and time spent in them.
+const coreTime = new AsyncLocalStorage();
+async function upstream(path, method = "GET", body, timeout = 8000, signal) {
+  const spent = coreTime.getStore();
+  const started = performance.now();
+  try {
+    return await upstreamCall(path, method, body, timeout, signal);
+  } finally {
+    if (spent) {
+      spent.calls++;
+      spent.ms += performance.now() - started;
+    }
+  }
+}
+async function upstreamCall(path, method, body, timeout, signal) {
+  const response = await fetch(core + path, {
+    method,
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeout)]) : AbortSignal.timeout(timeout),
+    redirect: "error",
+  });
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of response.body) {
+    size += chunk.length;
+    if (size > 2 << 20)
+      throw Object.assign(fail(502, "Réponse du moteur invalide."), {
+        oversized: true,
+      });
+    chunks.push(chunk);
+  }
+  const data = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  return { status: response.status, data };
+}
+function authenticated(req) {
+  if (!password) return true;
+  const cookie =
+    req.headers.cookie
+      ?.split("; ")
+      .find((value) => value.startsWith("quivr_demo="))
+      ?.slice(11) || "";
+  const [expires, signature = ""] = cookie.split(".");
+  return (
+    Number(expires) > Date.now() &&
+    Number(expires) < Date.now() + 86401000 &&
+    equal(signature, sign(expires))
+  );
+}
+// Answers are compressed when the browser accepts it: brotli, else gzip.
+const brotli = promisify(zlib.brotliCompress);
+const gzip = promisify(zlib.gzip);
+const COMPRESS_MIN = 1024;
+function encoding(req) {
+  // Codings the client accepts, "br;q=0" (refused) left out.
+  const accepted = new Set(
+    (req.headers["accept-encoding"] || "")
+      .split(",")
+      .map((part) => part.trim().split(/\s*;\s*/))
+      .filter(([, q]) => !/^q=0(\.0*)?$/.test(q || ""))
+      .map(([name]) => name.toLowerCase()),
+  );
+  return accepted.has("br") ? "br" : accepted.has("gzip") ? "gzip" : "";
+}
+async function compress(body, coding) {
+  if (coding === "br")
+    return brotli(body, {
+      params: {
+        [zlib.constants.BROTLI_PARAM_QUALITY]: 5,
+        [zlib.constants.BROTLI_PARAM_SIZE_HINT]: body.length,
+      },
+    });
+  return gzip(body);
+}
+const tag = (body) =>
+  `"${createHash("sha256").update(body).digest("base64url").slice(0, 27)}"`;
+const fresh = (req, etag) =>
+  (req.headers["if-none-match"] || "")
+    .split(",")
+    .some((value) => value.trim().replace(/^W\//, "") === etag);
+// A JSON answer. A successful read carries an ETag and is revalidated on each
+// use, so a browser reading the same snapshot or list again gets a 304.
+async function send(res, status, data, headers = {}) {
+  const req = res.req;
+  const body = Buffer.from(JSON.stringify(data));
+  const head = {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    ...headers,
+  };
+  const spent = coreTime.getStore();
+  if (spent?.calls)
+    head["Server-Timing"] =
+      `core;dur=${spent.ms.toFixed(1)};desc="${spent.calls} call${spent.calls > 1 ? "s" : ""}"`;
+  if (status === 200 && req.method === "GET" && !headers["Cache-Control"]) {
+    head.ETag = tag(body);
+    head["Cache-Control"] = "private, no-cache";
+    if (fresh(req, head.ETag)) {
+      res.writeHead(304, head);
+      res.end();
+      return;
+    }
+  }
+  await reply(res, status, head, body);
+}
+// `encoded`: the body's compressed forms, or null for one sent as is.
+async function reply(res, status, head, body, encoded) {
+  const coding =
+    body.length >= COMPRESS_MIN && encoded !== null ? encoding(res.req) : "";
+  head.Vary = "Accept-Encoding";
+  if (coding) {
+    body = encoded?.[coding] || (await compress(body, coding));
+    head["Content-Encoding"] = coding;
+  }
+  head["Content-Length"] = body.length;
+  res.writeHead(status, head);
+  res.end(res.req.method === "HEAD" ? undefined : body);
+}
+// Built files, read and compressed once: the bundle does not change while
+// the server runs (a new build means a new deploy).
+const files = new Map();
+async function builtFile(file) {
+  if (files.has(file)) return files.get(file);
+  const loading = readFile(file).then(async (raw) => {
+    // Images and fonts are compressed already: they go as they are.
+    const packed = /\.(png|woff2)$/.test(file);
+    return {
+      raw,
+      etag: tag(raw),
+      encoded: packed
+        ? null
+        : raw.length < COMPRESS_MIN
+          ? {}
+          : {
+              br: await brotli(raw, {
+                params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 11 },
+              }),
+              gzip: await gzip(raw, { level: 9 }),
+            },
+    };
+  });
+  files.set(file, loading);
+  // A missing file is not kept: it answers 404 each time it is asked.
+  loading.catch(() => files.delete(file));
+  return loading;
+}
+// Compressed as the server starts, off the request path: a request in the
+// first second waits for the same work, never redoes it. Listening does not
+// wait, so a restart answers its health check at once.
+readdir(resolve(root, "assets"))
+  .then((names) => [
+    resolve(root, "index.html"),
+    ...names.map((name) => resolve(root, "assets", name)),
+  ])
+  .catch(() => [])
+  .then((paths) => paths.forEach((path) => builtFile(path).catch(() => {})));
+async function authorizeRecord(id) {
+  const record = await upstream(`/v0/records/${id}`);
+  if (record.status >= 500) return record;
+  if (
+    record.status !== 200 ||
+    !(await readable()).includes(record.data.source?.corpus_id)
+  )
+    throw fail(404, "Document introuvable.");
+  return record;
+}
+// Connector routes are fenced to the demo corpus: an instance of any other
+// corpus is reported missing before a read or a mutation is relayed. Secrets
+// in request bodies are relayed once and never logged or kept.
+async function connectorRoute(req, path, url, corpus) {
+  if (path === "/v0/connector-kinds" && req.method === "GET")
+    return upstream(path);
+  if (path === "/v0/connectors" && req.method === "GET") {
+    const query = new URLSearchParams({ corpus_id: corpus });
+    for (const name of ["page_cursor", "limit"]) {
+      const value = url.searchParams.get(name);
+      if (value) query.set(name, value);
+    }
+    const page = await upstream(`${path}?${query}`);
+    if (page.status === 200 && Array.isArray(page.data.items))
+      page.data.items = page.data.items
+        .filter((item) => !removed.has(item.connector_id))
+        .map(named);
+    return page;
+  }
+  if (path === "/v0/connectors" && req.method === "POST") {
+    const body = await jsonBody(req);
+    if (body.corpus_id !== corpus) throw changed();
+    if (body.source_namespace === "web-demo")
+      throw fail(422, "Cet espace de noms est réservé aux textes ajoutés.");
+    if (body.kind === "rss") await feeds.check(body.config?.url);
+    return withName(await written(await upstream(path, "POST", body)));
+  }
+  const match = path.match(
+    /^\/v0\/connectors\/([\w-]+)(?:\/(disable|credential|schedule|runs))?$/,
+  );
+  const method = { disable: "POST", credential: "PUT", schedule: "PUT", runs: "POST" }[
+    match?.[2]
+  ];
+  if (!match || req.method !== (method || "GET")) return undefined;
+  const body = method ? await jsonBody(req) : undefined;
+  const current = await ownConnector(match[1], corpus);
+  if (current.status >= 500) return current;
+  return withName(method ? await upstream(path, method, body) : current);
+}
+// A connector as the browser sees it: with the name given to its source.
+const named = (connector) =>
+  sourceNames[connector.source_namespace]
+    ? { ...connector, display_name: sourceNames[connector.source_namespace] }
+    : connector;
+const withName = (response) =>
+  response.status < 300 && response.data?.source_namespace
+    ? { ...response, data: named(response.data) }
+    : response;
+// Renaming a source names its namespace, every instance included; an empty
+// name, or the namespace itself, gives the source its own name back.
+async function renameSource(req, corpus) {
+  const body = await jsonBody(req);
+  if (typeof body.connector_id !== "string" || typeof body.name !== "string")
+    throw fail(400, "Requête invalide.");
+  const name = body.name.replace(/\s+/g, " ").trim();
+  if (name.length > 80) throw fail(422, "Le nom d’une source tient en 80 caractères.");
+  const current = await ownConnector(body.connector_id, corpus);
+  if (current.status >= 500) return current;
+  const namespace = current.data.source_namespace;
+  if (!name || name === namespace) delete sourceNames[namespace];
+  else sourceNames[namespace] = name;
+  await saveState();
+  return {
+    status: 200,
+    data: { source_namespace: namespace, display_name: sourceNames[namespace] || null },
+  };
+}
+// A connector of the demo corpus that was not removed, or a 404.
+async function ownConnector(id, corpus) {
+  const current = await upstream(`/v0/connectors/${encodeURIComponent(id)}`);
+  if (current.status >= 500) return current;
+  if (
+    current.status !== 200 ||
+    current.data.corpus_id !== corpus ||
+    removed.has(current.data.connector_id)
+  )
+    throw fail(404, "Connecteur introuvable.");
+  return current;
+}
+// Removing a source disables every instance of its Source Namespace (a
+// resumed source has several) and hides them. The core keeps the Records.
+async function removeSource(req, corpus) {
+  const body = await jsonBody(req);
+  if (typeof body.connector_id !== "string")
+    throw fail(400, "Requête invalide.");
+  const current = await ownConnector(body.connector_id, corpus);
+  if (current.status >= 500) return current;
+  const namespace = current.data.source_namespace;
+  const siblings = [];
+  let cursor = "";
+  for (let page = 0; page < 50; page++) {
+    const query = new URLSearchParams({ corpus_id: corpus });
+    if (cursor) query.set("page_cursor", cursor);
+    const list = await upstream(`/v0/connectors?${query}`);
+    if (list.status !== 200) return list;
+    siblings.push(
+      ...list.data.items.filter((c) => c.source_namespace === namespace),
+    );
+    cursor = list.data.next_page_cursor;
+    if (!cursor) break;
+  }
+  for (const c of siblings.filter((c) => c.enabled)) {
+    const done = await upstream(
+      `/v0/connectors/${encodeURIComponent(c.connector_id)}/disable`,
+      "POST",
+      { idempotency_key: `demo-remove:${c.connector_id}` },
+    );
+    if (done.status !== 200) return done;
+  }
+  for (const c of siblings) removed.add(c.connector_id);
+  removed.add(current.data.connector_id);
+  await saveState();
+  return { status: 200, data: { removed: siblings.map((c) => c.connector_id) } };
+}
+const server = http.createServer((req, res) =>
+  coreTime.run({ calls: 0, ms: 0 }, () => handle(req, res)),
+);
+async function handle(req, res) {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "same-origin");
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  );
+  try {
+    const url = new URL(req.url, "http://localhost");
+    const path = url.pathname;
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      // Mutations must come from this origin. Browsers send Origin on every
+      // non-GET fetch; Sec-Fetch-Site covers the rare client that omits it.
+      // Only the login may come from a non-browser client (tests, scripts).
+      const origin = req.headers.origin;
+      const expected = `${secure ? "https" : "http"}://${req.headers.host}`;
+      const sameOrigin = origin
+        ? origin === expected
+        : req.headers["sec-fetch-site"] === "same-origin" ||
+          (path === "/demo/login" && !req.headers["sec-fetch-site"]);
+      if (!sameOrigin) throw fail(403, "Origine non autorisée.");
+    }
+    if (path === "/healthz" && req.method === "GET") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (path === "/demo/login" && req.method === "POST") {
+      const body = await jsonBody(req);
+      if (
+        password &&
+        (typeof body.password !== "string" || !equal(body.password, password))
+      )
+        throw fail(401, "Mot de passe incorrect.");
+      const expires = String(Date.now() + 86400000);
+      res.setHeader(
+        "Set-Cookie",
+        `quivr_demo=${expires}.${sign(expires)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${secure ? "; Secure" : ""}`,
+      );
+      await send(res, 200, { authenticated: true });
+      return;
+    }
+    if (
+      path === "/demo/session" ||
+      path.startsWith("/v0/") ||
+      path.startsWith("/demo/feeds/") ||
+      path === "/demo/sources/remove" ||
+      path === "/demo/sources/rename" ||
+      path.startsWith("/demo/sources/logo/") ||
+      path === "/demo/feed" ||
+      path === "/demo/feed/stream" ||
+      path === "/demo/feed/page" ||
+      path === "/demo/feed/days" ||
+      path === "/demo/feed/stats" ||
+      path === "/demo/feed/topics" ||
+      path === "/demo/corpora" ||
+      path === "/demo/explore" ||
+      path.startsWith("/demo/explore/") ||
+      path === "/demo/sources/stats" ||
+      path === "/demo/alerts" ||
+      path.startsWith("/demo/alerts/") ||
+      path === "/demo/admin" ||
+      path.startsWith("/demo/admin/")
+    ) {
+      if (!authenticated(req))
+        throw fail(401, "Ouvrez la démo pour continuer.");
+      // Every request checks the demo corpus is still there (its databases may
+      // have been reset), the reads of one page load with one call; the
+      // session always asks.
+      await corpora.confirm({ fresh: path === "/demo/session" });
+      const id = await corpora.ready();
+      if (path === "/demo/session" && req.method === "GET") {
+        await send(res, 200, { corpus_id: id, name: "Espace démo" });
+        return;
+      }
+      // The Veille page: a snapshot and a live stream of the corpora picked
+      // (?corpora=a,b; the demo corpus by default).
+      if (path === "/demo/feed" && req.method === "GET") {
+        await send(res, 200, await views.snapshot(await picked(url.searchParams)));
+        return;
+      }
+      if (path === "/demo/feed/stream" && req.method === "GET") {
+        await views.subscribe(req, res, await picked(url.searchParams));
+        return;
+      }
+      // Older days of the feed: one period, newest first, and day counts.
+      if (path === "/demo/feed/page" && req.method === "GET") {
+        await send(res, 200, await views.page(await picked(url.searchParams), url.searchParams));
+        return;
+      }
+      if (path === "/demo/feed/days" && req.method === "GET") {
+        await send(res, 200, await views.days(await picked(url.searchParams), url.searchParams));
+        return;
+      }
+      // The demo's numbers, over every article of the corpora (catalog.mjs).
+      if (path === "/demo/feed/stats" && req.method === "POST") {
+        const corpora = await picked(url.searchParams);
+        await send(res, 200, await views.stats(corpora, statsQuery(await jsonBody(req))));
+        return;
+      }
+      if (path === "/demo/feed/topics" && req.method === "GET") {
+        const corpora = await picked(url.searchParams);
+        await send(res, 200, await views.topics(corpora, topicsQuery(url.searchParams)));
+        return;
+      }
+      // The Explorer: the corpora read, a page of documents, facet values, one document.
+      if (path === "/demo/corpora" && req.method === "GET") {
+        await send(res, 200, await explorer.corpora());
+        return;
+      }
+      if (path === "/demo/explore" && req.method === "GET") {
+        await send(res, 200, await explorer.page(url.searchParams));
+        return;
+      }
+      if (path === "/demo/explore/facets" && req.method === "GET") {
+        // A browser that leaves stops the engine's counts: it admits few at once.
+        const left = new AbortController();
+        res.on("close", () => left.abort());
+        await send(res, 200, await explorer.facets(url.searchParams, left.signal));
+        return;
+      }
+      const explored = path.match(/^\/demo\/explore\/records\/([\w-]+)$/);
+      if (explored && req.method === "GET") {
+        await send(res, 200, await explorer.record(explored[1]));
+        return;
+      }
+      if (path === "/demo/sources/stats" && req.method === "GET") {
+        await send(res, 200, await indexFor(id).sources(boundsOf(url.searchParams.get("bounds"))));
+        return;
+      }
+      const logo = path.match(/^\/demo\/sources\/logo\/([\w-]+)$/);
+      if (logo && req.method === "GET") {
+        const current = await ownConnector(logo[1], id);
+        const feedURL = current.data?.kind === "rss" && current.data.config?.url;
+        const image = typeof feedURL === "string" && (await logoFor(feedURL));
+        // A source without a logo is not asked again for an hour, like the
+        // server's own cache of misses.
+        if (!image) {
+          await send(
+            res,
+            404,
+            { code: "demo_request_failed", message: "Logo introuvable.", retryable: false },
+            { "Cache-Control": `private, max-age=${LOGO_MISS_TTL / 1000}` },
+          );
+          return;
+        }
+        res.writeHead(200, {
+          "Content-Type": image.type,
+          "Content-Length": image.bytes.length,
+          "Cache-Control": "private, max-age=86400",
+          // An SVG logo opened on its own runs nothing, loads nothing and
+          // cannot be framed: this replaces the pages' own policy.
+          "Content-Security-Policy":
+            "default-src 'none'; style-src 'unsafe-inline'; sandbox; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+        });
+        res.end(image.bytes);
+        return;
+      }
+      // The Admin tab, read-only: a snapshot, a live stream, one timeline, the
+      // engine's rollups and the documents stored per day.
+      if (path === "/demo/admin" && req.method === "GET") {
+        await send(res, 200, await adminFor(id).snapshot());
+        return;
+      }
+      if (path === "/demo/admin/stream" && req.method === "GET") {
+        await adminFor(id).subscribe(req, res);
+        return;
+      }
+      let response;
+      const timeline = path.match(
+        /^\/demo\/admin\/documents\/([\w-]+)\/timeline$/,
+      );
+      const stats = path.match(/^\/demo\/admin\/stats\/([\w-]+)$/);
+      if (timeline && req.method === "GET")
+        response = await adminFor(id).timeline(timeline[1]);
+      else if (stats && req.method === "GET")
+        response = await adminFor(id).stats(stats[1], url);
+      else if (path === "/demo/admin/history" && req.method === "GET")
+        response = { status: 200, data: await adminFor(id).history(url) };
+      else if (path === "/demo/admin/plugins" && req.method === "GET")
+        response = await plugins();
+      else if (path.startsWith("/demo/alerts")) {
+        response = await alerts(req, path, id);
+        // The list dates what each alert caught from the index.
+        if (path === "/demo/alerts" && req.method === "GET" && response?.data?.available) {
+          response = { ...response, data: indexFor(id).alerts(response.data) };
+        }
+      }
+      else if (path === "/demo/feeds/suggestions" && req.method === "GET")
+        response = { status: 200, data: { items: suggestions } };
+      else if (path === "/demo/feeds/discover" && req.method === "POST") {
+        const body = await jsonBody(req);
+        response = { status: 200, data: await feeds.discover(body.url) };
+      } else if (path === "/demo/sources/remove" && req.method === "POST")
+        response = await removeSource(req, id);
+      else if (path === "/demo/sources/rename" && req.method === "POST")
+        response = await renameSource(req, id);
+      else if (path === "/v0/search" && req.method === "POST") {
+        const body = await jsonBody(req);
+        const allowed = await readable();
+        if (
+          !Array.isArray(body.corpus_ids) ||
+          !body.corpus_ids.length ||
+          body.corpus_ids.length > 16 ||
+          new Set(body.corpus_ids).size !== body.corpus_ids.length ||
+          !body.corpus_ids.every((corpus) => allowed.includes(corpus))
+        )
+          throw fail(403, "Corpus non autorisé.");
+        // The body goes through unchanged, profile included. A deep search
+        // may take up to the engine's hard bound, 9 s, before it answers.
+        response = await upstream(path, "POST", body, 10000);
+      } else if (path === "/v0/search/profiles" && req.method === "GET") {
+        // The profiles the engine answers: the page offers deep only when listed.
+        response = await upstream(path);
+      } else if (path === "/v0/records" && req.method === "POST") {
+        const body = await jsonBody(req);
+        if (body.source?.namespace !== "web-demo")
+          throw fail(403, "Corpus non autorisé.");
+        if (body.source.corpus_id !== id) throw changed();
+        response = await written(await upstream(path, "POST", body));
+      } else if (path.startsWith("/v0/connector")) {
+        response = await connectorRoute(req, path, url, id);
+      } else if (path === "/v0/changes" && req.method === "GET") {
+        const query = new URLSearchParams({ corpus_id: id, limit: "100" });
+        const cursor = url.searchParams.get("cursor");
+        if (cursor) query.set("cursor", cursor);
+        response = await upstream(`${path}?${query}`);
+      } else if (req.method === "GET") {
+        const record = path.match(
+          /^\/v0\/records\/([\w-]+)(?:\/versions\/([\w-]+))?$/,
+        );
+        const receipt = path.match(/^\/v0\/ingestion-receipts\/([\w-]+)$/);
+        if (record) {
+          response = await authorizeRecord(record[1]);
+          if (record[2] && response.status === 200) {
+            response = await upstream(path);
+            // A Version read here joins the Record's history in the Explorer.
+            if (response.status === 200)
+              history.note(record[1], response.data.version_id, response.data.accepted_at);
+          }
+        } else if (receipt) {
+          response = await upstream(path);
+          if (
+            response.status < 500 &&
+            (response.status !== 200 || response.data.source?.corpus_id !== id)
+          )
+            throw fail(404, "Ajout introuvable.");
+        }
+      }
+      if (!response) throw fail(404, "Page introuvable.");
+      await send(res, response.status, response.data);
+      return;
+    }
+    if (req.method !== "GET" && req.method !== "HEAD")
+      throw fail(405, "Méthode non autorisée.");
+    const relative =
+      decodeURIComponent(path) === "/"
+        ? "/index.html"
+        : decodeURIComponent(path);
+    const file = resolve(root, "." + relative);
+    if (!file.startsWith(root + sep)) throw fail(404, "Page introuvable.");
+    let data;
+    try {
+      data = await builtFile(file);
+    } catch {
+      throw fail(404, "Page introuvable.");
+    }
+    const mime =
+      {
+        ".html": "text/html; charset=utf-8",
+        ".js": "text/javascript",
+        ".css": "text/css",
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+        ".woff2": "font/woff2",
+      }[extname(file)] || "application/octet-stream";
+    const head = {
+      "Content-Type": mime,
+      "Cache-Control": relative.startsWith("/assets/")
+        ? "public,max-age=31536000,immutable"
+        : "no-cache",
+      ETag: data.etag,
+    };
+    if (fresh(req, data.etag)) {
+      res.writeHead(304, head);
+      res.end();
+      return;
+    }
+    await reply(res, 200, head, data.raw, data.encoded);
+  } catch (error) {
+    if (res.headersSent) return void res.destroy();
+    const status = error.status || 503;
+    await send(res, status, {
+      code:
+        error.status && error.code
+          ? error.code
+          : status === 503
+            ? "demo_unavailable"
+            : "demo_request_failed",
+      message: error.status
+        ? error.message
+        : "Le moteur est momentanément indisponible. Réessayez.",
+      retryable: status === 503,
+    });
+  }
+}
+server.requestTimeout = 15000;
+server.headersTimeout = 10000;
+server.listen(port, host, () => {
+  console.log(`Quivr demo listening on ${host}:${server.address().port}`);
+  corpora.check().then((problem) => problem && console.error(problem));
+});

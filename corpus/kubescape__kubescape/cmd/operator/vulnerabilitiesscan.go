@@ -1,0 +1,53 @@
+package operator
+
+import (
+	"fmt"
+
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	"github.com/kubescape/k8s-interface/k8sinterface"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/meta"
+	"github.com/spf13/cobra"
+)
+
+var operatorScanVulnerabilitiesExamples = fmt.Sprintf(`
+
+  # Trigger a vulnerabilities scan
+  %[1]s operator scan vulnerabilities
+
+`, cautils.ExecName())
+
+func getOperatorScanVulnerabilitiesCmd(ks meta.IKubescape, operatorInfo *cautils.OperatorInfo) *cobra.Command {
+	vulnerabilitiesScanInfo := &cautils.VulnerabilitiesScanInfo{}
+
+	configCmd := &cobra.Command{
+		Use:     "vulnerabilities",
+		Short:   "Scan your cluster for vulnerabilities using the Kubescape Operator in-cluster components",
+		Long:    ``,
+		Example: operatorScanVulnerabilitiesExamples,
+		Args: func(cmd *cobra.Command, args []string) error {
+			operatorInfo.Subcommands = append(operatorInfo.Subcommands, "vulnerabilities")
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			vulnerabilitiesScanInfo.ClusterName = k8sinterface.GetContextName()
+			operatorAdapter, err := newOperatorAdapter(vulnerabilitiesScanInfo, operatorInfo.Namespace)
+			if err != nil {
+				return err
+			}
+			logger.L().Start("Triggering the Kubescape Operator for vulnerability scanning")
+			_, err = operatorAdapter.OperatorScan()
+			if err != nil {
+				logger.L().StopError("Failed to trigger the Kubescape Operator for vulnerability scanning", helpers.Error(err))
+				return err
+			}
+			logger.L().StopSuccess("Triggered Kubescape Operator for vulnerability scanning. View the scanning results once they are ready using the following command: \"kubectl get vulnerabilitysummaries\"")
+			return err
+		},
+	}
+
+	configCmd.PersistentFlags().StringSliceVar(&vulnerabilitiesScanInfo.IncludeNamespaces, "include-namespaces", nil, "scan specific namespaces. e.g: --include-namespaces ns-a,ns-b")
+
+	return configCmd
+}

@@ -1,0 +1,499 @@
+package cautils
+
+import (
+	"context"
+	_ "embed"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling/locationresolver"
+	"github.com/kubescape/opa-utils/objectsenvelopes/localworkload"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+	helmchartutil "helm.sh/helm/v3/pkg/chartutil"
+	helmregistry "helm.sh/helm/v3/pkg/registry"
+)
+
+// registryClientField reads an unexported field off a *helmregistry.Client,
+// since the registry package exposes no public getters for plainHTTP,
+// username, or password.
+func registryClientField(t *testing.T, client *helmregistry.Client, name string) reflect.Value {
+	t.Helper()
+	v := reflect.ValueOf(client).Elem().FieldByName(name)
+	require.True(t, v.IsValid(), "helmregistry.Client has no %s field - update this test to match the library", name)
+	return v
+}
+
+func registryClientPlainHTTP(t *testing.T, client *helmregistry.Client) bool {
+	t.Helper()
+	return registryClientField(t, client, "plainHTTP").Bool()
+}
+
+// TestNewRegistryClient_PlainHTTPGatedOnPlainHTTPArg guards against a
+// regression where the plainHTTP client option was gated on the
+// insecureSkipTLS argument instead of the plainHTTP argument. Those mean
+// different things (skip certificate verification vs. disable TLS
+// entirely), so the old code silently disabled encryption for any caller
+// that only asked to skip certificate verification.
+func TestNewRegistryClient_PlainHTTPGatedOnPlainHTTPArg(t *testing.T) {
+	t.Run("plainHTTP=true enables plain HTTP", func(t *testing.T) {
+		client, err := newRegistryClient(true, "", "")
+		require.NoError(t, err)
+		assert.True(t, registryClientPlainHTTP(t, client))
+	})
+
+	t.Run("plainHTTP=false leaves plain HTTP disabled", func(t *testing.T) {
+		client, err := newRegistryClient(false, "", "")
+		require.NoError(t, err)
+		assert.False(t, registryClientPlainHTTP(t, client))
+	})
+}
+
+// TestNewRegistryClient_BasicAuthCredentialsAccepted guards against a
+// regression where the username/password arguments were accepted but never
+// passed to helmregistry.ClientOptBasicAuth, silently dropping credentials
+// for authenticated OCI registries. Asserting only that NewClient succeeds
+// isn't enough - that holds whether or not the credentials are actually
+// applied - so this reads them back off the unexported fields.
+func TestNewRegistryClient_BasicAuthCredentialsAccepted(t *testing.T) {
+	t.Run("username and password both set are applied", func(t *testing.T) {
+		client, err := newRegistryClient(false, "someuser", "somepass")
+		require.NoError(t, err)
+		require.NotNil(t, client)
+		assert.Equal(t, "someuser", registryClientField(t, client, "username").String())
+		assert.Equal(t, "somepass", registryClientField(t, client, "password").String())
+	})
+
+	t.Run("password empty leaves credentials unset", func(t *testing.T) {
+		client, err := newRegistryClient(false, "someuser", "")
+		require.NoError(t, err)
+		require.NotNil(t, client)
+		assert.Empty(t, registryClientField(t, client, "username").String())
+		assert.Empty(t, registryClientField(t, client, "password").String())
+	})
+}
+
+type HelmChartTestSuite struct {
+	suite.Suite
+	helmChartPath         string
+	expectedFiles         []string
+	expectedDefaultValues map[string]any
+}
+
+func TestHelmChartTestSuite(t *testing.T) {
+	suite.Run(t, new(HelmChartTestSuite))
+}
+
+func (s *HelmChartTestSuite) SetupSuite() {
+	o, _ := os.Getwd()
+
+	s.helmChartPath = filepath.Join(filepath.Dir(o), "..", "examples", "helm_chart")
+
+	s.expectedFiles = []string{
+		filepath.Join(s.helmChartPath, "templates", "clusterrolebinding.yaml"),
+		filepath.Join(s.helmChartPath, "templates", "clusterrole.yaml"),
+		filepath.Join(s.helmChartPath, "templates", "serviceaccount.yaml"),
+		filepath.Join(s.helmChartPath, "templates", "rolebinding.yaml"),
+		filepath.Join(s.helmChartPath, "templates", "role.yaml"),
+		filepath.Join(s.helmChartPath, "templates", "cronjob.yaml"),
+	}
+
+	var obj any
+	file, _ := os.ReadFile(filepath.Join("testdata", "helm_expected_default_values.json"))
+	_ = json.Unmarshal([]byte(file), &obj)
+	s.expectedDefaultValues = obj.(map[string]any)
+}
+
+func (s *HelmChartTestSuite) TestInvalidHelmDirectory() {
+	_, err := NewHelmChart("/invalid_path")
+	s.Error(err)
+}
+
+func (s *HelmChartTestSuite) TestValidHelmDirectory() {
+	chart, err := NewHelmChart(s.helmChartPath)
+	s.NoError(err)
+	s.NotNil(chart)
+}
+
+func (s *HelmChartTestSuite) TestGetName() {
+	chart, _ := NewHelmChart(s.helmChartPath)
+	s.Equal("kubescape", chart.GetName())
+}
+
+func (s *HelmChartTestSuite) TestGetDefaultValues() {
+	chart, _ := NewHelmChart(s.helmChartPath)
+
+	values := chart.GetDefaultValues()
+
+	valuesJson, _ := json.Marshal(values)
+	expectedValuesJson, _ := json.Marshal(s.expectedDefaultValues)
+
+	s.JSONEq(string(valuesJson), string(expectedValuesJson))
+}
+
+func (s *HelmChartTestSuite) TestGetWorkloadsWithOverride() {
+	chart, err := NewHelmChart(s.helmChartPath)
+	s.NoError(err, "Expected a valid helm chart")
+
+	values := chart.GetDefaultValues()
+
+	// Default pullPolicy value = Always
+	pullPolicyValue := values["image"].(map[string]any)["pullPolicy"].(string)
+	s.Equal(pullPolicyValue, "Always")
+
+	// Override default value
+	values["image"].(map[string]any)["pullPolicy"] = "Never"
+
+	fileToWorkloads, errs := chart.GetWorkloads(values)
+	s.Len(errs, 0)
+
+	s.Lenf(fileToWorkloads, len(s.expectedFiles), "Expected %d files", len(s.expectedFiles))
+
+	for _, expectedFile := range s.expectedFiles {
+		s.Contains(fileToWorkloads, expectedFile)
+		s.FileExists(expectedFile)
+		s.GreaterOrEqualf(len(fileToWorkloads[expectedFile]), 1, "Expected at least one workload in %q", expectedFile)
+
+		for i := range fileToWorkloads[expectedFile] {
+			pathInWorkload := fileToWorkloads[expectedFile][i].(*localworkload.LocalWorkload).GetPath()
+			// Every template in this chart uses "{{ include ... }}", so none of
+			// them is static (see isStaticTemplate) and GetPath() must stay
+			// index-free - the safe degradation, not a resolvable-but-possibly-
+			// wrong line. TestGetWorkloadsWithOptions_StaticTemplateGetsIndex
+			// covers the templated-and-static split this chart cannot exercise.
+			s.Equal(expectedFile, pathInWorkload, "Expected GetPath() to return the bare path: every template here contains \"{{\", so none is provably safe to index")
+		}
+
+		if strings.Contains(expectedFile, "cronjob.yaml") {
+			jsonBytes, _ := json.Marshal(fileToWorkloads[expectedFile][0].GetObject())
+			s.Contains(string(jsonBytes), "\"imagePullPolicy\":\"Never\"", "Expected to overridden value of imagePullPolicy to be 'Never'")
+		}
+	}
+}
+
+func (s *HelmChartTestSuite) TestGetWorkloadsMissingValue() {
+	chart, _ := NewHelmChart(s.helmChartPath)
+
+	values := chart.GetDefaultValues()
+	delete(values, "image")
+
+	fileToWorkloads, errs := chart.GetWorkloads(values)
+	s.Nil(fileToWorkloads)
+	s.Len(errs, 1, "Expected an error due to missing value")
+
+	expectedErrMsg := "<.Values.image.repository>: nil pointer"
+	s.Containsf(errs[0].Error(), expectedErrMsg, "expected error containing %q, got %q", expectedErrMsg, errs[0])
+}
+
+// TestGetWorkloadsWithOptions_ReleaseName verifies that a custom release name passed via
+// HelmReleaseName flows through to .Release.Name in the rendered manifests. The example
+// chart's ClusterRoleBinding sets the subject namespace from .Release.Namespace, so we
+// can use that to confirm the release options are honored.
+func (s *HelmChartTestSuite) TestGetWorkloadsWithOptions_ReleaseName() {
+	chart, err := NewHelmChart(s.helmChartPath)
+	s.Require().NoError(err)
+
+	releaseOpts := helmchartutil.ReleaseOptions{Name: "my-release", Namespace: "my-ns"}
+	fileToWorkloads, errs := chart.GetWorkloadsWithOptions(chart.GetDefaultValues(), releaseOpts)
+	s.Require().Len(errs, 0)
+
+	crbPath := filepath.Join(s.helmChartPath, "templates", "clusterrolebinding.yaml")
+	wls, ok := fileToWorkloads[crbPath]
+	s.Require().True(ok, "ClusterRoleBinding should be rendered")
+	s.Require().NotEmpty(wls)
+
+	jsonBytes, _ := json.Marshal(wls[0].GetObject())
+	s.Contains(string(jsonBytes), `"namespace":"my-ns"`, "release namespace should propagate to subject namespace")
+}
+
+// TestGetWorkloadsWithOptions_StaticTemplateGetsIndex is the regression matthyx's
+// review asked for: a real chart render, not a hand-built session, proving the
+// document index is only ever attached to a template proven static.
+// testdata/helm_chart_layout/mychart carries all three shapes at once -
+// templates/serviceaccount.yaml has no "{{" anywhere and must resolve to a
+// line; templates/deployment.yaml uses ".Release.Name" and ".Values.*" and
+// must not; its subchart's charts/mysubchart/templates/service.yaml templates
+// too and must not, proving the check applies at every nesting depth, not
+// just the parent chart's own templates/.
+func (s *HelmChartTestSuite) TestGetWorkloadsWithOptions_StaticTemplateGetsIndex() {
+	o, _ := os.Getwd()
+	chartPath := filepath.Join(o, "testdata", "helm_chart_layout", "mychart")
+	chart, err := NewHelmChart(chartPath)
+	s.Require().NoError(err)
+
+	fileToWorkloads, errs := chart.GetWorkloadsWithDefaultValues()
+	s.Require().Len(errs, 0)
+
+	staticPath := filepath.Join(chartPath, "templates", "serviceaccount.yaml")
+	staticWls, ok := fileToWorkloads[staticPath]
+	s.Require().True(ok, "static template should be rendered")
+	s.Require().Len(staticWls, 1)
+	s.Equal(staticPath+":0", staticWls[0].(*localworkload.LocalWorkload).GetPath(),
+		"a template with no \"{{\" anywhere is unchanged by rendering, so its document index is safe to claim")
+
+	templatedPath := filepath.Join(chartPath, "templates", "deployment.yaml")
+	templatedWls, ok := fileToWorkloads[templatedPath]
+	s.Require().True(ok, "templated file should still be rendered")
+	s.Require().Len(templatedWls, 1)
+	s.Equal(templatedPath, templatedWls[0].(*localworkload.LocalWorkload).GetPath(),
+		"a template using \"{{ .Values }}\"/\"{{ .Release }}\" must keep the bare path: "+
+			"the resolver would read the unrendered source, which is not valid YAML and "+
+			"in general is not even the same document by the time it templates")
+
+	subchartPath := filepath.Join(chartPath, "charts", "mysubchart", "templates", "service.yaml")
+	subchartWls, ok := fileToWorkloads[subchartPath]
+	s.Require().True(ok, "subchart template should still be rendered")
+	s.Require().Len(subchartWls, 1)
+	s.Equal(subchartPath, subchartWls[0].(*localworkload.LocalWorkload).GetPath(),
+		"the static/templated check must apply to a subchart's templates too, not just the parent's")
+}
+
+// findWorkloadByName returns the workload named name from wls, failing the
+// test if it is not present exactly once - the tests below rely on picking
+// out a specific document's workload rather than assuming render order.
+func findWorkloadByName(t *testing.T, wls []workloadinterface.IMetadata, name string) workloadinterface.IMetadata {
+	t.Helper()
+	var found workloadinterface.IMetadata
+	for _, wl := range wls {
+		if wl.GetName() == name {
+			require.Nil(t, found, "expected exactly one workload named %q", name)
+			found = wl
+		}
+	}
+	require.NotNil(t, found, "expected a workload named %q", name)
+	return found
+}
+
+// renderedChartWorkloads renders the layout fixture chart and returns the
+// workloads for one of its templates.
+func (s *HelmChartTestSuite) renderedChartWorkloads(template string) (string, []workloadinterface.IMetadata) {
+	o, _ := os.Getwd()
+	chartPath := filepath.Join(o, "testdata", "helm_chart_layout", "mychart")
+	chart, err := NewHelmChart(chartPath)
+	s.Require().NoError(err)
+
+	fileToWorkloads, errs := chart.GetWorkloadsWithDefaultValues()
+	s.Require().Len(errs, 0)
+
+	path := filepath.Join(chartPath, "templates", template)
+	wls, ok := fileToWorkloads[path]
+	s.Require().Truef(ok, "%s should be rendered", template)
+	return path, wls
+}
+
+// TestGetWorkloadsWithOptions_AlignedDocumentsGetOrdinalIndex is the positive
+// case the two rules below carve exceptions out of: a static template whose
+// documents are all plain single workloads, so each workload's raw document
+// index and its workload ordinal are the same number and the suffix is
+// correct however a consumer reads it. Resolving each one through
+// locationresolver proves the index reaches that document and no other.
+func (s *HelmChartTestSuite) TestGetWorkloadsWithOptions_AlignedDocumentsGetOrdinalIndex() {
+	path, wls := s.renderedChartWorkloads("aligned-multidoc.yaml")
+	s.Require().Len(wls, 3)
+
+	resolver, err := locationresolver.NewPathLocationResolver(path)
+	s.Require().NoError(err)
+
+	// marker labels sit on lines 6, 13 and 20 of the fixture.
+	for _, tc := range []struct {
+		name  string
+		index int
+		line  int
+	}{
+		{"mychart-aligned-first", 0, 6},
+		{"mychart-aligned-second", 1, 13},
+		{"mychart-aligned-third", 2, 20},
+	} {
+		wl := findWorkloadByName(s.T(), wls, tc.name)
+		s.Equal(fmt.Sprintf("%s:%d", path, tc.index), wl.(*localworkload.LocalWorkload).GetPath())
+
+		location, err := resolver.ResolveLocation(".metadata.labels.marker", tc.index)
+		s.Require().NoError(err)
+		s.Equalf(tc.line, location.Line, "%s's marker label is on line %d", tc.name, tc.line)
+	}
+}
+
+// TestGetWorkloadsWithOptions_SkippedDocumentLeavesPathsBare covers a static
+// template whose first YAML document is empty (two consecutive "---"
+// markers). readYamlFile drops that document, so both ConfigMaps sit one
+// ordinal below their raw document index: mychart-static-a is raw document 1
+// but workload 0, and mychart-static-b is raw document 2 but workload 1.
+//
+// There is no suffix that is right for both consumers here, which is why both
+// paths stay bare. Emitting the raw index (this PR's second revision) makes
+// SARIF remediation edit the wrong ConfigMap and puts the second one out of
+// range of the compacted workload list; emitting the ordinal makes line
+// resolution cite the preceding document. The assertions below resolve the
+// raw indexes directly to pin that the two numberings really do disagree for
+// this file, so the bare paths are a deliberate refusal rather than an
+// accident of the fixture.
+func (s *HelmChartTestSuite) TestGetWorkloadsWithOptions_SkippedDocumentLeavesPathsBare() {
+	path, wls := s.renderedChartWorkloads("skipped-document.yaml")
+	s.Require().Len(wls, 2, "the leading empty document must not become a phantom workload")
+
+	for _, name := range []string{"mychart-static-a", "mychart-static-b"} {
+		wl := findWorkloadByName(s.T(), wls, name)
+		s.Equal(path, wl.(*localworkload.LocalWorkload).GetPath(),
+			"a document dropped earlier in the file pushes raw index and workload ordinal apart, so neither is safe to write down")
+	}
+
+	resolver, err := locationresolver.NewPathLocationResolver(path)
+	s.Require().NoError(err)
+
+	locA, err := resolver.ResolveLocation(".metadata.labels.marker", 1)
+	s.Require().NoError(err)
+	s.Equal(8, locA.Line, "workload ordinal 0 is raw document 1, on line 8")
+
+	locB, err := resolver.ResolveLocation(".metadata.labels.marker", 2)
+	s.Require().NoError(err)
+	s.Equal(15, locB.Line, "workload ordinal 1 is raw document 2, on line 15")
+}
+
+// TestGetWorkloadsWithOptions_ListEnvelopesStayUnindexed covers List
+// envelopes, including the singleton ones matthyx's third review caught. A
+// list's workloads are the objects under items[], while both consumers of the
+// suffix address the document root - so the resolver would evaluate a
+// resource's path against the wrapper (here the wrapper carries a deliberately
+// conflicting "marker: wrapper" label, so a wrong answer would be visible
+// rather than empty) and YAMLTreeEditor refuses a List wrapper outright.
+//
+// A one-item list is the interesting case: it produces exactly one workload,
+// at an ordinal that does equal its raw document index, so it passes every
+// other test and is only caught by classifying the document structurally.
+func (s *HelmChartTestSuite) TestGetWorkloadsWithOptions_ListEnvelopesStayUnindexed() {
+	for _, tc := range []struct {
+		template string
+		items    []string
+	}{
+		{"list-envelope.yaml", []string{"mychart-list-item-a", "mychart-list-item-b"}},
+		{"singleton-list.yaml", []string{"mychart-singleton-list-item"}},
+		{"singleton-podlist.yaml", []string{"mychart-singleton-podlist-item"}},
+	} {
+		path, wls := s.renderedChartWorkloads(tc.template)
+		s.Require().Len(wls, len(tc.items))
+
+		for _, name := range tc.items {
+			wl := findWorkloadByName(s.T(), wls, name)
+			s.Equalf(path, wl.(*localworkload.LocalWorkload).GetPath(),
+				"%s: a List item lives under items[], not at the document root, so it may not claim the document's index", tc.template)
+		}
+	}
+}
+
+// TestHelmValueOptions_MergeValues exercises the helm-style value merger so we can be sure
+// that --set / -f equivalents are parsed and merged the same way `helm install` would.
+func TestHelmValueOptions_MergeValues(t *testing.T) {
+	opts := HelmValueOptions{
+		Values:       []string{"image.tag=v1.2.3", "replicaCount=5"},
+		StringValues: []string{"image.repository=myrepo/app"},
+	}
+	merged, err := opts.MergeValues()
+	assert.NoError(t, err)
+
+	image, ok := merged["image"].(map[string]any)
+	assert.True(t, ok, "expected image to be a nested map")
+	assert.Equal(t, "v1.2.3", image["tag"])
+	assert.Equal(t, "myrepo/app", image["repository"])
+	assert.EqualValues(t, 5, merged["replicaCount"])
+}
+
+// TestLoadResourcesFromHelmCharts_WithOverrides confirms that user-supplied --set values
+// are merged over chart defaults end-to-end via the public LoadResourcesFromHelmCharts entrypoint.
+func TestLoadResourcesFromHelmCharts_WithOverrides(t *testing.T) {
+	o, _ := os.Getwd()
+	chartPath := filepath.Join(filepath.Dir(o), "..", "examples", "helm_chart")
+
+	opts := HelmValueOptions{
+		Values: []string{"image.pullPolicy=Never"},
+	}
+	sourceToWorkloads, _, _, err := LoadResourcesFromHelmCharts(context.Background(), chartPath, opts)
+	assert.NoError(t, err)
+
+	cronjobPath := filepath.Join(chartPath, "templates", "cronjob.yaml")
+	wls, ok := sourceToWorkloads[cronjobPath]
+	assert.True(t, ok, "cronjob should be rendered")
+	assert.NotEmpty(t, wls)
+
+	jsonBytes, _ := json.Marshal(wls[0].GetObject())
+	assert.Contains(t, string(jsonBytes), `"imagePullPolicy":"Never"`, "user --set override should win over chart default")
+}
+
+// TestLoadResourcesFromHelmCharts_BadOverrideFailsFast verifies that an invalid user override
+// (here: a -f path that does not exist) is reported as an error rather than silently swallowed
+// and falling back to chart defaults. Scanning the wrong manifests would be worse than failing.
+func TestLoadResourcesFromHelmCharts_BadOverrideFailsFast(t *testing.T) {
+	o, _ := os.Getwd()
+	chartPath := filepath.Join(filepath.Dir(o), "..", "examples", "helm_chart")
+
+	opts := HelmValueOptions{
+		ValueFiles: []string{"/nonexistent/values.yaml"},
+	}
+	_, _, _, err := LoadResourcesFromHelmCharts(context.Background(), chartPath, opts)
+	assert.Error(t, err, "expected fail-fast on missing -f file")
+	assert.Contains(t, err.Error(), "Helm value overrides")
+}
+
+// TestLoadResourcesFromHelmCharts_AttachesProvenance confirms that the
+// helmprovenance package output is plumbed through LoadResourcesFromHelmCharts
+// and lands on the per-source Chart entry. This is the wiring the fix command
+// relies on to surface .Values guidance for Helm-rendered resources.
+func TestLoadResourcesFromHelmCharts_AttachesProvenance(t *testing.T) {
+	o, _ := os.Getwd()
+	chartPath := filepath.Join(filepath.Dir(o), "..", "examples", "helm_chart")
+
+	_, sourceToChart, _, err := LoadResourcesFromHelmCharts(context.TODO(), chartPath, HelmValueOptions{})
+	assert.NoError(t, err)
+
+	cronjobPath := filepath.Join(chartPath, "templates", "cronjob.yaml")
+	c, ok := sourceToChart[cronjobPath]
+	assert.True(t, ok, "expected provenance entry for cronjob.yaml")
+	assert.Equal(t, "templates/cronjob.yaml", c.Provenance.TemplateFile)
+	// cronjob.yaml uses .Values.schedule and .Values.image.* directly, plus
+	// includes from _helpers.tpl that read .Values.nameOverride etc.
+	assert.Contains(t, c.Provenance.ValuesPaths, "schedule")
+	assert.Contains(t, c.Provenance.ValuesPaths, "image.repository")
+	assert.Contains(t, c.Provenance.ValuesPaths, "image.tag")
+	// Helper-derived ref should be folded in via include resolution.
+	assert.Contains(t, c.Provenance.ValuesPaths, "nameOverride")
+}
+
+func TestMergeMaps_DeepMerge(t *testing.T) {
+	base := map[string]any{
+		"image": map[string]any{"repository": "base-repo", "tag": "default"},
+		"keep":  "untouched",
+	}
+	override := map[string]any{
+		"image": map[string]any{"tag": "overridden"},
+		"new":   "added",
+	}
+
+	out := mergeMaps(base, override)
+
+	img := out["image"].(map[string]any)
+	assert.Equal(t, "base-repo", img["repository"], "non-overridden nested key should survive")
+	assert.Equal(t, "overridden", img["tag"], "override should win on conflict")
+	assert.Equal(t, "untouched", out["keep"])
+	assert.Equal(t, "added", out["new"])
+
+	// base should not be mutated by mergeMaps
+	assert.Equal(t, "default", base["image"].(map[string]any)["tag"])
+}
+
+func (s *HelmChartTestSuite) TestIsHelmDirectory() {
+	ok, err := IsHelmDirectory(s.helmChartPath)
+	s.True(ok)
+	s.NoError(err)
+
+	o, _ := os.Getwd()
+	nonHelmDir := filepath.Join(filepath.Dir(o), "../examples/online-boutique")
+	ok, err = IsHelmDirectory(nonHelmDir)
+	s.False(ok)
+	s.Contains(err.Error(), "no Chart.yaml exists in directory")
+}

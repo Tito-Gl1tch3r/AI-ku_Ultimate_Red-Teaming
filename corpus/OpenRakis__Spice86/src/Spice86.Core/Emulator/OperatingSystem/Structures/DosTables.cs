@@ -1,0 +1,106 @@
+namespace Spice86.Core.Emulator.OperatingSystem.Structures;
+
+using Spice86.Core.Emulator.Memory;
+using Spice86.Core.Emulator.Memory.ReaderWriter;
+using Spice86.Core.Emulator.OperatingSystem;
+using Spice86.Shared.Emulator.Memory;
+using Spice86.Shared.Utils;
+
+using System;
+using System.Collections.Generic;
+
+/// <summary>
+/// Centralizes global DOS memory structures
+/// </summary>
+public class DosTables {
+    public const ushort DosPrivateTablesSegmentStart = 0xC800;
+    public const ushort DosPrivateTablesSegmentEnd = 0xD000;
+
+    public ushort CurrentMemorySegment { get; set; } = DosPrivateTablesSegmentStart;
+
+    private readonly Dictionary<ushort, ushort> _jobFileTableSegments = new();
+    private readonly Stack<ushort> _freeJobFileTableSegments = new();
+
+    /// <summary>
+    /// The current country information
+    /// </summary>
+    public CountryInfo CountryInfo { get; set; } = new();
+
+    /// <summary>
+    /// Gets the Current Directory Structure (CDS) for DOS drives.
+    /// </summary>
+    public CurrentDirectoryStructure CurrentDirectoryStructure { get; private set; }
+
+    /// <summary>
+    /// Gets the segmented address where the CDS is allocated.
+    /// </summary>
+    public SegmentedAddress CdsSegmentedAddress { get; private set; }
+
+    /// <summary>
+    /// Gets the Double Byte Character Set (DBCS) lead-byte table.
+    /// </summary>
+    public DosDoubleByteCharacterSet DoubleByteCharacterSet { get; private set; }
+
+    /// <summary>
+    /// Initializes the DOS table structures in memory.
+    /// </summary>
+    /// <param name="memory">The memory interface to write structures to.</param>
+    public DosTables(IByteReaderWriter memory) {
+        // CDS needs one entry per drive (A-Z), rounded up to the nearest paragraph.
+        const int bytesPerParagraph = 16;
+        int cdsSizeInBytes = DosDriveManager.MaxDriveCount * CurrentDirectoryStructure.CdsEntrySize;
+        ushort cdsParagraphs = (ushort)((cdsSizeInBytes + bytesPerParagraph - 1) / bytesPerParagraph);
+        ushort cdsSegment = ReserveDosPrivateSegment(cdsParagraphs);
+        CdsSegmentedAddress = new SegmentedAddress(cdsSegment, 0);
+        CurrentDirectoryStructure = new CurrentDirectoryStructure(memory, CdsSegmentedAddress.Linear);
+
+        ushort currentMemorySegment = ReserveDosPrivateSegment(DosDoubleByteCharacterSet.DbcsTableSizeInParagraphs);
+        ushort doubleByteCharacterSetSegment = (ushort)(currentMemorySegment + 1);
+        uint dbcsAddress = MemoryUtils.ToPhysicalAddress(doubleByteCharacterSetSegment, 0);
+        DoubleByteCharacterSet = new DosDoubleByteCharacterSet(memory, dbcsAddress);
+    }
+
+    /// <summary>
+    /// Reserves memory in the DOS private tables segment area (0xC800-0xD000).
+    /// </summary>
+    /// <param name="paragraphs">Number of paragraphs (16-byte blocks) to allocate.</param>
+    /// <returns>The current segment address pointer in the DOS private tables area, before the reservation is made.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when there is insufficient memory in the DOS private tables area.</exception>
+    public ushort ReserveDosPrivateSegment(ushort paragraphs) {
+        int requestedEndSegment = paragraphs + CurrentMemorySegment;
+        if (requestedEndSegment >= DosPrivateTablesSegmentEnd) {
+            throw new InvalidOperationException("DOS: Not enough memory for internal tables!");
+        }
+        ushort segmentNumber = CurrentMemorySegment;
+        CurrentMemorySegment = (ushort)requestedEndSegment;
+        return segmentNumber;
+    }
+
+    /// <summary>
+    /// Gets the extended job file table segment for a PSP, allocating one if needed.
+    /// </summary>
+    /// <param name="pspSegment">The PSP that owns the job file table.</param>
+    /// <returns>The segment containing the table.</returns>
+    public ushort GetJobFileTableSegment(ushort pspSegment) {
+        if (_jobFileTableSegments.TryGetValue(pspSegment, out ushort segment)) {
+            return segment;
+        }
+        if (_freeJobFileTableSegments.Count > 0) {
+            segment = _freeJobFileTableSegments.Pop();
+        } else {
+            segment = ReserveDosPrivateSegment(0x10);
+        }
+        _jobFileTableSegments.Add(pspSegment, segment);
+        return segment;
+    }
+
+    /// <summary>
+    /// Releases the extended job file table owned by a terminated PSP.
+    /// </summary>
+    /// <param name="pspSegment">The PSP whose table should be released.</param>
+    public void ReleaseJobFileTable(ushort pspSegment) {
+        if (_jobFileTableSegments.Remove(pspSegment, out ushort segment)) {
+            _freeJobFileTableSegments.Push(segment);
+        }
+    }
+}

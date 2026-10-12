@@ -1,0 +1,352 @@
+import 'package:drift3_preview/drift.dart';
+import 'package:mockito/mockito.dart';
+import 'package:test/test.dart';
+
+import '../generated/todos.dart';
+import '../test_utils.dart';
+import '../test_utils/mocks.dart';
+import '../test_utils/test_query_store.dart';
+
+void main() {
+  late TodoDb db;
+  late MockSession session;
+  late TestStreamQueryStore streamQueries;
+
+  setUp(() {
+    session = MockSession();
+    streamQueries = TestStreamQueryStore();
+
+    db = TodoDb(createConnection(session, streams: streamQueries));
+  });
+
+  test('runs generated statements', () async {
+    await db.batch((b) {
+      b.insertAll(db.todosTable, [
+        TodosTableCompanion.insert(content: 'first'),
+        TodosTableCompanion.insert(content: 'second'),
+      ]);
+
+      b.update(db.users, const UsersCompanion(name: Value('new name')));
+      b.update(
+        db.users,
+        const UsersCompanion(name: Value('Another')),
+        where: (Users row) => row.name.equals('old'),
+      );
+
+      b.replaceAll(db.categories, const [
+        CategoriesCompanion(id: Value(RowId(1)), description: Value('new1')),
+        CategoriesCompanion(id: Value(RowId(2)), description: Value('new2')),
+      ]);
+
+      b.deleteWhere<Category, $CategoriesTable>(
+        db.categories,
+        (tbl) => tbl.id.equals(1),
+      );
+      b.deleteAll(db.categories);
+      b.delete(db.todosTable, const TodosTableCompanion(id: Value(RowId(3))));
+
+      b.update(db.users, const UsersCompanion(name: Value('new name 2')));
+
+      b.customStatement('some custom statement', args: [Variable.withInt(4)]);
+    });
+
+    final transaction = session.transactions;
+    final batch =
+        verify(transaction.executeBatch(captureAny)).captured.single
+            as StatementBatch;
+
+    expect(batch.sql, [
+      'INSERT INTO "todos" ("content") VALUES (?1)',
+      'UPDATE "users" SET "name" = ?1;',
+      'UPDATE "users" SET "name" = ?1 WHERE "name" = ?2;',
+      'UPDATE "categories" SET "desc" = ?1,"priority" = 0 WHERE "id" = ?2;',
+      'DELETE FROM "categories" WHERE "id" = ?1;',
+      'DELETE FROM "categories";',
+      'DELETE FROM "todos" WHERE "id" = ?1;',
+      'some custom statement',
+    ]);
+
+    expect(batch.statements, [
+      isStatementInBatch(0, ['first']),
+      isStatementInBatch(0, ['second']),
+      isStatementInBatch(1, ['new name']),
+      isStatementInBatch(2, ['Another', 'old']),
+      isStatementInBatch(3, ['new1', 1]),
+      isStatementInBatch(3, ['new2', 2]),
+      isStatementInBatch(4, [1]),
+      isStatementInBatch(5, []),
+      isStatementInBatch(6, [3]),
+      isStatementInBatch(1, ['new name 2']),
+      isStatementInBatch(7, [4]),
+    ]);
+  });
+
+  test('custom statement can update queries', () async {
+    final update = TableUpdate.onTable(db.users);
+
+    await db.batch((batch) {
+      batch.customStatement('SELECT 1', updates: {update});
+    });
+
+    expect(streamQueries.recordedUpdates, contains(update));
+  });
+
+  test('supports inserts with upsert clause', () async {
+    await db.batch((batch) {
+      batch.insert<Category, $CategoriesTable>(
+        db.categories,
+        CategoriesCompanion.insert(description: 'description'),
+        onConflict: DoUpdate((old) {
+          return const CategoriesCompanion(id: Value(RowId(42)));
+        }),
+      );
+    });
+
+    final batch =
+        verify(session.transactions.executeBatch(captureAny)).captured.single
+            as StatementBatch;
+    expect(batch.sql, [
+      ('INSERT INTO "categories" ("desc") VALUES (?1) '
+          'ON CONFLICT("id") DO UPDATE SET "id" = ?2'),
+    ]);
+    expect(batch.statements, [
+      isStatementInBatch(0, ['description', 42]),
+    ]);
+  });
+
+  test('insertAllOnConflictUpdate', () async {
+    final entries = [
+      CategoriesCompanion.insert(description: 'first'),
+      CategoriesCompanion.insert(description: 'second'),
+    ];
+
+    await db.batch((batch) {
+      batch.insertAllOnConflictUpdate(db.categories, entries);
+    });
+
+    final batch =
+        verify(session.transactions.executeBatch(captureAny)).captured.single
+            as StatementBatch;
+    expect(batch.sql, [
+      ('INSERT INTO "categories" ("desc") VALUES (?1) '
+          'ON CONFLICT("id") DO UPDATE SET "desc" = ?1'),
+    ]);
+    expect(batch.statements, [
+      isStatementInBatch(0, ['first']),
+      isStatementInBatch(0, ['second']),
+    ]);
+  });
+
+  test('insert with where clause and excluded table', () async {
+    // https://github.com/simolus3/drift/issues/1781
+    final entries = [
+      CategoriesCompanion.insert(description: 'first'),
+      CategoriesCompanion.insert(description: 'second'),
+    ];
+
+    await db.batch((batch) {
+      batch.insertAll<Category, $CategoriesTable>(
+        db.categories,
+        entries,
+        onConflict: DoUpdate.withExcluded(
+          (old, excluded) => CategoriesCompanion.custom(
+            description: old.description.dartCast(),
+            priority: excluded.priority.dartCast(),
+          ),
+          where: (old, excluded) =>
+              old.id.dartCast<int>().isGreaterOrEqual(excluded.id.dartCast()),
+        ),
+      );
+    });
+
+    final batch =
+        verify(session.transactions.executeBatch(captureAny)).captured.single
+            as StatementBatch;
+    expect(batch.sql, [
+      ('INSERT INTO "categories" ("desc") VALUES (?1) ON CONFLICT("id") '
+          'DO UPDATE SET "desc" = "categories"."desc",'
+          '"priority" = "excluded"."priority" WHERE "categories"."id" >= "excluded"."id"'),
+    ]);
+    expect(batch.statements, [
+      isStatementInBatch(0, ['first']),
+      isStatementInBatch(0, ['second']),
+    ]);
+  });
+
+  test('supports async batch functions', () async {
+    await db.batch((batch) async {
+      batch.insert(
+        db.categories,
+        CategoriesCompanion.insert(description: 'first'),
+      );
+
+      await Future<void>.delayed(Duration.zero);
+
+      batch.insert(
+        db.categories,
+        CategoriesCompanion.insert(description: 'second'),
+      );
+    });
+
+    final batch =
+        verify(session.transactions.executeBatch(captureAny)).captured.single
+            as StatementBatch;
+    expect(batch.sql, ['INSERT INTO "categories" ("desc") VALUES (?1)']);
+    expect(batch.statements, [
+      isStatementInBatch(0, ['first']),
+      isStatementInBatch(0, ['second']),
+    ]);
+  });
+
+  test('updates stream queries', () async {
+    await db.batch((b) {
+      b.insert(
+        db.todosTable,
+        const TodoEntry(id: RowId(3), content: 'content'),
+      );
+
+      b.update(db.users, const UsersCompanion(name: Value('new user name')));
+      b.replace(
+        db.todosTable,
+        const TodosTableCompanion(id: Value(RowId(3)), content: Value('new')),
+      );
+
+      b.deleteWhere(db.todosTable, (TodosTable row) => row.id.equals(3));
+      b.delete(db.todosTable, const TodosTableCompanion(id: Value(RowId(3))));
+    });
+
+    expect(streamQueries.recordedUpdates, {
+      const TableUpdate('todos', kind: UpdateKind.insert),
+      const TableUpdate('users', kind: UpdateKind.update),
+      const TableUpdate('todos', kind: UpdateKind.update),
+      const TableUpdate('todos', kind: UpdateKind.delete),
+    });
+  });
+
+  test('starts nested transactions', () async {
+    final transactions = session.transactions;
+    when(
+      transactions.begin(any),
+    ).thenAnswer((_) async => MockSession(isTransaction: true));
+
+    await db.transaction(() async {
+      await db.batch((batch) {});
+      await db.batch((batch) {});
+    });
+
+    verify(session.begin(any)).called(1);
+    verify(transactions.begin(any)).called(2);
+  });
+
+  test('starts a new transaction when not running in a transaction', () async {
+    await db.batch((batch) {});
+
+    verify(session.begin(any)).called(1);
+  });
+
+  test('can get results', () async {
+    late BatchedStatement stmt;
+
+    final transactions = session.transactions;
+    when(transactions.executeBatch(any)).thenAnswer((_) async {
+      return [queryResult([], affectedRows: 42)];
+    });
+
+    final results = await db.batch((b) {
+      stmt = b.deleteAll(db.categories);
+    });
+
+    expect(stmt.resolveResult(results).affectedRows, 42);
+  });
+
+  group('insert from select', () {
+    test('with simple select statement', () async {
+      final query = db.select(db.categories);
+      await db.batch((b) {
+        b.insertFromSelect(
+          db.categories,
+          query,
+          columns: {
+            db.categories.description: db.categories.description,
+            db.categories.priority: db.categories.priority,
+          },
+        );
+      });
+
+      final batch =
+          verify(session.transactions.executeBatch(captureAny)).captured.single
+              as StatementBatch;
+      expect(batch.sql, [
+        'WITH _source AS (SELECT "id","desc" AS "c1","priority" AS "c2","description_in_upper_case" FROM "categories")INSERT INTO "categories" '
+            '("desc","priority") SELECT _source."c1",_source."c2" FROM _source',
+      ]);
+      expect(batch.statements, [isStatementInBatch(0, [])]);
+    });
+
+    test('with join', () async {
+      final amountOfTodos = db.todosTable.id.count();
+      final newDescription = db.categories.description + amountOfTodos.cast();
+      final query = db
+          .selectOnly(db.todosTable)
+          .innerJoin(
+            db.categories,
+            on: db.categories.id.equalsExp(db.todosTable.category),
+          )
+          .groupBy([db.categories.id])
+          .addColumns([newDescription, db.categories.priority]);
+
+      await db.batch((b) {
+        b.insertFromSelect(
+          db.categories,
+          query,
+          columns: {
+            db.categories.description: newDescription,
+            db.categories.priority: db.categories.priority,
+          },
+        );
+      });
+
+      final batch =
+          verify(session.transactions.executeBatch(captureAny)).captured.single
+              as StatementBatch;
+      expect(batch.sql, [
+        'WITH _source AS '
+            '(SELECT "categories"."desc" || CAST(COUNT("todos"."id") AS TEXT) AS "c0",'
+            '"categories"."priority" AS "c1" '
+            'FROM "todos" '
+            'INNER JOIN "categories" ON "categories"."id" = "todos"."category" '
+            'GROUP BY "categories"."id")'
+            'INSERT INTO "categories" ("desc","priority") SELECT _source."c0",_source."c1" FROM _source',
+      ]);
+      expect(batch.statements, [isStatementInBatch(0, [])]);
+    });
+
+    test('with on conflict clause', () async {
+      final query = db.select(db.categories);
+      await db.batch((b) {
+        b.insertFromSelect(
+          db.categories,
+          query,
+          columns: {
+            db.categories.description: db.categories.description,
+            db.categories.priority: db.categories.priority,
+          },
+          onConflict: DoUpdate<Category, $CategoriesTable>(
+            (old) => CategoriesCompanion.custom(description: old.description),
+          ),
+        );
+      });
+
+      final batch =
+          verify(session.transactions.executeBatch(captureAny)).captured.single
+              as StatementBatch;
+      expect(batch.sql, [
+        'WITH _source AS (SELECT "id","desc" AS "c1","priority" AS "c2","description_in_upper_case" FROM "categories")'
+            'INSERT INTO "categories" ("desc","priority") SELECT _source."c1",_source."c2" FROM _source '
+            'WHERE TRUE '
+            'ON CONFLICT("id") DO UPDATE SET "desc" = "desc"',
+      ]);
+      expect(batch.statements, [isStatementInBatch(0, [])]);
+    });
+  });
+}

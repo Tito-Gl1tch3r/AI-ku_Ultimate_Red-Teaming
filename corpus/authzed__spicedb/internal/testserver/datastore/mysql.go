@@ -1,0 +1,165 @@
+package datastore
+
+import (
+	"bytes"
+	"database/sql"
+	_ "embed"
+	"fmt"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/mysql"
+
+	"github.com/authzed/spicedb/internal/datastore/mysql/migrations"
+	"github.com/authzed/spicedb/internal/datastore/mysql/version"
+	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/migrate"
+	"github.com/authzed/spicedb/pkg/secrets"
+)
+
+const (
+	testDBPrefix = "spicedb_test_"
+	// This is the db name used for the dsn that's used to generate initial connections.
+	initialDB = "testdb"
+	// We connect as root since the tests create and migrate arbitrary databases,
+	// which the default non-root user is not granted privileges over.
+	mysqlRootUser     = "root"
+	mysqlRootPassword = "secret"
+)
+
+type mysqlTester struct {
+	pausableContainer
+
+	// db is a connection used to create databases
+	db *sql.DB
+	// endpoint is the host:port of the mysql container
+	endpoint string
+	options  MySQLTesterOptions
+}
+
+var _ PausableEngineForTest = (*mysqlTester)(nil)
+
+// MySQLTesterOptions allows tweaking the behaviour of the builder for the MySQL datastore
+type MySQLTesterOptions struct {
+	Prefix                 string
+	MigrateForNewDatastore bool
+}
+
+// RunMySQLForTesting returns a RunningEngineForTest for the mysql driver
+// backed by a MySQL instance with RunningEngineForTest options - no prefix is added, and datastore migration is run.
+func RunMySQLForTesting(t testing.TB, opts ...testcontainers.ContainerCustomizer) RunningEngineForTest {
+	return RunMySQLForTestingWithOptions(t, MySQLTesterOptions{Prefix: "", MigrateForNewDatastore: true}, opts...)
+}
+
+//go:embed config/mysql.cnf
+var mysqlConf []byte
+
+// RunMySQLForTestingWithOptions returns a RunningEngineForTest for the mysql driver
+// backed by a MySQL instance, while allowing options to be forwarded
+func RunMySQLForTestingWithOptions(t testing.TB, options MySQLTesterOptions, opts ...testcontainers.ContainerCustomizer) RunningEngineForTest {
+	ctx := t.Context()
+
+	containerOptions := make([]testcontainers.ContainerCustomizer, 0, len(opts)+3)
+	containerOptions = append(containerOptions,
+		// NOTE: we're doing this instead of using mysql.WithConfigFile
+		// because this function is invoked from more places than just
+		// this file, which means that embedding is easier than providing
+		// a path to a file.
+		testcontainers.WithFiles(testcontainers.ContainerFile{
+			ContainerFilePath: "/etc/mysql/conf.d/my.cnf",
+			Reader:            bytes.NewBuffer(mysqlConf),
+			FileMode:          0o644,
+		}),
+		mysql.WithDatabase(initialDB),
+		// Sets MYSQL_ROOT_PASSWORD so we can connect as root below.
+		mysql.WithPassword(mysqlRootPassword),
+	)
+	containerOptions = append(containerOptions, opts...)
+
+	image := "mirror.gcr.io/library/mysql:" + version.MinimumSupportedMySQLVersion
+	container, err := mysql.Run(ctx,
+		image,
+		containerOptions...,
+	)
+	require.NoError(t, err)
+	testcontainers.CleanupContainer(t, container)
+
+	endpoint, err := container.PortEndpoint(ctx, "3306/tcp", "")
+	require.NoError(t, err)
+
+	builder := &mysqlTester{
+		pausableContainer: pausableContainer{container: container},
+		options:           options,
+		endpoint:          endpoint,
+	}
+
+	builder.db, err = sql.Open("mysql", builder.dsn(initialDB))
+	require.NoError(t, err)
+
+	return builder
+}
+
+// dsn returns a root connection string for the given database, including the
+// parseTime=true parameter required by the MySQL datastore.
+func (mb *mysqlTester) dsn(dbName string) string {
+	return fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true", mysqlRootUser, mysqlRootPassword, mb.endpoint, dbName)
+}
+
+// newDatabase creates a new, empty logical database and returns its DSN. It
+// reports failure by returning an error rather than by failing the test, so that
+// it is safe to call from inside a retry condition: testify runs those in their
+// own goroutine, where require's FailNow would abort that goroutine instead of
+// the test, and the retry would spin until it timed out with nothing to report.
+func (mb *mysqlTester) newDatabase() (string, error) {
+	uniquePortion, err := secrets.TokenHex(4)
+	if err != nil {
+		return "", fmt.Errorf("could not generate unique portion of db name: %w", err)
+	}
+
+	dbName := testDBPrefix + uniquePortion
+
+	if _, err := mb.db.Exec(fmt.Sprintf("CREATE DATABASE %s;", dbName)); err != nil {
+		return "", fmt.Errorf("failed to create database %s: %w", dbName, err)
+	}
+
+	return mb.dsn(dbName), nil
+}
+
+func (mb *mysqlTester) NewDatabase(t testing.TB) string {
+	dsn, err := mb.newDatabase()
+	require.NoError(t, err)
+	return dsn
+}
+
+func (mb *mysqlTester) runMigrate(t testing.TB, dsn string) error {
+	driver, err := migrations.NewMySQLDriverFromDSN(dsn, mb.options.Prefix, datastore.NoCredentialsProvider)
+	if err != nil {
+		return fmt.Errorf("failed to create mysql driver: %w", err)
+	}
+	defer driver.Close(t.Context())
+
+	err = migrations.Manager.Run(t.Context(), driver, migrate.Head, migrate.LiveRun)
+	if err != nil {
+		return fmt.Errorf("failed to run migrations: %w", err)
+	}
+	return nil
+}
+
+func (mb *mysqlTester) NewDatastore(t testing.TB, initFunc InitFunc) datastore.Datastore {
+	var dsn string
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		db, err := mb.newDatabase()
+		if !assert.NoError(collect, err) {
+			return
+		}
+		if mb.options.MigrateForNewDatastore {
+			if !assert.NoError(collect, mb.runMigrate(t, db)) {
+				return
+			}
+		}
+		dsn = db
+	}, newDatastoreTimeout, newDatastoreTick)
+	return initFunc("mysql", dsn)
+}

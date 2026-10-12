@@ -1,0 +1,442 @@
+//! Runtime enforcement tests for AF_UNIX socket access control.
+//!
+//! Linux: `af_unix_mediation: pathname` installs a seccomp-notify BPF filter
+//! that traps AF_UNIX pathname connect/bind and routes them to the supervisor.
+//!
+//! macOS: `filesystem.deny` on a socket path causes Seatbelt to emit both a
+//! filesystem deny and a `network-outbound` deny, blocking the connect.
+
+use nono_test_support::{Argv, nono_test};
+#[cfg(target_os = "linux")]
+use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixDatagram;
+use std::os::unix::net::UnixListener;
+use std::process::Command;
+
+// Socket paths must stay under the 104-byte SUN_LEN limit; use /tmp directly
+// rather than std::env::temp_dir() which on macOS expands to a long path
+// under /var/folders/... that can exceed the limit.
+fn short_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("nono-sock-")
+        .tempdir_in(std::path::Path::new("/tmp"))
+        .expect("tempdir in /tmp")
+}
+
+/// Absolute path to a system `python3` (under a default-allowed bin dir),
+/// preferred over a pyenv/asdf shim: shims re-exec the real interpreter from a
+/// dir the sandbox doesn't grant, so the child fails to exec (exit 127).
+fn python3_bin() -> Option<String> {
+    for cand in ["/usr/bin/python3", "/bin/python3", "/usr/local/bin/python3"] {
+        let runnable = Command::new(cand)
+            .args(["-c", "import socket"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if runnable {
+            return Some(cand.to_string());
+        }
+    }
+    None
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn af_unix_mediation_pathname_blocks_connect_to_unlisted_socket() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+
+    let t = nono_test!("af-unix-mediation");
+    let sock_tmp = short_tempdir();
+    let socket_path = sock_tmp.path().join("t.sock");
+    let _listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+    let profile = t.write_profile(
+        "af-unix-test",
+        r#"{"meta":{"name":"af-unix-test"},"workdir":{"access":"readwrite"},"linux":{"af_unix_mediation":"pathname"}}"#,
+    );
+
+    let socket_arg = socket_path.to_string_lossy().into_owned();
+    let py_script = format!(
+        "import socket; s=socket.socket(socket.AF_UNIX); s.connect({socket_arg:?}); print('connected')"
+    );
+
+    let completed = t
+        .run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(&py_script))
+        .assert_failure("connect to an unlisted socket is denied")
+        .assert_stdout_lacks("connected");
+
+    let stderr = completed.stderr();
+    assert!(
+        stderr.contains("unix socket")
+            || stderr.contains("Unix socket")
+            || stderr.contains("unix_socket"),
+        "expected unix socket denial in diagnostic output\nstderr: {stderr}",
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn af_unix_mediation_pathname_allows_connect_to_listed_socket() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+
+    let t = nono_test!("af-unix-mediation-allow");
+    let sock_tmp = short_tempdir();
+    let socket_path = sock_tmp.path().join("a.sock");
+    let _listener = UnixDatagram::bind(&socket_path).expect("bind test datagram socket");
+
+    let socket_arg = socket_path.to_string_lossy().into_owned();
+    let profile = t.write_profile(
+        "af-unix-allow-test",
+        &format!(
+            r#"{{"meta":{{"name":"af-unix-allow-test"}},"workdir":{{"access":"readwrite"}},"linux":{{"af_unix_mediation":"pathname"}},"filesystem":{{"unix_socket":["{socket_arg}"]}}}}"#
+        ),
+    );
+
+    // Use SOCK_DGRAM: connect() sets the peer address without requiring an
+    // accept() on the far end, so the child exits immediately after the
+    // syscall and we avoid a hang waiting for a stream handshake.
+    let py_script = format!(
+        "import socket; s=socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM); s.connect({socket_arg:?}); print('ok')"
+    );
+
+    // The supervisor must not deny the allowlisted socket path. Other system
+    // sockets touched by Python or libc may still be denied; those are
+    // unrelated to the allowlist entry under test.
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(&py_script))
+        .assert_stderr_lacks(&format!("send {socket_arg}"));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn filesystem_deny_blocks_unix_socket_connect_on_macos() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+
+    let t = nono_test!("macos-socket-deny");
+    let sock_tmp = short_tempdir();
+    let socket_path = sock_tmp.path().join("d.sock");
+    let _listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+    let socket_arg = socket_path.to_string_lossy().into_owned();
+    let profile = t.write_profile(
+        "macos-socket-deny",
+        &format!(
+            r#"{{"meta":{{"name":"macos-socket-deny"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"deny":["{socket_arg}"]}}}}"#
+        ),
+    );
+
+    let py_script = format!(
+        "import socket; s=socket.socket(socket.AF_UNIX); s.connect({socket_arg:?}); print('connected')"
+    );
+
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(&py_script))
+        .assert_failure("connect to a denied socket path is blocked")
+        .assert_stdout_lacks("connected");
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn filesystem_directory_deny_blocks_nested_unix_socket_connect_on_macos() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+
+    let t = nono_test!("macos-socket-directory-deny");
+    let sock_tmp = short_tempdir();
+    let nested = sock_tmp.path().join("nested");
+    std::fs::create_dir(&nested).expect("create nested socket directory");
+    let socket_path = nested.join("d.sock");
+    let _listener = UnixListener::bind(&socket_path).expect("bind nested test socket");
+    let control_tmp = short_tempdir();
+    let control_path = control_tmp.path().join("control.sock");
+    let _control_listener = UnixListener::bind(&control_path).expect("bind control socket");
+
+    let denied_dir = sock_tmp.path().to_string_lossy().into_owned();
+    let socket_arg = socket_path.to_string_lossy().into_owned();
+    let control_arg = control_path.to_string_lossy().into_owned();
+    let profile = t.write_profile(
+        "macos-socket-directory-deny",
+        &format!(
+            r#"{{"meta":{{"name":"macos-socket-directory-deny"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"deny":["{denied_dir}"]}}}}"#
+        ),
+    );
+
+    let py_script = format!(
+        "import socket; c=socket.socket(socket.AF_UNIX); c.connect({control_arg:?}); print('control-connected', flush=True); s=socket.socket(socket.AF_UNIX); s.connect({socket_arg:?}); print('denied-connected')"
+    );
+
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(&py_script))
+        .assert_failure("connect to a socket below a denied directory is blocked")
+        .assert_stdout_contains("control-connected")
+        .assert_stdout_lacks("denied-connected");
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn filesystem_directory_deny_allows_only_bypassed_unix_socket_on_macos() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+
+    let t = nono_test!("macos-socket-directory-bypass");
+    let sock_tmp = short_tempdir();
+    let nested = sock_tmp.path().join("nested");
+    std::fs::create_dir(&nested).expect("create nested socket directory");
+    let allowed_path = nested.join("allowed.sock");
+    let sibling_path = nested.join("sibling.sock");
+    let _allowed_listener = UnixListener::bind(&allowed_path).expect("bind allowed socket");
+    let _sibling_listener = UnixListener::bind(&sibling_path).expect("bind sibling socket");
+
+    let denied_dir = sock_tmp.path().to_string_lossy().into_owned();
+    let allowed_arg = allowed_path.to_string_lossy().into_owned();
+    let sibling_arg = sibling_path.to_string_lossy().into_owned();
+    let profile_without_bypass = t.write_profile(
+        "macos-socket-directory-no-bypass",
+        &format!(
+            r#"{{"meta":{{"name":"macos-socket-directory-no-bypass"}},"workdir":{{"access":"readwrite"}},"network":{{"block":true}},"filesystem":{{"deny":["{denied_dir}"],"unix_socket":["{allowed_arg}"]}}}}"#
+        ),
+    );
+    let profile = t.write_profile(
+        "macos-socket-directory-bypass",
+        &format!(
+            r#"{{"meta":{{"name":"macos-socket-directory-bypass"}},"workdir":{{"access":"readwrite"}},"network":{{"block":true}},"filesystem":{{"deny":["{denied_dir}"],"unix_socket":["{allowed_arg}"],"bypass_protection":["{allowed_arg}"]}}}}"#
+        ),
+    );
+
+    let connect = |path: &str| {
+        format!(
+            "import socket; s=socket.socket(socket.AF_UNIX); s.connect({path:?}); print('connected')"
+        )
+    };
+
+    t.run()
+        .profile(&profile_without_bypass)
+        .exec(Argv::new(&py).arg("-c").arg(connect(&allowed_arg)))
+        .assert_failure("socket grant without a bypass remains blocked")
+        .assert_stdout_lacks("connected");
+
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(connect(&allowed_arg)))
+        .assert_success("explicitly bypassed socket below denied directory is allowed")
+        .assert_stdout_contains("connected");
+
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(connect(&sibling_arg)))
+        .assert_failure("sibling socket below denied directory remains blocked")
+        .assert_stdout_lacks("connected");
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn filesystem_directory_bypass_preserves_unix_socket_scope_on_macos() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+
+    let t = nono_test!("macos-socket-directory-scope-bypass");
+    let sock_tmp = short_tempdir();
+    let nested = sock_tmp.path().join("nested");
+    std::fs::create_dir(&nested).expect("create nested socket directory");
+    let direct_path = sock_tmp.path().join("direct.sock");
+    let sibling_path = sock_tmp.path().join("sibling.sock");
+    let nested_path = nested.join("nested.sock");
+    let _direct_listener = UnixListener::bind(&direct_path).expect("bind direct socket");
+    let _sibling_listener = UnixListener::bind(&sibling_path).expect("bind sibling socket");
+    let _nested_listener = UnixListener::bind(&nested_path).expect("bind nested socket");
+
+    let denied_dir = sock_tmp.path().to_string_lossy().into_owned();
+    let direct_arg = direct_path.to_string_lossy().into_owned();
+    let sibling_arg = sibling_path.to_string_lossy().into_owned();
+    let nested_arg = nested_path.to_string_lossy().into_owned();
+    let dir_profile = t.write_profile(
+        "macos-socket-dir-bypass",
+        &format!(
+            r#"{{"meta":{{"name":"macos-socket-dir-bypass"}},"workdir":{{"access":"readwrite"}},"network":{{"block":true}},"filesystem":{{"deny":["{denied_dir}"],"unix_socket_dir":["{denied_dir}"],"bypass_protection":["{denied_dir}"]}}}}"#
+        ),
+    );
+    let subtree_profile = t.write_profile(
+        "macos-socket-subtree-bypass",
+        &format!(
+            r#"{{"meta":{{"name":"macos-socket-subtree-bypass"}},"workdir":{{"access":"readwrite"}},"network":{{"block":true}},"filesystem":{{"deny":["{denied_dir}"],"unix_socket_subtree":["{denied_dir}"],"bypass_protection":["{denied_dir}"]}}}}"#
+        ),
+    );
+    let exact_profile = t.write_profile(
+        "macos-socket-subtree-exact-bypass",
+        &format!(
+            r#"{{"meta":{{"name":"macos-socket-subtree-exact-bypass"}},"workdir":{{"access":"readwrite"}},"network":{{"block":true}},"filesystem":{{"deny":["{denied_dir}"],"unix_socket_subtree":["{denied_dir}"],"bypass_protection":["{direct_arg}"]}}}}"#
+        ),
+    );
+    let connect = |path: &str| {
+        format!(
+            "import socket; s=socket.socket(socket.AF_UNIX); s.connect({path:?}); print('connected')"
+        )
+    };
+
+    t.run()
+        .profile(&dir_profile)
+        .exec(Argv::new(&py).arg("-c").arg(connect(&direct_arg)))
+        .assert_success("direct-child socket bypass is allowed");
+    t.run()
+        .profile(&dir_profile)
+        .exec(Argv::new(&py).arg("-c").arg(connect(&nested_arg)))
+        .assert_failure("direct-child socket bypass stays non-recursive");
+    t.run()
+        .profile(&subtree_profile)
+        .exec(Argv::new(&py).arg("-c").arg(connect(&nested_arg)))
+        .assert_success("subtree socket bypass is recursive");
+    t.run()
+        .profile(&exact_profile)
+        .exec(Argv::new(&py).arg("-c").arg(connect(&direct_arg)))
+        .assert_success("exact bypass under a subtree grant is allowed");
+    t.run()
+        .profile(&exact_profile)
+        .exec(Argv::new(&py).arg("-c").arg(connect(&sibling_arg)))
+        .assert_failure("exact bypass does not widen to a sibling socket");
+}
+
+/// Yama `ptrace_scope`, or `None` if it can't be read (non-Yama kernel).
+#[cfg(target_os = "linux")]
+fn yama_ptrace_scope() -> Option<i32> {
+    fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Regression test for the AF_UNIX-pathname orphan `connect()` bug: a
+/// double-forked grandchild reparents to pid 1, and pre-fix the supervisor
+/// could no longer read its `/proc/<pid>/mem` to classify the syscall (the read
+/// is ancestry-gated under Yama `ptrace_scope=1`), so its allowed TCP connect
+/// was denied with `EPERM`. The child-subreaper fix keeps such descendants in
+/// the supervisor's ancestry. Only manifests under `ptrace_scope >= 1`.
+#[test]
+#[cfg(target_os = "linux")]
+fn af_unix_mediation_pathname_allows_orphaned_child_tcp_connect() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+    match yama_ptrace_scope() {
+        Some(0) => eprintln!(
+            "note: ptrace_scope=0, the orphan-reparent regression is not exercised \
+             (read succeeds regardless); asserting the positive path only"
+        ),
+        Some(n) => eprintln!("ptrace_scope={n}: regression is exercised"),
+        None => eprintln!("note: could not read ptrace_scope (non-Yama kernel?)"),
+    }
+
+    let t = nono_test!("af-unix-orphan");
+
+    // Live loopback listener so an authorized connect completes locally without
+    // egress (the handshake lands in the backlog; no accept() needed).
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let port = listener.local_addr().expect("local_addr").port();
+
+    let profile = t.write_profile(
+        "af-unix-orphan",
+        r#"{"meta":{"name":"af-unix-orphan"},"workdir":{"access":"readwrite"},"network":{"block":false},"linux":{"af_unix_mediation":"pathname"}}"#,
+    );
+
+    // Foreground connect (always in the supervisor's ancestry) then a
+    // double-forked orphan that reparents to pid 1 before it connects.
+    let py_script = format!(
+        r#"
+import os, socket
+PORT = {port}
+def attempt():
+    s = socket.socket(); s.settimeout(3)
+    try:
+        s.connect(("127.0.0.1", PORT)); return "OK"
+    except OSError as e:
+        return "errno=%d" % (e.errno,)
+    finally:
+        s.close()
+print("foreground " + attempt(), flush=True)
+r, w = os.pipe()
+if os.fork() == 0:
+    os.setsid()
+    if os.fork() == 0:
+        import time; time.sleep(0.5)  # let the intermediate exit -> reparent to pid 1
+        os.write(w, ("orphan " + attempt()).encode()); os._exit(0)
+    os._exit(0)
+os.close(w)
+print(os.read(r, 200).decode(), flush=True)
+"#
+    );
+
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(&py_script))
+        // Sanity: foreground connect is authorized and completes.
+        .assert_stdout_contains("foreground OK")
+        // The fix: the orphaned grandchild's connect is authorized too (pre-fix
+        // it was "orphan errno=1" under ptrace_scope>=1).
+        .assert_stdout_contains("orphan OK")
+        // Fingerprint of the ancestry-gated /proc/<pid>/mem read failing.
+        .assert_stderr_lacks("Failed to read sockaddr");
+}
+
+/// Regression test for issue #1901: a profile that only sets
+/// `network.allow_domain` (proxy-only mode, `linux.af_unix_mediation` left at
+/// its default of off) must not deny `bind(2)` on AF_UNIX sockets. Pre-fix,
+/// the proxy seccomp filter routed every AF_UNIX operation to the supervisor,
+/// which treated them as allowlist-mediated even without the opt-in, so both
+/// pathname and abstract binds failed with `EACCES`. This broke the JVM attach
+/// mechanism (`jcmd`, `jstack`, Mockito test suites).
+#[test]
+#[cfg(target_os = "linux")]
+fn proxy_only_without_af_unix_mediation_allows_af_unix_bind() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+
+    let t = nono_test!("af-unix-proxy-only");
+    let sock_tmp = short_tempdir();
+    let sock_dir = sock_tmp.path().to_string_lossy().into_owned();
+    let socket_path = sock_tmp.path().join("p.sock");
+    let socket_arg = socket_path.to_string_lossy().into_owned();
+
+    let profile = t.write_profile(
+        "af-unix-proxy-only",
+        &format!(
+            r#"{{"meta":{{"name":"af-unix-proxy-only"}},"workdir":{{"access":"readwrite"}},"filesystem":{{"allow":["{sock_dir}"]}},"network":{{"allow_domain":["example.com"]}}}}"#
+        ),
+    );
+
+    // Pathname bind (the reporter's reproducer) plus an abstract-namespace
+    // bind, which proved the denial was not a filesystem grant issue.
+    let py_script = format!(
+        "import socket\n\
+         socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).bind({socket_arg:?})\n\
+         socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).bind('\\0nono-1901-abstract')\n\
+         print('ok')"
+    );
+
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(&py_script))
+        .assert_success("AF_UNIX bind must succeed with only allow_domain set (#1901)")
+        .assert_stdout_contains("ok");
+}

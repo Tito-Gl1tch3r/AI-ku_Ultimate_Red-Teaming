@@ -1,0 +1,146 @@
+//go:generate go run go.uber.org/mock/mockgen -source dispatch.go -destination ./mocks/mock_dispatcher.go -package mocks Dispatcher
+package dispatch
+
+import (
+	"context"
+	"errors"
+
+	"github.com/rs/zerolog"
+
+	log "github.com/authzed/spicedb/internal/logging"
+	core "github.com/authzed/spicedb/pkg/proto/core/v1"
+	v1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
+)
+
+// ReadyState represents the ready state of the dispatcher.
+type ReadyState struct {
+	// Message is a human-readable status message for the current state.
+	Message string
+
+	// IsReady indicates whether the datastore is ready.
+	IsReady bool
+}
+
+// Dispatcher interface describes a method for passing subchecks off to additional machines.
+type Dispatcher interface {
+	Check
+	Expand
+	LookupSubjects
+	LookupResources2
+	LookupResources3
+	Plan
+
+	// Close closes the dispatcher.
+	Close() error
+
+	// ReadyState returns true when dispatcher is able to respond to requests
+	ReadyState() ReadyState
+}
+
+// Check interface describes just the methods required to dispatch check requests.
+type Check interface {
+	// DispatchCheck submits a single check request and returns its result.
+	// The result should be safe to access from multiple goroutines.
+	DispatchCheck(ctx context.Context, req *v1.DispatchCheckRequest) (*v1.DispatchCheckResponse, error)
+}
+
+// Expand interface describes just the methods required to dispatch expand requests.
+type Expand interface {
+	// DispatchExpand submits a single expand request and returns its result.
+	// If an error is returned, DispatchExpandResponse will still contain Metadata.
+	DispatchExpand(ctx context.Context, req *v1.DispatchExpandRequest) (*v1.DispatchExpandResponse, error)
+}
+
+type LookupResources2Stream = Stream[*v1.DispatchLookupResources2Response]
+
+type LookupResources2 interface {
+	DispatchLookupResources2(
+		req *v1.DispatchLookupResources2Request,
+		stream LookupResources2Stream,
+	) error
+}
+
+type LookupResources3Stream = Stream[*v1.DispatchLookupResources3Response]
+
+type LookupResources3 interface {
+	DispatchLookupResources3(
+		req *v1.DispatchLookupResources3Request,
+		stream LookupResources3Stream,
+	) error
+}
+
+// LookupSubjectsStream is an alias for the stream to which found subjects will be written.
+type LookupSubjectsStream = Stream[*v1.DispatchLookupSubjectsResponse]
+
+// LookupSubjects interface describes just the methods required to dispatch lookup subjects requests.
+type LookupSubjects interface {
+	// DispatchLookupSubjects submits a single lookup subjects request, writing its results to the specified stream.
+	DispatchLookupSubjects(
+		req *v1.DispatchLookupSubjectsRequest,
+		stream LookupSubjectsStream,
+	) error
+}
+
+// PlanStream is an alias for the stream to which plan results will be written.
+type PlanStream = Stream[*v1.DispatchQueryPlanResponse]
+
+// PlanCheckLookup is the small, cheap-to-construct descriptor a caller passes
+// to LookupPlanCheck to consult dispatcher caches before paying to serialize a
+// full iterator subtree into a DispatchQueryPlanRequest. The fields mirror the
+// inputs the Plan-Check cache key hashes over (see keys.PlanCheckLookupKey):
+// callers that produce identical descriptors for the same underlying problem
+// will hit the same cache entry as the corresponding DispatchQueryPlan call.
+type PlanCheckLookup struct {
+	CanonicalKey string
+	Resource     *core.ObjectAndRelation
+	Subject      *core.ObjectAndRelation
+	PlanContext  *v1.PlanContext
+}
+
+// Plan interface describes the methods required to dispatch plan-based query planner requests.
+type Plan interface {
+	// DispatchQueryPlan submits a plan-based query request, writing its results to the specified stream.
+	DispatchQueryPlan(
+		req *v1.DispatchQueryPlanRequest,
+		stream PlanStream,
+	) error
+
+	// LookupPlanCheck consults any caches in the dispatcher chain for a
+	// Plan-Check answer matching lookup, without forcing the caller to
+	// serialize the iterator subtree first. Returns (path, true, nil) on a
+	// cache hit; (nil, false, nil) on a miss (caller should proceed to
+	// DispatchQueryPlan); error on a cache I/O failure. Implementations that
+	// hold no cache return (nil, false, nil) and should forward to any wrapped
+	// delegate so chained caches all get probed.
+	LookupPlanCheck(ctx context.Context, lookup PlanCheckLookup) (*v1.ResultPath, bool, error)
+}
+
+// DispatchableRequest is an interface for requests.
+type DispatchableRequest interface {
+	zerolog.LogObjectMarshaler
+
+	GetMetadata() *v1.ResolverMeta
+}
+
+// CheckDepth returns ErrMaxDepth if there is insufficient depth remaining to dispatch.
+func CheckDepth(ctx context.Context, req DispatchableRequest) error {
+	metadata := req.GetMetadata()
+	if metadata == nil {
+		log.Ctx(ctx).Warn().Object("request", req).Msg("request missing metadata")
+		return errors.New("request missing metadata")
+	}
+
+	if metadata.DepthRemaining == 0 {
+		return NewMaxDepthExceededError(req)
+	}
+
+	return nil
+}
+
+// AddResponseMetadata adds the metadata found in the incoming metadata to the existing
+// metadata, *modifying it in place*.
+func AddResponseMetadata(existing *v1.ResponseMeta, incoming *v1.ResponseMeta) {
+	existing.DispatchCount += incoming.DispatchCount
+	existing.CachedDispatchCount += incoming.CachedDispatchCount
+	existing.DepthRequired = max(existing.DepthRequired, incoming.DepthRequired)
+}

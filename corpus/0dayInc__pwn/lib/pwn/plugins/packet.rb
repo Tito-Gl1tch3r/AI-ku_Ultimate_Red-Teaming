@@ -1,0 +1,1432 @@
+# frozen_string_literal: true
+
+require 'packetfu'
+require 'open3'
+require 'fileutils'
+require 'packetfu/protos/arp'
+require 'packetfu/protos/eth'
+require 'packetfu/protos/hsrp'
+require 'packetfu/protos/icmp'
+require 'packetfu/protos/ip'
+require 'packetfu/protos/ipv6'
+require 'packetfu/protos/lldp'
+require 'packetfu/protos/tcp'
+require 'packetfu/protos/udp'
+require 'socket'
+
+module PWN
+  module Plugins
+    # This plugin is used for interacting with PCAP files to map out and visualize in an
+    # automated fashion what comprises a infrastructure, network, and/or application
+    module Packet
+      # Supported Method Parameters::
+      # pcap = PWN::Plugins::Packet.open_pcap_file(
+      #   path: 'required - path to packet capture file'
+      # )
+
+      public_class_method def self.open_pcap_file(opts = {})
+        path = opts[:path].to_s.scrub.strip.chomp if File.exist?(opts[:path].to_s.scrub.strip.chomp)
+
+        PacketFu::PcapFile.read_packets(path)
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # pkt = PWN::Plugins::Packet.construct_arp(
+      #   ip_saddr: 'required - source ip of packet',
+      #   ip_daddr: 'required - destination ip to send packet',
+      #   payload: 'optional - packet payload defaults to empty string',
+      #   ip_id: 'optional - defaults to 0xfeed',
+      #   iface: 'optional - interface to send packet (defaults to eth0)',
+      # )
+
+      public_class_method def self.construct_arp(opts = {})
+        # Ethernet Header
+        eth_src = opts[:eth_src]
+        eth_dst = opts[:eth_dst]
+
+        if opts[:eth_proto]
+          eth_proto = opts[:eth_proto]
+        else
+          eth_proto = 0x0806 # ARP
+        end
+
+        # ARP Header
+        if opts[:arp_hw]
+          arp_hw = opts[:arp_hw].to_i
+        else
+          arp_hw = 1
+        end
+
+        if opts[:arp_proto]
+          arp_proto = opts[:arp_proto]
+        else
+          arp_proto = 0x0800 # IPv4
+        end
+
+        if opts[:arp_hw_len]
+          arp_hw_len = opts[:arp_hw_len].to_i
+        else
+          arp_hw_len = 6
+        end
+
+        if opts[:arp_proto_len]
+          arp_proto_len = opts[:arp_proto_len].to_i
+        else
+          arp_proto_len = 4
+        end
+
+        if opts[:arp_opcode]
+          arp_opcode = opts[:arp_opcode].to_i
+        else
+          arp_opcode = 1
+        end
+
+        arp_src_mac = opts[:arp_src_mac]
+        arp_ip_saddr = opts[:ip_saddr].to_s.scrub.strip.chomp
+
+        arp_dst_mac = opts[:arp_dst_mac]
+        arp_ip_daddr = opts[:ip_daddr].to_s.scrub.strip.chomp
+
+        # Payload
+        payload = opts[:payload]
+
+        pkt = PacketFu::ARPPacket.new(config: PacketFu::Utils.whoami?)
+        # Ethernet Header
+        pkt.eth_saddr = eth_src unless eth_src.nil?
+        pkt.eth_daddr = eth_dst unless eth_dst.nil?
+        pkt.eth_proto = eth_proto
+        # ARP Header
+        pkt.arp_hw = arp_hw
+        pkt.arp_proto = arp_proto
+        pkt.arp_hw_len = arp_hw_len
+        pkt.arp_proto_len = arp_proto_len
+        pkt.arp_opcode = arp_opcode
+        pkt.arp_saddr_mac = arp_src_mac
+        pkt.arp_saddr_ip = arp_ip_saddr
+        pkt.arp_daddr_mac = arp_dst_mac
+        pkt.arp_daddr_ip = arp_ip_daddr
+        # Payload
+        pkt.payload = payload if payload
+
+        pkt
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # pkt = PWN::Plugins::Packet.construct_eth(
+      #   ip_saddr: 'required - source ip of packet',
+      #   ip_daddr: 'required - destination ip to send packet',
+      #   payload: 'optional - packet payload defaults to empty string',
+      #   ip_id: 'optional - defaults to 0xfeed',
+      #   iface: 'optional - interface to send packet (defaults to eth0)',
+      # )
+
+      public_class_method def self.construct_eth(opts = {})
+        # Ethernet Header
+        eth_src = opts[:eth_src]
+        eth_dst = opts[:eth_dst]
+
+        if opts[:eth_proto]
+          eth_proto = opts[:eth_proto]
+        else
+          eth_proto = 0x0800 # IPv4
+        end
+
+        # Payload
+        payload = opts[:payload]
+
+        pkt = PacketFu::EthPacket.new(config: PacketFu::Utils.whoami?)
+        # Ethernet Header
+        pkt.eth_saddr = eth_src unless eth_src.nil?
+        pkt.eth_daddr = eth_dst unless eth_dst.nil?
+        pkt.eth_proto = eth_proto
+        # Payload
+        pkt.payload = payload if payload
+
+        pkt
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # pkt = PWN::Plugins::Packet.construct_hsrp(
+      #   ip_saddr: 'required - source ip of packet',
+      #   ip_daddr: 'required - destination ip to send packet',
+      #   payload: 'optional - packet payload defaults to empty string',
+      #   ip_id: 'optional - defaults to 0xfeed',
+      #   iface: 'optional - interface to send packet (defaults to eth0)',
+      # )
+
+      public_class_method def self.construct_hsrp(opts = {})
+        # Ethernet Header
+        eth_src = opts[:eth_src]
+        eth_dst = opts[:eth_dst]
+
+        if opts[:eth_proto]
+          eth_proto = opts[:eth_proto]
+        else
+          eth_proto = 0x0800 # IPv4
+        end
+
+        # IP Header
+        if opts[:ip_v]
+          ip_v = opts[:ip_v]
+        else
+          ip_v = 4
+        end
+
+        if opts[:ip_hl]
+          ip_hl = opts[:ip_hl]
+        else
+          ip_hl = 5
+        end
+
+        if opts[:ip_tos]
+          ip_tos = opts[:ip_tos]
+        else
+          ip_tos = 0
+        end
+
+        if opts[:ip_len]
+          ip_len = opts[:ip_len]
+        else
+          ip_len = 20
+        end
+
+        if opts[:ip_id]
+          ip_id = opts[:ip_id]
+        else
+          ip_id = 0xfeed
+        end
+
+        if opts[:ip_frag]
+          ip_frag = opts[:ip_frag]
+        else
+          ip_frag = 0
+        end
+
+        if opts[:ip_ttl]
+          ip_ttl = opts[:ip_ttl]
+        else
+          ip_ttl = 32
+        end
+
+        if opts[:ip_proto]
+          ip_proto = opts[:ip_proto]
+        else
+          ip_proto = 17 # UDP
+        end
+
+        if opts[:ip_sum]
+          ip_sum = opts[:ip_sum]
+        else
+          ip_sum = 0xffff
+        end
+
+        ip_saddr = opts[:ip_saddr]
+        ip_daddr = opts[:ip_daddr]
+
+        # UDP Header
+        udp_src_port = opts[:udp_src_port]
+        udp_dst_port = opts[:udp_dst_port]
+
+        if opts[:udp_len]
+          udp_len = opts[:udp_len]
+        else
+          udp_len = 8
+        end
+
+        if opts[:udp_sum]
+          udp_sum = opts[:udp_sum]
+        else
+          udp_sum = 0x0000
+        end
+
+        # HSRP Header
+        if opts[:hsrp_version]
+          hsrp_version = opts[:hsrp_version]
+        else
+          hsrp_version = 0
+        end
+
+        if opts[:hsrp_opcode]
+          hsrp_opcode = opts[:hsrp_opcode]
+        else
+          hsrp_opcode = 0
+        end
+
+        if opts[:hsrp_state]
+          hsrp_state = opts[:hsrp_state]
+        else
+          hsrp_state = 0
+        end
+
+        if opts[:hsrp_hellotime]
+          hsrp_state = opts[:hsrp_hellotime]
+        else
+          hsrp_state = 3
+        end
+
+        if opts[:hsrp_holdtime]
+          hsrp_holdtime = opts[:hsrp_holdtime]
+        else
+          hsrp_holdtime = 10
+        end
+
+        if opts[:hsrp_priority]
+          hsrp_priority = opts[:hsrp_priority]
+        else
+          hsrp_priority = 0
+        end
+
+        if opts[:hsrp_group]
+          hsrp_group = opts[:hsrp_group]
+        else
+          hsrp_group = 0
+        end
+
+        if opts[:hsrp_reserved]
+          hsrp_reserved = opts[:hsrp_reserved]
+        else
+          hsrp_reserved = 0
+        end
+
+        if opts[:hsrp_password]
+          hsrp_password = opts[:hsrp_password]
+        else
+          hsrp_password = "cicso\x00\x00\x00"
+        end
+
+        if opts[:hsrp_addr]
+          hsrp_addr = opts[:hsrp_addr]
+        else
+          hsrp_addr = '0.0.0.0'
+        end
+
+        # Payload
+        payload = opts[:payload]
+
+        pkt = PacketFu::HSRPPacket.new(config: PacketFu::Utils.whoami?)
+        # Ethernet Header
+        pkt.eth_saddr = eth_src unless eth_src.nil?
+        pkt.eth_daddr = eth_dst unless eth_dst.nil?
+        pkt.eth_proto = eth_proto
+        # IP Header
+        pkt.ip_v = ip_v
+        pkt.ip_hl = ip_hl
+        pkt.ip_tos = ip_tos
+        pkt.ip_len = ip_len
+        pkt.ip_id = ip_id
+        pkt.ip_frag = ip_frag
+        pkt.ip_ttl = ip_ttl
+        pkt.ip_proto = ip_proto
+        pkt.ip_sum = ip_sum
+        pkt.ip_saddr = ip_saddr
+        pkt.ip_daddr = ip_daddr
+        # UDP Header
+        pkt.udp_src = udp_src_port if udp_src_port
+        pkt.udp_dst = udp_dst_port if udp_dst_port
+        pkt.udp_len = udp_len
+        pkt.udp_sum = udp_sum
+        # HSRP Header
+        pkt.hsrp_version = hsrp_version
+        pkt.hsrp_opcode = hsrp_opcode
+        pkt.hsrp_state = hsrp_state
+        pkt.hsrp_hellotime = hsrp_hellotime
+        pkt.hsrp_holdtime = hsrp_holdtime
+        pkt.hsrp_priority = hsrp_priority
+        pkt.hsrp_group = hsrp_group
+        pkt.hsrp_reserved = hsrp_reserved
+        pkt.hsrp_password = hsrp_password
+        pkt.hsrp_addr = hsrp_addr
+        # Payload
+        pkt.payload = payload if payload
+
+        pkt
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # pkt = PWN::Plugins::Packet.construct_icmp(
+      #   ip_saddr: 'required - source ip of packet',
+      #   ip_daddr: 'required - destination ip to send packet',
+      #   payload: 'optional - packet payload defaults to "*ping*"',
+      #   ip_id: 'optional - defaults to 0xfeed',
+      #   iface: 'optional - interface to send packet (defaults to eth0)',
+      # )
+
+      public_class_method def self.construct_icmp(opts = {})
+        # Ethernet Header
+        eth_src = opts[:eth_src]
+        eth_dst = opts[:eth_dst]
+
+        if opts[:eth_proto]
+          eth_proto = opts[:eth_proto]
+        else
+          eth_proto = 0x0800 # IPv4
+        end
+
+        # IP Header
+        if opts[:ip_v]
+          ip_v = opts[:ip_v]
+        else
+          ip_v = 4
+        end
+
+        if opts[:ip_hl]
+          ip_hl = opts[:ip_hl]
+        else
+          ip_hl = 5
+        end
+
+        if opts[:ip_tos]
+          ip_tos = opts[:ip_tos]
+        else
+          ip_tos = 0
+        end
+
+        if opts[:ip_len]
+          ip_len = opts[:ip_len]
+        else
+          ip_len = 20
+        end
+
+        if opts[:ip_id]
+          ip_id = opts[:ip_id]
+        else
+          ip_id = 0xfeed
+        end
+
+        if opts[:ip_frag]
+          ip_frag = opts[:ip_frag]
+        else
+          ip_frag = 0
+        end
+
+        if opts[:ip_ttl]
+          ip_ttl = opts[:ip_ttl]
+        else
+          ip_ttl = 32
+        end
+
+        if opts[:ip_proto]
+          ip_proto = opts[:ip_proto]
+        else
+          ip_proto = 1 # ICMP
+        end
+
+        if opts[:ip_sum]
+          ip_sum = opts[:ip_sum]
+        else
+          ip_sum = 0xffff
+        end
+
+        ip_saddr = opts[:ip_saddr]
+        ip_daddr = opts[:ip_daddr]
+
+        # ICMP Header
+        if opts[:icmp_type]
+          icmp_type = opts[:icmp_type]
+        else
+          icmp_type = 8
+        end
+
+        if opts[:icmp_code]
+          icmp_code = opts[:icmp_code]
+        else
+          icmp_code = 0
+        end
+
+        if opts[:icmp_sum]
+          icmp_sum = opts[:icmp_sum]
+        else
+          icmp_sum = 0xffff
+        end
+
+        # Payload
+        opts[:payload] ? payload = opts[:payload] : payload = '*ping*'
+
+        pkt = PacketFu::ICMPPacket.new(config: PacketFu::Utils.whoami?)
+        # Ethernet Header
+        pkt.eth_saddr = eth_src unless eth_src.nil?
+        pkt.eth_daddr = eth_dst unless eth_dst.nil?
+        pkt.eth_proto = eth_proto
+        # IP Header
+        pkt.ip_v = ip_v
+        pkt.ip_hl = ip_hl
+        pkt.ip_tos = ip_tos
+        pkt.ip_len = ip_len
+        pkt.ip_id = ip_id
+        pkt.ip_frag = ip_frag
+        pkt.ip_ttl = ip_ttl
+        pkt.ip_proto = ip_proto
+        pkt.ip_sum = ip_sum
+        pkt.ip_saddr = ip_saddr
+        pkt.ip_daddr = ip_daddr
+        # ICMP Header
+        pkt.icmp_type = icmp_type
+        pkt.icmp_code = icmp_code
+        pkt.icmp_sum = icmp_sum
+        # Payload
+        pkt.payload = payload if payload
+
+        pkt
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # pkt = PWN::Plugins::Packet.construct_icmpv6(
+      #   ip_saddr: 'required - source ip of packet',
+      #   ip_daddr: 'required - destination ip to send packet',
+      #   payload: 'optional - packet payload defaults to empty string',
+      #   ip_id: 'optional - defaults to 0xfeed',
+      #   iface: 'optional - interface to send packet (defaults to eth0)',
+      # )
+
+      public_class_method def self.construct_icmpv6(opts = {})
+        # Ethernet Header
+        eth_src = opts[:eth_src]
+        eth_dst = opts[:eth_dst]
+
+        if opts[:eth_proto]
+          eth_proto = opts[:eth_proto]
+        else
+          eth_proto = 0x86dd # IPv6
+        end
+
+        # IPv6 Header
+        if opts[:ipv6_v]
+          ipv6_v = opts[:ipv6_v]
+        else
+          ipv6_v = 6
+        end
+
+        if opts[:ipv6_class]
+          ipv6_class = opts[:ipv6_class]
+        else
+          ipv6_class = 0
+        end
+
+        if opts[:ipv6_label]
+          ipv6_label = opts[:ipv6_label]
+        else
+          ipv6_label = 0
+        end
+
+        if opts[:ipv6_len]
+          ipv6_len = opts[:ipv6_len]
+        else
+          ipv6_len = 0
+        end
+
+        if opts[:ipv6_next]
+          ipv6_next = opts[:ipv6_next]
+        else
+          ipv6_next = 58
+        end
+
+        if opts[:ipv6_hop]
+          ipv6_hop = opts[:ipv6_hop]
+        else
+          ipv6_hop = 255
+        end
+
+        ipv6_saddr = opts[:ipv6_saddr]
+        ipv6_daddr = opts[:ipv6_daddr]
+
+        # ICMPv6 Header
+        if opts[:icmpv6_type]
+          icmpv6_type = opts[:icmpv6_type]
+        else
+          icmp_type = 8
+        end
+
+        if opts[:icmpv6_code]
+          icmpv6_code = opts[:icmpv6_code]
+        else
+          icmpv6_code = 0
+        end
+
+        if opts[:icmpv6_sum]
+          icmp_sum = opts[:icmpv6_sum]
+        else
+          icmpv6_sum = 0x0000
+        end
+
+        # Payload
+        payload = opts[:payload]
+
+        pkt = PacketFu::IPv6Packet.new(config: PacketFu::Utils.whoami?)
+        # Ethernet Header
+        pkt.eth_saddr = eth_src unless eth_src.nil?
+        pkt.eth_daddr = eth_dst unless eth_dst.nil?
+        pkt.eth_proto = eth_proto
+        # IPv6 Header
+        pkt.ipv6_v = ipv6_v
+        pkt.ipv6_hl = ipv6_hl
+        pkt.ipv6_tos = ipv6_tos
+        pkt.ipv6_len = ipv6_len
+        pkt.ipv6_id = ipv6_id
+        pkt.ipv6_frag = ipv6_frag
+        pkt.ipv6_saddr = ipv6_saddr
+        pkt.ipv6_daddr = ipv6_daddr
+        # ICMPv6 Header
+        pkt.icmpv6_type = icmpv6_type
+        pkt.icmpv6_code = icmpv6_code
+        pkt.icmpv6_sum = icmpv6_sum
+        # Payload
+        pkt.payload = payload if payload
+
+        pkt
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # pkt = PWN::Plugins::Packet.construct_ip(
+      #   ip_saddr: 'required - source ip of packet',
+      #   ip_daddr: 'required - destination ip to send packet',
+      #   payload: 'optional - packet payload defaults to empty string',
+      #   ip_id: 'optional - defaults to 0xfeed',
+      #   iface: 'optional - interface to send packet (defaults to eth0)',
+      # )
+
+      public_class_method def self.construct_ip(opts = {})
+        # Ethernet Header
+        eth_src = opts[:eth_src]
+        eth_dst = opts[:eth_dst]
+
+        if opts[:eth_proto]
+          eth_proto = opts[:eth_proto]
+        else
+          eth_proto = 0x0800 # IPv4
+        end
+
+        # IP Header
+        if opts[:ip_v]
+          ip_v = opts[:ip_v]
+        else
+          ip_v = 4
+        end
+
+        if opts[:ip_hl]
+          ip_hl = opts[:ip_hl]
+        else
+          ip_hl = 5
+        end
+
+        if opts[:ip_tos]
+          ip_tos = opts[:ip_tos]
+        else
+          ip_tos = 0
+        end
+
+        if opts[:ip_len]
+          ip_len = opts[:ip_len]
+        else
+          ip_len = 20
+        end
+
+        if opts[:ip_id]
+          ip_id = opts[:ip_id]
+        else
+          ip_id = 0xfeed
+        end
+
+        if opts[:ip_frag]
+          ip_frag = opts[:ip_frag]
+        else
+          ip_frag = 0
+        end
+
+        if opts[:ip_ttl]
+          ip_ttl = opts[:ip_ttl]
+        else
+          ip_ttl = 32
+        end
+
+        if opts[:ip_proto]
+          ip_proto = opts[:ip_proto]
+        else
+          ip_proto = -1
+        end
+
+        if opts[:ip_sum]
+          ip_sum = opts[:ip_sum]
+        else
+          ip_sum = 0xffff
+        end
+
+        ip_saddr = opts[:ip_saddr]
+        ip_daddr = opts[:ip_daddr]
+
+        # Payload
+        payload = opts[:payload]
+
+        pkt = PacketFu::IPPacket.new(config: PacketFu::Utils.whoami?)
+        # Ethernet Header
+        pkt.eth_saddr = eth_src unless eth_src.nil?
+        pkt.eth_daddr = eth_dst unless eth_dst.nil?
+        pkt.eth_proto = eth_proto
+        # IP Header
+        pkt.ip_v = ip_v
+        pkt.ip_hl = ip_hl
+        pkt.ip_tos = ip_tos
+        pkt.ip_len = ip_len
+        pkt.ip_id = ip_id
+        pkt.ip_frag = ip_frag
+        pkt.ip_ttl = ip_ttl
+        pkt.ip_proto = ip_proto
+        pkt.ip_sum = ip_sum
+        pkt.ip_saddr = ip_saddr
+        pkt.ip_daddr = ip_daddr
+        # Payload
+        pkt.payload = payload if payload
+
+        pkt
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # pkt = PWN::Plugins::Packet.construct_ipv6(
+      #   ip_saddr: 'required - source ip of packet',
+      #   ip_daddr: 'required - destination ip to send packet',
+      #   payload: 'optional - packet payload defaults to empty string',
+      #   ip_id: 'optional - defaults to 0xfeed',
+      #   iface: 'optional - interface to send packet (defaults to eth0)',
+      # )
+
+      public_class_method def self.construct_ipv6(opts = {})
+        # Ethernet Header
+        eth_src = opts[:eth_src]
+        eth_dst = opts[:eth_dst]
+
+        if opts[:eth_proto]
+          eth_proto = opts[:eth_proto]
+        else
+          eth_proto = 0x86dd # IPv6
+        end
+
+        # IPv6 Header
+        if opts[:ipv6_v]
+          ipv6_v = opts[:ipv6_v]
+        else
+          ipv6_v = 6
+        end
+
+        if opts[:ipv6_class]
+          ipv6_class = opts[:ipv6_class]
+        else
+          ipv6_class = 0
+        end
+
+        if opts[:ipv6_label]
+          ipv6_label = opts[:ipv6_label]
+        else
+          ipv6_label = 0
+        end
+
+        if opts[:ipv6_len]
+          ipv6_len = opts[:ipv6_len]
+        else
+          ipv6_len = 0
+        end
+
+        if opts[:ipv6_next]
+          ipv6_next = opts[:ipv6_next]
+        else
+          ipv6_next = 0
+        end
+
+        if opts[:ipv6_hop]
+          ipv6_hop = opts[:ipv6_hop]
+        else
+          ipv6_hop = 255
+        end
+
+        ipv6_saddr = opts[:ipv6_saddr]
+        ipv6_daddr = opts[:ipv6_daddr]
+
+        # Payload
+        payload = opts[:payload]
+
+        pkt = PacketFu::IPv6Packet.new(config: PacketFu::Utils.whoami?)
+        # Ethernet Header
+        pkt.eth_saddr = eth_src unless eth_src.nil?
+        pkt.eth_daddr = eth_dst unless eth_dst.nil?
+        pkt.eth_proto = eth_proto
+        # IPv6 Header
+        pkt.ipv6_v = ipv6_v
+        pkt.ipv6_hl = ipv6_hl
+        pkt.ipv6_tos = ipv6_tos
+        pkt.ipv6_len = ipv6_len
+        pkt.ipv6_id = ipv6_id
+        pkt.ipv6_frag = ipv6_frag
+        pkt.ipv6_saddr = ipv6_saddr
+        pkt.ipv6_daddr = ipv6_daddr
+        # Payload
+        pkt.payload = payload if payload
+
+        pkt
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # pkt = PWN::Plugins::Packet.construct_tcp(
+      #   ip_saddr: 'required - source ip of packet',
+      #   ip_daddr: 'required - destination ip to send packet',
+      #   payload: 'optional - packet payload defaults to empty string',
+      #   ip_id: 'optional - defaults to 0xfeed',
+      #   iface: 'optional - interface to send packet (defaults to eth0)',
+      # )
+
+      public_class_method def self.construct_tcp(opts = {})
+        # Ethernet Header
+        eth_src = opts[:eth_src]
+        eth_dst = opts[:eth_dst]
+
+        if opts[:eth_proto]
+          eth_proto = opts[:eth_proto]
+        else
+          eth_proto = 0x0800 # IPv4
+        end
+
+        # IP Header
+        if opts[:ip_v]
+          ip_v = opts[:ip_v]
+        else
+          ip_v = 4
+        end
+
+        if opts[:ip_hl]
+          ip_hl = opts[:ip_hl]
+        else
+          ip_hl = 5
+        end
+
+        if opts[:ip_tos]
+          ip_tos = opts[:ip_tos]
+        else
+          ip_tos = 0
+        end
+
+        if opts[:ip_len]
+          ip_len = opts[:ip_len]
+        else
+          ip_len = 20
+        end
+
+        if opts[:ip_id]
+          ip_id = opts[:ip_id]
+        else
+          ip_id = 0xfeed
+        end
+
+        if opts[:ip_frag]
+          ip_frag = opts[:ip_frag]
+        else
+          ip_frag = 0
+        end
+
+        if opts[:ip_ttl]
+          ip_ttl = opts[:ip_ttl]
+        else
+          ip_ttl = 32
+        end
+
+        if opts[:ip_proto]
+          ip_proto = opts[:ip_proto]
+        else
+          ip_proto = 6 # TCP
+        end
+
+        if opts[:ip_sum]
+          ip_sum = opts[:ip_sum]
+        else
+          ip_sum = 0xffff
+        end
+
+        ip_saddr = opts[:ip_saddr]
+        ip_daddr = opts[:ip_daddr]
+
+        # TCP Header
+        tcp_src_port = opts[:tcp_src_port]
+        tcp_dst_port = opts[:tcp_dst_port]
+
+        if opts[:tcp_seq]
+          tcp_seq = opts[:tcp_seq]
+        else
+          tcp_seq = 0x5fcea416
+        end
+
+        if opts[:tcp_ack]
+          tcp_ack = opts[:tcp_ack]
+        else
+          tcp_ack = 0x00000000
+        end
+
+        if opts[:tcp_hlen]
+          tcp_hlen = opts[:tcp_hlen]
+        else
+          tcp_hlen = 5
+        end
+
+        if opts[:tcp_reserved]
+          tcp_reserved = opts[:tcp_reserved]
+        else
+          tcp_reserved = 0
+        end
+
+        if opts[:tcp_ecn]
+          tcp_ecn = opts[:tcp_ecn]
+        else
+          tcp_ecn = 0
+        end
+
+        tcp_flags = opts[:tcp_flags]
+
+        if opts[:tcp_win]
+          tcp_win = opts[:tcp_win]
+        else
+          tcp_win = 16_384
+        end
+
+        if opts[:tcp_sum]
+          tcp_sum = opts[:tcp_sum]
+        else
+          tcp_sum = 0x1ab2
+        end
+
+        if opts[:tcp_urg]
+          tcp_urg = opts[:tcp_urg]
+        else
+          tcp_urg = 0
+        end
+
+        tcp_opts = opts[:tcp_opts]
+
+        # Payload
+        payload = opts[:payload]
+
+        pkt = PacketFu::TCPPacket.new(config: PacketFu::Utils.whoami?)
+        # Ethernet Header
+        pkt.eth_saddr = eth_src unless eth_src.nil?
+        pkt.eth_daddr = eth_dst unless eth_dst.nil?
+        pkt.eth_proto = eth_proto
+        # IP Header
+        pkt.ip_v = ip_v
+        pkt.ip_hl = ip_hl
+        pkt.ip_tos = ip_tos
+        pkt.ip_len = ip_len
+        pkt.ip_id = ip_id
+        pkt.ip_frag = ip_frag
+        pkt.ip_ttl = ip_ttl
+        pkt.ip_proto = ip_proto
+        pkt.ip_sum = ip_sum
+        pkt.ip_saddr = ip_saddr
+        pkt.ip_daddr = ip_daddr
+        # TCP Header
+        pkt.tcp_src = tcp_src_port if tcp_src_port
+        pkt.tcp_dst = tcp_dst_port if tcp_dst_port
+        pkt.tcp_seq = tcp_seq
+        pkt.tcp_ack = tcp_ack
+        pkt.tcp_hlen = tcp_hlen
+        pkt.tcp_reserved = tcp_reserved
+        pkt.tcp_ecn = tcp_ecn
+        pkt.tcp_flags = PacketFu::TcpFlags.new
+        pkt.tcp_win = tcp_win
+        pkt.tcp_sum = tcp_sum
+        pkt.tcp_urg = tcp_urg
+        pkt.tcp_opts = PacketFu::TcpOptions.new
+        # Payload
+        pkt.payload = payload if payload
+
+        pkt
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # pkt = PWN::Plugins::Packet.construct_udp(
+      #   ip_saddr: 'required - source ip of packet',
+      #   ip_daddr: 'required - destination ip to send packet',
+      #   payload: 'optional - packet payload defaults to empty string',
+      #   ip_id: 'optional - defaults to 0xfeed',
+      #   iface: 'optional - interface to send packet (defaults to eth0)',
+      # )
+
+      public_class_method def self.construct_udp(opts = {})
+        # Ethernet Header
+        eth_src = opts[:eth_src]
+        eth_dst = opts[:eth_dst]
+
+        if opts[:eth_proto]
+          eth_proto = opts[:eth_proto]
+        else
+          eth_proto = 0x0800 # IPv4
+        end
+
+        # IP Header
+        if opts[:ip_v]
+          ip_v = opts[:ip_v]
+        else
+          ip_v = 4
+        end
+
+        if opts[:ip_hl]
+          ip_hl = opts[:ip_hl]
+        else
+          ip_hl = 5
+        end
+
+        if opts[:ip_tos]
+          ip_tos = opts[:ip_tos]
+        else
+          ip_tos = 0
+        end
+
+        if opts[:ip_len]
+          ip_len = opts[:ip_len]
+        else
+          ip_len = 20
+        end
+
+        if opts[:ip_id]
+          ip_id = opts[:ip_id]
+        else
+          ip_id = 0xfeed
+        end
+
+        if opts[:ip_frag]
+          ip_frag = opts[:ip_frag]
+        else
+          ip_frag = 0
+        end
+
+        if opts[:ip_ttl]
+          ip_ttl = opts[:ip_ttl]
+        else
+          ip_ttl = 32
+        end
+
+        if opts[:ip_proto]
+          ip_proto = opts[:ip_proto]
+        else
+          ip_proto = 17 # UDP
+        end
+
+        if opts[:ip_sum]
+          ip_sum = opts[:ip_sum]
+        else
+          ip_sum = 0xffff
+        end
+
+        ip_saddr = opts[:ip_saddr]
+        ip_daddr = opts[:ip_daddr]
+
+        # UDP Header
+        udp_src_port = opts[:udp_src_port]
+        udp_dst_port = opts[:udp_dst_port]
+
+        if opts[:udp_len]
+          udp_len = opts[:udp_len]
+        else
+          udp_len = 8
+        end
+
+        if opts[:udp_sum]
+          udp_sum = opts[:udp_sum]
+        else
+          udp_sum = 0xffde
+        end
+
+        # Payload
+        payload = opts[:payload]
+
+        pkt = PacketFu::UDPPacket.new(config: PacketFu::Utils.whoami?)
+        # Ethernet Header
+        pkt.eth_saddr = eth_src unless eth_src.nil?
+        pkt.eth_daddr = eth_dst unless eth_dst.nil?
+        pkt.eth_proto = eth_proto
+        # IP Header
+        pkt.ip_v = ip_v
+        pkt.ip_hl = ip_hl
+        pkt.ip_tos = ip_tos
+        pkt.ip_len = ip_len
+        pkt.ip_id = ip_id
+        pkt.ip_frag = ip_frag
+        pkt.ip_ttl = ip_ttl
+        pkt.ip_proto = ip_proto
+        pkt.ip_sum = ip_sum
+        pkt.ip_saddr = ip_saddr
+        pkt.ip_daddr = ip_daddr
+        # UDP Header
+        pkt.udp_src = udp_src_port if udp_src_port
+        pkt.udp_dst = udp_dst_port if udp_dst_port
+        pkt.udp_len = udp_len
+        pkt.udp_sum = udp_sum
+        # Payload
+        pkt.payload = payload if payload
+
+        pkt
+      rescue StandardError => e
+        raise e
+      end
+
+      # Supported Method Parameters::
+      # PWN::Plugins::Packet.send(
+      #   pkt: 'required - pkt returned from other #construct_<type> methods',
+      #   iface: 'optional - interface to send packet (defaults to eth0)',
+      # )
+
+      public_class_method def self.send(opts = {})
+        require 'pwn/plugins/capability_broker'
+        require 'base64'
+        pkt = opts.fetch(:pkt)
+        pkt.recalc
+        result = CapabilityBroker.request(operation: 'raw_send', iface: opts.fetch(:iface, 'eth0'),
+                                          frame: Base64.strict_encode64(pkt.to_s), socket: opts[:socket])
+        return result if result[:ok]
+
+        result.merge(degraded: true, missing_capabilities: cap_net_raw? ? [] : ['CAP_NET_RAW'])
+      end
+
+      public_class_method def self.tcp_connect_scan(opts = {})
+        hosts = Array(opts[:hosts] || opts[:targets])
+        ports = Array(opts[:ports]).map(&:to_i).reject(&:zero?)
+        ports = [80, 443] if ports.empty?
+        timeout = (opts[:timeout] || 2).to_f
+        rows = hosts.product(ports).map do |host, port|
+          open = begin
+            sock = Socket.tcp(host, port, connect_timeout: timeout)
+            sock.close
+            true
+          rescue StandardError
+            false
+          end
+          { host: host, port: port, open: open }
+        end
+        { results: rows, degraded: true, fidelity: 'connect-scan (no raw sockets / custom IP flags)' }
+      end
+
+      public_class_method def self.cap_net_raw?(opts = {})
+        _iface = opts[:iface]
+        return true if File.readable?('/dev/bpf0')
+
+        File.read('/proc/self/status').to_s.include?('CapEff:') && begin
+          line = File.readlines('/proc/self/status').find { |l| l.start_with?('CapEff:') }.to_s
+          val = line.split.last.to_s.to_i(16)
+          val.anybits?(0x2000)
+        rescue StandardError
+          false
+        end
+      end
+
+      public_class_method def self.capture(opts = {})
+        require 'pwn/plugins/capability_broker'
+        require 'base64'
+        result = CapabilityBroker.request(operation: 'capture', iface: opts.fetch(:iface, 'eth0'),
+                                          count: opts.fetch(:count, 8), timeout: opts.fetch(:timeout, 5), socket: opts[:socket])
+        unless result[:ok]
+          return result.merge(degraded: true, missing_capabilities: cap_net_raw? ? [] : ['CAP_NET_RAW'])
+        end
+
+        bytes = Base64.strict_decode64(result.fetch(:pcap))
+        raise 'invalid pcap response' unless bytes.bytesize >= 24 && bytes.start_with?([0xa1b2c3d4].pack('V'))
+
+        out = File.expand_path(opts.fetch(:path, File.join(Dir.home, '.pwn', 'artifacts', "capture-#{Time.now.to_i}.pcap")))
+        FileUtils.mkdir_p(File.dirname(out))
+        File.binwrite(out, bytes)
+        raise 'capture readback failed' unless File.binread(out) == bytes
+
+        result.except(:pcap).merge(path: out, degraded: false)
+      rescue StandardError => e
+        { ok: false, degraded: true, error: e.message }
+      end
+
+      public_class_method def self.health(opts = {})
+        require 'pwn/plugins/capability_broker'
+        result = CapabilityBroker.request(operation: 'status', socket: opts[:socket])
+        if result[:ok]
+          { ok: true, degraded: false, via: 'capability_broker', missing_capabilities: [] }
+        elsif cap_net_raw?(iface: opts[:iface])
+          { ok: true, degraded: false, via: 'cap_net_raw' }
+        else
+          result.merge(ok: false, degraded: true, missing_capabilities: ['CAP_NET_RAW'])
+        end
+      end
+
+      # Author(s):: 0day Inc. <support@0dayinc.com>
+
+      public_class_method def self.authors
+        "AUTHOR(S):
+          0day Inc. <support@0dayinc.com>
+        "
+      end
+
+      # Display Usage for this Module
+
+      public_class_method def self.help
+        puts "USAGE:
+          # Run open pcap file and return its result
+          #{self}.open_pcap_file(
+            path: 'required - path to packet capture file'
+          )
+
+          # Run construct arp and return its result
+          #{self}.construct_arp(
+            ip_saddr: 'required - source ip of packet',
+            ip_daddr: 'required - destination ip to send packet',
+            payload: 'optional - packet payload defaults to empty string',
+            ip_id: 'optional - defaults to 0xfeed',
+            iface: 'optional - interface to send packet (defaults to eth0)',
+            eth_src: 'optional - eth src value consumed by #construct_arp',
+            eth_dst: 'optional - eth dst value consumed by #construct_arp',
+            eth_proto: 'optional - eth proto value consumed by #construct_arp',
+            arp_hw: 'optional - arp hw value consumed by #construct_arp',
+            arp_proto: 'optional - arp proto value consumed by #construct_arp',
+            arp_hw_len: 'optional - arp hw len value consumed by #construct_arp',
+            arp_proto_len: 'optional - arp proto len value consumed by #construct_arp',
+            arp_opcode: 'optional - arp opcode value consumed by #construct_arp',
+            arp_src_mac: 'optional - arp src mac value consumed by #construct_arp',
+            arp_dst_mac: 'optional - arp dst mac value consumed by #construct_arp'
+          )
+
+          # Run construct eth and return its result
+          #{self}.construct_eth(
+            ip_saddr: 'required - source ip of packet',
+            ip_daddr: 'required - destination ip to send packet',
+            payload: 'optional - packet payload defaults to empty string',
+            ip_id: 'optional - defaults to 0xfeed',
+            iface: 'optional - interface to send packet (defaults to eth0)',
+            eth_src: 'optional - eth src value consumed by #construct_eth',
+            eth_dst: 'optional - eth dst value consumed by #construct_eth',
+            eth_proto: 'optional - eth proto value consumed by #construct_eth'
+          )
+
+          # Run construct hsrp and return its result
+          #{self}.construct_hsrp(
+            ip_saddr: 'required - source ip of packet',
+            ip_daddr: 'required - destination ip to send packet',
+            payload: 'optional - packet payload defaults to empty string',
+            ip_id: 'optional - defaults to 0xfeed',
+            iface: 'optional - interface to send packet (defaults to eth0)',
+            eth_src: 'optional - eth src value consumed by #construct_hsrp',
+            eth_dst: 'optional - eth dst value consumed by #construct_hsrp',
+            eth_proto: 'optional - eth proto value consumed by #construct_hsrp',
+            ip_v: 'optional - ip v value consumed by #construct_hsrp',
+            ip_hl: 'optional - ip hl value consumed by #construct_hsrp',
+            ip_tos: 'optional - ip tos value consumed by #construct_hsrp',
+            ip_len: 'optional - ip len value consumed by #construct_hsrp',
+            ip_frag: 'optional - ip frag value consumed by #construct_hsrp',
+            ip_ttl: 'optional - ip ttl value consumed by #construct_hsrp',
+            ip_proto: 'optional - ip proto value consumed by #construct_hsrp',
+            ip_sum: 'optional - ip sum value consumed by #construct_hsrp',
+            udp_src_port: 'optional - udp src port value consumed by #construct_hsrp',
+            udp_dst_port: 'optional - udp dst port value consumed by #construct_hsrp',
+            udp_len: 'optional - udp len value consumed by #construct_hsrp',
+            udp_sum: 'optional - udp sum value consumed by #construct_hsrp',
+            hsrp_version: 'optional - hsrp version value consumed by #construct_hsrp',
+            hsrp_opcode: 'optional - hsrp opcode value consumed by #construct_hsrp',
+            hsrp_state: 'optional - hsrp state value consumed by #construct_hsrp',
+            hsrp_hellotime: 'optional - hsrp hellotime value consumed by #construct_hsrp',
+            hsrp_holdtime: 'optional - hsrp holdtime value consumed by #construct_hsrp',
+            hsrp_priority: 'optional - hsrp priority value consumed by #construct_hsrp',
+            hsrp_group: 'optional - hsrp group value consumed by #construct_hsrp',
+            hsrp_reserved: 'optional - hsrp reserved value consumed by #construct_hsrp',
+            hsrp_password: 'optional - hsrp password value consumed by #construct_hsrp',
+            hsrp_addr: 'optional - hsrp addr value consumed by #construct_hsrp'
+          )
+
+          # Run construct icmp and return its result
+          #{self}.construct_icmp(
+            ip_saddr: 'required - source ip of packet',
+            ip_daddr: 'required - destination ip to send packet',
+            payload: 'optional - packet payload defaults to *ping*',
+            ip_id: 'optional - defaults to 0xfeed',
+            iface: 'optional - interface to send packet (defaults to eth0)',
+            eth_src: 'optional - eth src value consumed by #construct_icmp',
+            eth_dst: 'optional - eth dst value consumed by #construct_icmp',
+            eth_proto: 'optional - eth proto value consumed by #construct_icmp',
+            ip_v: 'optional - ip v value consumed by #construct_icmp',
+            ip_hl: 'optional - ip hl value consumed by #construct_icmp',
+            ip_tos: 'optional - ip tos value consumed by #construct_icmp',
+            ip_len: 'optional - ip len value consumed by #construct_icmp',
+            ip_frag: 'optional - ip frag value consumed by #construct_icmp',
+            ip_ttl: 'optional - ip ttl value consumed by #construct_icmp',
+            ip_proto: 'optional - ip proto value consumed by #construct_icmp',
+            ip_sum: 'optional - ip sum value consumed by #construct_icmp',
+            icmp_type: 'optional - icmp type value consumed by #construct_icmp',
+            icmp_code: 'optional - icmp code value consumed by #construct_icmp',
+            icmp_sum: 'optional - icmp sum value consumed by #construct_icmp'
+          )
+
+          # Run construct icmpv6 and return its result
+          #{self}.construct_icmpv6(
+            ip_saddr: 'required - source ip of packet',
+            ip_daddr: 'required - destination ip to send packet',
+            payload: 'optional - packet payload defaults to empty string',
+            ip_id: 'optional - defaults to 0xfeed',
+            iface: 'optional - interface to send packet (defaults to eth0)',
+            eth_src: 'optional - eth src value consumed by #construct_icmpv6',
+            eth_dst: 'optional - eth dst value consumed by #construct_icmpv6',
+            eth_proto: 'optional - eth proto value consumed by #construct_icmpv6',
+            ipv6_v: 'optional - ipv6 v value consumed by #construct_icmpv6',
+            ipv6_class: 'optional - ipv6 class value consumed by #construct_icmpv6',
+            ipv6_label: 'optional - ipv6 label value consumed by #construct_icmpv6',
+            ipv6_len: 'optional - ipv6 len value consumed by #construct_icmpv6',
+            ipv6_next: 'optional - ipv6 next value consumed by #construct_icmpv6',
+            ipv6_hop: 'optional - ipv6 hop value consumed by #construct_icmpv6',
+            ipv6_saddr: 'optional - ipv6 saddr value consumed by #construct_icmpv6',
+            ipv6_daddr: 'optional - ipv6 daddr value consumed by #construct_icmpv6',
+            icmpv6_type: 'optional - icmpv6 type value consumed by #construct_icmpv6',
+            icmpv6_code: 'optional - icmpv6 code value consumed by #construct_icmpv6',
+            icmpv6_sum: 'optional - icmpv6 sum value consumed by #construct_icmpv6'
+          )
+
+          # Run construct ip and return its result
+          #{self}.construct_ip(
+            ip_saddr: 'required - source ip of packet',
+            ip_daddr: 'required - destination ip to send packet',
+            payload: 'optional - packet payload defaults to empty string',
+            ip_id: 'optional - defaults to 0xfeed',
+            iface: 'optional - interface to send packet (defaults to eth0)',
+            eth_src: 'optional - eth src value consumed by #construct_ip',
+            eth_dst: 'optional - eth dst value consumed by #construct_ip',
+            eth_proto: 'optional - eth proto value consumed by #construct_ip',
+            ip_v: 'optional - ip v value consumed by #construct_ip',
+            ip_hl: 'optional - ip hl value consumed by #construct_ip',
+            ip_tos: 'optional - ip tos value consumed by #construct_ip',
+            ip_len: 'optional - ip len value consumed by #construct_ip',
+            ip_frag: 'optional - ip frag value consumed by #construct_ip',
+            ip_ttl: 'optional - ip ttl value consumed by #construct_ip',
+            ip_proto: 'optional - ip proto value consumed by #construct_ip',
+            ip_sum: 'optional - ip sum value consumed by #construct_ip'
+          )
+
+          # Run construct ipv6 and return its result
+          #{self}.construct_ipv6(
+            ip_saddr: 'required - source ip of packet',
+            ip_daddr: 'required - destination ip to send packet',
+            payload: 'optional - packet payload defaults to empty string',
+            ip_id: 'optional - defaults to 0xfeed',
+            iface: 'optional - interface to send packet (defaults to eth0)',
+            eth_src: 'optional - eth src value consumed by #construct_ipv6',
+            eth_dst: 'optional - eth dst value consumed by #construct_ipv6',
+            eth_proto: 'optional - eth proto value consumed by #construct_ipv6',
+            ipv6_v: 'optional - ipv6 v value consumed by #construct_ipv6',
+            ipv6_class: 'optional - ipv6 class value consumed by #construct_ipv6',
+            ipv6_label: 'optional - ipv6 label value consumed by #construct_ipv6',
+            ipv6_len: 'optional - ipv6 len value consumed by #construct_ipv6',
+            ipv6_next: 'optional - ipv6 next value consumed by #construct_ipv6',
+            ipv6_hop: 'optional - ipv6 hop value consumed by #construct_ipv6',
+            ipv6_saddr: 'optional - ipv6 saddr value consumed by #construct_ipv6',
+            ipv6_daddr: 'optional - ipv6 daddr value consumed by #construct_ipv6'
+          )
+
+          # Run construct tcp and return its result
+          #{self}.construct_tcp(
+            ip_saddr: 'required - source ip of packet',
+            ip_daddr: 'required - destination ip to send packet',
+            payload: 'optional - packet payload defaults to empty string',
+            ip_id: 'optional - defaults to 0xfeed',
+            iface: 'optional - interface to send packet (defaults to eth0)',
+            eth_src: 'optional - eth src value consumed by #construct_tcp',
+            eth_dst: 'optional - eth dst value consumed by #construct_tcp',
+            eth_proto: 'optional - eth proto value consumed by #construct_tcp',
+            ip_v: 'optional - ip v value consumed by #construct_tcp',
+            ip_hl: 'optional - ip hl value consumed by #construct_tcp',
+            ip_tos: 'optional - ip tos value consumed by #construct_tcp',
+            ip_len: 'optional - ip len value consumed by #construct_tcp',
+            ip_frag: 'optional - ip frag value consumed by #construct_tcp',
+            ip_ttl: 'optional - ip ttl value consumed by #construct_tcp',
+            ip_proto: 'optional - ip proto value consumed by #construct_tcp',
+            ip_sum: 'optional - ip sum value consumed by #construct_tcp',
+            tcp_src_port: 'optional - tcp src port value consumed by #construct_tcp',
+            tcp_dst_port: 'optional - tcp dst port value consumed by #construct_tcp',
+            tcp_seq: 'optional - tcp seq value consumed by #construct_tcp',
+            tcp_ack: 'optional - tcp ack value consumed by #construct_tcp',
+            tcp_hlen: 'optional - tcp hlen value consumed by #construct_tcp',
+            tcp_reserved: 'optional - tcp reserved value consumed by #construct_tcp',
+            tcp_ecn: 'optional - tcp ecn value consumed by #construct_tcp',
+            tcp_flags: 'optional - tcp flags value consumed by #construct_tcp',
+            tcp_win: 'optional - tcp win value consumed by #construct_tcp',
+            tcp_sum: 'optional - tcp sum value consumed by #construct_tcp',
+            tcp_urg: 'optional - tcp urg value consumed by #construct_tcp',
+            tcp_opts: 'optional - tcp opts value consumed by #construct_tcp'
+          )
+
+          # Run construct udp and return its result
+          #{self}.construct_udp(
+            ip_saddr: 'required - source ip of packet',
+            ip_daddr: 'required - destination ip to send packet',
+            payload: 'optional - packet payload defaults to empty string',
+            ip_id: 'optional - defaults to 0xfeed',
+            iface: 'optional - interface to send packet (defaults to eth0)',
+            eth_src: 'optional - eth src value consumed by #construct_udp',
+            eth_dst: 'optional - eth dst value consumed by #construct_udp',
+            eth_proto: 'optional - eth proto value consumed by #construct_udp',
+            ip_v: 'optional - ip v value consumed by #construct_udp',
+            ip_hl: 'optional - ip hl value consumed by #construct_udp',
+            ip_tos: 'optional - ip tos value consumed by #construct_udp',
+            ip_len: 'optional - ip len value consumed by #construct_udp',
+            ip_frag: 'optional - ip frag value consumed by #construct_udp',
+            ip_ttl: 'optional - ip ttl value consumed by #construct_udp',
+            ip_proto: 'optional - ip proto value consumed by #construct_udp',
+            ip_sum: 'optional - ip sum value consumed by #construct_udp',
+            udp_src_port: 'optional - udp src port value consumed by #construct_udp',
+            udp_dst_port: 'optional - udp dst port value consumed by #construct_udp',
+            udp_len: 'optional - udp len value consumed by #construct_udp',
+            udp_sum: 'optional - udp sum value consumed by #construct_udp'
+          )
+
+          # Run send and return its result
+          #{self}.send(
+            pkt: 'required - pkt returned from other #construct_<type> methods',
+            iface: 'optional - interface to send packet (defaults to eth0)',
+            socket: 'optional - local capability broker Unix socket path'
+          )
+
+          # Unprivileged TCP connect sweep (fallback when CAP_NET_RAW is missing).
+          #{self}.tcp_connect_scan(
+            hosts: 'required - Array of hostnames or IPs',
+            targets: 'optional - alias for hosts',
+            ports: 'optional - Array of ports (defaults to 80,443)',
+            timeout: 'optional - connect timeout seconds (defaults to 2)'
+          )
+
+          # True when this process has CAP_NET_RAW (or /dev/bpf0 on BSD).
+          #{self}.cap_net_raw?(
+            iface: 'optional - interface name reserved for callers'
+          )
+
+          # Capture packets; falls back to tcpdump when CAP_NET_RAW is missing.
+          #{self}.capture(
+            iface: 'optional - interface (defaults to eth0)',
+            count: 'optional - packet count (defaults to 8)',
+            path: 'optional - output pcap path',
+            timeout: 'optional - maximum capture duration in seconds',
+            socket: 'optional - local capability broker Unix socket path'
+          )
+
+          # Report ok when the capability broker or live CAP_NET_RAW is available.
+          #{self}.health(
+            socket: 'optional - local capability broker Unix socket path',
+            iface: 'optional - interface name reserved for callers'
+          )
+
+          # Print the AUTHOR(S) string for this module.
+          #{self}.authors
+        "
+        constants.sort
+      end
+    end
+  end
+end

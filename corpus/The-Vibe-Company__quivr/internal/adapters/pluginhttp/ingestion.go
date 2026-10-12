@@ -1,0 +1,270 @@
+package pluginhttp
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"regexp"
+	"sort"
+	"time"
+
+	"github.com/The-Vibe-Company/quivr/internal/content"
+	"github.com/The-Vibe-Company/quivr/internal/plugins"
+	"github.com/The-Vibe-Company/quivr/internal/plugins/call"
+	"github.com/The-Vibe-Company/quivr/internal/plugins/devhost"
+	"github.com/The-Vibe-Company/quivr/internal/plugins/registry"
+	"github.com/The-Vibe-Company/quivr/internal/processing"
+	"github.com/The-Vibe-Company/quivr/internal/retrieval"
+)
+
+// Ingestor is the pinned plugin's ingestion Contribution as the engine calls
+// it: segment_and_embed for the worker, embed_query for search. Every answer
+// is judged with the Contract Runner's checks before anything is stored.
+type Ingestor struct {
+	Pin *plugins.Pin
+	// Live supplies the current serving build for execution-equivalent updates.
+	// The descriptor and work binding remain those of Pin.
+	Live *plugins.Live
+}
+
+func (i Ingestor) serving() Ingestor {
+	if i.Live != nil {
+		for _, next := range i.Live.Set().Pins() {
+			if next.Manifest.ID == i.Pin.Manifest.ID {
+				i.Pin = registry.IngestionReplacement(i.Pin, next)
+				break
+			}
+		}
+	}
+	return i
+}
+
+var (
+	_ processing.IngestionPlugin = Ingestor{}
+	_ processing.Pinned          = Ingestor{}
+	_ retrieval.QueryEncoder     = Ingestor{}
+)
+
+// Bind records the selected owner even when stored artifacts avoid a call.
+func (i Ingestor) Bind(ctx context.Context) error { return plugins.BindIngestion(ctx, i.Pin) }
+
+func (i Ingestor) contribution() *plugins.Ingestion { return i.Pin.Manifest.Contributions.Ingestion }
+
+// Descriptor captures the metadata of this installed ingestion owner.
+func (i Ingestor) Descriptor() processing.IngestionDescriptor {
+	// Model and segment settings can change without a plugin version change.
+	// Keep both derivations immutable and reusable across projection generations;
+	// endpoints, registration ids and enabled roles do not affect the output.
+	recipe := registry.IngestionRecipe(i.Pin)
+	provenance := registry.IngestionProvenance(i.Pin)
+	d := processing.IngestionDescriptor{PluginID: i.Pin.Manifest.ID, PluginVersion: i.Pin.Manifest.Version,
+		RegistrationID: i.Pin.Registration, Configuration: i.Pin.Configuration, InputPrices: map[string]*float64{},
+		Recipe: recipe, Producer: recipe, Provenance: provenance,
+		SegmentsOnly: i.Pin.Speaks(plugins.FeatureSegmentsOnly), VectorSpaces: map[string]content.VectorSpace{}}
+	for _, space := range i.Pin.EnabledSpaces() {
+		d.Spaces = append(d.Spaces, space.Key)
+	}
+	if in := i.contribution(); in != nil {
+		d.Paged = in.Paging && i.Pin.Speaks(plugins.FeatureIngestionPages)
+		for id, space := range in.Spaces {
+			key := plugins.SpaceKey(id, space.Version)
+			var price *float64
+			if space.InputPrice != nil {
+				usd := space.InputPrice.USDPerMillionTokens
+				price = &usd
+			}
+			d.InputPrices[key] = price
+			d.VectorSpaces[key] = content.VectorSpace{ID: key, Manifest: plugins.SpaceManifest(i.Pin.Manifest.ID, id, space), Dimensions: space.Dimensions}
+		}
+	}
+	return d
+}
+
+// declared returns the declared space id of a space key.
+func (i Ingestor) declared(key string) (string, plugins.VectorSpace, bool) {
+	for id, space := range i.contribution().Spaces {
+		if plugins.SpaceKey(id, space.Version) == key {
+			return id, space, true
+		}
+	}
+	return "", plugins.VectorSpace{}, false
+}
+
+// Owns supplies the query encoder's declared-space lookup.
+func (i Ingestor) Owns(key string) bool {
+	_, _, ok := i.declared(key)
+	return ok
+}
+
+// refused is content.ErrIngestionRefused for the reason message states, which
+// a Version quarantined for it shows with the plugin's name and version.
+func (i Ingestor) refused(format string, args ...any) error {
+	reason := content.Diagnostic{Code: content.ErrIngestionRefused.Error(), Message: fmt.Sprintf(format, args...),
+		Plugin: i.Pin.Manifest.ID, PluginVersion: i.Pin.Manifest.Version, Contribution: "ingestion"}
+	return &content.Refusal{Reason: reason}
+}
+
+// SegmentAndEmbed asks the plugin for a Version's segments with a vector in
+// each space key; with no key, for the segments alone. A plugin that is unavailable or answers a retryable error
+// is retried by the caller; a terminal error or an answer the output checks
+// refuse is content.ErrIngestionRefused.
+func (i Ingestor) SegmentAndEmbed(ctx context.Context, org, corpusID string, v content.Version, keys []string) ([]processing.PluginSegment, error) {
+	if err := plugins.BindIngestion(ctx, i.Pin); err != nil {
+		return nil, err
+	}
+	i = i.serving()
+	ids := make([]string, 0, len(keys))
+	byID := map[string]string{}
+	for _, key := range keys {
+		id, _, ok := i.declared(key)
+		if !ok {
+			return nil, i.refused("space %s is not declared by %s@%s", key, i.Pin.Manifest.ID, i.Pin.Manifest.Version)
+		}
+		ids = append(ids, id)
+		byID[id] = key
+	}
+	sort.Strings(ids)
+	parts := []plugins.IngestionPart{}
+	for _, p := range v.Manifest.Parts {
+		if p.Content.Kind == "text" {
+			parts = append(parts, plugins.IngestionPart{Key: p.Key, Role: p.Role, Text: p.Content.Text})
+		}
+	}
+	switch {
+	case len(parts) == 0:
+		return nil, i.refused("the Version has no text Part to index")
+	case len(parts) > 256:
+		return nil, i.refused("the Version has %d text Parts; segment_and_embed takes at most 256", len(parts))
+	}
+
+	request := plugins.SegmentAndEmbedRequest{InvocationID: plugins.InvocationID(), IdempotencyKey: plugins.IngestionKey(i.Pin.Generation(), org, v.ID, ids), Contribution: "ingestion",
+		OrganizationID: org, Configuration: i.Pin.Configuration, Version: plugins.IngestionVersion{CorpusID: corpusID, RecordID: v.RecordID, RecordVersionID: v.ID}, Parts: parts, Spaces: ids}
+	body, err := plugins.BuildSegmentAndEmbedRequest(request)
+	if err != nil {
+		return nil, err
+	}
+	view := plugins.IngestionRequestView{Parts: parts, Spaces: ids}
+	m := &i.Pin.Manifest
+	started := time.Now()
+	result, err := call.Invoke(ctx, i.Pin, call.SegmentAndEmbed, call.Bytes(body), func(ctx context.Context, b []byte) []plugins.Issue {
+		return plugins.CheckSegmentAndEmbedOutput(b, view, m)
+	}, nil)
+	observe(i.Pin, org, OpSegmentAndEmbed, started, result, err)
+	if err != nil {
+		if i.Descriptor().Paged && wholeResponseTooLarge(result) {
+			return nil, errors.Join(i.refused("whole-item output exceeds a page work bound"), &plugins.PluginError{Code: "segmentation_limit"})
+		}
+		return nil, err
+	}
+	answer, err := plugins.DecodeSegmentAndEmbed(result.Body)
+	if err != nil {
+		return nil, i.refused("%s@%s answered segments the engine cannot read: %v", m.ID, m.Version, err)
+	}
+	out := make([]processing.PluginSegment, len(answer.Segments))
+	for n, s := range answer.Segments {
+		vectors := map[string][]float32{}
+		for id, vector := range s.Vectors {
+			vectors[byID[id]] = plugins.Float32s(vector)
+		}
+		ranges := make([]content.SourceRange, len(s.SourceRanges))
+		for k, r := range s.SourceRanges {
+			ranges[k] = content.SourceRange{PartKey: r.PartKey, Start: r.Start, End: r.End}
+		}
+		out[n] = processing.PluginSegment{SegmentInput: content.SegmentInput{PartKey: s.PartKey, Start: s.Start, End: s.End, LexicalText: s.LexicalText, Provenance: s.Provenance, SourceRanges: ranges, SourceSeparator: s.SourceSeparator}, Vectors: vectors}
+	}
+	return out, nil
+}
+
+// SDK error envelopes predate typed work-limit codes. Accept their size-only
+// clauses exactly; a combined size/vector/offset failure remains invalid.
+const sdkResponseLimitClause = `(?:[0-9]+ segments exceed max_segments [0-9]+|the response is [0-9]+ bytes; max_response_bytes is [0-9]+|the response exceeds max_(?:segments|response_bytes))`
+
+var sdkResponseLimit = regexp.MustCompile(`^` + sdkResponseLimitClause + `(?:; ` + sdkResponseLimitClause + `)*$`)
+
+func wholeResponseTooLarge(result *devhost.Result) bool {
+	if result == nil || result.Error != nil && result.Error.Retryable {
+		return false
+	}
+	sizeOnly := len(result.Issues) > 0
+	for _, issue := range result.Issues {
+		if issue.Code != plugins.CodeTooManySegments && issue.Code != plugins.CodeResponseTooLarge {
+			return false
+		}
+	}
+	return sizeOnly || result.Error != nil && (result.Error.Code == "response_too_large" || result.Error.Code == "invalid_response" && sdkResponseLimit.MatchString(result.Error.Message))
+}
+
+// Gone keeps live imports retrying through reachability outages, but preserves
+// explicit stops and the budget for invocation deadlines or incompatible owners.
+func (i Ingestor) Gone(ctx context.Context, cause error) (*content.Diagnostic, error) {
+	if !errors.Is(cause, ErrUnavailable) && !errors.Is(cause, processing.ErrSpaceUnowned) {
+		return nil, nil
+	}
+	if err := plugins.BindIngestion(ctx, i.Pin); err != nil {
+		return nil, err
+	}
+	if errors.Is(cause, ErrUnavailable) && !errors.Is(cause, processing.ErrSpaceUnowned) && !errors.Is(cause, processing.ErrPluginDeadline) && !errors.Is(cause, errPageInterrupted) {
+		return plugins.Unavailable(ctx, i.Pin, "ingestion")
+	}
+	return plugins.Unreachable(ctx, i.Pin, "ingestion")
+}
+
+// QueryTooLongCode is the error envelope code with which a plugin refuses a
+// query over the length its space accepts; its message names the limit.
+const QueryTooLongCode = "query_too_long"
+
+// EncodeQuery asks the plugin that owns a space for a query's vector. A
+// terminal refusal with code query_too_long is retrieval.ErrQueryTooLong
+// detailed by the plugin's message, which names its limit; any other terminal
+// refusal (the plugin cannot encode this query) is content.ErrInvalid;
+// anything else is unavailability.
+func (i Ingestor) EncodeQuery(ctx context.Context, org, key, text string) ([]float32, error) {
+	i = i.serving()
+	id, _, ok := i.declared(key)
+	if !ok {
+		return nil, fmt.Errorf("%w: space %s is not declared by the pinned ingestion plugin", ErrUnavailable, key)
+	}
+	started := time.Now()
+	result, err := i.embedQuery(ctx, plugins.InvocationID(), org, id, text)
+	observe(i.Pin, org, OpEmbedQuery, started, result, err)
+	if err != nil {
+		return nil, err
+	}
+	var answer struct {
+		Vector []float64 `json:"vector"`
+	}
+	if err := json.Unmarshal(result.Body, &answer); err != nil {
+		return nil, err
+	}
+	return plugins.Float32s(answer.Vector), nil
+}
+
+// embedQuery posts one embed_query within the contribution's query_timeout_ms.
+func (i Ingestor) embedQuery(ctx context.Context, invocation, org, space, text string) (*devhost.Result, error) {
+	body, err := plugins.BuildEmbedQueryRequest(plugins.EmbedQueryRequest{InvocationID: invocation, Contribution: "ingestion", OrganizationID: org, Configuration: i.Pin.Configuration, Space: space, Query: plugins.EmbedQuery{Modality: "text", Text: text}})
+	if err != nil {
+		return nil, err
+	}
+	m := &i.Pin.Manifest
+	return call.Invoke(ctx, i.Pin, call.EmbedQuery, call.Bytes(body), func(ctx context.Context, b []byte) []plugins.Issue { return plugins.CheckEmbedQueryOutput(b, space, m) }, nil)
+}
+
+// WarmUpOrganization is the organization_id of a warm-up embed_query: it
+// belongs to no Organization.
+const WarmUpOrganization = "engine.warm-up"
+
+// Warm sends one embed_query to each space the pin enables, served first, so
+// that the plugin loads what it loads on first use (core.ingest starts its
+// tokenizer process) before a search waits for it, not within that search's
+// latency budget. An error answer is a failed warm-up, so callers can retry
+// rather than report successful loading. The calls count for no Organization,
+// so they are not observed.
+func (i Ingestor) Warm(ctx context.Context) error {
+	for _, space := range i.Pin.EnabledSpaces() {
+		if _, err := i.embedQuery(ctx, "warm-up-"+plugins.InvocationID(), WarmUpOrganization, space.ID, "warm-up"); err != nil {
+			return fmt.Errorf("%w: %v", ErrUnavailable, err)
+		}
+	}
+	return nil
+}
