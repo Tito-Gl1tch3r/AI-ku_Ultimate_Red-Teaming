@@ -1,0 +1,373 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.fory.serializer.collection;
+
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodType;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import org.apache.fory.context.CopyContext;
+import org.apache.fory.context.ReadContext;
+import org.apache.fory.memory.MemoryBuffer;
+import org.apache.fory.memory.MemoryUtils;
+import org.apache.fory.platform.JdkVersion;
+import org.apache.fory.platform.internal._JDKAccess;
+import org.apache.fory.resolver.TypeResolver;
+import org.apache.fory.serializer.GraphMemoryEstimates;
+import org.apache.fory.util.ExceptionUtils;
+
+/** Serializers for jdk9+ java.util.ImmutableCollections. */
+@SuppressWarnings({"unchecked", "rawtypes"})
+public class ImmutableCollectionSerializers {
+  private static Class<?> List12;
+  private static Class<?> ListN;
+  private static Class<?> SubList;
+  private static Class<?> Set12;
+  private static Class<?> SetN;
+  private static Class<?> Map1;
+  private static Class<?> MapN;
+  private static MethodHandle listFactory;
+  private static MethodHandle setFactory;
+  private static MethodHandle map1Factory;
+  private static MethodHandle mapNFactory;
+
+  private static final int ARRAY_LIST_OWNER_BYTES =
+      GraphMemoryEstimates.shallowObjectBytes(ArrayList.class);
+  private static final int HASH_MAP_OWNER_BYTES =
+      GraphMemoryEstimates.shallowObjectBytes(HashMap.class);
+  private static final int HASH_SET_OWNER_BYTES =
+      Math.addExact(GraphMemoryEstimates.shallowObjectBytes(HashSet.class), HASH_MAP_OWNER_BYTES);
+  private static final int UNMODIFIABLE_LIST_OWNER_BYTES =
+      GraphMemoryEstimates.shallowObjectBytes(
+          Collections.unmodifiableList(new ArrayList<>()).getClass());
+  private static final int UNMODIFIABLE_SET_OWNER_BYTES =
+      GraphMemoryEstimates.shallowObjectBytes(
+          Collections.unmodifiableSet(new HashSet<>()).getClass());
+  private static final int UNMODIFIABLE_MAP_OWNER_BYTES =
+      GraphMemoryEstimates.shallowObjectBytes(
+          Collections.unmodifiableMap(new HashMap<>()).getClass());
+  private static final int IMMUTABLE_LIST_FALLBACK_OWNER_BYTES =
+      Math.addExact(UNMODIFIABLE_LIST_OWNER_BYTES, ARRAY_LIST_OWNER_BYTES);
+  private static final int IMMUTABLE_SET_FALLBACK_OWNER_BYTES =
+      Math.addExact(UNMODIFIABLE_SET_OWNER_BYTES, HASH_SET_OWNER_BYTES);
+  private static final int IMMUTABLE_MAP_FALLBACK_OWNER_BYTES =
+      Math.addExact(UNMODIFIABLE_MAP_OWNER_BYTES, HASH_MAP_OWNER_BYTES);
+
+  static {
+    if (JdkVersion.MAJOR_VERSION > 8) {
+      try {
+        List12 = Class.forName("java.util.ImmutableCollections$List12");
+        ListN = Class.forName("java.util.ImmutableCollections$ListN");
+        SubList = Class.forName("java.util.ImmutableCollections$SubList");
+        Set12 = Class.forName("java.util.ImmutableCollections$Set12");
+        SetN = Class.forName("java.util.ImmutableCollections$SetN");
+        Map1 = Class.forName("java.util.ImmutableCollections$Map1");
+        MapN = Class.forName("java.util.ImmutableCollections$MapN");
+        if (MemoryUtils.JDK_COLLECTION_FIELD_ACCESS) {
+          listFactory =
+              _JDKAccess._trustedLookup(List.class)
+                  .findStatic(List.class, "of", MethodType.methodType(List.class, Object[].class));
+          setFactory =
+              _JDKAccess._trustedLookup(Set.class)
+                  .findStatic(Set.class, "of", MethodType.methodType(Set.class, Object[].class));
+          map1Factory =
+              _JDKAccess._trustedLookup(Map1)
+                  .findConstructor(
+                      Map1, MethodType.methodType(void.class, Object.class, Object.class));
+          mapNFactory =
+              _JDKAccess._trustedLookup(MapN)
+                  .findConstructor(MapN, MethodType.methodType(void.class, Object[].class));
+        }
+      } catch (ClassNotFoundException | NoSuchMethodException | IllegalAccessException e) {
+        if (!MemoryUtils.JDK_COLLECTION_FIELD_ACCESS) {
+          useStubClasses();
+        } else {
+          e.printStackTrace();
+          ExceptionUtils.throwException(e);
+        }
+      }
+    } else {
+      useStubClasses();
+    }
+  }
+
+  private static void useStubClasses() {
+    // Use stub class as placeholder to ensure registered ids stay consistent when immutable
+    // collection internals are unavailable.
+    class List12Stub {}
+
+    class ListNStub {}
+
+    class SubListStub {}
+
+    class Set12Stub {}
+
+    class SetNStub {}
+
+    class Map1Stub {}
+
+    class MapNStub {}
+
+    List12 = List12Stub.class;
+    ListN = ListNStub.class;
+    SubList = SubListStub.class;
+    Set12 = Set12Stub.class;
+    SetN = SetNStub.class;
+    Map1 = Map1Stub.class;
+    MapN = MapNStub.class;
+  }
+
+  public static class ImmutableListSerializer extends CollectionSerializer {
+    public ImmutableListSerializer(TypeResolver typeResolver, Class cls) {
+      super(typeResolver, cls, true, immutableListOwnerBytes(cls));
+    }
+
+    @Override
+    public Collection newCollection(ReadContext readContext, boolean elementReadAlwaysAdvances) {
+      MemoryBuffer buffer = readContext.getBuffer();
+      int numElements = readCollectionSize(readContext, buffer, elementReadAlwaysAdvances);
+      setNumElements(numElements);
+      if (JdkVersion.MAJOR_VERSION > 8) {
+        return new CollectionContainer<>(numElements);
+      } else {
+        return new ArrayList(numElements);
+      }
+    }
+
+    @Override
+    public Collection copy(CopyContext copyContext, Collection originCollection) {
+      if (JdkVersion.MAJOR_VERSION <= 8) {
+        throw new UnsupportedOperationException(
+            String.format(
+                "Only support jdk9+ java.util.ImmutableCollections deep copy. %s",
+                originCollection.getClass()));
+      }
+      Object[] elements = new Object[originCollection.size()];
+      copyElements(copyContext, originCollection, elements);
+      if (!MemoryUtils.JDK_COLLECTION_FIELD_ACCESS) {
+        ArrayList list = new ArrayList(elements.length);
+        Collections.addAll(list, elements);
+        return Collections.unmodifiableList(list);
+      }
+      try {
+        return (List) listFactory.invoke(elements);
+      } catch (Throwable e) {
+        throw new RuntimeException(e);
+      }
+    }
+
+    @Override
+    public Collection onCollectionRead(Collection collection) {
+      if (JdkVersion.MAJOR_VERSION > 8) {
+        CollectionContainer container = (CollectionContainer) collection;
+        if (!MemoryUtils.JDK_COLLECTION_FIELD_ACCESS) {
+          Object[] elements = container.elements;
+          ArrayList list = new ArrayList(elements.length);
+          Collections.addAll(list, elements);
+          return Collections.unmodifiableList(list);
+        }
+        try {
+          collection = (List) listFactory.invoke(container.elements);
+        } catch (Throwable e) {
+          throw new RuntimeException(e);
+        }
+      } else {
+        collection = Collections.unmodifiableList((List) collection);
+      }
+      return collection;
+    }
+  }
+
+  public static class ImmutableSetSerializer extends CollectionSerializer {
+    public ImmutableSetSerializer(TypeResolver typeResolver, Class cls) {
+      super(typeResolver, cls, true, immutableSetOwnerBytes(cls));
+    }
+
+    @Override
+    public Collection newCollection(ReadContext readContext, boolean elementReadAlwaysAdvances) {
+      MemoryBuffer buffer = readContext.getBuffer();
+      int numElements = readCollectionSize(readContext, buffer, elementReadAlwaysAdvances);
+      setNumElements(numElements);
+      if (JdkVersion.MAJOR_VERSION > 8) {
+        return new CollectionContainer<>(numElements);
+      } else {
+        return new HashSet(numElements);
+      }
+    }
+
+    @Override
+    public Collection copy(CopyContext copyContext, Collection originCollection) {
+      if (JdkVersion.MAJOR_VERSION <= 8) {
+        throw new UnsupportedOperationException(
+            String.format(
+                "Only support jdk9+ java.util.ImmutableCollections deep copy. %s",
+                originCollection.getClass()));
+      }
+      Object[] elements = new Object[originCollection.size()];
+      copyElements(copyContext, originCollection, elements);
+      if (!MemoryUtils.JDK_COLLECTION_FIELD_ACCESS) {
+        HashSet set = new HashSet(elements.length);
+        Collections.addAll(set, elements);
+        return Collections.unmodifiableSet(set);
+      }
+      try {
+        return (Set) setFactory.invoke(elements);
+      } catch (Throwable e) {
+        throw new RuntimeException(e);
+      }
+    }
+
+    @Override
+    public Collection onCollectionRead(Collection collection) {
+      if (JdkVersion.MAJOR_VERSION > 8) {
+        CollectionContainer container = (CollectionContainer) collection;
+        if (!MemoryUtils.JDK_COLLECTION_FIELD_ACCESS) {
+          Object[] elements = container.elements;
+          HashSet set = new HashSet(elements.length);
+          Collections.addAll(set, elements);
+          return Collections.unmodifiableSet(set);
+        }
+        try {
+          collection = (Set) setFactory.invoke(container.elements);
+        } catch (Throwable e) {
+          throw new RuntimeException(e);
+        }
+      } else {
+        collection = Collections.unmodifiableSet((HashSet) collection);
+      }
+      return collection;
+    }
+  }
+
+  public static class ImmutableMapSerializer extends MapSerializer {
+    public ImmutableMapSerializer(TypeResolver typeResolver, Class cls) {
+      super(typeResolver, cls, true, immutableMapOwnerBytes(cls));
+    }
+
+    @Override
+    public Map newMap(ReadContext readContext, boolean entryReadAlwaysAdvances) {
+      MemoryBuffer buffer = readContext.getBuffer();
+      int numElements = readMapSize(readContext, buffer, entryReadAlwaysAdvances);
+      setNumElements(numElements);
+      if (JdkVersion.MAJOR_VERSION > 8) {
+        return new JDKImmutableMapContainer(numElements);
+      } else {
+        return new HashMap(numElements);
+      }
+    }
+
+    @Override
+    public Map copy(CopyContext copyContext, Map originMap) {
+      if (JdkVersion.MAJOR_VERSION <= 8) {
+        throw new UnsupportedOperationException(
+            String.format(
+                "Only support jdk9+ java.util.ImmutableCollections deep copy. %s",
+                originMap.getClass()));
+      }
+      int size = originMap.size();
+      Object[] elements = new Object[size * 2];
+      copyEntry(copyContext, originMap, elements);
+      if (!MemoryUtils.JDK_COLLECTION_FIELD_ACCESS) {
+        return Collections.unmodifiableMap(newHashMap(elements, size));
+      }
+      try {
+        if (size == 1) {
+          return (Map) map1Factory.invoke(elements[0], elements[1]);
+        } else {
+          return (Map) mapNFactory.invoke(elements);
+        }
+      } catch (Throwable e) {
+        throw new RuntimeException(e);
+      }
+    }
+
+    @Override
+    public Map onMapRead(Map map) {
+      if (JdkVersion.MAJOR_VERSION > 8) {
+        JDKImmutableMapContainer container = (JDKImmutableMapContainer) map;
+        if (!MemoryUtils.JDK_COLLECTION_FIELD_ACCESS) {
+          return Collections.unmodifiableMap(newHashMap(container.array, container.size()));
+        }
+        try {
+          if (container.size() == 1) {
+            Object[] elements = container.array;
+            map = (Map) map1Factory.invoke(elements[0], elements[1]);
+          } else {
+            map = (Map) mapNFactory.invoke(container.array);
+          }
+        } catch (Throwable e) {
+          throw new RuntimeException(e);
+        }
+      } else {
+        map = Collections.unmodifiableMap(map);
+      }
+      return map;
+    }
+
+    private static HashMap newHashMap(Object[] elements, int size) {
+      HashMap map = new HashMap(size);
+      for (int i = 0; i < size; i++) {
+        map.put(elements[i * 2], elements[i * 2 + 1]);
+      }
+      return map;
+    }
+  }
+
+  public static void registerSerializers(TypeResolver resolver) {
+    resolver.registerInternalSerializer(List12, new ImmutableListSerializer(resolver, List12));
+    resolver.registerInternalSerializer(ListN, new ImmutableListSerializer(resolver, ListN));
+    resolver.registerInternalSerializer(SubList, new ImmutableListSerializer(resolver, SubList));
+    resolver.registerInternalSerializer(Set12, new ImmutableSetSerializer(resolver, Set12));
+    resolver.registerInternalSerializer(SetN, new ImmutableSetSerializer(resolver, SetN));
+    resolver.registerInternalSerializer(Map1, new ImmutableMapSerializer(resolver, Map1));
+    resolver.registerInternalSerializer(MapN, new ImmutableMapSerializer(resolver, MapN));
+  }
+
+  private static int immutableListOwnerBytes(Class<?> cls) {
+    return usesJdkImmutableOwner()
+        ? GraphMemoryEstimates.shallowObjectBytes(cls)
+        : IMMUTABLE_LIST_FALLBACK_OWNER_BYTES;
+  }
+
+  private static int immutableSetOwnerBytes(Class<?> cls) {
+    return usesJdkImmutableOwner()
+        ? GraphMemoryEstimates.shallowObjectBytes(cls)
+        : IMMUTABLE_SET_FALLBACK_OWNER_BYTES;
+  }
+
+  private static int immutableMapOwnerBytes(Class<?> cls) {
+    return usesJdkImmutableOwner()
+        ? GraphMemoryEstimates.shallowObjectBytes(cls)
+        : IMMUTABLE_MAP_FALLBACK_OWNER_BYTES;
+  }
+
+  private static boolean usesJdkImmutableOwner() {
+    // The no-field-access/JDK8 fallback path materializes an unmodifiable wrapper plus a retained
+    // mutable source; charge that final graph shape instead of the inaccessible JDK immutable
+    // implementation class.
+    return JdkVersion.MAJOR_VERSION > 8 && MemoryUtils.JDK_COLLECTION_FIELD_ACCESS;
+  }
+}

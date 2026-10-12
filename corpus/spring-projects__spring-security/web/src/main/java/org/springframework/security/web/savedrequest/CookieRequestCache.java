@@ -1,0 +1,187 @@
+/*
+ * Copyright 2004-present the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.springframework.security.web.savedrequest;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.Objects;
+import java.util.function.Consumer;
+
+import jakarta.servlet.http.Cookie;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.jspecify.annotations.Nullable;
+
+import org.springframework.security.web.util.UrlUtils;
+import org.springframework.security.web.util.matcher.AnyRequestMatcher;
+import org.springframework.security.web.util.matcher.RequestMatcher;
+import org.springframework.util.Assert;
+import org.springframework.util.StringUtils;
+import org.springframework.web.util.UriComponents;
+import org.springframework.web.util.UriComponentsBuilder;
+import org.springframework.web.util.WebUtils;
+
+/**
+ * An Implementation of {@code RequestCache} which saves the original request URI in a
+ * cookie.
+ *
+ * @author Zeeshan Adnan
+ * @since 5.4
+ */
+public class CookieRequestCache implements RequestCache {
+
+	private RequestMatcher requestMatcher = AnyRequestMatcher.INSTANCE;
+
+	protected final Log logger = LogFactory.getLog(this.getClass());
+
+	private static final String COOKIE_NAME = "REDIRECT_URI";
+
+	private static final int COOKIE_MAX_AGE = -1;
+
+	private Consumer<Cookie> cookieCustomizer = (cookie) -> {
+	};
+
+	@Override
+	public void saveRequest(HttpServletRequest request, HttpServletResponse response) {
+		if (!this.requestMatcher.matches(request)) {
+			this.logger.debug("Request not saved as configured RequestMatcher did not match");
+			return;
+		}
+		String redirectUrl = buildRelativeRequestUrl(request);
+		Cookie savedCookie = new Cookie(COOKIE_NAME, encodeCookie(redirectUrl));
+		savedCookie.setMaxAge(COOKIE_MAX_AGE);
+		savedCookie.setSecure(request.isSecure());
+		savedCookie.setPath(getCookiePath(request));
+		savedCookie.setHttpOnly(true);
+		this.cookieCustomizer.accept(savedCookie);
+		response.addCookie(savedCookie);
+	}
+
+	@Override
+	public @Nullable SavedRequest getRequest(HttpServletRequest request, HttpServletResponse response) {
+		Cookie savedRequestCookie = WebUtils.getCookie(request, COOKIE_NAME);
+		if (savedRequestCookie == null) {
+			return null;
+		}
+		String originalURI = decodeCookie(savedRequestCookie.getValue());
+		if (originalURI == null) {
+			return null;
+		}
+		UriComponents uriComponents = UriComponentsBuilder.fromUriString(originalURI).build();
+		if (!isRelativePath(originalURI)) {
+			this.logger.debug("Did not use saved request since cookie did not contain a relative path");
+			return null;
+		}
+		DefaultSavedRequest.Builder builder = new DefaultSavedRequest.Builder();
+		int port = request.getServerPort();
+		return builder.setScheme(request.getScheme())
+			.setServerName(request.getServerName())
+			.setRequestURI(uriComponents.getPath())
+			.setQueryString(uriComponents.getQuery())
+			.setServerPort(port)
+			.setMethod(request.getMethod())
+			.setLocales(Collections.list(request.getLocales()))
+			.setParameters(request.getParameterMap())
+			.build();
+	}
+
+	private boolean isRelativePath(String uri) {
+		return uri.startsWith("/") && !uri.startsWith("//");
+	}
+
+	@Override
+	public @Nullable HttpServletRequest getMatchingRequest(HttpServletRequest request, HttpServletResponse response) {
+		@Nullable SavedRequest saved = this.getRequest(request, response);
+		if (!this.matchesSavedRequest(request, saved)) {
+			this.logger.debug("saved request doesn't match");
+			return null;
+		}
+		this.removeRequest(request, response);
+		// we know that saved is non-null because matchesSavedRequest = true
+		return new SavedRequestAwareWrapper(Objects.requireNonNull(saved), request);
+	}
+
+	@Override
+	public void removeRequest(HttpServletRequest request, HttpServletResponse response) {
+		Cookie removeSavedRequestCookie = new Cookie(COOKIE_NAME, "");
+		removeSavedRequestCookie.setSecure(request.isSecure());
+		removeSavedRequestCookie.setHttpOnly(true);
+		removeSavedRequestCookie.setPath(getCookiePath(request));
+		removeSavedRequestCookie.setMaxAge(0);
+		response.addCookie(removeSavedRequestCookie);
+	}
+
+	private static String buildRelativeRequestUrl(HttpServletRequest request) {
+		String uri = request.getRequestURI();
+		String query = request.getQueryString();
+		return (query != null) ? uri + "?" + query : uri;
+	}
+
+	private static String encodeCookie(String cookieValue) {
+		return Base64.getEncoder().encodeToString(cookieValue.getBytes(StandardCharsets.UTF_8));
+	}
+
+	private @Nullable String decodeCookie(String encodedCookieValue) {
+		try {
+			return new String(Base64.getDecoder().decode(encodedCookieValue.getBytes(StandardCharsets.UTF_8)));
+		}
+		catch (IllegalArgumentException ex) {
+			this.logger.debug("Failed decode cookie value " + encodedCookieValue);
+			return null;
+		}
+	}
+
+	private static String getCookiePath(HttpServletRequest request) {
+		String contextPath = request.getContextPath();
+		return (StringUtils.hasLength(contextPath)) ? contextPath : "/";
+	}
+
+	private boolean matchesSavedRequest(HttpServletRequest request, @Nullable SavedRequest savedRequest) {
+		if (savedRequest == null) {
+			return false;
+		}
+		String currentUrl = UrlUtils.buildFullRequestUrl(request);
+		return savedRequest.getRedirectUrl().equals(currentUrl);
+	}
+
+	/**
+	 * Allows selective use of saved requests for a subset of requests. By default any
+	 * request will be cached by the {@code saveRequest} method.
+	 * <p>
+	 * If set, only matching requests will be cached.
+	 * @param requestMatcher a request matching strategy which defines which requests
+	 * should be cached.
+	 */
+	public void setRequestMatcher(RequestMatcher requestMatcher) {
+		Assert.notNull(requestMatcher, "requestMatcher should not be null");
+		this.requestMatcher = requestMatcher;
+	}
+
+	/**
+	 * Sets the {@link Consumer}, allowing customization of cookie.
+	 * @param cookieCustomizer customize for cookie
+	 * @since 6.4
+	 */
+	public void setCookieCustomizer(Consumer<Cookie> cookieCustomizer) {
+		Assert.notNull(cookieCustomizer, "cookieCustomizer cannot be null");
+		this.cookieCustomizer = cookieCustomizer;
+	}
+
+}

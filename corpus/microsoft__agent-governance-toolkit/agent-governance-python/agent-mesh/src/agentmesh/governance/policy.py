@@ -1,0 +1,1472 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+"""
+Policy Engine
+
+Declarative policy engine with YAML/JSON policies.
+Policy evaluation latency <5ms with 100% deterministic results.
+
+Supports schema versioning via ``apiVersion`` (e.g.,
+``governance.toolkit/v1``). Older versions emit deprecation
+warnings; unknown versions raise ``ValueError``.
+"""
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Literal, Any
+from pydantic import BaseModel, Field, field_validator
+import logging
+import os
+import warnings
+import yaml
+import json
+import re
+import math
+
+logger = logging.getLogger(__name__)
+
+# Supported schema versions (newest first)
+CURRENT_API_VERSION = "governance.toolkit/v1"
+SUPPORTED_API_VERSIONS = {
+    "governance.toolkit/v1": {"status": "current"},
+    "1.0": {"status": "deprecated", "migrate_to": "governance.toolkit/v1"},
+}
+
+# Allowed rate-limit periods, mapped to their length in seconds.
+RATE_LIMIT_PERIODS = {
+    "second": 1,
+    "minute": 60,
+    "hour": 3600,
+    "day": 86400,
+}
+
+
+def parse_rate_limit(limit: str) -> tuple[int, int]:
+    """Parse a rate-limit string into ``(count, period_seconds)``.
+
+    Accepts the form ``"<count>/<period>"`` (e.g. ``"100/hour"``) where
+    ``count`` is a non-negative integer and ``period`` is one of
+    ``second``, ``minute``, ``hour``, ``day``.
+
+    Args:
+        limit: The rate-limit string to parse.
+
+    Returns:
+        A ``(count, period_seconds)`` tuple.
+
+    Raises:
+        ValueError: If ``limit`` is not a well-formed rate-limit string. This
+            is enforced at ``PolicyRule`` construction so malformed limits fail
+            fast at policy load rather than crashing evaluation.
+    """
+    parts = limit.split("/")
+    if len(parts) != 2:
+        raise ValueError(
+            f"Invalid rate limit {limit!r}: expected '<count>/<period>', e.g. '100/hour'"
+        )
+
+    count_str, period_str = parts[0].strip(), parts[1].strip().lower()
+    try:
+        count = int(count_str)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid rate limit {limit!r}: count must be an integer"
+        ) from exc
+    if count < 0:
+        raise ValueError(f"Invalid rate limit {limit!r}: count must be non-negative")
+    if period_str not in RATE_LIMIT_PERIODS:
+        raise ValueError(
+            f"Invalid rate limit {limit!r}: period must be one of "
+            f"{sorted(RATE_LIMIT_PERIODS)}"
+        )
+
+    return count, RATE_LIMIT_PERIODS[period_str]
+
+
+class PolicyRule(BaseModel):
+    """
+    A single policy rule.
+
+    Rules define conditions and actions:
+    - condition: Expression that evaluates to true/false
+    - action: What to do when condition matches (allow, deny, warn, require_approval)
+    - stage: When in the agent lifecycle this rule is evaluated
+    """
+
+    name: str = Field(..., description="Rule name")
+    description: Optional[str] = Field(None)
+
+    # Lifecycle stage
+    stage: Literal["pre_input", "pre_tool", "post_tool", "pre_output"] = Field(
+        default="pre_tool",
+        description="Agent lifecycle stage: pre_input, pre_tool, post_tool, pre_output",
+    )
+
+    # Condition
+    condition: str = Field(..., description="Condition expression")
+
+    # Action
+    action: Literal["allow", "deny", "warn", "require_approval", "log"] = Field(
+        default="deny"
+    )
+
+    # Rate limiting
+    limit: Optional[str] = Field(None, description="Rate limit (e.g., '100/hour')")
+
+    @field_validator("limit")
+    @classmethod
+    def _validate_limit(cls, value: Optional[str]) -> Optional[str]:
+        """Reject malformed rate-limit strings at construction.
+
+        Without this, a malformed ``limit`` would raise deep inside
+        ``PolicyEngine.evaluate`` on the first matching call instead of failing
+        at policy load.
+        """
+        if value is not None:
+            parse_rate_limit(value)
+        return value
+
+    # Approval workflow
+    approvers: list[str] = Field(default_factory=list)
+
+    # Priority (higher = evaluated first)
+    priority: int = Field(default=0)
+
+    # Enabled
+    enabled: bool = Field(default=True)
+
+    def evaluate(self, context: dict) -> bool:
+        """Evaluate the rule condition against a context.
+
+        Supports simple expressions like:
+        - ``action.type == 'export'``
+        - ``data.contains_pii``
+        - ``user.role in ['admin', 'operator']``
+        - ``action.path contains '..'``
+        - ``action.tool startswith 'delete_'``
+        - ``resource.name endswith '.pem'``
+
+        Args:
+            context: Dictionary of runtime values the condition is
+                evaluated against. Keys are accessed via dot notation.
+
+        Returns:
+            ``True`` if the rule is enabled and the condition matches.
+            On a guard trip or evaluation error, returns ``True`` for
+            non-``allow`` actions (fail-closed) and ``False`` for
+            ``allow`` actions (fail-open); otherwise ``False``.
+        """
+        if not self.enabled:
+            return False
+
+        try:
+            # Simple expression evaluation
+            # In production, would use a proper expression parser
+            return self._eval_expression(self.condition, context)
+        except Exception:
+            # V27: Fail-closed — treat evaluation errors as a match so
+            # the rule's action (typically "deny") takes effect. This
+            # prevents attackers from crafting inputs that trigger
+            # exceptions to bypass policy rules. An "allow" rule failing
+            # open here would grant access instead, so it doesn't match.
+            match = self.action != "allow"
+            logger.warning(
+                "Policy rule evaluation error for '%s' — treating as %s (fail-closed)",
+                self.name,
+                "MATCH" if match else "NO-MATCH",
+                exc_info=True,
+            )
+            return match
+
+    # Maximum recursion depth for compound expressions to prevent DoS
+    _MAX_EXPRESSION_DEPTH = 20
+
+    def _eval_expression(self, expr: str, context: dict, _depth: int = 0) -> bool:
+        """Evaluate a simple expression."""
+        # Trailing whitespace would otherwise push a valid condition into
+        # the anchored regexes' unrecognized-syntax fallback.
+        expr = expr.strip()
+
+        # Non-allow rules fail closed on a guard trip; an allow rule
+        # failing open would grant access instead of denying it.
+        if _depth > self._MAX_EXPRESSION_DEPTH:
+            match = self.action != "allow"
+            logger.warning(
+                "Policy rule '%s': expression exceeded max depth %d — treating as %s",
+                self.name,
+                self._MAX_EXPRESSION_DEPTH,
+                "MATCH" if match else "NO-MATCH",
+            )
+            return match
+
+        if len(expr) > 2000:
+            match = self.action != "allow"
+            logger.warning(
+                "Policy rule '%s': expression length %d exceeds 2000-char limit — treating as %s",
+                self.name,
+                len(expr),
+                "MATCH" if match else "NO-MATCH",
+            )
+            return match
+
+        # Handle compound conditions first (AND/OR)
+        # This must be checked before individual conditions
+
+        # OR conditions
+        if " or " in expr:
+            parts = expr.split(" or ")
+            return any(self._eval_expression(p.strip(), context, _depth + 1) for p in parts)
+
+        # AND conditions
+        if " and " in expr:
+            parts = expr.split(" and ")
+            return all(self._eval_expression(p.strip(), context, _depth + 1) for p in parts)
+
+        # Now handle atomic conditions
+
+        # Equality: action.type == 'export'
+        eq_match = re.match(r"(\w+(?:\.\w+)*)\s*==\s*(['\"])([^'\"]+)\2$", expr)
+        if eq_match:
+            path, _quote, value = eq_match.groups()
+            actual = self._get_nested(context, path)
+            return actual == value
+
+        # Inequality: action.type != 'export'
+        neq_match = re.match(r"(\w+(?:\.\w+)*)\s*!=\s*(['\"])([^'\"]+)\2$", expr)
+        if neq_match:
+            path, _quote, value = neq_match.groups()
+            actual = self._get_nested(context, path)
+            if actual is None:
+                # A missing field is not evidence of inequality: `x != 'v'`
+                # must not match an allow rule just because x was never set.
+                match = self.action != "allow"
+                logger.warning(
+                    "Policy rule '%s': '%s' is absent, '!=' cannot match — treating as %s",
+                    self.name,
+                    path,
+                    "MATCH" if match else "NO-MATCH",
+                )
+                return match
+            if not isinstance(actual, str):
+                # Non-string values always compare unequal to a string
+                # literal, which would falsely satisfy '!=' on malformed evidence.
+                match = self.action != "allow"
+                logger.warning(
+                    "Policy rule '%s': '%s' resolved to non-string %s, "
+                    "'!=' cannot match — treating as %s",
+                    self.name,
+                    path,
+                    type(actual).__name__,
+                    "MATCH" if match else "NO-MATCH",
+                )
+                return match
+            return actual != value
+
+        # Membership: field in ['a', 'b', 'c']
+        in_match = re.match(r"(\w+(?:\.\w+)*)\s+in\s+\[([^\]]*)\]$", expr)
+        if in_match:
+            path, items_str = in_match.groups()
+            actual = self._get_nested(context, path)
+            items = [s.strip().strip("'\"") for s in items_str.split(",") if s.strip()]
+            return actual in items
+
+        # String containment: field contains 'substring'
+        contains_match = re.match(r"(\w+(?:\.\w+)*)\s+contains\s+(['\"])([^'\"]+)\2$", expr)
+        if contains_match:
+            path, _quote, needle = contains_match.groups()
+            actual = self._get_nested(context, path)
+            if not isinstance(actual, str):
+                match = self.action != "allow"
+                logger.warning(
+                    "Policy rule '%s': '%s' resolved to non-string %s, "
+                    "'contains' cannot match — treating as %s",
+                    self.name,
+                    path,
+                    type(actual).__name__,
+                    "MATCH" if match else "NO-MATCH",
+                )
+                return match
+            return needle in actual
+
+        # String prefix: field startswith 'prefix'
+        startswith_match = re.match(r"(\w+(?:\.\w+)*)\s+startswith\s+(['\"])([^'\"]+)\2$", expr)
+        if startswith_match:
+            path, _quote, prefix = startswith_match.groups()
+            actual = self._get_nested(context, path)
+            if not isinstance(actual, str):
+                match = self.action != "allow"
+                logger.warning(
+                    "Policy rule '%s': '%s' resolved to non-string %s, "
+                    "'startswith' cannot match — treating as %s",
+                    self.name,
+                    path,
+                    type(actual).__name__,
+                    "MATCH" if match else "NO-MATCH",
+                )
+                return match
+            return actual.startswith(prefix)
+
+        # String suffix: field endswith 'suffix'
+        endswith_match = re.match(r"(\w+(?:\.\w+)*)\s+endswith\s+(['\"])([^'\"]+)\2$", expr)
+        if endswith_match:
+            path, _quote, suffix = endswith_match.groups()
+            actual = self._get_nested(context, path)
+            if not isinstance(actual, str):
+                match = self.action != "allow"
+                logger.warning(
+                    "Policy rule '%s': '%s' resolved to non-string %s, "
+                    "'endswith' cannot match — treating as %s",
+                    self.name,
+                    path,
+                    type(actual).__name__,
+                    "MATCH" if match else "NO-MATCH",
+                )
+                return match
+            return actual.endswith(suffix)
+
+        # Comparison: field > number
+        cmp_match = re.match(r"(\w+(?:\.\w+)*)\s*(>=|<=|>|<)\s*(\d+(?:\.\d+)?)$", expr)
+        if cmp_match:
+            path, op, num_str = cmp_match.groups()
+            actual = self._get_nested(context, path)
+            if actual is None:
+                # Missing evidence must not be coerced to 0 -- that would
+                # let e.g. `action.cost < 10` match an allow rule with no
+                # cost recorded at all.
+                match = self.action != "allow"
+                logger.warning(
+                    "Policy rule '%s': '%s' is absent, numeric comparison cannot "
+                    "match — treating as %s",
+                    self.name,
+                    path,
+                    "MATCH" if match else "NO-MATCH",
+                )
+                return match
+            try:
+                actual_num = float(actual)
+                target = float(num_str)
+                if not (math.isfinite(actual_num) and math.isfinite(target)):
+                    # NaN/inf parse fine but every ordered comparison against
+                    # them is False, silently failing open a deny rule.
+                    match = self.action != "allow"
+                    logger.warning(
+                        "Policy rule '%s': '%s' is non-finite (%r), comparison "
+                        "cannot match — treating as %s",
+                        self.name,
+                        path,
+                        actual,
+                        "MATCH" if match else "NO-MATCH",
+                    )
+                    return match
+                if op == ">":
+                    return actual_num > target
+                if op == "<":
+                    return actual_num < target
+                if op == ">=":
+                    return actual_num >= target
+                if op == "<=":
+                    return actual_num <= target
+            except (TypeError, ValueError):
+                match = self.action != "allow"
+                logger.warning(
+                    "Policy rule '%s': '%s' is not numeric, comparison cannot "
+                    "match — treating as %s",
+                    self.name,
+                    path,
+                    "MATCH" if match else "NO-MATCH",
+                )
+                return match
+
+        # Boolean attribute: data.contains_pii
+        bool_match = re.match(r"^(\w+(?:\.\w+)*)$", expr)
+        if bool_match:
+            path = bool_match.group(1)
+            return bool(self._get_nested(context, path))
+
+        # Unrecognized syntax (unknown operator, typo, malformed expression):
+        # fail closed for non-allow rules so a malformed deny rule doesn't
+        # silently disable itself; an allow rule must not match on garbage.
+        match = self.action != "allow"
+        logger.warning(
+            "Policy rule '%s': unrecognized condition syntax %r — treating as %s",
+            self.name,
+            expr,
+            "MATCH" if match else "NO-MATCH",
+        )
+        return match
+
+    def _get_nested(self, obj: dict, path: str) -> Any:
+        """Get nested value from dict using dot notation."""
+        parts = path.split(".")
+        current = obj
+        for part in parts:
+            if isinstance(current, dict):
+                current = current.get(part)
+            else:
+                return None
+        return current
+
+
+class Policy(BaseModel):
+    """
+    Complete policy document.
+
+    Policies are defined in YAML/JSON and loaded at runtime.
+    Use ``apiVersion: governance.toolkit/v1`` in YAML files for
+    schema-versioned policies.
+
+    Supports hierarchical composition via ``extends``. Child policies
+    inherit all rules from parent policies and can add new rules but
+    cannot weaken or remove parent rules (additive-only semantics).
+    """
+
+    apiVersion: str = Field(
+        default=CURRENT_API_VERSION,
+        description="Schema version (e.g., governance.toolkit/v1)",
+    )
+    version: str = Field(default="1.0")
+    name: str = Field(...)
+    description: Optional[str] = Field(None)
+
+    # Composition
+    extends: list[str] = Field(
+        default_factory=list,
+        description="Parent policy file paths to inherit rules from (additive-only)",
+    )
+
+    # Target
+    agent: Optional[str] = Field(None, description="Agent this policy applies to")
+    agents: list[str] = Field(default_factory=list, description="Multiple agents")
+
+    # Scope for conflict resolution
+    scope: str = Field(
+        default="global",
+        description="Policy scope: global, tenant, organization, or agent",
+    )
+
+    # Rules
+    rules: list[PolicyRule] = Field(default_factory=list)
+
+    # Default action
+    default_action: Literal["allow", "deny"] = Field(default="deny")
+
+    # Metadata
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope(cls, value: str) -> str:
+        """Reject scope values that ``PolicyScope`` cannot parse.
+
+        Without this, a misspelled scope (``"organisation"``, ``"Agent"``,
+        ``"team"``, ``""``) silently demotes to ``GLOBAL`` inside
+        ``PolicyEngine.evaluate``, which can flip a scope-sensitive deny
+        into an allow under ``most_specific_wins``.
+
+        The accepted values are derived from the ``PolicyScope`` enum so
+        the validator and the enum cannot drift apart.
+        """
+        from agentmesh.governance.conflict_resolution import PolicyScope
+
+        valid_scopes = {s.value for s in PolicyScope}
+        if value not in valid_scopes:
+            raise ValueError(
+                f"Invalid policy scope {value!r}. "
+                f"Accepted values (case-sensitive): {sorted(valid_scopes)}. "
+                f"Hint: scope must be lowercase; "
+                f"'organisation' is not accepted — use 'organization'."
+            )
+        return value
+
+    @classmethod
+    def from_yaml(cls, yaml_content: str, base_dir: str = "") -> "Policy":
+        """Load a policy from a YAML string.
+
+        Validates the ``apiVersion`` field against supported versions
+        and emits deprecation warnings for older schemas. Resolves
+        ``extends`` references relative to ``base_dir``.
+
+        Args:
+            yaml_content: Raw YAML string containing the policy definition.
+            base_dir: Directory for resolving relative ``extends`` paths.
+
+        Returns:
+            A fully-constructed ``Policy`` instance with inherited rules.
+
+        Raises:
+            ValueError: If the ``apiVersion`` is not recognized or a
+                circular ``extends`` reference is detected.
+        """
+        data = yaml.safe_load(yaml_content)
+        _validate_api_version(data)
+
+        # Normalize extends field
+        extends_raw = data.pop("extends", None)
+        extends_list: list[str] = []
+        if isinstance(extends_raw, str):
+            extends_list = [extends_raw]
+        elif isinstance(extends_raw, list):
+            extends_list = extends_raw
+
+        # Parse own rules
+        rules = []
+        for rule_data in data.get("rules", []):
+            rules.append(PolicyRule(**rule_data))
+        data["rules"] = rules
+        data["extends"] = extends_list
+
+        return cls(**data)
+
+    @classmethod
+    def from_yaml_file(
+        cls,
+        file_path: str,
+        _resolve_stack: list[str] | None = None,
+    ) -> "Policy":
+        """Load a policy from a YAML file, resolving ``extends`` parents.
+
+        Recursively loads parent policies referenced by ``extends``,
+        merging rules with additive-only semantics (child can add
+        rules but cannot weaken or remove parent deny rules).
+
+        Detects and rejects circular references.
+
+        Args:
+            file_path: Path to the YAML policy file.
+
+        Returns:
+            A ``Policy`` with all inherited rules merged.
+
+        Raises:
+            ValueError: On circular references or missing parent files.
+            FileNotFoundError: If a referenced file does not exist.
+        """
+        abs_path = os.path.abspath(file_path)
+
+        # Cycle detection
+        if _resolve_stack is None:
+            _resolve_stack = []
+        if abs_path in _resolve_stack:
+            chain = " -> ".join(_resolve_stack + [abs_path])
+            raise ValueError(f"Circular policy extends detected: {chain}")
+        _resolve_stack = [*_resolve_stack, abs_path]
+
+        with open(abs_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        base_dir = os.path.dirname(abs_path)
+        policy = cls.from_yaml(content, base_dir=base_dir)
+
+        if not policy.extends:
+            return policy
+
+        # Resolve parent policies and merge rules
+        parent_rules: list[PolicyRule] = []
+        parent_names_seen: set[str] = set()
+
+        for parent_ref in policy.extends:
+            parent_path = (
+                parent_ref
+                if os.path.isabs(parent_ref)
+                else os.path.join(base_dir, parent_ref)
+            )
+
+            # Prevent path traversal: resolved path must stay within base_dir
+            real_parent = os.path.realpath(parent_path)
+            real_base = os.path.realpath(base_dir)
+            if not real_parent.startswith(real_base + os.sep) and real_parent != real_base:
+                raise ValueError(
+                    f"Policy extends '{parent_ref}' resolves to '{real_parent}' "
+                    f"which is outside the policy directory '{real_base}'"
+                )
+
+            if not os.path.exists(parent_path):
+                raise FileNotFoundError(
+                    f"Policy extends '{parent_ref}' not found at {parent_path}"
+                )
+
+            parent = cls.from_yaml_file(parent_path, _resolve_stack=_resolve_stack)
+
+            # Deduplicate (diamond inheritance) — track by rule name
+            for rule in parent.rules:
+                if rule.name not in parent_names_seen:
+                    parent_names_seen.add(rule.name)
+                    parent_rules.append(rule)
+
+        # Merge: parent rules first, then child rules.
+        # Child cannot override parent deny rules (additive-only).
+        parent_deny_names = {r.name for r in parent_rules if r.action == "deny"}
+        child_rules_filtered = []
+        for rule in policy.rules:
+            if rule.name in parent_deny_names and rule.action in ("allow", "log"):
+                logger.warning(
+                    "Policy '%s' rule '%s' attempts to weaken parent deny — ignored",
+                    policy.name,
+                    rule.name,
+                )
+                continue
+            child_rules_filtered.append(rule)
+
+        policy.rules = parent_rules + child_rules_filtered
+        return policy
+
+    @classmethod
+    def from_json(cls, json_content: str) -> "Policy":
+        """Load a policy from a JSON string.
+
+        Validates the ``apiVersion`` field against supported versions
+        and emits deprecation warnings for older schemas.
+
+        Args:
+            json_content: Raw JSON string containing the policy definition.
+
+        Returns:
+            A fully-constructed ``Policy`` instance.
+
+        Raises:
+            ValueError: If the ``apiVersion`` is not recognized.
+        """
+        data = json.loads(json_content)
+        _validate_api_version(data)
+
+        rules = []
+        for rule_data in data.get("rules", []):
+            rules.append(PolicyRule(**rule_data))
+        data["rules"] = rules
+
+        return cls(**data)
+
+    def applies_to(self, agent_did: str) -> bool:
+        """Check if this policy applies to a given agent.
+
+        A policy applies when the agent DID matches ``self.agent``,
+        appears in ``self.agents``, or when ``self.agents`` contains
+        the wildcard ``"*"``.
+
+        Args:
+            agent_did: Decentralized identifier of the agent.
+
+        Returns:
+            ``True`` if the policy targets this agent.
+        """
+        if self.agent and self.agent == agent_did:
+            return True
+        if agent_did in self.agents:
+            return True
+        if "*" in self.agents:
+            return True
+        return False
+
+    def to_yaml(self) -> str:
+        """Export this policy as a YAML string.
+
+        Returns:
+            YAML-formatted policy document.
+        """
+        data = self.model_dump(exclude_none=True)
+        # Convert rules to dicts
+        data["rules"] = [r.model_dump(exclude_none=True) for r in self.rules]
+        return yaml.dump(data, default_flow_style=False)
+
+
+class PolicyDecision(BaseModel):
+    """Result of policy evaluation.
+
+    Attributes:
+        allowed: Whether the action is permitted.
+        action: The action taken (allow, deny, warn, require_approval, log).
+        matched_rule: Name of the rule that triggered the decision.
+        policy_name: Name of the policy containing the matched rule.
+        reason: Human-readable explanation of the decision.
+        approvers: List of required approvers for ``require_approval`` actions.
+        rate_limited: Whether the decision was caused by rate limiting.
+        rate_limit_reset: When the rate limit resets (if applicable).
+        evaluated_at: Timestamp of evaluation.
+        evaluation_ms: Evaluation latency in milliseconds.
+    """
+
+    allowed: bool
+    action: Literal["allow", "deny", "warn", "require_approval", "log"]
+
+    # Which rule matched
+    matched_rule: Optional[str] = None
+    policy_name: Optional[str] = None
+
+    # Details
+    reason: Optional[str] = None
+
+    # For require_approval
+    approvers: list[str] = Field(default_factory=list)
+
+    # For rate limiting
+    rate_limited: bool = False
+    rate_limit_reset: Optional[datetime] = None
+
+    # Timing
+    evaluated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    evaluation_ms: Optional[float] = None
+
+    # Extension metadata (e.g., authority resolver details)
+    metadata: Optional[dict] = Field(default=None, description="Additional decision context from resolvers")
+
+
+class PolicyEngine:
+    """
+    Declarative policy engine.
+
+    Features:
+    - YAML/JSON policy definitions
+    - <5ms evaluation latency
+    - 100% deterministic across runs
+    - Rate limiting support
+    - Approval workflows
+    - Configurable conflict resolution strategy
+    """
+
+    MAX_EVAL_MS = 5  # Target: <5ms evaluation
+
+    def __init__(self, conflict_strategy: str = "priority_first_match"):
+        """Initialize the policy engine.
+
+        Args:
+            conflict_strategy: How to resolve conflicts when multiple
+                rules match. One of ``"deny_overrides"``,
+                ``"allow_overrides"``, ``"priority_first_match"``
+                (default, preserves v1.0 behavior), or
+                ``"most_specific_wins"``.
+        """
+        from agentmesh.governance.conflict_resolution import (
+            ConflictResolutionStrategy,
+            PolicyConflictResolver,
+        )
+
+        self._policies: dict[str, Policy] = {}
+        # (agent_did, policy_name, rule_name) -> {count, reset_at} | None
+        self._rate_limits: dict[tuple[str, str, str], Any] = {}
+        self._rego_evaluators: list[tuple[str, Any]] = []  # [(package, OPAEvaluator)]
+        self._cedar_evaluators: list[Any] = []  # [CedarEvaluator]
+        self._authority_resolver: Any = None  # AuthorityResolver protocol
+        self._conflict_strategy = ConflictResolutionStrategy(conflict_strategy)
+        self._resolver = PolicyConflictResolver(self._conflict_strategy)
+
+    def load_policy(self, policy: Policy) -> None:
+        """Load a policy into the engine.
+
+        Args:
+            policy: Policy instance to register. Replaces any existing
+                policy with the same name.
+        """
+        self._policies[policy.name] = policy
+
+    def load_yaml(self, yaml_content: str) -> Policy:
+        """Parse and register a policy from a YAML string.
+
+        Args:
+            yaml_content: Raw YAML policy definition.
+
+        Returns:
+            The loaded ``Policy`` instance.
+        """
+        policy = Policy.from_yaml(yaml_content)
+        self.load_policy(policy)
+        return policy
+
+    def load_yaml_file(self, file_path: str) -> Policy:
+        """Parse and register a policy from a YAML file.
+
+        Resolves ``extends`` references recursively with additive-only
+        merge semantics. Parent deny rules cannot be weakened by children.
+
+        Args:
+            file_path: Path to the YAML policy file.
+
+        Returns:
+            The loaded ``Policy`` with inherited rules merged.
+        """
+        policy = Policy.from_yaml_file(file_path)
+        self.load_policy(policy)
+        return policy
+
+    def load_json(self, json_content: str) -> Policy:
+        """Parse and register a policy from a JSON string.
+
+        Args:
+            json_content: Raw JSON policy definition.
+
+        Returns:
+            The loaded ``Policy`` instance.
+        """
+        policy = Policy.from_json(json_content)
+        self.load_policy(policy)
+        return policy
+
+    def set_authority_resolver(self, resolver: Any) -> None:
+        """Register an ``AuthorityResolver`` for reputation-gated authority.
+
+        The resolver is called during evaluation after YAML/JSON rule
+        matching and before OPA/Cedar policies. It can narrow
+        capabilities, apply spend limits, or deny the action based on
+        trust scoring and delegation chain context.
+
+        Args:
+            resolver: An object implementing the ``AuthorityResolver``
+                protocol (i.e., has a ``resolve(AuthorityRequest) ->
+                AuthorityDecision`` method).
+        """
+        self._authority_resolver = resolver
+
+    @staticmethod
+    def _rate_limit_key(
+        agent_did: str, policy_name: str, rule_name: str
+    ) -> tuple[str, str, str]:
+        """Build the rate-limit counter key.
+
+        Counters are scoped per agent, per policy, and per rule so that one
+        agent cannot exhaust a shared (wildcard) policy limit for another, and
+        so that same-named rules in different policies do not collide. This
+        mirrors the per-agent keying used by the service-layer ``RateLimiter``.
+        """
+        return (agent_did, policy_name, rule_name)
+
+    def _is_rate_limited(self, rule: PolicyRule, limit_key: tuple[str, str, str]) -> bool:
+        """Check whether ``rule`` is currently rate limited for ``limit_key``."""
+        if not rule.limit:
+            return False
+
+        limit_data = self._rate_limits.get(limit_key)
+        if not limit_data:
+            return False
+
+        # Reset the window if it has elapsed.
+        if datetime.now(timezone.utc) > limit_data["reset_at"]:
+            self._rate_limits[limit_key] = None
+            return False
+
+        count, _period = self._parse_limit(rule.limit)
+        return limit_data["count"] >= count
+
+    def _increment_rate_limit(self, rule: PolicyRule, limit_key: tuple[str, str, str]) -> None:
+        """Advance the rate-limit counter for ``limit_key``."""
+        if not rule.limit:
+            return
+
+        _count, period = self._parse_limit(rule.limit)
+
+        if self._rate_limits.get(limit_key) is None:
+            from datetime import timedelta
+            self._rate_limits[limit_key] = {
+                "count": 0,
+                "reset_at": datetime.now(timezone.utc) + timedelta(seconds=period),
+            }
+
+        self._rate_limits[limit_key]["count"] += 1
+
+    def _parse_limit(self, limit: str) -> tuple[int, int]:
+        """Parse a limit string like '100/hour' into ``(count, period_seconds)``.
+
+        Delegates to the module-level :func:`parse_rate_limit`. Limits are
+        validated at ``PolicyRule`` construction, so this is not expected to
+        raise during evaluation.
+        """
+        return parse_rate_limit(limit)
+
+    def get_policy(self, name: str) -> Optional[Policy]:
+        """Get a loaded policy by name.
+
+        Args:
+            name: Policy name.
+
+        Returns:
+            The ``Policy`` if found, otherwise ``None``.
+        """
+        return self._policies.get(name)
+
+    def list_policies(self) -> list[str]:
+        """List all loaded policy names.
+
+        Returns:
+            List of registered policy name strings.
+        """
+        return list(self._policies.keys())
+
+    def remove_policy(self, name: str) -> bool:
+        """Remove a policy from the engine.
+
+        Args:
+            name: Name of the policy to remove.
+
+        Returns:
+            ``True`` if the policy was found and removed, ``False`` otherwise.
+        """
+        if name in self._policies:
+            del self._policies[name]
+            return True
+        return False
+
+    # ── OPA/Rego integration ──────────────────────────────────
+
+    def load_rego(self, rego_path: Optional[str] = None, rego_content: Optional[str] = None, package: str = "agentmesh") -> "OPAEvaluator":  # noqa: F821
+        """
+        Load a .rego file alongside YAML/JSON policies.
+
+        The OPA evaluator runs in parallel: YAML rules are checked first,
+        and if no rule matches, the Rego policy is consulted.
+
+        Validated eagerly, here, rather than left to surface per governed
+        call: an absent opa binary, a missing rego_path, a compile error, or
+        a rego_package that doesn't match the file's own `package`
+        declaration (so ``data.{package}.allow`` could never resolve) used
+        to all evaluate() into an error that PolicyEngine.evaluate() then
+        silently skipped past — the governed call executed, unlogged, as if
+        no Rego policy had been configured at all.
+
+        Args:
+            rego_path: Path to a .rego file
+            rego_content: Inline Rego policy string
+            package: Rego package name (used to build query path)
+
+        Returns:
+            OPAEvaluator instance for direct use
+
+        Raises:
+            ValueError: neither rego_path nor rego_content given, both are
+                given, either is an empty string, the declared package
+                doesn't match `package`, the policy fails to compile, or
+                `package` has no rules anywhere in the loaded source.
+            FileNotFoundError: rego_path does not exist.
+            RuntimeError: the opa CLI is not on PATH.
+        """
+        from agentmesh.governance.opa import OPAEvaluator
+
+        # "" is falsy like None, but a caller who passed it explicitly meant
+        # *something* - collapsing it into "nothing configured" would skip
+        # Rego with no error rather than reject the mistake.
+        if rego_path == "":
+            raise ValueError("rego_path must not be an empty string")
+        if rego_content == "":
+            raise ValueError("rego_content must not be an empty string")
+        if not rego_path and not rego_content:
+            raise ValueError("load_rego requires rego_path or rego_content")
+        if rego_path and rego_content:
+            raise ValueError(
+                "load_rego received both rego_path and rego_content — pass "
+                "only one; rego_path would otherwise win silently at "
+                "evaluation time (see OPAEvaluator._rego_file_for_cli) and "
+                "rego_content would be loaded but never actually queried"
+            )
+        if rego_path and not os.path.exists(rego_path):
+            raise FileNotFoundError(f"rego_path does not exist: {rego_path}")
+
+        # A directory of .rego files is a valid `opa eval --data` target
+        # (and worked as rego_path before the existence check above was
+        # narrowed to files only).
+        source = rego_content
+        if source is None and rego_path and os.path.isfile(rego_path):
+            with open(rego_path, "r", encoding="utf-8") as f:
+                source = f.read()
+        if source is not None:
+            declared = re.search(r"^\s*package\s+([\w.]+)", source, re.MULTILINE)
+            if declared and declared.group(1) != package:
+                raise ValueError(
+                    f"rego file declares package '{declared.group(1)}' but "
+                    f"load_rego was called with package='{package}' — "
+                    f"data.{package}.allow would never resolve against it"
+                )
+        elif rego_path and os.path.isdir(rego_path):
+            # Same check as above, across every .rego file opa eval --data
+            # loads from a directory (recursively). Needed because a child
+            # package (e.g. agentmesh.sub for a configured "agentmesh")
+            # would pass the data.<package> probe below too.
+            declared_packages = set()
+            for rego_file in Path(rego_path).rglob("*.rego"):
+                match = re.search(
+                    r"^\s*package\s+([\w.]+)",
+                    rego_file.read_text(encoding="utf-8"),
+                    re.MULTILINE,
+                )
+                if match:
+                    declared_packages.add(match.group(1))
+            if declared_packages and package not in declared_packages:
+                raise ValueError(
+                    f"no .rego file under {rego_path!r} declares package "
+                    f"'{package}' (found: {sorted(declared_packages)}) — "
+                    f"data.{package}.allow would never resolve against it"
+                )
+
+        evaluator = OPAEvaluator(mode="local", rego_path=rego_path, rego_content=rego_content)
+        if not evaluator.opa_available:
+            raise RuntimeError(
+                "opa CLI not found on PATH; install it to use Rego policies: "
+                "https://www.openpolicyagent.org/docs/latest/#running-opa"
+            )
+        # A query that only depends on the file compiling, not on `package`
+        # or on any input — so a compile error is distinguishable here from
+        # the query simply being undefined for this input.
+        probe = evaluator.evaluate("true", {})
+        if probe.error is not None:
+            raise ValueError(f"rego policy failed to compile: {probe.error}")
+
+        # Belt-and-suspenders on top of the static check: query the bare
+        # package (not `.allow`) so a package with no rules at all is
+        # still caught even if the regex above missed something. Bare
+        # package, not `.allow`, so a rule that's legitimately undefined
+        # for empty input isn't mistaken for a missing package.
+        package_probe = evaluator.evaluate(f"data.{package}", {})
+        if not package_probe.defined:
+            raise ValueError(
+                f"package '{package}' has no rules anywhere in the loaded "
+                f"rego source (data.{package} is undefined) — every "
+                f"governed call would silently deny. Check that {package} "
+                "matches what the source actually declares."
+            )
+
+        self._rego_evaluators.append((package, evaluator))
+        return evaluator
+
+    # ── Cedar integration ─────────────────────────────────────
+
+    def load_cedar(
+        self,
+        cedar_path: Optional[str] = None,
+        cedar_content: Optional[str] = None,
+        entities: Optional[list] = None,
+        mode: str = "auto",
+    ) -> "CedarEvaluator":  # noqa: F821
+        """
+        Load a .cedar file alongside YAML/JSON and Rego policies.
+
+        Cedar evaluators run after Rego: YAML rules first, then Rego,
+        then Cedar, then defaults.
+
+        Args:
+            cedar_path: Path to a .cedar policy file
+            cedar_content: Inline Cedar policy string
+            entities: Cedar entities for authorization context
+            mode: Evaluation mode (auto, cedarpy, cli, builtin)
+
+        Returns:
+            CedarEvaluator instance for direct use
+        """
+        from agentmesh.governance.cedar import CedarEvaluator
+        evaluator = CedarEvaluator(
+            mode=mode,
+            policy_path=cedar_path,
+            policy_content=cedar_content,
+            entities=entities,
+        )
+        self._cedar_evaluators.append(evaluator)
+        return evaluator
+
+    def evaluate(
+        self,
+        agent_did: str,
+        context: dict,
+        stage: str = "pre_tool",
+    ) -> PolicyDecision:
+        """Evaluate all applicable policies for an agent action.
+
+        Collects ALL matching rules across all applicable policies
+        for the given lifecycle stage, then resolves conflicts using
+        the configured strategy:
+
+        - ``priority_first_match``: Highest-priority matching rule wins
+          (v1.0 behavior).
+        - ``deny_overrides``: Any deny wins, regardless of priority.
+        - ``allow_overrides``: Any allow wins, regardless of priority.
+        - ``most_specific_wins``: Agent-scoped > tenant > global;
+          priority breaks ties within the same scope.
+
+        Args:
+            agent_did: Decentralized identifier of the acting agent.
+            context: Runtime context dict describing the action.
+            stage: Lifecycle stage to evaluate. One of ``"pre_input"``,
+                ``"pre_tool"`` (default), ``"post_tool"``, ``"pre_output"``.
+                Only rules matching this stage are evaluated.
+
+        Returns:
+            A ``PolicyDecision`` indicating whether the action is allowed
+            and which rule (if any) matched.
+        """
+        from agentmesh.governance.conflict_resolution import (
+            CandidateDecision,
+            PolicyScope,
+        )
+
+        start = datetime.now(timezone.utc)
+
+        # Populate sql.* and k8s.* fields before rules run
+        from agentmesh.governance.protocol_facets import extract_protocol_facets
+        extract_protocol_facets(context)
+
+        # 1. Check YAML/JSON policies first
+        applicable = [p for p in self._policies.values() if p.applies_to(agent_did)]
+
+        if applicable:
+            candidates: list[CandidateDecision] = []
+            for policy in applicable:
+                # Map policy scope string to enum.
+                # The field_validator on Policy rejects invalid scopes at
+                # construction, but pydantic does not re-validate on
+                # assignment so this fallback is kept as a defence-in-depth
+                # measure.  Unlike the previous silent demotion, we now log
+                # a warning so the misconfiguration is observable.
+                try:
+                    scope = PolicyScope(policy.scope)
+                except ValueError:
+                    # Fail-closed: rank at AGENT (max specificity) so a
+                    # corrupted deny can never lose to a valid global allow
+                    # under most_specific_wins.  GLOBAL would be permissive.
+                    logger.warning(
+                        "Policy '%s' has unrecognised scope %r — "
+                        "ranking at AGENT (max specificity, fail-closed).  "
+                        "Fix the scope value to one of %s.",
+                        policy.name,
+                        policy.scope,
+                        [s.value for s in PolicyScope],
+                    )
+                    scope = PolicyScope.AGENT
+
+                for rule in policy.rules:
+                    if rule.stage != stage:
+                        continue  # skip rules for other stages
+                    if rule.enabled and rule.evaluate(context):
+                        candidates.append(CandidateDecision(
+                            action=rule.action,
+                            priority=rule.priority,
+                            scope=scope,
+                            policy_name=policy.name,
+                            rule_name=rule.name,
+                            reason=rule.description or f"Rule {rule.name} matched",
+                            approvers=rule.approvers,
+                        ))
+
+            if candidates:
+                result = self._resolver.resolve(candidates)
+                winner = result.winning_decision
+                elapsed = (datetime.now(timezone.utc) - start).total_seconds() * 1000
+
+                # Apply rate limiting for the winning rule. Resolve the rule
+                # from the WINNING policy (not just the first name match) so
+                # same-named rules in other policies cannot shadow it.
+                matched_rule = None
+                for policy in applicable:
+                    if policy.name != winner.policy_name:
+                        continue
+                    for rule in policy.rules:
+                        if rule.name == winner.rule_name:
+                            matched_rule = rule
+                            break
+                    if matched_rule:
+                        break
+
+                if matched_rule and matched_rule.limit:
+                    limit_key = self._rate_limit_key(
+                        agent_did, winner.policy_name, matched_rule.name
+                    )
+                    if self._is_rate_limited(matched_rule, limit_key):
+                        return PolicyDecision(
+                            allowed=False,
+                            action="deny",
+                            matched_rule=matched_rule.name,
+                            policy_name=winner.policy_name,
+                            reason=f"Rate limited: {matched_rule.limit}",
+                            rate_limited=True,
+                            evaluated_at=start,
+                            evaluation_ms=elapsed,
+                        )
+                    # Not rate limited: count this matching evaluation toward
+                    # the window so the (N+1)th matching call trips the limit.
+                    self._increment_rate_limit(matched_rule, limit_key)
+
+                return PolicyDecision(
+                    allowed=(winner.action == "allow"),
+                    action=winner.action,
+                    matched_rule=winner.rule_name,
+                    policy_name=winner.policy_name,
+                    reason=winner.reason,
+                    approvers=winner.approvers,
+                    evaluated_at=start,
+                    evaluation_ms=elapsed,
+                )
+
+        # 2. Authority resolution (trust-based narrowing)
+        if self._authority_resolver is not None:
+            from agentmesh.governance.authority import (
+                ActionRequest,
+                AuthorityRequest,
+                DelegationInfo,
+                TrustInfo,
+            )
+            delegation_info = DelegationInfo(
+                agent_did=agent_did,
+                delegated_capabilities=context.get("capabilities", []),
+            )
+            trust_info = TrustInfo(
+                score=context.get("trust_score", 500),
+                risk_level=context.get("risk_level", "medium"),
+            )
+            action_info = ActionRequest(
+                action_type=context.get("action", {}).get("type", "unknown")
+                if isinstance(context.get("action"), dict)
+                else context.get("tool_name", "unknown"),
+                tool_name=context.get("tool_name"),
+                resource=context.get("resource"),
+                requested_spend=context.get("requested_spend"),
+            )
+            authority_req = AuthorityRequest(
+                delegation=delegation_info,
+                trust=trust_info,
+                action=action_info,
+                context=context,
+            )
+            authority_decision = self._authority_resolver.resolve(authority_req)
+            if authority_decision.decision == "deny":
+                elapsed = (datetime.now(timezone.utc) - start).total_seconds() * 1000
+                return PolicyDecision(
+                    allowed=False,
+                    action="deny",
+                    reason=f"Authority resolver denied: {authority_decision.narrowing_reason or 'trust check failed'}",
+                    evaluated_at=start,
+                    evaluation_ms=elapsed,
+                )
+            if authority_decision.decision == "allow_narrowed":
+                elapsed = (datetime.now(timezone.utc) - start).total_seconds() * 1000
+                return PolicyDecision(
+                    allowed=True,
+                    action="allow",
+                    reason=f"Authority resolver narrowed: {authority_decision.narrowing_reason}",
+                    evaluated_at=start,
+                    evaluation_ms=elapsed,
+                    metadata={
+                        "effective_scope": authority_decision.effective_scope,
+                        "effective_spend_limit": authority_decision.effective_spend_limit,
+                        "trust_tier": authority_decision.trust_tier,
+                    },
+                )
+
+        # 3. Check Rego policies
+        for package, evaluator in self._rego_evaluators:
+            query = f"data.{package}.allow"
+            opa_result = evaluator.evaluate(query, context)
+            elapsed = (datetime.now(timezone.utc) - start).total_seconds() * 1000
+            if opa_result.error is not None:
+                # A Rego evaluator that errors at call time (opa binary
+                # vanished, the process hit its timeout, ...) used to be
+                # silently skipped here, falling through to Cedar and then
+                # to default_action — so a call governed only by an
+                # allow-all YAML policy plus Rego was executed, unlogged,
+                # exactly as if Rego had never errored at all. Deny instead:
+                # load_rego() already fails fast on the errors that are
+                # caught at construction (missing opa, bad syntax, wrong
+                # package), so only runtime faults reach here, and denying
+                # is the fail-closed choice for those.
+                logger.error(
+                    "Rego policy (%s) errored during evaluation, denying: %s",
+                    package, opa_result.error,
+                )
+                return PolicyDecision(
+                    allowed=False,
+                    action="deny",
+                    reason=f"OPA/Rego policy ({package}) errored: {opa_result.error}",
+                    evaluated_at=start,
+                    evaluation_ms=elapsed,
+                )
+            return PolicyDecision(
+                allowed=opa_result.allowed,
+                action="allow" if opa_result.allowed else "deny",
+                reason=f"OPA/Rego policy ({package}): {'allowed' if opa_result.allowed else 'denied'}",
+                evaluated_at=start,
+                evaluation_ms=elapsed,
+            )
+
+        # 4. Check Cedar policies
+        for cedar_eval in self._cedar_evaluators:
+            # Map context to Cedar action
+            action_name = context.get("action", {}).get("type", context.get("tool_name", "unknown"))
+            cedar_action = f'Action::"{action_name}"' if "::" not in action_name else action_name
+            cedar_result = cedar_eval.evaluate(cedar_action, context)
+            if cedar_result.error is None:
+                elapsed = (datetime.now(timezone.utc) - start).total_seconds() * 1000
+                return PolicyDecision(
+                    allowed=cedar_result.allowed,
+                    action="allow" if cedar_result.allowed else "deny",
+                    reason=f"Cedar policy: {'allowed' if cedar_result.allowed else 'denied'}",
+                    evaluated_at=start,
+                    evaluation_ms=elapsed,
+                )
+
+        # 5. No rules matched - use default
+        if applicable:
+            default = applicable[0].default_action
+        else:
+            # V26: Fail-closed — no policies loaded means deny by default.
+            # Operators must explicitly load an allow policy.
+            default = "deny"
+
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds() * 1000
+        return PolicyDecision(
+            allowed=(default == "allow"),
+            action=default,
+            reason="No matching rules, using default" if applicable else "No policies loaded (deny by default)",
+            evaluated_at=start,
+            evaluation_ms=elapsed,
+        )
+
+
+# ── Schema versioning helpers ──────────────────────────────
+
+
+def _validate_api_version(data: dict) -> None:
+    """Validate and warn about the apiVersion field in a policy document.
+
+    Args:
+        data: Parsed policy dict (from YAML/JSON).
+
+    Raises:
+        ValueError: If the ``apiVersion`` is present but not recognized.
+    """
+    api_version = data.get("apiVersion")
+
+    if api_version is None:
+        # Legacy policy without apiVersion — treat as v1.0, inject current
+        legacy_version = data.get("version", "1.0")
+        if legacy_version in SUPPORTED_API_VERSIONS:
+            info = SUPPORTED_API_VERSIONS[legacy_version]
+            if info["status"] == "deprecated":
+                warnings.warn(
+                    f"Policy schema version '{legacy_version}' is deprecated. "
+                    f"Add 'apiVersion: {info['migrate_to']}' to your policy file. "
+                    f"See https://github.com/microsoft/agent-governance-toolkit/docs/policy-migration.md",
+                    DeprecationWarning,
+                    stacklevel=3,
+                )
+        data["apiVersion"] = CURRENT_API_VERSION
+        return
+
+    if api_version not in SUPPORTED_API_VERSIONS:
+        raise ValueError(
+            f"Unsupported policy apiVersion: '{api_version}'. "
+            f"Supported versions: {list(SUPPORTED_API_VERSIONS.keys())}"
+        )
+
+    info = SUPPORTED_API_VERSIONS[api_version]
+    if info["status"] == "deprecated":
+        warnings.warn(
+            f"Policy apiVersion '{api_version}' is deprecated. "
+            f"Migrate to '{info['migrate_to']}'. "
+            f"See https://github.com/microsoft/agent-governance-toolkit/docs/policy-migration.md",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+
+def migrate_policy(yaml_content: str, target_version: str = CURRENT_API_VERSION) -> str:
+    """Migrate a policy YAML document to the target schema version.
+
+    Currently supports:
+    - ``1.0`` → ``governance.toolkit/v1``: Adds ``apiVersion`` field.
+
+    Args:
+        yaml_content: Raw YAML policy string.
+        target_version: Target apiVersion to migrate to.
+
+    Returns:
+        Updated YAML string with the new apiVersion.
+
+    Raises:
+        ValueError: If the target version is not supported.
+    """
+    if target_version not in SUPPORTED_API_VERSIONS:
+        raise ValueError(f"Unknown target version: {target_version}")
+
+    data = yaml.safe_load(yaml_content)
+    current = data.get("apiVersion", data.get("version", "1.0"))
+
+    if current == target_version:
+        return yaml_content  # Already at target
+
+    # Migration: 1.0 → governance.toolkit/v1
+    if current == "1.0" and target_version == CURRENT_API_VERSION:
+        data["apiVersion"] = CURRENT_API_VERSION
+        if "version" in data:
+            del data["version"]
+        return yaml.dump(data, default_flow_style=False, sort_keys=False)
+
+    logger.warning(
+        "No migration path from '%s' to '%s'", current, target_version
+    )
+    return yaml_content
+
+
+def validate_policy_schema(yaml_content: str) -> list[str]:
+    """Validate a policy YAML document against its declared schema.
+
+    Checks for required fields, valid values, and structural correctness.
+
+    Args:
+        yaml_content: Raw YAML policy string.
+
+    Returns:
+        List of validation error strings. Empty list means valid.
+    """
+    errors: list[str] = []
+    try:
+        data = yaml.safe_load(yaml_content)
+    except yaml.YAMLError as e:
+        return [f"YAML parse error: {e}"]
+
+    if not isinstance(data, dict):
+        return ["Policy must be a YAML mapping"]
+
+    # Check apiVersion
+    api_version = data.get("apiVersion", data.get("version", "1.0"))
+    if api_version not in SUPPORTED_API_VERSIONS:
+        errors.append(f"Unknown apiVersion: '{api_version}'")
+
+    # Check required fields
+    if "name" not in data:
+        errors.append("Missing required field: 'name'")
+
+    # Validate rules
+    rules = data.get("rules", [])
+    if not isinstance(rules, list):
+        errors.append("'rules' must be a list")
+    else:
+        valid_actions = {"allow", "deny", "warn", "require_approval", "log"}
+        for i, rule in enumerate(rules):
+            if not isinstance(rule, dict):
+                errors.append(f"Rule {i}: must be a mapping")
+                continue
+            if "name" not in rule:
+                errors.append(f"Rule {i}: missing required field 'name'")
+            if "condition" not in rule:
+                errors.append(f"Rule {i}: missing required field 'condition'")
+            action = rule.get("action", "deny")
+            if action not in valid_actions:
+                errors.append(
+                    f"Rule {i} ('{rule.get('name', '?')}'): "
+                    f"invalid action '{action}', must be one of {valid_actions}"
+                )
+
+    # Validate scope
+    scope_value = data.get("scope", "global")
+    from agentmesh.governance.conflict_resolution import PolicyScope
+
+    valid_scopes = {s.value for s in PolicyScope}
+    if not isinstance(scope_value, str):
+        errors.append(
+            f"Invalid scope: expected a string, got {type(scope_value).__name__}"
+        )
+    elif scope_value not in valid_scopes:
+        errors.append(
+            f"Invalid scope: '{scope_value}', "
+            f"must be one of {sorted(valid_scopes)}"
+        )
+
+    # Validate default_action
+    default_action = data.get("default_action", "deny")
+    if default_action not in ("allow", "deny"):
+        errors.append(f"Invalid default_action: '{default_action}', must be 'allow' or 'deny'")
+
+    return errors

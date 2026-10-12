@@ -1,0 +1,1010 @@
+//! LLIR type definitions — see crate::ir for design notes.
+
+use std::fmt;
+
+/// Bit width of a value or operation. Newtype over a `u16` count of **bits** so
+/// the type system distinguishes widths from arbitrary integers and so callers
+/// read at an explicit, machine-checkable width. See
+/// `docs/history/execution-engine-2026-06/architecture/executable-llir.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Width(pub u16);
+
+impl Width {
+    pub const W1: Width = Width(1);
+    pub const W8: Width = Width(8);
+    pub const W16: Width = Width(16);
+    pub const W32: Width = Width(32);
+    pub const W64: Width = Width(64);
+    pub const W128: Width = Width(128);
+    pub const W256: Width = Width(256);
+    pub const W512: Width = Width(512);
+
+    /// Width in bits.
+    pub fn bits(self) -> u16 {
+        self.0
+    }
+    /// Width in bytes (truncating; sub-byte widths report 0).
+    pub fn bytes(self) -> u16 {
+        self.0 / 8
+    }
+    /// Construct from a byte count (e.g. `MemOp.size`).
+    pub fn from_bytes(bytes: u16) -> Width {
+        Width(bytes.saturating_mul(8))
+    }
+}
+
+impl fmt::Display for Width {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "i{}", self.0)
+    }
+}
+
+/// Byte order of a memory access. The IR carries endianness explicitly so the
+/// execution engine stays endian-agnostic — the lifter decides per access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Endian {
+    #[default]
+    Little,
+    Big,
+}
+
+/// Status-like flags modelled as virtual registers. These are *condition-code
+/// values*, not the literal x86 EFLAGS bits — keeping them in terms of
+/// machine-independent comparison results lets other backends (ARM `NZCV`,
+/// RISC-V branches) map cleanly onto the same IR.
+///
+/// * `Z`   — equal / zero (result == 0)
+/// * `C`   — carry / unsigned-less-than (a `ult` b)
+/// * `Ule` — unsigned-less-or-equal (a `ule` b; `C || Z`)
+/// * `S`   — raw sign — top bit of the last arithmetic/logic result; equals
+///           the x86 `SF` flag. After `test` this differs from [`Flag::Slt`]
+///           (which is `SF ^ OF` and would be wrong for test-derived paths).
+/// * `Slt` — signed-less-than (a `slt` b; x86 `SF ^ OF` after cmp)
+/// * `Sle` — signed-less-or-equal (a `sle` b; `Z || Slt`)
+/// * `O`   — overflow
+/// * `P`   — parity
+/// * `A`   — auxiliary carry
+/// * `D`   — x86 string-operation direction (0 increments, 1 decrements)
+/// * `Bit` — internal one-bit predicate for flag-preserving ISA branches such
+///           as AArch64 `tbz`/`tbnz`; it is not an architectural status flag
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Flag {
+    Z,
+    C,
+    Ule,
+    S,
+    Slt,
+    Sle,
+    O,
+    P,
+    A,
+    D,
+    Bit,
+}
+
+impl Flag {
+    /// Stable identifier stem used by every textual representation.
+    pub fn ident(self) -> &'static str {
+        match self {
+            Flag::Z => "zf",
+            Flag::C => "cf",
+            Flag::Ule => "ule",
+            Flag::S => "sf",
+            Flag::Slt => "slt",
+            Flag::Sle => "sle",
+            Flag::O => "of",
+            Flag::P => "pf",
+            Flag::A => "af",
+            Flag::D => "df",
+            Flag::Bit => "bitpred",
+        }
+    }
+}
+
+/// A virtual register. Named physical registers carry the source-ISA name
+/// verbatim (`"rax"`, `"x0"`) so downstream annotations can round-trip.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum VReg {
+    /// Physical / ISA register, e.g. `"rax"`, `"rdi"`, `"x0"`.
+    Phys(String),
+    /// Synthetic temporary introduced during lifting.
+    Temp(u32),
+    /// Processor status flag.
+    Flag(Flag),
+    /// A particular SSA value of a processor flag / boolean predicate.
+    ///
+    /// `Flag` is the architectural name used by the lifter. The value-numbering
+    /// pass rewrites definitions and uses to this form so distinct producers do
+    /// not alias merely because both write (for example) ZF. Version zero is the
+    /// implicit live-in value and identifies an undefined-in-function read.
+    FlagValue { flag: Flag, version: u32 },
+}
+
+/// Whether a physical-register spelling denotes storage promoted from a stack
+/// slot. Keep this convention centralized: AST, type, copy, and field passes
+/// must agree on when a store to a named slot is a local definition.
+pub fn is_promoted_local_name(name: &str) -> bool {
+    name.starts_with("local_") || name.starts_with("stack_")
+}
+
+/// Register form of [`is_promoted_local_name`].
+pub fn is_promoted_local_reg(register: &VReg) -> bool {
+    matches!(register, VReg::Phys(name) if is_promoted_local_name(name))
+}
+
+/// A scalar dword lane of a packed register.
+///
+/// Packed operations in every ISA lower through this one spelling so ordinary
+/// LLIR, SSA, type recovery, and C emission can compose over lanes without a
+/// parallel vector AST.
+pub fn packed_dword_lane(register: &str, lane: usize) -> VReg {
+    VReg::phys(format!("{register}_d{lane}"))
+}
+
+/// A readable RHS value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Value {
+    Reg(VReg),
+    /// Integer constant. We store as i64 (signed) because most x86 immediates
+    /// are sign-extended to register width.
+    Const(i64),
+    /// Absolute VA (e.g. for lifted RIP-relative `lea`s that resolve to a
+    /// concrete VA at lift time).
+    Addr(u64),
+}
+
+/// Effective address of a memory operand.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemOp {
+    pub base: Option<VReg>,
+    pub index: Option<VReg>,
+    /// Byte multiplier for `index`. Zero is the legacy spelling for unity when
+    /// no architecture-specific scale was encoded.
+    pub scale: u8,
+    pub disp: i64,
+    /// Access width in bytes (1, 2, 4, 8).
+    pub size: u8,
+    /// Segment override: `Some("fs")` / `Some("gs")` for x86-64 TLS; None
+    /// for ARM64 and for x86 accesses that use a default segment (ds/ss/cs).
+    pub segment: Option<String>,
+    /// Byte order of the access. Defaults to little-endian (x86/ARM common case);
+    /// the lifter overrides for big-endian targets.
+    pub endian: Endian,
+}
+
+impl MemOp {
+    /// Construct a MemOp with no segment override (the common case),
+    /// little-endian.
+    pub fn plain(base: Option<VReg>, index: Option<VReg>, scale: u8, disp: i64, size: u8) -> Self {
+        Self {
+            base,
+            index,
+            scale,
+            disp,
+            size,
+            segment: None,
+            endian: Endian::Little,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    /// Source-level left-to-right, short-circuit conjunction.
+    LogicalAnd,
+    /// Source-level left-to-right, short-circuit disjunction.
+    LogicalOr,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Sar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnOp {
+    Not,
+    Neg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    /// Unsigned less-than.
+    Ult,
+    /// Unsigned less-or-equal.
+    Ule,
+    /// Signed less-than.
+    Slt,
+    /// Signed less-or-equal.
+    Sle,
+}
+
+/// How a call transfers control.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallTarget {
+    Direct(u64),
+    Indirect(Value),
+}
+
+/// What a call does to registers, in the terms the value model needs.
+///
+/// One explicit representation, consulted by every pass, rather than each pass
+/// deciding for itself what a call means. Filled from the calling convention by
+/// `abi::annotate_calls`; the lifter cannot fill it because an instruction stream does
+/// not say which ABI it obeys.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct CallEffects {
+    /// The register the callee leaves its return value in — always written, whether
+    /// or not this program uses it. This is the DEF that makes a post-call read a new
+    /// value.
+    pub result: Option<VReg>,
+    /// Whether the machine-level `result` may represent a source-language value.
+    ///
+    /// A declared-void callee still clobbers its ABI return register, so `result`
+    /// must remain a DEF for sound SSA and reaching definitions. This separate
+    /// contract prevents prototype recovery from interpreting that clobber as a
+    /// value returned by the caller.
+    pub result_is_source_value: bool,
+    /// Argument registers the callee may read, in ABI order. These are the call's
+    /// USES: without them the argument setup looks dead, and the value model renames
+    /// it out from under argument reconstruction.
+    pub args: Vec<VReg>,
+    /// Argument registers proven to be semantic inputs by a recovered callee
+    /// contract, while `args` remains the convention-wide conservative may-use
+    /// set required for sound liveness.
+    ///
+    /// This is deliberately a subset rather than an arity.  It lets signature
+    /// and type recovery consume positive evidence without claiming that an
+    /// incomplete recovered contract names every register the callee may read.
+    pub proven_args: Vec<VReg>,
+    /// Whether `args` is an exact callee contract rather than the convention's
+    /// conservative may-read set.
+    ///
+    /// Exact inputs are also evidence about the caller's live-in parameters;
+    /// convention-wide may-uses are liveness-only and must not inflate them.
+    pub args_are_exact: bool,
+    /// This call replaces the current machine frame instead of returning to it.
+    ///
+    /// Function lifting records the CFG-proven tail transfer before the calling
+    /// convention or callee contract is known. Keeping the marker on the call
+    /// prevents its synthetic structural `Return` from masquerading as a real
+    /// read of stale result-register residue.
+    pub is_tail_call: bool,
+}
+
+/// A single LLIR operation. Multiple LLIR ops may correspond to one machine
+/// instruction (e.g. `push rax` expands to a `sub rsp, 8` + `store [rsp], rax`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Op {
+    Assign {
+        dst: VReg,
+        src: Value,
+    },
+    /// Explicitly poison a value whose architecture-level contents are not
+    /// defined (or whose defined semantics are not yet modelled).
+    ///
+    /// This is a real definition for SSA: a later read must reach this new value,
+    /// never an older plausible value. Execution halts if the poisoned value is
+    /// read and AST verification marks a live poison, while ordinary DCE can
+    /// remove an unused poisoned flag.
+    Undef {
+        dst: VReg,
+        reason: String,
+    },
+    Bin {
+        dst: VReg,
+        op: BinOp,
+        lhs: Value,
+        rhs: Value,
+    },
+    Un {
+        dst: VReg,
+        op: UnOp,
+        src: Value,
+    },
+    /// Write a boolean comparison result into a flag / temp.
+    Cmp {
+        dst: VReg,
+        op: CmpOp,
+        lhs: Value,
+        rhs: Value,
+    },
+    Load {
+        dst: VReg,
+        addr: MemOp,
+    },
+    /// Load only when `cond` has the requested polarity. `fallback` is the
+    /// value assigned when the predicate is false (normally the destination's
+    /// prior value). Keeping the dereference inside this op prevents a
+    /// predicated ARM load from faulting on a path where hardware skips it.
+    CondLoad {
+        dst: VReg,
+        cond: VReg,
+        inverted: bool,
+        addr: MemOp,
+        fallback: Value,
+    },
+    Store {
+        addr: MemOp,
+        src: Value,
+    },
+    /// Store only when `cond` has the requested polarity. This is distinct
+    /// from selecting the stored value: when the predicate is false the
+    /// architecture performs no memory access at all.
+    CondStore {
+        cond: VReg,
+        inverted: bool,
+        addr: MemOp,
+        src: Value,
+    },
+    /// Unconditional direct jump.
+    Jump {
+        target: u64,
+    },
+    /// Unconditional jump through a computed value — `jmp *%rax`, `jmp *[mem]`.
+    ///
+    /// These used to lift to [`Op::Call`], with the lifter noting that "downstream
+    /// analyses treat both the same". They must not: **a call returns and a jump
+    /// does not.** Modelling a dispatch as a call made the AST emit
+    /// `var = (*(code *)(table + ...))();` in place of the switch — the dispatch
+    /// became a value-producing statement, so the switch lowering could not
+    /// recognise it as the terminator to drop, and the arms hung off a
+    /// discriminant nothing defined.
+    ///
+    /// The *targets* are deliberately absent. Where control goes is a property of
+    /// the graph, recovered once by `analysis::dispatch` and recorded as CFG
+    /// edges; what the instruction IS belongs here. Duplicating the target set
+    /// into the op would create a second copy to disagree with the first.
+    IndirectJump {
+        /// The value jumped through, for the renderer to reconstruct the
+        /// dispatch from.
+        target: Value,
+        /// CFG-proven normalized jump-table index, snapshotted before the
+        /// dispatch arithmetic clobbers its source register. `None` for an
+        /// unresolved computed transfer or an indirect jump that is not a
+        /// switch.
+        index: Option<Value>,
+    },
+    /// Conditional jump on a previously-computed flag/bool value.
+    /// `inverted = true` means "take the jump when `cond` is *not* set" —
+    /// this is how JNE / JAE / JGE / etc. lift while still letting their
+    /// positive sibling (JE / JB / JL) share the same flag VReg as the
+    /// `cmp` that produced it. Downstream passes use this to render
+    /// `if (X != Y)` vs `if (X == Y)` correctly when hoisting the Cmp.
+    CondJump {
+        cond: VReg,
+        target: u64,
+        inverted: bool,
+    },
+    /// Return from the current function only when `cond` has the requested
+    /// polarity. A32 uses this for condition-suffixed register branches such
+    /// as `bxeq lr`: the taken path returns while the false path continues at
+    /// the next instruction.
+    CondReturn {
+        cond: VReg,
+        inverted: bool,
+    },
+    /// Conditional return with a prototype-proven direct scalar result.
+    CondReturnValue {
+        cond: VReg,
+        inverted: bool,
+        value: Value,
+    },
+    Call {
+        target: CallTarget,
+        /// The ABI effects of this call, filled by `abi::annotate_calls` once the
+        /// calling convention is known. `None` means "not yet annotated", NOT "no
+        /// effects": a call always clobbers its ABI's return register.
+        ///
+        /// Recording the effects on the op is what lets a call participate in
+        /// def/use and SSA like any other instruction. Without them
+        /// `use_def::def_uses` reported a call as defining nothing, so a read of the
+        /// return register after a call saw the pre-call value — `fib` recursed and
+        /// then used its ARGUMENT where the returned value belonged — and every
+        /// consumer that wanted the truth had to special-case calls for itself.
+        effects: Option<CallEffects>,
+    },
+    /// Return a prototype-proven direct scalar value.
+    ///
+    /// Machine return instructions initially lift as bare [`Op::Return`]
+    /// because the instruction encoding does not say whether the source
+    /// function is void or which ABI result bank it uses. Prototype recovery
+    /// upgrades a proven direct result to this form before final SSA so the
+    /// exact reaching definition is an ordinary explicit use.
+    ReturnValue {
+        value: Value,
+    },
+    /// Unresolved machine return. This remains deliberately operand-free until
+    /// prototype recovery proves a direct result; void and unknown outputs do
+    /// not acquire an invented register read.
+    Return,
+    Nop,
+    /// Zero-extend `src` (`from` bits) into `dst` (`to` bits, `to >= from`).
+    /// Mirrors P-code `INT_ZEXT` / BIL `UNSIGNED`.
+    ZExt {
+        dst: VReg,
+        src: Value,
+        from: Width,
+        to: Width,
+    },
+    /// Sign-extend `src` (`from` bits) into `dst` (`to` bits, `to >= from`).
+    /// Mirrors P-code `INT_SEXT` / BIL `SIGNED`.
+    SExt {
+        dst: VReg,
+        src: Value,
+        from: Width,
+        to: Width,
+    },
+    /// Truncate `src` (`from` bits) to its low `to` bits (`to <= from`).
+    /// Mirrors P-code `SUBPIECE`(0) / BIL `LOW`.
+    Trunc {
+        dst: VReg,
+        src: Value,
+        from: Width,
+        to: Width,
+    },
+    /// Extract bits `[lo, hi)` of `src` into `dst` (a bit slice; `hi > lo`).
+    /// Mirrors Miasm `ExprSlice` / sub-register reads.
+    Extract {
+        dst: VReg,
+        src: Value,
+        hi: u16,
+        lo: u16,
+    },
+    /// Concatenate: `dst = (hi << width(lo)) | lo`, most-significant part first.
+    /// Mirrors P-code `PIECE` / Miasm `ExprCompose`.
+    Concat {
+        dst: VReg,
+        hi: Value,
+        lo: Value,
+    },
+    /// Pure select: `dst = cond ? t : e`, where `cond` is a 1-bit value.
+    /// Both inputs are explicit, so SSA and symbolic execution observe the
+    /// dependency on the destination's prior value when it is the false arm.
+    Ite {
+        dst: VReg,
+        cond: VReg,
+        t: Value,
+        e: Value,
+        width: Width,
+    },
+    /// A typed, side-effect-declaring opaque operation — the executable-IR
+    /// replacement for [`Op::Unknown`]. Models VEX "dirty calls" / P-code
+    /// `CALLOTHER` / Binary Ninja intrinsics: an opaque body with explicit
+    /// inputs, typed outputs, and a declared memory footprint, so dataflow and
+    /// symbolic execution stay sound even when the semantics are not modelled.
+    /// Refinable into real ops later without changing the IR shape.
+    Intrinsic {
+        /// Operation name, e.g. `"cpuid"`, `"rdtsc"`, `"pshufb"`, `"syscall"`.
+        name: String,
+        /// Input operands read by the operation.
+        ins: Vec<Value>,
+        /// Output registers written, with their widths.
+        outs: Vec<(VReg, Width)>,
+        /// Whether the operation reads memory (conservatively `true` if unknown).
+        reads_mem: bool,
+        /// Whether the operation writes memory (conservatively `true` if unknown).
+        writes_mem: bool,
+    },
+    /// Could not lift faithfully. The mnemonic is preserved so analysers can
+    /// flag unsupported instructions rather than silently miscompile.
+    ///
+    /// **Deprecated** in favour of [`Op::Intrinsic`], which additionally declares
+    /// the operation's read/write footprint so execution stays sound. Retained
+    /// during the lifter migration (Phase 0 task 0.7); new lifting code should
+    /// emit `Intrinsic`.
+    Unknown {
+        mnemonic: String,
+    },
+}
+
+/// A single LLIR instruction annotated with its source VA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlirInstr {
+    /// VA of the *machine* instruction this op came from. Multiple LLIR
+    /// instructions may share one `va` when one machine instruction expanded
+    /// into several LLIR ops.
+    pub va: u64,
+    pub op: Op,
+}
+
+/// A straight-line LLIR basic block.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LlirBlock {
+    pub start_va: u64,
+    /// Exclusive upper bound of the last machine instruction contained.
+    pub end_va: u64,
+    pub instrs: Vec<LlirInstr>,
+    /// Successor VAs (unconditional or conditional targets + fallthrough).
+    pub succs: Vec<u64>,
+}
+
+/// An LLIR function — one entry VA and a list of blocks. No SSA, no dominator
+/// tree yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlirFunction {
+    pub entry_va: u64,
+    pub blocks: Vec<LlirBlock>,
+}
+
+// --- Convenience constructors & helpers --------------------------------------
+
+impl VReg {
+    pub fn phys(name: impl Into<String>) -> Self {
+        Self::Phys(name.into())
+    }
+
+    /// C-safe identifier for a flag/predicate value, if this is one.
+    pub fn predicate_ident(&self) -> Option<String> {
+        match self {
+            VReg::Flag(flag) => Some(flag.ident().to_string()),
+            VReg::FlagValue { flag, version } => Some(format!("{}_{}", flag.ident(), version)),
+            _ => None,
+        }
+    }
+
+    /// Bit width of this register where derivable.
+    ///
+    /// * `Flag` is always 1 bit.
+    /// * `Phys` is looked up by ISA register name (x86-64 + AArch64).
+    /// * `Temp` width is not encoded in the name; it is tracked by the producing
+    ///   op / executor, so this returns `None` for temporaries.
+    pub fn width(&self) -> Option<Width> {
+        match self {
+            VReg::Flag(_) | VReg::FlagValue { .. } => Some(Width::W1),
+            VReg::Temp(_) => None,
+            VReg::Phys(name) => phys_reg_width(name),
+        }
+    }
+}
+
+/// Bit width of a physical ISA register by name (x86-64 and AArch64). Returns
+/// `None` for names we don't model (callers treat that as "unknown width").
+///
+/// This helper is **arch-agnostic** and resolves purely by name, so a few short
+/// names that collide across ISAs (notably `sp`/`bp` — x86 16-bit registers vs
+/// AArch64's 64-bit stack/frame pointer) resolve to their **x86** width here.
+/// The authoritative, arch-aware width comes from the per-arch register layout
+/// introduced with the execution engine's `CpuModel` (Phase 1); until then
+/// callers that know the architecture should prefer that.
+pub fn phys_reg_width(name: &str) -> Option<Width> {
+    let n = name.to_ascii_lowercase();
+    // x86-64 64-bit GPRs
+    const R64: &[&str] = &[
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12",
+        "r13", "r14", "r15", "rip",
+    ];
+    // x86-64 32-bit GPRs
+    const R32: &[&str] = &[
+        "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "r8d", "r9d", "r10d", "r11d",
+        "r12d", "r13d", "r14d", "r15d", "eip",
+    ];
+    // x86-64 16-bit GPRs
+    const R16: &[&str] = &[
+        "ax", "bx", "cx", "dx", "si", "di", "bp", "sp", "r8w", "r9w", "r10w", "r11w", "r12w",
+        "r13w", "r14w", "r15w",
+    ];
+    // x86-64 8-bit GPRs (low and high byte)
+    const R8: &[&str] = &[
+        "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh", "sil", "dil", "bpl", "spl", "r8b", "r9b",
+        "r10b", "r11b", "r12b", "r13b", "r14b", "r15b",
+    ];
+    if R64.contains(&n.as_str()) {
+        return Some(Width::W64);
+    }
+    if R32.contains(&n.as_str()) {
+        return Some(Width::W32);
+    }
+    if R16.contains(&n.as_str()) {
+        return Some(Width::W16);
+    }
+    if R8.contains(&n.as_str()) {
+        return Some(Width::W8);
+    }
+    // x86 segment registers
+    if matches!(n.as_str(), "cs" | "ds" | "es" | "fs" | "gs" | "ss") {
+        return Some(Width::W16);
+    }
+    // The eight absolute x87 stack slots `crate::ir::x87` resolves `%st(i)`
+    // into. Reported as 64 bits, which is the width this IR MODELS them at, not
+    // the 80 the hardware holds: `ScalarType` has no extended-precision variant,
+    // so every transfer is exact and only intermediate rounding differs. See
+    // the `crate::ir::x87` module documentation.
+    if let Some(rest) = n.strip_prefix("st") {
+        if rest.parse::<u8>().is_ok_and(|index| index < 8) {
+            return Some(Width::W64);
+        }
+    }
+    // x86 SSE/AVX vector registers
+    if let Some(rest) = n.strip_prefix("xmm") {
+        if rest.parse::<u8>().is_ok() {
+            return Some(Width::W128);
+        }
+    }
+    // Scalarised packed-dword views used by the x86 and AArch64 lifters.
+    // Keeping lane identity in the register name lets ordinary SSA/dataflow
+    // process packed operations without pretending a lane-wise add is one
+    // scalar 128-bit add.
+    if let Some((register, lane)) = n.rsplit_once("_d") {
+        let packed_register = register
+            .strip_prefix("xmm")
+            .or_else(|| register.strip_prefix('v'))
+            .is_some_and(|index| index.parse::<u8>().is_ok_and(|index| index <= 31));
+        if packed_register && lane.parse::<u8>().is_ok_and(|index| index < 4) {
+            return Some(Width::W32);
+        }
+    }
+    if let Some(rest) = n.strip_prefix("ymm") {
+        if rest.parse::<u8>().is_ok() {
+            return Some(Width::W256);
+        }
+    }
+    if let Some(rest) = n.strip_prefix("zmm") {
+        if rest.parse::<u8>().is_ok() {
+            return Some(Width::W512);
+        }
+    }
+    // AArch64 64-bit GPRs: x0..x30, plus sp/xzr/pc
+    if let Some(rest) = n.strip_prefix('x') {
+        if let Ok(idx) = rest.parse::<u8>() {
+            if idx <= 30 {
+                return Some(Width::W64);
+            }
+        }
+    }
+    if matches!(n.as_str(), "sp" | "xzr" | "pc" | "lr" | "fp") {
+        return Some(Width::W64);
+    }
+    // AArch64 32-bit views: w0..w30, wzr
+    if let Some(rest) = n.strip_prefix('w') {
+        if let Ok(idx) = rest.parse::<u8>() {
+            if idx <= 30 {
+                return Some(Width::W32);
+            }
+        }
+    }
+    if n == "wzr" {
+        return Some(Width::W32);
+    }
+    // AArch64 SIMD/FP: v0..v31 (128b), q (128), d (64), s (32), h (16), b (8)
+    for (pfx, w) in [
+        ('v', Width::W128),
+        ('q', Width::W128),
+        ('d', Width::W64),
+        ('s', Width::W32),
+        ('h', Width::W16),
+    ] {
+        if let Some(rest) = n.strip_prefix(pfx) {
+            if let Ok(idx) = rest.parse::<u8>() {
+                if idx <= 31 {
+                    return Some(w);
+                }
+            }
+        }
+    }
+    None
+}
+
+impl Value {
+    pub fn reg(name: impl Into<String>) -> Self {
+        Value::Reg(VReg::phys(name))
+    }
+    pub fn konst(v: i64) -> Self {
+        Value::Const(v)
+    }
+}
+
+impl fmt::Display for VReg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VReg::Phys(n) => write!(f, "%{}", n),
+            VReg::Temp(i) => write!(f, "%t{}", i),
+            VReg::Flag(fl) => match fl {
+                Flag::Z => write!(f, "%zf"),
+                Flag::C => write!(f, "%cf"),
+                Flag::Ule => write!(f, "%ule"),
+                Flag::S => write!(f, "%sf"),
+                Flag::Slt => write!(f, "%slt"),
+                Flag::Sle => write!(f, "%sle"),
+                Flag::O => write!(f, "%of"),
+                Flag::P => write!(f, "%pf"),
+                Flag::A => write!(f, "%af"),
+                Flag::D => write!(f, "%df"),
+                Flag::Bit => write!(f, "%bitpred"),
+            },
+            VReg::FlagValue { flag, version } => {
+                write!(f, "%{}#{version}", flag.ident())
+            }
+        }
+    }
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Reg(r) => write!(f, "{}", r),
+            Value::Const(v) => write!(f, "{}", v),
+            Value::Addr(v) => write!(f, "@0x{:x}", v),
+        }
+    }
+}
+
+impl Op {
+    /// Whether this operation terminates the current function on every path.
+    pub fn is_unconditional_return(&self) -> bool {
+        matches!(self, Op::Return | Op::ReturnValue { .. })
+    }
+
+    /// Whether this operation terminates the current function on one condition.
+    pub fn is_conditional_return(&self) -> bool {
+        matches!(self, Op::CondReturn { .. } | Op::CondReturnValue { .. })
+    }
+
+    /// Whether this operation is any machine-level function return.
+    pub fn is_return(&self) -> bool {
+        self.is_unconditional_return() || self.is_conditional_return()
+    }
+
+    /// Whether result storage has not yet been resolved to an explicit value.
+    pub fn is_unresolved_return(&self) -> bool {
+        matches!(self, Op::Return | Op::CondReturn { .. })
+    }
+
+    /// The explicit source value of a prototype-resolved return, if present.
+    pub fn returned_value(&self) -> Option<&Value> {
+        match self {
+            Op::ReturnValue { value } | Op::CondReturnValue { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Build a maximally-conservative opaque [`Op::Intrinsic`] from an
+    /// unmodelled instruction mnemonic: no typed inputs/outputs, and assumed to
+    /// both read and write memory. This is the lowering target for the
+    /// deprecated [`Op::Unknown`] (Phase 0 task 0.7) — sound (over-approximate)
+    /// but imprecise. A concrete executor halts on it; a symbolic executor
+    /// havocs memory.
+    pub fn opaque(mnemonic: impl Into<String>) -> Op {
+        Op::Intrinsic {
+            name: mnemonic.into(),
+            ins: Vec::new(),
+            outs: Vec::new(),
+            reads_mem: true,
+            writes_mem: true,
+        }
+    }
+}
+
+impl fmt::Display for Op {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Op::Assign { dst, src } => write!(f, "{} = {}", dst, src),
+            Op::Undef { dst, reason } => write!(f, "{} = undef({})", dst, reason),
+            Op::Bin { dst, op, lhs, rhs } => write!(f, "{} = {:?} {} {}", dst, op, lhs, rhs),
+            Op::Un { dst, op, src } => write!(f, "{} = {:?} {}", dst, op, src),
+            Op::Cmp { dst, op, lhs, rhs } => write!(f, "{} = cmp {:?} {} {}", dst, op, lhs, rhs),
+            Op::Load { dst, addr } => write!(f, "{} = load[{} bytes] {:?}", dst, addr.size, addr),
+            Op::CondLoad {
+                dst,
+                cond,
+                inverted,
+                addr,
+                fallback,
+            } => {
+                let prefix = if *inverted { "!" } else { "" };
+                write!(
+                    f,
+                    "{} = if {}{} load[{} bytes] {:?} else {}",
+                    dst, prefix, cond, addr.size, addr, fallback
+                )
+            }
+            Op::Store { addr, src } => {
+                write!(f, "store[{} bytes] {:?} <- {}", addr.size, addr, src)
+            }
+            Op::CondStore {
+                cond,
+                inverted,
+                addr,
+                src,
+            } => {
+                let prefix = if *inverted { "!" } else { "" };
+                write!(
+                    f,
+                    "if {}{} store[{} bytes] {:?} <- {}",
+                    prefix, cond, addr.size, addr, src
+                )
+            }
+            Op::Jump { target } => write!(f, "jmp 0x{:x}", target),
+            Op::IndirectJump { target, index } => match index {
+                Some(index) => write!(f, "jmp *{} [switch index {}]", target, index),
+                None => write!(f, "jmp *{}", target),
+            },
+            Op::CondJump {
+                cond,
+                target,
+                inverted,
+            } => {
+                let prefix = if *inverted { "!" } else { "" };
+                write!(f, "if {}{} jmp 0x{:x}", prefix, cond, target)
+            }
+            Op::CondReturn { cond, inverted } => {
+                let prefix = if *inverted { "!" } else { "" };
+                write!(f, "if {}{} ret", prefix, cond)
+            }
+            Op::CondReturnValue {
+                cond,
+                inverted,
+                value,
+            } => {
+                let prefix = if *inverted { "!" } else { "" };
+                write!(f, "if {}{} ret {}", prefix, cond, value)
+            }
+            Op::Call { target, .. } => match target {
+                CallTarget::Direct(a) => write!(f, "call 0x{:x}", a),
+                CallTarget::Indirect(v) => write!(f, "call {}", v),
+            },
+            Op::ReturnValue { value } => write!(f, "ret {}", value),
+            Op::Return => write!(f, "ret"),
+            Op::Nop => write!(f, "nop"),
+            Op::ZExt {
+                dst, src, from, to, ..
+            } => write!(f, "{} = zext.{}.{} {}", dst, from, to, src),
+            Op::SExt {
+                dst, src, from, to, ..
+            } => write!(f, "{} = sext.{}.{} {}", dst, from, to, src),
+            Op::Trunc {
+                dst, src, from, to, ..
+            } => write!(f, "{} = trunc.{}.{} {}", dst, from, to, src),
+            Op::Extract { dst, src, hi, lo } => {
+                write!(f, "{} = extract[{}:{}] {}", dst, hi, lo, src)
+            }
+            Op::Concat { dst, hi, lo } => write!(f, "{} = concat {}:{}", dst, hi, lo),
+            Op::Ite {
+                dst, cond, t, e, ..
+            } => write!(f, "{} = {} ? {} : {}", dst, cond, t, e),
+            Op::Intrinsic {
+                name, ins, outs, ..
+            } => {
+                let outs_s: Vec<String> =
+                    outs.iter().map(|(r, w)| format!("{}:{}", r, w)).collect();
+                let ins_s: Vec<String> = ins.iter().map(|v| v.to_string()).collect();
+                write!(
+                    f,
+                    "[{}] = intrinsic {}({})",
+                    outs_s.join(", "),
+                    name,
+                    ins_s.join(", ")
+                )
+            }
+            Op::Unknown { mnemonic } => write!(f, "unk({})", mnemonic),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn width_accessors() {
+        assert_eq!(Width::W32.bits(), 32);
+        assert_eq!(Width::W32.bytes(), 4);
+        assert_eq!(Width::W1.bytes(), 0); // sub-byte
+        assert_eq!(Width::from_bytes(8), Width::W64);
+        assert_eq!(format!("{}", Width::W64), "i64");
+    }
+
+    #[test]
+    fn endian_defaults_little() {
+        assert_eq!(Endian::default(), Endian::Little);
+    }
+
+    #[test]
+    fn memop_plain_is_little_endian() {
+        let m = MemOp::plain(Some(VReg::phys("rsp")), None, 1, -8, 8);
+        assert_eq!(m.endian, Endian::Little);
+        assert_eq!(m.segment, None);
+    }
+
+    #[test]
+    fn phys_reg_width_x86_gpr_aliases() {
+        assert_eq!(phys_reg_width("rax"), Some(Width::W64));
+        assert_eq!(phys_reg_width("eax"), Some(Width::W32));
+        assert_eq!(phys_reg_width("ax"), Some(Width::W16));
+        assert_eq!(phys_reg_width("al"), Some(Width::W8));
+        assert_eq!(phys_reg_width("ah"), Some(Width::W8));
+        assert_eq!(phys_reg_width("r8"), Some(Width::W64));
+        assert_eq!(phys_reg_width("r8d"), Some(Width::W32));
+        assert_eq!(phys_reg_width("r8w"), Some(Width::W16));
+        assert_eq!(phys_reg_width("r8b"), Some(Width::W8));
+        // case-insensitive
+        assert_eq!(phys_reg_width("RAX"), Some(Width::W64));
+    }
+
+    #[test]
+    fn phys_reg_width_x86_vectors() {
+        assert_eq!(phys_reg_width("xmm0"), Some(Width::W128));
+        assert_eq!(phys_reg_width("xmm0_d0"), Some(Width::W32));
+        assert_eq!(phys_reg_width("xmm15_d3"), Some(Width::W32));
+        assert_eq!(phys_reg_width("xmm0_d4"), None);
+        assert_eq!(phys_reg_width("ymm15"), Some(Width::W256));
+        assert_eq!(phys_reg_width("zmm3"), Some(Width::W512));
+    }
+
+    #[test]
+    fn phys_reg_width_aarch64() {
+        assert_eq!(phys_reg_width("x0"), Some(Width::W64));
+        assert_eq!(phys_reg_width("x30"), Some(Width::W64));
+        assert_eq!(phys_reg_width("w0"), Some(Width::W32));
+        assert_eq!(phys_reg_width("v5"), Some(Width::W128));
+        assert_eq!(phys_reg_width("v5_d0"), Some(Width::W32));
+        assert_eq!(phys_reg_width("v31_d3"), Some(Width::W32));
+        assert_eq!(phys_reg_width("v31_d4"), None);
+        assert_eq!(phys_reg_width("d7"), Some(Width::W64));
+        assert_eq!(phys_reg_width("s7"), Some(Width::W32));
+    }
+
+    #[test]
+    fn phys_reg_width_ambiguous_names_prefer_x86() {
+        // `sp`/`bp` collide (x86 16-bit vs AArch64 64-bit); the arch-agnostic
+        // helper resolves them as x86. Arch-aware width (Phase 1 CpuModel)
+        // overrides this for AArch64.
+        assert_eq!(phys_reg_width("sp"), Some(Width::W16));
+        assert_eq!(phys_reg_width("bp"), Some(Width::W16));
+    }
+
+    #[test]
+    fn phys_reg_width_unknown_is_none() {
+        assert_eq!(phys_reg_width("not_a_register"), None);
+        assert_eq!(phys_reg_width("x99"), None); // out of range
+    }
+
+    #[test]
+    fn vreg_width() {
+        assert_eq!(VReg::phys("rax").width(), Some(Width::W64));
+        assert_eq!(VReg::phys("eax").width(), Some(Width::W32));
+        assert_eq!(VReg::Flag(Flag::Z).width(), Some(Width::W1));
+        assert_eq!(VReg::Temp(0).width(), None); // temp width tracked elsewhere
+    }
+
+    #[test]
+    fn new_ops_display() {
+        let zx = Op::ZExt {
+            dst: VReg::phys("rax"),
+            src: Value::reg("eax"),
+            from: Width::W32,
+            to: Width::W64,
+        };
+        assert_eq!(format!("{}", zx), "%rax = zext.i32.i64 %eax");
+
+        let ex = Op::Extract {
+            dst: VReg::phys("ah"),
+            src: Value::reg("rax"),
+            hi: 16,
+            lo: 8,
+        };
+        assert_eq!(format!("{}", ex), "%ah = extract[16:8] %rax");
+
+        let intr = Op::Intrinsic {
+            name: "cpuid".into(),
+            ins: vec![Value::reg("eax")],
+            outs: vec![
+                (VReg::phys("eax"), Width::W32),
+                (VReg::phys("edx"), Width::W32),
+            ],
+            reads_mem: false,
+            writes_mem: false,
+        };
+        assert_eq!(
+            format!("{}", intr),
+            "[%eax:i32, %edx:i32] = intrinsic cpuid(%eax)"
+        );
+    }
+}

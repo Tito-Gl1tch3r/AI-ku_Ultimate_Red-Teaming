@@ -1,0 +1,334 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+"""Google ADK adapter end-to-end scenarios on the AGT 5.0 ACS runtime.
+
+These scenarios exercise the native :class:`GoogleADKKernel` callback
+surface routed through :class:`agent_control_specification.AgentControl` via the
+:class:`agent_os.integrations._native_adapter_runtime.NativeAdapterRuntime`.
+The scripted policy dispatcher is injected directly so the suite does
+not depend on OPA being on ``PATH`` or on ``google-adk`` being
+installed (the kernel ships its own ``PolicyConfig`` shim).
+
+Each test covers one of the AGT verdicts that the adapter must
+expose through its native callback surface:
+
+- ``allow`` -> ``before_tool_callback`` returns ``None``.
+- ``deny`` -> the callback returns a sanitized ``{"error": "..."}`` dict
+  carrying the AGT reason.
+- ``transform`` -> the callback mutates ``tool_context.tool_args``
+  in-place (pre_tool_call) or rewrites the ``tool_result`` (output)
+  with the AGT D1.1 ``{path, value}`` payload.
+- ``escalate`` (resolver approves) -> the callback returns ``None``.
+- ``escalate`` (no resolver) -> the callback returns an error dict.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+pytest.importorskip("agent_control_specification")
+pytest.importorskip("agent_os")
+
+from agent_control_specification import InterventionPointResult, SnapshotBuilder  # noqa: E402,F401
+from agent_control_specification import (  # noqa: E402
+    AgentControl,
+    ApprovalResolution,
+)
+
+
+_MANIFEST = """agent_control_specification_version: 0.4.0-alpha.1
+metadata:
+  name: google_adk_adapter_scenarios
+extends: []
+policies:
+  scenario_policy:
+    type: custom
+    adapter: google_adk_adapter_scenarios_adapter
+intervention_points:
+  input:
+    policy_target: $.input.body
+    policy_target_kind: user_input
+    policy:
+      id: scenario_policy
+  pre_tool_call:
+    policy_target: $.tool_call.args
+    policy_target_kind: tool_args
+    tool_name_from: $.tool_call.name
+    policy:
+      id: scenario_policy
+  output:
+    policy_target: $.response.content
+    policy_target_kind: assistant_output
+    policy:
+      id: scenario_policy
+tools:
+  search:
+    clearance: public
+  delete_file:
+    clearance: confidential
+"""
+
+
+class _ScriptedPolicy:
+    """Tiny ACS PolicyDispatcher that returns a scripted verdict per call."""
+
+    def __init__(self, verdicts: list[dict[str, Any]]):
+        self._verdicts = list(verdicts)
+        self.invocations: list[dict[str, Any]] = []
+
+    def evaluate(self, invocation):  # type: ignore[no-untyped-def]
+        self.invocations.append(dict(invocation))
+        if not self._verdicts:
+            raise AssertionError(
+                "ScriptedPolicy ran out of verdicts; test wired too few."
+            )
+        return self._verdicts.pop(0)
+
+
+def _write_manifest(tmp_path: Path) -> Path:
+    path = tmp_path / "manifest.yaml"
+    path.write_text(_MANIFEST, encoding="utf-8")
+    return path
+
+
+def _build_runtime(
+    tmp_path: Path,
+    verdicts: list[dict[str, Any]],
+    *,
+    approval_resolver=None,
+) -> tuple[AgentControl, _ScriptedPolicy]:
+    policy = _ScriptedPolicy(verdicts)
+    runtime = AgentControl.from_path(
+        str(_write_manifest(tmp_path)),
+        policy_dispatcher=policy,
+        approval_resolver=approval_resolver,
+    )
+    return runtime, policy
+
+
+class _FakeToolContext:
+    """Minimal fake of ADK's ``ToolContext`` for kernel callback tests."""
+
+    def __init__(self, tool_name="search", tool_args=None, agent_name="agent"):
+        self.tool_name = tool_name
+        self.tool_args = tool_args if tool_args is not None else {}
+        self.agent_name = agent_name
+
+
+class _FakeCallbackContext:
+    """Minimal fake of ADK's ``CallbackContext``."""
+
+    def __init__(self, agent_name="root-agent", invocation_id="inv-001"):
+        self.agent_name = agent_name
+        self.invocation_id = invocation_id
+
+
+def _kernel(runtime, *, approval_resolver=None):
+    from agent_os.integrations.google_adk_adapter import GoogleADKKernel
+
+    assert approval_resolver is None or runtime._approval_resolver is approval_resolver
+    return GoogleADKKernel(runtime=runtime)
+
+
+# ── verdict scenarios — pre_tool_call ────────────────────────────────
+
+
+def test_before_tool_callback_allow_path(tmp_path: Path) -> None:
+    """An ``allow`` verdict lets the ADK tool execute."""
+    runtime, policy = _build_runtime(tmp_path, [{"decision": "allow"}])
+    kernel = _kernel(runtime)
+    ctx = _FakeToolContext(tool_name="search", tool_args={"q": "AI"})
+
+    result = kernel.before_tool_callback(ctx)
+
+    assert result is None
+    assert len(policy.invocations) == 1
+    assert (
+        policy.invocations[0]["input"]["intervention_point"] == "pre_tool_call"
+    )
+
+
+def test_before_tool_callback_deny_path(tmp_path: Path) -> None:
+    """A ``deny`` verdict surfaces as a sanitized error dict."""
+    runtime, _policy = _build_runtime(
+        tmp_path,
+        [
+            {
+                "decision": "deny",
+                "reason": "tool_args_forbidden",
+                "message": "query is off limits",
+            }
+        ],
+    )
+    kernel = _kernel(runtime)
+    ctx = _FakeToolContext(tool_name="search", tool_args={"q": "secrets"})
+
+    result = kernel.before_tool_callback(ctx)
+
+    assert result is not None
+    assert "error" in result
+    assert result["error"] == "Request blocked by policy."
+
+
+def test_before_tool_callback_transform_rewrites_args(tmp_path: Path) -> None:
+    """A ``transform`` verdict rewrites ``tool_context.tool_args``."""
+    runtime, _policy = _build_runtime(
+        tmp_path,
+        [
+            {
+                "decision": "transform",
+                "reason": "args_sanitized",
+                "transform": {
+                    "path": "$target",
+                    "value": {"q": "[REDACTED]"},
+                },
+            }
+        ],
+    )
+    kernel = _kernel(runtime)
+    ctx = _FakeToolContext(tool_name="search", tool_args={"q": "raw input"})
+
+    result = kernel.before_tool_callback(ctx)
+
+    assert result is None
+    assert ctx.tool_args == {"q": "[REDACTED]"}
+
+
+def test_before_tool_callback_escalate_with_resolver_passes(
+    tmp_path: Path,
+) -> None:
+    """An ``escalate`` verdict that the resolver approves passes."""
+    captured: dict[str, Any] = {}
+
+    def resolver(ip: str, result: InterventionPointResult) -> ApprovalResolution:
+        captured["ip"] = ip
+        captured["enforced_identity"] = result.enforced_identity
+        return ApprovalResolution.allow(result.enforced_identity)  # type: ignore[arg-type]
+
+    runtime, _policy = _build_runtime(
+        tmp_path,
+        [{"decision": "escalate", "reason": "human_approval_required"}],
+        approval_resolver=resolver,
+    )
+    kernel = _kernel(runtime, approval_resolver=resolver)
+    ctx = _FakeToolContext(tool_name="search", tool_args={"q": "AI"})
+
+    result = kernel.before_tool_callback(ctx)
+
+    assert captured["ip"] == "pre_tool_call"
+    assert result is None
+    identity_events = [
+        event
+        for event in kernel.get_audit_log()
+        if event.event_type == "agt_pre_tool_call"
+    ]
+    assert len(identity_events) == 1
+    assert identity_events[0].details["input_identity"]
+    assert (
+        identity_events[0].details["enforced_identity"]
+        == captured["enforced_identity"]
+    )
+
+
+def test_before_tool_callback_escalate_with_no_resolver_denies(
+    tmp_path: Path,
+) -> None:
+    """An ``escalate`` verdict without a resolver fails closed to deny."""
+    runtime, _policy = _build_runtime(
+        tmp_path,
+        [{"decision": "escalate", "reason": "human_approval_required"}],
+        approval_resolver=None,
+    )
+    kernel = _kernel(runtime)
+    ctx = _FakeToolContext(tool_name="search", tool_args={"q": "AI"})
+
+    result = kernel.before_tool_callback(ctx)
+
+    assert result is not None
+    assert "error" in result
+
+
+# ── verdict scenarios — output / agent ───────────────────────────────
+
+
+def test_after_tool_callback_transform_rewrites_result(tmp_path: Path) -> None:
+    """A ``transform`` verdict on the output rewrites ``tool_result``."""
+    runtime, _policy = _build_runtime(
+        tmp_path,
+        [
+            {
+                "decision": "transform",
+                "reason": "output_redaction",
+                "transform": {
+                    "path": "$target",
+                    "value": "[REDACTED OUTPUT]",
+                },
+            }
+        ],
+    )
+    kernel = _kernel(runtime)
+    ctx = _FakeToolContext(tool_name="search")
+
+    result = kernel.after_tool_callback(ctx, tool_result="leaked secret")
+
+    assert result == "[REDACTED OUTPUT]"
+
+
+def test_after_tool_callback_deny_path(tmp_path: Path) -> None:
+    """A ``deny`` verdict on the output returns a sanitized error dict."""
+    runtime, _policy = _build_runtime(
+        tmp_path,
+        [{"decision": "deny", "reason": "output_blocked"}],
+    )
+    kernel = _kernel(runtime)
+    ctx = _FakeToolContext(tool_name="search")
+
+    result = kernel.after_tool_callback(ctx, tool_result="secret payload")
+
+    assert isinstance(result, dict)
+    assert "error" in result
+    assert result["error"] == "Request blocked by policy."
+
+
+def test_before_agent_callback_deny_blocks_agent(tmp_path: Path) -> None:
+    """A ``deny`` verdict on agent invocation blocks the agent."""
+    runtime, _policy = _build_runtime(
+        tmp_path,
+        [{"decision": "deny", "reason": "agent_blocked"}],
+    )
+    kernel = _kernel(runtime)
+    ctx = _FakeCallbackContext(agent_name="suspicious-agent")
+
+    result = kernel.before_agent_callback(callback_context=ctx)
+
+    assert isinstance(result, dict)
+    assert "error" in result
+    assert result["error"] == "Request blocked by policy."
+
+
+def test_after_agent_callback_transform_rewrites_content(tmp_path: Path) -> None:
+    """A ``transform`` verdict on agent output rewrites content."""
+    runtime, _policy = _build_runtime(
+        tmp_path,
+        [
+            {
+                "decision": "transform",
+                "reason": "output_redaction",
+                "transform": {
+                    "path": "$target",
+                    "value": "[SANITISED AGENT OUTPUT]",
+                },
+            }
+        ],
+    )
+    kernel = _kernel(runtime)
+    ctx = _FakeCallbackContext()
+
+    result = kernel.after_agent_callback(
+        callback_context=ctx, content="leaked secret"
+    )
+
+    assert result == "[SANITISED AGENT OUTPUT]"

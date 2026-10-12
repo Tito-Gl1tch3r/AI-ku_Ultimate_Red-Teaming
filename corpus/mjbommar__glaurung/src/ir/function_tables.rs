@@ -1,0 +1,2255 @@
+//! Recover relocation-proven local function-pointer tables.
+//!
+//! A decompiled load through an input image VA is not standalone C: that VA is
+//! not mapped in the rebuilt object.  Conversely, turning an arbitrary computed
+//! call into a direct call guesses away writable data.  This pass only annotates
+//! a table when a real defined data symbol has pointer-sized storage, every slot
+//! has an exact dynamic relocation, and every relocation resolves to an exact
+//! defined function symbol.  Anything less remains the original dereference.
+
+use std::collections::HashMap;
+
+use object::{
+    Architecture, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationKind,
+    RelocationTarget, SymbolKind,
+};
+
+use crate::ir::ast::{Expr, Function, FunctionTableTarget, OriginSet, Stmt};
+use crate::ir::types::{BinOp, VReg};
+
+const MIN_ENTRIES: usize = 2;
+const MAX_ENTRIES: usize = 64;
+
+#[derive(Clone, Copy)]
+enum FunctionTableAuthority<'a> {
+    Exact(&'a crate::ir::value_number::ValueIdentities),
+    #[cfg(test)]
+    LegacySpelling,
+}
+
+impl FunctionTableAuthority<'_> {
+    fn is_versioned_value(self, register: &VReg) -> bool {
+        match self {
+            Self::Exact(identities) => identities.candidates(register).is_some_and(|values| {
+                !values.is_empty() && values.iter().all(|value| value.version > 0)
+            }),
+            #[cfg(test)]
+            Self::LegacySpelling => {
+                matches!(register, VReg::Phys(name) if name.contains('#'))
+            }
+        }
+    }
+
+    fn is_promoted_stack_object(self, value: &VReg) -> bool {
+        match self {
+            Self::Exact(identities) => identities.is_promoted_stack_object(value),
+            #[cfg(test)]
+            Self::LegacySpelling => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionPointerTable {
+    pub va: u64,
+    pub name: String,
+    pub pointer_size: u8,
+    pub targets: Vec<FunctionTableTarget>,
+}
+
+/// Collect complete local function-pointer tables from an object.
+pub fn collect_function_pointer_tables(data: &[u8]) -> Vec<FunctionPointerTable> {
+    let Ok(object) = crate::decompile::profile::parse_object(data) else {
+        return Vec::new();
+    };
+    let Some(pointer_size) = object
+        .architecture()
+        .address_size()
+        .map(|size| size.bytes())
+    else {
+        return Vec::new();
+    };
+    if !matches!(pointer_size, 4 | 8) {
+        return Vec::new();
+    }
+
+    let mut function_names: HashMap<u64, String> = HashMap::new();
+    for symbol in object.symbols().chain(object.dynamic_symbols()) {
+        if !symbol.is_definition() || symbol.kind() != SymbolKind::Text || symbol.address() == 0 {
+            continue;
+        }
+        let Ok(name) = symbol.name() else {
+            continue;
+        };
+        if name.is_empty() || crate::ir::name_resolve::is_internal_alias(name) {
+            continue;
+        }
+        function_names
+            .entry(symbol.address())
+            .or_insert_with(|| name.to_string());
+    }
+
+    let relocated_targets = relocation_targets(&object, pointer_size);
+
+    let mut tables = Vec::new();
+    for symbol in object.symbols() {
+        if !symbol.is_definition() || symbol.kind() != SymbolKind::Data || symbol.address() == 0 {
+            continue;
+        }
+        let size = symbol.size();
+        if size == 0 || size % u64::from(pointer_size) != 0 {
+            continue;
+        }
+        let Ok(entry_count) = usize::try_from(size / u64::from(pointer_size)) else {
+            continue;
+        };
+        if !(MIN_ENTRIES..=MAX_ENTRIES).contains(&entry_count) {
+            continue;
+        }
+        let Ok(name) = symbol.name() else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+
+        let mut targets = Vec::with_capacity(entry_count);
+        for index in 0..entry_count {
+            let Some(place) = symbol
+                .address()
+                .checked_add((index as u64).saturating_mul(u64::from(pointer_size)))
+            else {
+                targets.clear();
+                break;
+            };
+            let Some(target_va) = relocated_targets.get(&place).copied() else {
+                targets.clear();
+                break;
+            };
+            let Some(target_name) = function_names.get(&target_va) else {
+                targets.clear();
+                break;
+            };
+            targets.push(FunctionTableTarget {
+                va: target_va,
+                name: target_name.clone(),
+            });
+        }
+        if targets.len() == entry_count {
+            tables.push(FunctionPointerTable {
+                va: symbol.address(),
+                name: name.to_string(),
+                pointer_size,
+                targets,
+            });
+        }
+    }
+    tables.sort_by_key(|table| table.va);
+    tables
+}
+
+/// The tables in `tables` whose base address `caller` materialises.
+///
+/// Used to bound the cost of recovering an entry contract per table entry:
+/// a table this function never mentions cannot be the one it dispatches
+/// through, and lifting every entry of every table in the image would multiply
+/// the dominant cost of decompilation.
+///
+/// The scan is deliberately **fail-closed in the cheap direction**: it reports a
+/// table only when it can see the address, and an operand shape it does not
+/// enumerate simply yields nothing. Missing a reference costs the recovery that
+/// would have followed — the behavior before this existed — while a false
+/// positive would only recover contracts nobody asks about.
+pub fn tables_referenced_by<'tables>(
+    caller: &crate::ir::types::LlirFunction,
+    tables: &'tables [FunctionPointerTable],
+) -> Vec<&'tables FunctionPointerTable> {
+    use crate::ir::types::{MemOp, Op, Value};
+
+    if tables.is_empty() {
+        return Vec::new();
+    }
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let note_value = |value: &Value, seen: &mut std::collections::HashSet<u64>| match value {
+        Value::Addr(address) => {
+            seen.insert(*address);
+        }
+        Value::Const(constant) => {
+            if let Ok(address) = u64::try_from(*constant) {
+                seen.insert(address);
+            }
+        }
+        _ => {}
+    };
+    let note_mem = |address: &MemOp, seen: &mut std::collections::HashSet<u64>| {
+        if let Ok(displacement) = u64::try_from(address.disp) {
+            seen.insert(displacement);
+        }
+    };
+    for instruction in caller
+        .blocks
+        .iter()
+        .flat_map(|block| block.instrs.iter())
+        .map(|instruction| &instruction.op)
+    {
+        match instruction {
+            Op::Assign { src, .. }
+            | Op::Un { src, .. }
+            | Op::ZExt { src, .. }
+            | Op::SExt { src, .. }
+            | Op::Trunc { src, .. }
+            | Op::Extract { src, .. }
+            | Op::ReturnValue { value: src } => note_value(src, &mut seen),
+            Op::Bin { lhs, rhs, .. }
+            | Op::Cmp { lhs, rhs, .. }
+            | Op::Concat {
+                hi: lhs, lo: rhs, ..
+            } => {
+                note_value(lhs, &mut seen);
+                note_value(rhs, &mut seen);
+            }
+            Op::Load { addr, .. } => note_mem(addr, &mut seen),
+            Op::CondLoad { addr, fallback, .. } => {
+                note_mem(addr, &mut seen);
+                note_value(fallback, &mut seen);
+            }
+            Op::Store { addr, src } | Op::CondStore { addr, src, .. } => {
+                note_mem(addr, &mut seen);
+                note_value(src, &mut seen);
+            }
+            Op::IndirectJump { target, index } => {
+                note_value(target, &mut seen);
+                if let Some(index) = index {
+                    note_value(index, &mut seen);
+                }
+            }
+            Op::Ite { t, e, .. } => {
+                note_value(t, &mut seen);
+                note_value(e, &mut seen);
+            }
+            Op::Intrinsic { ins, .. } => {
+                for input in ins {
+                    note_value(input, &mut seen);
+                }
+            }
+            Op::Call {
+                target: crate::ir::types::CallTarget::Indirect(target),
+                ..
+            } => note_value(target, &mut seen),
+            Op::CondReturnValue { value, .. } => note_value(value, &mut seen),
+            _ => {}
+        }
+    }
+
+    // AArch64 commonly materialises a data address as ADRP(page) followed by
+    // ADD(page_offset), so neither instruction contains the final table VA on
+    // its own. This is a demand-discovery scan, not the semantic call-site
+    // proof: a false positive only asks callee recovery for an unused table.
+    // Track exact affine addresses within each straight-line block so those
+    // tables are not missed while refusing unknown arithmetic and joins.
+    fn offset(address: u64, displacement: i64) -> Option<u64> {
+        if displacement >= 0 {
+            address.checked_add(displacement as u64)
+        } else {
+            address.checked_sub(displacement.unsigned_abs())
+        }
+    }
+    for block in &caller.blocks {
+        let mut addresses: HashMap<VReg, u64> = HashMap::new();
+        for instruction in &block.instrs {
+            let definition = crate::ir::use_def::def_ref(&instruction.op).cloned();
+            let derived = match &instruction.op {
+                Op::Assign { src, .. } => match src {
+                    Value::Addr(address) => Some(*address),
+                    Value::Const(address) => u64::try_from(*address).ok(),
+                    Value::Reg(source) => addresses.get(source).copied(),
+                },
+                Op::Bin {
+                    op: BinOp::Add,
+                    lhs,
+                    rhs,
+                    ..
+                } => match (lhs, rhs) {
+                    (Value::Reg(base), Value::Addr(addend))
+                    | (Value::Addr(addend), Value::Reg(base)) => addresses
+                        .get(base)
+                        .copied()
+                        .and_then(|address| address.checked_add(*addend)),
+                    (Value::Reg(base), Value::Const(displacement))
+                    | (Value::Const(displacement), Value::Reg(base)) => addresses
+                        .get(base)
+                        .copied()
+                        .and_then(|address| offset(address, *displacement)),
+                    _ => None,
+                },
+                Op::Bin {
+                    op: BinOp::Sub,
+                    lhs: Value::Reg(base),
+                    rhs: Value::Const(displacement),
+                    ..
+                } => addresses
+                    .get(base)
+                    .copied()
+                    .and_then(|address| offset(address, displacement.saturating_neg())),
+                _ => None,
+            };
+            if let Some(definition) = definition.as_ref() {
+                addresses.remove(definition);
+            }
+            if let (Some(definition), Some(address)) = (definition, derived) {
+                addresses.insert(definition, address);
+                if tables.iter().any(|table| table.va == address) {
+                    seen.insert(address);
+                }
+            }
+        }
+    }
+    tables
+        .iter()
+        .filter(|table| seen.contains(&table.va))
+        .collect()
+}
+
+/// `relocated place VA -> target VA` for every dynamic relocation whose target
+/// this pass can prove.
+fn relocation_targets(object: &object::read::File<'_>, pointer_size: u8) -> HashMap<u64, u64> {
+    let mut targets = HashMap::new();
+    let Some(relocations) = object.dynamic_relocations() else {
+        return targets;
+    };
+    for (place, relocation) in relocations {
+        if relocation.size() != 0 && relocation.size() != pointer_size.saturating_mul(8) {
+            continue;
+        }
+        if let Some(target) = relocation_target_va(object, &relocation, place, pointer_size) {
+            targets.insert(place, target);
+        }
+    }
+    targets
+}
+
+/// The value an ELF `Rel` (no explicit addend) relocation carries IN PLACE.
+///
+/// ELF32 uses `Rel`, not `Rela`: `R_386_RELATIVE` and `R_ARM_RELATIVE` have no
+/// addend field, and the value to be relocated is stored at the relocated
+/// address itself. `object` reports `addend() == 0` and
+/// `has_implicit_addend() == true` for them, so reading only the explicit addend
+/// saw every 32-bit function-pointer table as a run of null entries and
+/// recovered none of them — the `ops[tag]` dispatch in a 32-bit binary stayed a
+/// load from an input-image VA that is not mapped in the rebuilt C.
+fn implicit_relative_addend(
+    object: &object::read::File<'_>,
+    place: u64,
+    pointer_size: u8,
+) -> Option<u64> {
+    let width = usize::from(pointer_size);
+    for section in object.sections() {
+        if section.address() == 0 {
+            continue; // a non-allocated section: its "address" is not a VA
+        }
+        let Some(offset) = place.checked_sub(section.address()) else {
+            continue;
+        };
+        if offset.saturating_add(width as u64) > section.size() {
+            continue;
+        }
+        let (Ok(data), Ok(offset)) = (section.data(), usize::try_from(offset)) else {
+            continue;
+        };
+        let Some(bytes) = data.get(offset..).and_then(|rest| rest.get(..width)) else {
+            continue; // NOBITS (`.bss`) has a range but no file content
+        };
+        return match (width, object.is_little_endian()) {
+            (4, true) => Some(u64::from(u32::from_le_bytes(bytes.try_into().ok()?))),
+            (4, false) => Some(u64::from(u32::from_be_bytes(bytes.try_into().ok()?))),
+            (8, true) => Some(u64::from_le_bytes(bytes.try_into().ok()?)),
+            (8, false) => Some(u64::from_be_bytes(bytes.try_into().ok()?)),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn relocation_target_va(
+    object: &object::read::File<'_>,
+    relocation: &object::Relocation,
+    place: u64,
+    pointer_size: u8,
+) -> Option<u64> {
+    match relocation.target() {
+        RelocationTarget::Absolute
+            if is_image_relative(object.architecture(), relocation.flags()) =>
+        {
+            if relocation.has_implicit_addend() {
+                return implicit_relative_addend(object, place, pointer_size);
+            }
+            u64::try_from(relocation.addend()).ok()
+        }
+        RelocationTarget::Symbol(index)
+            if !relocation.has_implicit_addend()
+                && relocation.kind() == RelocationKind::Absolute =>
+        {
+            object
+                .symbol_by_index(index)
+                .ok()?
+                .address()
+                .checked_add_signed(relocation.addend())
+        }
+        RelocationTarget::Section(index)
+            if !relocation.has_implicit_addend()
+                && relocation.kind() == RelocationKind::Absolute =>
+        {
+            object
+                .section_by_index(index)
+                .ok()?
+                .address()
+                .checked_add_signed(relocation.addend())
+        }
+        _ => None,
+    }
+}
+
+fn is_image_relative(architecture: Architecture, flags: RelocationFlags) -> bool {
+    let RelocationFlags::Elf { r_type } = flags else {
+        return false;
+    };
+    match architecture {
+        Architecture::X86_64 | Architecture::X86_64_X32 => {
+            matches!(
+                r_type,
+                object::elf::R_X86_64_RELATIVE | object::elf::R_X86_64_RELATIVE64
+            )
+        }
+        Architecture::I386 => r_type == object::elf::R_386_RELATIVE,
+        Architecture::Aarch64 => r_type == object::elf::R_AARCH64_RELATIVE,
+        Architecture::Aarch64_Ilp32 => r_type == object::elf::R_AARCH64_P32_RELATIVE,
+        Architecture::Arm => r_type == object::elf::R_ARM_RELATIVE,
+        Architecture::Riscv32 | Architecture::Riscv64 => r_type == object::elf::R_RISCV_RELATIVE,
+        Architecture::LoongArch32 | Architecture::LoongArch64 => {
+            r_type == object::elf::R_LARCH_RELATIVE
+        }
+        _ => false,
+    }
+}
+
+/// Replace exact pointer-sized loads from complete tables with semantic entries.
+#[cfg(test)]
+pub fn resolve_function_table_entries(function: &mut Function, tables: &[FunctionPointerTable]) {
+    resolve_function_table_entries_impl(
+        function,
+        tables,
+        FunctionTableAuthority::LegacySpelling,
+        None,
+    );
+}
+
+/// Replace exact pointer-sized loads using pipeline-owned SSA value identities.
+pub fn resolve_function_table_entries_with_identities(
+    function: &mut Function,
+    tables: &[FunctionPointerTable],
+    identities: &crate::ir::value_number::ValueIdentities,
+) {
+    resolve_function_table_entries_impl(
+        function,
+        tables,
+        FunctionTableAuthority::Exact(identities),
+        None,
+    );
+}
+
+/// Resolve table loads through scalar stack objects created by stack promotion.
+pub(crate) fn resolve_promoted_function_table_entries(
+    function: &mut Function,
+    tables: &[FunctionPointerTable],
+    identities: &crate::ir::value_number::ValueIdentities,
+    promoted_stack_sizes: &HashMap<String, u8>,
+) {
+    resolve_function_table_entries_impl(
+        function,
+        tables,
+        FunctionTableAuthority::Exact(identities),
+        Some(promoted_stack_sizes),
+    );
+}
+
+fn resolve_function_table_entries_impl(
+    function: &mut Function,
+    tables: &[FunctionPointerTable],
+    authority: FunctionTableAuthority<'_>,
+    promoted_stack_sizes: Option<&HashMap<String, u8>>,
+) {
+    if tables.is_empty() {
+        return;
+    }
+    resolve_body(
+        &mut function.body,
+        tables,
+        &HashMap::new(),
+        authority,
+        promoted_stack_sizes,
+    );
+}
+
+fn resolve_body(
+    body: &mut [Stmt],
+    tables: &[FunctionPointerTable],
+    inherited_definitions: &HashMap<VReg, Expr>,
+    authority: FunctionTableAuthority<'_>,
+    promoted_stack_sizes: Option<&HashMap<String, u8>>,
+) {
+    let mut definitions = inherited_definitions.clone();
+    for statement in body {
+        match statement.semantic_mut() {
+            Stmt::Origin { .. } => unreachable!("semantic statement cannot be an origin wrapper"),
+            Stmt::IndirectGoto { target } | Stmt::Push { value: target } => {
+                resolve_expr(target, tables, &definitions);
+                promote_table_copy(target, &definitions);
+            }
+            Stmt::Assign { src, .. } => resolve_expr(src, tables, &definitions),
+            Stmt::Store { addr, src, .. } => {
+                resolve_expr(addr, tables, &definitions);
+                resolve_expr(src, tables, &definitions);
+            }
+            Stmt::Call { target, args, .. } => {
+                resolve_expr(target, tables, &definitions);
+                promote_table_copy(target, &definitions);
+                for argument in args {
+                    resolve_expr(argument, tables, &definitions);
+                }
+            }
+            Stmt::Return { value } => {
+                if let Some(value) = value {
+                    resolve_expr(value, tables, &definitions);
+                }
+            }
+            Stmt::Throw { value } => resolve_expr(value, tables, &definitions),
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                resolve_expr(cond, tables, &definitions);
+                resolve_body(
+                    then_body,
+                    tables,
+                    &definitions,
+                    authority,
+                    promoted_stack_sizes,
+                );
+                if let Some(else_body) = else_body.as_deref_mut() {
+                    resolve_body(
+                        else_body,
+                        tables,
+                        &definitions,
+                        authority,
+                        promoted_stack_sizes,
+                    );
+                }
+                forget_definitions_written_in(then_body, &mut definitions, authority);
+                if let Some(else_body) = else_body.as_deref() {
+                    forget_definitions_written_in(else_body, &mut definitions, authority);
+                }
+            }
+            Stmt::While { cond, body } | Stmt::DoWhile { cond, body } => {
+                resolve_expr(cond, tables, &definitions);
+                resolve_body(body, tables, &definitions, authority, promoted_stack_sizes);
+                forget_definitions_written_in(body, &mut definitions, authority);
+            }
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                resolve_body(
+                    std::slice::from_mut(init.as_mut()),
+                    tables,
+                    &definitions,
+                    authority,
+                    promoted_stack_sizes,
+                );
+                resolve_expr(cond, tables, &definitions);
+                resolve_body(body, tables, &definitions, authority, promoted_stack_sizes);
+                resolve_body(
+                    std::slice::from_mut(step.as_mut()),
+                    tables,
+                    &definitions,
+                    authority,
+                    promoted_stack_sizes,
+                );
+                forget_definitions_written_in(
+                    std::slice::from_ref(init.as_ref()),
+                    &mut definitions,
+                    authority,
+                );
+                forget_definitions_written_in(body, &mut definitions, authority);
+                forget_definitions_written_in(
+                    std::slice::from_ref(step.as_ref()),
+                    &mut definitions,
+                    authority,
+                );
+            }
+            Stmt::Switch {
+                discriminant,
+                cases,
+                default,
+            } => {
+                resolve_expr(discriminant, tables, &definitions);
+                for (_, case) in cases.iter_mut() {
+                    resolve_body(case, tables, &definitions, authority, promoted_stack_sizes);
+                }
+                if let Some(default) = default.as_deref_mut() {
+                    resolve_body(
+                        default,
+                        tables,
+                        &definitions,
+                        authority,
+                        promoted_stack_sizes,
+                    );
+                }
+                for (_, case) in cases.iter() {
+                    forget_definitions_written_in(case, &mut definitions, authority);
+                }
+                if let Some(default) = default.as_deref() {
+                    forget_definitions_written_in(default, &mut definitions, authority);
+                }
+            }
+            Stmt::TryCatch { try_body, catches } => {
+                resolve_body(
+                    try_body,
+                    tables,
+                    &definitions,
+                    authority,
+                    promoted_stack_sizes,
+                );
+                for catch in catches.iter_mut() {
+                    resolve_body(
+                        &mut catch.body,
+                        tables,
+                        &definitions,
+                        authority,
+                        promoted_stack_sizes,
+                    );
+                }
+                forget_definitions_written_in(try_body, &mut definitions, authority);
+                for catch in catches.iter() {
+                    forget_definitions_written_in(&catch.body, &mut definitions, authority);
+                }
+            }
+            Stmt::Pop { .. }
+            | Stmt::Goto { .. }
+            | Stmt::Label(_)
+            | Stmt::Break
+            | Stmt::Continue
+            | Stmt::Nop
+            | Stmt::Unknown(_)
+            | Stmt::Comment(_) => {}
+        }
+
+        if let Stmt::Assign { dst, src } = statement.semantic() {
+            definitions.insert(dst.clone(), src.clone());
+        } else if matches!(statement.semantic(), Stmt::Store { .. }) {
+            // A promoted stack object is memory, not an SSA register. Keep a
+            // store that covers the whole object as a reaching value, but
+            // invalidate all such facts at every other memory write: without
+            // alias analysis a pointer store may name any escaped local. This
+            // is deliberately more conservative than ordinary register
+            // definitions.
+            forget_promoted_stack_definitions(&mut definitions, authority);
+            if let Some((object, value)) =
+                covering_promoted_stack_store(statement, authority, promoted_stack_sizes)
+            {
+                definitions.insert(object, value);
+            }
+        } else if matches!(
+            statement.semantic(),
+            Stmt::Call { .. } | Stmt::IndirectGoto { .. }
+        ) {
+            // Unversioned physical registers may be clobbered by a transfer.
+            // Never carry an address proof across that boundary.
+            definitions.clear();
+        }
+    }
+}
+
+/// Drop every definition a nested body could have overwritten, and keep the rest.
+///
+/// A structured statement used to `clear()` the whole table, which is sound but
+/// throws away proofs the branch cannot touch. That mattered: a bounds-checked
+/// dispatcher (`if (tag < 0 || tag >= 5) return -1; return ops[tag](a, b);`)
+/// materialises its table base BEFORE the guards, so after two early-return
+/// `if`s nothing remained to prove the base with and the 32-bit PIC `ops[tag]`
+/// stayed an unresolvable load through an input-image VA.
+///
+/// A definition the nested body never writes still reaches the statements after
+/// it. A call or indirect transfer anywhere inside it can leave any UNVERSIONED
+/// physical register in an unknown state, so those are all forgotten — an
+/// SSA-versioned name is defined exactly once and cannot be one of them.
+fn forget_definitions_written_in(
+    body: &[Stmt],
+    definitions: &mut HashMap<VReg, Expr>,
+    authority: FunctionTableAuthority<'_>,
+) {
+    if definitions.is_empty() {
+        return;
+    }
+    let mut written = Vec::new();
+    let clobbers_registers = collect_written(body, &mut written, 0);
+    for register in written {
+        definitions.remove(&register);
+    }
+    if clobbers_registers {
+        definitions.retain(|register, _| {
+            !matches!(register, VReg::Phys(_)) || authority.is_versioned_value(register)
+        });
+    }
+    if body_may_clobber_memory(body, 0) {
+        forget_promoted_stack_definitions(definitions, authority);
+    }
+}
+
+fn covering_promoted_stack_store(
+    statement: &Stmt,
+    authority: FunctionTableAuthority<'_>,
+    promoted_stack_sizes: Option<&HashMap<String, u8>>,
+) -> Option<(VReg, Expr)> {
+    let promoted_stack_sizes = promoted_stack_sizes?;
+    let Stmt::Store { addr, src, size } = statement.semantic() else {
+        return None;
+    };
+    let Expr::Reg(object @ VReg::Phys(name)) = addr.semantic() else {
+        return None;
+    };
+    let object_size = promoted_stack_sizes.get(name)?;
+    (*size > 0 && *size >= *object_size && authority.is_promoted_stack_object(object))
+        .then(|| (object.clone(), src.clone()))
+}
+
+fn forget_promoted_stack_definitions(
+    definitions: &mut HashMap<VReg, Expr>,
+    authority: FunctionTableAuthority<'_>,
+) {
+    definitions.retain(|value, _| !authority.is_promoted_stack_object(value));
+}
+
+fn body_may_clobber_memory(body: &[Stmt], depth: usize) -> bool {
+    if depth >= 32 {
+        return true;
+    }
+    body.iter().any(|statement| match statement.semantic() {
+        Stmt::Store { .. } | Stmt::Call { .. } | Stmt::IndirectGoto { .. } => true,
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            body_may_clobber_memory(then_body, depth + 1)
+                || else_body
+                    .as_deref()
+                    .is_some_and(|body| body_may_clobber_memory(body, depth + 1))
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            body_may_clobber_memory(body, depth + 1)
+        }
+        Stmt::For {
+            init, step, body, ..
+        } => {
+            body_may_clobber_memory(std::slice::from_ref(init.as_ref()), depth + 1)
+                || body_may_clobber_memory(body, depth + 1)
+                || body_may_clobber_memory(std::slice::from_ref(step.as_ref()), depth + 1)
+        }
+        Stmt::Switch { cases, default, .. } => {
+            cases
+                .iter()
+                .any(|(_, body)| body_may_clobber_memory(body, depth + 1))
+                || default
+                    .as_deref()
+                    .is_some_and(|body| body_may_clobber_memory(body, depth + 1))
+        }
+        Stmt::TryCatch { try_body, catches } => {
+            body_may_clobber_memory(try_body, depth + 1)
+                || catches
+                    .iter()
+                    .any(|catch| body_may_clobber_memory(&catch.body, depth + 1))
+        }
+        _ => false,
+    })
+}
+
+/// Push every register `body` assigns into `out`; return whether it also
+/// contains a transfer that can clobber unversioned physical registers.
+fn collect_written(body: &[Stmt], out: &mut Vec<VReg>, depth: usize) -> bool {
+    if depth >= 32 {
+        return true; // too deep to enumerate: assume the worst
+    }
+    let mut clobbers = false;
+    for statement in body {
+        match statement.semantic() {
+            Stmt::Origin { .. } => unreachable!("semantic statement cannot be an origin wrapper"),
+            Stmt::Assign { dst, .. } => out.push(dst.clone()),
+            Stmt::Call { .. } | Stmt::IndirectGoto { .. } => clobbers = true,
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                clobbers |= collect_written(then_body, out, depth + 1);
+                if let Some(else_body) = else_body {
+                    clobbers |= collect_written(else_body, out, depth + 1);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+                clobbers |= collect_written(body, out, depth + 1);
+            }
+            Stmt::For {
+                init, step, body, ..
+            } => {
+                clobbers |= collect_written(std::slice::from_ref(init.as_ref()), out, depth + 1);
+                clobbers |= collect_written(body, out, depth + 1);
+                clobbers |= collect_written(std::slice::from_ref(step.as_ref()), out, depth + 1);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for (_, case) in cases {
+                    clobbers |= collect_written(case, out, depth + 1);
+                }
+                if let Some(default) = default {
+                    clobbers |= collect_written(default, out, depth + 1);
+                }
+            }
+            Stmt::TryCatch { try_body, catches } => {
+                clobbers |= collect_written(try_body, out, depth + 1);
+                for catch in catches {
+                    clobbers |= collect_written(&catch.body, out, depth + 1);
+                }
+            }
+            Stmt::Store { .. }
+            | Stmt::Return { .. }
+            | Stmt::Pop { .. }
+            | Stmt::Goto { .. }
+            | Stmt::Label(_)
+            | Stmt::Break
+            | Stmt::Continue
+            | Stmt::Push { .. }
+            | Stmt::Nop
+            | Stmt::Unknown(_)
+            | Stmt::Comment(_)
+            | Stmt::Throw { .. } => {}
+        }
+    }
+    clobbers
+}
+
+fn resolve_expr(
+    expression: &mut Expr,
+    tables: &[FunctionPointerTable],
+    definitions: &HashMap<VReg, Expr>,
+) {
+    match expression {
+        Expr::Origin { origins, expr } => {
+            resolve_expr(expr, tables, definitions);
+            if matches!(expr.as_ref(), Expr::Origin { .. }) {
+                let nested = std::mem::replace(expr, Box::new(Expr::Unknown(String::new())));
+                let (semantic, nested_origins) = (*nested).into_semantic_with_origins();
+                if let Some(nested_origins) = nested_origins {
+                    origins.merge(&nested_origins);
+                }
+                *expr = Box::new(semantic);
+            }
+        }
+        Expr::Deref { addr, .. } => resolve_expr(addr, tables, definitions),
+        Expr::Call { target, args, .. } => {
+            resolve_expr(target, tables, definitions);
+            for argument in args {
+                resolve_expr(argument, tables, definitions);
+            }
+        }
+        Expr::Bin { lhs, rhs, .. } | Expr::Cmp { lhs, rhs, .. } => {
+            resolve_expr(lhs, tables, definitions);
+            resolve_expr(rhs, tables, definitions);
+        }
+        Expr::Select {
+            cond,
+            if_true,
+            if_false,
+            ..
+        } => {
+            resolve_expr(cond, tables, definitions);
+            resolve_expr(if_true, tables, definitions);
+            resolve_expr(if_false, tables, definitions);
+        }
+        Expr::Un { src, .. }
+        | Expr::Cast { expr: src, .. }
+        | Expr::NumericConvert { expr: src, .. } => resolve_expr(src, tables, definitions),
+        Expr::FunctionTableEntry { index, .. } => resolve_expr(index, tables, definitions),
+        Expr::WideArithmetic { args, .. } => {
+            for argument in args {
+                resolve_expr(argument, tables, definitions);
+            }
+        }
+        Expr::Reg(_)
+        | Expr::Const(_)
+        | Expr::FloatConst { .. }
+        | Expr::Addr(_)
+        | Expr::Named { .. }
+        | Expr::StringLit { .. }
+        | Expr::StackAddr { .. }
+        | Expr::Lea { .. }
+        | Expr::PdbFieldAddr { .. }
+        | Expr::Unknown(_) => {}
+    }
+
+    let replacement_origins = matches!(expression.semantic(), Expr::Deref { .. })
+        .then(|| reaching_expression_origins(expression, definitions, 0))
+        .flatten();
+    let replacement = match expression {
+        Expr::Deref { addr, size } => tables.iter().find_map(|table| {
+            if *size != table.pointer_size {
+                return None;
+            }
+            let index = indexed_table_address(addr, table.va, table.pointer_size, definitions, 0)?;
+            Some(
+                Expr::FunctionTableEntry {
+                    table_va: table.va,
+                    table_name: table.name.clone(),
+                    pointer_size: table.pointer_size,
+                    index: Box::new(index),
+                    targets: table.targets.clone(),
+                }
+                .with_optional_origins(replacement_origins.clone()),
+            )
+        }),
+        _ => None,
+    };
+    if let Some(replacement) = replacement {
+        *expression = replacement;
+    }
+}
+
+fn promote_table_copy(expression: &mut Expr, definitions: &HashMap<VReg, Expr>) {
+    let Some((replacement, origins)) = copied_table_entry(expression, definitions, 0) else {
+        return;
+    };
+    *expression = replacement.with_optional_origins(origins);
+}
+
+fn copied_table_entry(
+    expression: &Expr,
+    definitions: &HashMap<VReg, Expr>,
+    depth: usize,
+) -> Option<(Expr, Option<OriginSet>)> {
+    if depth >= 16 {
+        return None;
+    }
+    let own_origins = expression.origins().cloned();
+    match expression.semantic() {
+        entry @ Expr::FunctionTableEntry { .. } => Some((entry.clone(), own_origins)),
+        Expr::Cast { expr, .. } => {
+            let (entry, nested_origins) = copied_table_entry(expr, definitions, depth + 1)?;
+            Some((entry, union_optional_origins(own_origins, nested_origins)))
+        }
+        Expr::Reg(register) => {
+            let (entry, definition_origins) =
+                copied_table_entry(definitions.get(register)?, definitions, depth + 1)?;
+            Some((
+                entry,
+                union_optional_origins(own_origins, definition_origins),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn union_optional_origins(left: Option<OriginSet>, right: Option<OriginSet>) -> Option<OriginSet> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.union(&right)),
+        (Some(origins), None) | (None, Some(origins)) => Some(origins),
+        (None, None) => None,
+    }
+}
+
+fn indexed_table_address(
+    address: &Expr,
+    table_va: u64,
+    pointer_size: u8,
+    definitions: &HashMap<VReg, Expr>,
+    depth: usize,
+) -> Option<Expr> {
+    if depth >= 16 {
+        return None;
+    }
+    match strip_cast(address) {
+        Expr::Reg(register) => indexed_table_address(
+            definitions.get(register)?,
+            table_va,
+            pointer_size,
+            definitions,
+            depth + 1,
+        ),
+        Expr::Bin {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } => table_base_and_index(lhs, 1, rhs, 1, table_va, pointer_size, definitions, depth)
+            .or_else(|| {
+                table_base_and_index(rhs, 1, lhs, 1, table_va, pointer_size, definitions, depth)
+            }),
+        // 32-bit PIC reaches its own data through a materialised
+        // `_GLOBAL_OFFSET_TABLE_` base plus a link-time displacement:
+        // `mov 0x10(%eax,%edx,4),%eax` with `eax` holding the GOT. The base
+        // register alone is therefore NOT the table; base + disp is. Resolve
+        // the register to its constant address and fold the displacement in
+        // before asking whether it names the table.
+        Expr::Lea {
+            base: Some(base),
+            index: Some(index),
+            scale,
+            disp,
+            segment: None,
+        } if *disp != 0 => {
+            let base_va = constant_address(&Expr::Reg(base.clone()), definitions, depth + 1)?;
+            if base_va.checked_add_signed(*disp) != Some(table_va) {
+                return None;
+            }
+            scaled_index(
+                &Expr::Reg(index.clone()),
+                *scale,
+                pointer_size,
+                definitions,
+                depth + 1,
+            )
+        }
+        Expr::Lea {
+            base: Some(base),
+            index: Some(index),
+            scale,
+            disp: 0,
+            segment: None,
+        }
+        | Expr::PdbFieldAddr {
+            base: Some(base),
+            index: Some(index),
+            scale,
+            disp: 0,
+            segment: None,
+            ..
+        } => {
+            let base = Expr::Reg(base.clone());
+            let index = Expr::Reg(index.clone());
+            table_base_and_index(
+                &base,
+                1,
+                &index,
+                *scale,
+                table_va,
+                pointer_size,
+                definitions,
+                depth,
+            )
+            .or_else(|| {
+                table_base_and_index(
+                    &index,
+                    *scale,
+                    &base,
+                    1,
+                    table_va,
+                    pointer_size,
+                    definitions,
+                    depth,
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn table_base_and_index(
+    base: &Expr,
+    base_scale: u8,
+    index: &Expr,
+    index_scale: u8,
+    table_va: u64,
+    pointer_size: u8,
+    definitions: &HashMap<VReg, Expr>,
+    depth: usize,
+) -> Option<Expr> {
+    if base_scale != 1 || !is_table_base(base, table_va, definitions, depth + 1) {
+        return None;
+    }
+    scaled_index(index, index_scale, pointer_size, definitions, depth + 1)
+}
+
+fn strip_cast(expression: &Expr) -> &Expr {
+    match expression {
+        Expr::Origin { expr, .. } | Expr::Cast { expr, .. } => strip_cast(expr),
+        _ => expression,
+    }
+}
+
+/// The constant image address `expression` denotes, following register copies.
+fn constant_address(
+    expression: &Expr,
+    definitions: &HashMap<VReg, Expr>,
+    depth: usize,
+) -> Option<u64> {
+    if depth >= 16 {
+        return None;
+    }
+    match strip_cast(expression) {
+        Expr::Named { va, .. } | Expr::Addr(va) => Some(*va),
+        // ARM literal-pool values reach this pass as integers. The result is
+        // still checked for exact equality with a relocation-proven table VA.
+        Expr::Const(value) => u64::try_from(*value).ok(),
+        Expr::Reg(register) => constant_address(definitions.get(register)?, definitions, depth + 1),
+        // `_GLOBAL_OFFSET_TABLE_` is materialised in two instructions
+        // (`call __x86.get_pc_thunk.bx; add $GOT,%ebx`), and the pair survives
+        // as two statements whenever the intermediate has a second reader — so
+        // the base has to be summed here rather than relying on constant
+        // folding having already collapsed it.
+        Expr::Bin {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } => {
+            let (base, offset) = match (
+                literal_displacement(strip_cast(lhs)),
+                literal_displacement(strip_cast(rhs)),
+            ) {
+                (_, Some(offset)) => (strip_cast(lhs), offset),
+                (Some(offset), _) => (strip_cast(rhs), offset),
+                _ => return None,
+            };
+            constant_address(base, definitions, depth + 1)?.checked_add_signed(offset)
+        }
+        _ => None,
+    }
+}
+
+/// Numeric displacement, independent of the lifter's address-vs-integer tag.
+fn literal_displacement(expression: &Expr) -> Option<i64> {
+    match expression {
+        Expr::Const(value) => Some(*value),
+        Expr::Addr(va) => i64::try_from(*va).ok(),
+        _ => None,
+    }
+}
+
+fn is_table_base(
+    expression: &Expr,
+    table_va: u64,
+    definitions: &HashMap<VReg, Expr>,
+    depth: usize,
+) -> bool {
+    if depth >= 16 {
+        return false;
+    }
+    constant_address(expression, definitions, depth) == Some(table_va)
+}
+
+fn scaled_index(
+    expression: &Expr,
+    outer_scale: u8,
+    pointer_size: u8,
+    definitions: &HashMap<VReg, Expr>,
+    depth: usize,
+) -> Option<Expr> {
+    if depth >= 16 {
+        return None;
+    }
+    let origins = expression_tree_origins(expression);
+    if outer_scale == pointer_size {
+        return Some(
+            strip_cast(expression)
+                .clone()
+                .with_optional_origins(origins),
+        );
+    }
+    if outer_scale != 1 {
+        return None;
+    }
+    let expression = strip_cast(expression);
+    match expression {
+        Expr::Reg(register) => Some(
+            scaled_index(
+                definitions.get(register)?,
+                1,
+                pointer_size,
+                definitions,
+                depth + 1,
+            )?
+            .with_optional_origins(origins),
+        ),
+        Expr::Bin {
+            op: BinOp::Mul,
+            lhs,
+            rhs,
+        } => {
+            if matches!(strip_cast(lhs), Expr::Const(scale) if *scale == i64::from(pointer_size)) {
+                Some(
+                    strip_cast(rhs)
+                        .clone()
+                        .with_optional_origins(origins.clone()),
+                )
+            } else if matches!(strip_cast(rhs), Expr::Const(scale) if *scale == i64::from(pointer_size))
+            {
+                Some(
+                    strip_cast(lhs)
+                        .clone()
+                        .with_optional_origins(origins.clone()),
+                )
+            } else {
+                None
+            }
+        }
+        Expr::Bin {
+            op: BinOp::Shl,
+            lhs,
+            rhs,
+        } if matches!(strip_cast(rhs), Expr::Const(shift) if (1_i64.checked_shl(*shift as u32) == Some(i64::from(pointer_size)))) => {
+            Some(
+                strip_cast(lhs)
+                    .clone()
+                    .with_optional_origins(origins.clone()),
+            )
+        }
+        Expr::Bin {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } if is_zero(lhs, definitions, depth + 1) => Some(
+            scaled_index(rhs, 1, pointer_size, definitions, depth + 1)?
+                .with_optional_origins(origins.clone()),
+        ),
+        Expr::Bin {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } if is_zero(rhs, definitions, depth + 1) => Some(
+            scaled_index(lhs, 1, pointer_size, definitions, depth + 1)?
+                .with_optional_origins(origins),
+        ),
+        _ => None,
+    }
+}
+
+fn expression_tree_origins(expression: &Expr) -> Option<OriginSet> {
+    fn collect(expression: &Expr, origins: &mut OriginSet) {
+        if let Some(owner) = expression.origins() {
+            origins.merge(owner);
+        }
+        match expression.semantic() {
+            Expr::FunctionTableEntry { index, .. } => collect(index, origins),
+            Expr::Deref { addr, .. }
+            | Expr::Un { src: addr, .. }
+            | Expr::Cast { expr: addr, .. }
+            | Expr::NumericConvert { expr: addr, .. } => collect(addr, origins),
+            Expr::Bin { lhs, rhs, .. } | Expr::Cmp { lhs, rhs, .. } => {
+                collect(lhs, origins);
+                collect(rhs, origins);
+            }
+            Expr::Call { target, args, .. } => {
+                collect(target, origins);
+                for argument in args {
+                    collect(argument, origins);
+                }
+            }
+            Expr::Select {
+                cond,
+                if_true,
+                if_false,
+                ..
+            } => {
+                collect(cond, origins);
+                collect(if_true, origins);
+                collect(if_false, origins);
+            }
+            Expr::WideArithmetic { args, .. } => {
+                for argument in args {
+                    collect(argument, origins);
+                }
+            }
+            Expr::Origin { .. } => unreachable!("semantic expression cannot be an origin wrapper"),
+            Expr::Reg(_)
+            | Expr::Const(_)
+            | Expr::FloatConst { .. }
+            | Expr::Addr(_)
+            | Expr::Named { .. }
+            | Expr::StringLit { .. }
+            | Expr::StackAddr { .. }
+            | Expr::Lea { .. }
+            | Expr::PdbFieldAddr { .. }
+            | Expr::Unknown(_) => {}
+        }
+    }
+
+    let mut origins = OriginSet::empty();
+    collect(expression, &mut origins);
+    (!origins.is_empty()).then_some(origins)
+}
+
+fn reaching_expression_origins(
+    expression: &Expr,
+    definitions: &HashMap<VReg, Expr>,
+    depth: usize,
+) -> Option<OriginSet> {
+    fn collect(
+        expression: &Expr,
+        definitions: &HashMap<VReg, Expr>,
+        depth: usize,
+        origins: &mut OriginSet,
+    ) {
+        if depth >= 16 {
+            return;
+        }
+        if let Some(owner) = expression.origins() {
+            origins.merge(owner);
+        }
+        let mut collect_register = |register: &VReg| {
+            if let Some(definition) = definitions.get(register) {
+                collect(definition, definitions, depth + 1, origins);
+            }
+        };
+        match expression.semantic() {
+            Expr::Reg(register) => collect_register(register),
+            Expr::StackAddr { object, .. } => collect_register(object),
+            Expr::Lea { base, index, .. } | Expr::PdbFieldAddr { base, index, .. } => {
+                if let Some(base) = base {
+                    collect_register(base);
+                }
+                if let Some(index) = index {
+                    collect_register(index);
+                }
+            }
+            Expr::FunctionTableEntry { index, .. } => {
+                collect(index, definitions, depth + 1, origins)
+            }
+            Expr::Deref { addr, .. }
+            | Expr::Un { src: addr, .. }
+            | Expr::Cast { expr: addr, .. }
+            | Expr::NumericConvert { expr: addr, .. } => {
+                collect(addr, definitions, depth + 1, origins)
+            }
+            Expr::Bin { lhs, rhs, .. } | Expr::Cmp { lhs, rhs, .. } => {
+                collect(lhs, definitions, depth + 1, origins);
+                collect(rhs, definitions, depth + 1, origins);
+            }
+            Expr::Call { target, args, .. } => {
+                collect(target, definitions, depth + 1, origins);
+                for argument in args {
+                    collect(argument, definitions, depth + 1, origins);
+                }
+            }
+            Expr::Select {
+                cond,
+                if_true,
+                if_false,
+                ..
+            } => {
+                collect(cond, definitions, depth + 1, origins);
+                collect(if_true, definitions, depth + 1, origins);
+                collect(if_false, definitions, depth + 1, origins);
+            }
+            Expr::WideArithmetic { args, .. } => {
+                for argument in args {
+                    collect(argument, definitions, depth + 1, origins);
+                }
+            }
+            Expr::Origin { .. } => unreachable!("semantic expression cannot be an origin wrapper"),
+            Expr::Const(_)
+            | Expr::FloatConst { .. }
+            | Expr::Addr(_)
+            | Expr::Named { .. }
+            | Expr::StringLit { .. }
+            | Expr::Unknown(_) => {}
+        }
+    }
+
+    let mut origins = OriginSet::empty();
+    collect(expression, definitions, depth, &mut origins);
+    (!origins.is_empty()).then_some(origins)
+}
+
+fn is_zero(expression: &Expr, definitions: &HashMap<VReg, Expr>, depth: usize) -> bool {
+    if depth >= 16 {
+        return false;
+    }
+    match strip_cast(expression) {
+        Expr::Const(0) => true,
+        Expr::Reg(register) => definitions
+            .get(register)
+            .is_some_and(|definition| is_zero(definition, definitions, depth + 1)),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::ast::{CatchClause, OriginSet};
+    use crate::ir::ssa::SsaValue;
+    use crate::ir::value_number::ValueIdentities;
+
+    /// ELF32 relocations are `Rel`: the value to relocate lives at the relocated
+    /// address, not in an addend field. Read from a real armhf binary whose
+    /// `.data` (`objdump -s -j .data`) holds `c4080000` at 0x11008 under an
+    /// `R_ARM_RELATIVE` entry (`readelf -r`).
+    #[test]
+    fn elf32_rel_relocations_read_their_addend_from_the_relocated_place() {
+        const SAMPLE: &str = "samples/binaries/platforms/linux/amd64/cross/armhf/c2_demo-armhf-gcc";
+        let data = std::fs::read(SAMPLE).unwrap_or_else(|_| panic!("missing sample {SAMPLE}"));
+        let object = crate::decompile::profile::parse_object(&*data).expect("parse armhf sample");
+        assert_eq!(
+            object.architecture().address_size().map(|s| s.bytes()),
+            Some(4)
+        );
+
+        let targets = relocation_targets(&object, 4);
+        assert_eq!(
+            targets.get(&0x11008),
+            Some(&0x8c4),
+            "R_ARM_RELATIVE at 0x11008 carries its addend in place; \
+             resolved targets were {:?}",
+            {
+                let mut sorted: Vec<_> = targets.iter().map(|(k, v)| (*k, *v)).collect();
+                sorted.sort_unstable();
+                sorted
+            }
+        );
+        assert!(
+            targets.values().any(|&target| target != 0),
+            "every relative relocation resolved to 0 — the in-place addend was not read"
+        );
+    }
+
+    fn ops_table() -> FunctionPointerTable {
+        FunctionPointerTable {
+            va: 0x4004,
+            name: "ops".into(),
+            pointer_size: 4,
+            targets: vec![
+                FunctionTableTarget {
+                    va: 0x113d,
+                    name: "h_add".into(),
+                },
+                FunctionTableTarget {
+                    va: 0x1157,
+                    name: "h_sub".into(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn aarch64_page_plus_offset_marks_referenced_table() {
+        use crate::ir::types::{LlirBlock, LlirFunction, LlirInstr, Op, Value};
+
+        let caller = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![LlirBlock {
+                start_va: 0x1000,
+                end_va: 0x1008,
+                instrs: vec![
+                    LlirInstr {
+                        va: 0x1000,
+                        op: Op::Assign {
+                            dst: VReg::phys("x22"),
+                            src: Value::Addr(0x3000),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1004,
+                        op: Op::Bin {
+                            dst: VReg::phys("x22"),
+                            op: BinOp::Add,
+                            lhs: Value::Reg(VReg::phys("x22")),
+                            rhs: Value::Const(0x1004),
+                        },
+                    },
+                ],
+                succs: vec![],
+            }],
+        };
+        let table = ops_table();
+
+        let referenced = tables_referenced_by(&caller, std::slice::from_ref(&table));
+
+        assert_eq!(referenced, [&table]);
+    }
+
+    #[test]
+    fn arm32_literal_displacement_plus_pc_marks_referenced_table() {
+        use crate::ir::types::{LlirBlock, LlirFunction, LlirInstr, Op, Value};
+
+        let caller = LlirFunction {
+            entry_va: 0x1400,
+            blocks: vec![LlirBlock {
+                start_va: 0x1400,
+                end_va: 0x1408,
+                instrs: vec![
+                    LlirInstr {
+                        va: 0x1400,
+                        op: Op::Assign {
+                            dst: VReg::phys("r3"),
+                            src: Value::Const(0x2bfc),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1404,
+                        op: Op::Bin {
+                            dst: VReg::phys("r3"),
+                            op: BinOp::Add,
+                            lhs: Value::Reg(VReg::phys("r3")),
+                            rhs: Value::Addr(0x1408),
+                        },
+                    },
+                ],
+                succs: vec![],
+            }],
+        };
+        let table = ops_table();
+
+        let referenced = tables_referenced_by(&caller, std::slice::from_ref(&table));
+
+        assert_eq!(referenced, [&table]);
+    }
+
+    #[test]
+    fn unknown_page_arithmetic_does_not_mark_referenced_table() {
+        use crate::ir::types::{LlirBlock, LlirFunction, LlirInstr, Op, Value};
+
+        let caller = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![LlirBlock {
+                start_va: 0x1000,
+                end_va: 0x1008,
+                instrs: vec![
+                    LlirInstr {
+                        va: 0x1000,
+                        op: Op::Assign {
+                            dst: VReg::phys("x22"),
+                            src: Value::Addr(0x3000),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1004,
+                        op: Op::Bin {
+                            dst: VReg::phys("x22"),
+                            op: BinOp::Mul,
+                            lhs: Value::Reg(VReg::phys("x22")),
+                            rhs: Value::Const(2),
+                        },
+                    },
+                ],
+                succs: vec![],
+            }],
+        };
+        let table = ops_table();
+
+        assert!(tables_referenced_by(&caller, &[table]).is_empty());
+    }
+
+    /// `mov 0x10(%eax,%edx,4),%eax` with `eax` holding `_GLOBAL_OFFSET_TABLE_`:
+    /// the base register alone is not the table, base + displacement is. This is
+    /// how EVERY 32-bit PIC binary reaches its own function-pointer tables.
+    #[test]
+    fn a_got_relative_table_load_resolves_through_its_displacement() {
+        let mut function = Function {
+            name: "dispatch".into(),
+            entry_va: 0x11c5,
+            body: vec![
+                Stmt::Assign {
+                    dst: VReg::phys("rax#2"),
+                    src: Expr::Bin {
+                        op: BinOp::Add,
+                        lhs: Box::new(Expr::Addr(0x11d0)),
+                        rhs: Box::new(Expr::Const(0x2e24)),
+                    },
+                },
+                Stmt::Assign {
+                    dst: VReg::phys("rax#3"),
+                    src: Expr::Deref {
+                        addr: Box::new(Expr::Lea {
+                            base: Some(VReg::phys("rax#2")),
+                            index: Some(VReg::phys("rdx#1")),
+                            scale: 4,
+                            disp: 0x10,
+                            segment: None,
+                        }),
+                        size: 4,
+                    },
+                },
+            ],
+        };
+
+        resolve_function_table_entries(&mut function, &[ops_table()]);
+
+        let Stmt::Assign { src, .. } = &function.body[1] else {
+            panic!("statement shape changed");
+        };
+        assert!(
+            matches!(
+                src,
+                Expr::FunctionTableEntry { table_va: 0x4004, table_name, .. }
+                    if table_name == "ops"
+            ),
+            "expected the ops[] entry, got {src:?}"
+        );
+    }
+
+    fn promoted_stack_table_fixture(
+        store_size: u8,
+        mut before_load: Vec<Stmt>,
+    ) -> (Function, String) {
+        let table = ops_table();
+        let object_name = "local_20".to_string();
+        let object = VReg::phys(object_name.clone());
+        let loaded = VReg::phys("rax#3");
+        let call = Stmt::Call {
+            target: Expr::Deref {
+                addr: Box::new(Expr::Lea {
+                    base: Some(loaded.clone()),
+                    index: Some(VReg::phys("which")),
+                    scale: 4,
+                    disp: 0,
+                    segment: None,
+                }),
+                size: 4,
+            },
+            args: Vec::new(),
+            dst: None,
+            call_spec: None,
+        };
+        before_load.extend([
+            Stmt::Assign {
+                dst: loaded,
+                src: Expr::Reg(object.clone()),
+            },
+            call,
+        ]);
+        (
+            Function {
+                name: "dispatch_loop".into(),
+                entry_va: 0x1200,
+                body: vec![
+                    Stmt::Store {
+                        addr: Expr::Reg(object.clone()),
+                        src: Expr::Addr(table.va),
+                        size: store_size,
+                    },
+                    Stmt::While {
+                        cond: Expr::Reg(VReg::phys("keep_going")),
+                        body: before_load,
+                    },
+                ],
+            },
+            object_name,
+        )
+    }
+
+    #[test]
+    fn promoted_stack_table_base_reaches_a_nested_call() {
+        let table = ops_table();
+        // The same physical slot previously carried a byte-wide predicate, so
+        // promotion conservatively records a one-byte object. The later
+        // four-byte store still covers it completely and is the exact value
+        // subsequently loaded for the call target.
+        let (mut function, object_name) = promoted_stack_table_fixture(4, Vec::new());
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.attach_promoted_stack_objects([&object_name]);
+        let sizes = HashMap::from([(object_name, 1)]);
+
+        resolve_promoted_function_table_entries(&mut function, &[table], &identities, &sizes);
+
+        let Stmt::While { body, .. } = function.body[1].semantic() else {
+            unreachable!("fixture has a loop")
+        };
+        assert!(matches!(
+            body[1].semantic(),
+            Stmt::Call {
+                target: Expr::FunctionTableEntry {
+                    table_va: 0x4004,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn partial_promoted_stack_store_does_not_prove_a_table_base() {
+        let table = ops_table();
+        let (mut function, object_name) = promoted_stack_table_fixture(2, Vec::new());
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.attach_promoted_stack_objects([&object_name]);
+        let sizes = HashMap::from([(object_name, 4)]);
+
+        resolve_promoted_function_table_entries(&mut function, &[table], &identities, &sizes);
+
+        let Stmt::While { body, .. } = function.body[1].semantic() else {
+            unreachable!("fixture has a loop")
+        };
+        assert!(matches!(
+            body[1].semantic(),
+            Stmt::Call {
+                target: Expr::Deref { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_store_invalidates_a_promoted_stack_table_base() {
+        let table = ops_table();
+        let clobber = Stmt::Store {
+            addr: Expr::Reg(VReg::phys("unknown_pointer")),
+            src: Expr::Const(0),
+            size: 4,
+        };
+        let (mut function, object_name) = promoted_stack_table_fixture(4, vec![clobber]);
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.attach_promoted_stack_objects([&object_name]);
+        let sizes = HashMap::from([(object_name, 1)]);
+
+        resolve_promoted_function_table_entries(&mut function, &[table], &identities, &sizes);
+
+        let Stmt::While { body, .. } = function.body[1].semantic() else {
+            unreachable!("fixture has a loop")
+        };
+        assert!(matches!(
+            body[2].semantic(),
+            Stmt::Call {
+                target: Expr::Deref { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_attributed_table_base_remains_available_to_the_following_load() {
+        let base_owner = OriginSet::one(0x11d0);
+        let load_owner = OriginSet::one(0x11d8);
+        let mut function = Function {
+            name: "dispatch".into(),
+            entry_va: 0x11c5,
+            body: vec![
+                Stmt::Assign {
+                    dst: VReg::phys("rax#2"),
+                    src: Expr::Addr(0x3ff4),
+                }
+                .with_origins(base_owner.clone()),
+                Stmt::Assign {
+                    dst: VReg::phys("rax#3"),
+                    src: Expr::Deref {
+                        addr: Box::new(Expr::Lea {
+                            base: Some(VReg::phys("rax#2")),
+                            index: Some(VReg::phys("rdx#1")),
+                            scale: 4,
+                            disp: 0x10,
+                            segment: None,
+                        }),
+                        size: 4,
+                    },
+                }
+                .with_origins(load_owner.clone()),
+            ],
+        };
+
+        resolve_function_table_entries(&mut function, &[ops_table()]);
+
+        assert!(matches!(
+            function.body[1].semantic(),
+            Stmt::Assign {
+                src: Expr::FunctionTableEntry {
+                    table_va: 0x4004,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(function.body[0].origins(), Some(&base_owner));
+        assert_eq!(function.body[1].origins(), Some(&load_owner));
+    }
+
+    #[test]
+    fn expression_origins_do_not_hide_a_scaled_table_index() {
+        let scaled_index = Expr::Bin {
+            op: BinOp::Mul,
+            lhs: Box::new(Expr::Reg(VReg::phys("which"))),
+            rhs: Box::new(Expr::Const(4)),
+        }
+        .with_origins(OriginSet::one(0x11a0));
+        let mut function = Function {
+            name: "dispatch".into(),
+            entry_va: 0x1170,
+            body: vec![
+                Stmt::Assign {
+                    dst: VReg::phys("scaled"),
+                    src: scaled_index,
+                },
+                Stmt::Assign {
+                    dst: VReg::phys("table"),
+                    src: Expr::Named {
+                        va: 0x4004,
+                        name: "ops".into(),
+                    }
+                    .with_origins(OriginSet::one(0x11a4)),
+                },
+                Stmt::Assign {
+                    dst: VReg::phys("entry"),
+                    src: Expr::Deref {
+                        addr: Box::new(
+                            Expr::Lea {
+                                base: Some(VReg::phys("scaled")),
+                                index: Some(VReg::phys("table")),
+                                scale: 1,
+                                disp: 0,
+                                segment: None,
+                            }
+                            .with_origins(OriginSet::one(0x11a8)),
+                        ),
+                        size: 4,
+                    }
+                    .with_origins(OriginSet::one(0x11ac)),
+                },
+            ],
+        };
+
+        resolve_function_table_entries(&mut function, &[ops_table()]);
+
+        let Stmt::Assign { src, .. } = function.body[2].semantic() else {
+            panic!("table-load statement shape changed: {function:#?}")
+        };
+        let Expr::FunctionTableEntry { index, .. } = src.semantic() else {
+            panic!("scaled lookup did not become a table entry: {src:#?}")
+        };
+        assert_eq!(index.origins(), Some(&OriginSet::one(0x11a0)));
+        assert_eq!(
+            src.origins(),
+            Some(&OriginSet::from_iter([0x11a0, 0x11a4, 0x11a8, 0x11ac]))
+        );
+    }
+
+    #[test]
+    fn copied_table_call_target_composes_definition_and_use_origins() {
+        let table = ops_table();
+        let entry = VReg::phys("entry");
+        let mut function = Function {
+            name: "dispatch".into(),
+            entry_va: 0x11c5,
+            body: vec![
+                Stmt::Assign {
+                    dst: entry.clone(),
+                    src: Expr::FunctionTableEntry {
+                        table_va: table.va,
+                        table_name: table.name.clone(),
+                        pointer_size: table.pointer_size,
+                        index: Box::new(Expr::Reg(VReg::phys("which"))),
+                        targets: table.targets.clone(),
+                    }
+                    .with_origins(OriginSet::one(0x11b0)),
+                },
+                Stmt::Call {
+                    target: Expr::Reg(entry).with_origins(OriginSet::one(0x11b4)),
+                    args: Vec::new(),
+                    dst: None,
+                    call_spec: None,
+                },
+            ],
+        };
+
+        resolve_function_table_entries(&mut function, &[table]);
+
+        let Stmt::Call { target, .. } = function.body[1].semantic() else {
+            panic!("call shape changed: {function:#?}")
+        };
+        assert!(matches!(target.semantic(), Expr::FunctionTableEntry { .. }));
+        assert_eq!(
+            target.origins(),
+            Some(&OriginSet::from_iter([0x11b0, 0x11b4]))
+        );
+    }
+
+    #[test]
+    fn exception_and_transfer_expressions_share_the_table_resolution_surface() {
+        let indexed_load = || Expr::Deref {
+            addr: Box::new(Expr::Bin {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Addr(0x4004)),
+                rhs: Box::new(Expr::Bin {
+                    op: BinOp::Mul,
+                    lhs: Box::new(Expr::Reg(VReg::phys("arg0"))),
+                    rhs: Box::new(Expr::Const(4)),
+                }),
+            }),
+            size: 4,
+        };
+        let owner = OriginSet::one(0x1200);
+        let mut function = Function {
+            name: "dispatch".into(),
+            entry_va: 0x11c5,
+            body: vec![Stmt::TryCatch {
+                try_body: vec![Stmt::Throw {
+                    value: indexed_load(),
+                }],
+                catches: vec![CatchClause {
+                    type_name: "void *".into(),
+                    binding: VReg::phys("caught"),
+                    body: vec![Stmt::IndirectGoto {
+                        target: indexed_load(),
+                    }],
+                }],
+            }
+            .with_origins(owner.clone())],
+        };
+
+        resolve_function_table_entries(&mut function, &[ops_table()]);
+
+        let Stmt::TryCatch { try_body, catches } = function.body[0].semantic() else {
+            panic!("exception shape changed")
+        };
+        assert!(matches!(
+            try_body.as_slice(),
+            [Stmt::Throw {
+                value: Expr::FunctionTableEntry {
+                    table_va: 0x4004,
+                    ..
+                }
+            }]
+        ));
+        assert!(matches!(
+            catches[0].body.as_slice(),
+            [Stmt::IndirectGoto {
+                target: Expr::FunctionTableEntry {
+                    table_va: 0x4004,
+                    ..
+                }
+            }]
+        ));
+        assert_eq!(function.body[0].origins(), Some(&owner));
+    }
+
+    /// The wrong displacement names a different object and must not resolve.
+    #[test]
+    fn a_got_relative_load_at_the_wrong_displacement_is_left_alone() {
+        let load = Expr::Deref {
+            addr: Box::new(Expr::Lea {
+                base: Some(VReg::phys("rax#2")),
+                index: Some(VReg::phys("rdx#1")),
+                scale: 4,
+                disp: 0x20,
+                segment: None,
+            }),
+            size: 4,
+        };
+        let mut function = Function {
+            name: "dispatch".into(),
+            entry_va: 0x11c5,
+            body: vec![
+                Stmt::Assign {
+                    dst: VReg::phys("rax#2"),
+                    src: Expr::Addr(0x3ff4),
+                },
+                Stmt::Assign {
+                    dst: VReg::phys("rax#3"),
+                    src: load.clone(),
+                },
+            ],
+        };
+
+        resolve_function_table_entries(&mut function, &[ops_table()]);
+
+        let Stmt::Assign { src, .. } = &function.body[1] else {
+            panic!("statement shape changed");
+        };
+        assert_eq!(*src, load);
+    }
+
+    /// The table base is materialised BEFORE the bounds guards, so the proof has
+    /// to survive an intervening `if` that never writes it.
+    #[test]
+    fn a_table_base_survives_a_guard_that_does_not_write_it() {
+        let mut function = Function {
+            name: "dispatch".into(),
+            entry_va: 0x11c5,
+            body: vec![
+                Stmt::Assign {
+                    dst: VReg::phys("rax#2"),
+                    src: Expr::Addr(0x3ff4),
+                },
+                Stmt::If {
+                    cond: Expr::Cmp {
+                        op: crate::ir::types::CmpOp::Slt,
+                        lhs: Box::new(Expr::Reg(VReg::phys("arg0"))),
+                        rhs: Box::new(Expr::Const(0)),
+                    },
+                    then_body: vec![Stmt::Return {
+                        value: Some(Expr::Const(-1)),
+                    }],
+                    else_body: None,
+                },
+                Stmt::Assign {
+                    dst: VReg::phys("rax#3"),
+                    src: Expr::Deref {
+                        addr: Box::new(Expr::Lea {
+                            base: Some(VReg::phys("rax#2")),
+                            index: Some(VReg::phys("rdx#1")),
+                            scale: 4,
+                            disp: 0x10,
+                            segment: None,
+                        }),
+                        size: 4,
+                    },
+                },
+            ],
+        };
+
+        resolve_function_table_entries(&mut function, &[ops_table()]);
+
+        let Stmt::Assign { src, .. } = &function.body[2] else {
+            panic!("statement shape changed");
+        };
+        assert!(
+            matches!(src, Expr::FunctionTableEntry { .. }),
+            "a guard that never writes the base erased the proof: {src:?}"
+        );
+    }
+
+    /// A guard that DOES redefine the base invalidates it, as before.
+    #[test]
+    fn a_guard_that_rewrites_the_table_base_invalidates_it() {
+        let load = Expr::Deref {
+            addr: Box::new(Expr::Lea {
+                base: Some(VReg::phys("rax#2")),
+                index: Some(VReg::phys("rdx#1")),
+                scale: 4,
+                disp: 0x10,
+                segment: None,
+            }),
+            size: 4,
+        };
+        let mut function = Function {
+            name: "dispatch".into(),
+            entry_va: 0x11c5,
+            body: vec![
+                Stmt::Assign {
+                    dst: VReg::phys("rax#2"),
+                    src: Expr::Addr(0x3ff4),
+                },
+                Stmt::If {
+                    cond: Expr::Const(1),
+                    then_body: vec![Stmt::Assign {
+                        dst: VReg::phys("rax#2"),
+                        src: Expr::Const(0),
+                    }],
+                    else_body: None,
+                },
+                Stmt::Assign {
+                    dst: VReg::phys("rax#3"),
+                    src: load.clone(),
+                },
+            ],
+        };
+
+        resolve_function_table_entries(&mut function, &[ops_table()]);
+
+        let Stmt::Assign { src, .. } = &function.body[2] else {
+            panic!("statement shape changed");
+        };
+        assert_eq!(*src, load);
+    }
+
+    #[test]
+    fn an_opaque_ssa_table_base_survives_a_nested_call_by_identity() {
+        let base = VReg::phys("opaque_base");
+        let load = Expr::Deref {
+            addr: Box::new(Expr::Lea {
+                base: Some(base.clone()),
+                index: Some(VReg::phys("opaque_index")),
+                scale: 4,
+                disp: 0x10,
+                segment: None,
+            }),
+            size: 4,
+        };
+        let mut function = Function {
+            name: "dispatch".into(),
+            entry_va: 0x11c5,
+            body: vec![
+                Stmt::Assign {
+                    dst: base.clone(),
+                    src: Expr::Addr(0x3ff4),
+                },
+                Stmt::If {
+                    cond: Expr::Reg(VReg::phys("guard")),
+                    then_body: vec![Stmt::Call {
+                        target: Expr::Named {
+                            va: 0x2000,
+                            name: "observe".into(),
+                        },
+                        args: Vec::new(),
+                        dst: None,
+                        call_spec: None,
+                    }],
+                    else_body: None,
+                },
+                Stmt::Assign {
+                    dst: VReg::phys("loaded_entry"),
+                    src: load,
+                },
+            ],
+        };
+        let mut identities = ValueIdentities::default();
+        identities.record(
+            base,
+            SsaValue {
+                base: VReg::phys("rax"),
+                version: 2,
+            },
+        );
+
+        resolve_function_table_entries_with_identities(&mut function, &[ops_table()], &identities);
+
+        assert!(matches!(
+            function.body[2].semantic(),
+            Stmt::Assign {
+                src: Expr::FunctionTableEntry { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_misleading_version_spelling_does_not_survive_a_nested_call() {
+        let base = VReg::phys("rax#2");
+        let load = Expr::Deref {
+            addr: Box::new(Expr::Lea {
+                base: Some(base.clone()),
+                index: Some(VReg::phys("rdx#1")),
+                scale: 4,
+                disp: 0x10,
+                segment: None,
+            }),
+            size: 4,
+        };
+        let mut function = Function {
+            name: "dispatch".into(),
+            entry_va: 0x11c5,
+            body: vec![
+                Stmt::Assign {
+                    dst: base.clone(),
+                    src: Expr::Addr(0x3ff4),
+                },
+                Stmt::If {
+                    cond: Expr::Reg(VReg::phys("guard")),
+                    then_body: vec![Stmt::Call {
+                        target: Expr::Named {
+                            va: 0x2000,
+                            name: "clobber".into(),
+                        },
+                        args: Vec::new(),
+                        dst: None,
+                        call_spec: None,
+                    }],
+                    else_body: None,
+                },
+                Stmt::Assign {
+                    dst: VReg::phys("loaded_entry"),
+                    src: load.clone(),
+                },
+            ],
+        };
+        let mut identities = ValueIdentities::default();
+        identities.record(
+            base,
+            SsaValue {
+                base: VReg::phys("rax"),
+                version: 0,
+            },
+        );
+
+        resolve_function_table_entries_with_identities(&mut function, &[ops_table()], &identities);
+
+        let Stmt::Assign { src, .. } = function.body[2].semantic() else {
+            panic!("statement shape changed")
+        };
+        assert_eq!(src, &load);
+    }
+
+    /// A 64-bit `Rela` image keeps using the explicit addend field.
+    #[test]
+    fn elf64_rela_relocations_still_use_the_explicit_addend() {
+        const SAMPLE: &str =
+            "samples/binaries/platforms/linux/amd64/export/native/gcc/O0/hello-c-gcc-O0";
+        let data = std::fs::read(SAMPLE).unwrap_or_else(|_| panic!("missing sample {SAMPLE}"));
+        let object = crate::decompile::profile::parse_object(&*data).expect("parse amd64 sample");
+        let targets = relocation_targets(&object, 8);
+        assert!(
+            targets.values().any(|&target| target != 0),
+            "no relative relocation resolved on a RELA image"
+        );
+    }
+
+    #[test]
+    fn arm32_literal_pool_table_base_resolves_to_the_table() {
+        const TABLE_VA: u64 = 0x20028;
+        let (pool, base, index) = (VReg::phys("r3#3"), VReg::phys("r3#4"), VReg::phys("r2#1"));
+        let mut definitions: HashMap<VReg, Expr> = HashMap::new();
+        definitions.insert(pool.clone(), Expr::Const(0x1fb88));
+        definitions.insert(
+            base.clone(),
+            Expr::Bin {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Reg(pool)),
+                rhs: Box::new(Expr::Addr(0x4a0)),
+            },
+        );
+
+        assert_eq!(
+            constant_address(&Expr::Reg(base.clone()), &definitions, 0),
+            Some(TABLE_VA)
+        );
+        assert!(is_table_base(
+            &Expr::Reg(base.clone()),
+            TABLE_VA,
+            &definitions,
+            0
+        ));
+        let address = Expr::Lea {
+            base: Some(base),
+            index: Some(index.clone()),
+            scale: 4,
+            disp: 0,
+            segment: None,
+        };
+        assert_eq!(
+            indexed_table_address(&address, TABLE_VA, 4, &definitions, 0),
+            Some(Expr::Reg(index))
+        );
+    }
+
+    #[test]
+    fn a_constant_base_that_is_not_the_table_does_not_match() {
+        const TABLE_VA: u64 = 0x20028;
+        let base = VReg::phys("r3#4");
+        let mut definitions: HashMap<VReg, Expr> = HashMap::new();
+        definitions.insert(base.clone(), Expr::Const(0x20030));
+
+        assert!(!is_table_base(
+            &Expr::Reg(base.clone()),
+            TABLE_VA,
+            &definitions,
+            0
+        ));
+        let address = Expr::Lea {
+            base: Some(base),
+            index: Some(VReg::phys("r2#1")),
+            scale: 4,
+            disp: 0,
+            segment: None,
+        };
+        assert_eq!(
+            indexed_table_address(&address, TABLE_VA, 4, &definitions, 0),
+            None
+        );
+    }
+}

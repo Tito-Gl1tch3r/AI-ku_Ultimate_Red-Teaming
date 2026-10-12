@@ -1,0 +1,278 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+import pytest
+from fory_compiler.frontend.fdl.parser import Parser, ParseError
+from fory_compiler.ir.validator import SchemaValidator
+
+
+def parse(source: str):
+    parser = Parser.from_source(source)
+    schema = parser.parse()
+    return schema
+
+
+def validate(source: str) -> SchemaValidator:
+    schema = parse(source)
+    validator = SchemaValidator(schema)
+    validator.validate()
+    return validator
+
+
+def test_empty_service():
+    source = """
+    package test;
+    service Greeter {}
+    """
+    schema = parse(source)
+    assert len(schema.services) == 1
+    service = schema.services[0]
+    assert service.name == "Greeter"
+    assert len(service.methods) == 0
+
+
+def test_unary_rpc():
+    source = """
+    package test;
+    
+    message HelloRequest {}
+    message HelloReply {}
+
+    service Greeter {
+        rpc SayHello (HelloRequest) returns (HelloReply);
+    }
+    """
+    schema = parse(source)
+    service = schema.services[0]
+    assert len(service.methods) == 1
+    method = service.methods[0]
+    assert method.name == "SayHello"
+    assert method.request_type.name == "HelloRequest"
+    assert method.response_type.name == "HelloReply"
+    assert not method.client_streaming
+    assert not method.server_streaming
+
+
+def test_rpc_with_qualified_request_and_response_types():
+    source = """
+    package test;
+
+    message Outer {
+        message HelloRequest {}
+    }
+
+    message ReplyEnvelope {
+        message HelloReply {}
+    }
+
+    service Greeter {
+        rpc SayHello (Outer.HelloRequest) returns (ReplyEnvelope.HelloReply);
+    }
+    """
+    schema = parse(source)
+    service = schema.services[0]
+    method = service.methods[0]
+    assert method.request_type.name == "Outer.HelloRequest"
+    assert method.response_type.name == "ReplyEnvelope.HelloReply"
+
+
+def test_client_streaming_rpc():
+    source = """
+    package test;
+    
+    message HelloRequest {}
+    message HelloReply {}
+
+    service Greeter {
+        rpc LotsOfGreetings (stream HelloRequest) returns (HelloReply);
+    }
+    """
+    schema = parse(source)
+    service = schema.services[0]
+    method = service.methods[0]
+    assert method.name == "LotsOfGreetings"
+    assert method.client_streaming
+    assert not method.server_streaming
+
+
+def test_server_streaming_rpc():
+    source = """
+    package test;
+    
+    message HelloRequest {}
+    message HelloReply {}
+
+    service Greeter {
+        rpc LotsOfReplies (HelloRequest) returns (stream HelloReply);
+    }
+    """
+    schema = parse(source)
+    service = schema.services[0]
+    method = service.methods[0]
+    assert method.name == "LotsOfReplies"
+    assert not method.client_streaming
+    assert method.server_streaming
+
+
+def test_bidi_streaming_rpc():
+    source = """
+    package test;
+    
+    message HelloRequest {}
+    message HelloReply {}
+
+    service Greeter {
+        rpc BidiHello (stream HelloRequest) returns (stream HelloReply);
+    }
+    """
+    schema = parse(source)
+    service = schema.services[0]
+    method = service.methods[0]
+    assert method.name == "BidiHello"
+    assert method.client_streaming
+    assert method.server_streaming
+
+
+def test_service_options():
+    source = """
+    package test;
+    
+    service Greeter {
+        option deprecated = true;
+    }
+    """
+    schema = parse(source)
+    service = schema.services[0]
+    assert service.options["deprecated"] is True
+
+
+def test_method_options():
+    source = """
+    package test;
+    
+    message HelloRequest {}
+    message HelloReply {}
+
+    service Greeter {
+        rpc SayHello (HelloRequest) returns (HelloReply) {
+            option deprecated = true;
+        }
+    }
+    """
+    schema = parse(source)
+    service = schema.services[0]
+    method = service.methods[0]
+    assert method.options["deprecated"] is True
+
+
+def test_invalid_syntax_missing_returns():
+    source = """
+    package test;
+    service Greeter {
+        rpc SayHello (HelloRequest);
+    }
+    """
+    with pytest.raises(ParseError):
+        parse(source)
+
+
+def test_invalid_syntax_missing_parens():
+    source = """
+    package test;
+    service Greeter {
+        rpc SayHello HelloRequest returns HelloReply;
+    }
+    """
+    with pytest.raises(ParseError):
+        parse(source)
+
+
+def test_service_unknown_request_type_fails_validation():
+    source = """
+    package test;
+
+    message HelloReply {}
+
+    service Greeter {
+        rpc SayHello (UnknownRequest) returns (HelloReply);
+    }
+    """
+    schema = parse(source)
+    validator = SchemaValidator(schema)
+    assert not validator.validate()
+    # Ensure we surface a clear unknown-type error on the RPC line.
+    matching_errors = [
+        err
+        for err in validator.errors
+        if "Unknown type 'UnknownRequest'" in err.message
+    ]
+    assert matching_errors
+    # Location should be attached so tooling/CLI can point at the RPC.
+    assert matching_errors[0].location is not None
+
+
+def test_service_unknown_response_type_fails_validation():
+    source = """
+    package test;
+
+    message HelloRequest {}
+
+    service Greeter {
+        rpc SayHello (HelloRequest) returns (UnknownReply);
+    }
+    """
+    schema = parse(source)
+    validator = SchemaValidator(schema)
+    assert not validator.validate()
+    assert any("Unknown type 'UnknownReply'" in err.message for err in validator.errors)
+
+
+def test_service_known_types_pass_validation():
+    source = """
+    package test;
+
+    message HelloRequest {}
+    message HelloReply {}
+
+    service Greeter {
+        rpc SayHello (HelloRequest) returns (HelloReply);
+    }
+    """
+    schema = parse(source)
+    validator = SchemaValidator(schema)
+    assert validator.validate()
+
+
+def test_service_qualified_known_types_pass_validation():
+    source = """
+    package test;
+
+    message Outer {
+        message HelloRequest {}
+    }
+
+    message ReplyEnvelope {
+        message HelloReply {}
+    }
+
+    service Greeter {
+        rpc SayHello (Outer.HelloRequest) returns (ReplyEnvelope.HelloReply);
+    }
+    """
+    schema = parse(source)
+    validator = SchemaValidator(schema)
+    assert validator.validate()

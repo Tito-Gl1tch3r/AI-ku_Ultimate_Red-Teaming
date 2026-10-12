@@ -1,0 +1,1852 @@
+from __future__ import annotations
+
+from typing import Any, Literal, TypeVar, cast
+
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.models import Model
+
+from ..context import MemoryContext
+from ..tools.base import tool_to_pyd_ai
+from ..tools.annotate_binary import build_tool as build_annotate, AnnotateResult
+from ..tools.search_kb import build_tool as build_kb_search, KBSearchResult
+from ..tools.kb_add_note import build_tool as build_add_note, AddNoteResult
+from ..tools.hash_file import build_tool as build_file_hash, FileHashResult
+from ..tools.import_triage import build_tool as build_import_triage, TriageImportResult
+from ..tools.view_entry import build_tool as build_view_entry, DetectEntryResult
+from ..tools.view_symbols import build_tool as build_view_symbols, SymbolsListResult
+from ..tools.map_elf_plt import build_tool as build_map_elf_plt, ElfPltMapResult
+from ..tools.map_elf_got import build_tool as build_map_elf_got, ElfGotMapResult
+from ..tools.map_pe_iat import build_tool as build_map_pe_iat, PeIatMapResult
+from ..tools.pe_list_resources import build_tool as build_pe_list_resources
+from ..tools.pe_decode_version_info import build_tool as build_pe_decode_version_info
+from ..tools.pe_view_manifest import build_tool as build_pe_view_manifest
+from ..tools.view_disassembly import (
+    build_tool as build_view_disassembly,
+    DisasmWindowResult,
+)
+from ..tools.view_hex import build_tool as build_view_hex, BytesViewResult
+from ..tools.view_entropy import build_tool as build_view_entropy, EntropyCalcResult
+from ..tools.search_symbols import (
+    build_tool as build_search_symbols,
+    SymbolsSearchResult,
+)
+from ..tools.search_strings import (
+    build_tool as build_search_strings,
+    StringsSearchResult,
+)
+from ..tools.view_strings import build_tool as build_view_strings, StringsImportResult
+from ..tools.list_functions import (
+    build_tool as build_list_functions,
+    ListFunctionsResult,
+)
+from ..tools.map_symbol_addresses import (
+    build_tool as build_map_symbol_addresses,
+    MapSymbolAddressesResult,
+)
+from ..tools.view_function import build_tool as build_view_function, ViewFunctionResult
+from ..tools.suggest_function_name import (
+    build_tool as build_name_function,
+    SuggestFunctionNameResult,
+)
+from ..tools.decompile_function import (
+    build_tool as build_decompile_function,
+    DecompileFunctionResult,
+)
+from ..tools.xrefs import (
+    build_xrefs_to as build_list_xrefs_to,
+    build_xrefs_from as build_list_xrefs_from,
+    XrefResult,
+)
+from ..tools.list_calls import (
+    build_tool as build_list_calls,
+    ListCallsResult,
+)
+from ..tools.get_string_xrefs import (
+    build_tool as build_get_string_xrefs,
+    StringXrefsResult,
+)
+from ..tools.rename_in_kb import (
+    build_tool as build_rename_in_kb,
+    RenameInKBResult,
+)
+from ..tools.scan_until_byte import (
+    build_tool as build_scan_until_byte,
+    ScanUntilByteResult,
+)
+from ..tools.verify_recovery_tool import (
+    build_verify_compile_tool,
+    build_verify_runtime_tool,
+    VerifyCompileResult,
+    VerifyRuntimeResult,
+)
+from ..tools.search_byte_pattern import (
+    build_tool as build_search_byte_pattern,
+    SearchBytePatternResult,
+)
+from ..tools.list_suspicious_imports import (
+    build_tool as build_list_suspicious_imports,
+    SuspiciousImportsResult,
+)
+from ..tools.windows_surface_metadata import (
+    build_tool as build_windows_surface_metadata,
+)
+from ..tools.windows_risk_report import (
+    build_tool as build_windows_risk_report,
+)
+from ..tools.windows_build_corpus import (
+    build_tool as build_windows_build_corpus,
+)
+from ..tools.windows_project_fact_summary import (
+    build_tool as build_windows_project_fact_summary,
+)
+from ..tools.windows_project_fact_manifest import (
+    build_tool as build_windows_project_fact_manifest,
+)
+from ..tools.windows_bootstrap_project_facts import (
+    build_tool as build_windows_bootstrap_project_facts,
+)
+from ..tools.windows_project_callsite_facts import (
+    build_tool as build_windows_project_callsite_facts,
+)
+from ..tools.windows_project_sink_call_packets import (
+    build_tool as build_windows_project_sink_call_packets,
+)
+from ..tools.windows_vulnerability_seed_packets import (
+    build_tool as build_windows_vulnerability_seed_packets,
+)
+from ..tools.windows_project_sink_operation_summary import (
+    build_tool as build_windows_project_sink_operation_summary,
+)
+from ..tools.windows_project_operation_coverage_summary import (
+    build_tool as build_windows_project_operation_coverage_summary,
+)
+from ..tools.windows_project_operation_backlog_summary import (
+    build_tool as build_windows_project_operation_backlog_summary,
+)
+from ..tools.windows_operation_backlog_packets import (
+    build_tool as build_windows_operation_backlog_packets,
+)
+from ..tools.windows_project_operation_return_value_summary import (
+    build_tool as build_windows_project_operation_return_value_summary,
+)
+from ..tools.windows_project_operation_gate_summary import (
+    build_tool as build_windows_project_operation_gate_summary,
+)
+from ..tools.windows_project_operation_source_summary import (
+    build_tool as build_windows_project_operation_source_summary,
+)
+from ..tools.windows_project_operation_risk_summary import (
+    build_tool as build_windows_project_operation_risk_summary,
+)
+from ..tools.windows_project_callgraph_slice import (
+    build_tool as build_windows_project_callgraph_slice,
+)
+from ..tools.windows_project_callgraph_reachability import (
+    build_tool as build_windows_project_callgraph_reachability,
+)
+from ..tools.windows_project_callgraph_diff import (
+    build_tool as build_windows_project_callgraph_diff,
+)
+from ..tools.windows_project_guard_condition_diff import (
+    build_tool as build_windows_project_guard_condition_diff,
+)
+from ..tools.windows_project_function_boundary_diff import (
+    build_tool as build_windows_project_function_boundary_diff,
+)
+from ..tools.windows_project_call_argument_snapshot import (
+    build_tool as build_windows_project_call_argument_snapshot,
+)
+from ..tools.windows_project_memory_operand_facts import (
+    build_tool as build_windows_project_memory_operand_facts,
+)
+from ..tools.windows_project_memory_access_query import (
+    build_tool as build_windows_project_memory_access_query,
+)
+from ..tools.windows_project_memory_access_diff import (
+    build_tool as build_windows_project_memory_access_diff,
+)
+from ..tools.windows_project_return_value_use_snapshot import (
+    build_tool as build_windows_project_return_value_use_snapshot,
+)
+from ..tools.windows_project_data_label_facts import (
+    build_tool as build_windows_project_data_label_facts,
+)
+from ..tools.windows_project_data_table_facts import (
+    build_tool as build_windows_project_data_table_facts,
+)
+from ..tools.windows_project_data_table_diff import (
+    build_tool as build_windows_project_data_table_diff,
+)
+from ..tools.windows_project_xref_query import (
+    build_tool as build_windows_project_xref_query,
+)
+from ..tools.windows_project_function_start_explain import (
+    build_tool as build_windows_project_function_start_explain,
+)
+from ..tools.windows_project_symbol_range_facts import (
+    build_tool as build_windows_project_symbol_range_facts,
+)
+from ..tools.windows_project_prototype_diff import (
+    build_tool as build_windows_project_prototype_diff,
+)
+from ..tools.windows_project_onehop_sink_chains import (
+    build_tool as build_windows_project_onehop_sink_chains,
+)
+from ..tools.windows_project_onehop_argument_flow import (
+    build_tool as build_windows_project_onehop_argument_flow,
+)
+from ..tools.windows_project_helper_argument_summary import (
+    build_tool as build_windows_project_helper_argument_summary,
+)
+from ..tools.windows_project_onehop_flow_packets import (
+    build_tool as build_windows_project_onehop_flow_packets,
+)
+from ..tools.windows_binary_diff_summary import (
+    build_tool as build_windows_binary_diff_summary,
+)
+from ..tools.windows_pdb_identity_manifest import (
+    build_tool as build_windows_pdb_identity_manifest,
+)
+from ..tools.windows_patch_function_identity_extract import (
+    build_tool as build_windows_patch_function_identity_extract,
+)
+from ..tools.windows_patch_diff_packets import (
+    build_tool as build_windows_patch_diff_packets,
+)
+from ..tools.windows_reconcile_pdb_identity import (
+    build_tool as build_windows_reconcile_pdb_identity,
+)
+from ..tools.windows_import_pdb_facts import (
+    build_tool as build_windows_import_pdb_facts,
+)
+from ..tools.windows_component_profile import (
+    build_tool as build_windows_component_profile,
+)
+from ..tools.windows_ghidra_delta_manifest import (
+    build_tool as build_windows_ghidra_delta_manifest,
+)
+from ..tools.windows_agent_evidence_bundle import (
+    build_tool as build_windows_agent_evidence_bundle,
+)
+from ..tools.windows_analyst_notebook import (
+    build_tool as build_windows_analyst_notebook,
+)
+from ..tools.windows_interactive_analyst import (
+    build_tool as build_windows_interactive_analyst,
+)
+from ..tools.windows_function_boundary_diff import (
+    build_tool as build_windows_function_boundary_diff,
+)
+from ..tools.windows_function_start_explain import (
+    build_tool as build_windows_function_start_explain,
+)
+from ..tools.windows_simd_start_classifier import (
+    build_tool as build_windows_simd_start_classifier,
+)
+from ..tools.windows_candidate_start_worklist import (
+    build_tool as build_windows_candidate_start_worklist,
+)
+from ..tools.windows_data_ref_confidence import (
+    build_tool as build_windows_data_ref_confidence,
+)
+from ..tools.windows_decompile_context_packet import (
+    build_tool as build_windows_decompile_context_packet,
+)
+from ..tools.windows_import_thunk_catalog import (
+    build_tool as build_windows_import_thunk_catalog,
+)
+from ..tools.windows_function_body_split_candidates import (
+    build_tool as build_windows_function_body_split_candidates,
+)
+from ..tools.windows_surface_catalog import (
+    build_tool as build_windows_surface_catalog,
+)
+from ..tools.windows_source_reachability import (
+    build_tool as build_windows_source_reachability,
+)
+from ..tools.windows_target_surface_profile import (
+    build_tool as build_windows_target_surface_profile,
+)
+from ..tools.windows_vulnerability_seed_catalog import (
+    build_tool as build_windows_vulnerability_seed_catalog,
+)
+from ..tools.windows_seed_binary_diff_triage import (
+    build_tool as build_windows_seed_binary_diff_triage,
+)
+from ..tools.windows_enumerate_entrypoints import (
+    build_tool as build_windows_enumerate_entrypoints,
+)
+from ..tools.windows_function_arg_roles import (
+    build_tool as build_windows_function_arg_roles,
+)
+from ..tools.windows_operation_metadata import (
+    build_tool as build_windows_operation_metadata,
+)
+from ..tools.windows_operation_classification_backlog import (
+    build_tool as build_windows_operation_classification_backlog,
+)
+from ..tools.windows_operation_return_value_snapshots import (
+    build_tool as build_windows_operation_return_value_snapshots,
+)
+from ..tools.windows_list_operation_sinks import (
+    build_tool as build_windows_list_operation_sinks,
+)
+from ..tools.windows_callsite_operand_facts import (
+    build_tool as build_windows_callsite_operand_facts,
+)
+from ..tools.windows_trace_arg_flow import (
+    build_tool as build_windows_trace_arg_flow,
+)
+from ..tools.windows_source_sink_operand_match import (
+    build_tool as build_windows_source_sink_operand_match,
+)
+from ..tools.windows_trace_onehop_flow import (
+    build_tool as build_windows_trace_onehop_flow,
+)
+from ..tools.windows_check_gate_to_sink import (
+    build_tool as build_windows_check_gate_to_sink,
+)
+from ..tools.windows_cfg_dominance import (
+    build_tool as build_windows_cfg_dominance,
+)
+from ..tools.windows_cfg_gate_to_sink import (
+    build_tool as build_windows_cfg_gate_to_sink,
+)
+from ..tools.windows_project_cfg_path_query import (
+    build_tool as build_windows_project_cfg_path_query,
+)
+from ..tools.windows_project_branch_condition_facts import (
+    build_tool as build_windows_project_branch_condition_facts,
+)
+from ..tools.windows_project_function_chunk_facts import (
+    build_tool as build_windows_project_function_chunk_facts,
+)
+from ..tools.windows_project_sysinfo_dispatch_facts import (
+    build_tool as build_windows_project_sysinfo_dispatch_facts,
+)
+from ..tools.windows_project_zero_length_write_paths import (
+    build_tool as build_windows_project_zero_length_write_paths,
+)
+from ..tools.windows_compose_source_gate_sink_packet import (
+    build_tool as build_windows_compose_source_gate_sink_packet,
+)
+from ..tools.windows_emit_review_packet import (
+    build_tool as build_windows_emit_review_packet,
+)
+from ..tools.windows_compose_candidate_packets import (
+    build_tool as build_windows_compose_candidate_packets,
+)
+from ..tools.windows_rank_candidate_packets import (
+    build_tool as build_windows_rank_candidate_packets,
+)
+from ..tools.windows_emit_vm_validation_plan import (
+    build_tool as build_windows_emit_vm_validation_plan,
+)
+from ..tools.windows_candidate_validation_report import (
+    build_tool as build_windows_candidate_validation_report,
+)
+from ..tools.windows_record_validation_artifact_bundle import (
+    build_tool as build_windows_record_validation_artifact_bundle,
+)
+from ..tools.windows_import_validation_artifact_directory import (
+    build_tool as build_windows_import_validation_artifact_directory,
+)
+from ..tools.windows_record_candidate_snapshot_mapping import (
+    build_tool as build_windows_record_candidate_snapshot_mapping,
+)
+from ..tools.windows_emit_validation_harness_template import (
+    build_tool as build_windows_emit_validation_harness_template,
+)
+from ..tools.windows_validation_harness_recipe import (
+    build_tool as build_windows_validation_harness_recipe,
+)
+from ..tools.windows_summarize_helper_side_effects import (
+    build_tool as build_windows_summarize_helper_side_effects,
+)
+from ..tools.windows_compare_selector_cases import (
+    build_tool as build_windows_compare_selector_cases,
+)
+from ..tools.windows_api_contract_primitives import (
+    build_tool as build_windows_api_contract_primitives,
+)
+from ..tools.windows_api_contract_rule_scan import (
+    build_tool as build_windows_api_contract_rule_scan,
+)
+from ..tools.windows_function_pretty_lift import (
+    build_tool as build_windows_function_pretty_lift,
+)
+from ..tools.windows_syscall_stub_atlas import (
+    build_tool as build_windows_syscall_stub_atlas,
+)
+from ..tools.windows_syscall_atlas_diff import (
+    build_tool as build_windows_syscall_atlas_diff,
+)
+from ..tools.windows_syscall_handler_correlate import (
+    build_tool as build_windows_syscall_handler_correlate,
+)
+from ..tools.windows_live_kernel_snapshot import (
+    build_tool as build_windows_live_kernel_snapshot,
+)
+from ..tools.windows_diff_security_relevant_facts import (
+    build_tool as build_windows_diff_security_relevant_facts,
+)
+from ..tools.windows_regression_fixture_catalog import (
+    build_tool as build_windows_regression_fixture_catalog,
+)
+from ..tools.windows_replay_regression_fixtures import (
+    build_tool as build_windows_replay_regression_fixtures,
+)
+from ..tools.windows_functionization_rule_replay import (
+    build_tool as build_windows_functionization_rule_replay,
+)
+from ..tools.windows_scan_rejection_dashboard import (
+    build_tool as build_windows_scan_rejection_dashboard,
+)
+from ..tools.windows_high_volume_preflight import (
+    build_tool as build_windows_high_volume_preflight,
+)
+from ..tools.windows_pipeline_blocker_task_plan import (
+    build_tool as build_windows_pipeline_blocker_task_plan,
+)
+from ..tools.windows_symbol_similarity_extraction_plan import (
+    build_tool as build_windows_symbol_similarity_extraction_plan,
+)
+from ..tools.windows_function_similarity_manifest import (
+    build_tool as build_windows_function_similarity_manifest,
+)
+from ..tools.windows_runner_artifact_review import (
+    build_tool as build_windows_runner_artifact_review,
+)
+from ..tools.windows_runner_artifact_promotion_plan import (
+    build_tool as build_windows_runner_artifact_promotion_plan,
+)
+from ..tools.windows_runner_artifact_promotion_apply import (
+    build_tool as build_windows_runner_artifact_promotion_apply,
+)
+from ..tools.identify_compiler_and_runtime import (
+    build_tool as build_identify_compiler,
+    IdentifyCompilerResult,
+)
+from ..tools.detect_crypto_usage import (
+    build_tool as build_detect_crypto,
+    DetectCryptoResult,
+)
+from ..tools.diff_functions import (
+    build_tool as build_diff_functions,
+    DiffFunctionsResult,
+)
+from ..tools.propose_types_for_function import (
+    build_tool as build_propose_types,
+    ProposeTypesResult,
+)
+from ..tools.extract_archive import (
+    build_enumerate_archive,
+    EnumerateArchiveResult,
+    build_extract_archive_entry,
+    ExtractArchiveEntryResult,
+    build_extract_archive_all,
+    ExtractArchiveAllResult,
+    build_recursive_unpack,
+    RecursiveUnpackResult,
+)
+from ..tools.find_embedded_executables import (
+    build_tool as build_find_embedded_executables,
+    FindEmbeddedExecutablesResult,
+)
+from ..tools.find_encoded_blobs import (
+    build_find_base64_blobs,
+    FindBase64BlobsResult,
+    build_find_hex_blobs,
+    FindHexBlobsResult,
+    build_find_pem_blocks,
+    FindPemBlocksResult,
+    build_try_xor_brute,
+    TryXorBruteResult,
+    build_scan_xor_encoded_strings,
+    ScanXorEncodedStringsResult,
+    build_find_compressed_blobs,
+    FindCompressedBlobsResult,
+)
+from ..tools.find_structured_blobs import (
+    build_find_embedded_images,
+    FindEmbeddedImagesResult,
+    build_find_xml_blobs,
+    FindXmlBlobsResult,
+    build_find_json_blobs,
+    FindJsonBlobsResult,
+    build_find_plist_blobs,
+    FindPlistBlobsResult,
+    build_find_ini_blobs,
+    FindIniBlobsResult,
+    build_extract_pe_overlay,
+    ExtractPeOverlayResult,
+    build_extract_elf_section,
+    ExtractElfSectionResult,
+)
+from ..tools.analyze_recursively import (
+    build_tool as build_analyze_recursively,
+    AnalyzeRecursivelyResult,
+)
+from ..tools.java_index_archive import build_tool as build_java_index_archive
+from ..tools.java_agent_context import build_tool as build_java_agent_context
+from ..tools.java_detect_obfuscation import (
+    build_tool as build_java_detect_obfuscation,
+)
+from ..tools.java_detect_security_sensitive_behavior import (
+    build_tool as build_java_detect_sensitive_behavior,
+)
+from ..tools.java_detect_entrypoints import build_tool as build_java_detect_entrypoints
+from ..tools.java_detect_frameworks import build_tool as build_java_detect_frameworks
+from ..tools.java_extract_config_surface import (
+    build_tool as build_java_extract_config_surface,
+)
+from ..tools.java_view_class import build_tool as build_java_view_class
+from ..tools.java_annotate_mappings import build_tool as build_java_annotate_mappings
+from ..tools.java_lookup_mapping import build_tool as build_java_lookup_mapping
+from ..tools.java_list_classes import build_tool as build_java_list_classes
+from ..tools.java_list_packages import build_tool as build_java_list_packages
+from ..tools.java_list_resources import build_tool as build_java_list_resources
+from ..tools.java_list_fields import build_tool as build_java_list_fields
+from ..tools.java_list_methods import build_tool as build_java_list_methods
+from ..tools.java_list_annotations import build_tool as build_java_list_annotations
+from ..tools.java_view_manifest import build_tool as build_java_view_manifest
+from ..tools.java_list_services import build_tool as build_java_list_services
+from ..tools.java_detect_duplicate_classes import (
+    build_tool as build_java_detect_duplicate_classes,
+)
+from ..tools.java_list_string_constants import (
+    build_tool as build_java_list_string_constants,
+)
+from ..tools.java_audit_archive_set import build_tool as build_java_audit_archive_set
+from ..tools.java_trace_to_sink import build_tool as build_java_trace_to_sink
+from ..tools.java_detect_secrets import build_tool as build_java_detect_secrets
+from ..tools.java_detect_suspicious_blobs import (
+    build_tool as build_java_detect_suspicious_blobs,
+)
+from ..tools.java_verify_signatures import build_tool as build_java_verify_signatures
+from ..tools.java_infer_dependencies import build_tool as build_java_infer_dependencies
+from ..tools.java_infer_build_system import build_tool as build_java_infer_build_system
+from ..tools.java_compile_recovered_project import (
+    build_tool as build_java_compile_recovered_project,
+)
+from ..tools.java_reconstruct_source_tree import (
+    build_tool as build_java_reconstruct_source_tree,
+)
+from ..tools.java_decompile_class import build_tool as build_java_decompile_class
+from ..tools.java_decompile_archive import build_tool as build_java_decompile_archive
+from ..tools.java_parse_decompiled_source import (
+    build_tool as build_java_parse_decompiled_source,
+)
+from ..tools.java_index_source_project import (
+    build_tool as build_java_index_source_project,
+)
+from ..tools.java_repair_decompiled_source import (
+    build_tool as build_java_repair_decompiled_source,
+)
+from ..tools.java_compare_rebuilt_abi import (
+    build_tool as build_java_compare_rebuilt_abi,
+)
+from ..tools.java_validate_recovered_application import (
+    build_tool as build_java_validate_recovered_application,
+)
+from ..tools.java_recover_project import build_tool as build_java_recover_project
+from ..tools.java_recovery_report import build_tool as build_java_recovery_report
+from ..tools.java_view_bytecode import build_tool as build_java_view_bytecode
+from ..tools.java_cfg import build_tool as build_java_cfg
+from ..tools.java_xrefs_from import build_tool as build_java_xrefs_from
+from ..tools.java_xrefs_to import build_tool as build_java_xrefs_to
+from ..tools.java_call_graph import build_tool as build_java_call_graph
+from ..tools.java_reachability import build_tool as build_java_reachability
+from ..tools.java_correlate_behavior_config import (
+    build_tool as build_java_correlate_behavior_config,
+)
+from ..tools.java_risk_report import build_tool as build_java_risk_report
+from ..tools.runtime_project_summary import build_tool as build_runtime_project_summary
+from ..tools.minecraft_detect_archive import (
+    build_tool as build_minecraft_detect_archive,
+)
+from ..tools.minecraft_fetch_mappings import (
+    build_tool as build_minecraft_fetch_mappings,
+)
+from ..tools.minecraft_extract_bundled_server import (
+    build_tool as build_minecraft_extract_bundled_server,
+)
+from .memory_foundation import create_foundation_agent
+
+
+AgentOutputT = TypeVar("AgentOutputT")
+SymbolSearchScope = Literal["all", "dynamic", "imports", "exports", "libs"]
+StringEncoding = Literal["ascii", "utf16le", "utf16be"]
+
+
+def register_analysis_tools(
+    agent: Agent[MemoryContext, AgentOutputT],
+    *,
+    model_name: str | Model | None = None,
+    tool_filter: set[str] | None = None,
+) -> Agent[MemoryContext, AgentOutputT]:
+    """Register glaurung's memory/analysis tools onto an existing Agent.
+
+    Pulled out of :func:`create_memory_agent` so specialised agents
+    (FunctionExplainAgent, VulnerabilityHuntAgent, …) can reuse the
+    exact same tool surface while supplying their own system prompt
+    and output schema.
+
+    Passing ``model_name`` lets the tool wrapper pick a provider-safe
+    default for pydantic-ai's ``strict`` flag. Anthropic caps strict-tool
+    count at 20; without this hint, registering the ~163-tool memory
+    surface against an Anthropic model fails with "Too many strict tools".
+    When ``model_name`` is omitted the legacy default (env-controlled)
+    is preserved for back-compat.
+
+    Passing ``tool_filter={'name1', 'name2', ...}`` (L5) restricts
+    registration to the named tools only. Names that don't match any
+    tool are silently ignored (so future renames don't break callers).
+    Pass ``None`` (the default) to register everything.
+    """
+    from ..tools.base import (
+        default_tool_strict_for,
+        default_tool_strict_for_model,
+    )
+
+    target_strict = (
+        default_tool_strict_for_model(model_name)
+        if model_name is not None
+        else None  # legacy: env GLAURUNG_TOOL_STRICT or default-True
+    )
+    with default_tool_strict_for(target_strict):
+        agent = _register_analysis_tools_inner(agent)
+
+    # L5: if a filter is set, remove tools whose name is not in the
+    # filter from the agent's function toolset. The toolset's
+    # remove_tool() API isn't universally available, so we filter the
+    # underlying tool dict directly when possible.
+    if tool_filter is not None:
+        _apply_tool_filter(agent, tool_filter)
+    return agent
+
+
+def _apply_tool_filter(agent, tool_filter: set[str]) -> None:
+    """Best-effort prune of agent tools to names in ``tool_filter``.
+
+    pydantic-ai's Tool registry is exposed via ``agent._function_toolset``
+    in 1.x; the internal API isn't stable but the shape ('_tools' dict
+    keyed by tool name) has held across versions. We treat any failure
+    as a soft warning: the agent runs with extra tools rather than
+    refusing to start.
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+    toolset = getattr(agent, "_function_toolset", None)
+    if toolset is None:
+        log.warning("agent has no _function_toolset; tool filter not applied")
+        return
+    tools = getattr(toolset, "_tools", None) or getattr(toolset, "tools", None)
+    if tools is None:
+        log.warning("agent toolset has no _tools / tools attr; filter skipped")
+        return
+    if isinstance(tools, dict):
+        keep_names = {n for n in tool_filter}
+        drop = [n for n in list(tools.keys()) if n not in keep_names]
+        for n in drop:
+            tools.pop(n, None)
+        log.debug(
+            "tool_filter retained %d/%d tools (dropped %d)",
+            len(tools),
+            len(tools) + len(drop),
+            len(drop),
+        )
+        return
+    log.warning(
+        "tool registry has unexpected shape (%s); filter skipped", type(tools).__name__
+    )
+
+
+def _register_analysis_tools_inner(
+    agent: Agent[MemoryContext, AgentOutputT],
+) -> Agent[MemoryContext, AgentOutputT]:
+    """Implementation body: 165 tool_to_pyd_ai calls. Always called inside
+    a default_tool_strict_for(...) context so the per-model strict choice
+    propagates without touching individual registrations."""
+    # Wrapper functions expose clear schemas and call atomic tools
+
+    async def hash_file(
+        ctx: RunContext[MemoryContext],
+        algorithm: Literal["md5", "sha1", "sha256"] = "sha256",
+    ) -> FileHashResult:
+        tool = build_file_hash()
+        return tool.run(ctx.deps, ctx.deps.kb, tool.input_model(algorithm=algorithm))
+
+    async def annotate_binary(
+        ctx: RunContext[MemoryContext],
+        max_functions: int = 5,
+        snippet_max_instructions: int = 120,
+        full_function_instr_threshold: int = 200,
+    ) -> AnnotateResult:
+        tool = build_annotate()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                max_functions=max_functions,
+                snippet_max_instructions=snippet_max_instructions,
+                full_function_instr_threshold=full_function_instr_threshold,
+            ),
+        )
+
+    async def search_kb(
+        ctx: RunContext[MemoryContext],
+        query: str,
+        k: int = 10,
+    ) -> KBSearchResult:
+        tool = build_kb_search()
+        return tool.run(ctx.deps, ctx.deps.kb, tool.input_model(query=query, k=k))
+
+    async def kb_add_note(
+        ctx: RunContext[MemoryContext],
+        text: str,
+        tags: list[str] | None = None,
+    ) -> AddNoteResult:
+        tool = build_add_note()
+        return tool.run(
+            ctx.deps, ctx.deps.kb, tool.input_model(text=text, tags=tags or [])
+        )
+
+    async def import_triage(
+        ctx: RunContext[MemoryContext],
+        path: str | None = None,
+        max_read_bytes: int | None = None,
+        max_file_size: int | None = None,
+        max_depth: int = 1,
+    ) -> TriageImportResult:
+        tool = build_import_triage()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                path=path,
+                max_read_bytes=max_read_bytes,
+                max_file_size=max_file_size,
+                max_depth=max_depth,
+            ),
+        )
+
+    async def view_entry(ctx: RunContext[MemoryContext]) -> DetectEntryResult:
+        tool = build_view_entry()
+        return tool.run(ctx.deps, ctx.deps.kb, tool.input_model())
+
+    async def view_symbols(ctx: RunContext[MemoryContext]) -> SymbolsListResult:
+        tool = build_view_symbols()
+        return tool.run(ctx.deps, ctx.deps.kb, tool.input_model())
+
+    async def map_elf_plt(ctx: RunContext[MemoryContext]) -> ElfPltMapResult:
+        tool = build_map_elf_plt()
+        return tool.run(ctx.deps, ctx.deps.kb, tool.input_model())
+
+    async def map_elf_got(ctx: RunContext[MemoryContext]) -> ElfGotMapResult:
+        tool = build_map_elf_got()
+        return tool.run(ctx.deps, ctx.deps.kb, tool.input_model())
+
+    async def map_pe_iat(ctx: RunContext[MemoryContext]) -> PeIatMapResult:
+        tool = build_map_pe_iat()
+        return tool.run(ctx.deps, ctx.deps.kb, tool.input_model())
+
+    async def view_disassembly(
+        ctx: RunContext[MemoryContext],
+        va: int,
+        window_bytes: int | None = None,
+        max_instructions: int | None = None,
+    ) -> DisasmWindowResult:
+        tool = build_view_disassembly()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                va=va, window_bytes=window_bytes, max_instructions=max_instructions
+            ),
+        )
+
+    async def view_strings(
+        ctx: RunContext[MemoryContext], max_samples: int = 200
+    ) -> StringsImportResult:
+        tool = build_view_strings()
+        return tool.run(
+            ctx.deps, ctx.deps.kb, tool.input_model(max_samples=max_samples)
+        )
+
+    async def view_hex(
+        ctx: RunContext[MemoryContext],
+        va: int | None = None,
+        file_offset: int | None = None,
+        length: int = 64,
+    ) -> BytesViewResult:
+        tool = build_view_hex()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(va=va, file_offset=file_offset, length=length),
+        )
+
+    async def view_entropy(
+        ctx: RunContext[MemoryContext],
+        va: int | None = None,
+        file_offset: int | None = None,
+        length: int = 4096,
+    ) -> EntropyCalcResult:
+        tool = build_view_entropy()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(va=va, file_offset=file_offset, length=length),
+        )
+
+    async def search_symbols(
+        ctx: RunContext[MemoryContext],
+        query: str,
+        where: list[SymbolSearchScope] | None = None,
+        case_sensitive: bool = False,
+        regex: bool = False,
+        demangle: bool = True,
+        max_results: int | None = None,
+    ) -> SymbolsSearchResult:
+        tool = build_search_symbols()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                query=query,
+                where=where or ["all", "imports", "exports"],
+                case_sensitive=case_sensitive,
+                regex=regex,
+                demangle=demangle,
+                max_results=max_results,
+            ),
+        )
+
+    async def name_function(
+        ctx: RunContext[MemoryContext],
+        va: int,
+        original_name: str | None = None,
+        max_instructions: int = 64,
+        use_llm: bool = True,
+    ) -> SuggestFunctionNameResult:
+        tool = build_name_function()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                va=va,
+                original_name=original_name,
+                max_instructions=max_instructions,
+                use_llm=use_llm,
+            ),
+        )
+
+    async def list_functions(
+        ctx: RunContext[MemoryContext], max_functions: int | None = None
+    ) -> ListFunctionsResult:
+        tool = build_list_functions()
+        return tool.run(
+            ctx.deps, ctx.deps.kb, tool.input_model(max_functions=max_functions)
+        )
+
+    async def map_symbol_addresses(
+        ctx: RunContext[MemoryContext],
+    ) -> MapSymbolAddressesResult:
+        tool = build_map_symbol_addresses()
+        return tool.run(ctx.deps, ctx.deps.kb, tool.input_model())
+
+    async def view_function(
+        ctx: RunContext[MemoryContext],
+        va: int,
+        window_bytes: int | None = None,
+        max_instructions: int | None = None,
+    ) -> ViewFunctionResult:
+        tool = build_view_function()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                va=va, window_bytes=window_bytes, max_instructions=max_instructions
+            ),
+        )
+
+    async def search_strings(
+        ctx: RunContext[MemoryContext],
+        query: str,
+        case_sensitive: bool = False,
+        regex: bool = False,
+        encodings: list[StringEncoding] | None = None,
+        min_length: int = 4,
+        max_results: int | None = None,
+        max_scan_bytes: int | None = None,
+    ) -> StringsSearchResult:
+        tool = build_search_strings()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                query=query,
+                case_sensitive=case_sensitive,
+                regex=regex,
+                encodings=encodings or ["ascii", "utf16le", "utf16be"],
+                min_length=min_length,
+                max_results=max_results,
+                max_scan_bytes=max_scan_bytes,
+            ),
+        )
+
+    async def decompile_function(
+        ctx: RunContext[MemoryContext], va: int, style: str = "c", timeout_ms: int = 500
+    ) -> DecompileFunctionResult:
+        tool = build_decompile_function()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(va=va, style=style, timeout_ms=timeout_ms),
+        )
+
+    async def list_xrefs_to(
+        ctx: RunContext[MemoryContext], va: int, max_results: int = 32
+    ) -> XrefResult:
+        tool = build_list_xrefs_to()
+        return tool.run(
+            ctx.deps, ctx.deps.kb, tool.input_model(va=va, max_results=max_results)
+        )
+
+    async def list_xrefs_from(
+        ctx: RunContext[MemoryContext], va: int, max_results: int = 32
+    ) -> XrefResult:
+        tool = build_list_xrefs_from()
+        return tool.run(
+            ctx.deps, ctx.deps.kb, tool.input_model(va=va, max_results=max_results)
+        )
+
+    async def list_calls_from_function(
+        ctx: RunContext[MemoryContext], func_va: int, max_results: int = 64
+    ) -> ListCallsResult:
+        tool = build_list_calls()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(func_va=func_va, max_results=max_results),
+        )
+
+    async def get_string_xrefs(
+        ctx: RunContext[MemoryContext],
+        query: str,
+        case_sensitive: bool = False,
+        regex: bool = False,
+        max_functions: int = 64,
+    ) -> StringXrefsResult:
+        tool = build_get_string_xrefs()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                query=query,
+                case_sensitive=case_sensitive,
+                regex=regex,
+                max_functions=max_functions,
+            ),
+        )
+
+    async def rename_in_kb(
+        ctx: RunContext[MemoryContext],
+        entry_va: int,
+        new_name: str,
+        rationale: str | None = None,
+    ) -> RenameInKBResult:
+        tool = build_rename_in_kb()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(entry_va=entry_va, new_name=new_name, rationale=rationale),
+        )
+
+    async def search_byte_pattern(
+        ctx: RunContext[MemoryContext],
+        pattern: str,
+        max_results: int = 64,
+        resolve_va: bool = True,
+    ) -> SearchBytePatternResult:
+        tool = build_search_byte_pattern()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                pattern=pattern, max_results=max_results, resolve_va=resolve_va
+            ),
+        )
+
+    async def verify_compile(
+        ctx: RunContext[MemoryContext],
+        source: str,
+        language: str = "c",
+        timeout_seconds: float = 15.0,
+    ) -> VerifyCompileResult:
+        """Syntax-check rewritten C/C++ source. First gate after the
+        agent rewrites a decompiled function — if compile fails, fix
+        the rewrite before claiming recovery is complete."""
+        tool = build_verify_compile_tool()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                source=source,
+                language=language,
+                timeout_seconds=timeout_seconds,
+            ),
+        )
+
+    async def verify_runtime(
+        ctx: RunContext[MemoryContext],
+        source: str,
+        target_binary: str | None = None,
+        args: list[str] | None = None,
+        stdin: str | None = None,
+        language: str = "c",
+        timeout_seconds: float = 5.0,
+    ) -> VerifyRuntimeResult:
+        """Compile and execute rewritten source. With `target_binary`
+        set, also runs the target on the same input and reports
+        agreement — the behavioral-equivalence gate."""
+        tool = build_verify_runtime_tool()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                source=source,
+                target_binary=target_binary,
+                args=args or [],
+                stdin=stdin,
+                language=language,
+                timeout_seconds=timeout_seconds,
+            ),
+        )
+
+    async def kickoff_analysis(
+        ctx: RunContext[MemoryContext],
+        max_functions: int = 64,
+        analyze_packed: bool = False,
+    ) -> dict:
+        """Run the canonical first-touch pipeline on the binary in
+        scope: detect_packer + triage + analyze_functions + index +
+        demangle + per-function stack-frame discovery + type
+        propagation + auto-struct recovery. Returns a structured
+        summary suitable for the agent's opening message. Idempotent
+        when re-run on the same KB."""
+        from glaurung.llm.kb.kickoff import kickoff_analysis as _kickoff
+        from dataclasses import asdict
+
+        # Best-effort: route through the context's persistent KB if
+        # available, else run with a tmp DB.
+        db_path = getattr(ctx.deps, "db_path", None)
+        summary = _kickoff(
+            str(ctx.deps.file_path),
+            db_path=db_path,
+            max_functions_for_kb_lift=max_functions,
+            skip_if_packed=not analyze_packed,
+        )
+        return asdict(summary)
+
+    async def scan_until_byte(
+        ctx: RunContext[MemoryContext],
+        va: int | None = None,
+        file_offset: int | None = None,
+        sentinels: list[int] | None = None,
+        max_scan_bytes: int = 4096,
+        include_sentinel: bool = False,
+    ) -> ScanUntilByteResult:
+        tool = build_scan_until_byte()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                va=va,
+                file_offset=file_offset,
+                sentinels=sentinels if sentinels is not None else [0x00],
+                max_scan_bytes=max_scan_bytes,
+                include_sentinel=include_sentinel,
+            ),
+        )
+
+    async def list_suspicious_imports(
+        ctx: RunContext[MemoryContext], include_util: bool = False
+    ) -> SuspiciousImportsResult:
+        tool = build_list_suspicious_imports()
+        return tool.run(
+            ctx.deps, ctx.deps.kb, tool.input_model(include_util=include_util)
+        )
+
+    async def identify_compiler_and_runtime(
+        ctx: RunContext[MemoryContext],
+    ) -> IdentifyCompilerResult:
+        tool = build_identify_compiler()
+        return tool.run(ctx.deps, ctx.deps.kb, tool.input_model())
+
+    async def detect_crypto_usage(ctx: RunContext[MemoryContext]) -> DetectCryptoResult:
+        tool = build_detect_crypto()
+        return tool.run(ctx.deps, ctx.deps.kb, tool.input_model())
+
+    async def diff_functions(
+        ctx: RunContext[MemoryContext],
+        va_a: int,
+        va_b: int,
+        path_a: str | None = None,
+        path_b: str | None = None,
+        style: str = "c",
+    ) -> DiffFunctionsResult:
+        tool = build_diff_functions()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                va_a=va_a, va_b=va_b, path_a=path_a, path_b=path_b, style=style
+            ),
+        )
+
+    async def propose_types_for_function(
+        ctx: RunContext[MemoryContext], va: int, use_llm: bool = True
+    ) -> ProposeTypesResult:
+        tool = build_propose_types()
+        return tool.run(ctx.deps, ctx.deps.kb, tool.input_model(va=va, use_llm=use_llm))
+
+    # Register canonical, human-friendly names only
+    tool_agent = cast(Any, agent)
+    tool_agent.tool(hash_file, name="hash_file")
+    tool_agent.tool(annotate_binary, name="annotate_binary")
+    tool_agent.tool(search_kb, name="search_kb")
+    tool_agent.tool(kb_add_note, name="kb_add_note")
+    tool_agent.tool(import_triage, name="import_triage")
+    tool_agent.tool(view_entry, name="view_entry")
+    tool_agent.tool(view_symbols, name="view_symbols")
+    tool_agent.tool(search_symbols, name="search_symbols")
+    tool_agent.tool(view_strings, name="view_strings")
+    tool_agent.tool(search_strings, name="search_strings")
+    tool_agent.tool(view_hex, name="view_hex")
+    tool_agent.tool(view_disassembly, name="view_disassembly")
+    tool_agent.tool(view_entropy, name="view_entropy")
+    tool_agent.tool(map_elf_plt, name="map_elf_plt")
+    tool_agent.tool(map_elf_got, name="map_elf_got")
+    tool_agent.tool(map_pe_iat, name="map_pe_iat")
+    tool_agent.tool(name_function, name="name_function")
+    tool_agent.tool(list_functions, name="list_functions")
+    tool_agent.tool(map_symbol_addresses, name="map_symbol_addresses")
+    tool_agent.tool(view_function, name="view_function")
+    # Tier-1 analysis additions (xrefs / decompile / pattern-hunt / rename / triage)
+    tool_agent.tool(decompile_function, name="decompile_function")
+    tool_agent.tool(list_xrefs_to, name="list_xrefs_to")
+    tool_agent.tool(list_xrefs_from, name="list_xrefs_from")
+    tool_agent.tool(list_calls_from_function, name="list_calls_from_function")
+    tool_agent.tool(get_string_xrefs, name="get_string_xrefs")
+    tool_agent.tool(rename_in_kb, name="rename_in_kb")
+    tool_agent.tool(search_byte_pattern, name="search_byte_pattern")
+    tool_agent.tool(scan_until_byte, name="scan_until_byte")
+    tool_agent.tool(kickoff_analysis, name="kickoff_analysis")
+    tool_agent.tool(verify_compile, name="verify_compile")
+    tool_agent.tool(verify_runtime, name="verify_runtime")
+    tool_agent.tool(list_suspicious_imports, name="list_suspicious_imports")
+    tool_agent.tool(identify_compiler_and_runtime, name="identify_compiler_and_runtime")
+    tool_agent.tool(detect_crypto_usage, name="detect_crypto_usage")
+    tool_agent.tool(diff_functions, name="diff_functions")
+    tool_agent.tool(propose_types_for_function, name="propose_types_for_function")
+
+    # Embedded-content tools (Sprint 1) — archive extraction + magic scan.
+    async def enumerate_archive(
+        ctx: RunContext[MemoryContext], path: str
+    ) -> EnumerateArchiveResult:
+        tool = build_enumerate_archive()
+        return tool.run(ctx.deps, ctx.deps.kb, tool.input_model(path=path))
+
+    async def extract_archive_entry(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        entry_name: str,
+        out_path: str | None = None,
+    ) -> ExtractArchiveEntryResult:
+        tool = build_extract_archive_entry()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(path=path, entry_name=entry_name, out_path=out_path),
+        )
+
+    async def extract_archive_all(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        out_dir: str,
+        max_files: int = 64,
+        max_bytes: int = 256 * 1024 * 1024,
+    ) -> ExtractArchiveAllResult:
+        tool = build_extract_archive_all()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                path=path,
+                out_dir=out_dir,
+                max_files=max_files,
+                max_bytes=max_bytes,
+            ),
+        )
+
+    async def recursive_unpack(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        out_dir: str,
+        max_depth: int = 4,
+        max_total_bytes: int = 256 * 1024 * 1024,
+    ) -> RecursiveUnpackResult:
+        tool = build_recursive_unpack()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                path=path,
+                out_dir=out_dir,
+                max_depth=max_depth,
+                max_total_bytes=max_total_bytes,
+            ),
+        )
+
+    async def find_embedded_executables(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        skip_first_match: bool = True,
+        max_results: int = 64,
+    ) -> FindEmbeddedExecutablesResult:
+        tool = build_find_embedded_executables()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                path=path,
+                skip_first_match=skip_first_match,
+                max_results=max_results,
+            ),
+        )
+
+    tool_agent.tool(enumerate_archive, name="enumerate_archive")
+    tool_agent.tool(extract_archive_entry, name="extract_archive_entry")
+    tool_agent.tool(extract_archive_all, name="extract_archive_all")
+    tool_agent.tool(recursive_unpack, name="recursive_unpack")
+    tool_agent.tool(find_embedded_executables, name="find_embedded_executables")
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_pe_list_resources()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_pe_decode_version_info()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_pe_view_manifest()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_build_corpus()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_bootstrap_project_facts())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_fact_manifest())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_fact_summary())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_callsite_facts())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_sink_call_packets())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_vulnerability_seed_packets())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_sink_operation_summary())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_operation_coverage_summary())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_operation_backlog_summary())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_operation_backlog_packets())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_operation_return_value_summary())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_operation_gate_summary())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_operation_source_summary())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_operation_risk_summary())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_callgraph_slice())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_callgraph_reachability())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_callgraph_diff())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_guard_condition_diff())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_function_boundary_diff())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_call_argument_snapshot())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_memory_operand_facts())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_memory_access_query())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_memory_access_diff())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_return_value_use_snapshot())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_data_label_facts())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_data_table_facts())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_data_table_diff())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_project_xref_query()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_function_start_explain())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_symbol_range_facts())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_onehop_sink_chains())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_onehop_argument_flow())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_helper_argument_summary())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_onehop_flow_packets())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_binary_diff_summary())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_pdb_identity_manifest())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_patch_function_identity_extract())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_prototype_diff())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_patch_diff_packets()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_reconcile_pdb_identity())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_import_pdb_facts()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_component_profile()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_ghidra_delta_manifest())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_agent_evidence_bundle())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_analyst_notebook()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_interactive_analyst())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_function_boundary_diff())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_function_start_explain())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_simd_start_classifier())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_candidate_start_worklist())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_data_ref_confidence())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_decompile_context_packet())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_import_thunk_catalog())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_function_body_split_candidates())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_surface_catalog()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_source_reachability())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_target_surface_profile())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_vulnerability_seed_catalog())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_seed_binary_diff_triage())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_surface_metadata()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_risk_report()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_enumerate_entrypoints())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_function_arg_roles()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_operation_metadata()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_operation_classification_backlog())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_operation_return_value_snapshots())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_list_operation_sinks())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_callsite_operand_facts())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_trace_arg_flow()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_source_sink_operand_match())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_trace_onehop_flow()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_check_gate_to_sink()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_cfg_dominance()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_cfg_gate_to_sink()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_cfg_path_query())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_branch_condition_facts())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_function_chunk_facts())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_sysinfo_dispatch_facts())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_project_zero_length_write_paths())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_compose_source_gate_sink_packet())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_emit_review_packet()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_compose_candidate_packets())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_rank_candidate_packets())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_emit_vm_validation_plan())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_candidate_validation_report())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_record_validation_artifact_bundle())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_import_validation_artifact_directory())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_record_candidate_snapshot_mapping())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_emit_validation_harness_template())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_validation_harness_recipe())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_summarize_helper_side_effects())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_compare_selector_cases())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_api_contract_primitives())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_api_contract_rule_scan())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_function_pretty_lift())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_syscall_stub_atlas()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_windows_syscall_atlas_diff()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_syscall_handler_correlate())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_live_kernel_snapshot())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_diff_security_relevant_facts())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_regression_fixture_catalog())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_replay_regression_fixtures())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_functionization_rule_replay())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_scan_rejection_dashboard())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_high_volume_preflight())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_runtime_project_summary()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_pipeline_blocker_task_plan())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_symbol_similarity_extraction_plan())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_function_similarity_manifest())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_runner_artifact_review())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_runner_artifact_promotion_plan())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_windows_runner_artifact_promotion_apply())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_agent_context()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_index_archive()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_detect_obfuscation()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_java_detect_sensitive_behavior())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_detect_entrypoints()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_detect_frameworks()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_java_extract_config_surface())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_view_class()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_annotate_mappings()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_lookup_mapping()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_list_classes()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_list_packages()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_list_resources()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_list_fields()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_list_methods()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_list_annotations()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_view_manifest()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_list_services()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_java_detect_duplicate_classes())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_list_string_constants()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_audit_archive_set()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_trace_to_sink()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_detect_secrets()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_java_detect_suspicious_blobs())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_verify_signatures()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_infer_dependencies()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_infer_build_system()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_java_compile_recovered_project())
+    )
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_java_reconstruct_source_tree())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_decompile_class()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_decompile_archive()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_java_parse_decompiled_source())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_index_source_project()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_java_repair_decompiled_source())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_compare_rebuilt_abi()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_java_validate_recovered_application())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_recover_project()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_recovery_report()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_view_bytecode()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_cfg()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_xrefs_from()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_xrefs_to()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_call_graph()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_reachability()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_java_correlate_behavior_config())
+    )
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_java_risk_report()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_minecraft_detect_archive()))
+    agent._function_toolset.add_tool(tool_to_pyd_ai(build_minecraft_fetch_mappings()))
+    agent._function_toolset.add_tool(
+        tool_to_pyd_ai(build_minecraft_extract_bundled_server())
+    )
+
+    # Embedded-content Sprint 2 — encoded-blob detection
+    async def find_base64_blobs(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        min_len: int = 32,
+        max_results: int = 64,
+    ) -> FindBase64BlobsResult:
+        tool = build_find_base64_blobs()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(path=path, min_len=min_len, max_results=max_results),
+        )
+
+    async def find_hex_blobs(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        min_bytes: int = 64,
+        max_results: int = 32,
+    ) -> FindHexBlobsResult:
+        tool = build_find_hex_blobs()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(path=path, min_bytes=min_bytes, max_results=max_results),
+        )
+
+    async def find_pem_blocks(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        max_results: int = 32,
+    ) -> FindPemBlocksResult:
+        tool = build_find_pem_blocks()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(path=path, max_results=max_results),
+        )
+
+    async def try_xor_brute(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        offset: int = 0,
+        length: int = 256,
+        top_k: int = 3,
+    ) -> TryXorBruteResult:
+        tool = build_try_xor_brute()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                path=path,
+                offset=offset,
+                length=length,
+                top_k=top_k,
+            ),
+        )
+
+    async def scan_xor_encoded_strings(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        window: int = 32,
+        stride: int = 8,
+        min_score: float = 0.06,
+        max_results: int = 32,
+    ) -> ScanXorEncodedStringsResult:
+        tool = build_scan_xor_encoded_strings()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                path=path,
+                window=window,
+                stride=stride,
+                min_score=min_score,
+                max_results=max_results,
+            ),
+        )
+
+    async def find_compressed_blobs(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        max_results: int = 32,
+        probe_bytes: int = 4096,
+    ) -> FindCompressedBlobsResult:
+        tool = build_find_compressed_blobs()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                path=path,
+                max_results=max_results,
+                probe_bytes=probe_bytes,
+            ),
+        )
+
+    tool_agent.tool(find_base64_blobs, name="find_base64_blobs")
+    tool_agent.tool(find_hex_blobs, name="find_hex_blobs")
+    tool_agent.tool(find_pem_blocks, name="find_pem_blocks")
+    tool_agent.tool(try_xor_brute, name="try_xor_brute")
+    tool_agent.tool(scan_xor_encoded_strings, name="scan_xor_encoded_strings")
+    tool_agent.tool(find_compressed_blobs, name="find_compressed_blobs")
+
+    # Embedded-content Sprint 3 — structured-blob + resource extraction
+    async def find_embedded_images(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        max_results: int = 32,
+    ) -> FindEmbeddedImagesResult:
+        tool = build_find_embedded_images()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(path=path, max_results=max_results),
+        )
+
+    async def find_xml_blobs(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        max_results: int = 16,
+    ) -> FindXmlBlobsResult:
+        tool = build_find_xml_blobs()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(path=path, max_results=max_results),
+        )
+
+    async def find_json_blobs(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        min_size: int = 64,
+        max_results: int = 16,
+    ) -> FindJsonBlobsResult:
+        tool = build_find_json_blobs()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(path=path, min_size=min_size, max_results=max_results),
+        )
+
+    async def find_plist_blobs(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        max_results: int = 16,
+    ) -> FindPlistBlobsResult:
+        tool = build_find_plist_blobs()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(path=path, max_results=max_results),
+        )
+
+    async def find_ini_blobs(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        min_sections: int = 2,
+        max_results: int = 16,
+    ) -> FindIniBlobsResult:
+        tool = build_find_ini_blobs()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                path=path,
+                min_sections=min_sections,
+                max_results=max_results,
+            ),
+        )
+
+    async def extract_pe_overlay(
+        ctx: RunContext[MemoryContext],
+        path: str,
+    ) -> ExtractPeOverlayResult:
+        tool = build_extract_pe_overlay()
+        return tool.run(ctx.deps, ctx.deps.kb, tool.input_model(path=path))
+
+    async def extract_elf_section(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        section_name: str,
+    ) -> ExtractElfSectionResult:
+        tool = build_extract_elf_section()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(path=path, section_name=section_name),
+        )
+
+    tool_agent.tool(find_embedded_images, name="find_embedded_images")
+    tool_agent.tool(find_xml_blobs, name="find_xml_blobs")
+    tool_agent.tool(find_json_blobs, name="find_json_blobs")
+    tool_agent.tool(find_plist_blobs, name="find_plist_blobs")
+    tool_agent.tool(find_ini_blobs, name="find_ini_blobs")
+    tool_agent.tool(extract_pe_overlay, name="extract_pe_overlay")
+    tool_agent.tool(extract_elf_section, name="extract_elf_section")
+
+    # Embedded-content Sprint 4 — recursive triage orchestrator. Composes
+    # every sprint 1-3 scanner into one "what's actually inside this file?"
+    # walk, returning a tree of triage nodes.
+    async def analyze_recursively(
+        ctx: RunContext[MemoryContext],
+        path: str,
+        out_dir: str | None = None,
+        max_depth: int = 4,
+        max_total_bytes: int = 256 * 1024 * 1024,
+        max_nodes: int = 200,
+    ) -> AnalyzeRecursivelyResult:
+        tool = build_analyze_recursively()
+        return tool.run(
+            ctx.deps,
+            ctx.deps.kb,
+            tool.input_model(
+                path=path,
+                out_dir=out_dir,
+                max_depth=max_depth,
+                max_total_bytes=max_total_bytes,
+                max_nodes=max_nodes,
+            ),
+        )
+
+    tool_agent.tool(analyze_recursively, name="analyze_recursively")
+
+    return agent
+
+
+def create_memory_agent(
+    model: str | Model | None = None,
+    *,
+    tool_filter: set[str] | None = None,
+) -> Agent[MemoryContext, str]:
+    """Foundation string-output agent with analysis tools registered.
+
+    When ``tool_filter`` is supplied (L5), only the named tools survive;
+    use :func:`glaurung.llm.tool_routing.select_tools_for_question` to
+    derive the filter from a free-text question.
+    """
+    agent = create_foundation_agent(model=model)
+    return register_analysis_tools(
+        agent,
+        model_name=model,
+        tool_filter=tool_filter,
+    )

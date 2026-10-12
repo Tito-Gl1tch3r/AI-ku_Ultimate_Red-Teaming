@@ -1,0 +1,72 @@
+// swift-tools-version: 6.0
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+import CompilerPluginSupport
+import PackageDescription
+
+let package = Package(
+    name: "fory",
+    platforms: [
+        .macOS(.v13),
+        .iOS(.v16),
+        .tvOS(.v16),
+        .watchOS(.v9),
+        .visionOS(.v1)
+    ],
+    products: [
+        .library(
+            name: "Fory",
+            targets: ["Fory"]
+        ),
+        .executable(
+            name: "ForyXlangTests",
+            targets: ["ForyXlangTests"]
+        )
+    ],
+    dependencies: [
+        .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0")
+    ],
+    targets: [
+        .macro(
+            name: "ForyMacro",
+            dependencies: [
+                .product(name: "SwiftCompilerPlugin", package: "swift-syntax"),
+                .product(name: "SwiftSyntax", package: "swift-syntax"),
+                .product(name: "SwiftSyntaxBuilder", package: "swift-syntax"),
+                .product(name: "SwiftSyntaxMacros", package: "swift-syntax")
+            ],
+            path: "swift/Sources/ForyMacro"
+        ),
+        .target(
+            name: "Fory",
+            dependencies: ["ForyMacro"],
+            path: "swift/Sources",
+            exclude: ["ForyMacro"]
+        ),
+        .executableTarget(
+            name: "ForyXlangTests",
+            dependencies: ["Fory"],
+            path: "swift/Tests/ForyXlangTests"
+        ),
+        .testTarget(
+            name: "ForyTests",
+            dependencies: ["Fory"],
+            path: "swift/Tests/ForyTests"
+        )
+    ]
+)

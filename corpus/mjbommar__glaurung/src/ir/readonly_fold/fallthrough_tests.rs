@@ -1,0 +1,265 @@
+use super::*;
+use crate::ir::ast::OriginSet;
+
+#[test]
+fn terminating_upper_bound_guard_materialises_the_fallthrough_lookup() {
+    let data = ReadonlyData {
+        regions: vec![ReadonlyRegion {
+            base: 0xc28,
+            bytes: [303u32, 399, 301, 300, 399, 302]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+        }],
+        little_endian: true,
+        ..ReadonlyData::default()
+    };
+    let lookup = || Expr::Deref {
+        addr: Box::new(
+            Expr::Bin {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Addr(0xc28).with_origins(OriginSet::one(0x2000))),
+                rhs: Box::new(
+                    Expr::Bin {
+                        op: BinOp::Mul,
+                        lhs: Box::new(
+                            Expr::Reg(VReg::phys("index")).with_origins(OriginSet::one(0x2004)),
+                        ),
+                        rhs: Box::new(Expr::Const(4).with_origins(OriginSet::one(0x2008))),
+                    }
+                    .with_origins(OriginSet::one(0x200c)),
+                ),
+            }
+            .with_origins(OriginSet::one(0x2010)),
+        ),
+        size: 4,
+    };
+    let guard = Stmt::If {
+        cond: Expr::Cmp {
+            op: CmpOp::Ult,
+            lhs: Box::new(Expr::Const(5).with_origins(OriginSet::one(0x2014))),
+            rhs: Box::new(Expr::Reg(VReg::phys("index")).with_origins(OriginSet::one(0x2018))),
+        }
+        .with_origins(OriginSet::one(0x201c)),
+        then_body: vec![Stmt::Return {
+            value: Some(Expr::Const(399)),
+        }],
+        else_body: None,
+    };
+    let mut function = Function {
+        name: "negative_cases".into(),
+        entry_va: 0,
+        body: vec![
+            guard.clone(),
+            Stmt::Return {
+                value: Some(lookup()),
+            },
+        ],
+    };
+    let mut nonterminal_guard = guard.clone();
+    let Stmt::If { then_body, .. } = &mut nonterminal_guard else {
+        unreachable!("the test guard is an if")
+    };
+    *then_body = vec![Stmt::Assign {
+        dst: VReg::phys("observed"),
+        src: Expr::Const(399),
+    }];
+    let mut nonterminal = Function {
+        name: "nonterminal_guard".into(),
+        entry_va: 0,
+        body: vec![
+            nonterminal_guard,
+            Stmt::Return {
+                value: Some(lookup()),
+            },
+        ],
+    };
+    let mut signed_guard = guard.clone();
+    let Stmt::If { cond, .. } = &mut signed_guard else {
+        unreachable!("the test guard is an if")
+    };
+    let Expr::Cmp { op, .. } = cond.semantic_mut() else {
+        unreachable!("the test condition is a comparison")
+    };
+    *op = CmpOp::Slt;
+    let mut signed = Function {
+        name: "signed_guard".into(),
+        entry_va: 0,
+        body: vec![
+            signed_guard,
+            Stmt::Return {
+                value: Some(lookup()),
+            },
+        ],
+    };
+
+    fold_guarded_readonly_lookups(&mut function, &data);
+    fold_guarded_readonly_lookups(&mut nonterminal, &data);
+    fold_guarded_readonly_lookups(&mut signed, &data);
+
+    let rendered = crate::ir::ast::render(&function);
+    for value in [303, 399, 301, 300, 302] {
+        assert!(
+            rendered.contains(&value.to_string()),
+            "missing {value}:\n{rendered}"
+        );
+    }
+    assert!(
+        rendered.contains('?'),
+        "table was not materialised:\n{rendered}"
+    );
+    let nonterminal = crate::ir::ast::render(&nonterminal);
+    assert!(
+        !nonterminal.contains('?'),
+        "a nonterminating guard invented a fallthrough bound:\n{nonterminal}"
+    );
+    let signed = crate::ir::ast::render(&signed);
+    assert!(
+        !signed.contains('?'),
+        "a signed guard cannot exclude negative table indices:\n{signed}"
+    );
+}
+
+#[test]
+fn nonnegative_then_signed_inclusive_guard_bounds_a_readonly_lookup() {
+    let data = ReadonlyData {
+        regions: vec![ReadonlyRegion {
+            base: 0x2000,
+            bytes: [0u32, 10, 30, 0, 50, 0]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+        }],
+        little_endian: true,
+        ..ReadonlyData::default()
+    };
+    let index = || Expr::Reg(VReg::phys("index"));
+    let early_return = |cond| Stmt::If {
+        cond,
+        then_body: vec![Stmt::Return {
+            value: Some(Expr::Const(-1)),
+        }],
+        else_body: None,
+    };
+    let negative = early_return(Expr::Cmp {
+        op: CmpOp::Slt,
+        lhs: Box::new(index()),
+        rhs: Box::new(Expr::Const(0)),
+    });
+    let too_large = early_return(Expr::Cmp {
+        op: CmpOp::Eq,
+        lhs: Box::new(Expr::Bin {
+            op: BinOp::Or,
+            lhs: Box::new(Expr::Cmp {
+                op: CmpOp::Eq,
+                lhs: Box::new(index()),
+                rhs: Box::new(Expr::Const(5)),
+            }),
+            rhs: Box::new(Expr::Cmp {
+                op: CmpOp::Slt,
+                lhs: Box::new(index()),
+                rhs: Box::new(Expr::Const(5)),
+            }),
+        }),
+        rhs: Box::new(Expr::Const(0)),
+    });
+    let lookup = Stmt::Return {
+        value: Some(Expr::Deref {
+            addr: Box::new(Expr::Bin {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Addr(0x2000)),
+                rhs: Box::new(Expr::Bin {
+                    op: BinOp::Mul,
+                    lhs: Box::new(index()),
+                    rhs: Box::new(Expr::Const(4)),
+                }),
+            }),
+            size: 4,
+        }),
+    };
+    let mut proven = Function {
+        name: "designated_array".into(),
+        entry_va: 0,
+        body: vec![negative, too_large.clone(), lookup.clone()],
+    };
+    let mut missing_lower_bound = Function {
+        name: "signed_only".into(),
+        entry_va: 0,
+        body: vec![too_large, lookup],
+    };
+
+    fold_guarded_readonly_lookups(&mut proven, &data);
+    fold_guarded_readonly_lookups(&mut missing_lower_bound, &data);
+
+    assert!(
+        crate::ir::ast::render(&proven).contains('?'),
+        "two-sided proof did not materialise the table: {proven:#?}"
+    );
+    assert!(
+        !crate::ir::ast::render(&missing_lower_bound).contains('?'),
+        "a signed upper guard without nonnegative proof was trusted"
+    );
+}
+
+#[test]
+fn nonnegative_then_direct_signed_limit_guard_bounds_a_readonly_lookup() {
+    let data = ReadonlyData {
+        regions: vec![ReadonlyRegion {
+            base: 0x2020,
+            bytes: [10u32, 20, 30, 40, 50]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+        }],
+        little_endian: true,
+        ..ReadonlyData::default()
+    };
+    let index = || Expr::Reg(VReg::phys("opcode"));
+    let early_return = |cond| Stmt::If {
+        cond,
+        then_body: vec![Stmt::Return {
+            value: Some(Expr::Const(-1)),
+        }],
+        else_body: None,
+    };
+    let negative = early_return(Expr::Cmp {
+        op: CmpOp::Slt,
+        lhs: Box::new(index()),
+        rhs: Box::new(Expr::Const(0)),
+    });
+    let too_large = early_return(Expr::Cmp {
+        op: CmpOp::Sle,
+        lhs: Box::new(Expr::Const(5)),
+        rhs: Box::new(index()),
+    });
+    let lookup = Stmt::Return {
+        value: Some(Expr::Deref {
+            addr: Box::new(Expr::Bin {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Addr(0x2020)),
+                rhs: Box::new(Expr::Bin {
+                    op: BinOp::Mul,
+                    lhs: Box::new(index()),
+                    rhs: Box::new(Expr::Const(4)),
+                }),
+            }),
+            size: 4,
+        }),
+    };
+    let mut proven = Function {
+        name: "clang_direct_guard".into(),
+        entry_va: 0,
+        body: vec![negative, too_large.clone(), lookup.clone()],
+    };
+    let mut missing_lower_bound = Function {
+        name: "signed_only".into(),
+        entry_va: 0,
+        body: vec![too_large, lookup],
+    };
+
+    fold_guarded_readonly_lookups(&mut proven, &data);
+    fold_guarded_readonly_lookups(&mut missing_lower_bound, &data);
+
+    assert!(crate::ir::ast::render(&proven).contains('?'));
+    assert!(!crate::ir::ast::render(&missing_lower_bound).contains('?'));
+}

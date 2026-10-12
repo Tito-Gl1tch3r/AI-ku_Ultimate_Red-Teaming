@@ -1,0 +1,482 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.fory.xlang;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import lombok.Data;
+import org.apache.fory.Fory;
+import org.apache.fory.annotation.ForyField;
+import org.apache.fory.annotation.ForyStruct;
+import org.apache.fory.annotation.Int32Type;
+import org.apache.fory.memory.MemoryBuffer;
+import org.apache.fory.memory.MemoryUtils;
+import org.apache.fory.test.TestUtils;
+import org.testng.Assert;
+import org.testng.SkipException;
+import org.testng.annotations.Test;
+
+/** Executes cross-language tests against the Dart implementation. */
+@Test
+public class DartXlangTest extends XlangTestBase {
+  private static final String DART_EXECUTABLE = "dart";
+  private static final int DART_SETUP_TIMEOUT_SECONDS = 300;
+  private static final File DART_WORK_DIR = new File("../../dart");
+  private static final File DART_FORY_TEST_WORK_DIR = new File("../../dart/packages/fory-test");
+  private static final File DART_INHERITANCE_PROVIDER_WORK_DIR =
+      new File("../../dart/packages/inheritance-test-models");
+  private static final String DART_MODULE =
+      "packages/fory-test/test/cross_lang_test/xlang_test_main.dart";
+  private static final List<String> DART_CODEGEN_COMMAND =
+      Arrays.asList(DART_EXECUTABLE, "run", "build_runner", "build");
+
+  private static final List<String> DART_BASE_COMMAND =
+      Arrays.asList(DART_EXECUTABLE, "run", DART_MODULE, "<DART_TESTCASE>");
+
+  private static final int DART_TESTCASE_INDEX = 3;
+
+  @Override
+  protected void ensurePeerReady() {
+    String enabled = System.getenv("FORY_DART_JAVA_CI");
+    if (!"1".equals(enabled)) {
+      throw new SkipException("Skipping DartXlangTest: FORY_DART_JAVA_CI not set to 1");
+    }
+    boolean dartInstalled = true;
+    try {
+      Process process = new ProcessBuilder(DART_EXECUTABLE, "--version").start();
+      int exitCode = process.waitFor();
+      if (exitCode != 0) {
+        dartInstalled = false;
+      }
+    } catch (IOException | InterruptedException e) {
+      dartInstalled = false;
+      if (e instanceof InterruptedException) {
+        Thread.currentThread().interrupt();
+      }
+    }
+    if (!dartInstalled) {
+      throw new SkipException("Skipping DartXlangTest: dart not installed");
+    }
+    ensureGeneratedXlangSpecs();
+  }
+
+  @Override
+  protected CommandContext buildCommandContext(String caseName, Path dataFile) {
+    List<String> command = new ArrayList<>(DART_BASE_COMMAND);
+    command.set(DART_TESTCASE_INDEX, caseName);
+    Map<String, String> env = envBuilder(dataFile);
+    env.put("ENABLE_FORY_DEBUG_OUTPUT", "1");
+    return new CommandContext(command, env, DART_WORK_DIR);
+  }
+
+  private static synchronized void ensureGeneratedXlangSpecs() {
+    if (!TestUtils.executeCommand(
+        DART_CODEGEN_COMMAND,
+        DART_SETUP_TIMEOUT_SECONDS,
+        Collections.emptyMap(),
+        DART_INHERITANCE_PROVIDER_WORK_DIR)) {
+      throw new IllegalStateException(
+          "Failed to generate Dart inheritance providers by command: "
+              + String.join(" ", DART_CODEGEN_COMMAND));
+    }
+    if (!TestUtils.executeCommand(
+        DART_CODEGEN_COMMAND,
+        DART_SETUP_TIMEOUT_SECONDS,
+        Collections.emptyMap(),
+        DART_FORY_TEST_WORK_DIR)) {
+      throw new IllegalStateException(
+          "Failed to generate Dart xlang specs by command: "
+              + String.join(" ", DART_CODEGEN_COMMAND));
+    }
+  }
+
+  // ============================================================================
+  // Test methods - duplicated from XlangTestBase for Maven Surefire discovery
+  // ============================================================================
+
+  @Data
+  @ForyStruct
+  static class ExternalUser {
+    @ForyField(id = 1)
+    String name;
+
+    @ForyField(id = 2)
+    int age;
+  }
+
+  @Data
+  @ForyStruct
+  static class FlatInheritedStruct {
+    @ForyField(id = 1)
+    @Int32Type
+    int childInt;
+
+    @ForyField(id = 2)
+    @Int32Type
+    int parentInt;
+
+    @ForyField(id = 5)
+    boolean childFlag;
+
+    @ForyField(id = 6)
+    boolean parentFlag;
+
+    @ForyField(id = 9)
+    String childText;
+
+    @ForyField(id = 10)
+    String parentText;
+  }
+
+  private void runExternalUser(boolean enableCodegen, boolean named) throws IOException {
+    Fory fory =
+        Fory.builder().withXlang(true).withCompatible(true).withCodegen(enableCodegen).build();
+    String caseName;
+    if (named) {
+      caseName = "test_external_struct_name";
+      fory.register(ExternalUser.class, "test", "external_user");
+    } else {
+      caseName = "test_external_struct_id";
+      fory.register(ExternalUser.class, 1001);
+    }
+    ExternalUser user = new ExternalUser();
+    user.name = "Ada";
+    user.age = 36;
+    MemoryBuffer buffer = MemoryUtils.buffer(64);
+    fory.serialize(buffer, user);
+
+    ExecutionContext ctx = prepareExecution(caseName, buffer.getBytes(0, buffer.writerIndex()));
+    runPeer(ctx);
+    Assert.assertEquals(fory.deserialize(readBuffer(ctx.dataFile())), user);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testExternalStructId(boolean enableCodegen) throws IOException {
+    runExternalUser(enableCodegen, false);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testExternalStructName(boolean enableCodegen) throws IOException {
+    runExternalUser(enableCodegen, true);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testInheritedFlatStruct(boolean enableCodegen) throws IOException {
+    Fory fory =
+        Fory.builder()
+            .withXlang(true)
+            .withCompatible(false)
+            .withCodegen(enableCodegen)
+            .withMetaCompressor(new NoOpMetaCompressor())
+            .build();
+    fory.register(FlatInheritedStruct.class, 1101);
+
+    FlatInheritedStruct expected = new FlatInheritedStruct();
+    expected.childInt = 101;
+    expected.parentInt = 202;
+    expected.childFlag = true;
+    expected.parentFlag = false;
+    expected.childText = "child";
+    expected.parentText = "parent";
+    byte[] javaBytes = fory.serialize(expected);
+
+    ExecutionContext javaContext = prepareExecution("test_inherited_flat_from_java", javaBytes);
+    runPeer(javaContext);
+    byte[] dartRoundTripBytes = readBytes(javaContext.dataFile());
+    Assert.assertTrue(
+        Arrays.equals(dartRoundTripBytes, javaBytes),
+        "Dart inherited round-trip must preserve Java flat bytes.");
+    Assert.assertEquals(fory.deserialize(dartRoundTripBytes), expected);
+
+    ExecutionContext dartContext = prepareExecution("test_inherited_flat_from_dart", new byte[0]);
+    runPeer(dartContext);
+    byte[] dartBytes = readBytes(dartContext.dataFile());
+    Assert.assertTrue(
+        Arrays.equals(dartBytes, javaBytes),
+        "Dart inherited and Java flat writers must emit identical bytes.");
+    Assert.assertEquals(fory.deserialize(dartBytes), expected);
+  }
+
+  @Test(groups = "xlang")
+  public void testBuffer() throws java.io.IOException {
+    super.testBuffer();
+  }
+
+  @Test(groups = "xlang")
+  public void testBufferVar() throws java.io.IOException {
+    super.testBufferVar();
+  }
+
+  @Test(groups = "xlang")
+  public void testMurmurHash3() throws java.io.IOException {
+    super.testMurmurHash3();
+  }
+
+  @Test(groups = "xlang")
+  public void testStringSerializer() throws Exception {
+    super.testStringSerializer();
+  }
+
+  @Test(groups = "xlang")
+  public void testCrossLanguageSerializer() throws Exception {
+    super.testCrossLanguageSerializer();
+  }
+
+  @Override
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testExactFieldTags(boolean enableCodegen) throws java.io.IOException {
+    super.testExactFieldTags(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testSimpleStruct(boolean enableCodegen) throws java.io.IOException {
+    super.testSimpleStruct(enableCodegen);
+  }
+
+  @Test(groups = "xlang")
+  public void testSimpleNamedStructCodegenEnabled() throws java.io.IOException {
+    super.testSimpleNamedStruct(false);
+  }
+
+  @Test(groups = "xlang")
+  public void testSimpleNamedStructCodegenDisabled() throws java.io.IOException {
+    super.testSimpleNamedStruct(false);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testStructEvolvingOverride(boolean enableCodegen) throws java.io.IOException {
+    super.testStructEvolvingOverride(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testList(boolean enableCodegen) throws java.io.IOException {
+    super.testList(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testMap(boolean enableCodegen) throws java.io.IOException {
+    super.testMap(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testInteger(boolean enableCodegen) throws java.io.IOException {
+    super.testInteger(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testDecimal(boolean enableCodegen) throws java.io.IOException {
+    super.testDecimal(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testItem(boolean enableCodegen) throws java.io.IOException {
+    super.testItem(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testColor(boolean enableCodegen) throws java.io.IOException {
+    super.testColor(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testStructWithList(boolean enableCodegen) throws java.io.IOException {
+    super.testStructWithList(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testStructWithMap(boolean enableCodegen) throws java.io.IOException {
+    super.testStructWithMap(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testCollectionElementRefOverride(boolean enableCodegen) throws java.io.IOException {
+    super.testCollectionElementRefOverride(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testCollectionElementRefRemoteTracking(boolean enableCodegen)
+      throws java.io.IOException {
+    super.testCollectionElementRefRemoteTracking(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testSkipIdCustom(boolean enableCodegen) throws java.io.IOException {
+    super.testSkipIdCustom(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testSkipNameCustom(boolean enableCodegen) throws java.io.IOException {
+    super.testSkipNameCustom(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testConsistentNamed(boolean enableCodegen) throws java.io.IOException {
+    super.testConsistentNamed(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testStructVersionCheck(boolean enableCodegen) throws java.io.IOException {
+    super.testStructVersionCheck(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testPolymorphicList(boolean enableCodegen) throws java.io.IOException {
+    super.testPolymorphicList(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testPolymorphicMap(boolean enableCodegen) throws java.io.IOException {
+    super.testPolymorphicMap(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testOneStringFieldSchemaConsistent(boolean enableCodegen) throws java.io.IOException {
+    super.testOneStringFieldSchemaConsistent(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testOneStringFieldCompatible(boolean enableCodegen) throws java.io.IOException {
+    super.testOneStringFieldCompatible(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testTwoStringFieldCompatible(boolean enableCodegen) throws java.io.IOException {
+    super.testTwoStringFieldCompatible(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testSchemaEvolutionCompatible(boolean enableCodegen) throws java.io.IOException {
+    super.testSchemaEvolutionCompatible(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testOneEnumFieldSchemaConsistent(boolean enableCodegen) throws java.io.IOException {
+    super.testOneEnumFieldSchemaConsistent(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testOneEnumFieldCompatible(boolean enableCodegen) throws java.io.IOException {
+    super.testOneEnumFieldCompatible(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testTwoEnumFieldCompatible(boolean enableCodegen) throws java.io.IOException {
+    super.testTwoEnumFieldCompatible(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testEnumSchemaEvolutionCompatible(boolean enableCodegen) throws java.io.IOException {
+    super.testEnumSchemaEvolutionCompatible(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testNullableFieldSchemaConsistentNotNull(boolean enableCodegen)
+      throws java.io.IOException {
+    super.testNullableFieldSchemaConsistentNotNull(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testNullableFieldSchemaConsistentNull(boolean enableCodegen)
+      throws java.io.IOException {
+    super.testNullableFieldSchemaConsistentNull(enableCodegen);
+  }
+
+  @Override
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testNullableFieldCompatibleNotNull(boolean enableCodegen) throws java.io.IOException {
+    super.testNullableFieldCompatibleNotNull(enableCodegen);
+  }
+
+  @Override
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testNullableFieldCompatibleNull(boolean enableCodegen) throws java.io.IOException {
+    super.testNullableFieldCompatibleNull(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testUnionXlang(boolean enableCodegen) throws java.io.IOException {
+    super.testUnionXlang(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testRefSchemaConsistent(boolean enableCodegen) throws java.io.IOException {
+    super.testRefSchemaConsistent(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testRefCompatible(boolean enableCodegen) throws java.io.IOException {
+    super.testRefCompatible(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testCircularRefSchemaConsistent(boolean enableCodegen) throws java.io.IOException {
+    super.testCircularRefSchemaConsistent(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testCircularRefCompatible(boolean enableCodegen) throws java.io.IOException {
+    super.testCircularRefCompatible(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testUnsignedSchemaConsistent(boolean enableCodegen) throws java.io.IOException {
+    super.testUnsignedSchemaConsistent(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testUnsignedSchemaConsistentSimple(boolean enableCodegen) throws java.io.IOException {
+    super.testUnsignedSchemaConsistentSimple(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testUnsignedSchemaCompatible(boolean enableCodegen) throws java.io.IOException {
+    super.testUnsignedSchemaCompatible(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testNestedAnnotatedContainerSchemaConsistent(boolean enableCodegen)
+      throws java.io.IOException {
+    super.testNestedAnnotatedContainerSchemaConsistent(enableCodegen);
+  }
+
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testNestedAnnotatedContainerCompatible(boolean enableCodegen)
+      throws java.io.IOException {
+    super.testNestedAnnotatedContainerCompatible(enableCodegen);
+  }
+
+  @Override
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testManualSchemaKindStruct(boolean enableCodegen) throws java.io.IOException {
+    super.testManualSchemaKindStruct(enableCodegen);
+  }
+
+  @Override
+  @Test(groups = "xlang", dataProvider = "enableCodegenParallel")
+  public void testListArrayCompatibleRead(boolean enableCodegen) throws java.io.IOException {
+    super.testListArrayCompatibleRead(enableCodegen);
+  }
+}

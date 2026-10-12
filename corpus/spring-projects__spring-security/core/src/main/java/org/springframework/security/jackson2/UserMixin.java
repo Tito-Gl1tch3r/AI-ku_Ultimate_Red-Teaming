@@ -1,0 +1,59 @@
+/*
+ * Copyright 2004-present the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.springframework.security.jackson2;
+
+import com.fasterxml.jackson.annotation.JsonAutoDetect;
+import com.fasterxml.jackson.annotation.JsonAutoDetect.Visibility;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
+import com.fasterxml.jackson.annotation.JsonTypeInfo.As;
+import com.fasterxml.jackson.annotation.JsonTypeInfo.Id;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+
+/**
+ * This mixin class helps in serialize/deserialize
+ * {@link org.springframework.security.core.userdetails.User}. This class also register a
+ * custom deserializer {@link UserDeserializer} to deserialize User object successfully.
+ * In order to use this mixin you need to register two more mixin classes in your
+ * ObjectMapper configuration.
+ * <ol>
+ * <li>{@link SimpleGrantedAuthorityMixin}</li>
+ * <li>{@link UnmodifiableSetMixin}</li>
+ * </ol>
+ * <pre>
+ *     ObjectMapper mapper = new ObjectMapper();
+ *     mapper.registerModule(new CoreJackson2Module());
+ * </pre>
+ *
+ * @author Jitendra Singh
+ * @since 4.2
+ * @see UserDeserializer
+ * @see CoreJackson2Module
+ * @see SecurityJackson2Modules
+ * @deprecated as of 7.0 in favor of
+ * {@code org.springframework.security.jackson.UserMixin} based on Jackson 3
+ */
+@SuppressWarnings("removal")
+@JsonTypeInfo(use = Id.CLASS, include = As.PROPERTY)
+@JsonDeserialize(using = UserDeserializer.class)
+@JsonAutoDetect(fieldVisibility = Visibility.ANY, getterVisibility = Visibility.NONE,
+		isGetterVisibility = Visibility.NONE)
+@JsonIgnoreProperties(ignoreUnknown = true)
+@Deprecated(forRemoval = true)
+abstract class UserMixin {
+
+}

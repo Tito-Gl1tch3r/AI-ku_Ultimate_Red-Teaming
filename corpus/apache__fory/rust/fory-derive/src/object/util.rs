@@ -1,0 +1,1239 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::field_meta::IntEncoding;
+use fory_core::type_id::TypeId;
+use fory_core::util::to_snake_case;
+use proc_macro2::TokenStream;
+use quote::{quote, ToTokens};
+use std::cell::RefCell;
+use std::collections::HashSet;
+use syn::{Field, Fields, GenericArgument, Index, PathArguments, Type};
+
+/// Get field name for a field, handling both named and tuple struct fields.
+/// For named fields, returns the field name.
+/// For tuple struct fields, returns the index as a string (e.g., "0", "1").
+pub(super) fn get_field_name(field: &Field, index: usize) -> String {
+    match &field.ident {
+        Some(ident) => ident.to_string(),
+        None => index.to_string(),
+    }
+}
+
+/// Get the target-value field accessor token for a field.
+/// For named fields: `value.field_name`
+/// For tuple struct fields: `value.0`, `value.1`, etc.
+pub(super) fn get_field_accessor(field: &Field, index: usize) -> TokenStream {
+    match &field.ident {
+        Some(ident) => quote! { value.#ident },
+        None => {
+            let idx = Index::from(index);
+            quote! { value.#idx }
+        }
+    }
+}
+
+/// Check if this is a tuple struct (all fields are unnamed)
+pub fn is_tuple_struct(fields: &[&Field]) -> bool {
+    !fields.is_empty() && fields[0].ident.is_none()
+}
+
+thread_local! {
+    static MACRO_CONTEXT: RefCell<Option<MacroContext>> = const {RefCell::new(None)};
+}
+
+#[derive(Clone)]
+struct MacroContext {
+    struct_name: String,
+    debug_enabled: bool,
+}
+
+/// Set the macro context with struct name and debug flag.
+pub(super) fn set_struct_context(name: &str, debug_enabled: bool) {
+    MACRO_CONTEXT.with(|ctx| {
+        *ctx.borrow_mut() = Some(MacroContext {
+            struct_name: name.to_string(),
+            debug_enabled,
+        });
+    });
+}
+
+pub(super) fn clear_struct_context() {
+    MACRO_CONTEXT.with(|ctx| {
+        *ctx.borrow_mut() = None;
+    });
+}
+
+pub(super) fn get_struct_name() -> Option<String> {
+    MACRO_CONTEXT.with(|ctx| ctx.borrow().as_ref().map(|c| c.struct_name.clone()))
+}
+
+pub(super) fn is_debug_enabled() -> bool {
+    MACRO_CONTEXT.with(|ctx| {
+        ctx.borrow()
+            .as_ref()
+            .map(|c| c.debug_enabled)
+            .unwrap_or(false)
+    })
+}
+
+fn is_forward_field(ty: &Type) -> bool {
+    let struct_name = match get_struct_name() {
+        Some(name) => name,
+        None => return false,
+    };
+    is_forward_field_internal(ty, &struct_name)
+}
+
+fn is_forward_field_internal(ty: &Type, struct_name: &str) -> bool {
+    match ty {
+        Type::TraitObject(_) => true,
+
+        Type::Path(type_path) => {
+            if let Some(seg) = type_path.path.segments.last() {
+                // Direct match: type is the struct itself
+                if seg.ident == struct_name {
+                    return true;
+                }
+
+                // Special cases for weak pointers
+                if seg.ident == "RcWeak" || seg.ident == "ArcWeak" {
+                    return true;
+                }
+
+                // Check smart pointers: Rc<T> / Arc<T>
+                // Only return true if:
+                // 1. Inner type is dyn Any (polymorphic)
+                // 2. Inner type references the containing struct (forward reference)
+                if seg.ident == "Rc" || seg.ident == "Arc" {
+                    if let PathArguments::AngleBracketed(args) = &seg.arguments {
+                        if let Some(GenericArgument::Type(inner_ty)) = args.args.first() {
+                            match inner_ty {
+                                // Inner type is trait object
+                                Type::TraitObject(trait_obj) => {
+                                    if trait_obj
+                                        .bounds
+                                        .iter()
+                                        .any(|b| trait_bound_ident(b).as_deref() == Some("Any"))
+                                    {
+                                        // Rc/Arc<dyn Any ...> needs polymorphic ref handling.
+                                        return true;
+                                    } else {
+                                        // Rc/Arc<dyn SomethingElse> uses generated wrapper handling.
+                                        return false;
+                                    }
+                                }
+                                // Inner type is not a trait object - recursively check
+                                // if it references the containing struct
+                                _ => {
+                                    return is_forward_field_internal(inner_ty, struct_name);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Recursively check other generic args
+                if let PathArguments::AngleBracketed(args) = &seg.arguments {
+                    for arg in &args.args {
+                        if let GenericArgument::Type(inner_ty) = arg {
+                            if is_forward_field_internal(inner_ty, struct_name) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            false
+        }
+
+        _ => false,
+    }
+}
+
+#[derive(Clone)]
+struct FieldSortKey {
+    id: i32,
+    text: String,
+}
+
+impl FieldSortKey {
+    fn id(id: i32) -> Self {
+        Self {
+            id,
+            text: id.to_string(),
+        }
+    }
+
+    fn name(name: String) -> Self {
+        Self { id: -1, text: name }
+    }
+}
+
+fn compare_field_sort_key(a: &FieldSortKey, b: &FieldSortKey) -> std::cmp::Ordering {
+    match (a.id >= 0, b.id >= 0) {
+        (true, true) => a.id.cmp(&b.id),
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => a.text.cmp(&b.text),
+    }
+}
+
+type FieldGroup = Vec<(String, FieldSortKey, u32)>;
+type FieldGroups = (FieldGroup, FieldGroup, FieldGroup);
+
+/// Extract the inner generic arguments from a type name while ignoring path qualifiers.
+///
+/// e.g., both `Vec<T>` and `::std::vec::Vec<T>` return `T` when `outer` is `Vec`.
+fn extract_generic_inner<'a>(s: &'a str, outer: &str) -> Option<&'a str> {
+    let generic_start = s.find('<')?;
+    let owner = s[..generic_start]
+        .rsplit("::")
+        .next()
+        .unwrap_or(&s[..generic_start]);
+    if owner != outer {
+        return None;
+    }
+    s[generic_start + 1..].strip_suffix('>')
+}
+
+/// Return the final path segment so absolute generated paths match the same runtime type names.
+///
+/// e.g., `::fory::Float16` and `Float16` both normalize to `Float16`.
+fn unqualified_type_name(ty: &str) -> &str {
+    ty.rsplit("::").next().unwrap_or(ty)
+}
+
+fn extract_option_inner(s: &str) -> Option<&str> {
+    extract_generic_inner(s, "Option")
+}
+
+const PRIMITIVE_TYPE_NAMES: [&str; 17] = [
+    "bool", "i8", "i16", "i32", "i64", "i128", "float16", "Float16", "bfloat16", "BFloat16", "f32",
+    "f64", "u8", "u16", "u32", "u64", "u128",
+];
+
+fn is_primitive_type_name(ty: &str) -> bool {
+    PRIMITIVE_TYPE_NAMES.contains(&unqualified_type_name(ty))
+}
+
+fn get_primitive_type_id(ty: &str) -> u32 {
+    match unqualified_type_name(ty) {
+        "bool" => TypeId::BOOL as u32,
+        "i8" => TypeId::INT8 as u32,
+        "i16" => TypeId::INT16 as u32,
+        // Use VARINT32 for i32 to match Java xlang mode and Rust type resolver registration
+        "i32" => TypeId::VARINT32 as u32,
+        // Use VARINT64 for i64 to match Java xlang mode and Rust type resolver registration
+        "i64" => TypeId::VARINT64 as u32,
+        "float16" | "Float16" => TypeId::FLOAT16 as u32,
+        "bfloat16" | "BFloat16" => TypeId::BFLOAT16 as u32,
+        "f32" => TypeId::FLOAT32 as u32,
+        "f64" => TypeId::FLOAT64 as u32,
+        "u8" => TypeId::UINT8 as u32,
+        "u16" => TypeId::UINT16 as u32,
+        // Use VAR_UINT32 for u32 to match Rust type resolver registration
+        "u32" => TypeId::VAR_UINT32 as u32,
+        // Use VAR_UINT64 for u64 to match Rust type resolver registration
+        "u64" => TypeId::VAR_UINT64 as u32,
+        "u128" => TypeId::U128 as u32,
+        "i128" => TypeId::INT128 as u32,
+        _ => unreachable!("Unknown primitive type: {}", ty),
+    }
+}
+
+/// Get the type ID for a given type string.
+///
+/// Returns:
+/// - `type_id` for known types (primitives, internal types, collections)
+/// - `UNKNOWN` for unknown/user-defined types
+pub(crate) fn get_type_id_by_name(ty: &str) -> u32 {
+    let ty = extract_option_inner(ty).unwrap_or(ty);
+    let unqualified_ty = ty.rsplit("::").next().unwrap_or(ty);
+    // Check primitive types
+    if PRIMITIVE_TYPE_NAMES.contains(&ty) {
+        return get_primitive_type_id(ty);
+    }
+    if PRIMITIVE_TYPE_NAMES.contains(&unqualified_ty) {
+        return get_primitive_type_id(unqualified_ty);
+    }
+
+    // Check internal types
+    match unqualified_ty {
+        "String" => return TypeId::STRING as u32,
+        "Date" => return TypeId::DATE as u32,
+        "Timestamp" => return TypeId::TIMESTAMP as u32,
+        "Duration" => return TypeId::DURATION as u32,
+        "NaiveDate" => return TypeId::DATE as u32,
+        "NaiveDateTime" => return TypeId::TIMESTAMP as u32,
+        "Decimal" => return TypeId::DECIMAL as u32,
+        "bytes" => return TypeId::BINARY as u32,
+        _ => {}
+    }
+
+    // Check primitive arrays (fixed-size arrays [T; N])
+    // These will be serialized similarly to Vec but with fixed size
+    if ty.starts_with('[') && ty.contains(';') {
+        // Extract the element type from [T; N]
+        if let Some(elem_ty) = ty.strip_prefix('[').and_then(|s| s.split(';').next()) {
+            match elem_ty {
+                "bool" => return TypeId::BOOL_ARRAY as u32,
+                "i8" => return TypeId::INT8_ARRAY as u32,
+                "i16" => return TypeId::INT16_ARRAY as u32,
+                "i32" => return TypeId::INT32_ARRAY as u32,
+                "i64" => return TypeId::INT64_ARRAY as u32,
+                "i128" => return TypeId::INT128_ARRAY as u32,
+                "float16" | "Float16" => return TypeId::FLOAT16_ARRAY as u32,
+                "bfloat16" | "BFloat16" => return TypeId::BFLOAT16_ARRAY as u32,
+                "f32" => return TypeId::FLOAT32_ARRAY as u32,
+                "f64" => return TypeId::FLOAT64_ARRAY as u32,
+                "u16" => return TypeId::UINT16_ARRAY as u32,
+                "u32" => return TypeId::UINT32_ARRAY as u32,
+                "u64" => return TypeId::UINT64_ARRAY as u32,
+                "u128" => return TypeId::U128_ARRAY as u32,
+                _ => {
+                    // Non-primitive array elements, treat as LIST
+                    return TypeId::LIST as u32;
+                }
+            }
+        }
+    }
+
+    // Check collection types
+    if extract_generic_inner(ty, "Vec").is_some()
+        || extract_generic_inner(ty, "VecDeque").is_some()
+        || extract_generic_inner(ty, "LinkedList").is_some()
+    {
+        return TypeId::LIST as u32;
+    }
+
+    if extract_generic_inner(ty, "HashSet").is_some()
+        || extract_generic_inner(ty, "BTreeSet").is_some()
+        || extract_generic_inner(ty, "BinaryHeap").is_some()
+    {
+        return TypeId::SET as u32;
+    }
+
+    if extract_generic_inner(ty, "HashMap").is_some()
+        || extract_generic_inner(ty, "BTreeMap").is_some()
+    {
+        return TypeId::MAP as u32;
+    }
+
+    // Check tuple types (represented as "Tuple" by extract_type_name or starts with '(')
+    if ty == "Tuple" || ty.starts_with('(') {
+        return TypeId::LIST as u32;
+    }
+
+    // Unknown type
+    TypeId::UNKNOWN as u32
+}
+
+fn get_primitive_type_size(type_id_num: u32) -> i32 {
+    if type_id_num > u8::MAX as u32 {
+        return 0;
+    }
+    let type_id = TypeId::try_from(type_id_num as u8).unwrap();
+    match type_id {
+        TypeId::BOOL => 1,
+        TypeId::INT8 => 1,
+        TypeId::INT16 => 2,
+        TypeId::INT32 => 4,
+        TypeId::VARINT32 => 4,
+        TypeId::INT64 => 8,
+        TypeId::VARINT64 => 8,
+        TypeId::TAGGED_INT64 => 8,
+        TypeId::FLOAT8 => 1,
+        TypeId::FLOAT16 => 2,
+        TypeId::BFLOAT16 => 2,
+        TypeId::FLOAT32 => 4,
+        TypeId::FLOAT64 => 8,
+        TypeId::INT128 => 16,
+        TypeId::UINT8 => 1,
+        TypeId::UINT16 => 2,
+        TypeId::UINT32 => 4,
+        TypeId::VAR_UINT32 => 4,
+        TypeId::UINT64 => 8,
+        TypeId::VAR_UINT64 => 8,
+        TypeId::TAGGED_UINT64 => 8,
+        TypeId::U128 => 16,
+        TypeId::USIZE => std::mem::size_of::<usize>() as i32,
+        TypeId::ISIZE => std::mem::size_of::<isize>() as i32,
+        _ => unreachable!(),
+    }
+}
+
+fn is_compress(type_id: u32) -> bool {
+    // Variable-length and tagged types are marked as compressible
+    // This must match Java's Types.isCompressedType() for xlang compatibility
+    [
+        // Signed compressed types
+        TypeId::VARINT32 as u32,
+        TypeId::VARINT64 as u32,
+        TypeId::TAGGED_INT64 as u32,
+        // Unsigned compressed types
+        TypeId::VAR_UINT32 as u32,
+        TypeId::VAR_UINT64 as u32,
+        TypeId::TAGGED_UINT64 as u32,
+    ]
+    .contains(&type_id)
+}
+
+/// Group fields into serialization categories while normalizing field names to snake_case.
+/// The returned groups preserve the ordering rules required by the serialization layout.
+fn group_fields_by_type(fields: &[&Field]) -> FieldGroups {
+    use super::field_meta::parse_field_meta;
+
+    let mut primitive_fields = Vec::new();
+    let mut nullable_primitive_fields = Vec::new();
+    let mut non_primitive_fields = Vec::new();
+
+    // First handle Forward fields separately to avoid borrow checker issues
+    for (idx, field) in fields.iter().enumerate() {
+        if is_forward_field(&field.ty) {
+            let raw_ident = get_field_name(field, idx);
+            let ident = to_snake_case(&raw_ident);
+            // Forward fields don't have explicit IDs; sort by name.
+            non_primitive_fields.push((
+                ident.clone(),
+                FieldSortKey::name(ident),
+                TypeId::UNKNOWN as u32,
+            ));
+        }
+    }
+
+    for (idx, field) in fields.iter().enumerate() {
+        let raw_ident = get_field_name(field, idx);
+        let ident = to_snake_case(&raw_ident);
+
+        // Skip if already handled as Forward field
+        if is_forward_field(&field.ty) {
+            continue;
+        }
+
+        // Parse field metadata to get encoding attributes and field ID
+        let meta = parse_field_meta(field).unwrap_or_default();
+        let sort_key = if meta.uses_tag_id() {
+            FieldSortKey::id(meta.effective_id())
+        } else {
+            FieldSortKey::name(ident.clone())
+        };
+
+        let ty: String = field
+            .ty
+            .to_token_stream()
+            .to_string()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+
+        // A selected serializer can own an EXT-shaped leaf even when its target is a
+        // canonical Rust scalar. Keep schema ordering aligned with the selected codec rather than
+        // classifying the target's source syntax as a primitive field.
+        if meta.with.is_some() {
+            non_primitive_fields.push((ident, sort_key, TypeId::UNKNOWN as u32));
+            continue;
+        }
+
+        // Closure to group non-option fields, considering encoding attributes
+        let mut group_field =
+            |ident: String, sort_key: FieldSortKey, ty_str: &str, is_primitive: bool| {
+                let type_id = if meta.bytes {
+                    TypeId::BINARY as u32
+                } else if meta.array {
+                    array_type_id_for_vec_name(ty_str).unwrap_or(TypeId::UNKNOWN as u32)
+                } else {
+                    // Adjust type ID based on encoding attributes for u32/u64 fields.
+                    adjust_type_id_for_encoding(get_type_id_by_name(ty_str), &meta)
+                };
+
+                if is_primitive {
+                    primitive_fields.push((ident, sort_key, type_id));
+                } else {
+                    non_primitive_fields.push((ident, sort_key, type_id));
+                }
+            };
+
+        // handle Option<Primitive> specially
+        if let Some(inner) = extract_option_inner(&ty) {
+            if is_primitive_type_name(inner) {
+                // Get base type ID and adjust for encoding attributes
+                let base_type_id = get_primitive_type_id(inner);
+                let type_id = adjust_type_id_for_encoding(base_type_id, &meta);
+                nullable_primitive_fields.push((ident, sort_key, type_id));
+            } else {
+                group_field(ident, sort_key, inner, false);
+            }
+        } else if is_primitive_type_name(&ty) {
+            group_field(ident, sort_key, &ty, true);
+        } else {
+            group_field(ident, sort_key, &ty, false);
+        }
+    }
+
+    fn numeric_sorter(
+        a: &(String, FieldSortKey, u32),
+        b: &(String, FieldSortKey, u32),
+    ) -> std::cmp::Ordering {
+        let compress_a = is_compress(a.2);
+        let compress_b = is_compress(b.2);
+        let size_a = get_primitive_type_size(a.2);
+        let size_b = get_primitive_type_size(b.2);
+        compress_a
+            .cmp(&compress_b)
+            .then_with(|| size_b.cmp(&size_a))
+            .then_with(|| a.2.cmp(&b.2))
+            // Field identifier (numeric tag ID or name) as tie-breaker.
+            .then_with(|| compare_field_sort_key(&a.1, &b.1))
+            // Deterministic fallback for duplicate identifiers
+            .then_with(|| a.0.cmp(&b.0))
+    }
+
+    fn name_sorter(
+        a: &(String, FieldSortKey, u32),
+        b: &(String, FieldSortKey, u32),
+    ) -> std::cmp::Ordering {
+        compare_field_sort_key(&a.1, &b.1).then_with(|| a.0.cmp(&b.0))
+    }
+
+    primitive_fields.sort_by(numeric_sorter);
+    nullable_primitive_fields.sort_by(numeric_sorter);
+    non_primitive_fields.sort_by(name_sorter);
+
+    (
+        primitive_fields,
+        nullable_primitive_fields,
+        non_primitive_fields,
+    )
+}
+
+pub(crate) fn get_sorted_field_names(fields: &[&Field]) -> Vec<String> {
+    // For tuple structs, preserve the original field order.
+    // Tuple struct field names are "0", "1", "2", etc., which are positional.
+    // Sorting would break schema evolution when adding fields in the middle
+    // (e.g., (f64, u8) -> (f64, u8, f64) would change sorted order).
+    if is_tuple_struct(fields) {
+        return fields
+            .iter()
+            .enumerate()
+            .map(|(idx, field)| get_field_name(field, idx))
+            .collect();
+    }
+
+    // For named structs, sort by Fory field order. Tag IDs are the field identifier inside each
+    // group, but they do not bypass the language-neutral grouping rules.
+    let (primitive_fields, nullable_primitive_fields, non_primitive_fields) =
+        group_fields_by_type(fields);
+
+    let mut all_fields = primitive_fields;
+    all_fields.extend(nullable_primitive_fields);
+    all_fields.extend(non_primitive_fields);
+
+    all_fields.into_iter().map(|(name, _, _)| name).collect()
+}
+
+pub(crate) fn get_filtered_fields_iter<'a>(
+    fields: &'a [&'a Field],
+) -> impl Iterator<Item = &'a Field> {
+    fields.iter().filter(|field| !is_skip_field(field)).copied()
+}
+
+pub(super) fn get_sort_fields_ts(fields: &[&Field]) -> TokenStream {
+    let filterd_fields: Vec<&Field> = get_filtered_fields_iter(fields).collect();
+    let sorted_names = get_sorted_field_names(&filterd_fields);
+    let names = sorted_names.iter().map(|name| {
+        quote! { #name }
+    });
+    quote! {
+        &[#(#names),*]
+    }
+}
+
+/// Field metadata for fingerprint computation.
+struct FieldFingerprintInfo {
+    /// Field ID, or -1 when the field is identified by name.
+    field_id: i32,
+    /// Field name (snake_case) or field ID as string.
+    name_or_id: String,
+    /// Recursive field type fingerprint.
+    type_fingerprint: String,
+}
+
+/// Adjusts integer type IDs based on semantic `encoding` attributes.
+fn adjust_type_id_for_encoding(base_type_id: u32, meta: &super::field_meta::ForyFieldMeta) -> u32 {
+    match meta.encoding.unwrap_or(IntEncoding::Varint) {
+        IntEncoding::Varint => base_type_id,
+        IntEncoding::Fixed => match base_type_id {
+            id if id == TypeId::VARINT32 as u32 => TypeId::INT32 as u32,
+            id if id == TypeId::VARINT64 as u32 => TypeId::INT64 as u32,
+            id if id == TypeId::VAR_UINT32 as u32 => TypeId::UINT32 as u32,
+            id if id == TypeId::VAR_UINT64 as u32 => TypeId::UINT64 as u32,
+            _ => base_type_id,
+        },
+        IntEncoding::Tagged => match base_type_id {
+            id if id == TypeId::VARINT64 as u32 => TypeId::TAGGED_INT64 as u32,
+            id if id == TypeId::VAR_UINT64 as u32 => TypeId::TAGGED_UINT64 as u32,
+            _ => base_type_id,
+        },
+    }
+}
+
+fn array_type_id_for_vec_name(ty: &str) -> Option<u32> {
+    let elem = extract_generic_inner(ty, "Vec")?;
+    match unqualified_type_name(elem) {
+        "bool" => Some(TypeId::BOOL_ARRAY as u32),
+        "i8" => Some(TypeId::INT8_ARRAY as u32),
+        "i16" => Some(TypeId::INT16_ARRAY as u32),
+        "i32" => Some(TypeId::INT32_ARRAY as u32),
+        "i64" => Some(TypeId::INT64_ARRAY as u32),
+        "u8" => Some(TypeId::UINT8_ARRAY as u32),
+        "u16" => Some(TypeId::UINT16_ARRAY as u32),
+        "u32" => Some(TypeId::UINT32_ARRAY as u32),
+        "u64" => Some(TypeId::UINT64_ARRAY as u32),
+        "float16" | "Float16" => Some(TypeId::FLOAT16_ARRAY as u32),
+        "bfloat16" | "BFloat16" => Some(TypeId::BFLOAT16_ARRAY as u32),
+        "f32" => Some(TypeId::FLOAT32_ARRAY as u32),
+        "f64" => Some(TypeId::FLOAT64_ARRAY as u32),
+        _ => None,
+    }
+}
+
+fn fingerprint_type_id(type_id: u32) -> u32 {
+    if type_id == TypeId::UNKNOWN as u32
+        || type_id == TypeId::UNION as u32
+        || type_id == TypeId::TYPED_UNION as u32
+        || type_id == TypeId::NAMED_UNION as u32
+    {
+        TypeId::UNKNOWN as u32
+    } else {
+        type_id
+    }
+}
+
+fn type_name_and_args(
+    ty: &Type,
+) -> Option<(
+    String,
+    Option<&syn::punctuated::Punctuated<GenericArgument, syn::token::Comma>>,
+)> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    let seg = type_path.path.segments.last()?;
+    let PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return Some((seg.ident.to_string(), None));
+    };
+    Some((seg.ident.to_string(), Some(&args.args)))
+}
+
+fn single_type_arg(
+    args: &syn::punctuated::Punctuated<GenericArgument, syn::token::Comma>,
+) -> Option<&Type> {
+    args.iter().find_map(|arg| match arg {
+        GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    })
+}
+
+fn two_type_args(
+    args: &syn::punctuated::Punctuated<GenericArgument, syn::token::Comma>,
+) -> Option<(&Type, &Type)> {
+    let mut iter = args.iter().filter_map(|arg| match arg {
+        GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    });
+    Some((iter.next()?, iter.next()?))
+}
+
+fn build_type_fingerprint(
+    ty: &Type,
+    meta: &super::field_meta::ForyFieldMeta,
+    include_ref: bool,
+    include_nullable: bool,
+) -> String {
+    use super::field_meta::{classify_field_type, extract_option_inner_type, is_option_type};
+
+    let type_class = classify_field_type(ty);
+    let nullable = meta.effective_nullable(type_class) || is_option_type(ty);
+    let track_ref = include_ref && meta.effective_ref(type_class);
+    let container_ty = extract_option_inner_type(ty).unwrap_or_else(|| ty.clone());
+    let container_ty_str = container_ty
+        .to_token_stream()
+        .to_string()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
+    let type_id = fingerprint_type_id(if meta.with.is_some() {
+        TypeId::UNKNOWN as u32
+    } else if meta.bytes {
+        TypeId::BINARY as u32
+    } else if meta.array {
+        array_type_id_for_vec_name(&container_ty_str).unwrap_or(TypeId::UNKNOWN as u32)
+    } else {
+        adjust_type_id_for_encoding(get_type_id_by_name(&container_ty_str), meta)
+    });
+
+    let mut fingerprint = format!(
+        "{},{},{}",
+        type_id,
+        if track_ref { 1 } else { 0 },
+        if include_nullable && nullable { 1 } else { 0 }
+    );
+
+    if let Type::Array(array) = &container_ty {
+        if type_id == TypeId::LIST as u32 {
+            fingerprint.push('[');
+            fingerprint.push_str(&build_type_fingerprint(
+                array.elem.as_ref(),
+                &meta.element_meta(),
+                false,
+                false,
+            ));
+            fingerprint.push(']');
+        }
+        return fingerprint;
+    }
+
+    let Some((name, args)) = type_name_and_args(&container_ty) else {
+        return fingerprint;
+    };
+
+    match name.as_str() {
+        "Vec" | "VecDeque" | "LinkedList" if type_id == TypeId::LIST as u32 => {
+            if let Some(elem_ty) = args.and_then(single_type_arg) {
+                fingerprint.push('[');
+                fingerprint.push_str(&build_type_fingerprint(
+                    elem_ty,
+                    &meta.element_meta(),
+                    false,
+                    false,
+                ));
+                fingerprint.push(']');
+            }
+        }
+        "HashSet" | "BTreeSet" | "BinaryHeap" if type_id == TypeId::SET as u32 => {
+            if let Some(elem_ty) = args.and_then(single_type_arg) {
+                fingerprint.push('[');
+                fingerprint.push_str(&build_type_fingerprint(
+                    elem_ty,
+                    &meta.element_meta(),
+                    false,
+                    false,
+                ));
+                fingerprint.push(']');
+            }
+        }
+        "HashMap" | "BTreeMap" if type_id == TypeId::MAP as u32 => {
+            if let Some((key_ty, value_ty)) = args.and_then(two_type_args) {
+                fingerprint.push('[');
+                fingerprint.push_str(&build_type_fingerprint(
+                    key_ty,
+                    &meta.map_key_meta(),
+                    false,
+                    false,
+                ));
+                fingerprint.push('|');
+                fingerprint.push_str(&build_type_fingerprint(
+                    value_ty,
+                    &meta.map_value_meta(),
+                    false,
+                    false,
+                ));
+                fingerprint.push(']');
+            }
+        }
+        _ => {}
+    }
+
+    fingerprint
+}
+
+/// Computes struct fingerprint string at compile time (during proc-macro execution).
+///
+/// **Fingerprint Format:** `<field_name_or_id>,<type_id>,<ref>,<nullable>[<child...>];`
+/// Tagged fields are sorted by numeric ID. Untagged fields are sorted by name lexicographically.
+fn compute_struct_fingerprint(fields: &[&Field]) -> String {
+    use super::field_meta::parse_field_meta;
+    use std::cmp::Ordering;
+
+    let mut field_infos: Vec<FieldFingerprintInfo> = Vec::with_capacity(fields.len());
+
+    for (idx, field) in fields.iter().enumerate() {
+        let meta = parse_field_meta(field).unwrap_or_default();
+        if meta.skip {
+            continue;
+        }
+
+        let name = get_field_name(field, idx);
+        let field_id = meta.effective_id();
+        let name_or_id = if field_id >= 0 {
+            field_id.to_string()
+        } else {
+            to_snake_case(&name)
+        };
+
+        field_infos.push(FieldFingerprintInfo {
+            field_id,
+            name_or_id,
+            type_fingerprint: build_type_fingerprint(&field.ty, &meta, true, true),
+        });
+    }
+
+    field_infos.sort_by(|a, b| match (a.field_id >= 0, b.field_id >= 0) {
+        (true, true) => a
+            .field_id
+            .cmp(&b.field_id)
+            .then_with(|| a.name_or_id.cmp(&b.name_or_id)),
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => a.name_or_id.cmp(&b.name_or_id),
+    });
+
+    // Build fingerprint string
+    let mut fingerprint = String::new();
+    for info in &field_infos {
+        fingerprint.push_str(&info.name_or_id);
+        fingerprint.push(',');
+        fingerprint.push_str(&info.type_fingerprint);
+        fingerprint.push(';');
+    }
+
+    fingerprint
+}
+
+/// Generates TokenStream for struct version hash (computed at compile time).
+pub(crate) fn gen_struct_version_hash_ts(fields: &[&Field]) -> TokenStream {
+    let fingerprint = compute_struct_fingerprint(fields);
+    let (hash, _) = fory_core::util::murmurhash3_x64_128(fingerprint.as_bytes(), 47);
+    let version_hash = (hash & 0xFFFF_FFFF) as i32;
+
+    quote! {
+        {
+            const VERSION_HASH: i32 = #version_hash;
+            if fory_core::util::ENABLE_FORY_DEBUG_OUTPUT {
+                println!(
+                    "[rust][fory-debug] struct {} version fingerprint=\"{}\" hash={}",
+                    ::std::any::type_name::<Self::Target>(),
+                    #fingerprint,
+                    VERSION_HASH
+                );
+            }
+            VERSION_HASH
+        }
+    }
+}
+
+pub(crate) fn is_skip_field(field: &syn::Field) -> bool {
+    super::field_meta::is_skip_field(field)
+}
+
+pub(crate) fn is_skip_enum_variant(variant: &syn::Variant) -> bool {
+    variant.attrs.iter().any(|attr| {
+        attr.path().is_ident("fory") && {
+            let mut skip = false;
+            let _ = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("skip") {
+                    skip = true;
+                }
+                Ok(())
+            });
+            skip
+        }
+    })
+}
+
+pub(crate) fn enum_variant_id(variant: &syn::Variant) -> Option<u32> {
+    for attr in &variant.attrs {
+        if !attr.path().is_ident("fory") {
+            continue;
+        }
+        let mut id = None;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("id") {
+                if let Ok(value) = meta.value() {
+                    if let Ok(lit) = value.parse::<syn::LitInt>() {
+                        if let Ok(parsed) = lit.base10_parse::<u32>() {
+                            id = Some(parsed);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+        if id.is_some() {
+            return id;
+        }
+    }
+    None
+}
+
+pub(crate) fn has_fory_unknown_attr(variant: &syn::Variant) -> bool {
+    variant.attrs.iter().any(|attr| {
+        if !attr.path().is_ident("fory") {
+            return false;
+        }
+        let mut is_unknown = false;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("unknown") {
+                is_unknown = true;
+            } else if !meta.input.is_empty() {
+                let value = meta.value()?;
+                let _ = value.parse::<syn::Expr>()?;
+            }
+            Ok(())
+        });
+        is_unknown
+    })
+}
+
+pub(crate) fn is_unknown_case_type(ty: &Type) -> bool {
+    let Type::Path(type_path) = ty else {
+        return false;
+    };
+    type_path
+        .path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "UnknownCase")
+}
+
+pub(crate) fn type_param_send_sync_bounds(generics: &syn::Generics) -> HashSet<String> {
+    let mut params = HashSet::new();
+    for param in generics.type_params() {
+        if bounds_include_send_sync(&param.bounds) {
+            params.insert(param.ident.to_string());
+        }
+    }
+    if let Some(where_clause) = &generics.where_clause {
+        for predicate in &where_clause.predicates {
+            let syn::WherePredicate::Type(predicate_ty) = predicate else {
+                continue;
+            };
+            let Type::Path(type_path) = &predicate_ty.bounded_ty else {
+                continue;
+            };
+            let Some(segment) = type_path.path.segments.last() else {
+                continue;
+            };
+            if bounds_include_send_sync(&predicate_ty.bounds) {
+                params.insert(segment.ident.to_string());
+            }
+        }
+    }
+    params
+}
+
+pub(crate) fn all_type_params_send_sync(generics: &syn::Generics) -> bool {
+    let bounded = type_param_send_sync_bounds(generics);
+    generics
+        .type_params()
+        .all(|param| bounded.contains(&param.ident.to_string()))
+}
+
+pub(crate) fn type_is_send_sync(ty: &Type, send_sync_params: &HashSet<String>) -> bool {
+    match ty {
+        Type::Array(array) => type_is_send_sync(array.elem.as_ref(), send_sync_params),
+        Type::Tuple(tuple) => tuple
+            .elems
+            .iter()
+            .all(|elem| type_is_send_sync(elem, send_sync_params)),
+        Type::Path(type_path) => {
+            let Some(segment) = type_path.path.segments.last() else {
+                return false;
+            };
+            let name = segment.ident.to_string();
+            if send_sync_params.contains(&name) && matches!(segment.arguments, PathArguments::None)
+            {
+                return true;
+            }
+            match name.as_str() {
+                "bool" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32"
+                | "u64" | "u128" | "usize" | "f32" | "f64" | "String" | "Date" | "Timestamp"
+                | "Duration" | "Decimal" | "float16" | "bfloat16" | "Float16" | "BFloat16"
+                | "UnknownCase" => true,
+                "Rc" | "RcWeak" | "RefCell" | "Cell" => false,
+                "Option" | "Vec" | "VecDeque" | "LinkedList" | "HashSet" | "BTreeSet"
+                | "BinaryHeap" | "Box" | "Arc" | "ArcWeak" | "Mutex" => {
+                    let Some(inner) = first_type_arg(&segment.arguments) else {
+                        return false;
+                    };
+                    match (name.as_str(), inner) {
+                        ("Box", Type::TraitObject(_)) => false,
+                        ("Arc", Type::TraitObject(trait_obj)) => {
+                            trait_object_is_any_send_sync(trait_obj)
+                        }
+                        (_, Type::TraitObject(_)) => false,
+                        _ => type_is_send_sync(inner, send_sync_params),
+                    }
+                }
+                "HashMap" | "BTreeMap" => {
+                    let Some((key, value)) = two_path_type_args(&segment.arguments) else {
+                        return false;
+                    };
+                    type_is_send_sync(key, send_sync_params)
+                        && type_is_send_sync(value, send_sync_params)
+                }
+                _ => true,
+            }
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn trait_object_is_any_send_sync(trait_obj: &syn::TypeTraitObject) -> bool {
+    trait_object_has_trait(trait_obj, "Any")
+        && trait_object_has_trait(trait_obj, "Send")
+        && trait_object_has_trait(trait_obj, "Sync")
+}
+
+pub(crate) fn trait_object_is_any_without_auto_traits(trait_obj: &syn::TypeTraitObject) -> bool {
+    trait_object_has_trait(trait_obj, "Any")
+        && !trait_object_has_trait(trait_obj, "Send")
+        && !trait_object_has_trait(trait_obj, "Sync")
+}
+
+fn first_type_arg(arguments: &PathArguments) -> Option<&Type> {
+    let PathArguments::AngleBracketed(args) = arguments else {
+        return None;
+    };
+    args.args.iter().find_map(|arg| match arg {
+        GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    })
+}
+
+fn two_path_type_args(arguments: &PathArguments) -> Option<(&Type, &Type)> {
+    let PathArguments::AngleBracketed(args) = arguments else {
+        return None;
+    };
+    let mut iter = args.args.iter().filter_map(|arg| match arg {
+        GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    });
+    Some((iter.next()?, iter.next()?))
+}
+
+fn bounds_include_send_sync(
+    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::token::Plus>,
+) -> bool {
+    let mut has_send = false;
+    let mut has_sync = false;
+    for bound in bounds {
+        match trait_bound_ident(bound).as_deref() {
+            Some("Send") => has_send = true,
+            Some("Sync") => has_sync = true,
+            _ => {}
+        }
+    }
+    has_send && has_sync
+}
+
+fn trait_object_has_trait(trait_obj: &syn::TypeTraitObject, ident: &str) -> bool {
+    trait_obj
+        .bounds
+        .iter()
+        .any(|bound| trait_bound_ident(bound).as_deref() == Some(ident))
+}
+
+fn trait_bound_ident(bound: &syn::TypeParamBound) -> Option<String> {
+    let syn::TypeParamBound::Trait(trait_bound) = bound else {
+        return None;
+    };
+    trait_bound
+        .path
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string())
+}
+
+// The typed-ADT forward-compatibility carrier is selected by a runtime marker,
+// not by its name or a schema case id. Generated names may avoid schema cases,
+// and known schema cases may still use id 0.
+pub(crate) fn is_runtime_unknown_variant(variant: &syn::Variant) -> bool {
+    if !has_fory_unknown_attr(variant) {
+        return false;
+    }
+    let Fields::Unnamed(fields) = &variant.fields else {
+        return false;
+    };
+    if fields.unnamed.len() != 1 || !is_unknown_case_type(&fields.unnamed[0].ty) {
+        return false;
+    }
+    enum_variant_id(variant).is_none()
+}
+
+pub(crate) fn is_default_value_variant(variant: &syn::Variant) -> bool {
+    variant.attrs.iter().any(|attr| {
+        if attr.path().is_ident("default") {
+            return true;
+        }
+        attr.path().is_ident("fory") && {
+            let mut is_default = false;
+            let _ = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("default") {
+                    is_default = true;
+                } else if !meta.input.is_empty() {
+                    let value = meta.value()?;
+                    let _ = value.parse::<syn::Expr>()?;
+                }
+                Ok(())
+            });
+            is_default
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    #[test]
+    fn group_fields_normalizes_names_and_preserves_ordering() {
+        let fields: Vec<syn::Field> = vec![
+            parse_quote!(pub camelCase: i32),
+            parse_quote!(pub optionalValue: Option<i64>),
+            parse_quote!(pub simpleString: String),
+            parse_quote!(pub listItems: Vec<String>),
+            parse_quote!(pub setItems: HashSet<i32>),
+            parse_quote!(pub mapValues: HashMap<String, i32>),
+            parse_quote!(pub customType: CustomType),
+        ];
+        let field_refs: Vec<&syn::Field> = fields.iter().collect();
+
+        let (primitive_fields, nullable_primitive_fields, non_primitive_fields) =
+            group_fields_by_type(&field_refs);
+
+        let primitive_names: Vec<&str> = primitive_fields
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        assert_eq!(primitive_names, vec!["camel_case"]);
+
+        let nullable_names: Vec<&str> = nullable_primitive_fields
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        assert_eq!(nullable_names, vec!["optional_value"]);
+
+        let non_primitive_names: Vec<&str> = non_primitive_fields
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        assert_eq!(
+            non_primitive_names,
+            vec![
+                "custom_type",
+                "list_items",
+                "map_values",
+                "set_items",
+                "simple_string"
+            ]
+        );
+
+        let sorted_names = get_sorted_field_names(&field_refs);
+        assert_eq!(
+            sorted_names,
+            vec![
+                "camel_case".to_string(),
+                "optional_value".to_string(),
+                "custom_type".to_string(),
+                "list_items".to_string(),
+                "map_values".to_string(),
+                "set_items".to_string(),
+                "simple_string".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn group_fields_sorts_uint8_array_with_dense_arrays() {
+        let fields: Vec<syn::Field> = vec![
+            parse_quote!(#[fory(id = 21, bytes)] pub bytesValue: Vec<u8>),
+            parse_quote!(#[fory(id = 306, array)] pub uint8Array: Vec<u8>),
+            parse_quote!(#[fory(id = 302, array)] pub int8Array: Vec<i8>),
+            parse_quote!(#[fory(id = 307, array)] pub uint16Array: Vec<u16>),
+            parse_quote!(pub customType: CustomType),
+        ];
+        let field_refs: Vec<&syn::Field> = fields.iter().collect();
+
+        let (_primitive_fields, _nullable_primitive_fields, non_primitive_fields) =
+            group_fields_by_type(&field_refs);
+
+        let non_primitive_names: Vec<&str> = non_primitive_fields
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        assert_eq!(
+            non_primitive_names,
+            vec![
+                "bytes_value",
+                "int8_array",
+                "uint8_array",
+                "uint16_array",
+                "custom_type"
+            ]
+        );
+
+        let sorted_names = get_sorted_field_names(&field_refs);
+        assert_eq!(
+            sorted_names,
+            vec![
+                "bytes_value".to_string(),
+                "int8_array".to_string(),
+                "uint8_array".to_string(),
+                "uint16_array".to_string(),
+                "custom_type".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn group_fields_sorts_tag_ids_numerically_inside_group() {
+        let fields: Vec<syn::Field> = vec![
+            parse_quote!(#[fory(id = 10)] pub ten: i32),
+            parse_quote!(#[fory(id = 2)] pub two: i32),
+            parse_quote!(#[fory(id = 1)] pub one: i32),
+        ];
+        let field_refs: Vec<&syn::Field> = fields.iter().collect();
+
+        let sorted_names = get_sorted_field_names(&field_refs);
+        assert_eq!(
+            sorted_names,
+            vec!["one".to_string(), "two".to_string(), "ten".to_string()]
+        );
+    }
+
+    #[test]
+    fn selected_scalar_is_external() {
+        let fields: Vec<syn::Field> = vec![
+            parse_quote!(pub ordinary: i32),
+            parse_quote!(#[fory(with = ExternalI32Serializer)] pub external: i32),
+        ];
+        let field_refs: Vec<&syn::Field> = fields.iter().collect();
+
+        let (primitive, nullable_primitive, non_primitive) = group_fields_by_type(&field_refs);
+        assert_eq!(primitive[0].0, "ordinary");
+        assert!(nullable_primitive.is_empty());
+        assert_eq!(non_primitive[0].0, "external");
+
+        let fingerprint = compute_struct_fingerprint(&field_refs);
+        let unknown = TypeId::UNKNOWN as u32;
+        assert!(fingerprint.contains(&format!("external,{unknown},0,0;")));
+    }
+}

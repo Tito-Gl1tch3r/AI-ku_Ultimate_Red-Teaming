@@ -1,0 +1,2823 @@
+//! The typed C ("dec") **expression** printer.
+//!
+//! [`super::decbench_render::render_decbench_typed_with_output_and_prototype_and_dwarf_types_and_local_types`]
+//! (the DecBench front door, in the parent module) installs a
+//! [`DeclarationPlan`](super::DeclarationPlan) and a handful of render-scoped
+//! thread-locals (global address set, wide-local set, named-call-prototype
+//! table, renderable-struct set, pointer width, semantic-wide-cast flag) and
+//! then calls [`write_stmt_dec`] once per top-level statement. Everything in
+//! this module is the read-only consumer of that installed state: it walks
+//! the already-lowered [`Expr`] tree and prints C text, consulting
+//! the plan and thread-locals through the parent module's accessors
+//! (`dec_plan`, `dec_ptr_arg_type`, `dec_ptr_width`, ...) rather than reading
+//! them directly, for the same reason the plan itself exists: so a
+//! declaration decision is made once, upstream, and every print site agrees
+//! with it.
+//!
+//! The **statement** half lives in the [`stmt`] submodule and is re-exported
+//! from here, so the front door's `write_stmt_dec` import is unchanged. The
+//! split is the call graph's: `write_expr_dec` and its 43 helpers form a
+//! closed sub-graph that never calls a statement printer, while
+//! `write_stmt_dec` and its 7 helpers name twelve functions from this module
+//! and are named by none of them. `stmt` is a *child* of this module rather
+//! than a sibling for the same reason this module is a child of `ir::ast`:
+//! a descendant already sees its parent's private items, so nothing had to
+//! be widened to make the boundary legal.
+//!
+//! A few helpers that look like they belong here stay in the parent module
+//! instead, because the call graph — not their physical position in the old
+//! file — says they are shared:
+//! - [`callee_display_name`](super::callee_display_name) and
+//!   [`declared_reg_ctype`](super::declared_reg_ctype) are also called from
+//!   the DecBench front door and its ident-collection pass.
+//! - `write_unit_step` is also called by the untyped C renderer's
+//!   `write_for_clause_c`, parameterised over which register-printer to use.
+//! - `signed_shift_operand`, `expr_machine_width`, and
+//!   `normalize_wrapped_scaled_index_constant` are exercised directly by
+//!   dedicated unit tests in the parent module's `tests` submodule.
+//!
+//! Splitting those out too would either widen the newly-public surface
+//! between this module and its parent for no reader benefit, or require
+//! rewriting test call sites — neither of which this extraction does.
+
+use std::fmt::Write;
+
+use crate::ir::call_contracts::{CallPrototype, CallPrototypeAuthority, CallSiteSpec};
+use crate::ir::types::{BinOp, CmpOp, UnOp, VReg};
+use crate::ir::types_recover::TypeHint;
+
+use super::dwarf_render_types::{c_language_prototype, pointed_struct_name, valid_c_identifier};
+use super::{
+    binop_sym_c, callee_display_name, cmpop_sym_c, dec_global_name, dec_global_scalar_width,
+    dec_int_type, dec_plan, dec_ptr_arg_type, dec_ptr_width, declared_reg_ctype,
+    direct_global_address, expr_machine_width, flag_ident, int_ctype,
+    normalize_wrapped_scaled_index_constant, sanitize_c_ident, signed_shift_operand,
+    target_int_ctype, unop_sym, width_ctype, write_float_literal, Expr, OriginSet, PdbFieldHint,
+    ScalarType, WideArithmetic, DEC_GLOBAL_ADDRS, DEC_NAMED_CALL_PROTOTYPES, DEC_POINTER_WIDTH,
+    DEC_RENDERABLE_STRUCTS, DEC_SEMANTIC_WIDE_CAST, DEC_STRUCT_PTR_TYPES, DEC_WIDE_LOCALS,
+};
+
+mod stmt;
+
+pub(super) use stmt::write_stmt_dec;
+
+#[derive(Default)]
+struct LineMappingCollector {
+    last_offset: usize,
+    line_number: usize,
+    mappings: std::collections::BTreeMap<usize, OriginSet>,
+}
+
+thread_local! {
+    static DEC_LINE_MAPPINGS: std::cell::RefCell<Option<LineMappingCollector>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+pub(super) fn begin_line_mapping_collection(rendered_prefix: &str) {
+    DEC_LINE_MAPPINGS.with(|slot| {
+        *slot.borrow_mut() = Some(LineMappingCollector {
+            last_offset: rendered_prefix.len(),
+            line_number: rendered_prefix
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1,
+            mappings: std::collections::BTreeMap::new(),
+        });
+    });
+}
+
+pub(super) fn record_line_mapping(rendered: &str, origins: &OriginSet) {
+    if origins.is_empty() {
+        return;
+    }
+    DEC_LINE_MAPPINGS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(collector) = slot.as_mut() else {
+            return;
+        };
+        collector.line_number += rendered[collector.last_offset..]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        collector.last_offset = rendered.len();
+        collector
+            .mappings
+            .entry(collector.line_number)
+            .and_modify(|existing| existing.merge(origins))
+            .or_insert_with(|| origins.clone());
+    });
+}
+
+thread_local! {
+    /// The identifier the rendered signature gave each ABI parameter.
+    ///
+    /// The renderer may substitute names the caller never declared -- a
+    /// conventional `main` becomes `(int argc, char **argv)` with no DWARF at
+    /// all -- so the caller cannot reconstruct them from its own inputs. The
+    /// recovered-variable inventory needs the spelling that was actually
+    /// printed, or it reports no arguments for the function.
+    static DEC_PARAMETER_NAMES: std::cell::RefCell<Vec<Option<String>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(super) fn record_parameter_names(names: &[Option<String>]) {
+    DEC_PARAMETER_NAMES.with(|slot| {
+        *slot.borrow_mut() = names.to_vec();
+    });
+}
+
+pub(crate) fn take_parameter_names() -> Vec<Option<String>> {
+    DEC_PARAMETER_NAMES.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+pub(crate) fn take_line_mappings() -> Vec<(usize, OriginSet)> {
+    DEC_LINE_MAPPINGS.with(|slot| {
+        slot.borrow_mut()
+            .take()
+            .map(|collector| collector.mappings.into_iter().collect())
+            .unwrap_or_default()
+    })
+}
+
+fn dec_is_global_addr(address: u64) -> bool {
+    DEC_GLOBAL_ADDRS.with(|addresses| addresses.borrow().contains(&address))
+}
+
+fn dec_is_wide_local(register: &VReg) -> bool {
+    let spelling = match register {
+        VReg::Phys(name) => sanitize_c_ident(name),
+        VReg::Temp(index) => format!("t{index}"),
+        VReg::Flag(flag) => flag_ident(flag).to_string(),
+        VReg::FlagValue { .. } => register
+            .predicate_ident()
+            .expect("FlagValue always has a predicate identifier"),
+    };
+    DEC_WIDE_LOCALS.with(|locals| locals.borrow().contains(&spelling))
+}
+
+fn selected_named_call_prototype(name: &str) -> Option<CallPrototype> {
+    let displayed = sanitize_c_ident(callee_display_name(name));
+    DEC_NAMED_CALL_PROTOTYPES.with(|selected| selected.borrow().get(&displayed).cloned())
+}
+
+fn dec_struct_ptr_type(name: &str) -> Option<String> {
+    DEC_STRUCT_PTR_TYPES.with(|m| m.borrow().get(name).cloned())
+}
+
+fn dec_is_stack_object(name: &str) -> bool {
+    let displayed = sanitize_c_ident(name);
+    dec_plan(|plan| plan.is_stack_object(&displayed))
+}
+
+/// The unsigned-cast width for a logical right shift `lhs >> rhs`. The shift
+/// must happen at the operand's machine width so a negative narrow value is not
+/// sign-extended into the high half before the zero-fill. Narrowing is applied
+/// only when (a) the operand's width is positively known from narrow-typed
+/// identifiers, and (b) the shift amount is a constant that fits inside that
+/// width — a `>> 32` on a value that is genuinely 64-bit (e.g. `mul_widen`'s
+/// `(uint64_t)a*b`) must keep an eight-byte type.  A declared call-result local
+/// is stronger evidence than its canonical SSA parent: on ILP32, `long` is
+/// only four bytes while a proven `long long` destination remains eight.
+fn shift_operand_ctype(lhs: &Expr, rhs: &Expr) -> &'static str {
+    if let Expr::Reg(register) = lhs.semantic() {
+        let pointer_width = DEC_POINTER_WIDTH.with(std::cell::Cell::get);
+        if let Some(width) = crate::ir::call_contracts::integer_c_type_width(
+            &declared_reg_ctype(register),
+            pointer_width,
+        )
+        .filter(|width| *width > pointer_width)
+        {
+            // A value declared at exactly two machine words must be shifted at
+            // that width: `(unsigned long)(v) >> 64` on an LP64 target is a
+            // shift by the operand's own width, which is undefined and in
+            // practice yields nothing. The double-word spelling is the only one
+            // under which extracting the high eightbyte of a `rax:rdx` result
+            // means what it says.
+            if width == pointer_width.saturating_mul(2) {
+                return double_width_ctype(false, pointer_width);
+            }
+            return target_int_ctype(false, width);
+        }
+    }
+    if let (Some(w), Expr::Const(k)) = (expr_machine_width(lhs), rhs.semantic()) {
+        if *k >= 0 && (*k as u64) < (w as u64) * 8 {
+            // Target-parametric, not `int_ctype`: the two agree for one, two
+            // and four bytes, and disagree for eight, where ILP32's `unsigned
+            // long` is only a single machine word and would truncate the very
+            // operand this cast exists to keep wide.
+            return target_int_ctype(false, w);
+        }
+    }
+    target_int_ctype(false, 8)
+}
+
+/// The `(wide)((narrow)x)` spellings a LEFT shift's operand needs when the
+/// count is at least as wide as the operand's DECLARED type, or `None`.
+///
+/// `x << k` where `x` is declared `int32_t` and `k` is 33 is undefined in C
+/// (C23 6.5.7p3) and in practice shifts by `k % 32`, which is not what the
+/// machine did: `shl %rdi, $33` shifted the whole 64-bit register. The count
+/// alone proves the operand was wider than its declaration says, so this is a
+/// rule about a contradiction rather than a guess about intent —
+/// `197:clang:O2:hfa197_make_tagged` composes `tag` into the high eightbyte
+/// exactly this way.
+///
+/// The narrow cast is applied FIRST and is unsigned, which is the same
+/// wraparound spelling `write_expr_dec` uses everywhere else: the caller
+/// materialised the parameter with a 32-bit move, so the register's high half
+/// is the ZERO extension of the declared value, not its sign extension.
+///
+/// Only a register with a declared integer type qualifies. Nothing else states
+/// a width this can contradict, and a shift whose count already fits the
+/// operand is left exactly as it was.
+fn wide_left_shift_operand_ctypes(lhs: &Expr, rhs: &Expr) -> Option<(&'static str, &'static str)> {
+    let Expr::Const(count) = rhs.semantic() else {
+        return None;
+    };
+    let Expr::Reg(register) = lhs.semantic() else {
+        return None;
+    };
+    let count = u64::try_from(*count).ok()?;
+    let pointer_width = DEC_POINTER_WIDTH.with(std::cell::Cell::get);
+    let width = crate::ir::call_contracts::integer_c_type_width(
+        &declared_reg_ctype(register),
+        pointer_width,
+    )?;
+    (count >= u64::from(width) * 8 && count < u64::from(pointer_width) * 8).then(|| {
+        (
+            target_int_ctype(false, pointer_width),
+            target_int_ctype(false, width),
+        )
+    })
+}
+
+/// Recognise the array-index idiom `base + index*sizeof(T)` for a `T`-sized
+/// access, where `base` is a pointer declared with pointee width == `size`.
+/// Returns `(base name, index expr)` so the deref renders as `base[index]`,
+/// dropping the byte-offset arithmetic and `(long)` cast. Correct because
+/// `base[i]` is exactly `*(base + i)` and C scales the index by `sizeof(*base)`,
+/// which equals `size` — the guard we check.
+fn try_array_index<'a>(addr: &'a Expr, size: u8) -> Option<(&'a str, &'a Expr)> {
+    let (lhs, rhs) = match addr.semantic() {
+        Expr::Bin {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } => (lhs.as_ref(), rhs.as_ref()),
+        _ => return None,
+    };
+    for (base_side, off_side) in [(lhs, rhs), (rhs, lhs)] {
+        if let Expr::Reg(VReg::Phys(name)) = base_side.semantic() {
+            if dec_ptr_width(name) == Some(size) {
+                if let Some(index) = scaled_index(off_side, size) {
+                    return Some((name.as_str(), index));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// If `off` is `index * size` — a multiply or an equivalent left shift, possibly
+/// wrapped in a redundant `+ 0` — return the (unscaled) index. `size == 1` needs
+/// no scaling, so any expression is the index.
+fn scaled_index<'a>(off: &'a Expr, size: u8) -> Option<&'a Expr> {
+    let off = off.semantic();
+    // Strip a redundant `0 + x` / `x + 0` the lifter leaves on scaled indices.
+    let off = match off {
+        Expr::Bin {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } if matches!(lhs.semantic(), Expr::Const(0)) => rhs.as_ref(),
+        Expr::Bin {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } if matches!(rhs.semantic(), Expr::Const(0)) => lhs.as_ref(),
+        _ => off,
+    };
+    let off = off.semantic();
+    if size == 1 {
+        return Some(strip_implicit_pointer_index_extension(off));
+    }
+    match off {
+        Expr::Bin {
+            op: BinOp::Mul,
+            lhs,
+            rhs,
+        } if matches!(rhs.semantic(), Expr::Const(s) if *s == size as i64) => {
+            Some(strip_implicit_pointer_index_extension(lhs))
+        }
+        Expr::Bin {
+            op: BinOp::Mul,
+            lhs,
+            rhs,
+        } if matches!(lhs.semantic(), Expr::Const(s) if *s == size as i64) => {
+            Some(strip_implicit_pointer_index_extension(rhs))
+        }
+        Expr::Bin {
+            op: BinOp::Shl,
+            lhs,
+            rhs,
+        } => match rhs.semantic() {
+            Expr::Const(k) if *k >= 0 && *k < 63 && (1i64 << *k) == size as i64 => {
+                Some(strip_implicit_pointer_index_extension(lhs))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn index_with_addend(base: &Expr, addend: i64) -> Expr {
+    if addend == 0 {
+        return base.clone();
+    }
+    if addend < 0 {
+        let magnitude = addend
+            .checked_abs()
+            .expect("normalized 32-bit index addend cannot be i64::MIN");
+        return Expr::Bin {
+            op: BinOp::Sub,
+            lhs: Box::new(base.clone()),
+            rhs: Box::new(Expr::Const(magnitude)),
+        };
+    }
+    Expr::Bin {
+        op: BinOp::Add,
+        lhs: Box::new(base.clone()),
+        rhs: Box::new(Expr::Const(addend)),
+    }
+}
+
+/// Normalize only the constant term of a proven scaled array index. Dynamic
+/// terms and non-affine expressions remain byte-for-byte identical.
+fn normalize_wrapped_array_index(index: &Expr, element_size: u8) -> std::borrow::Cow<'_, Expr> {
+    let pointer_width = DEC_POINTER_WIDTH.with(std::cell::Cell::get);
+    let normalized = match index {
+        Expr::Const(value) => {
+            normalize_wrapped_scaled_index_constant(*value, element_size, pointer_width)
+                .filter(|normalized| normalized != value)
+                .map(Expr::Const)
+        }
+        Expr::Bin {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } => match (lhs.as_ref(), rhs.as_ref()) {
+            (base, Expr::Const(addend)) | (Expr::Const(addend), base) => {
+                normalize_wrapped_scaled_index_constant(*addend, element_size, pointer_width)
+                    .filter(|normalized| normalized != addend)
+                    .map(|normalized| index_with_addend(base, normalized))
+            }
+            _ => None,
+        },
+        Expr::Bin {
+            op: BinOp::Sub,
+            lhs,
+            rhs,
+        } => match rhs.as_ref() {
+            Expr::Const(subtrahend) => subtrahend.checked_neg().and_then(|addend| {
+                normalize_wrapped_scaled_index_constant(addend, element_size, pointer_width)
+                    .filter(|normalized| *normalized != addend)
+                    .map(|normalized| index_with_addend(lhs, normalized))
+            }),
+            _ => None,
+        },
+        _ => None,
+    };
+    normalized.map_or(std::borrow::Cow::Borrowed(index), std::borrow::Cow::Owned)
+}
+
+/// Render one already-proven typed array access. Loads and stores must share
+/// this path: otherwise an ILP32 wrapped index can be made safe on the read
+/// side while the corresponding write still escapes as host-width arithmetic.
+fn write_array_access_dec(base: &str, index: &Expr, element_size: u8, out: &mut String) {
+    // `try_array_index` returns the IR role (`arg0`), not necessarily the
+    // spelling selected for the function declaration (`in`, `buffer`, ...).
+    // Route the base through the same declaration-aware register renderer as
+    // every other use, or an authoritative signature can leave an undefined
+    // `argN` in the body and make otherwise-correct output invalid C.
+    write_reg_lvalue_dec(&VReg::phys(base), out);
+    out.push('[');
+    write_expr_dec(&normalize_wrapped_array_index(index, element_size), out);
+    out.push(']');
+}
+
+fn strip_implicit_pointer_index_extension(expr: &Expr) -> &Expr {
+    let expression = expr.semantic();
+    let Expr::Cast {
+        signed: outer_signed,
+        width: outer_width,
+        expr: outer,
+    } = expression
+    else {
+        return expr;
+    };
+    let Expr::Cast {
+        signed: _,
+        width: inner_width,
+        expr: inner,
+    } = outer.semantic()
+    else {
+        return expr;
+    };
+    let Expr::Reg(VReg::Phys(name)) = inner.semantic() else {
+        return expr;
+    };
+    if inner_width < outer_width && dec_int_type(name) == Some((*outer_signed, *inner_width)) {
+        inner
+    } else {
+        expr
+    }
+}
+
+/// Render a register in **rvalue** position. A pointer-typed argument or complete
+/// stack object is cast to `long` here: our byte-offset arithmetic treats it as
+/// an integer address, and leaving it a pointer would be an invalid operand for
+/// `&`/`*`/`-`/pointer±pointer.
+fn write_reg_dec(v: &VReg, out: &mut String) {
+    if let VReg::Phys(n) = v {
+        if let Some((aggregate, width)) = dec_plan(|plan| {
+            plan.aggregate_parameter(n)
+                .map(|(c_type, width)| (c_type.to_string(), width))
+        }) {
+            write_aggregate_carrier_dec(&aggregate, width, v, out);
+            return;
+        }
+        if declared_reg_ctype(v).ends_with('*') || dec_is_stack_object(n) {
+            out.push_str("(long)");
+            write_reg_lvalue_dec(v, out);
+            return;
+        }
+    }
+    write_reg_lvalue_dec(v, out);
+}
+
+fn aggregate_carrier_ctype(width: u8) -> Option<&'static str> {
+    match width {
+        1 => Some("unsigned char"),
+        2 => Some("unsigned short"),
+        4 => Some("unsigned int"),
+        8 => Some("unsigned long long"),
+        16 => Some("unsigned __int128"),
+        _ => None,
+    }
+}
+
+/// Cross from an authoritative source aggregate to the integer carrier used by
+/// the recovered machine-level AST without invoking a numeric conversion.
+fn write_aggregate_carrier_dec(c_type: &str, width: u8, value: &VReg, out: &mut String) {
+    let carrier = aggregate_carrier_ctype(width).expect("aggregate widths are filtered by plan");
+    let _ = write!(
+        out,
+        "((union {{ {c_type} object; {carrier} bits; }}){{ .object = "
+    );
+    write_reg_lvalue_dec(value, out);
+    out.push_str(" }).bits");
+}
+
+/// Render an operand of machine-level byte arithmetic.
+///
+/// Exact DWARF local types can turn a machine address into a C pointer after
+/// the AST was built.  A literal displacement in this IR is still measured in
+/// bytes, so allowing C to scale `pointer + displacement` by the pointee size
+/// would change the recovered program.  Keep ordinary pointer values intact at
+/// calls and memory boundaries; cross to the integer representation only here.
+fn write_machine_arithmetic_operand_dec(expr: &Expr, out: &mut String) {
+    if let Expr::Reg(reg @ VReg::Phys(_)) = expr.semantic() {
+        if declared_reg_ctype(reg).ends_with('*') {
+            out.push_str("(long)");
+            write_reg_lvalue_dec(reg, out);
+            return;
+        }
+    }
+    // A nested native-pointer step still produces a pointer. The enclosing IR
+    // operation is byte arithmetic, so cross back to an integer address before
+    // adding a dynamic byte offset; otherwise C scales that offset a second
+    // time (`(p + 1) + i*4` advances by `i*16` for `int *`).
+    if let Expr::Bin { op, lhs, rhs } = expr.semantic() {
+        if scaled_pointer_offset(*op, lhs, rhs).is_some() {
+            out.push_str("(long)(");
+            write_expr_dec(expr, out);
+            out.push(')');
+            return;
+        }
+    }
+    write_expr_dec(expr, out);
+}
+
+fn scaled_pointer_offset<'a>(op: BinOp, lhs: &'a Expr, rhs: &Expr) -> Option<(&'a VReg, i64)> {
+    if !matches!(op, BinOp::Add | BinOp::Sub) {
+        return None;
+    }
+    let Expr::Reg(reg @ VReg::Phys(_)) = lhs.semantic() else {
+        return None;
+    };
+    let displacement = match rhs.semantic() {
+        Expr::Const(displacement) => *displacement,
+        // Address symbolisation can retain a small arithmetic literal as an
+        // `Addr` even when it occupies the displacement side of a pointer
+        // add/subtract. In that role its numeric value is still bytes.
+        Expr::Addr(displacement) => i64::try_from(*displacement).ok()?,
+        _ => return None,
+    };
+    let width = declared_pointer_element_width(reg)?;
+    let width = i64::from(width);
+    (displacement % width == 0).then_some((reg, displacement / width))
+}
+
+fn declared_pointer_element_width(reg: &VReg) -> Option<u8> {
+    let declared = declared_reg_ctype(reg);
+    let mut pointee = declared.strip_suffix('*').map(str::trim)?;
+    while let Some(unqualified) = pointee
+        .strip_prefix("const ")
+        .or_else(|| pointee.strip_prefix("volatile "))
+    {
+        pointee = unqualified.trim();
+    }
+    let pointer_width = DEC_POINTER_WIDTH.with(std::cell::Cell::get);
+    let width = crate::ir::call_contracts::integer_c_type_width(pointee, pointer_width).or(
+        match pointee {
+            "float" => Some(4),
+            "double" => Some(8),
+            _ => None,
+        },
+    )?;
+    (width > 0).then_some(width)
+}
+
+/// Prefer native C pointer arithmetic when an exact pointee width can express
+/// the IR's byte displacement without loss.  This is equivalent to the
+/// integer-address form but lets the compiler recover the original increment
+/// shape (`p + 1` for an eight-byte pointer slot, not `(long)p + 8`).
+fn write_scaled_pointer_offset_dec(op: BinOp, lhs: &Expr, rhs: &Expr, out: &mut String) -> bool {
+    let Some((reg, scaled_displacement)) = scaled_pointer_offset(op, lhs, rhs) else {
+        return false;
+    };
+    write_reg_lvalue_dec(reg, out);
+    let _ = write!(out, " {} ", binop_sym_c(op));
+    write_const_dec(scaled_displacement, out);
+    true
+}
+
+/// Render a register in **lvalue** position (assignment target) — never cast,
+/// since a cast is not a valid lvalue.
+fn write_reg_lvalue_dec(v: &VReg, out: &mut String) {
+    match v {
+        VReg::Phys(n) => {
+            if let Some(displayed) =
+                dec_plan(|plan| plan.displayed_parameter(n).map(str::to_string))
+            {
+                out.push_str(&displayed);
+            } else {
+                out.push_str(&sanitize_c_ident(n));
+            }
+        }
+        VReg::Temp(i) => {
+            let _ = write!(out, "t{}", i);
+        }
+        VReg::Flag(fl) => out.push_str(flag_ident(fl)),
+        VReg::FlagValue { .. } => out.push_str(
+            &v.predicate_ident()
+                .expect("FlagValue always has a predicate identifier"),
+        ),
+    }
+}
+
+/// Write a `long`-valued integer constant using the same compact spelling as
+/// the register-level renderer (small decimals, hex for wide values).
+fn write_const_dec(c: i64, out: &mut String) {
+    if c == 0 {
+        out.push('0');
+    } else if c == -1 {
+        out.push_str("-1");
+    } else if (-4096..=4096).contains(&c) {
+        let _ = write!(out, "{}", c);
+    } else if c == i64::MIN {
+        // The magnitude of INT64_MIN is not representable as a signed literal.
+        // Building it from two representable signed terms avoids both Rust-side
+        // negation overflow and C's unsigned-hex unary-minus semantics.
+        out.push_str("(-0x7fffffffffffffffLL - 1LL)");
+    } else if c < 0 {
+        // Unsuffixed hex chooses the first fitting type.  Magnitudes above
+        // INT32_MAX therefore become `unsigned int`, so `-0x80000001` wraps to
+        // positive 0x7fffffff before a surrounding long expression sees it.
+        // Every remaining i64 magnitude fits signed long long exactly.
+        let _ = write!(out, "-0x{:x}LL", c.unsigned_abs());
+    } else {
+        let _ = write!(out, "0x{:x}", c);
+    }
+}
+
+/// Render `base + index*scale + disp` as a parenthesised `long` expression (an
+/// address computed as an integer — no `&`, no segment). Used for `lea`/field
+/// addresses; a parent `Deref`/`Store` wraps it in `*(long *)(...)`.
+fn write_addr_arith_dec(
+    base: &Option<VReg>,
+    index: &Option<VReg>,
+    scale: u8,
+    disp: i64,
+    out: &mut String,
+) {
+    if index.is_none() {
+        if let Some(base) = base {
+            if let Some(width) = declared_pointer_element_width(base) {
+                let width = i64::from(width);
+                if disp % width == 0 {
+                    let elements = disp / width;
+                    out.push('(');
+                    write_reg_lvalue_dec(base, out);
+                    if elements < 0 {
+                        let _ = write!(out, " - {}", elements.unsigned_abs());
+                    } else if elements > 0 {
+                        let _ = write!(out, " + {elements}");
+                    }
+                    out.push(')');
+                    return;
+                }
+            }
+        }
+    }
+    out.push('(');
+    let mut wrote = false;
+    if let Some(b) = base {
+        write_reg_dec(b, out);
+        wrote = true;
+    }
+    if let Some(i) = index {
+        if wrote {
+            out.push_str(" + ");
+        }
+        write_reg_dec(i, out);
+        if scale > 1 {
+            let _ = write!(out, " * {}", scale);
+        }
+        wrote = true;
+    }
+    if disp != 0 || !wrote {
+        if disp < 0 {
+            out.push_str(if wrote { " - " } else { "-" });
+            let _ = write!(out, "0x{:x}", disp.unsigned_abs());
+        } else {
+            if wrote {
+                out.push_str(" + ");
+            }
+            let _ = write!(out, "0x{:x}", disp);
+        }
+    }
+    out.push(')');
+}
+
+/// The C spelling of the *double-width* intermediate a `width`-byte
+/// multiply-high or wide divide computes in.
+///
+/// `__int128` is a 64-bit-target extension: naming it for 32-bit operands makes
+/// the fragment unbuildable for i386/ARM32/PE32 even though those are exactly
+/// the targets where a 32x32 multiply-high is most common. The intermediate is
+/// a property of the operand width, not of the host, so derive it.
+fn double_width_ctype(signed: bool, width: u8) -> &'static str {
+    match (signed, width) {
+        (true, 1) => "short",
+        (false, 1) => "unsigned short",
+        (true, 2) => "int",
+        (false, 2) => "unsigned int",
+        (true, 4) => "long long",
+        (false, 4) => "unsigned long long",
+        (true, _) => "__int128",
+        (false, _) => "unsigned __int128",
+    }
+}
+
+fn write_wide_arithmetic_dec(op: WideArithmetic, args: &[Expr], width: u8, out: &mut String) {
+    let signed = int_ctype(true, width);
+    let unsigned = int_ctype(false, width);
+    let wide_signed = double_width_ctype(true, width);
+    let wide_unsigned = double_width_ctype(false, width);
+    let bits = u16::from(width) * 8;
+    match (op, args) {
+        (WideArithmetic::UnsignedMulHigh, [lhs, rhs]) => {
+            let _ = write!(out, "(({unsigned})((({wide_unsigned})({unsigned})(");
+            write_expr_dec(lhs, out);
+            let _ = write!(out, ") * ({wide_unsigned})({unsigned})(");
+            write_expr_dec(rhs, out);
+            let _ = write!(out, ")) >> {bits}))");
+        }
+        (WideArithmetic::SignedMulHigh, [lhs, rhs]) => {
+            let _ = write!(
+                out,
+                "(({signed})((({wide_unsigned})(({wide_signed})({signed})("
+            );
+            write_expr_dec(lhs, out);
+            let _ = write!(out, ") * ({wide_signed})({signed})(");
+            write_expr_dec(rhs, out);
+            let _ = write!(out, "))) >> {bits}))");
+        }
+        (
+            operation
+            @ (WideArithmetic::UnsignedDivQuotient | WideArithmetic::UnsignedDivRemainder),
+            [hi, lo, divisor],
+        ) => {
+            let symbol = if matches!(operation, WideArithmetic::UnsignedDivQuotient) {
+                "/"
+            } else {
+                "%"
+            };
+            let _ = write!(out, "(({unsigned})((((({wide_unsigned})({unsigned})(");
+            write_expr_dec(hi, out);
+            let _ = write!(out, ") << {bits}) | ({unsigned})(");
+            write_expr_dec(lo, out);
+            let _ = write!(out, ")) {symbol} ({unsigned})(");
+            write_expr_dec(divisor, out);
+            out.push_str("))))");
+        }
+        (
+            operation @ (WideArithmetic::SignedDivQuotient | WideArithmetic::SignedDivRemainder),
+            [hi, lo, divisor],
+        ) => {
+            let symbol = if matches!(operation, WideArithmetic::SignedDivQuotient) {
+                "/"
+            } else {
+                "%"
+            };
+            let _ = write!(out, "(({signed})(((({wide_signed})({signed})(");
+            write_expr_dec(hi, out);
+            let _ = write!(out, ") * ((({wide_signed})1) << {bits})) + ({unsigned})(");
+            write_expr_dec(lo, out);
+            let _ = write!(out, ")) {symbol} ({signed})(");
+            write_expr_dec(divisor, out);
+            out.push_str(")))");
+        }
+        (WideArithmetic::CountLeadingZeros, [value]) => {
+            // `clz(0)` is architecturally the operand's width in bits, and
+            // `__builtin_clz` is UNDEFINED there — so the zero case is spelled
+            // out rather than left to the builtin. The `({unsigned})` cast is
+            // the other half of the exactness: the IR keeps a 32-bit machine
+            // register at its canonical 64-bit width, and counting a 64-bit
+            // quantity's leading zeros would answer 32 too high.
+            //
+            // The operand is written twice. It is a pure value expression here
+            // (`can_eagerly_evaluate` governs what may reach an operand
+            // position), so the duplication costs width in the output and
+            // nothing in semantics — the same shape a compiler emits for this
+            // idiom.
+            let builtin = if bits >= 64 {
+                "__builtin_clzll"
+            } else {
+                "__builtin_clz"
+            };
+            let operand = if bits >= 64 {
+                "unsigned long long"
+            } else {
+                "unsigned int"
+            };
+            let _ = write!(out, "((({operand})(");
+            write_expr_dec(value, out);
+            let _ = write!(out, ") == 0) ? {bits} : {builtin}(({operand})(");
+            write_expr_dec(value, out);
+            out.push_str(")))");
+        }
+        (WideArithmetic::CountTrailingZeros, [value]) => {
+            // The zero case is spelled out for the same reason the leading
+            // count spells it out: `__builtin_ctz(0)` is UNDEFINED, while
+            // `tzcnt` architecturally answers the operand width. The
+            // `({operand})` cast is the other half — the IR keeps a 32-bit
+            // machine register at its canonical 64-bit width, and counting a
+            // 64-bit quantity's trailing zeros would answer 32 too high for
+            // every operand whose low word is zero.
+            let builtin = if bits >= 64 {
+                "__builtin_ctzll"
+            } else {
+                "__builtin_ctz"
+            };
+            let operand = if bits >= 64 {
+                "unsigned long long"
+            } else {
+                "unsigned int"
+            };
+            let _ = write!(out, "((({operand})(");
+            write_expr_dec(value, out);
+            let _ = write!(out, ") == 0) ? {bits} : {builtin}(({operand})(");
+            write_expr_dec(value, out);
+            out.push_str(")))");
+        }
+        (WideArithmetic::PopulationCount, [value]) => {
+            // Total at every argument, so no zero case — but the width cast is
+            // still load-bearing: a 32-bit `popcnt` must not count set bits in
+            // the parent's stale high half.
+            let builtin = if bits >= 64 {
+                "__builtin_popcountll"
+            } else {
+                "__builtin_popcount"
+            };
+            let operand = if bits >= 64 {
+                "unsigned long long"
+            } else {
+                "unsigned int"
+            };
+            let _ = write!(out, "({builtin}(({operand})(");
+            write_expr_dec(value, out);
+            out.push_str(")))");
+        }
+        _ => out.push_str("__unknown(0)"),
+    }
+}
+
+fn write_expr_dec(e: &Expr, out: &mut String) {
+    match e {
+        Expr::Origin { expr, .. } => write_expr_dec(expr, out),
+        Expr::Reg(v) => write_reg_dec(v, out),
+        Expr::StackAddr { object, .. } => {
+            if matches!(object, VReg::Phys(name) if dec_plan(|plan| plan.parameter_slot(name).is_some()))
+            {
+                out.push_str("(void *)(");
+                write_reg_lvalue_dec(object, out);
+                out.push(')');
+            } else {
+                out.push('&');
+                write_reg_lvalue_dec(object, out);
+                out.push_str("[0]");
+            }
+        }
+        Expr::Const(c) => write_const_dec(*c, out),
+        Expr::FloatConst { bits, width } => write_float_literal(*bits, *width, out),
+        Expr::Addr(a) => {
+            if dec_is_global_addr(*a) {
+                if dec_global_scalar_width(*a).is_some() {
+                    let _ = write!(out, "&{}", dec_global_name(*a));
+                } else {
+                    let _ = write!(out, "&{}[0]", dec_global_name(*a));
+                }
+            } else {
+                let _ = write!(out, "0x{:x}", a);
+            }
+        }
+        // In a value position a resolved symbol normally becomes its address
+        // constant; the readable name is kept only where it is *called* (see
+        // write_call_dec). A direct data dereference/store is the exception:
+        // the collector marks its VA so the recompiled function addresses the
+        // portable backing object rather than the old image mapping.
+        Expr::Named { va, name } => {
+            if dec_is_global_addr(*va) {
+                if dec_global_scalar_width(*va).is_some() {
+                    let _ = write!(out, "&{}", dec_global_name(*va));
+                } else {
+                    let _ = write!(out, "&{}[0]", dec_global_name(*va));
+                }
+            } else {
+                // The identifier, when — and ONLY when — this render has
+                // selected a prototype for it. That gate is the whole
+                // difference from the 2026-08-05 attempt, which was measured
+                // and reverted: it emitted `extern void <name>(void);`, which
+                // conflicts with the callee's real signature once the whole
+                // unit is compiled (`fixture_harness` and `arch_roundtrip` both
+                // do). Cost then: 656 -> 633 and a CONTROL-lane regression.
+                //
+                // `selected_named_call_prototype` now answers from
+                // `ir::symbol_env` — one agreed record per callee, keyed by the
+                // identifier printed here — so the declaration this render
+                // emits and the definition the unit contains are the same
+                // signature by construction. A symbol with no such record keeps
+                // its raw VA, which is the fail-closed answer.
+                //
+                // `__libc_start_main(main, ...)` is the shape this recovers: a
+                // function's address passed as a value. GCC compiles the raw
+                // literal to `mov $imm` where the original used `lea sym(%rip)`,
+                // so byte_match could never agree.
+                let displayed = sanitize_c_ident(callee_display_name(name));
+                match selected_named_call_prototype(&displayed) {
+                    Some(_) => {
+                        let _ = write!(out, "(long)({})", displayed);
+                    }
+                    None => {
+                        let _ = write!(out, "0x{:x}", va);
+                    }
+                }
+            }
+        }
+        Expr::FunctionTableEntry {
+            table_name, index, ..
+        } => {
+            out.push_str(&sanitize_c_ident(table_name));
+            out.push('[');
+            write_expr_dec(index, out);
+            out.push(']');
+        }
+        Expr::StringLit { value } => write_string_lit(value, out),
+        Expr::Lea {
+            base,
+            index,
+            scale,
+            disp,
+            ..
+        }
+        | Expr::PdbFieldAddr {
+            base,
+            index,
+            scale,
+            disp,
+            ..
+        } => write_addr_arith_dec(base, index, *scale, *disp, out),
+        Expr::Deref { addr, size } => {
+            if let Some(address) = direct_global_address(addr) {
+                if dec_global_scalar_width(address) == Some(*size) {
+                    out.push_str(&dec_global_name(address));
+                    return;
+                }
+            }
+            if let Some((base, index, hint)) = renderable_field_access(addr) {
+                write_field_access_dec(base, index, hint, out);
+                return;
+            }
+            // Array-index idiom: a `T`-sized read through `base + i*sizeof(T)`
+            // where `base` is a declared `T *` renders as `base[i]`. This drops
+            // the `(long)` cast + explicit scale, so the compiler re-emits its own
+            // scaled-addressing (`lea (%rax,%rdx,4)`) instead of our `shl`+`add`.
+            if let Some((base, index)) = try_array_index(addr, *size) {
+                write_array_access_dec(base, index, *size, out);
+            } else {
+                // Use the recovered access width for the load cast (`*(int *)` for
+                // a 4-byte read, not a blanket `*(long *)`). The width picks the
+                // recompiled load instruction (`mov eax` vs `mov rax`), so matching
+                // it to the original narrows byte_match's assembly diff.
+                let _ = write!(out, "*({} *)(", width_ctype(*size));
+                write_expr_dec(addr, out);
+                out.push(')');
+            }
+        }
+        Expr::Call {
+            target,
+            args,
+            call_spec,
+            ..
+        } => write_call_dec(target, args, None, call_spec.as_ref(), out),
+        Expr::Bin { op, lhs, rhs } => {
+            // Logical (unsigned) right shift has no direct signed-`long` C form;
+            // cast the operand to `unsigned long` so `>>` is the zero-filling
+            // shift the IR means. Arithmetic shift (`Sar`) is plain `>>`.
+            if matches!(op, BinOp::Shr) {
+                // `widen::insert_widening_casts` states the reinterpretation
+                // structurally when it has recovered types; re-stating it here
+                // would only nest an identical cast.
+                let stated = matches!(lhs.semantic(), Expr::Cast { signed: false, .. });
+                out.push('(');
+                if stated {
+                    write_expr_dec(lhs, out);
+                } else {
+                    let _ = write!(out, "({})(", shift_operand_ctype(lhs, rhs));
+                    write_expr_dec(lhs, out);
+                    out.push(')');
+                }
+                out.push_str(" >> ");
+                write_expr_dec(rhs, out);
+                out.push(')');
+            } else if let Some((wide, narrow)) = matches!(op, BinOp::Shl)
+                .then(|| wide_left_shift_operand_ctypes(lhs, rhs))
+                .flatten()
+            {
+                let _ = write!(out, "(({wide})(({narrow})(");
+                write_expr_dec(lhs, out);
+                out.push_str(")) << ");
+                write_expr_dec(rhs, out);
+                out.push(')');
+            } else if matches!(op, BinOp::Sar) {
+                // Preserve both signedness and machine width at the point of
+                // the shift. The explicit AST cast may otherwise be elided as
+                // declaration-redundant even when copy propagation has replaced
+                // the register with a wider unsigned producer.
+                let (ctype, operand) = signed_shift_operand(lhs, rhs);
+                let _ = write!(out, "(({ctype})(");
+                write_expr_dec(operand, out);
+                out.push_str(") >> ");
+                write_expr_dec(rhs, out);
+                out.push(')');
+            } else {
+                let (shown_op, shown_rhs) = match (*op, rhs.as_ref()) {
+                    (BinOp::Add, Expr::Const(c)) if *c < 0 && *c != i64::MIN => {
+                        (BinOp::Sub, Expr::Const(-c))
+                    }
+                    (BinOp::Sub, Expr::Const(c)) if *c < 0 && *c != i64::MIN => {
+                        (BinOp::Add, Expr::Const(-c))
+                    }
+                    _ => (*op, *rhs.clone()),
+                };
+                out.push('(');
+                if !write_scaled_pointer_offset_dec(shown_op, lhs, &shown_rhs, out) {
+                    write_machine_arithmetic_operand_dec(lhs, out);
+                    let _ = write!(out, " {} ", binop_sym_c(shown_op));
+                    write_machine_arithmetic_operand_dec(&shown_rhs, out);
+                }
+                out.push(')');
+            }
+        }
+        Expr::Un { op, src } => {
+            let _ = write!(out, "({}", unop_sym(*op));
+            write_expr_dec(src, out);
+            out.push(')');
+        }
+        Expr::Cast {
+            signed,
+            width,
+            expr,
+        } => {
+            if let Some(reg) = redundant_declared_integer_cast(e) {
+                write_reg_dec(reg, out);
+            } else {
+                // A DOUBLE-WORD cast is the one width `int_ctype` cannot spell:
+                // it answers `long` for sixteen bytes, which silently halves
+                // the value. That is the spelling a two-register INTEGER result
+                // needs on both sides of the call boundary, and the extension
+                // exists only on a 64-bit target — so it is derived from the
+                // target's pointer width rather than named unconditionally.
+                let pointer_width = DEC_POINTER_WIDTH.with(std::cell::Cell::get);
+                let c_type = if *width == 16 && pointer_width == 8 {
+                    double_width_ctype(*signed, pointer_width)
+                } else if *width == 8 && DEC_SEMANTIC_WIDE_CAST.with(std::cell::Cell::get) {
+                    target_int_ctype(*signed, *width)
+                } else {
+                    int_ctype(*signed, *width)
+                };
+                let _ = write!(out, "({c_type})(");
+                // `Expr::Cast` is an INTEGER cast by construction — a width
+                // and a signedness, nothing else — so an operand that RENDERS
+                // as a `float` is a bit view of one, never a value to convert.
+                // The machine agrees: `movd %xmm0, %eax` copies bits. Printing
+                // the operand plainly made C perform its own float-to-integer
+                // conversion instead, so a `float` member composed into an
+                // INTEGER-class result handed back the NUMBER where the callee
+                // had put the BIT PATTERN (`197:*:O2:hfa197_make_tagged`).
+                //
+                // The statement-level path (`write_representation_value_dec`)
+                // has done this since the `fp174_float_bits` family was fixed;
+                // this is the same rule in expression position, which is where
+                // an optimised body puts it once the assignment is folded away.
+                // A genuine conversion is `Expr::NumericConvert` and is
+                // rendered by the arm below, untouched.
+                match float_rendered_width(expr) {
+                    Some(float_width) => write_float_bits_expr_dec(expr, float_width, out),
+                    None => write_expr_dec(expr, out),
+                }
+                out.push(')');
+            }
+        }
+        // The operand is spelled at the type it HAS before the conversion is
+        // applied: a `float` source rendered as a machine word would convert
+        // the bit pattern rather than the value, which is the same mistake the
+        // union fallback makes and the reason this node exists.
+        Expr::NumericConvert { from, to, expr } => {
+            let _ = write!(out, "({})(", to.c_name());
+            if from.is_float() {
+                write_float_expr_dec(expr, from.width(), out);
+            } else {
+                // `from` is signed, and `write_expr_dec` spells integer
+                // arithmetic through `(unsigned int)`/`(unsigned long)`
+                // machine-width casts -- correct, and required, for wraparound.
+                // Without restoring the declared type here, C converts an
+                // UNSIGNED value: `(double)(seed * 6 + 1)` at `seed == -1`
+                // returned 4294967291.0 instead of -5.0
+                // (`197:*:*:hfa197_make_scalar`, failing on all four host lanes
+                // and all eight cross lanes; diary Entry 59).
+                //
+                // Neither half was wrong on its own -- the conversion is right
+                // and the wraparound casts are right -- and nothing between them
+                // noticed the operand's C type had changed under the
+                // conversion's feet. The comment above says the operand is
+                // spelled at the type it HAS before the conversion; on this path
+                // it was not.
+                //
+                // The cast also pins the WIDTH the machine actually reads:
+                // `cvtsi2sd %eax` consumes 32 bits, so narrowing a wider
+                // rendered operand to `from` is the instruction's own semantics,
+                // not a loss.
+                let _ = write!(out, "({})(", from.c_name());
+                write_expr_dec(expr, out);
+                out.push(')');
+            }
+            out.push(')');
+        }
+        Expr::Cmp { op, lhs, rhs } => {
+            if write_unsigned_subtract_range_dec(*op, lhs, rhs, out) {
+                return;
+            }
+            // Unsigned comparisons need explicit `unsigned long` casts; the
+            // register-level `u<` / `u<=` spellings are not valid C.
+            if matches!(op, CmpOp::Ult | CmpOp::Ule) {
+                let sym = if matches!(op, CmpOp::Ult) { "<" } else { "<=" };
+                out.push_str("((unsigned long)(");
+                write_expr_dec(lhs, out);
+                let _ = write!(out, ") {} (unsigned long)(", sym);
+                write_expr_dec(rhs, out);
+                out.push_str("))");
+            } else {
+                out.push('(');
+                if matches!(op, CmpOp::Slt | CmpOp::Sle)
+                    && write_value_preserving_signed_comparison_operand(lhs, rhs, out)
+                {
+                    // The declaration already expresses the narrow signed
+                    // value, and the literal fits that type. C's usual
+                    // conversions therefore preserve the comparison.
+                } else if matches!(op, CmpOp::Slt | CmpOp::Sle)
+                    && write_declared_unsigned_as_signed_comparison_operand(lhs, out)
+                {
+                    // The machine relation is signed even though stronger
+                    // declaration evidence keeps this value unsigned at the
+                    // function boundary. State the machine interpretation at
+                    // this use rather than changing the declaration.
+                } else if !matches!(op, CmpOp::Eq | CmpOp::Ne)
+                    || !matches!(rhs.semantic(), Expr::Const(0))
+                    || !write_direct_pointer_value_dec(lhs, out)
+                {
+                    write_expr_dec(lhs, out);
+                }
+                let _ = write!(out, " {} ", cmpop_sym_c(*op));
+                if matches!(op, CmpOp::Slt | CmpOp::Sle)
+                    && write_value_preserving_signed_comparison_operand(rhs, lhs, out)
+                {
+                    // Symmetric constant-on-the-left form.
+                } else if matches!(op, CmpOp::Slt | CmpOp::Sle)
+                    && write_declared_unsigned_as_signed_comparison_operand(rhs, out)
+                {
+                    // Symmetric declared-unsigned operand.
+                } else if !matches!(op, CmpOp::Eq | CmpOp::Ne)
+                    || !matches!(lhs.semantic(), Expr::Const(0))
+                    || !write_direct_pointer_value_dec(rhs, out)
+                {
+                    write_expr_dec(rhs, out);
+                }
+                out.push(')');
+            }
+        }
+        Expr::Select {
+            cond,
+            if_true,
+            if_false,
+            ..
+        } => {
+            let canonical_true =
+                is_one_lazy_call_times_two(if_false) && unsigned_all_ones_width(if_true).is_some();
+            let canonical_false =
+                is_one_lazy_call_times_two(if_true) && unsigned_all_ones_width(if_false).is_some();
+            let true_is_pointer = expression_has_pointer_representation(if_true);
+            let false_is_pointer = expression_has_pointer_representation(if_false);
+            let null_pointer_pair = (true_is_pointer
+                && matches!(if_false.semantic(), Expr::Const(0)))
+                || (false_is_pointer && matches!(if_true.semantic(), Expr::Const(0)));
+            let mixed_representation = true_is_pointer != false_is_pointer && !null_pointer_pair;
+            out.push('(');
+            write_expr_dec(cond, out);
+            out.push_str(" ? ");
+            if mixed_representation {
+                // A surrounding cast is too late: C resolves a conditional's
+                // common type before applying it. Put both non-null arms in the
+                // machine-word representation here so nested casts and stores
+                // cannot emit an invalid pointer/integer conditional.
+                write_representation_value_dec("long", if_true, out);
+            } else {
+                write_nullable_select_arm_dec(
+                    if_true,
+                    null_pointer_pair && true_is_pointer,
+                    canonical_true,
+                    out,
+                );
+            }
+            out.push_str(" : ");
+            if mixed_representation {
+                write_representation_value_dec("long", if_false, out);
+            } else {
+                write_nullable_select_arm_dec(
+                    if_false,
+                    null_pointer_pair && false_is_pointer,
+                    canonical_false,
+                    out,
+                );
+            }
+            out.push(')');
+        }
+        Expr::WideArithmetic { op, args, width } => {
+            write_wide_arithmetic_dec(*op, args, *width, out);
+        }
+        // An unmodelled/indirect value: a call to an undeclared `__unknown`
+        // (implicit-declaration warning only) keeps it a valid `long` rvalue.
+        Expr::Unknown(_) => out.push_str("__unknown(0)"),
+    }
+}
+
+fn strip_integer_casts(mut expression: &Expr) -> &Expr {
+    loop {
+        expression = expression.semantic();
+        match expression {
+            Expr::Cast { expr, .. } => expression = expr,
+            _ => return expression,
+        }
+    }
+}
+
+fn unsigned_range_render_parts(expression: &Expr) -> Option<(&Expr, i64, u8)> {
+    let mut narrowest = None;
+    let mut current = expression;
+    loop {
+        current = current.semantic();
+        match current {
+            Expr::Cast { width, expr, .. } => {
+                narrowest = Some(narrowest.map_or(*width, |seen: u8| seen.min(*width)));
+                current = expr;
+            }
+            _ => break,
+        }
+    }
+    let (value, low) = match current {
+        Expr::Bin {
+            op: BinOp::Sub,
+            lhs,
+            rhs,
+        } => match strip_integer_casts(rhs) {
+            Expr::Const(low) if *low >= 0 => (lhs.as_ref(), *low),
+            _ => return None,
+        },
+        Expr::Bin {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } => match strip_integer_casts(rhs) {
+            Expr::Const(delta) if *delta < 0 => (lhs.as_ref(), delta.checked_neg()?),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let width = narrowest.or_else(|| expr_machine_width(value.semantic()))?;
+    matches!(width, 1 | 2 | 4 | 8).then_some((value, low, width))
+}
+
+fn write_unsigned_range_value(value: &Expr, width: u8, out: &mut String) {
+    let _ = write!(out, "({})(", int_ctype(false, width));
+    write_expr_dec(value, out);
+    out.push(')');
+}
+
+/// Render the compiler idiom `(unsigned W)(x - low) <= span` (or its reversed
+/// rejecting form) as an explicit closed range. Width comes from the existing
+/// typed render context and is restated on both uses of `x`.
+fn write_unsigned_subtract_range_dec(op: CmpOp, lhs: &Expr, rhs: &Expr, out: &mut String) -> bool {
+    if !matches!(op, CmpOp::Ult | CmpOp::Ule) {
+        return false;
+    }
+
+    if let (Expr::Const(limit), Some((value, low, width))) =
+        (strip_integer_casts(lhs), unsigned_range_render_parts(rhs))
+    {
+        let inside_op = if op == CmpOp::Ult {
+            CmpOp::Ule
+        } else {
+            CmpOp::Ult
+        };
+        if let Some((low, high)) =
+            crate::ir::cmp_fusion::unsigned_range_bounds(width, low, *limit, inside_op)
+        {
+            out.push('(');
+            write_unsigned_range_value(value, width, out);
+            let _ = write!(out, " < {low} || {high} < ");
+            write_unsigned_range_value(value, width, out);
+            out.push(')');
+            return true;
+        }
+    }
+
+    if let (Some((value, low, width)), Expr::Const(limit)) =
+        (unsigned_range_render_parts(lhs), strip_integer_casts(rhs))
+    {
+        if let Some((low, high)) =
+            crate::ir::cmp_fusion::unsigned_range_bounds(width, low, *limit, op)
+        {
+            out.push('(');
+            let _ = write!(out, "{low} <= ");
+            write_unsigned_range_value(value, width, out);
+            out.push_str(" && ");
+            write_unsigned_range_value(value, width, out);
+            let _ = write!(out, " <= {high})");
+            return true;
+        }
+    }
+    false
+}
+
+fn unsigned_all_ones_width(expression: &Expr) -> Option<u8> {
+    match expression.semantic() {
+        Expr::Cast {
+            signed: false,
+            width,
+            expr,
+        } if matches!(expr.semantic(), Expr::Const(-1)) => Some(*width),
+        _ => None,
+    }
+}
+
+fn is_one_lazy_call_times_two(expression: &Expr) -> bool {
+    matches!(
+        expression.semantic(),
+        Expr::Bin {
+            op: BinOp::Mul,
+            lhs,
+            rhs,
+        } if (matches!(lhs.semantic(), Expr::Call { .. })
+            && matches!(rhs.semantic(), Expr::Const(2)))
+            || (matches!(rhs.semantic(), Expr::Call { .. })
+                && matches!(lhs.semantic(), Expr::Const(2)))
+    )
+}
+
+fn write_select_arm_dec(expression: &Expr, canonical_all_ones: bool, out: &mut String) {
+    if canonical_all_ones {
+        match unsigned_all_ones_width(expression) {
+            Some(1) => out.push_str("0xffU"),
+            Some(2) => out.push_str("0xffffU"),
+            Some(4) => out.push_str("0xffffffffU"),
+            Some(8) => out.push_str("0xffffffffffffffffULL"),
+            _ => write_expr_dec(expression, out),
+        }
+    } else {
+        write_expr_dec(expression, out);
+    }
+}
+
+fn write_nullable_select_arm_dec(
+    expression: &Expr,
+    direct_pointer: bool,
+    canonical_all_ones: bool,
+    out: &mut String,
+) {
+    if !direct_pointer || !write_direct_pointer_value_dec(expression, out) {
+        write_select_arm_dec(expression, canonical_all_ones, out);
+    }
+}
+
+/// Render a declared pointer as a C pointer value rather than the integer
+/// address representation used by generic machine arithmetic.
+///
+/// This is intentionally narrow: direct pointer identities (optionally behind
+/// lossless machine casts) are safe in a null comparison. Arbitrary address
+/// arithmetic still goes through `write_expr_dec`, where the integer spelling
+/// is required for byte offsets and masks.
+fn write_direct_pointer_value_dec(expression: &Expr, out: &mut String) -> bool {
+    match expression.semantic() {
+        Expr::Reg(register @ VReg::Phys(name))
+            if dec_ptr_arg_type(name).is_some()
+                || dec_struct_ptr_type(name).is_some()
+                || dec_is_stack_object(name) =>
+        {
+            write_reg_lvalue_dec(register, out);
+            true
+        }
+        Expr::Cast { width, expr, .. }
+            if *width == DEC_POINTER_WIDTH.with(std::cell::Cell::get) =>
+        {
+            write_direct_pointer_value_dec(expr, out)
+        }
+        _ => false,
+    }
+}
+
+fn renderable_field_access(addr: &Expr) -> Option<(&VReg, Option<&VReg>, &PdbFieldHint)> {
+    let Expr::PdbFieldAddr {
+        base: Some(base),
+        index,
+        scale,
+        hints,
+        ..
+    } = addr.semantic()
+    else {
+        return None;
+    };
+    let [hint] = hints.as_slice() else {
+        return None;
+    };
+    (hint.renderable
+        && ((*scale == 1 && index.is_none()) || (*scale > 0 && index.is_some()))
+        && valid_c_identifier(&hint.type_name)
+        && hint.field_name.split('.').all(valid_c_identifier)
+        && DEC_RENDERABLE_STRUCTS.with(|selected| selected.borrow().contains(&hint.type_name)))
+    .then_some((base, index.as_ref(), hint))
+}
+
+fn write_field_access_dec(
+    base: &VReg,
+    index: Option<&VReg>,
+    hint: &PdbFieldHint,
+    out: &mut String,
+) {
+    let base_is_declared = matches!(base, VReg::Phys(name) if dec_struct_ptr_type(name)
+        .as_deref()
+        .and_then(pointed_struct_name)
+        == Some(hint.type_name.as_str()));
+    if base_is_declared {
+        write_reg_lvalue_dec(base, out);
+    } else {
+        let _ = write!(out, "((struct {} *)", hint.type_name);
+        write_reg_lvalue_dec(base, out);
+    }
+    if let Some(index) = index {
+        if base_is_declared {
+            out.push('[');
+        } else {
+            out.push_str(")[");
+        }
+        if let (Some(signed), Some(width)) = (hint.index_signed, hint.index_width) {
+            let _ = write!(out, "({})(", int_ctype(signed, width));
+            write_reg_dec(index, out);
+            out.push(')');
+        } else {
+            write_reg_dec(index, out);
+        }
+        let _ = write!(out, "].{}", hint.field_name);
+    } else {
+        let _ = write!(
+            out,
+            "{}{}",
+            if base_is_declared { "->" } else { ")->" },
+            hint.field_name
+        );
+    }
+}
+
+fn redundant_declared_integer_cast(expr: &Expr) -> Option<&VReg> {
+    let Expr::Cast {
+        signed,
+        width,
+        expr: inner,
+    } = expr.semantic()
+    else {
+        return None;
+    };
+    if let Expr::Reg(reg @ VReg::Phys(_)) = inner.semantic() {
+        return (declared_reg_ctype(reg) == target_int_ctype(*signed, *width)).then_some(reg);
+    }
+    let Expr::Cast {
+        signed: inner_signed,
+        width: inner_width,
+        expr: inner,
+    } = inner.semantic()
+    else {
+        return None;
+    };
+    let Expr::Reg(reg @ VReg::Phys(_)) = inner.semantic() else {
+        return None;
+    };
+    // C's integer promotions convert every 1/2-byte integer to signed int on
+    // our target ABIs. If the declaration already states the inner cast, the
+    // explicit two-cast chain has no source-level effect.
+    (*signed
+        && *width == 4
+        && *inner_width < 4
+        && declared_reg_ctype(reg) == int_ctype(*inner_signed, *inner_width))
+    .then_some(reg)
+}
+
+/// Write a declared signed integer directly when an explicit widening around
+/// it cannot affect this signed comparison. This is deliberately local to
+/// relational comparisons: dropping the same cast from arithmetic can change
+/// overflow semantics, and dropping it against a wider literal can change the
+/// usual arithmetic conversions on a target whose `long` width differs.
+fn write_value_preserving_signed_comparison_operand(
+    expression: &Expr,
+    other: &Expr,
+    out: &mut String,
+) -> bool {
+    let Expr::Const(constant) = other.semantic() else {
+        return false;
+    };
+    let Expr::Cast {
+        signed: true,
+        width: widened_width,
+        expr,
+    } = expression.semantic()
+    else {
+        return false;
+    };
+    let (register, declared_signed, declared_width) = match expr.semantic() {
+        Expr::Reg(register @ VReg::Phys(name)) => {
+            let Some((declared_signed, declared_width)) = dec_int_type(name) else {
+                return false;
+            };
+            (register, declared_signed, declared_width)
+        }
+        Expr::Cast {
+            signed,
+            width,
+            expr,
+        } => {
+            let Expr::Reg(register @ VReg::Phys(name)) = expr.semantic() else {
+                return false;
+            };
+            if dec_int_type(name) != Some((*signed, *width)) {
+                return false;
+            }
+            (register, *signed, *width)
+        }
+        _ => return false,
+    };
+    if !declared_signed
+        || declared_width >= *widened_width
+        || !signed_constant_fits(*constant, declared_width)
+    {
+        return false;
+    }
+    write_reg_dec(register, out);
+    true
+}
+
+/// Render the signed interpretation carried by a machine comparison without
+/// weakening an authoritative unsigned declaration.
+///
+/// A compiler may legally lower an unsigned source switch with a signed tree
+/// edge when the surrounding partition proves the values on that edge. If the
+/// recovered signature correctly remains `uint64_t`, printing the direct C
+/// comparison would apply C's unsigned conversions and change the edge for
+/// values such as `UINT64_MAX`. The comparison operator is per-use evidence;
+/// make that use signed at the exact declared width and leave the declaration
+/// authority untouched.
+fn write_declared_unsigned_as_signed_comparison_operand(
+    expression: &Expr,
+    out: &mut String,
+) -> bool {
+    let Expr::Reg(register @ VReg::Phys(name)) = expression.semantic() else {
+        return false;
+    };
+    let Some((false, width)) = dec_plan(|plan| plan.authoritative_integer_parameter(name)) else {
+        return false;
+    };
+    let _ = write!(out, "({})(", target_int_ctype(true, width));
+    write_reg_dec(register, out);
+    out.push(')');
+    true
+}
+
+fn signed_constant_fits(constant: i64, width: u8) -> bool {
+    let bits = u32::from(width) * 8;
+    if bits == 0 {
+        return false;
+    }
+    if bits >= i64::BITS {
+        return true;
+    }
+    let limit = 1_i64 << (bits - 1);
+    (-limit..limit).contains(&constant)
+}
+
+/// Shared C-string quoting for the DecBench renderer.
+fn write_string_lit(value: &str, out: &mut String) {
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            c if (c as u32) < 0x20 || (c as u32) == 0x7f => {
+                let _ = write!(out, "\\x{:02x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn write_call_arg_dec(arg: &Expr, out: &mut String) {
+    // `write_reg_dec` casts pointer arguments to integer addresses for machine
+    // arithmetic. At a call boundary the recovered pointer declaration is the
+    // stronger fact, so pass the pointer itself to the matching prototype.
+    if let Expr::Reg(reg @ VReg::Phys(_)) = arg.semantic() {
+        if declared_reg_ctype(reg).ends_with('*') {
+            write_reg_lvalue_dec(reg, out);
+            return;
+        }
+    }
+    write_expr_dec(arg, out);
+}
+
+/// The exact C pointer type a call argument renders as, when it is known.
+///
+/// Two different pointer types are still a type error, so "renders as a
+/// pointer" is not enough to skip the boundary cast: the rendered type has to
+/// be the declared parameter type. This oracle is consumed as a *proof of
+/// equality* — every arm must answer the spelling `write_call_arg_dec` will
+/// actually print, and anything it cannot name answers `None` so the caller
+/// keeps the cast. Answering a spelling this renderer does not actually print
+/// would suppress a needed cast and emit `-Wincompatible-pointer-types`, which
+/// GCC 14 and later treat as an error.
+fn call_argument_pointer_ctype(arg: &Expr) -> Option<String> {
+    match arg {
+        Expr::Origin { expr, .. } => call_argument_pointer_ctype(expr),
+        Expr::Reg(register @ VReg::Phys(_)) => {
+            let declared = declared_reg_ctype(register);
+            declared.ends_with('*').then_some(declared)
+        }
+        // A string literal has C type `char *` after array-to-pointer decay,
+        // whatever pointee the callee's recovered prototype names.
+        Expr::StringLit { .. } => Some("char *".to_string()),
+        // An indexed load from a pointer-to-pointer declaration renders as
+        // `base[index]`, whose C type is the declaration with one pointer
+        // level removed. This is the ordinary `argv[i]` -> `char *` case; if
+        // the base points to scalars, removing its only `*` produces a
+        // non-pointer type and therefore supplies no pointer proof.
+        Expr::Deref { addr, size } => try_array_index(addr, *size).and_then(|(base, _)| {
+            let element = declared_reg_ctype(&VReg::phys(base));
+            let element = element.strip_suffix('*')?.trim_end().to_string();
+            element.ends_with('*').then_some(element)
+        }),
+        // `write_expr_dec` prints an incoming-argument frame object as
+        // `(void *)(argN)` and every other frame object as `&local_N[0]` over
+        // an `unsigned char local_N[..]` declaration.
+        Expr::StackAddr { object, .. } => Some(
+            if matches!(object, VReg::Phys(name) if dec_plan(|plan| plan.parameter_slot(name).is_some()))
+            {
+                "void *".to_string()
+            } else {
+                "unsigned char *".to_string()
+            },
+        ),
+        _ => None,
+    }
+}
+
+/// Whether a pointer parameter needs its argument reasserted with a cast.
+///
+/// C converts between object pointers through `void *` and permits adding
+/// qualifiers to the pointed-to type. Otherwise the cast is skipped only when
+/// the argument is PROVEN to render with the same pointer spelling. An
+/// argument whose rendered spelling is unknown keeps the cast, because that
+/// includes machine-word address arithmetic, which would otherwise be an
+/// implicit integer-to-pointer conversion.
+fn pointer_parameter_needs_cast(parameter_type: &str, arg: &Expr) -> bool {
+    match call_argument_pointer_ctype(arg) {
+        Some(rendered) => {
+            rendered != parameter_type
+                && rendered != "void *"
+                && parameter_type != "void *"
+                // C permits adding qualifiers to the pointed-to type.  A
+                // string literal has the historical expression type
+                // `char[N]` and decays to `char *`, while every libc string
+                // consumer correctly declares `const char *`.  Reasserting
+                // that ordinary qualification conversion with a cast is
+                // redundant source noise.
+                && !(rendered == "char *" && parameter_type == "const char *")
+        }
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod pointer_parameter_tests {
+    use super::*;
+
+    fn string_literal() -> Expr {
+        Expr::StringLit {
+            value: "Hello, World!".into(),
+        }
+    }
+
+    #[test]
+    fn string_literal_needs_no_cast_when_parameter_adds_const() {
+        assert!(!pointer_parameter_needs_cast(
+            "const char *",
+            &string_literal()
+        ));
+    }
+
+    #[test]
+    fn string_literal_still_needs_cast_for_incompatible_pointer() {
+        assert!(pointer_parameter_needs_cast("long *", &string_literal()));
+    }
+
+    #[test]
+    fn typed_const_char_argument_renders_without_redundant_cast() {
+        let mut rendered = String::new();
+        write_typed_call_arg_dec("const char *", &string_literal(), &mut rendered);
+        assert_eq!(rendered, "\"Hello, World!\"");
+    }
+
+    #[test]
+    fn attributed_const_char_argument_renders_without_redundant_cast() {
+        let argument = string_literal().with_origins(super::super::OriginSet::one(0x1010));
+        let mut rendered = String::new();
+        write_typed_call_arg_dec("const char *", &argument, &mut rendered);
+        assert_eq!(rendered, "\"Hello, World!\"");
+    }
+}
+
+/// Render a value proven to flow through scalar floating-point storage.
+///
+/// AAPCS-VFP commonly materialises a float field as `ldr r3, [base, #off]`
+/// followed by `vmov sN, r3`. The move preserves bits; rendering the ordinary
+/// width-only load as `*(int *)` and then applying `(float)` would perform a
+/// numeric conversion and change every nontrivial value. In a proven VFP
+/// expression, use a float-typed memory read. A surviving core-register value
+/// is reinterpreted through a C99 union rather than numerically converted.
+fn write_float_expr_dec(expr: &Expr, width: u8, out: &mut String) {
+    let float_type = if width == 4 { "float" } else { "double" };
+    match expr {
+        Expr::Origin { expr, .. } => write_float_expr_dec(expr, width, out),
+        Expr::FloatConst {
+            width: literal_width,
+            bits,
+        } if *literal_width == width => write_float_literal(*bits, *literal_width, out),
+        Expr::Reg(register @ VReg::Phys(_)) if declared_reg_ctype(register) == float_type => {
+            write_reg_lvalue_dec(register, out);
+        }
+        // The OTHER float width is a numeric conversion, not a reinterpretation.
+        // Only a value whose declared type is not floating point at all has
+        // bits worth punning; `double` to `float` is `(float)x`, and taking its
+        // bits instead hands back an unrelated number. i386 makes this routine
+        // rather than exotic: `crate::ir::x87` models every x87 stack slot as
+        // binary64, so a `float`-returning function's own result reaches a
+        // four-byte context as a `double`-declared register, and
+        // `172_float_double_widths::single_precision_horner` rendered its whole
+        // Horner evaluation as bit patterns because of it.
+        Expr::Reg(register @ VReg::Phys(_))
+            if matches!(declared_reg_ctype(register).as_str(), "float" | "double") =>
+        {
+            let _ = write!(out, "({float_type})(");
+            write_reg_lvalue_dec(register, out);
+            out.push(')');
+        }
+        // A recovered conversion already states its own result type. Wrapping
+        // it in the reinterpreting union below would take the bits of a value
+        // that was just numerically converted — `(unsigned)((float)arg0)` —
+        // and hand back a different number entirely.
+        Expr::NumericConvert { to, .. } if *to == ScalarType::Float(width) => {
+            write_expr_dec(expr, out);
+        }
+        // A conversion to the OTHER float width is still a number, so narrow or
+        // widen it rather than punning it. `crate::ir::x87` widens every x87
+        // load to binary64, which puts a `(double)` conversion in front of a
+        // `float` context in every i386 single-precision function.
+        Expr::NumericConvert {
+            to: ScalarType::Float(_),
+            ..
+        } => {
+            let _ = write!(out, "({float_type})(");
+            write_expr_dec(expr, out);
+            out.push(')');
+        }
+        Expr::Call { .. } if float_rendered_width(expr) == Some(width) => {
+            // The call's C prototype already makes this a floating VALUE.
+            // Reinterpreting it through the fallback union would first convert
+            // the number to an integer and then treat that integer as IEEE
+            // bits, changing every nonzero result.
+            write_expr_dec(expr, out);
+        }
+        Expr::Deref {
+            addr,
+            size: access_width,
+        } if *access_width == width => {
+            let _ = write!(out, "*({float_type} *)(");
+            write_expr_dec(addr, out);
+            out.push(')');
+        }
+        Expr::Bin { op, lhs, rhs }
+            if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) =>
+        {
+            out.push('(');
+            write_float_expr_dec(lhs, width, out);
+            let _ = write!(out, " {} ", binop_sym_c(*op));
+            write_float_expr_dec(rhs, width, out);
+            out.push(')');
+        }
+        Expr::Un { op: UnOp::Neg, src } => {
+            out.push_str("(-");
+            write_float_expr_dec(src, width, out);
+            out.push(')');
+        }
+        Expr::Select {
+            cond,
+            if_true,
+            if_false,
+            ..
+        } => {
+            out.push('(');
+            write_expr_dec(cond, out);
+            out.push_str(" ? ");
+            write_float_expr_dec(if_true, width, out);
+            out.push_str(" : ");
+            write_float_expr_dec(if_false, width, out);
+            out.push(')');
+        }
+        _ if width == 4 => {
+            out.push_str("((union { unsigned int bits; float value; }){ .bits = (unsigned int)(");
+            write_expr_dec(expr, out);
+            out.push_str(") }).value");
+        }
+        _ => {
+            out.push_str(
+                "((union { unsigned long long bits; double value; }){ .bits = (unsigned long long)(",
+            );
+            write_expr_dec(expr, out);
+            out.push_str(") }).value");
+        }
+    }
+}
+
+/// The width of the C floating type a value RENDERS AS, when it renders as one.
+///
+/// The mirror of the question [`write_float_expr_dec`] answers. That direction
+/// is asked "these are bits, how do I spell them as a `float`"; this one is
+/// asked "this spelling IS a `float`, how do I spell its bits". Only a value
+/// whose printed C type is genuinely floating point answers, because the
+/// reinterpretation this gates is not free to apply to a value that was never
+/// a `float`.
+///
+/// Four spellings qualify, and the boundary between them and everything else
+/// is the reason this can be a rule rather than a heuristic:
+///
+///  * a register the type recovery declared `float`/`double` — the machine
+///    moved it with `movss`/`movsd`/`vmov`, which copies bits;
+///  * a recovered conversion whose stated result type is floating, which
+///    `write_expr_dec` prints as `(float)(…)`/`(double)(…)`;
+///  * a floating literal; and
+///  * floating arithmetic over any of those.
+///
+/// A genuine `cvttss2si` is `NumericConvert { to: SignedInt }` and prints as
+/// `(int)(…)`, so it answers `None` and keeps its arithmetic meaning. That is
+/// what stops the reinterpretation from swallowing the conversions C really
+/// does perform, and it is a structural distinction rather than a guess: the
+/// lifter states the conversion's result type, and this reads it.
+///
+/// The recursion is deliberately NOT extended to `Expr::Select`, whose two arms
+/// can disagree, or to a `Deref`, which has no type of its own beyond its
+/// access width — neither has an instance in the fixture corpus and neither is
+/// verified here.
+fn float_rendered_width(expr: &Expr) -> Option<u8> {
+    match expr {
+        Expr::Origin { expr, .. } => float_rendered_width(expr),
+        Expr::Reg(register @ VReg::Phys(_)) => match declared_reg_ctype(register).as_str() {
+            "float" => Some(4),
+            "double" => Some(8),
+            _ => None,
+        },
+        Expr::NumericConvert {
+            to: ScalarType::Float(width),
+            ..
+        } => Some(*width),
+        Expr::FloatConst { width, .. } => Some(*width),
+        Expr::Call {
+            call_spec: Some(call_spec),
+            ..
+        } => match call_spec.call_prototype.return_type.as_str() {
+            "float" => Some(4),
+            "double" => Some(8),
+            _ => None,
+        },
+        // Floating ARITHMETIC, which `write_float_expr_dec` already renders
+        // recursively — this only decides whether to ask it. One floating
+        // operand is enough, because C's usual arithmetic conversions make the
+        // whole expression floating (C23 6.3.1.8) and the machine agreed: the
+        // instruction was `divss`, not `div`. Bounded to the four operators
+        // that HAVE a floating form, so a bitwise or shift operand (which C
+        // gives no floating operand at all) is not swept in here.
+        Expr::Bin { op, lhs, rhs }
+            if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) =>
+        {
+            float_rendered_width(lhs).or_else(|| float_rendered_width(rhs))
+        }
+        Expr::Un { op: UnOp::Neg, src } => float_rendered_width(src),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod float_origin_tests {
+    use super::*;
+
+    #[test]
+    fn attributed_float_arithmetic_remains_a_numeric_value() {
+        let expression = Expr::Un {
+            op: UnOp::Neg,
+            src: Box::new(Expr::FloatConst {
+                width: 4,
+                bits: (1.0_f32).to_bits() as u64,
+            }),
+        }
+        .with_origins(super::super::OriginSet::one(0x4010));
+
+        assert_eq!(float_rendered_width(&expression), Some(4));
+        let mut rendered = String::new();
+        write_float_expr_dec(&expression, 4, &mut rendered);
+        assert_eq!(rendered, "(-1.0f)");
+    }
+}
+
+/// Render a floating value's BIT PATTERN, for a destination that is declared
+/// an integer and cannot be respelled.
+///
+/// `unsigned int bits = value;` where `value` is a `float` is a C *value*
+/// conversion — C23 6.3.1.4 truncates toward zero — so `1.5f` was written as
+/// `1`, not `0x3FC00000`. The machine's `movss %xmm0, -0x14(%rbp)` is a bit
+/// copy, and the C spelling for that is the same C99 union
+/// [`write_float_expr_dec`] already uses for the other direction, read from
+/// the member that was not written. `-fno-strict-aliasing` is not required:
+/// reading a different member of a union whose value was set through another
+/// member is what C23 6.5.3.4 footnote 106 defines, and it is the pun both GCC
+/// and Clang document as supported.
+///
+/// The union's integer member is the width of the SOURCE, not of the
+/// destination. Four bytes of `float` reaching an eight-byte lvalue is a
+/// partial register write whose upper half the instruction never defined; the
+/// zero extension C then applies is the same assumption
+/// `write_float_expr_dec`'s fallback makes in the other direction.
+fn write_float_bits_expr_dec(expr: &Expr, width: u8, out: &mut String) {
+    if width == 4 {
+        out.push_str("((union { unsigned int bits; float value; }){ .value = ");
+    } else {
+        out.push_str("((union { unsigned long long bits; double value; }){ .value = ");
+    }
+    write_float_expr_dec(expr, width, out);
+    out.push_str(" }).bits");
+}
+
+/// Render one argument against the exact parameter type consumed by this call.
+///
+/// C validates a conditional expression's two arms before applying an outer
+/// cast, so `(void *)(cond ? word : pointer)` is still ill-typed in C23.  Push
+/// the call-boundary conversion into each arm while retaining the explicit
+/// casts used for authoritative library prototypes.
+fn write_typed_call_arg_dec(parameter_type: &str, arg: &Expr, out: &mut String) {
+    if let Expr::Select {
+        cond,
+        if_true,
+        if_false,
+        ..
+    } = arg.semantic()
+    {
+        out.push('(');
+        write_expr_dec(cond, out);
+        out.push_str(" ? ");
+        write_typed_call_arg_dec(parameter_type, if_true, out);
+        out.push_str(" : ");
+        write_typed_call_arg_dec(parameter_type, if_false, out);
+        out.push(')');
+        return;
+    }
+
+    // The middle layer may preserve a pointer value as an explicit
+    // pointer-width integer cast. Once an authoritative pointer parameter
+    // supplies the consuming type, retaining that transport cast creates the
+    // noisy and weaker `(T *)((long)(pointer))` spelling. Strip exactly one
+    // width-proved representation wrapper, and only when the inner expression
+    // already renders as a pointer compatible with the parameter.
+    if parameter_type.ends_with('*') {
+        if let Expr::Cast { width, expr, .. } = arg.semantic() {
+            let pointer_width = DEC_POINTER_WIDTH.with(std::cell::Cell::get);
+            if *width == pointer_width && !pointer_parameter_needs_cast(parameter_type, expr) {
+                write_call_arg_dec(expr, out);
+                return;
+            }
+        }
+    }
+
+    if let Some(width) = dec_plan(|plan| plan.aggregate_value_width(parameter_type)) {
+        if let Expr::Reg(register) = arg.semantic() {
+            if declared_reg_ctype(register) == parameter_type {
+                write_reg_lvalue_dec(register, out);
+                return;
+            }
+        }
+        let carrier =
+            aggregate_carrier_ctype(width).expect("aggregate widths are filtered by plan");
+        let _ = write!(
+            out,
+            "((union {{ {parameter_type} object; {carrier} bits; }}){{ .bits = ({carrier})("
+        );
+        write_call_arg_dec(arg, out);
+        out.push_str(") }).object");
+        return;
+    }
+
+    if matches!(parameter_type, "float" | "double") {
+        // A source-level parameter already declared with the exact scalar
+        // floating type needs no conversion at the call boundary.  Retain the
+        // explicit cast for machine-word carriers, where it is the evidence
+        // that the bits belong to the VFP storage class rather than an integer
+        // numeric conversion.
+        if let Expr::Reg(register) = arg.semantic() {
+            if declared_reg_ctype(register) == parameter_type {
+                write_call_arg_dec(arg, out);
+                return;
+            }
+        }
+        out.push('(');
+        out.push_str(parameter_type);
+        out.push_str(")(");
+        write_float_expr_dec(arg, if parameter_type == "float" { 4 } else { 8 }, out);
+        out.push(')');
+        return;
+    }
+
+    if let Some(address) = declared_global_integer_call_arg_through_views(parameter_type, arg) {
+        out.push_str(&dec_global_name(address));
+        return;
+    }
+    if let Some(register) = declared_integer_call_arg_through_views(parameter_type, arg) {
+        write_reg_lvalue_dec(register, out);
+        return;
+    }
+    if integer_call_arg_cast_is_redundant(parameter_type, arg) {
+        write_call_arg_dec(arg, out);
+        return;
+    }
+    if parameter_type.ends_with('*') && !pointer_parameter_needs_cast(parameter_type, arg) {
+        write_call_arg_dec(arg, out);
+        return;
+    }
+    out.push('(');
+    out.push_str(parameter_type);
+    out.push_str(")(");
+    write_call_arg_dec(arg, out);
+    out.push(')');
+}
+
+/// The scalar-global counterpart of
+/// [`declared_integer_call_arg_through_views`]. An exact symbol extent and an
+/// equal-width load prove that the expression already has the parameter's
+/// integer width; surrounding wider register views vanish at that boundary.
+fn declared_global_integer_call_arg_through_views(parameter_type: &str, arg: &Expr) -> Option<u64> {
+    let pointer_width = DEC_POINTER_WIDTH.with(std::cell::Cell::get);
+    let parameter_width =
+        crate::ir::call_contracts::integer_c_type_width(parameter_type, pointer_width)?;
+    let mut current = arg;
+    loop {
+        current = current.semantic();
+        let Expr::Cast { width, expr, .. } = current else {
+            break;
+        };
+        if *width < parameter_width {
+            return None;
+        }
+        current = expr;
+    }
+    let Expr::Deref { addr, size } = current.semantic() else {
+        return None;
+    };
+    let address = direct_global_address(addr)?;
+    (*size == parameter_width && dec_global_scalar_width(address) == Some(*size)).then_some(address)
+}
+
+/// Recover a declared integer value hidden only by non-narrowing machine views.
+///
+/// An `int` argument commonly arrives as `(uint64_t)(uint32_t)x` after x86-64
+/// register canonicalisation. Passing it to an `int` parameter selects the low
+/// 32 bits again, exactly as passing `x` directly does. A view narrower than
+/// the parameter can discard information, so that chain deliberately declines.
+fn declared_integer_call_arg_through_views<'a>(
+    parameter_type: &str,
+    arg: &'a Expr,
+) -> Option<&'a VReg> {
+    let pointer_width = DEC_POINTER_WIDTH.with(std::cell::Cell::get);
+    let parameter_width =
+        crate::ir::call_contracts::integer_c_type_width(parameter_type, pointer_width)?;
+    let mut current = arg;
+    loop {
+        current = current.semantic();
+        let Expr::Cast { width, expr, .. } = current else {
+            break;
+        };
+        if *width < parameter_width {
+            return None;
+        }
+        current = expr;
+    }
+    let Expr::Reg(register @ VReg::Phys(_)) = current.semantic() else {
+        return None;
+    };
+    (declared_reg_ctype(register) == parameter_type).then_some(register)
+}
+
+/// Whether the call-boundary cast onto `parameter_type` would convert nothing.
+///
+/// The cast exists because the argument's machine carrier is usually wider than
+/// the parameter — `(int)(rsi)` on a `long`-declared register is a real
+/// truncation and must stay. It is noise when the argument is already exactly
+/// that type, and noise at a call boundary is not free: `arm_hf_mixed_callee(
+/// (int)(7), arg0, (int)(arg1))` in place of `arm_hf_mixed_callee(7, arg0,
+/// arg1)` is three casts a reader must check and discard.
+///
+/// Deliberately narrow. Only two things are admitted:
+///
+/// * a register whose OWN declaration in this render is that same type, so the
+///   conversion is the identity by construction; and
+/// * an integer literal the type represents exactly, where C's own conversion
+///   at the (in-scope, declared) prototype does the same thing the cast would.
+///
+/// Anything else — a pointer, an expression, a type this does not recognise —
+/// keeps its cast. Being wrong in that direction costs a redundant cast; being
+/// wrong in the other direction silently drops a truncation.
+fn integer_call_arg_cast_is_redundant(parameter_type: &str, arg: &Expr) -> bool {
+    match arg.semantic() {
+        Expr::Reg(register @ VReg::Phys(_)) => declared_reg_ctype(register) == parameter_type,
+        Expr::Const(value) => signed_integer_type_represents(parameter_type, *value),
+        // A symbolised code address already renders as `(long)(name)`; the call
+        // boundary would otherwise wrap that in a second identical cast.
+        Expr::Named { .. } => parameter_type == "long",
+        _ => false,
+    }
+}
+
+/// Whether `c_type` is a signed integer type that holds `value` exactly.
+fn signed_integer_type_represents(c_type: &str, value: i64) -> bool {
+    let (low, high) = match c_type {
+        "signed char" | "int8_t" => (i64::from(i8::MIN), i64::from(i8::MAX)),
+        "short" | "int16_t" => (i64::from(i16::MIN), i64::from(i16::MAX)),
+        "int" | "signed int" | "int32_t" => (i64::from(i32::MIN), i64::from(i32::MAX)),
+        "long" | "long long" | "int64_t" => (i64::MIN, i64::MAX),
+        _ => return false,
+    };
+    (low..=high).contains(&value)
+}
+
+/// Re-spell an unsigned-looking immediate in the signed destination's value
+/// domain when the two spellings have the same two's-complement bit pattern.
+///
+/// The lifters preserve immediates as machine bit patterns, so a 32-bit
+/// `0xffff_ffff` commonly reaches the typed renderer as positive `4294967295`.
+/// Once the consuming declaration proves `int32_t`, C will truncate those bits
+/// to that destination. Printing `-1` states the resulting source-level value
+/// directly and avoids an implementation-defined out-of-range conversion.
+/// Unknown, unsigned, boolean, pointer, and 64-bit destinations decline.
+pub(super) fn signed_destination_literal(
+    c_type: &str,
+    value: i64,
+    pointer_width: u8,
+) -> Option<i64> {
+    if value < 0 {
+        return None;
+    }
+    let width = match c_type.trim() {
+        "signed char" | "int8_t" => 1,
+        "short" | "signed short" | "short int" | "signed short int" | "int16_t" => 2,
+        "int" | "signed" | "signed int" | "int32_t" => 4,
+        "long" | "signed long" | "long int" | "signed long int" => pointer_width,
+        "long long" | "signed long long" | "long long int" | "signed long long int" | "int64_t" => {
+            8
+        }
+        _ => return None,
+    };
+    // Expr::Const is i64, so an unsigned-looking 64-bit value with its sign
+    // bit set cannot be represented as a positive input here. Negative i64
+    // literals are already printed in their signed value domain.
+    if width == 0 || width >= 8 {
+        return None;
+    }
+    let bits = u32::from(width) * 8;
+    let modulus = 1_i128 << bits;
+    let raw = i128::from(value);
+    if raw >= modulus || raw < modulus / 2 {
+        return None;
+    }
+    i64::try_from(raw - modulus).ok()
+}
+
+fn effective_call_site_spec(
+    target: &Expr,
+    args: &[Expr],
+    dst: Option<&VReg>,
+    call_spec: Option<&CallSiteSpec>,
+) -> CallSiteSpec {
+    call_spec
+        .cloned()
+        .unwrap_or_else(|| crate::ir::call_contracts::recover_call_site_spec(target, args, dst))
+}
+
+fn call_prototype_for_render(
+    target: &Expr,
+    args: &[Expr],
+    dst: Option<&VReg>,
+    call_spec: Option<&CallSiteSpec>,
+) -> (CallSiteSpec, Option<CallPrototype>, bool) {
+    let target = target.semantic();
+    let mut call_spec = effective_call_site_spec(target, args, dst, call_spec);
+    call_spec.call_prototype = c_language_prototype(&call_spec.call_prototype);
+    call_spec.callee_prototype = call_spec
+        .callee_prototype
+        .as_ref()
+        .map(c_language_prototype);
+    let declaration = match target {
+        Expr::Named { name, .. } => selected_named_call_prototype(name),
+        _ => None,
+    };
+    let requires_cast = declaration.as_ref().is_some_and(|declaration| {
+        !crate::ir::call_contracts::prototype_accepts(declaration, &call_spec.call_prototype)
+    });
+    (call_spec, declaration, requires_cast)
+}
+
+fn write_call_pointer_declarator(prototype: &CallPrototype, out: &mut String) {
+    out.push_str(&prototype.return_type);
+    out.push_str(" (*)(");
+    if prototype.parameter_types.is_empty() {
+        out.push_str("void");
+    } else {
+        for (index, parameter_type) in prototype.parameter_types.iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(parameter_type);
+        }
+        if prototype.variadic {
+            out.push_str(", ...");
+        }
+    }
+    out.push(')');
+}
+
+fn write_call_dec(
+    target: &Expr,
+    args: &[Expr],
+    dst: Option<&VReg>,
+    call_spec: Option<&CallSiteSpec>,
+    out: &mut String,
+) {
+    let (call_spec, declaration, requires_cast) =
+        call_prototype_for_render(target, args, dst, call_spec);
+    match target.semantic() {
+        Expr::Named { name, .. } => {
+            let displayed = sanitize_c_ident(callee_display_name(name));
+            if requires_cast {
+                out.push_str("((");
+                write_call_pointer_declarator(&call_spec.call_prototype, out);
+                out.push(')');
+                out.push_str(&displayed);
+                out.push(')');
+            } else {
+                out.push_str(&displayed);
+            }
+        }
+        _ => {
+            out.push_str("((");
+            write_call_pointer_declarator(&call_spec.call_prototype, out);
+            out.push_str(")(");
+            write_expr_dec(target, out);
+            out.push_str("))");
+        }
+    }
+    // The callee's source-level name, for the symbolic-constant annotation
+    // below. Only a directly-named call can be looked up: an indirect call
+    // through a pointer is not known to be `mprotect` just because it might
+    // be.
+    let annotated_callee = match target.semantic() {
+        Expr::Named { name, .. } => Some(sanitize_c_ident(callee_display_name(name))),
+        _ => None,
+    };
+    out.push('(');
+    let variadic_parameter_types = printf_variadic_parameter_types(target, args);
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let emitted_prototype = if requires_cast || declaration.is_none() {
+            &call_spec.call_prototype
+        } else {
+            declaration
+                .as_ref()
+                .expect("a direct uncast call has a selected declaration")
+        };
+        if let Some(parameter_type) = emitted_prototype.parameter_types.get(i) {
+            if let Some(register) = declared_integer_call_arg_through_views(parameter_type, a) {
+                write_reg_lvalue_dec(register, out);
+                continue;
+            }
+            // The expression and function-pointer declarator must consume the
+            // same call-site type. This is essential for recovered pointer
+            // parameters too: a machine-word carrier such as `rbp` otherwise
+            // makes the generated C invalid even though the ABI fact is sound.
+            let representation_mismatch =
+                parameter_type.ends_with('*') != expression_has_pointer_representation(a);
+            if emitted_prototype.authority == CallPrototypeAuthority::Authoritative
+                // Address arithmetic is rendered in machine-word form even
+                // when its base has pointer representation. Reassert every
+                // recovered pointer parameter at the consuming boundary so C
+                // sees the ABI pointer rather than an implicit integer cast.
+                //
+                // The cast is skipped only on PROOF that the argument already
+                // renders as this exact pointer spelling. "Renders as some
+                // pointer" is not that proof: a string literal is `char *` and
+                // a frame object is `unsigned char *`, both incompatible with
+                // a recovered `long *`/`int *` parameter, and C rejects the
+                // call outright rather than converting.
+                || (parameter_type.ends_with('*')
+                    && pointer_parameter_needs_cast(parameter_type, a))
+                || representation_mismatch
+                // A recovered AAPCS-VFP parameter still proves the consuming
+                // storage class.  Render its complete expression in float
+                // context so core-loaded IEEE payloads remain bit-preserving;
+                // C's ordinary implicit conversion would invent a `vcvt` that
+                // is absent from the binary.
+                || matches!(parameter_type.as_str(), "float" | "double")
+            {
+                write_typed_call_arg_dec(parameter_type, a, out);
+            } else {
+                write_call_arg_dec(a, out);
+            }
+        } else if let Some(parameter_type) = variadic_parameter_types
+            .as_ref()
+            .and_then(|types| types.get(i))
+            .and_then(Option::as_deref)
+        {
+            // A completely parsed literal printf format is a real type
+            // contract for its variadic tail. Use it exactly like a fixed
+            // prototype parameter; unsupported formats leave every entry
+            // unknown and retain the representation-preserving spelling.
+            write_typed_call_arg_dec(parameter_type, a, out);
+        } else {
+            // Variadic tails and unknown calls retain their recovered value
+            // spelling; default argument promotions belong to the C compiler.
+            write_call_arg_dec(a, out);
+        }
+        // Name the magic numbers. `mprotect(page, 4096, 5)` is correct and
+        // nearly unreadable; the 5 is PROT_READ|PROT_EXEC, which is the most
+        // interesting thing in the call. As a COMMENT and not a substitution,
+        // because this render is recompiled by the execution differential and
+        // a bare `PROT_READ` would need headers the renderer does not emit.
+        if let Some(callee) = annotated_callee.as_deref() {
+            if let Some(value) = crate::ir::named_constants::constant_argument_value(a) {
+                if let Some(name) = crate::ir::named_constants::symbolic_name(callee, i, value) {
+                    let _ = write!(out, " /* {name} */");
+                }
+            }
+        }
+    }
+    out.push(')');
+}
+
+/// Per-argument C types proven by a literal `printf`-family format string.
+///
+/// The shared parser declines positional parameters, dynamic widths, and all
+/// unsupported conversions atomically. Fixed arguments remain `None`; only the
+/// variadic conversions receive types. Integer formats narrower than `int`
+/// consume promoted `int`/`unsigned int` values at the ABI boundary.
+fn printf_variadic_parameter_types(target: &Expr, args: &[Expr]) -> Option<Vec<Option<String>>> {
+    let Expr::Named { name, .. } = target.semantic() else {
+        return None;
+    };
+    let clean = callee_display_name(name);
+    let (format_index, variadic_start): (usize, usize) = match clean {
+        "printf" => (0, 1),
+        "fprintf" => (1, 2),
+        "__printf_chk" => (1, 2),
+        "__fprintf_chk" => (2, 3),
+        "error" => (2, 3),
+        _ => return None,
+    };
+    let Expr::StringLit { value } = args.get(format_index)?.semantic() else {
+        return None;
+    };
+    let pointer_width = DEC_POINTER_WIDTH.with(std::cell::Cell::get);
+    let hints = crate::ir::printf_format::parse_printf_hints(value, pointer_width)?;
+    if variadic_start.checked_add(hints.len())? != args.len() {
+        return None;
+    }
+    let mut types = vec![None; args.len()];
+    for (index, hint) in hints.into_iter().enumerate() {
+        let c_type = match hint {
+            TypeHint::Int { signed, width } if width <= 4 => {
+                if signed { "int" } else { "unsigned int" }.to_string()
+            }
+            TypeHint::Int { signed, width } => int_ctype(signed, width).to_string(),
+            TypeHint::Pointer { pointee_width: 1 } => "const char *".to_string(),
+            TypeHint::Pointer { .. } | TypeHint::CodePointer => "void *".to_string(),
+            TypeHint::Float { .. } => "double".to_string(),
+            TypeHint::BoolLike => "int".to_string(),
+        };
+        types[variadic_start + index] = Some(c_type);
+    }
+    Some(types)
+}
+
+fn expression_has_pointer_representation(expr: &Expr) -> bool {
+    match expr {
+        Expr::Origin { expr, .. } => expression_has_pointer_representation(expr),
+        Expr::Reg(register @ VReg::Phys(name)) => {
+            declared_reg_ctype(register).ends_with('*') || dec_is_stack_object(name)
+        }
+        Expr::Named { .. }
+        | Expr::FunctionTableEntry { .. }
+        | Expr::StringLit { .. }
+        | Expr::StackAddr { .. }
+        | Expr::Lea { .. }
+        | Expr::PdbFieldAddr { .. } => true,
+        Expr::Select {
+            if_true, if_false, ..
+        } => {
+            expression_has_pointer_representation(if_true)
+                || expression_has_pointer_representation(if_false)
+        }
+        Expr::Bin {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } => {
+            expression_has_pointer_representation(lhs) || expression_has_pointer_representation(rhs)
+        }
+        Expr::Bin {
+            op: BinOp::Sub,
+            lhs,
+            rhs,
+        } => {
+            expression_has_pointer_representation(lhs)
+                && !expression_has_pointer_representation(rhs)
+        }
+        Expr::Deref { addr, .. } => renderable_field_access(addr).is_some_and(|(_, _, hint)| {
+            hint.field_type
+                .as_deref()
+                .is_some_and(|field_type| field_type.trim_end().ends_with('*'))
+        }),
+        // A numeric conversion produces an arithmetic value by construction:
+        // `(double)p` is not a pointer, whatever `p` was.
+        Expr::NumericConvert { .. } => false,
+        cast @ Expr::Cast { expr, .. } => {
+            let direct_pointer = matches!(expr.as_ref(), Expr::Reg(register @ VReg::Phys(_))
+                if declared_reg_ctype(register).ends_with('*'));
+            direct_pointer
+                || redundant_declared_integer_cast(cast).is_some_and(|reg| {
+                    matches!(reg, VReg::Phys(name) if dec_ptr_arg_type(name).is_some()
+                        || dec_struct_ptr_type(name).is_some()
+                        || dec_ptr_width(name).is_some()
+                        || dec_is_stack_object(name))
+                })
+        }
+        // A direct image address that was proven to be writable static storage
+        // is spelled `&glaurung_global_X[0]` — a real C pointer, not the
+        // integer literal the address used to render as. The classifier has to
+        // agree with the printer or every integer-typed consumer receives a
+        // pointer without a conversion.
+        Expr::Addr(address) => dec_is_global_addr(*address),
+        Expr::Call { call_spec, .. } => call_spec
+            .as_ref()
+            .is_some_and(|spec| spec.call_prototype.return_type.trim_end().ends_with('*')),
+        Expr::Reg(_)
+        | Expr::Const(_)
+        | Expr::FloatConst { .. }
+        | Expr::Bin { .. }
+        | Expr::Un { .. }
+        | Expr::Cmp { .. }
+        | Expr::WideArithmetic { .. }
+        | Expr::Unknown(_) => false,
+    }
+}
+
+fn write_expr_for_destination_dec(destination_type: &str, src: &Expr, out: &mut String) {
+    let pointer_width = DEC_POINTER_WIDTH.with(std::cell::Cell::get);
+    let semantic_wide =
+        crate::ir::call_contracts::integer_c_type_width(destination_type, pointer_width)
+            .is_some_and(|width| width > pointer_width);
+    DEC_SEMANTIC_WIDE_CAST.with(|context| {
+        let previous = context.replace(context.get() || semantic_wide);
+        write_expr_dec(src, out);
+        context.set(previous);
+    });
+}
+
+/// Is `c_type` the C boolean, whose conversion is a zero test rather than a
+/// truncation?
+///
+/// Both spellings reach the renderer: DWARF emits `_Bool` for C and `bool` for
+/// C++, and `dwarf_render_types` passes the source spelling through unchanged.
+fn is_bool_ctype(c_type: &str) -> bool {
+    matches!(c_type.trim(), "_Bool" | "bool")
+}
+
+/// Is this expression already 0 or 1, so that converting it to `_Bool` cannot
+/// change it?
+///
+/// A C relational or equality operator yields 0 or 1 by definition (C23
+/// 6.5.8p6, 6.5.9p3), which is what a recovered `setcc`/`test` renders as, and
+/// a literal states its own value. Narrowing either would be output churn with
+/// no semantic content — and `nrw194_bool_bit` (`test $0x100 ; setne %al`) is
+/// exactly that case, already passing.
+fn is_normalised_boolean(e: &Expr) -> bool {
+    match e {
+        Expr::Origin { expr, .. } => is_normalised_boolean(expr),
+        Expr::Cmp { .. } => true,
+        Expr::Const(value) => matches!(value, 0 | 1),
+        // An INTEGER cast (which `Expr::Cast` is by construction) cannot turn
+        // 0 or 1 into anything else: truncation keeps both, and either
+        // extension of them is itself. A float `NumericConvert` deliberately
+        // does not qualify — `(int)3.5` is 3.
+        Expr::Cast { expr, .. } => is_normalised_boolean(expr),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod boolean_origin_tests {
+    use super::*;
+
+    #[test]
+    fn attributed_comparison_remains_a_normalised_boolean() {
+        let comparison = Expr::Cmp {
+            op: CmpOp::Eq,
+            lhs: Box::new(Expr::Reg(VReg::phys("arg0"))),
+            rhs: Box::new(Expr::Const(0)),
+        }
+        .with_origins(super::super::OriginSet::one(0x4010));
+
+        let mut rendered = String::new();
+        write_representation_value_dec("_Bool", &comparison, &mut rendered);
+        assert_eq!(rendered, "(arg0 == 0)");
+    }
+}
+
+/// Render a value against the declaration that consumes it.
+///
+/// The AST retains machine values even when type recovery proves that one side
+/// of the C boundary is a pointer. Explicit casts preserve those address bits
+/// and keep the generated unit valid under the producer's real diagnostics;
+/// implicit pointer/integer conversions are neither valid C23 nor useful
+/// evidence about the recovered program.
+fn write_representation_value_dec(destination_type: &str, src: &Expr, out: &mut String) {
+    let src = src.semantic();
+
+    if let Expr::Select {
+        cond,
+        if_true,
+        if_false,
+        ..
+    } = src
+    {
+        let canonical_true =
+            is_one_lazy_call_times_two(if_false) && unsigned_all_ones_width(if_true).is_some();
+        let canonical_false =
+            is_one_lazy_call_times_two(if_true) && unsigned_all_ones_width(if_false).is_some();
+        // C type-checks the two conditional operands before applying an outer
+        // cast. Convert each arm at the recovered destination boundary so a
+        // pointer-shaped literal and a machine word form one valid expression.
+        out.push('(');
+        write_expr_dec(cond, out);
+        out.push_str(" ? ");
+        if canonical_true {
+            write_select_arm_dec(if_true, true, out);
+        } else {
+            write_representation_value_dec(destination_type, if_true, out);
+        }
+        out.push_str(" : ");
+        if canonical_false {
+            write_select_arm_dec(if_false, true, out);
+        } else {
+            write_representation_value_dec(destination_type, if_false, out);
+        }
+        out.push(')');
+        return;
+    }
+
+    if let Expr::Cast {
+        signed,
+        width,
+        expr,
+    } = src
+    {
+        if let Expr::Select {
+            cond,
+            if_true,
+            if_false,
+            ..
+        } = expr.as_ref()
+        {
+            let cast_type = int_ctype(*signed, *width);
+            let destination_is_pointer = destination_type.ends_with('*');
+            if destination_is_pointer {
+                let _ = write!(out, "({destination_type})(");
+            }
+            let _ = write!(out, "({cast_type})(");
+            write_expr_dec(cond, out);
+            out.push_str(" ? ");
+            // An outer integer cast does not make a pointer/integer conditional
+            // valid: C resolves the two arms first. Convert each arm at the
+            // cast's own representation boundary before forming the select.
+            write_representation_value_dec(cast_type, if_true, out);
+            out.push_str(" : ");
+            write_representation_value_dec(cast_type, if_false, out);
+            out.push_str(")");
+            if destination_is_pointer {
+                out.push(')');
+            }
+            return;
+        }
+    }
+
+    if let Some(width) = dec_plan(|plan| plan.aggregate_value_width(destination_type)) {
+        if let Expr::Reg(register) = src.semantic() {
+            if declared_reg_ctype(register) == destination_type {
+                write_reg_lvalue_dec(register, out);
+                return;
+            }
+        }
+        let carrier =
+            aggregate_carrier_ctype(width).expect("aggregate widths are filtered by plan");
+        let _ = write!(
+            out,
+            "((union {{ {destination_type} object; {carrier} bits; }}){{ .bits = "
+        );
+        if float_rendered_width(src) == Some(width) {
+            // A scalar floating register can be the ABI carrier for an
+            // INTEGER-class union. C's numeric cast would truncate its value;
+            // retain the exact IEEE payload before rebuilding the union.
+            write_float_bits_expr_dec(src, width, out);
+        } else {
+            let _ = write!(out, "({carrier})(");
+            write_expr_dec(src, out);
+            out.push(')');
+        }
+        out.push_str(" }).object");
+        return;
+    }
+
+    if matches!(destination_type, "float" | "double") {
+        write_float_expr_dec(src, if destination_type == "float" { 4 } else { 8 }, out);
+        return;
+    }
+
+    if let Expr::Const(value) = src.semantic() {
+        let pointer_width = DEC_POINTER_WIDTH.with(std::cell::Cell::get);
+        if let Some(signed_value) =
+            signed_destination_literal(destination_type, *value, pointer_width)
+        {
+            write_const_dec(signed_value, out);
+            return;
+        }
+    }
+
+    // ...and the mirror of it, which did not exist. This function picks the
+    // conversion from the DESTINATION type alone, so an integer-declared
+    // destination fed by a value that renders as a `float` got C's arithmetic
+    // conversion — a truncation toward zero — where the machine had done a bit
+    // copy. GCC's `-O0` `memcpy(&bits, &value, 4)` is `movss %xmm0, -0x14(%rbp)`
+    // then `mov -0x14(%rbp), %eax`, and rendering that as `bits = value;` wrote
+    // `1` for `1.5f` (`174:*:O0:fp174_float_bits`, whose four callers are all
+    // `fail`; `172:gcc:O0:double_precision_horner` is the `double` form).
+    //
+    // `_Bool` is excluded because C's conversion to it is a TEST against zero
+    // (C23 6.3.1.2), which is meaningful on the floating value itself and is
+    // what the arm below spells; punning first would test the bit pattern, and
+    // `-0.0` would read as `true`. Pointers are excluded because a float has no
+    // address semantics to preserve and the pointer arms below own that case.
+    if !is_bool_ctype(destination_type) && !destination_type.ends_with('*') {
+        if let Some(width) = float_rendered_width(src) {
+            write_float_bits_expr_dec(src, width, out);
+            return;
+        }
+    }
+
+    if is_bool_ctype(destination_type)
+        && !expression_has_pointer_representation(src)
+        && !is_normalised_boolean(src)
+    {
+        // C converts a value to `_Bool` by comparing it against zero — 6.3.1.2,
+        // "the result is 0 if the value compares equal to 0; otherwise 1" —
+        // and to every OTHER integer type by reducing it modulo that type's
+        // width (6.3.1.3). The modular case is exactly what the machine did, so
+        // the conversion C already performs at the boundary is the right one
+        // and spelling a cast for it would change nothing on the ~650
+        // `int32_t`-returning functions in the corpus. `_Bool` is the sole type
+        // where the language's conversion is a TEST rather than a truncation,
+        // and therefore the sole type where the boundary has to be narrowed
+        // explicitly first.
+        //
+        // It has to be narrowed because the ABI puts a `_Bool` result in `al`
+        // alone and says nothing about the rest of the register (SysV AMD64
+        // psABI 3.2.3; AAPCS64 4.1). `nrw194_bool_and` at clang -O2 is
+        // `and %edi,%eax ; and $0x1,%al` — a bit-preserving byte AND whose
+        // partial write this recovery models exactly, then returns the whole
+        // merged register. For x == y == -64 the source answers 0 while
+        // `(var8 & -256) | (var8 & 1)` is 0x1FFFFF00, which `!= 0` reads as
+        // `true`.
+        //
+        // Narrowing to `unsigned char` and testing that is the ABI's own
+        // reading of the register, and it is what the caller does.
+        out.push_str("((unsigned char)(");
+        write_expr_dec(src, out);
+        out.push_str(") != 0)");
+        return;
+    }
+
+    let destination_is_pointer = destination_type.ends_with('*');
+
+    // A pointer identity may retain the machine's explicit integer transport
+    // cast in the AST even after the declaration plan has selected a concrete
+    // pointer type for the underlying value. At a pointer-typed assignment or
+    // return boundary, strip exactly one pointer-width wrapper. Preserve an
+    // explicit pointer-to-pointer cast when the source and destination pointee
+    // types differ; only the integer round trip is redundant.
+    if destination_is_pointer {
+        if let Expr::Cast { width, expr, .. } = src.semantic() {
+            let pointer_width = DEC_POINTER_WIDTH.with(std::cell::Cell::get);
+            if *width == pointer_width {
+                if let Expr::Reg(reg @ VReg::Phys(_)) = expr.semantic() {
+                    let source_type = declared_reg_ctype(reg);
+                    if source_type.ends_with('*') {
+                        if source_type != destination_type
+                            && source_type != "void *"
+                            && destination_type != "void *"
+                        {
+                            let _ = write!(out, "({destination_type})");
+                        }
+                        write_reg_lvalue_dec(reg, out);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    let source_is_pointer = expression_has_pointer_representation(src);
+    if destination_is_pointer && source_is_pointer {
+        if let Expr::Reg(reg @ VReg::Phys(_)) = src.semantic() {
+            let source_type = declared_reg_ctype(reg);
+            // Pointer facts and emitted declarations intentionally have
+            // different authorities. A recovered call result can retain its
+            // machine-word declaration while later uses prove address
+            // semantics; a stack object is emitted as a byte array even when
+            // its promoted identity has a concrete pointee width. In both
+            // cases, use the C declaration that the compiler actually sees to
+            // decide whether this assignment needs an explicit conversion.
+            let source_needs_cast = dec_is_stack_object(match reg {
+                VReg::Phys(name) => name,
+                _ => unreachable!("the pattern above admits only physical registers"),
+            }) || !source_type.ends_with('*')
+                || (source_type != destination_type
+                    && source_type != "void *"
+                    && destination_type != "void *");
+            if source_needs_cast {
+                let _ = write!(out, "({destination_type})");
+                write_reg_lvalue_dec(reg, out);
+                return;
+            }
+        }
+        match src.semantic() {
+            // Register rvalues are normally rendered as machine words so byte
+            // arithmetic remains valid.  At a pointer boundary, use the
+            // declared pointer lvalue directly when no arithmetic is present.
+            Expr::Reg(reg @ VReg::Phys(_)) => write_reg_lvalue_dec(reg, out),
+            Expr::Cast { expr, .. }
+                if matches!(expr.semantic(), Expr::Reg(VReg::Phys(name))
+                    if dec_ptr_arg_type(name).is_some()
+                        || dec_struct_ptr_type(name).is_some()) =>
+            {
+                if let Expr::Reg(reg) = expr.semantic() {
+                    write_reg_lvalue_dec(reg, out);
+                } else {
+                    write_expr_dec(src, out);
+                }
+            }
+            Expr::Deref { addr, .. }
+                if renderable_field_access(addr).is_some_and(|(_, _, hint)| {
+                    hint.field_type
+                        .as_deref()
+                        .is_some_and(|field_type| field_type.trim_end().ends_with('*'))
+                }) =>
+            {
+                write_expr_dec(src, out);
+            }
+            // String literals already have the compatible `char *` family in
+            // C. Recovered stack objects, however, are deliberately emitted as
+            // unsigned-byte arrays. Their decay is compatible with `void *`
+            // but needs an explicit conversion for every concrete pointee type.
+            Expr::StringLit { .. } => write_expr_dec(src, out),
+            Expr::StackAddr { .. } if destination_type == "void *" => write_expr_dec(src, out),
+            Expr::StackAddr { .. } => {
+                let _ = write!(out, "({destination_type})");
+                write_expr_dec(src, out);
+            }
+            // Address arithmetic, named addresses, and LEA nodes retain a
+            // pointer *representation* in the middle layer but deliberately
+            // render as integer machine expressions.  Cast the completed
+            // expression back at the consuming boundary.
+            _ => {
+                let _ = write!(out, "({destination_type})(");
+                write_expr_dec(src, out);
+                out.push(')');
+            }
+        }
+        return;
+    }
+    if destination_is_pointer == source_is_pointer {
+        write_expr_for_destination_dec(destination_type, src, out);
+        return;
+    }
+
+    if source_is_pointer {
+        if let Expr::Reg(reg @ VReg::Phys(_)) = src.semantic() {
+            let _ = write!(out, "({destination_type})");
+            write_reg_lvalue_dec(reg, out);
+            return;
+        } else {
+            let _ = write!(out, "({destination_type})(");
+            write_expr_dec(src, out);
+            out.push(')');
+            return;
+        }
+    }
+
+    let _ = write!(out, "({destination_type})(");
+    write_expr_dec(src, out);
+    out.push(')');
+}

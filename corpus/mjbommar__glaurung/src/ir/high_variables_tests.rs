@@ -1,0 +1,1680 @@
+use super::{
+    identity_value_role, is_source_value_local_with_identities,
+    refine_pointer_high_variables_with_identities,
+};
+use crate::ir::ast::{Expr, Function, OriginSet, Stmt};
+use crate::ir::call_contracts::{CallPrototype, CallPrototypeAuthority, CallSiteSpec};
+use crate::ir::types::{BinOp, CmpOp, VReg};
+use crate::ir::types_recover::{TypeHint, TypeMap};
+
+fn refine_pointer_high_variables(function: &Function, types: &mut TypeMap) {
+    let mut identities = crate::ir::value_number::ValueIdentities::default();
+    for index in 0..=1000 {
+        identities.record(
+            VReg::phys(format!("var{index}")),
+            crate::ir::ssa::SsaValue {
+                base: VReg::phys("test_value"),
+                version: index + 1,
+            },
+        );
+    }
+    let parameter_slots = (0..=32)
+        .map(|index| (format!("arg{index}"), index))
+        .collect();
+    identities.attach_promoted_stack_parameter_slots(&parameter_slots);
+    let promoted_objects = [
+        "local_8".to_string(),
+        "local_10".to_string(),
+        "local_20".to_string(),
+        "local_30".to_string(),
+        "local_850".to_string(),
+    ];
+    identities.attach_promoted_stack_objects(&promoted_objects);
+    refine_pointer_high_variables_with_identities(function, types, &identities);
+}
+
+fn pointer_width(types: &TypeMap, name: &str) -> Option<u8> {
+    match types.get(&VReg::phys(name)) {
+        Some(TypeHint::Pointer { pointee_width }) => Some(pointee_width),
+        _ => None,
+    }
+}
+
+#[test]
+fn recovered_pointer_parameter_survives_high_variable_revalidation() {
+    let parameter = VReg::phys("arg0");
+    let function = Function {
+        name: "parameter_pointer".into(),
+        entry_va: 0,
+        body: vec![Stmt::Return {
+            value: Some(Expr::Reg(parameter.clone())),
+        }],
+    };
+    let mut identities = crate::ir::value_number::ValueIdentities::default();
+    identities.record(
+        parameter.clone(),
+        crate::ir::ssa::SsaValue {
+            base: VReg::phys("rdi"),
+            version: 0,
+        },
+    );
+    identities = identities.with_role_aliases_and_parameter_slots(
+        &std::collections::HashMap::new(),
+        &std::collections::HashSet::from([0]),
+    );
+    let mut types = TypeMap::default();
+    types.upsert_public(parameter, TypeHint::Pointer { pointee_width: 1 });
+
+    refine_pointer_high_variables_with_identities(&function, &mut types, &identities);
+
+    assert_eq!(pointer_width(&types, "arg0"), Some(1));
+}
+
+fn coalesced_same_storage_identities(
+    value: &VReg,
+    base: &str,
+) -> crate::ir::value_number::ValueIdentities {
+    let mut identities = crate::ir::value_number::ValueIdentities::default();
+    for version in [1, 2] {
+        identities.record(
+            value.clone(),
+            crate::ir::ssa::SsaValue {
+                base: VReg::phys(base),
+                version,
+            },
+        );
+    }
+    identities
+}
+
+#[test]
+fn installed_identity_authority_does_not_trust_var_spelling_for_type_refinement() {
+    let mut identities = crate::ir::value_number::ValueIdentities::default();
+
+    assert!(!identity_value_role("var12", &identities));
+    assert!(!is_source_value_local_with_identities("var12", &identities));
+    assert!(!is_source_value_local_with_identities(
+        "local_8",
+        &identities
+    ));
+    let local = "local_8".to_string();
+    identities.attach_promoted_stack_objects([&local]);
+    assert!(is_source_value_local_with_identities(
+        "local_8",
+        &identities
+    ));
+}
+
+#[test]
+fn exact_opaque_identity_is_eligible_for_pointer_refinement() {
+    let value = VReg::phys("opaque-value");
+    let function = Function {
+        name: "opaque_pointer".into(),
+        entry_va: 0,
+        body: vec![Stmt::Assign {
+            dst: value.clone(),
+            src: Expr::StringLit {
+                value: "identity".into(),
+            },
+        }],
+    };
+    let mut identities = crate::ir::value_number::ValueIdentities::default();
+    identities.record(
+        value,
+        crate::ir::ssa::SsaValue {
+            base: VReg::phys("rax"),
+            version: 1,
+        },
+    );
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables_with_identities(&function, &mut types, &identities);
+
+    assert_eq!(pointer_width(&types, "opaque-value"), Some(1));
+}
+
+#[test]
+fn coalesced_same_storage_identity_is_eligible_for_pointer_refinement() {
+    let value = VReg::phys("opaque-value");
+    let function = Function {
+        name: "coalesced_pointer".into(),
+        entry_va: 0,
+        body: vec![Stmt::Assign {
+            dst: value.clone(),
+            src: Expr::StringLit {
+                value: "coalesced".into(),
+            },
+        }],
+    };
+    let identities = coalesced_same_storage_identities(&value, "rax");
+    let mut types = TypeMap::default();
+
+    assert!(identities.exact(&value).is_none());
+    refine_pointer_high_variables_with_identities(&function, &mut types, &identities);
+
+    assert_eq!(pointer_width(&types, "opaque-value"), Some(1));
+}
+
+#[test]
+fn ambiguous_opaque_identity_is_not_eligible_for_pointer_refinement() {
+    let value = VReg::phys("opaque-value");
+    let function = Function {
+        name: "ambiguous_pointer".into(),
+        entry_va: 0,
+        body: vec![Stmt::Assign {
+            dst: value.clone(),
+            src: Expr::StringLit {
+                value: "ambiguous".into(),
+            },
+        }],
+    };
+    let mut identities = crate::ir::value_number::ValueIdentities::default();
+    for (base, version) in [("rax", 1), ("rbx", 2)] {
+        identities.record(
+            value.clone(),
+            crate::ir::ssa::SsaValue {
+                base: VReg::phys(base),
+                version,
+            },
+        );
+    }
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables_with_identities(&function, &mut types, &identities);
+
+    assert_eq!(pointer_width(&types, "opaque-value"), None);
+}
+
+#[test]
+fn exact_integer_value_width_survives_pointer_refinement() {
+    let function = Function {
+        name: "negative_cases".into(),
+        entry_va: 0,
+        body: vec![Stmt::Assign {
+            dst: VReg::phys("var0"),
+            src: Expr::Bin {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Reg(VReg::phys("arg0"))),
+                rhs: Box::new(Expr::Const(3)),
+            },
+        }],
+    };
+    let mut types = TypeMap::default();
+    types.upsert_public(
+        VReg::phys("var0"),
+        TypeHint::Int {
+            signed: false,
+            width: 4,
+        },
+    );
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(
+        types.get(&VReg::phys("var0")),
+        Some(TypeHint::Int {
+            signed: false,
+            width: 4,
+        })
+    );
+}
+
+#[test]
+fn origin_wrapped_high_bit_constant_used_by_unsigned_widening_is_unsigned() {
+    let function = Function {
+        name: "divide_by_ten".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: VReg::phys("var12"),
+                src: Expr::Const(0xcccc_cccd).with_origins(OriginSet::one(0x1001)),
+            }
+            .with_origins(OriginSet::one(0x1000)),
+            Stmt::Assign {
+                dst: VReg::phys("var20"),
+                src: Expr::Bin {
+                    op: BinOp::Mul,
+                    lhs: Box::new(Expr::Cast {
+                        signed: false,
+                        width: 8,
+                        expr: Box::new(Expr::Reg(VReg::phys("var16"))),
+                    }),
+                    rhs: Box::new(
+                        Expr::Reg(VReg::phys("var12")).with_origins(OriginSet::one(0x1005)),
+                    ),
+                },
+            }
+            .with_origins(OriginSet::one(0x1004)),
+        ],
+    };
+    let mut types = TypeMap::default();
+    types.upsert_public(
+        VReg::phys("var12"),
+        TypeHint::Int {
+            signed: true,
+            width: 4,
+        },
+    );
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(
+        types.get(&VReg::phys("var12")),
+        Some(TypeHint::Int {
+            signed: false,
+            width: 4,
+        })
+    );
+}
+
+#[test]
+fn exact_opaque_high_bit_constant_used_unsigned_is_retyped() {
+    let value = VReg::phys("opaque_constant");
+    let function = Function {
+        name: "divide_by_ten".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: value.clone(),
+                src: Expr::Const(0xcccc_cccd),
+            },
+            Stmt::Assign {
+                dst: VReg::phys("result"),
+                src: Expr::Bin {
+                    op: BinOp::Mul,
+                    lhs: Box::new(Expr::Cast {
+                        signed: false,
+                        width: 8,
+                        expr: Box::new(Expr::Reg(VReg::phys("arg0"))),
+                    }),
+                    rhs: Box::new(Expr::Reg(value.clone())),
+                },
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+    types.upsert_public(
+        value.clone(),
+        TypeHint::Int {
+            signed: true,
+            width: 4,
+        },
+    );
+    let mut identities = crate::ir::value_number::ValueIdentities::default();
+    identities.record(
+        value.clone(),
+        crate::ir::ssa::SsaValue {
+            base: VReg::phys("eax"),
+            version: 1,
+        },
+    );
+
+    refine_pointer_high_variables_with_identities(&function, &mut types, &identities);
+
+    assert_eq!(
+        types.get(&value),
+        Some(TypeHint::Int {
+            signed: false,
+            width: 4,
+        })
+    );
+}
+
+#[test]
+fn coalesced_same_storage_high_bit_constant_used_unsigned_is_retyped() {
+    let value = VReg::phys("opaque_constant");
+    let function = Function {
+        name: "coalesced_divide_by_ten".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: value.clone(),
+                src: Expr::Const(0xcccc_cccd),
+            },
+            Stmt::Assign {
+                dst: VReg::phys("result"),
+                src: Expr::Bin {
+                    op: BinOp::Mul,
+                    lhs: Box::new(Expr::Cast {
+                        signed: false,
+                        width: 8,
+                        expr: Box::new(Expr::Reg(VReg::phys("arg0"))),
+                    }),
+                    rhs: Box::new(Expr::Reg(value.clone())),
+                },
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+    types.upsert_public(
+        value.clone(),
+        TypeHint::Int {
+            signed: true,
+            width: 4,
+        },
+    );
+    let identities = coalesced_same_storage_identities(&value, "eax");
+
+    assert!(identities.exact(&value).is_none());
+    refine_pointer_high_variables_with_identities(&function, &mut types, &identities);
+
+    assert_eq!(
+        types.get(&value),
+        Some(TypeHint::Int {
+            signed: false,
+            width: 4,
+        })
+    );
+}
+
+#[test]
+fn ambiguous_opaque_high_bit_constant_stays_signed() {
+    let value = VReg::phys("opaque_constant");
+    let function = Function {
+        name: "ambiguous_constant".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: value.clone(),
+                src: Expr::Const(0xcccc_cccd),
+            },
+            Stmt::Assign {
+                dst: VReg::phys("result"),
+                src: Expr::Bin {
+                    op: BinOp::Mul,
+                    lhs: Box::new(Expr::Cast {
+                        signed: false,
+                        width: 8,
+                        expr: Box::new(Expr::Reg(VReg::phys("arg0"))),
+                    }),
+                    rhs: Box::new(Expr::Reg(value.clone())),
+                },
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+    types.upsert_public(
+        value.clone(),
+        TypeHint::Int {
+            signed: true,
+            width: 4,
+        },
+    );
+    let mut identities = crate::ir::value_number::ValueIdentities::default();
+    for (base, version) in [("eax", 1), ("ebx", 2)] {
+        identities.record(
+            value.clone(),
+            crate::ir::ssa::SsaValue {
+                base: VReg::phys(base),
+                version,
+            },
+        );
+    }
+
+    refine_pointer_high_variables_with_identities(&function, &mut types, &identities);
+
+    assert_eq!(
+        types.get(&value),
+        Some(TypeHint::Int {
+            signed: true,
+            width: 4,
+        })
+    );
+}
+
+#[test]
+fn high_bit_constant_with_a_signed_use_stays_signed() {
+    let function = Function {
+        name: "signed_sentinel".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: VReg::phys("var1"),
+                src: Expr::Const(0xffff_ffff),
+            },
+            Stmt::If {
+                cond: Expr::Cmp {
+                    op: CmpOp::Slt,
+                    lhs: Box::new(Expr::Reg(VReg::phys("var1"))),
+                    rhs: Box::new(Expr::Const(0)),
+                },
+                then_body: vec![Stmt::Return {
+                    value: Some(Expr::Const(1)),
+                }],
+                else_body: None,
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+    types.upsert_public(
+        VReg::phys("var1"),
+        TypeHint::Int {
+            signed: true,
+            width: 4,
+        },
+    );
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(
+        types.get(&VReg::phys("var1")),
+        Some(TypeHint::Int {
+            signed: true,
+            width: 4,
+        })
+    );
+}
+
+#[test]
+fn high_bit_bound_compared_in_a_wide_signed_domain_is_unsigned() {
+    let function = Function {
+        name: "range_guard".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: VReg::phys("var24"),
+                src: Expr::Const(0x8000_0000),
+            }
+            .with_origins(OriginSet::one(0x2000)),
+            Stmt::If {
+                cond: Expr::Cmp {
+                    op: CmpOp::Sle,
+                    lhs: Box::new(Expr::Reg(VReg::phys("var24"))),
+                    rhs: Box::new(Expr::Reg(VReg::phys("var22"))),
+                },
+                then_body: vec![Stmt::Return {
+                    value: Some(Expr::Const(-2)),
+                }],
+                else_body: None,
+            }
+            .with_origins(OriginSet::one(0x2004)),
+        ],
+    };
+    let mut types = TypeMap::default();
+    types.upsert_public(
+        VReg::phys("var24"),
+        TypeHint::Int {
+            signed: true,
+            width: 4,
+        },
+    );
+    types.upsert_public(
+        VReg::phys("var22"),
+        TypeHint::Int {
+            signed: true,
+            width: 8,
+        },
+    );
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(
+        types.get(&VReg::phys("var24")),
+        Some(TypeHint::Int {
+            signed: false,
+            width: 4,
+        })
+    );
+}
+
+#[test]
+fn exact_opaque_high_bit_bound_uses_the_rendered_machine_word_domain() {
+    let value = VReg::phys("opaque_constant");
+    let bound = VReg::phys("opaque_bound");
+    let function = Function {
+        name: "range_guard".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: value.clone(),
+                src: Expr::Const(0x8000_0000),
+            },
+            Stmt::If {
+                cond: Expr::Cmp {
+                    op: CmpOp::Sle,
+                    lhs: Box::new(Expr::Reg(value.clone())),
+                    rhs: Box::new(Expr::Reg(bound.clone())),
+                },
+                then_body: vec![Stmt::Return {
+                    value: Some(Expr::Const(-2)),
+                }],
+                else_body: None,
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+    types.upsert_public(
+        value.clone(),
+        TypeHint::Int {
+            signed: true,
+            width: 4,
+        },
+    );
+    let mut identities = crate::ir::value_number::ValueIdentities::default();
+    for (role, base) in [(&value, "eax"), (&bound, "rcx")] {
+        identities.record(
+            role.clone(),
+            crate::ir::ssa::SsaValue {
+                base: VReg::phys(base),
+                version: 1,
+            },
+        );
+    }
+
+    refine_pointer_high_variables_with_identities(&function, &mut types, &identities);
+
+    assert_eq!(
+        types.get(&value),
+        Some(TypeHint::Int {
+            signed: false,
+            width: 4,
+        })
+    );
+}
+
+#[test]
+fn unowned_arg_spelling_does_not_supply_a_wide_signed_comparison_domain() {
+    let value = VReg::phys("opaque_constant");
+    let unowned_bound = VReg::phys("arg99");
+    let function = Function {
+        name: "range_guard".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: value.clone(),
+                src: Expr::Const(0x8000_0000),
+            },
+            Stmt::If {
+                cond: Expr::Cmp {
+                    op: CmpOp::Sle,
+                    lhs: Box::new(Expr::Reg(value.clone())),
+                    rhs: Box::new(Expr::Reg(unowned_bound.clone())),
+                },
+                then_body: vec![Stmt::Return {
+                    value: Some(Expr::Const(-2)),
+                }],
+                else_body: None,
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+    types.upsert_public(
+        value.clone(),
+        TypeHint::Int {
+            signed: true,
+            width: 4,
+        },
+    );
+    types.upsert_public(
+        unowned_bound,
+        TypeHint::Int {
+            signed: true,
+            width: 8,
+        },
+    );
+    let mut identities = crate::ir::value_number::ValueIdentities::default();
+    identities.record(
+        value.clone(),
+        crate::ir::ssa::SsaValue {
+            base: VReg::phys("eax"),
+            version: 1,
+        },
+    );
+
+    refine_pointer_high_variables_with_identities(&function, &mut types, &identities);
+
+    assert_eq!(
+        types.get(&value),
+        Some(TypeHint::Int {
+            signed: true,
+            width: 4,
+        })
+    );
+}
+
+#[test]
+fn known_call_and_literal_flow_through_exact_copy_chain() {
+    let function = Function {
+        name: "f".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0,
+                    name: "getenv@plt".into(),
+                }
+                .with_origins(OriginSet::one(0x2000)),
+                args: vec![Expr::StringLit {
+                    value: "PATH".into(),
+                }],
+                dst: Some(VReg::phys("var1")),
+                call_spec: None,
+            },
+            Stmt::Store {
+                addr: Expr::Reg(VReg::phys("local_8")).with_origins(OriginSet::one(0x2004)),
+                src: Expr::Reg(VReg::phys("var1")).with_origins(OriginSet::one(0x2008)),
+                size: 8,
+            },
+            Stmt::Assign {
+                dst: VReg::phys("var2"),
+                src: Expr::StringLit {
+                    value: "/tmp/fallback".into(),
+                }
+                .with_origins(OriginSet::one(0x200c)),
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "var1"), Some(1));
+    assert_eq!(pointer_width(&types, "local_8"), Some(1));
+    assert_eq!(pointer_width(&types, "var2"), Some(1));
+}
+
+#[test]
+fn recovered_callee_pointer_result_flows_through_an_exact_copy() {
+    let recovered = CallPrototype {
+        return_type: "void *".into(),
+        parameter_types: vec![],
+        variadic: false,
+        authority: CallPrototypeAuthority::Recovered,
+    };
+    let function = Function {
+        name: "copy_project_pointer".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0x2000,
+                    name: "project_device".into(),
+                },
+                args: vec![],
+                dst: Some(VReg::phys("var1")),
+                call_spec: Some(CallSiteSpec {
+                    callee_prototype: Some(recovered.clone()),
+                    call_prototype: recovered,
+                }),
+            },
+            Stmt::Assign {
+                dst: VReg::phys("var2"),
+                src: Expr::Reg(VReg::phys("var1")),
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "var1"), Some(0));
+    assert_eq!(pointer_width(&types, "var2"), Some(0));
+}
+
+#[test]
+fn null_initialized_local_accepts_a_later_character_pointer() {
+    let function = Function {
+        name: "save_locale".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: VReg::phys("local_8"),
+                src: Expr::Const(0),
+            },
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0,
+                    name: "strdup@plt".into(),
+                },
+                args: vec![Expr::Reg(VReg::phys("arg0"))],
+                dst: Some(VReg::phys("var1")),
+                call_spec: None,
+            },
+            Stmt::Assign {
+                dst: VReg::phys("local_8"),
+                src: Expr::Reg(VReg::phys("var1")),
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "var1"), Some(1));
+    assert_eq!(pointer_width(&types, "local_8"), Some(1));
+}
+
+#[test]
+fn authoritative_call_parameter_refines_a_direct_function_argument() {
+    let function = Function {
+        name: "find_name".into(),
+        entry_va: 0,
+        body: vec![Stmt::Call {
+            target: Expr::Named {
+                va: 0,
+                name: "strcmp@plt".into(),
+            }
+            .with_origins(OriginSet::one(0x2000)),
+            args: vec![
+                Expr::Reg(VReg::phys("arg0")).with_origins(OriginSet::one(0x2004)),
+                Expr::StringLit {
+                    value: "known".into(),
+                }
+                .with_origins(OriginSet::one(0x2008)),
+            ],
+            dst: Some(VReg::phys("var1")),
+            call_spec: None,
+        }],
+    };
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "arg0"), Some(1));
+}
+
+#[test]
+fn authoritative_character_use_does_not_retype_an_unknown_call_temporary() {
+    // A consumer contract proves how this value is used at one boundary,
+    // not the source-level return type of an otherwise unknown helper.
+    // Keep the ephemeral call result scalar and put any required cast at
+    // the call boundary; promoted locals may still recover independently
+    // when all of their definitions and uses establish one source type.
+    let function = Function {
+        name: "consume_unknown_result".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0,
+                    name: "project_value".into(),
+                },
+                args: vec![],
+                dst: Some(VReg::phys("var1")),
+                call_spec: None,
+            },
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0,
+                    name: "strlen@plt".into(),
+                },
+                args: vec![Expr::Reg(VReg::phys("var1"))],
+                dst: Some(VReg::phys("var2")),
+                call_spec: None,
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "var1"), None);
+}
+
+#[test]
+fn recovered_direct_callee_parameter_refines_a_forwarded_argument() {
+    let recovered = CallPrototype {
+        return_type: "int".into(),
+        parameter_types: vec!["int *".into()],
+        variadic: false,
+        authority: CallPrototypeAuthority::Recovered,
+    };
+    let function = Function {
+        name: "forward_pointer".into(),
+        entry_va: 0,
+        body: vec![Stmt::Call {
+            target: Expr::Named {
+                va: 0x2000,
+                name: "read_first".into(),
+            },
+            args: vec![Expr::Reg(VReg::phys("arg0"))],
+            dst: Some(VReg::phys("ret")),
+            call_spec: Some(CallSiteSpec {
+                call_prototype: recovered.clone(),
+                callee_prototype: Some(recovered),
+            }),
+        }],
+    };
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "arg0"), Some(4));
+}
+
+#[test]
+fn attributed_authoritative_callee_refines_a_forwarded_argument() {
+    let recovered = CallPrototype {
+        return_type: "int".into(),
+        parameter_types: vec!["int *".into()],
+        variadic: false,
+        authority: CallPrototypeAuthority::Recovered,
+    };
+    let function = Function {
+        name: "forward_attributed_pointer".into(),
+        entry_va: 0,
+        body: vec![Stmt::Call {
+            target: Expr::Named {
+                va: 0x2000,
+                name: "read_first".into(),
+            }
+            .with_origins(OriginSet::one(0x1008)),
+            args: vec![Expr::Reg(VReg::phys("arg0")).with_origins(OriginSet::one(0x100c))],
+            dst: Some(VReg::phys("ret")),
+            call_spec: Some(CallSiteSpec {
+                call_prototype: recovered.clone(),
+                callee_prototype: Some(recovered),
+            }),
+        }
+        .with_origins(crate::ir::ast::OriginSet::one(0x1010))],
+    };
+    let identities = crate::ir::value_number::ValueIdentities::default()
+        .with_role_aliases_and_parameter_slots(
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::from([0]),
+        );
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables_with_identities(&function, &mut types, &identities);
+
+    assert_eq!(pointer_width(&types, "arg0"), Some(4));
+}
+
+#[test]
+fn callee_pointer_contract_does_not_trust_an_unowned_arg_spelling() {
+    let recovered = CallPrototype {
+        return_type: "int".into(),
+        parameter_types: vec!["int *".into()],
+        variadic: false,
+        authority: CallPrototypeAuthority::Recovered,
+    };
+    let function = Function {
+        name: "stale_parameter_role".into(),
+        entry_va: 0,
+        body: vec![Stmt::Call {
+            target: Expr::Named {
+                va: 0x2000,
+                name: "read_first".into(),
+            },
+            args: vec![Expr::Reg(VReg::phys("arg99"))],
+            dst: Some(VReg::phys("ret")),
+            call_spec: Some(CallSiteSpec {
+                call_prototype: recovered.clone(),
+                callee_prototype: Some(recovered),
+            }),
+        }],
+    };
+    let identities = crate::ir::value_number::ValueIdentities::default()
+        .with_role_aliases_and_parameter_slots(
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::from([0]),
+        );
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables_with_identities(&function, &mut types, &identities);
+
+    assert_eq!(pointer_width(&types, "arg99"), None);
+}
+
+#[test]
+fn callee_pointer_contract_does_not_follow_an_unowned_var_copy() {
+    let recovered = CallPrototype {
+        return_type: "int".into(),
+        parameter_types: vec!["long *".into()],
+        variadic: false,
+        authority: CallPrototypeAuthority::Recovered,
+    };
+    let function = Function {
+        name: "unowned_copy".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: VReg::phys("var2"),
+                src: Expr::Reg(VReg::phys("arg0")),
+            },
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0x2000,
+                    name: "refill".into(),
+                },
+                args: vec![Expr::Reg(VReg::phys("var2"))],
+                dst: Some(VReg::phys("ret")),
+                call_spec: Some(CallSiteSpec {
+                    call_prototype: recovered.clone(),
+                    callee_prototype: Some(recovered),
+                }),
+            },
+        ],
+    };
+    let identities = crate::ir::value_number::ValueIdentities::default()
+        .with_role_aliases_and_parameter_slots(
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::from([0]),
+        );
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables_with_identities(&function, &mut types, &identities);
+
+    assert_eq!(pointer_width(&types, "arg0"), None);
+}
+
+#[test]
+fn recovered_callee_pointer_flows_back_through_a_coalesced_parameter_copy() {
+    // Real shape: diffutils `lf_skip(struct line_filter *lf, lin lines)`.
+    // The incoming pointer is copied to a numbered value, used in raw byte
+    // address arithmetic, and passed to a helper whose recovered contract
+    // is the only source-level pointer witness. Keep the numbered value a
+    // machine word so `+ 8` remains byte-addressed, but recover the source
+    // parameter transported into it.
+    let recovered = CallPrototype {
+        return_type: "int".into(),
+        parameter_types: vec!["long *".into()],
+        variadic: false,
+        authority: CallPrototypeAuthority::Recovered,
+    };
+    let function = Function {
+        name: "lf_skip_shape".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: VReg::phys("var2"),
+                src: Expr::Reg(VReg::phys("arg0")),
+            },
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0x2000,
+                    name: "refill".into(),
+                },
+                args: vec![Expr::Reg(VReg::phys("var2"))],
+                dst: Some(VReg::phys("ret")),
+                call_spec: Some(CallSiteSpec {
+                    call_prototype: recovered.clone(),
+                    callee_prototype: Some(recovered),
+                }),
+            },
+            Stmt::Assign {
+                dst: VReg::phys("var3"),
+                src: Expr::Bin {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::Reg(VReg::phys("var2"))),
+                    rhs: Box::new(Expr::Const(8)),
+                },
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "arg0"), Some(8));
+    assert_eq!(pointer_width(&types, "var2"), None);
+
+    let mut identities = crate::ir::value_number::ValueIdentities::default();
+    identities.record(
+        VReg::phys("var2"),
+        crate::ir::ssa::SsaValue {
+            base: VReg::phys("rax"),
+            version: 1,
+        },
+    );
+    identities.record(
+        VReg::phys("var2"),
+        crate::ir::ssa::SsaValue {
+            base: VReg::phys("rax"),
+            version: 2,
+        },
+    );
+    let identities = identities.with_role_aliases_and_parameter_slots(
+        &std::collections::HashMap::new(),
+        &std::collections::HashSet::from([0]),
+    );
+    let mut authoritative_types = TypeMap::default();
+
+    refine_pointer_high_variables_with_identities(&function, &mut authoritative_types, &identities);
+
+    assert_eq!(pointer_width(&authoritative_types, "arg0"), Some(8));
+    assert_eq!(pointer_width(&authoritative_types, "var2"), None);
+}
+
+#[test]
+fn conflicting_alias_contracts_do_not_randomly_retype_their_parameter() {
+    let recovered = CallPrototype {
+        return_type: "int".into(),
+        parameter_types: vec!["long *".into()],
+        variadic: false,
+        authority: CallPrototypeAuthority::Recovered,
+    };
+    let function = Function {
+        name: "conflicting_alias_contracts".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: VReg::phys("var1"),
+                src: Expr::Reg(VReg::phys("arg0")),
+            },
+            Stmt::Assign {
+                dst: VReg::phys("var2"),
+                src: Expr::Reg(VReg::phys("arg0")),
+            },
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0,
+                    name: "strcmp@plt".into(),
+                },
+                args: vec![
+                    Expr::Reg(VReg::phys("var1")),
+                    Expr::StringLit {
+                        value: "known".into(),
+                    },
+                ],
+                dst: Some(VReg::phys("cmp")),
+                call_spec: None,
+            },
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0x2000,
+                    name: "consume_longs".into(),
+                },
+                args: vec![Expr::Reg(VReg::phys("var2"))],
+                dst: Some(VReg::phys("ret")),
+                call_spec: Some(CallSiteSpec {
+                    call_prototype: recovered.clone(),
+                    callee_prototype: Some(recovered),
+                }),
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "arg0"), None);
+}
+
+#[test]
+fn recovered_callee_pointer_rejects_a_copy_with_conflicting_origins() {
+    let recovered = CallPrototype {
+        return_type: "int".into(),
+        parameter_types: vec!["long *".into()],
+        variadic: false,
+        authority: CallPrototypeAuthority::Recovered,
+    };
+    let function = Function {
+        name: "overwritten_forwarder".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: VReg::phys("var2"),
+                src: Expr::Reg(VReg::phys("arg0")),
+            },
+            Stmt::Assign {
+                dst: VReg::phys("var2"),
+                src: Expr::Reg(VReg::phys("arg1")),
+            },
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0x2000,
+                    name: "consume_pointer".into(),
+                },
+                args: vec![Expr::Reg(VReg::phys("var2"))],
+                dst: None,
+                call_spec: Some(CallSiteSpec {
+                    call_prototype: recovered.clone(),
+                    callee_prototype: Some(recovered),
+                }),
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "arg0"), None);
+    assert_eq!(pointer_width(&types, "arg1"), None);
+}
+
+#[test]
+fn integer_arithmetic_blocks_call_parameter_pointer_refinement() {
+    let function = Function {
+        name: "tagged_name".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0,
+                    name: "strcmp@plt".into(),
+                },
+                args: vec![
+                    Expr::Reg(VReg::phys("arg0")),
+                    Expr::StringLit {
+                        value: "known".into(),
+                    },
+                ],
+                dst: Some(VReg::phys("var1")),
+                call_spec: None,
+            },
+            Stmt::Assign {
+                dst: VReg::phys("local_30"),
+                src: Expr::Bin {
+                    op: BinOp::And,
+                    lhs: Box::new(Expr::Reg(VReg::phys("arg0"))),
+                    rhs: Box::new(Expr::Const(7)),
+                },
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "arg0"), None);
+}
+
+#[test]
+fn character_arithmetic_does_not_retype_an_abi_parameter() {
+    // The promoted-local exception must not become a second ABI prototype
+    // inference path. An argument consumed as text and incremented may be
+    // a source pointer, but proving that belongs to value-keyed prototype
+    // recovery; this pass only owns high/local declaration refinement.
+    let function = Function {
+        name: "copy_text".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0,
+                    name: "strlen@plt".into(),
+                },
+                args: vec![Expr::Reg(VReg::phys("arg0"))],
+                dst: Some(VReg::phys("var1")),
+                call_spec: None,
+            },
+            Stmt::Assign {
+                dst: VReg::phys("var2"),
+                src: Expr::Bin {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::Reg(VReg::phys("arg0"))),
+                    rhs: Box::new(Expr::Const(1)),
+                },
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "arg0"), None);
+}
+
+#[test]
+fn unsafe_pointer_input_does_not_retype_its_machine_copy() {
+    // A separately recovered ABI spelling may already call the argument a
+    // pointer. If this pass rejects its additive use, it must not leak that
+    // rejected interpretation into a numbered machine temporary. The
+    // source-level parameter spelling remains owned by prototype recovery.
+    let function = Function {
+        name: "copy_text".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: VReg::phys("var1"),
+                src: Expr::Reg(VReg::phys("arg0")),
+            },
+            Stmt::Assign {
+                dst: VReg::phys("arg0"),
+                src: Expr::Bin {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::Reg(VReg::phys("arg0"))),
+                    rhs: Box::new(Expr::Const(1)),
+                },
+            },
+            Stmt::Store {
+                addr: Expr::Reg(VReg::phys("var1")),
+                src: Expr::Const(0),
+                size: 1,
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+    types.upsert_public(VReg::phys("arg0"), TypeHint::Pointer { pointee_width: 1 });
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "arg0"), Some(1));
+    assert_eq!(pointer_width(&types, "var1"), None);
+}
+
+#[test]
+fn character_pointer_arithmetic_preserves_proven_copied_pointers() {
+    // Real shape: gzip O0 `get_method` advances one character pointer and
+    // subtracts its copied base. Both operations are valid byte-scaled C
+    // pointer arithmetic and must not erase independent `char *` evidence.
+    let function = Function {
+        name: "character_cursor".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0,
+                    name: "project_base".into(),
+                },
+                args: vec![],
+                dst: Some(VReg::phys("var1")),
+                call_spec: None,
+            },
+            Stmt::Assign {
+                dst: VReg::phys("local_30"),
+                src: Expr::Reg(VReg::phys("var1")),
+            },
+            Stmt::Assign {
+                dst: VReg::phys("local_20"),
+                src: Expr::Reg(VReg::phys("local_30")),
+            },
+            Stmt::Store {
+                addr: Expr::Lea {
+                    base: Some(VReg::phys("local_30")),
+                    index: None,
+                    scale: 1,
+                    disp: 0,
+                    segment: None,
+                },
+                src: Expr::Const(0),
+                size: 1,
+            },
+            Stmt::Assign {
+                dst: VReg::phys("var2"),
+                src: Expr::Bin {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::Reg(VReg::phys("local_30"))),
+                    rhs: Box::new(Expr::Const(1)),
+                },
+            },
+            Stmt::Assign {
+                dst: VReg::phys("var3"),
+                src: Expr::Bin {
+                    op: BinOp::Sub,
+                    lhs: Box::new(Expr::Reg(VReg::phys("local_30"))),
+                    rhs: Box::new(Expr::Reg(VReg::phys("local_20"))),
+                },
+            },
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0,
+                    name: "strlen@plt".into(),
+                },
+                args: vec![Expr::Reg(VReg::phys("local_30"))],
+                dst: Some(VReg::phys("var4")),
+                call_spec: None,
+            },
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0,
+                    name: "memmove@plt".into(),
+                },
+                args: vec![
+                    Expr::Reg(VReg::phys("local_20")),
+                    Expr::Reg(VReg::phys("local_30")),
+                    Expr::Const(4),
+                ],
+                dst: Some(VReg::phys("var5")),
+                call_spec: None,
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "local_30"), Some(1));
+    assert_eq!(pointer_width(&types, "local_20"), Some(1));
+}
+
+#[test]
+fn multiply_defined_promoted_local_rejects_opaque_and_concrete_pointer_lifetimes() {
+    // Real negative shape: coreutils `dopass` reuses one promoted stack
+    // slot for an opaque helper result and `errno`. Without reaching
+    // definitions, merging those lifetimes into `int *` is unsound.
+    let function = Function {
+        name: "reused_slot".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0,
+                    name: "malloc@plt".into(),
+                },
+                args: vec![Expr::Const(8)],
+                dst: Some(VReg::phys("local_850")),
+                call_spec: None,
+            },
+            Stmt::Call {
+                target: Expr::Named {
+                    va: 0,
+                    name: "__errno_location@plt".into(),
+                },
+                args: vec![],
+                dst: Some(VReg::phys("local_850")),
+                call_spec: None,
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "local_850"), None);
+}
+
+#[test]
+fn conflicting_definition_or_integer_use_blocks_pointer_declaration() {
+    let function = Function {
+        name: "f".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: VReg::phys("var0"),
+                src: Expr::StringLit { value: "a".into() },
+            },
+            Stmt::Assign {
+                dst: VReg::phys("var0"),
+                src: Expr::Const(7),
+            },
+            Stmt::Assign {
+                dst: VReg::phys("var1"),
+                src: Expr::StringLit { value: "b".into() },
+            },
+            Stmt::Assign {
+                dst: VReg::phys("var2"),
+                src: Expr::Bin {
+                    op: BinOp::And,
+                    lhs: Box::new(Expr::Reg(VReg::phys("var1"))),
+                    rhs: Box::new(Expr::Const(-16)),
+                },
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+    // A legacy storage-keyed collision must not bypass the exact
+    // multi-definition proof merely because it is already a pointer.
+    types.upsert_public(VReg::phys("var0"), TypeHint::Pointer { pointee_width: 1 });
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "var0"), None);
+    assert_eq!(pointer_width(&types, "var1"), None);
+}
+
+#[test]
+fn structural_stack_register_type_does_not_seed_a_source_pointer() {
+    let function = Function {
+        name: "f".into(),
+        entry_va: 0,
+        body: vec![Stmt::Assign {
+            dst: VReg::phys("var0"),
+            src: Expr::Reg(VReg::phys("sp")),
+        }],
+    };
+    let mut types = TypeMap::default();
+    types.upsert_public(VReg::phys("sp"), TypeHint::Pointer { pointee_width: 4 });
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "var0"), None);
+}
+
+#[test]
+fn select_accepts_null_but_rejects_incompatible_pointer_arms() {
+    let function = Function {
+        name: "f".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: VReg::phys("var0"),
+                src: Expr::Select {
+                    cond: Box::new(Expr::Const(1)),
+                    if_true: Box::new(Expr::StringLit { value: "p".into() }),
+                    if_false: Box::new(Expr::Const(0)),
+                    width: 8,
+                },
+            },
+            Stmt::Assign {
+                dst: VReg::phys("local_8"),
+                src: Expr::Select {
+                    cond: Box::new(Expr::Const(1)),
+                    if_true: Box::new(Expr::Reg(VReg::phys("var0"))),
+                    if_false: Box::new(Expr::Reg(VReg::phys("arg0"))),
+                    width: 8,
+                },
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+    types.upsert_public(VReg::phys("arg0"), TypeHint::Pointer { pointee_width: 4 });
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "var0"), Some(1));
+    assert_eq!(pointer_width(&types, "local_8"), None);
+}
+
+#[test]
+fn pointer_copy_into_conflicted_word_keeps_explicit_machine_cast() {
+    let function = Function {
+        name: "f".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: VReg::phys("var0"),
+                src: Expr::StringLit { value: "p".into() },
+            },
+            Stmt::Assign {
+                dst: VReg::phys("var1"),
+                src: Expr::Reg(VReg::phys("var0")),
+            },
+            Stmt::Assign {
+                dst: VReg::phys("var1"),
+                src: Expr::Const(1),
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+    refine_pointer_high_variables(&function, &mut types);
+
+    let rendered = crate::ir::ast::render_decbench_typed(&function, Some(&types), None);
+
+    assert!(rendered.contains("char * var0;"), "{rendered}");
+    assert!(rendered.contains("long var1;"), "{rendered}");
+    assert!(rendered.contains("var1 = (long)var0;"), "{rendered}");
+}
+
+#[test]
+fn pointer_stored_through_width_only_memory_is_explicitly_represented() {
+    let function = Function {
+        name: "f".into(),
+        entry_va: 0,
+        body: vec![
+            Stmt::Assign {
+                dst: VReg::phys("var0"),
+                src: Expr::StringLit { value: "p".into() },
+            },
+            Stmt::Store {
+                addr: Expr::Addr(0x1000),
+                src: Expr::Reg(VReg::phys("var0")),
+                size: 4,
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+    refine_pointer_high_variables(&function, &mut types);
+
+    let rendered = crate::ir::ast::render_decbench_typed(&function, Some(&types), None);
+
+    assert!(
+        rendered
+            .contains("static unsigned char glaurung_global_1000[4] __attribute__((aligned(16)));"),
+        "the original image address needs portable storage:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("*(int *)(&glaurung_global_1000[0]) = (int)((long)var0);"),
+        "the 4-byte pointer-to-integer store must remain explicit:\n{rendered}"
+    );
+    assert!(!rendered.contains("*(int *)(0x1000)"), "{rendered}");
+}
+
+#[test]
+fn proven_aggregate_cursor_becomes_a_byte_pointer_without_scaling_its_stride() {
+    let cursor = VReg::phys("local_8");
+    let offset = |value| {
+        Expr::Bin {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Reg(cursor.clone()).with_origins(OriginSet::one(0x3000))),
+            rhs: Box::new(Expr::Const(value).with_origins(OriginSet::one(0x3004))),
+        }
+        .with_origins(OriginSet::one(0x3008))
+    };
+    let function = Function {
+        name: "walk_records".into(),
+        entry_va: 0x1000,
+        body: vec![
+            Stmt::Store {
+                addr: Expr::Reg(cursor.clone()),
+                src: Expr::Deref {
+                    addr: Box::new(Expr::Addr(0x4000)),
+                    size: 8,
+                },
+                size: 8,
+            },
+            Stmt::While {
+                cond: Expr::Const(1),
+                body: vec![
+                    Stmt::Store {
+                        addr: offset(44),
+                        src: Expr::Const(7),
+                        size: 4,
+                    },
+                    Stmt::Store {
+                        addr: offset(40),
+                        src: Expr::Const(3),
+                        size: 4,
+                    },
+                    Stmt::Store {
+                        addr: Expr::Reg(cursor.clone()),
+                        src: offset(64),
+                        size: 8,
+                    },
+                ],
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+    types.upsert_public(
+        cursor,
+        TypeHint::Int {
+            signed: true,
+            width: 8,
+        },
+    );
+
+    refine_pointer_high_variables(&function, &mut types);
+    let rendered = crate::ir::ast::render_decbench_typed(&function, Some(&types), None);
+
+    assert_eq!(pointer_width(&types, "local_8"), Some(1));
+    assert!(
+        rendered.contains("char * local_8 = (char *)("),
+        "{rendered}"
+    );
+    assert!(rendered.contains("(local_8 + 64)"), "{rendered}");
+    assert!(!rendered.contains("local_8 + 256"), "{rendered}");
+}
+
+#[test]
+fn unbounded_dereferenced_word_does_not_become_an_aggregate_cursor() {
+    let function = Function {
+        name: "one_load".into(),
+        entry_va: 0x1000,
+        body: vec![
+            Stmt::Assign {
+                dst: VReg::phys("local_8"),
+                src: Expr::Deref {
+                    addr: Box::new(Expr::Addr(0x4000)),
+                    size: 8,
+                },
+            },
+            Stmt::Store {
+                addr: Expr::Bin {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::Reg(VReg::phys("local_8"))),
+                    rhs: Box::new(Expr::Const(4)),
+                },
+                src: Expr::Const(1),
+                size: 4,
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+    types.upsert_public(
+        VReg::phys("local_8"),
+        TypeHint::Int {
+            signed: true,
+            width: 8,
+        },
+    );
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "local_8"), None);
+}
+
+#[test]
+fn aggregate_cursor_waits_for_its_pointer_origin_in_the_same_fixed_point() {
+    let origin = VReg::phys("local_10");
+    let cursor = VReg::phys("local_8");
+    let offset = |value| Expr::Bin {
+        op: BinOp::Add,
+        lhs: Box::new(Expr::Reg(cursor.clone())),
+        rhs: Box::new(Expr::Const(value)),
+    };
+    let function = Function {
+        name: "walk_copied_records".into(),
+        entry_va: 0x1000,
+        body: vec![
+            Stmt::Store {
+                addr: Expr::Reg(origin.clone()),
+                src: Expr::StringLit {
+                    value: "storage".into(),
+                },
+                size: 8,
+            },
+            Stmt::Store {
+                addr: Expr::Reg(cursor.clone()),
+                src: Expr::Reg(origin.clone()),
+                size: 8,
+            },
+            Stmt::Store {
+                addr: offset(40),
+                src: Expr::Const(3),
+                size: 4,
+            },
+            Stmt::Store {
+                addr: Expr::Reg(cursor.clone()),
+                src: offset(64),
+                size: 8,
+            },
+        ],
+    };
+    let mut types = TypeMap::default();
+    for register in [origin, cursor] {
+        types.upsert_public(
+            register,
+            TypeHint::Int {
+                signed: true,
+                width: 8,
+            },
+        );
+    }
+
+    refine_pointer_high_variables(&function, &mut types);
+
+    assert_eq!(pointer_width(&types, "local_10"), Some(1));
+    assert_eq!(pointer_width(&types, "local_8"), Some(1));
+}

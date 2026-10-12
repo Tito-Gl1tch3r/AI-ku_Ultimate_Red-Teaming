@@ -1,0 +1,409 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+"""
+Hypervisor Integration Tests
+
+End-to-end tests validating the full hypervisor lifecycle:
+session creation → agent join → saga execution → audit → termination.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from hypervisor import (
+    ConsistencyMode,
+    ExecutionRing,
+    Hypervisor,
+    ReversibilityLevel,
+    SagaState,
+    SagaTimeoutError,
+    SessionConfig,
+    StepState,
+)
+from hypervisor.audit.delta import VFSChange
+from hypervisor.models import ActionDescriptor
+
+# ---------------------------------------------------------------------------
+# Full Lifecycle
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestFullLifecycle:
+    """End-to-end session lifecycle: create → join → activate → terminate."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.hv = Hypervisor()
+
+    async def test_complete_session_lifecycle(self):
+        """Happy path: create, join two agents, activate, terminate with audit."""
+        session = self.hv.create_session(
+            config=SessionConfig(
+                consistency_mode=ConsistencyMode.EVENTUAL,
+                max_participants=5,
+                enable_audit=True,
+            ),
+            creator_did="did:mesh:admin",
+        )
+        assert session.sso is not None
+        sid = session.sso.session_id
+
+        # Join two agents
+        ring_a = self.hv.join_session(sid, "did:mesh:agent-alpha", sigma_raw=0.85)
+        ring_b = self.hv.join_session(sid, "did:mesh:agent-beta", sigma_raw=0.45)
+        assert ring_a == ExecutionRing.RING_2_STANDARD
+        assert ring_b == ExecutionRing.RING_3_SANDBOX
+
+        # Activate
+        self.hv.activate_session(sid)
+
+        # Capture some audit deltas
+        session.delta_engine.capture(
+            "did:mesh:agent-alpha",
+            [VFSChange(path="/data/report.md", operation="add", content_hash="abc123")],
+        )
+        session.delta_engine.capture(
+            "did:mesh:agent-beta",
+            [VFSChange(path="/data/report.md", operation="modify", content_hash="def456")],
+        )
+
+        # Terminate — should get audit log root
+        hash_chain_root = self.hv.terminate_session(sid)
+        assert hash_chain_root is not None
+        assert len(hash_chain_root) == 64  # SHA-256 hex
+
+    async def test_session_without_audit(self):
+        """Session with audit disabled returns None audit log root."""
+        session = self.hv.create_session(
+            config=SessionConfig(enable_audit=False),
+            creator_did="did:mesh:admin",
+        )
+        sid = session.sso.session_id
+        self.hv.join_session(sid, "did:mesh:a", sigma_raw=0.7)
+        self.hv.activate_session(sid)
+        hash_chain_root = self.hv.terminate_session(sid)
+        assert hash_chain_root is None
+
+    async def test_multiple_concurrent_sessions(self):
+        """Multiple sessions can run independently."""
+        s1 = self.hv.create_session(config=SessionConfig(), creator_did="did:mesh:admin")
+        s2 = self.hv.create_session(config=SessionConfig(), creator_did="did:mesh:admin")
+
+        self.hv.join_session(s1.sso.session_id, "did:mesh:a", sigma_raw=0.8)
+        self.hv.join_session(s2.sso.session_id, "did:mesh:b", sigma_raw=0.9)
+
+        assert len(self.hv.active_sessions) == 2
+        assert s1.sso.session_id != s2.sso.session_id
+
+
+# ---------------------------------------------------------------------------
+# Ring Assignment & Demotion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestRingEnforcementIntegration:
+    """Test ring assignment with real sessions and sponsorship."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.hv = Hypervisor()
+
+    async def test_high_score_gets_standard_ring(self):
+        session = self.hv.create_session(config=SessionConfig(), creator_did="did:mesh:admin")
+        ring = self.hv.join_session(session.sso.session_id, "did:mesh:expert", sigma_raw=0.85)
+        assert ring == ExecutionRing.RING_2_STANDARD
+
+    async def test_low_score_gets_sandbox(self):
+        session = self.hv.create_session(config=SessionConfig(), creator_did="did:mesh:admin")
+        ring = self.hv.join_session(session.sso.session_id, "did:mesh:newbie", sigma_raw=0.3)
+        assert ring == ExecutionRing.RING_3_SANDBOX
+
+    async def test_non_reversible_action_forces_strong_mode(self):
+        """Joining with non-reversible actions forces STRONG consistency."""
+        session = self.hv.create_session(
+            config=SessionConfig(consistency_mode=ConsistencyMode.EVENTUAL),
+            creator_did="did:mesh:admin",
+        )
+        actions = [
+            ActionDescriptor(
+                action_id="delete_data",
+                name="Delete Data",
+                execute_api="/api/delete",
+                reversibility=ReversibilityLevel.NONE,
+            )
+        ]
+        self.hv.join_session(
+            session.sso.session_id,
+            "did:mesh:agent",
+            actions=actions,
+            sigma_raw=0.8,
+        )
+        # Reversibility registry detects non-reversible actions.
+        # Verify the registry flags it correctly.
+        assert session.reversibility.has_non_reversible_actions() is True
+
+
+# ---------------------------------------------------------------------------
+# Saga Execution with Timeout & Retry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestSagaIntegration:
+    """Test saga orchestration with real timeout and retry behavior."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.hv = Hypervisor()
+
+    async def test_saga_happy_path(self):
+        """Multi-step saga executes all steps successfully."""
+        session = self.hv.create_session(config=SessionConfig(), creator_did="did:mesh:admin")
+        saga = session.saga.create_saga(session.sso.session_id)
+
+        step1 = session.saga.add_step(
+            saga.saga_id, "draft", "did:mesh:a", "/api/draft", undo_api="/api/undo-draft"
+        )
+        step2 = session.saga.add_step(
+            saga.saga_id, "review", "did:mesh:b", "/api/review", undo_api="/api/undo-review"
+        )
+
+        await session.saga.execute_step(
+            saga.saga_id, step1.step_id, executor=lambda: asyncio.sleep(0)
+        )
+        await session.saga.execute_step(
+            saga.saga_id, step2.step_id, executor=lambda: asyncio.sleep(0)
+        )
+
+        assert step1.state == StepState.COMMITTED
+        assert step2.state == StepState.COMMITTED
+
+    async def test_saga_timeout_triggers_failure(self):
+        """Step that exceeds timeout is marked as failed."""
+        session = self.hv.create_session(config=SessionConfig(), creator_did="did:mesh:admin")
+        saga = session.saga.create_saga(session.sso.session_id)
+
+        step = session.saga.add_step(
+            saga.saga_id,
+            "slow_op",
+            "did:mesh:a",
+            "/api/slow",
+            timeout_seconds=1,  # 1 second timeout
+        )
+
+        async def slow_executor():
+            await asyncio.sleep(10)  # Will exceed timeout
+            return "done"
+
+        with pytest.raises(SagaTimeoutError):
+            await session.saga.execute_step(saga.saga_id, step.step_id, executor=slow_executor)
+
+    async def test_saga_retry_on_failure(self):
+        """Step retries on transient failure and eventually succeeds."""
+        session = self.hv.create_session(config=SessionConfig(), creator_did="did:mesh:admin")
+        saga = session.saga.create_saga(session.sso.session_id)
+
+        step = session.saga.add_step(
+            saga.saga_id,
+            "flaky_op",
+            "did:mesh:a",
+            "/api/flaky",
+            timeout_seconds=5,
+            max_retries=2,
+        )
+
+        call_count = 0
+
+        async def flaky_executor():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise ConnectionError("transient failure")
+            return "success"
+
+        result = await session.saga.execute_step(
+            saga.saga_id, step.step_id, executor=flaky_executor
+        )
+        assert result == "success"
+        assert call_count == 3
+        assert step.state == StepState.COMMITTED
+
+    async def test_saga_compensation_on_failure(self):
+        """Failed step triggers compensation of all committed steps."""
+        session = self.hv.create_session(config=SessionConfig(), creator_did="did:mesh:admin")
+        saga = session.saga.create_saga(session.sso.session_id)
+
+        step1 = session.saga.add_step(
+            saga.saga_id, "step1", "did:mesh:a", "/api/s1", undo_api="/api/undo-s1"
+        )
+        step2 = session.saga.add_step(
+            saga.saga_id, "step2", "did:mesh:b", "/api/s2", undo_api="/api/undo-s2"
+        )
+        step3 = session.saga.add_step(
+            saga.saga_id, "step3", "did:mesh:c", "/api/s3", undo_api="/api/undo-s3"
+        )
+
+        # Execute first two successfully
+        await session.saga.execute_step(
+            saga.saga_id, step1.step_id, executor=lambda: asyncio.sleep(0)
+        )
+        await session.saga.execute_step(
+            saga.saga_id, step2.step_id, executor=lambda: asyncio.sleep(0)
+        )
+
+        # Step 3 fails
+        with pytest.raises(ValueError):
+            await session.saga.execute_step(
+                saga.saga_id,
+                step3.step_id,
+                executor=lambda: (_ for _ in ()).throw(ValueError("boom")),
+            )
+
+        # Compensate
+        compensated_steps = []
+
+        async def compensator(step):
+            compensated_steps.append(step.action_id)
+
+        failed = await session.saga.compensate(saga.saga_id, compensator)
+        assert len(failed) == 0
+        # Compensation runs in reverse: step2 first, then step1
+        assert compensated_steps == ["step2", "step1"]
+        assert saga.state == SagaState.COMPLETED
+
+    async def test_saga_escalation_on_compensation_failure(self):
+        """Failed compensation escalates for manual intervention."""
+        session = self.hv.create_session(config=SessionConfig(), creator_did="did:mesh:admin")
+        saga = session.saga.create_saga(session.sso.session_id)
+
+        step1 = session.saga.add_step(
+            saga.saga_id,
+            "irrev",
+            "did:mesh:a",
+            "/api/irrev",
+            # No undo_api — compensation impossible
+        )
+        await session.saga.execute_step(
+            saga.saga_id, step1.step_id, executor=lambda: asyncio.sleep(0)
+        )
+
+        async def compensator(step):
+            raise RuntimeError("cannot undo")
+
+        failed = await session.saga.compensate(saga.saga_id, compensator)
+        assert len(failed) == 1
+        assert saga.state == SagaState.ESCALATED
+        assert "penalty triggered" in saga.error
+
+
+# ---------------------------------------------------------------------------
+# Audit Trail Integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestAuditTrailIntegration:
+    """Test delta audit engine in context of full sessions."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.hv = Hypervisor()
+
+    async def test_audit_trail_captures_all_turns(self):
+        session = self.hv.create_session(
+            config=SessionConfig(enable_audit=True),
+            creator_did="did:mesh:admin",
+        )
+        sid = session.sso.session_id
+        self.hv.join_session(sid, "did:mesh:a", sigma_raw=0.8)
+        self.hv.activate_session(sid)
+
+        # Capture 5 turns
+        for i in range(5):
+            session.delta_engine.capture(
+                "did:mesh:a",
+                [VFSChange(path=f"/file{i}.txt", operation="add", content_hash=f"hash{i}")],
+            )
+
+        assert session.delta_engine.turn_count == 5
+        assert len(session.delta_engine.deltas) == 5
+
+    async def test_hash_chain_integrity(self):
+        """Public Preview: no chain verification, always returns True."""
+        session = self.hv.create_session(config=SessionConfig(), creator_did="did:mesh:admin")
+        for i in range(10):
+            session.delta_engine.capture(
+                f"did:mesh:agent-{i % 3}",
+                [VFSChange(path=f"/doc{i}", operation="add", content_hash=f"h{i}")],
+            )
+
+        valid, error = session.delta_engine.verify_chain()
+        assert valid is True
+
+        # Tamper with a delta — chain verification now detects tampering
+        session.delta_engine._deltas[5].agent_did = "did:mesh:tampered"
+        valid, error = session.delta_engine.verify_chain()
+        assert valid is False
+
+    async def test_hash_chain_root_deterministic(self):
+        """Same session with same deltas produces consistent audit log roots."""
+        session = self.hv.create_session(config=SessionConfig(), creator_did="did:mesh:admin")
+
+        # Capture deltas
+        session.delta_engine.capture(
+            "did:mesh:a",
+            [VFSChange(path="/x", operation="add", content_hash="abc")],
+            delta_id="delta:1",
+        )
+        session.delta_engine.capture(
+            "did:mesh:a",
+            [VFSChange(path="/y", operation="add", content_hash="def")],
+            delta_id="delta:2",
+        )
+
+        root1 = session.delta_engine.compute_hash_chain_root()
+        # Computing again on same engine should give same result
+        root2 = session.delta_engine.compute_hash_chain_root()
+        assert root1 is not None
+        assert root1 == root2
+
+
+# ---------------------------------------------------------------------------
+# Edge Cases & Security
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestEdgeCases:
+    """Edge cases and security boundaries."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.hv = Hypervisor()
+
+    async def test_cannot_join_nonexistent_session(self):
+        with pytest.raises(ValueError, match="not found"):
+            self.hv.join_session("fake-session", "did:mesh:a", sigma_raw=0.8)
+
+    async def test_duplicate_agent_rejected(self):
+        session = self.hv.create_session(config=SessionConfig(), creator_did="did:mesh:admin")
+        sid = session.sso.session_id
+        self.hv.join_session(sid, "did:mesh:a", sigma_raw=0.8)
+        with pytest.raises(Exception):
+            self.hv.join_session(sid, "did:mesh:a", sigma_raw=0.8)
+
+    async def test_max_participants_enforced(self):
+        session = self.hv.create_session(
+            config=SessionConfig(max_participants=2),
+            creator_did="did:mesh:admin",
+        )
+        sid = session.sso.session_id
+        self.hv.join_session(sid, "did:mesh:a", sigma_raw=0.8)
+        self.hv.join_session(sid, "did:mesh:b", sigma_raw=0.7)
+        with pytest.raises(Exception):
+            self.hv.join_session(sid, "did:mesh:c", sigma_raw=0.6)

@@ -1,0 +1,149 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import Fory, { Type } from "../packages/core/index";
+import { TypeId } from "../packages/core/lib/type";
+import { describe, expect, test } from "@jest/globals";
+
+describe("bool", () => {
+  test("should write null work", () => {
+    const fory = new Fory({ compatible: false });
+    const bin = fory.serialize(null);
+    expect(fory.deserialize(bin)).toBe(null);
+  });
+  test("should write undefined work", () => {
+    const fory = new Fory({ compatible: false });
+    const bin = fory.serialize(undefined);
+    expect(fory.deserialize(bin)).toBe(null);
+  });
+
+  test("should write number work", () => {
+    const fory = new Fory({ compatible: false });
+    const bin = fory.serialize(123);
+    expect(fory.deserialize(bin)).toBe(123);
+  });
+
+  test("should write NaN work", () => {
+    const fory = new Fory({ compatible: false });
+    const bin = fory.serialize(NaN);
+    expect(fory.deserialize(bin)).toBe(NaN);
+  });
+
+  test("should write big number work", () => {
+    const fory = new Fory({ compatible: false });
+    const bin = fory.serialize(3000000000);
+    expect(fory.deserialize(bin)).toBe(3000000000n);
+  });
+
+  test("should write INFINITY work", () => {
+    const fory = new Fory({ compatible: false });
+    const bin = fory.serialize(Number.NEGATIVE_INFINITY);
+    expect(fory.deserialize(bin)).toBe(Number.NEGATIVE_INFINITY);
+  });
+
+  test("should write float work", () => {
+    const fory = new Fory({ compatible: false });
+    const bin = fory.serialize(123.123);
+    expect(fory.deserialize(bin)).toBe(123.123);
+  });
+
+  test("should write bigint work", () => {
+    const fory = new Fory({ compatible: false });
+    const bin = fory.serialize(BigInt(123));
+    expect(fory.deserialize(bin)).toBe(BigInt(123));
+  });
+
+  test("should write true work", () => {
+    const fory = new Fory({ compatible: false });
+    const bin = fory.serialize(true);
+    expect(fory.deserialize(bin)).toBe(true);
+  });
+
+  test("should write false work", () => {
+    const fory = new Fory({ compatible: false });
+    const bin = fory.serialize(false);
+    expect(fory.deserialize(bin)).toBe(false);
+  });
+
+  test("should write date work", () => {
+    const fory = new Fory({ compatible: false });
+    const dt = new Date();
+    const bin = fory.serialize(dt);
+    const ret = fory.deserialize(bin);
+    expect(ret instanceof Date).toBe(true);
+    expect(ret.toUTCString()).toBe(dt.toUTCString());
+  });
+
+  test("should write string work", () => {
+    const fory = new Fory({ compatible: false });
+    const bin = fory.serialize("hello");
+    expect(fory.deserialize(bin)).toBe("hello");
+  });
+
+  test("should write map work", () => {
+    const fory = new Fory({ compatible: false });
+    const obj = new Map([
+      [1, 2],
+      [3, 4],
+    ]);
+    const bin = fory.serialize(obj);
+    const ret = fory.deserialize(bin);
+    expect(ret instanceof Map).toBe(true);
+    expect([...ret.values()]).toEqual([...obj.values()]);
+    expect([...ret.keys()]).toEqual([...obj.keys()]);
+  });
+
+  test("should root any work", () => {
+    const fory = new Fory({ compatible: false });
+    const { serialize, deserialize } = fory.register(Type.any());
+    const bin = serialize("hello");
+    const result = deserialize(bin);
+    expect(result).toEqual("hello");
+  });
+
+  test.each([
+    [1.5, TypeId.FLOAT32],
+    [-1.5, TypeId.FLOAT32],
+    [2 ** -149, TypeId.FLOAT32],
+    [-(2 ** -149), TypeId.FLOAT32],
+    [0.1, TypeId.FLOAT64],
+    [1 / 3, TypeId.FLOAT64],
+    [-0.7, TypeId.FLOAT64],
+    [1.5 + Number.EPSILON, TypeId.FLOAT64],
+    [Number.MIN_VALUE, TypeId.FLOAT64],
+    [-Number.MIN_VALUE, TypeId.FLOAT64],
+    [3000000000.5, TypeId.FLOAT64],
+  ])("should dispatch %p as type %p", (value, typeId) => {
+    const fory = new Fory({ compatible: false });
+    // Round trips alone also pass if every value is written as float64.
+    expect(fory.typeResolver.getSerializerByData(value)).toBe(
+      fory.typeResolver.getSerializerById(typeId),
+    );
+    expect(fory.deserialize(fory.serialize(value))).toBe(value);
+  });
+
+  test("should preserve mixed float precision", () => {
+    // Non-integer numbers narrow to float32 only when exactly representable;
+    // otherwise the dynamic dispatch must pick float64.
+    const fory = new Fory({ compatible: false });
+    const { serialize, deserialize } = fory.register(Type.list(Type.any()));
+    const values = [0.1, 1 / 3, 1234.5678, -0.7, 1.5, 3000000000.5];
+    expect(deserialize(serialize(values))).toEqual(values);
+  });
+});

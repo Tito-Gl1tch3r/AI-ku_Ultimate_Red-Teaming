@@ -1,0 +1,958 @@
+//! Make the machine's implicit widening explicit in the C we emit.
+//!
+//! Once declarations are recovered at their true machine width, a parameter that
+//! DWARF calls `uint32_t` is declared `int` rather than `long` — which is what a
+//! reader (and a type-accuracy metric) wants. But the *body* still describes
+//! 64-bit register machine code: after canonicalisation every LLIR value lives in
+//! a 64-bit parent register, and a 32-bit write **zero-extends** into that parent
+//! (see [`crate::ir::regview`]). C's own promotion rules do something else, so a
+//! narrow declaration silently changes the arithmetic:
+//!
+//! | source                        | machine                  | C with `int arg`      |
+//! |-------------------------------|--------------------------|-----------------------|
+//! | `(uint64_t)a * (uint64_t)b`   | 64-bit `imul`            | 32-bit product        |
+//! | `(uint64_t)hi << 32`          | 64-bit `shl`             | shift ≥ width (UB)    |
+//! | `(unsigned long)x >> n`       | zero-extended `shr`      | sign-extends first    |
+//!
+//! This pass restores the machine's meaning by inserting the extension the
+//! hardware performed: where a value declared narrower than its use context is
+//! read, it is spelled `(unsigned long)(unsigned int)x`. The inner cast is what
+//! makes the widening a *zero*-extension; without it C sign-extends a signed
+//! narrow type. Where the compiler genuinely sign-extended it emitted `movslq`,
+//! which the lifter already models as an explicit [`Expr::Cast`] — those are left
+//! exactly as they are.
+//!
+//! Deliberately untouched: comparison operands (a narrow signed compare is its
+//! own recovery problem, and widening one would change its polarity), address
+//! arithmetic, and shift *counts*.
+
+use crate::ir::ast::{Expr, Function, Stmt};
+use crate::ir::types::{BinOp, VReg};
+use crate::ir::types_recover::TypeMap;
+
+/// Width, in bytes, at which a subexpression's value is consumed. `None` means
+/// "no widening applies here" — recurse, but do not insert casts at this level.
+type Want = Option<u8>;
+
+/// Rewrite `f` so every implicitly widened read is an explicit zero-extension,
+/// at the target's machine-register width and keyed by exact opaque SSA
+/// identities.
+///
+/// Semantics-preserving with respect to the *machine*, not to the C we emitted
+/// before: that is the point. Definitions, uses, control flow and value identities
+/// are unchanged, so `verify_defs` and the structural lane see the same function.
+///
+/// Decompilation entry points know the calling convention and must pass four
+/// for ARM32/i386 so their recovered C is not widened merely because the
+/// differential runner rebuilds it on an LP64 host. Exact identities are
+/// required because recovered declaration width belongs to a value, not its
+/// display spelling.
+pub fn insert_widening_casts_for_machine_width_with_identities(
+    f: &mut Function,
+    tm: &TypeMap,
+    machine_width: u8,
+    identities: &crate::ir::value_number::ValueIdentities,
+) {
+    // A return value may span more than one architectural register.  ARM32 and
+    // i386 return a uint64_t in a register pair, so clamping the return context
+    // to one machine word turns `(uint64_t)a * b` back into a 32-bit C multiply
+    // and only widens the already-truncated product.
+    let ret_width = crate::ir::ast::inferred_return_width(&f.body, Some(tm));
+    rewrite_body(&mut f.body, ret_width, tm, machine_width, identities);
+}
+
+fn rewrite_body(
+    body: &mut [Stmt],
+    ret_width: u8,
+    tm: &TypeMap,
+    machine_width: u8,
+    identities: &crate::ir::value_number::ValueIdentities,
+) {
+    for s in body.iter_mut() {
+        rewrite_stmt(s, ret_width, tm, machine_width, identities);
+    }
+}
+
+fn rewrite_stmt(
+    s: &mut Stmt,
+    ret_width: u8,
+    tm: &TypeMap,
+    machine_width: u8,
+    identities: &crate::ir::value_number::ValueIdentities,
+) {
+    match s.semantic_mut() {
+        Stmt::Assign { dst, src } => {
+            // The destination's own declaration says how wide this value is kept.
+            let want = declared_int_destination(dst, tm, identities)
+                .map(|(_, w)| w)
+                .unwrap_or(machine_width);
+            rewrite_expr(src, Some(want), tm, identities);
+        }
+        Stmt::Store { src, size, .. } => {
+            // The address expression is left alone: pointer arithmetic already
+            // computes at 64 bits and carries its own recovered casts.
+            // A recovered 128-bit transport is an aggregate byte value, not a
+            // scalar integer to widen.  Casting its array temporary to a
+            // machine word would narrow the subsequent store back to 8 bytes.
+            if *size != 16 {
+                rewrite_expr(src, Some((*size).min(machine_width)), tm, identities);
+            }
+        }
+        // NOT a blanket 64-bit context: a function declared to return `int`
+        // returns a value the machine computed in 32 bits.
+        Stmt::Return { value: Some(e) } => rewrite_expr(e, Some(ret_width), tm, identities),
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            rewrite_expr(cond, None, tm, identities);
+            rewrite_body(then_body, ret_width, tm, machine_width, identities);
+            if let Some(b) = else_body {
+                rewrite_body(b, ret_width, tm, machine_width, identities);
+            }
+        }
+        Stmt::While { cond, body } => {
+            rewrite_expr(cond, None, tm, identities);
+            rewrite_body(body, ret_width, tm, machine_width, identities);
+        }
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            rewrite_stmt(init, ret_width, tm, machine_width, identities);
+            rewrite_expr(cond, None, tm, identities);
+            rewrite_body(body, ret_width, tm, machine_width, identities);
+            rewrite_stmt(step, ret_width, tm, machine_width, identities);
+        }
+        Stmt::DoWhile { body, cond } => {
+            rewrite_body(body, ret_width, tm, machine_width, identities);
+            rewrite_expr(cond, None, tm, identities);
+        }
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => {
+            rewrite_expr(discriminant, None, tm, identities);
+            for (_, b) in cases.iter_mut() {
+                rewrite_body(b, ret_width, tm, machine_width, identities);
+            }
+            if let Some(b) = default {
+                rewrite_body(b, ret_width, tm, machine_width, identities);
+            }
+        }
+        Stmt::Call { target, args, .. } => {
+            rewrite_expr(target, None, tm, identities);
+            for a in args.iter_mut() {
+                rewrite_expr(a, None, tm, identities);
+            }
+        }
+        Stmt::Push { value } => rewrite_expr(value, None, tm, identities),
+        _ => {}
+    }
+}
+
+fn rewrite_expr(
+    e: &mut Expr,
+    want: Want,
+    tm: &TypeMap,
+    identities: &crate::ir::value_number::ValueIdentities,
+) {
+    match e {
+        Expr::Origin { expr, .. } => rewrite_expr(expr, want, tm, identities),
+        Expr::Reg(v) => {
+            let Some(want) = want else { return };
+            let Some(name) = reg_name(v) else { return };
+            let Some((signed, w)) = declared_int(Some(name), tm, identities) else {
+                return;
+            };
+            if w == 0 || w >= want {
+                return;
+            }
+            *e = widen(e.clone(), signed, w, want);
+        }
+        Expr::Bin { op, lhs, rhs } => match op {
+            // A shift *count* is consumed at its own width; only the shifted
+            // value participates in the wide operation.
+            BinOp::Shl => {
+                rewrite_expr(lhs, want, tm, identities);
+                rewrite_expr(rhs, None, tm, identities);
+            }
+            // An arithmetic right shift replicates the SIGN bit at the operand's
+            // own width — `sar %eax` is a 32-bit signed shift. Widening the
+            // operand through its unsigned type would turn it into a zero-fill,
+            // which is precisely the shift `Shr` already means.
+            BinOp::Sar => {
+                rewrite_expr(lhs, None, tm, identities);
+                rewrite_expr(rhs, None, tm, identities);
+            }
+            // A logical right shift zero-fills at the operand's own width. C
+            // would shift a signed-declared operand arithmetically, so the
+            // reinterpretation is stated even when no widening is needed.
+            BinOp::Shr => {
+                rewrite_expr(lhs, want, tm, identities);
+                make_unsigned(lhs, tm, identities);
+                rewrite_expr(rhs, None, tm, identities);
+            }
+            _ => {
+                rewrite_expr(lhs, want, tm, identities);
+                rewrite_expr(rhs, want, tm, identities);
+            }
+        },
+        Expr::Un { src, .. } => rewrite_expr(src, want, tm, identities),
+        // An explicit cast states its own width: it is the compiler's recovered
+        // extension, and its operand is consumed at the cast's width.
+        Expr::Cast { width, expr, .. } => rewrite_expr(expr, Some(*width), tm, identities),
+        Expr::Cmp { lhs, rhs, .. } => {
+            rewrite_expr(lhs, None, tm, identities);
+            rewrite_expr(rhs, None, tm, identities);
+        }
+        Expr::Select {
+            cond,
+            if_true,
+            if_false,
+            width,
+        } => {
+            rewrite_expr(cond, None, tm, identities);
+            rewrite_expr(if_true, Some(*width), tm, identities);
+            rewrite_expr(if_false, Some(*width), tm, identities);
+        }
+        Expr::Deref { addr, .. } => rewrite_expr(addr, None, tm, identities),
+        _ => {}
+    }
+}
+
+/// Reinterpret a signed-declared identifier as unsigned at its own width, so a
+/// following logical shift zero-fills. A no-op for anything already unsigned, for
+/// compound expressions (whose own operands were handled on the way down), and for
+/// values that are not integers.
+fn make_unsigned(
+    e: &mut Expr,
+    tm: &TypeMap,
+    identities: &crate::ir::value_number::ValueIdentities,
+) {
+    if let Expr::Origin { expr, .. } = e {
+        make_unsigned(expr, tm, identities);
+        return;
+    }
+    let Expr::Reg(v) = e else { return };
+    let Some(name) = reg_name(v) else { return };
+    let Some((true, w)) = declared_int(Some(name), tm, identities) else {
+        return;
+    };
+    *e = Expr::Cast {
+        signed: false,
+        width: w,
+        expr: Box::new(e.clone()),
+    };
+}
+
+/// `(unsigned <want>)(unsigned <have>)expr` — the zero-extension a narrow write
+/// performs into its 64-bit parent. The inner cast is omitted when the value is
+/// already unsigned at its declared width (the widening is a zero-extension
+/// either way, and the extra cast would be noise).
+fn widen(expr: Expr, signed: bool, have: u8, want: u8) -> Expr {
+    let inner = if signed {
+        Expr::Cast {
+            signed: false,
+            width: have,
+            expr: Box::new(expr),
+        }
+    } else {
+        expr
+    };
+    Expr::Cast {
+        signed: false,
+        width: want,
+        expr: Box::new(inner),
+    }
+}
+
+fn reg_name(v: &VReg) -> Option<&str> {
+    match v {
+        VReg::Phys(n) => Some(n.as_str()),
+        _ => None,
+    }
+}
+
+fn declared_int_destination(
+    v: &VReg,
+    tm: &TypeMap,
+    identities: &crate::ir::value_number::ValueIdentities,
+) -> Option<(bool, u8)> {
+    if let Some(name) = reg_name(v) {
+        return declared_int(Some(name), tm, identities);
+    }
+    match tm.get(v) {
+        Some(crate::ir::types_recover::TypeHint::Int { signed, width }) => Some((signed, width)),
+        _ => None,
+    }
+}
+
+/// The `(signed, width)` the renderer will actually **declare** this name with —
+/// not merely what type recovery inferred. Delegating keeps the two in step: a
+/// `varN` that recovery tagged 4 bytes is still printed `long`, and widening it
+/// would emit a cast that truncates.
+fn declared_int(
+    name: Option<&str>,
+    tm: &TypeMap,
+    identities: &crate::ir::value_number::ValueIdentities,
+) -> Option<(bool, u8)> {
+    crate::ir::ast::declared_int_type_with_identities(name?, Some(tm), Some(identities))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::ast::{render_decbench_typed, OriginSet};
+    use crate::ir::types_recover::TypeHint;
+
+    fn tm_of(pairs: &[(&str, bool, u8)]) -> TypeMap {
+        let mut m = TypeMap::default();
+        for (n, signed, width) in pairs {
+            m.upsert_public(
+                VReg::phys(*n),
+                TypeHint::Int {
+                    signed: *signed,
+                    width: *width,
+                },
+            );
+        }
+        m
+    }
+
+    fn typed_identities(types: &TypeMap) -> crate::ir::value_number::ValueIdentities {
+        let mut slots = std::collections::HashSet::new();
+        let mut promoted = Vec::new();
+        for (value, _) in types.iter() {
+            let VReg::Phys(name) = value else { continue };
+            if let Some(slot) = crate::ir::ast::parse_arg_index(name) {
+                slots.insert(slot);
+            }
+            if name.starts_with("local_") || name.starts_with("stack_") {
+                promoted.push(name.clone());
+            }
+        }
+        let mut identities = crate::ir::value_number::ValueIdentities::default()
+            .with_role_aliases_and_parameter_slots(&std::collections::HashMap::new(), &slots);
+        identities.attach_promoted_stack_objects(&promoted);
+        for (index, (value, _)) in types.iter().enumerate() {
+            let VReg::Phys(name) = value else { continue };
+            if name.strip_prefix("var").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            }) {
+                identities.record(
+                    value.clone(),
+                    crate::ir::ssa::SsaValue {
+                        base: VReg::phys(format!("test_value_{index}")),
+                        version: 1,
+                    },
+                );
+            }
+        }
+        identities
+    }
+
+    fn func(body: Vec<Stmt>) -> Function {
+        Function {
+            name: "f".into(),
+            entry_va: 0x1000,
+            body,
+        }
+    }
+
+    fn reg(n: &str) -> Expr {
+        Expr::Reg(VReg::phys(n))
+    }
+
+    fn bin(op: BinOp, l: Expr, r: Expr) -> Expr {
+        Expr::Bin {
+            op,
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        }
+    }
+
+    /// `mul_widen`: a 64-bit product of two 32-bit parameters. Declared `int`,
+    /// C would compute the product in 32 bits and lose the high half.
+    #[test]
+    fn narrow_operands_of_a_wide_multiply_are_widened() {
+        let tm = tm_of(&[("arg0", true, 4), ("arg1", true, 4), ("local_8", false, 8)]);
+        let mut f = func(vec![Stmt::Assign {
+            dst: VReg::phys("local_8"),
+            src: bin(BinOp::Mul, reg("arg0"), reg("arg1")),
+        }]);
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+        let out = render_decbench_typed(&f, Some(&tm), Some(&tm));
+        assert!(
+            out.contains(
+                "(unsigned long)((unsigned int)(arg0)) * (unsigned long)((unsigned int)(arg1))"
+            ) || out.contains("(unsigned long)((unsigned int)(arg0))"),
+            "both operands must widen before the multiply:\n{out}"
+        );
+    }
+
+    #[test]
+    fn exact_opaque_identity_is_widened_in_a_wide_context() {
+        let value = VReg::phys("opaque_value");
+        let tm = tm_of(&[("opaque_value", true, 4), ("local_8", false, 8)]);
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.record(
+            value.clone(),
+            crate::ir::ssa::SsaValue {
+                base: VReg::phys("eax"),
+                version: 1,
+            },
+        );
+        let mut function = func(vec![Stmt::Assign {
+            dst: VReg::phys("local_8"),
+            src: Expr::Reg(value.clone()),
+        }]);
+
+        insert_widening_casts_for_machine_width_with_identities(&mut function, &tm, 8, &identities);
+
+        assert!(matches!(
+            &function.body[0],
+            Stmt::Assign {
+                src: Expr::Cast {
+                    signed: false,
+                    width: 8,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ambiguous_opaque_identity_is_not_widened() {
+        let value = VReg::phys("opaque_value");
+        let tm = tm_of(&[("opaque_value", true, 4), ("local_8", false, 8)]);
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        for (base, version) in [("eax", 1), ("ebx", 2)] {
+            identities.record(
+                value.clone(),
+                crate::ir::ssa::SsaValue {
+                    base: VReg::phys(base),
+                    version,
+                },
+            );
+        }
+        let mut function = func(vec![Stmt::Assign {
+            dst: VReg::phys("local_8"),
+            src: Expr::Reg(value.clone()),
+        }]);
+        let before = function.clone();
+
+        insert_widening_casts_for_machine_width_with_identities(&mut function, &tm, 8, &identities);
+
+        assert_eq!(function, before);
+    }
+
+    #[test]
+    fn exact_opaque_destination_keeps_its_arithmetic_narrow() {
+        let destination = VReg::phys("opaque_destination");
+        let tm = tm_of(&[
+            ("opaque_destination", false, 4),
+            ("arg0", false, 4),
+            ("arg1", false, 4),
+        ]);
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.record(
+            destination.clone(),
+            crate::ir::ssa::SsaValue {
+                base: VReg::phys("eax"),
+                version: 2,
+            },
+        );
+        let mut function = func(vec![Stmt::Assign {
+            dst: destination,
+            src: bin(BinOp::Add, reg("arg0"), reg("arg1")),
+        }]);
+        let before = function.clone();
+
+        insert_widening_casts_for_machine_width_with_identities(&mut function, &tm, 8, &identities);
+
+        assert_eq!(function, before);
+    }
+
+    #[test]
+    fn exact_narrow_value_assignment_keeps_wrapping_arithmetic_narrow() {
+        let tm = tm_of(&[("arg0", false, 4), ("var0", false, 4)]);
+        let mut f = func(vec![Stmt::Assign {
+            dst: VReg::phys("var0"),
+            src: bin(BinOp::Add, reg("arg0"), Expr::Const(3)),
+        }]);
+
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+
+        let out = render_decbench_typed(&f, Some(&tm), Some(&tm));
+        assert!(out.contains("unsigned int var0;"), "{out}");
+        assert!(out.contains("var0 = (arg0 + 3);"), "{out}");
+        assert!(!out.contains("unsigned long"), "{out}");
+    }
+
+    /// `reconstruct_64`: `(uint64_t)hi << 32`. A 32-bit shift by 32 is undefined;
+    /// the machine shifts the 64-bit parent.
+    #[test]
+    fn a_narrow_value_shifted_into_the_high_word_is_widened_first() {
+        let tm = tm_of(&[("arg0", true, 4), ("local_8", false, 8)]);
+        let mut f = func(vec![Stmt::Assign {
+            dst: VReg::phys("local_8"),
+            src: bin(BinOp::Shl, reg("arg0"), Expr::Const(32)),
+        }]);
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+        let out = render_decbench_typed(&f, Some(&tm), Some(&tm));
+        assert!(
+            out.contains("(unsigned long)"),
+            "shifted value must widen:\n{out}"
+        );
+    }
+
+    /// The count of a shift is not a wide operand — widening it is pure noise.
+    #[test]
+    fn a_shift_count_is_not_widened() {
+        let tm = tm_of(&[("arg0", false, 8), ("arg1", true, 4), ("local_8", false, 8)]);
+        let mut f = func(vec![Stmt::Assign {
+            dst: VReg::phys("local_8"),
+            src: bin(BinOp::Shr, reg("arg0"), reg("arg1")),
+        }]);
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+        let Stmt::Assign { src, .. } = &f.body[0] else {
+            panic!("expected an assignment");
+        };
+        let Expr::Bin { rhs, .. } = src else {
+            panic!("expected a binary op");
+        };
+        assert_eq!(**rhs, reg("arg1"), "the shift count must be left alone");
+    }
+
+    /// A signed narrow read must zero-extend, because that is what the 32-bit
+    /// write into the 64-bit parent did. `(unsigned long)arg0` alone would
+    /// sign-extend and set the whole high word for a negative value.
+    #[test]
+    fn widening_a_signed_value_goes_through_its_unsigned_type() {
+        let tm = tm_of(&[("arg0", true, 4), ("local_8", false, 8)]);
+        let mut f = func(vec![Stmt::Assign {
+            dst: VReg::phys("local_8"),
+            src: reg("arg0"),
+        }]);
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+        let Stmt::Assign { src, .. } = &f.body[0] else {
+            panic!("expected an assignment");
+        };
+        assert_eq!(
+            *src,
+            Expr::Cast {
+                signed: false,
+                width: 8,
+                expr: Box::new(Expr::Cast {
+                    signed: false,
+                    width: 4,
+                    expr: Box::new(reg("arg0")),
+                }),
+            }
+        );
+    }
+
+    /// An already-unsigned narrow value needs only the outer widening.
+    #[test]
+    fn widening_an_unsigned_value_needs_no_inner_cast() {
+        let tm = tm_of(&[("arg0", false, 4), ("local_8", false, 8)]);
+        let mut f = func(vec![Stmt::Assign {
+            dst: VReg::phys("local_8"),
+            src: reg("arg0"),
+        }]);
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+        let Stmt::Assign { src, .. } = &f.body[0] else {
+            panic!("expected an assignment");
+        };
+        assert_eq!(
+            *src,
+            Expr::Cast {
+                signed: false,
+                width: 8,
+                expr: Box::new(reg("arg0")),
+            }
+        );
+    }
+
+    /// Assigning into a narrow destination keeps narrow arithmetic narrow —
+    /// the machine truncated too, and a cast here would only add noise.
+    #[test]
+    fn a_narrow_destination_does_not_widen_its_operands() {
+        let tm = tm_of(&[("arg0", true, 4), ("arg1", true, 4), ("local_4", true, 4)]);
+        let mut f = func(vec![Stmt::Assign {
+            dst: VReg::phys("local_4"),
+            src: bin(BinOp::Add, reg("arg0"), reg("arg1")),
+        }]);
+        let before = f.clone();
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+        assert_eq!(f, before);
+    }
+
+    /// Comparison operands are left alone: a narrow signed compare is its own
+    /// recovery problem and zero-extending one would flip its polarity.
+    #[test]
+    fn comparison_operands_are_left_alone() {
+        let tm = tm_of(&[("arg0", true, 4)]);
+        let mut f = func(vec![Stmt::If {
+            cond: Expr::Cmp {
+                op: crate::ir::types::CmpOp::Slt,
+                lhs: Box::new(reg("arg0")),
+                rhs: Box::new(Expr::Const(0)),
+            },
+            then_body: vec![Stmt::Nop],
+            else_body: None,
+        }]);
+        let before = f.clone();
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+        assert_eq!(f, before);
+    }
+
+    /// An explicit cast is the compiler's own recovered extension (`movslq`);
+    /// its operand is consumed at the cast's width, not the statement's.
+    #[test]
+    fn an_explicit_cast_sets_the_width_of_its_operand() {
+        let tm = tm_of(&[("arg0", true, 4), ("local_8", false, 8)]);
+        let mut f = func(vec![Stmt::Assign {
+            dst: VReg::phys("local_8"),
+            src: Expr::Cast {
+                signed: true,
+                width: 8,
+                expr: Box::new(reg("arg0")),
+            },
+        }]);
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+        let Stmt::Assign { src, .. } = &f.body[0] else {
+            panic!("expected an assignment");
+        };
+        // The outer sign-extending cast survives; only its operand is made
+        // explicit about the zero-extension underneath.
+        let Expr::Cast { signed, width, .. } = src else {
+            panic!("expected the explicit cast to survive");
+        };
+        assert!(*signed && *width == 8);
+    }
+
+    #[test]
+    fn a_declared_view_fold_does_not_turn_movsxd_into_zero_extension() {
+        // GCC's optimized `fib(int)` begins with `movsxd rbp, edi`. The typed
+        // declared-view fold used to erase this exact signed 32->64 extension;
+        // contextual widening then rebuilt a zero-extension from the bare
+        // signed `int` parameter, making fib(-1) return 4294967295 instead of
+        // -1 in an actual recompiled round trip.
+        let signed_extension = Expr::Cast {
+            signed: true,
+            width: 8,
+            expr: Box::new(Expr::Cast {
+                signed: true,
+                width: 4,
+                expr: Box::new(reg("arg0")),
+            }),
+        };
+        let tm = tm_of(&[("arg0", true, 4), ("local_8", true, 8)]);
+        let mut f = func(vec![Stmt::Assign {
+            dst: VReg::phys("local_8"),
+            src: signed_extension.clone(),
+        }]);
+
+        let identities = crate::ir::value_number::ValueIdentities::default()
+            .with_role_aliases_and_parameter_slots(
+                &std::collections::HashMap::new(),
+                &std::collections::HashSet::from([0]),
+            );
+        crate::ir::const_fold::fold_typed_declared_views_with_identities(&mut f, &tm, &identities);
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+
+        let Stmt::Assign { src, .. } = &f.body[0] else {
+            panic!("expected an assignment");
+        };
+        assert_eq!(src, &signed_extension);
+    }
+
+    /// A value with no recovered type stays `long` and is already machine-wide.
+    #[test]
+    fn an_untyped_value_is_untouched() {
+        let tm = tm_of(&[("local_8", false, 8)]);
+        let mut f = func(vec![Stmt::Assign {
+            dst: VReg::phys("local_8"),
+            src: reg("var3"),
+        }]);
+        let before = f.clone();
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+        assert_eq!(f, before);
+    }
+
+    /// The renderer declares raw machine registers (`ret`, `varN`) `long` whatever
+    /// type recovery inferred. Widening one against the recovered width would emit
+    /// a cast that *truncates* a 64-bit value.
+    #[test]
+    fn a_register_local_is_never_narrowed_by_a_recovered_width() {
+        // Recovery tagged `ret` as 4 bytes; the printer still declares it `long`.
+        let tm = tm_of(&[("ret", true, 4), ("local_8", false, 8)]);
+        let mut f = func(vec![Stmt::Assign {
+            dst: VReg::phys("local_8"),
+            src: reg("ret"),
+        }]);
+        let before = f.clone();
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+        assert_eq!(f, before, "`ret` is declared `long`; casting it truncates");
+    }
+
+    /// `rotr32`: `x >> n` where the count is variable. C shifts a signed operand
+    /// arithmetically; the machine's `shr` zero-fills.
+    #[test]
+    fn a_logical_shift_reinterprets_a_signed_operand_as_unsigned() {
+        let tm = tm_of(&[("arg0", true, 4), ("local_4", true, 4)]);
+        let mut f = func(vec![Stmt::Assign {
+            dst: VReg::phys("local_4"),
+            src: bin(BinOp::Shr, reg("arg0"), reg("t6")),
+        }]);
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+        let Stmt::Assign { src, .. } = &f.body[0] else {
+            panic!("expected an assignment");
+        };
+        let Expr::Bin { lhs, .. } = src else {
+            panic!("expected a binary op");
+        };
+        assert_eq!(
+            **lhs,
+            Expr::Cast {
+                signed: false,
+                width: 4,
+                expr: Box::new(reg("arg0")),
+            }
+        );
+    }
+
+    /// ARM32 and i386 values occupy four-byte machine registers.  A raw
+    /// register local is rendered as `long` for portability, but that spelling
+    /// must not make a logical shift execute at the 64-bit rebuild host's word
+    /// width: `-1 >> 8` would remain `-1` instead of becoming `0x00ffffff`.
+    #[test]
+    fn a_thirty_two_bit_machine_does_not_widen_a_logical_shift_to_host_long() {
+        let tm = tm_of(&[("arg0", true, 4)]);
+        let mut f = func(vec![Stmt::Store {
+            addr: Expr::Const(0),
+            src: bin(BinOp::Shr, reg("arg0"), Expr::Const(8)),
+            // Canonical LLIR still carries an eight-byte parent-register store
+            // width here even though the ARM machine can only consume four.
+            size: 8,
+        }]);
+
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 4, &identities);
+
+        let out = render_decbench_typed(&f, Some(&tm), Some(&tm));
+        assert!(out.contains("(unsigned int)(arg0) >> 8"), "{out}");
+        assert!(!out.contains("unsigned long"), "{out}");
+    }
+
+    /// An arithmetic shift keeps its signed operand — that is what `sar` means.
+    #[test]
+    fn an_arithmetic_shift_keeps_its_signed_operand() {
+        let tm = tm_of(&[("arg0", true, 4), ("local_4", true, 4)]);
+        let mut f = func(vec![Stmt::Assign {
+            dst: VReg::phys("local_4"),
+            src: bin(BinOp::Sar, reg("arg0"), Expr::Const(3)),
+        }]);
+        let before = f.clone();
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+        assert_eq!(f, before);
+    }
+
+    /// `sar_signed`: `return x >> 4` on a signed `int`. Widening the operand into
+    /// a 64-bit unsigned makes the sign bit stop replicating, so every negative
+    /// input returns a large positive number instead.
+    #[test]
+    fn an_arithmetic_shift_is_not_widened_by_its_return_context() {
+        let tm = tm_of(&[("arg0", true, 4)]);
+        let mut f = func(vec![Stmt::Return {
+            value: Some(bin(BinOp::Sar, reg("arg0"), Expr::Const(4))),
+        }]);
+        let before = f.clone();
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+        assert_eq!(f, before, "an arithmetic shift must stay signed and narrow");
+    }
+
+    /// `wrap_sub_u32`: a 32-bit subtraction whose borrow must not escape the low
+    /// word. Returning it does not make it a 64-bit computation — the declared
+    /// return type is `int`, so the machine computed it in 32 bits.
+    ///
+    /// The `ret` entry is what makes the renderer declare an `int` return: the
+    /// returned expression is compound, so the type falls back to the return
+    /// register's own recovered type.
+    #[test]
+    fn returning_a_narrow_value_is_not_a_sixty_four_bit_context() {
+        let tm = tm_of(&[("arg0", false, 4), ("arg1", false, 4), ("ret", true, 4)]);
+        let mut f = func(vec![Stmt::Return {
+            value: Some(bin(BinOp::Sub, reg("arg0"), reg("arg1"))),
+        }]);
+        let before = f.clone();
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+        assert_eq!(f, before, "an `int`-returning subtract must stay 32-bit");
+    }
+
+    /// The converse: a function that returns `long` DOES widen, because its value
+    /// really is the 64-bit register.
+    #[test]
+    fn returning_a_wide_value_widens_its_narrow_operands() {
+        // `ret` is a register local, declared `long`, so the return type is `long`.
+        let tm = tm_of(&[("arg0", false, 4), ("ret", true, 8)]);
+        let mut f = func(vec![
+            Stmt::Assign {
+                dst: VReg::phys("ret"),
+                src: reg("arg0"),
+            },
+            Stmt::Return {
+                value: Some(reg("ret")),
+            },
+        ]);
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+        let Stmt::Assign { src, .. } = &f.body[0] else {
+            panic!("expected an assignment");
+        };
+        assert_eq!(
+            *src,
+            Expr::Cast {
+                signed: false,
+                width: 8,
+                expr: Box::new(reg("arg0")),
+            }
+        );
+    }
+
+    #[test]
+    fn a_wide_register_pair_return_widens_operands_on_a_32_bit_machine() {
+        let mut f = func(vec![
+            Stmt::Assign {
+                dst: VReg::phys("t0"),
+                src: bin(BinOp::Mul, reg("arg0"), reg("arg1")),
+            },
+            Stmt::Return {
+                value: Some(reg("t0")),
+            },
+        ]);
+        let tm = tm_of(&[
+            ("arg0", false, 4),
+            ("arg1", false, 4),
+            ("t0", false, 8),
+            ("ret", false, 8),
+        ]);
+
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 4, &identities);
+        let out = render_decbench_typed(&f, Some(&tm), Some(&tm));
+
+        assert!(
+            out.contains("(unsigned long)(arg0)") && out.contains("(unsigned long)(arg1)"),
+            "both register-pair operands must widen before multiplication:\n{out}"
+        );
+    }
+
+    #[test]
+    fn attributed_assignment_is_widened_without_losing_its_owner() {
+        let owner = OriginSet::one(0x1010);
+        let tm = tm_of(&[("arg0", false, 4), ("ret", true, 8)]);
+        let mut f = func(vec![Stmt::Assign {
+            dst: VReg::phys("ret"),
+            src: reg("arg0"),
+        }
+        .with_origins(owner.clone())]);
+
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+
+        assert!(matches!(
+            f.body[0].semantic(),
+            Stmt::Assign {
+                src: Expr::Cast { width: 8, .. },
+                ..
+            }
+        ));
+        assert_eq!(f.body[0].origins(), Some(&owner));
+    }
+
+    #[test]
+    fn attributed_value_is_widened_without_losing_its_owner() {
+        let owner = OriginSet::one(0x1020);
+        let tm = tm_of(&[("arg0", true, 4), ("local_8", false, 8)]);
+        let mut f = func(vec![Stmt::Assign {
+            dst: VReg::phys("local_8"),
+            src: reg("arg0").with_origins(owner.clone()),
+        }]);
+
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+
+        let Stmt::Assign { src, .. } = f.body[0].semantic() else {
+            panic!("expected an assignment: {:#?}", f.body);
+        };
+        assert!(
+            matches!(
+                src.semantic(),
+                Expr::Cast {
+                    signed: false,
+                    width: 8,
+                    ..
+                }
+            ),
+            "the expression carrier hid the required machine widening: {src:#?}"
+        );
+        assert_eq!(src.origins(), Some(&owner));
+    }
+
+    #[test]
+    fn attributed_signed_shift_value_is_reinterpreted_without_losing_its_owner() {
+        let owner = OriginSet::one(0x1030);
+        let tm = tm_of(&[("arg0", true, 4), ("local_4", true, 4)]);
+        let mut f = func(vec![Stmt::Assign {
+            dst: VReg::phys("local_4"),
+            src: bin(
+                BinOp::Shr,
+                reg("arg0").with_origins(owner.clone()),
+                Expr::Const(8),
+            ),
+        }]);
+
+        let identities = typed_identities(&tm);
+        insert_widening_casts_for_machine_width_with_identities(&mut f, &tm, 8, &identities);
+
+        let Stmt::Assign { src, .. } = f.body[0].semantic() else {
+            panic!("expected an assignment: {:#?}", f.body);
+        };
+        let Expr::Bin { lhs, .. } = src.semantic() else {
+            panic!("expected a logical shift: {src:#?}");
+        };
+        assert!(matches!(
+            lhs.semantic(),
+            Expr::Cast {
+                signed: false,
+                width: 4,
+                ..
+            }
+        ));
+        assert_eq!(lhs.origins(), Some(&owner));
+    }
+}

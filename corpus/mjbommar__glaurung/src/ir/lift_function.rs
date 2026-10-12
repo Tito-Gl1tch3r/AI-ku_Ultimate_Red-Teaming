@@ -1,0 +1,1938 @@
+//! Bridge between CFG-discovered `Function`s and LLIR.
+//!
+//! The CFG pass in `crate::analysis::cfg` already enumerates every basic
+//! block's VA range. This module lifts each block's raw bytes through
+//! `lift_x86::lift_bytes` and assembles an `LlirFunction`.
+//!
+//! Only x86, x86-64, AArch64 and ARM32 are supported today. Every other
+//! architecture — and every incoherent target/mode combination — is rejected
+//! with a typed [`LiftError`] before a single byte is decoded, so a caller can
+//! tell "this ISA has no lifter" from "this function had nothing to lift".
+
+use std::fmt;
+
+use crate::analysis::entry::va_to_code_file_offset;
+use crate::core::binary::Arch;
+use crate::core::function::Function;
+use crate::ir::types::*;
+use crate::ir::use_def::def_uses;
+use crate::ir::{lift_arm32, lift_arm64, lift_x86};
+use crate::target::{CodeMode, TargetId, TargetSpec};
+
+/// Why a lift request produced no [`LlirFunction`].
+///
+/// The lifter used to answer `Option<LlirFunction>`, and its `None` meant three
+/// unrelated things at once: the architecture has no lifter at all, the
+/// function's encoding mode contradicts its target, or the architecture *is*
+/// supported and the function simply owned no liftable block. A caller must
+/// treat those differently — the first is a permanent capability gap worth
+/// reporting once per binary, the second is a defect in the function record
+/// that names an exact function, and the third is per-function data loss whose
+/// affected ranges are worth surfacing. Reporting all three as `None` is why
+/// the Python surface raised "LLIR lifter does not support this architecture"
+/// for x86-64 binaries whose lifter works fine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiftError {
+    /// No LLIR lifter exists for this architecture. Permanent for this binary:
+    /// every function in it will fail the same way.
+    UnsupportedArchitecture {
+        /// The architecture the caller asked for.
+        arch: Arch,
+    },
+    /// The function's instruction-encoding marker cannot be reconciled with its
+    /// target — for example an `IS_THUMB` function on a target with no Thumb
+    /// mode. Lifting it anyway decodes one ISA's bytes with another's decoder,
+    /// which produces confident nonsense rather than an error.
+    IncoherentCodeMode {
+        /// Architecture the request named.
+        arch: Arch,
+        /// Target identity, when the request carried one.
+        target: Option<TargetId>,
+        /// Whether the function is marked as Thumb-encoded.
+        thumb: bool,
+        /// Entry VA of the offending function.
+        entry_va: u64,
+    },
+    /// The architecture is supported and the mode is coherent, but no block
+    /// survived to be lifted. `disowned` carries the exact VA ranges rejected
+    /// because they lie outside every range the function owns, so the caller
+    /// can report *which* bytes went missing instead of only that some did.
+    NoLiftableBlocks {
+        /// Entry VA of the function that produced nothing.
+        entry_va: u64,
+        /// How many CFG basic blocks were offered to the lifter.
+        considered: usize,
+        /// The `[start, end)` ranges rejected as belonging to another function.
+        disowned: Vec<(u64, u64)>,
+    },
+}
+
+impl LiftError {
+    /// The VA ranges this failure lost, when it lost any.
+    ///
+    /// Only [`LiftError::NoLiftableBlocks`] loses specific bytes; the other two
+    /// reject the whole request before any range is considered.
+    pub fn affected_ranges(&self) -> &[(u64, u64)] {
+        match self {
+            LiftError::NoLiftableBlocks { disowned, .. } => disowned,
+            _ => &[],
+        }
+    }
+
+    /// True when every function in this binary will fail the same way, so a
+    /// caller sweeping many functions should stop rather than retry each one.
+    pub fn is_whole_binary(&self) -> bool {
+        matches!(self, LiftError::UnsupportedArchitecture { .. })
+    }
+}
+
+impl fmt::Display for LiftError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LiftError::UnsupportedArchitecture { arch } => {
+                write!(f, "no LLIR lifter exists for architecture {arch:?}")
+            }
+            LiftError::IncoherentCodeMode {
+                arch,
+                target,
+                thumb,
+                entry_va,
+            } => write!(
+                f,
+                "function at {entry_va:#x} is marked thumb={thumb}, which architecture {arch:?} \
+                 (target {target:?}) has no encoding mode for"
+            ),
+            LiftError::NoLiftableBlocks {
+                entry_va,
+                considered,
+                disowned,
+            } => write!(
+                f,
+                "function at {entry_va:#x} lifted no blocks ({considered} considered, \
+                 {} disowned)",
+                disowned.len()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LiftError {}
+
+/// Lift a byte window into LLIR using the decoder the validated mode selects.
+///
+/// Taking a [`CodeMode`] rather than `(arch, thumb)` is what removes the
+/// lifter's last untyped hole: the match is total, so there is no `_ =>
+/// Vec::new()` arm silently producing an empty block for an ISA nobody checked.
+///
+/// `image` is the whole file the window came from. ARM32 needs it: its
+/// constants live in a literal pool read through `ldr Rd,[pc,#imm]`, and the
+/// pool sits after the function's last basic block — outside every per-block
+/// window this function lifts.
+fn lift_window(
+    bytes: &[u8],
+    start_va: u64,
+    mode: CodeMode,
+    image: &[u8],
+    x87: Option<&crate::ir::x87::Depths>,
+) -> Vec<LlirInstr> {
+    match mode {
+        CodeMode::X86_32 => lift_x86::lift_bytes_with_x87(bytes, start_va, 32, x87),
+        CodeMode::X86_64 => lift_x86::lift_bytes_with_x87(bytes, start_va, 64, x87),
+        CodeMode::AArch64 => lift_arm64::lift_bytes(bytes, start_va),
+        CodeMode::ArmA32 => lift_arm32::lift_bytes_in_image(bytes, start_va, false, Some(image)),
+        CodeMode::ArmThumb => lift_arm32::lift_bytes_in_image(bytes, start_va, true, Some(image)),
+    }
+}
+
+/// One basic block, located in the image and ready to lift.
+struct PreparedBlock {
+    start: u64,
+    end: u64,
+    succs: Vec<u64>,
+    /// Byte span of the block in `data`, or `None` when the block's VA maps to
+    /// no file offset.
+    window: Option<(usize, usize)>,
+}
+
+/// Resolve the x87 stack depth over the whole function, or `None` when there is
+/// no x87 or it is not provable.
+///
+/// This has to be a FUNCTION-level question. `%st(1)` names different storage
+/// at different depths, and compiler-emitted x87 routinely pushes an
+/// accumulator in one basic block and consumes it in another —
+/// `175_float_matrix_kernel::dot_product_f32` does exactly that with `fldz`
+/// before its loop and `faddp` inside it. A per-block analysis starting each
+/// block at depth zero would underflow on the second block and refuse, which is
+/// how the first draft of this left half of every conversion function opaque.
+fn x87_depths(
+    data: &[u8],
+    prepared: &[PreparedBlock],
+    mode: CodeMode,
+    entry_va: u64,
+) -> Option<crate::ir::x87::Depths> {
+    let bits = match mode {
+        CodeMode::X86_32 => 32,
+        CodeMode::X86_64 => 64,
+        _ => return None,
+    };
+    let windows: Vec<crate::ir::x87::BlockWindow<'_>> = prepared
+        .iter()
+        .map(|block| crate::ir::x87::BlockWindow {
+            start_va: block.start,
+            // A block whose bytes could not be located transfers control to a
+            // depth nothing observed. Presenting it as empty with no successors
+            // stops the propagation there instead of guessing across it.
+            bytes: match block.window {
+                Some((from, to)) => &data[from..to],
+                None => &[],
+            },
+            succs: match block.window {
+                Some(_) => &block.succs,
+                None => &[],
+            },
+        })
+        .collect();
+    crate::ir::x87::plan_function(&windows, bits, entry_va)
+}
+
+/// Returns true when an LLIR lifter exists for the given architecture.
+pub fn supports_arch(arch: Arch) -> bool {
+    matches!(arch, Arch::X86 | Arch::X86_64 | Arch::AArch64 | Arch::ARM)
+}
+
+/// Resolve and validate the instruction-encoding mode for one function, from
+/// its architecture and its own Thumb marker alone.
+///
+/// This runs *before* any byte is decoded. Previously the mode was re-derived
+/// inside the per-block loop as a raw `(arch, thumb)` pair and no combination
+/// was ever checked: a Thumb-marked x86-64 function was lifted as x86-64
+/// because the x86 arm of the decoder match simply ignores `thumb`. Neither the
+/// caller nor the output recorded that a mode marker had been discarded.
+pub fn validate_code_mode(arch: Arch, thumb: bool, entry_va: u64) -> Result<CodeMode, LiftError> {
+    match arch {
+        Arch::ARM => Ok(if thumb {
+            CodeMode::ArmThumb
+        } else {
+            CodeMode::ArmA32
+        }),
+        Arch::X86 | Arch::X86_64 | Arch::AArch64 if thumb => Err(LiftError::IncoherentCodeMode {
+            arch,
+            target: None,
+            thumb,
+            entry_va,
+        }),
+        Arch::X86 => Ok(CodeMode::X86_32),
+        Arch::X86_64 => Ok(CodeMode::X86_64),
+        Arch::AArch64 => Ok(CodeMode::AArch64),
+        other => Err(LiftError::UnsupportedArchitecture { arch: other }),
+    }
+}
+
+/// Resolve and validate the encoding mode for one function against a full
+/// [`TargetSpec`], which knows more than the bare architecture does.
+///
+/// Both answers must agree. `TargetSpec::code_mode_for_function` already
+/// rejected a Thumb marker on a non-ARM target, but `lift_function_from_image`
+/// threw that rejection away into a `?` on an `Option`, so the caller saw the
+/// same `None` it would have seen for an unsupported ISA.
+///
+/// The architecture is resolved first, so a RISC-V image is reported as an
+/// unsupported architecture rather than as a mode problem — which is what it
+/// actually is. `code_mode_for_function` answers `None` for both, and only the
+/// first is worth telling the analyst.
+pub fn validate_target_mode(target: TargetSpec, func: &Function) -> Result<CodeMode, LiftError> {
+    let arch = target.architecture();
+    let thumb = func.has_flag(crate::core::function::FunctionFlags::IS_THUMB);
+    let entry_va = func.entry_point.value;
+    let from_arch = validate_code_mode(arch, thumb, entry_va)?;
+    match target.code_mode_for_function(thumb) {
+        Some(from_target) if from_target == from_arch => Ok(from_arch),
+        _ => Err(LiftError::IncoherentCodeMode {
+            arch,
+            target: Some(target.id()),
+            thumb,
+            entry_va,
+        }),
+    }
+}
+
+/// Intersect a heuristic basic block with the authoritative chunks owned by
+/// `func`.
+///
+/// CFG recovery can temporarily attach blocks beyond a function boundary (for
+/// example, when a requested entry is analysed before the following ELF
+/// symbol). DWARF then replaces `func.chunks` with the exact ranges, but the
+/// heuristic block list intentionally remains available to analysis clients.
+/// The lifter is the semantic boundary: it must never import instructions from
+/// a different function. A block that starts in an owned chunk is clipped at
+/// that chunk's end; a block that starts outside every chunk is rejected.
+/// Legacy `Function`s with no range metadata retain their historical behavior.
+fn clip_block_to_owned_ranges(func: &Function, start: u64, end: u64) -> Option<(u64, u64)> {
+    if end <= start {
+        return None;
+    }
+    let ranges = func.all_ranges();
+    if ranges.is_empty() {
+        return Some((start, end));
+    }
+    ranges.into_iter().find_map(|range| {
+        let range_start = range.start.value;
+        let range_end = range_start.saturating_add(range.size);
+        (start >= range_start && start < range_end).then_some((start, end.min(range_end)))
+    })
+}
+
+/// An explicit "these bytes were never decoded" marker.
+///
+/// Design rule 8: a failed proof becomes an explicit unknown, never a silent
+/// omission. Bytes we could not read still transfer control and still touch
+/// memory, so the marker declares the maximal footprint — reads memory, writes
+/// memory, no known outputs. That keeps every dataflow consumer conservative,
+/// where dropping the block instead invites the much worse conclusion that the
+/// code was never there at all.
+fn undecoded_bytes(va: u64) -> LlirInstr {
+    LlirInstr {
+        va,
+        op: Op::Intrinsic {
+            name: "undecoded_bytes".to_string(),
+            ins: Vec::new(),
+            outs: Vec::new(),
+            reads_mem: true,
+            writes_mem: true,
+        },
+    }
+}
+
+/// Lift every basic block of `func` from `data` into LLIR blocks.
+///
+/// The target/mode combination is validated up front (see
+/// [`validate_code_mode`]); an unsupported architecture and an incoherent Thumb
+/// marker are distinct, typed rejections rather than a shared `None`.
+///
+/// Blocks outside every range the function owns belong to a neighbouring
+/// function and are excluded — and their exact ranges are reported on
+/// [`LiftError::NoLiftableBlocks`] when nothing is left. Blocks the function
+/// *does* own whose bytes cannot be located, or whose window is clipped by the
+/// end of the image, are kept and marked [`undecoded_bytes`] rather than
+/// skipped.
+pub fn lift_function_from_bytes(
+    data: &[u8],
+    func: &Function,
+    arch: Arch,
+) -> Result<LlirFunction, LiftError> {
+    let thumb = func.has_flag(crate::core::function::FunctionFlags::IS_THUMB);
+    let mode = validate_code_mode(arch, thumb, func.entry_point.value)?;
+    lift_function(data, func, mode, None)
+}
+
+/// Lift a function while reusing the immutable indices in `image`.
+///
+/// Validates the function's encoding mode against the image's full target, not
+/// just its architecture: the target is what knows whether a Thumb marker is
+/// meaningful here.
+pub fn lift_function_from_image(
+    image: &crate::program::image::ProgramImage,
+    func: &Function,
+) -> Result<LlirFunction, LiftError> {
+    let mode = validate_target_mode(*image.target(), func)?;
+    lift_function(image.bytes(), func, mode, Some(image))
+}
+
+fn lift_function(
+    data: &[u8],
+    func: &Function,
+    mode: CodeMode,
+    image: Option<&crate::program::image::ProgramImage>,
+) -> Result<LlirFunction, LiftError> {
+    let mut blocks: Vec<LlirBlock> = Vec::with_capacity(func.basic_blocks.len());
+    // Kept for the failure report: a caller told only "nothing lifted" cannot
+    // tell an empty CFG from a function whose every block was attributed to a
+    // neighbour, and the second case names the bytes that went missing.
+    let mut disowned: Vec<(u64, u64)> = Vec::new();
+
+    let mut prepared: Vec<PreparedBlock> = Vec::with_capacity(func.basic_blocks.len());
+    for bb in &func.basic_blocks {
+        let Some((start, end)) =
+            clip_block_to_owned_ranges(func, bb.start_address.value, bb.end_address.value)
+        else {
+            // Outside every range this function owns, so the block belongs to a
+            // neighbouring function. Excluding it — and pruning edges into it
+            // below — is correct, not lossy.
+            disowned.push((bb.start_address.value, bb.end_address.value));
+            continue;
+        };
+
+        // Successors are the CFG successor block starts, which we can recover
+        // from bb.successor_ids by finding the corresponding BasicBlock.
+        //
+        // Computed before the bytes are located, because they must survive the
+        // case where the bytes cannot be: a block we failed to decode still
+        // transfers control, and dropping its edges would leave the CFG better
+        // formed than the truth.
+        let mut succs: Vec<u64> = Vec::new();
+        for sid in &bb.successor_ids {
+            if let Some(target) = func
+                .basic_blocks
+                .iter()
+                .find(|b| &b.id == sid)
+                .map(|b| b.start_address.value)
+            {
+                succs.push(target);
+            }
+        }
+
+        let size = (end - start) as usize;
+        let window = image
+            .map_or_else(
+                || va_to_code_file_offset(data, start),
+                |image| image.va_to_code_file_offset(start),
+            )
+            .map(|foff| (foff, foff.saturating_add(size).min(data.len())))
+            .filter(|(foff, end_off)| foff < end_off);
+        prepared.push(PreparedBlock {
+            start,
+            end,
+            succs,
+            window,
+        });
+    }
+
+    // Resolved before any block is lifted, because the answer for one block
+    // depends on every block that can reach it.
+    let x87 = x87_depths(data, &prepared, mode, func.entry_point.value);
+
+    for block in &prepared {
+        let size = (block.end - block.start) as usize;
+        let instrs = match block.window {
+            // The VA maps to no file offset, or maps past the end of the image.
+            // Emit the block as explicitly undecoded rather than dropping it.
+            None => vec![undecoded_bytes(block.start)],
+            Some((foff, end_off)) => {
+                let mut instrs =
+                    lift_window(&data[foff..end_off], block.start, mode, data, x87.as_ref());
+                if end_off - foff < size {
+                    // The window was clipped by the end of the image, so this
+                    // block's tail was never decoded. A silently short block
+                    // reads downstream as a complete one.
+                    instrs.push(undecoded_bytes(block.start + (end_off - foff) as u64));
+                }
+                instrs
+            }
+        };
+
+        blocks.push(LlirBlock {
+            start_va: block.start,
+            end_va: block.end,
+            instrs,
+            succs: block.succs.clone(),
+        });
+    }
+
+    // A clipped-out target must not survive as a dangling LLIR edge. This is
+    // especially important for oversized heuristic graphs corrected by DWARF:
+    // their last in-range block can still name the next function's entry.
+    let owned_starts: std::collections::HashSet<u64> =
+        blocks.iter().map(|block| block.start_va).collect();
+    for block in &mut blocks {
+        block.succs.retain(|target| owned_starts.contains(target));
+    }
+
+    recover_proven_direct_tail_calls(&mut blocks, func);
+    resolve_pc_thunk_calls(&mut blocks, |target| {
+        image_pc_thunk_register(image, data, mode, target)
+    });
+    annotate_resolved_switch_indices(&mut blocks);
+
+    if blocks.is_empty() {
+        return Err(LiftError::NoLiftableBlocks {
+            entry_va: func.entry_point.value,
+            considered: func.basic_blocks.len(),
+            disowned,
+        });
+    }
+
+    // Every SSA/dominance/structuring consumer defines block index zero as the
+    // semantic entry. Keep the remaining blocks VA-sorted for determinism, but
+    // never let a lower-address cold split become block zero.
+    let entry_va = func.entry_point.value;
+    blocks.sort_by_key(|block| (block.start_va != entry_va, block.start_va));
+
+    // Both the SysV and Microsoft x86 calling conventions require DF clear at
+    // function boundaries. Materialize that ABI fact only for functions that
+    // contain a repeated string-memory effect; CLD/STD instructions then
+    // replace it through ordinary SSA like any other flag definition.
+    let direction_flag = VReg::Flag(Flag::D);
+    let needs_direction_flag = blocks
+        .iter()
+        .flat_map(|block| &block.instrs)
+        .any(|instruction| {
+            let (_, uses) = def_uses(&instruction.op);
+            uses.contains(&direction_flag)
+        });
+    if needs_direction_flag {
+        blocks[0].instrs.insert(
+            0,
+            LlirInstr {
+                va: entry_va,
+                op: Op::Assign {
+                    dst: VReg::Flag(Flag::D),
+                    src: Value::Const(0),
+                },
+            },
+        );
+    }
+
+    // Phase 0 (task 0.7): the executable IR has no untyped holes. Rewrite any
+    // residual `Op::Unknown` the per-arch lifters emitted into a conservative,
+    // footprint-declaring `Op::Intrinsic` so downstream execution/dataflow stays
+    // sound. The lifters keep emitting `Unknown` internally (their unit tests
+    // assert on it); this pass is the single migration point at the function
+    // boundary.
+    lower_unknowns(&mut blocks);
+
+    Ok(LlirFunction {
+        entry_va: func.entry_point.value,
+        blocks,
+    })
+}
+
+/// Attach the normalized index to CFG-proven multiway indirect jumps.
+///
+/// The x86 instruction itself only says `jmp rax`; the table index is an
+/// earlier value in the address expression.  In GCC -O0 the source register is
+/// reused for the table base before the load, so retaining a late `rax` use
+/// names the table target rather than the switch value.  Snapshotting the
+/// recovered index at its last safe point gives SSA and AST lowering an exact
+/// value identity, matching the normalized-variable artifact carried by
+/// Ghidra/Kuna jump-table recovery.
+fn annotate_resolved_switch_indices(blocks: &mut [LlirBlock]) {
+    let mut next_temp = blocks
+        .iter()
+        .flat_map(|block| block.instrs.iter())
+        .flat_map(|instruction| {
+            let (def, uses) = def_uses(&instruction.op);
+            def.into_iter().chain(uses)
+        })
+        .filter_map(|register| match register {
+            VReg::Temp(id) => Some(id),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+
+    for block in blocks {
+        // Only a CFG-proven dispatch receives this semantic annotation. An
+        // arbitrary computed jump with zero/one successor must stay opaque.
+        if block.succs.len() < 3 {
+            continue;
+        }
+        let Some(jump_index) = block
+            .instrs
+            .iter()
+            .rposition(|instruction| matches!(instruction.op, Op::IndirectJump { .. }))
+        else {
+            continue;
+        };
+        let Some((source, insert_at)) = switch_index_source_before(&block.instrs, jump_index)
+        else {
+            continue;
+        };
+        let snapshot = VReg::Temp(next_temp);
+        next_temp = next_temp.saturating_add(1);
+        let va = block
+            .instrs
+            .get(insert_at)
+            .map_or(block.start_va, |instruction| instruction.va);
+        block.instrs.insert(
+            insert_at,
+            LlirInstr {
+                va,
+                op: Op::Assign {
+                    dst: snapshot.clone(),
+                    src: source,
+                },
+            },
+        );
+        let adjusted_jump = jump_index + usize::from(insert_at <= jump_index);
+        if let Some(LlirInstr {
+            op: Op::IndirectJump { index, .. },
+            ..
+        }) = block.instrs.get_mut(adjusted_jump)
+        {
+            *index = Some(Value::Reg(snapshot));
+        }
+    }
+}
+
+/// Find the table index and the instruction position before which it must be
+/// snapshotted. A locally materialized table address identifies the other
+/// component as the index. For a CFG-proven dispatch whose table base was
+/// materialized in a predecessor block, the x86 addressing mode itself is
+/// sufficient when it has exactly one scale-one base and one scale-four index.
+fn switch_index_source_before(
+    instructions: &[LlirInstr],
+    jump_index: usize,
+) -> Option<(Value, usize)> {
+    for load_index in (0..jump_index).rev() {
+        let Op::Load { addr, .. } = &instructions[load_index].op else {
+            continue;
+        };
+        // x86 PIC tables load signed i32 offsets. AArch64 GCC uses a compact
+        // signed-byte offset table and scales the loaded byte later in the ADD
+        // that forms the branch target. Both are CFG-proven dispatches; the
+        // table base versus selector distinction below remains address-based.
+        if !matches!(addr.size, 1 | 4) || addr.disp != 0 {
+            continue;
+        }
+        let mut components = Vec::with_capacity(2);
+        if let Some(base) = &addr.base {
+            components.push((base, 1u64));
+        }
+        if let Some(index) = &addr.index {
+            components.push((index, u64::from(addr.scale.max(1))));
+        }
+        let cross_block_index = if addr.size == 1 {
+            // Compact ARM tables keep the materialised table in `base` and
+            // the source selector in `index`; both have scale one at the byte
+            // load, so scale alone cannot distinguish them when the base
+            // arrived from a predecessor block.
+            addr.index.clone()
+        } else if components.len() == 2 && components.iter().any(|(_, scale)| *scale == 1) {
+            components
+                .iter()
+                .find_map(|(register, scale)| (*scale == 4).then_some((*register).clone()))
+        } else {
+            None
+        };
+        let has_table_base = components.iter().any(|(register, address_scale)| {
+            *address_scale == 1
+                && resolves_to_address(instructions, register, load_index, 0).is_some()
+        });
+        if !has_table_base {
+            if let Some(index) = cross_block_index {
+                return Some((Value::Reg(index), load_index));
+            }
+            continue;
+        }
+        for (register, address_scale) in components {
+            if resolves_to_address(instructions, register, load_index, 0).is_some() {
+                continue;
+            }
+            if address_scale == 4 || (addr.size == 1 && address_scale == 1) {
+                return Some((Value::Reg(register.clone()), load_index));
+            }
+            if address_scale == 1 {
+                if let Some(found) = scaled_index_source(instructions, register, load_index, 0) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn latest_definition(instructions: &[LlirInstr], register: &VReg, before: usize) -> Option<usize> {
+    (0..before)
+        .rev()
+        .find(|index| def_uses(&instructions[*index].op).0.as_ref() == Some(register))
+}
+
+fn resolves_to_address(
+    instructions: &[LlirInstr],
+    register: &VReg,
+    before: usize,
+    depth: usize,
+) -> Option<u64> {
+    if depth > 8 {
+        return None;
+    }
+    let definition = latest_definition(instructions, register, before)?;
+    match &instructions[definition].op {
+        Op::Assign {
+            src: Value::Addr(address),
+            ..
+        } => Some(*address),
+        Op::Assign {
+            src: Value::Reg(source),
+            ..
+        }
+        | Op::ZExt {
+            src: Value::Reg(source),
+            ..
+        }
+        | Op::SExt {
+            src: Value::Reg(source),
+            ..
+        } => resolves_to_address(instructions, source, definition, depth + 1),
+        Op::Bin {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+            ..
+        } => match (lhs, rhs) {
+            (Value::Reg(base), Value::Const(offset)) | (Value::Const(offset), Value::Reg(base)) => {
+                resolves_to_address(instructions, base, definition, depth + 1)?
+                    .checked_add_signed(*offset)
+            }
+            (Value::Addr(base), Value::Const(offset))
+            | (Value::Const(offset), Value::Addr(base)) => base.checked_add_signed(*offset),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn resolves_to_zero(
+    instructions: &[LlirInstr],
+    value: &Value,
+    before: usize,
+    depth: usize,
+) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match value {
+        Value::Const(0) => true,
+        Value::Reg(register) => {
+            let Some(definition) = latest_definition(instructions, register, before) else {
+                return false;
+            };
+            match &instructions[definition].op {
+                Op::Assign { src, .. } => {
+                    resolves_to_zero(instructions, src, definition, depth + 1)
+                }
+                _ => false,
+            }
+        }
+        Value::Const(_) | Value::Addr(_) => false,
+    }
+}
+
+fn scaled_index_source(
+    instructions: &[LlirInstr],
+    register: &VReg,
+    before: usize,
+    depth: usize,
+) -> Option<(Value, usize)> {
+    if depth > 8 {
+        return None;
+    }
+    let definition = latest_definition(instructions, register, before)?;
+    match &instructions[definition].op {
+        Op::Assign {
+            src: Value::Reg(source),
+            ..
+        }
+        | Op::ZExt {
+            src: Value::Reg(source),
+            ..
+        }
+        | Op::SExt {
+            src: Value::Reg(source),
+            ..
+        } => scaled_index_source(instructions, source, definition, depth + 1),
+        Op::Bin {
+            op: BinOp::Mul,
+            lhs,
+            rhs,
+            ..
+        } => match (lhs, rhs) {
+            (source @ Value::Reg(_), Value::Const(4))
+            | (Value::Const(4), source @ Value::Reg(_)) => Some((source.clone(), definition)),
+            _ => None,
+        },
+        Op::Bin {
+            op: BinOp::Shl,
+            lhs: source @ Value::Reg(_),
+            rhs: Value::Const(2),
+            ..
+        } => Some((source.clone(), definition)),
+        Op::Bin {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+            ..
+        } => {
+            if resolves_to_zero(instructions, lhs, definition, depth + 1) {
+                if let Value::Reg(source) = rhs {
+                    return scaled_index_source(instructions, source, definition, depth + 1);
+                }
+            }
+            if resolves_to_zero(instructions, rhs, definition, depth + 1) {
+                if let Value::Reg(source) = lhs {
+                    return scaled_index_source(instructions, source, definition, depth + 1);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Materialize CFG-proven nonlocal direct jumps as LLIR tail calls.
+///
+/// Delaying this conversion until the AST loses the argument-register writes:
+/// SSA and value numbering quite reasonably see a plain `Jump` as reading no ABI
+/// arguments.  The discovery pass has already separated strong sibling-call
+/// targets from local CFG successors and retained their exact addresses in
+/// `Function::callees`, so making the call semantics explicit here keeps both the
+/// arguments and the returned value live through every downstream pass.
+fn recover_proven_direct_tail_calls(blocks: &mut [LlirBlock], func: &Function) {
+    let local_starts: std::collections::HashSet<u64> =
+        blocks.iter().map(|block| block.start_va).collect();
+    let callee_vas: std::collections::HashSet<u64> =
+        func.callees.iter().map(|address| address.value).collect();
+
+    for block in blocks {
+        // A compiler-split child can first be discovered as a sibling and only
+        // later merged into its DWARF parent. Its direct branch may therefore
+        // have no relationship metadata even though the target block is now
+        // owned locally. Restore that exact machine edge before deciding
+        // whether any remaining target is a true tail call.
+        if let Some(Op::Jump { target } | Op::CondJump { target, .. }) =
+            block.instrs.last().map(|instruction| &instruction.op)
+        {
+            if local_starts.contains(target) && !block.succs.contains(target) {
+                block.succs.push(*target);
+            }
+        }
+        if !block.succs.is_empty() {
+            continue;
+        }
+        let Some(last) = block.instrs.last_mut() else {
+            continue;
+        };
+        let Op::Jump { target } = last.op else {
+            continue;
+        };
+        if local_starts.contains(&target) || !callee_vas.contains(&target) {
+            continue;
+        }
+        let va = last.va;
+        last.op = Op::Call {
+            target: CallTarget::Direct(target),
+            effects: Some(CallEffects {
+                is_tail_call: true,
+                ..CallEffects::default()
+            }),
+        };
+        block.instrs.push(LlirInstr { va, op: Op::Return });
+    }
+}
+
+/// Replace each `call <PC thunk>` with the constant address it materialises.
+///
+/// See [`lift_x86::pc_thunk_register`] for what a PC thunk is and why it is
+/// recognised by its body rather than its name. `thunk_register` answers "what
+/// does the function at this VA leave in which register", and is a parameter so
+/// this rewrite is testable without an ELF image.
+///
+/// The materialised value is the address of the instruction *after* the call —
+/// the return address the thunk loads off the stack. That is the VA of the next
+/// LLIR instruction in the block, or the block's end when the call is last.
+/// [`Value::Addr`] rather than [`Value::Const`] so `const_fold` folds the
+/// following `add $_GLOBAL_OFFSET_TABLE_,%reg` into a single named address,
+/// exactly as it already does for the AArch64 `adrp`/`add` pair.
+fn resolve_pc_thunk_calls(
+    blocks: &mut [LlirBlock],
+    thunk_register: impl Fn(u64) -> Option<String>,
+) {
+    for block in blocks.iter_mut() {
+        let mut index = 0usize;
+        while index < block.instrs.len() {
+            let Op::Call {
+                target: CallTarget::Direct(target),
+                ..
+            } = block.instrs[index].op
+            else {
+                index += 1;
+                continue;
+            };
+            let va = block.instrs[index].va;
+            let return_va = block.instrs[index + 1..]
+                .iter()
+                .map(|instruction| instruction.va)
+                .find(|next| *next != va)
+                .unwrap_or(block.end_va);
+            if target == return_va {
+                let inline_pop = match block.instrs.get(index + 1..index + 3) {
+                    Some([load, adjust]) if load.va == target && adjust.va == target => {
+                        match (&load.op, &adjust.op) {
+                            (
+                                Op::Load {
+                                    dst,
+                                    addr:
+                                        MemOp {
+                                            base: Some(base),
+                                            index: None,
+                                            scale: 0,
+                                            disp: 0,
+                                            size: 4,
+                                            segment: None,
+                                            endian: Endian::Little,
+                                        },
+                                },
+                                Op::Bin {
+                                    dst: stack_dst,
+                                    op: BinOp::Add,
+                                    lhs: Value::Reg(stack_lhs),
+                                    rhs: Value::Const(4),
+                                },
+                            ) if base == &VReg::phys("esp")
+                                && stack_dst == base
+                                && stack_lhs == base
+                                && dst != base =>
+                            {
+                                Some(dst.clone())
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(register) = inline_pop {
+                    block.instrs[index].op = Op::Assign {
+                        dst: register,
+                        src: Value::Addr(return_va),
+                    };
+                    block.instrs.drain(index + 1..index + 3);
+                    index += 1;
+                    continue;
+                }
+            }
+            let Some(register) = thunk_register(target) else {
+                index += 1;
+                continue;
+            };
+            block.instrs[index].op = Op::Assign {
+                dst: VReg::phys(&register),
+                src: Value::Addr(return_va),
+            };
+            index += 1;
+        }
+    }
+}
+
+/// The PC-thunk destination register for the function at `va` in `data`, if it
+/// is one. Only 32-bit x86 has the idiom: x86-64 addresses everything
+/// RIP-relative and never emits it, so the 64-bit lane is left untouched.
+fn image_pc_thunk_register(
+    image: Option<&crate::program::image::ProgramImage>,
+    data: &[u8],
+    mode: CodeMode,
+    va: u64,
+) -> Option<String> {
+    if mode != CodeMode::X86_32 {
+        return None;
+    }
+    let offset = image.map_or_else(
+        || va_to_code_file_offset(data, va),
+        |image| image.va_to_code_file_offset(va),
+    )?;
+    let end = offset.saturating_add(4).min(data.len());
+    lift_x86::pc_thunk_register(data.get(offset..end)?).map(str::to_string)
+}
+
+/// Rewrite every residual [`Op::Unknown`] in `blocks` into a conservative
+/// [`Op::Intrinsic`] (see [`Op::opaque`]).
+fn lower_unknowns(blocks: &mut [LlirBlock]) {
+    for b in blocks.iter_mut() {
+        for ins in &mut b.instrs {
+            if let Op::Unknown { mnemonic } = &ins.op {
+                ins.op = Op::opaque(mnemonic.clone());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::cfg::{analyze_functions_bytes, Budgets};
+    use std::path::Path;
+
+    /// The i386 PIC preamble `call __x86.get_pc_thunk.bx ; add $GOT,%ebx` must
+    /// leave `ebx` holding the address of the instruction after the call — not a
+    /// call to a callee with no C spelling.
+    #[test]
+    fn a_pc_thunk_call_becomes_the_address_it_materialises() {
+        let mut blocks = vec![LlirBlock {
+            start_va: 0x11ba,
+            end_va: 0x11ca,
+            instrs: vec![
+                LlirInstr {
+                    va: 0x11c0,
+                    op: Op::Call {
+                        target: CallTarget::Direct(0x1380),
+                        effects: None,
+                    },
+                },
+                LlirInstr {
+                    va: 0x11c5,
+                    op: Op::Bin {
+                        dst: VReg::phys("ebx"),
+                        op: BinOp::Add,
+                        lhs: Value::Reg(VReg::phys("ebx")),
+                        rhs: Value::Const(0x2e2f),
+                    },
+                },
+            ],
+            succs: vec![],
+        }];
+        resolve_pc_thunk_calls(&mut blocks, |target| {
+            (target == 0x1380).then(|| "ebx".to_string())
+        });
+        assert_eq!(
+            blocks[0].instrs[0].op,
+            Op::Assign {
+                dst: VReg::phys("ebx"),
+                src: Value::Addr(0x11c5),
+            }
+        );
+    }
+
+    #[test]
+    fn a_call_to_inline_pop_pc_thunk_becomes_the_return_address() {
+        let esp = VReg::phys("esp");
+        let mut blocks = vec![LlirBlock {
+            start_va: 0x1190,
+            end_va: 0x11a3,
+            instrs: vec![
+                LlirInstr {
+                    va: 0x1197,
+                    op: Op::Call {
+                        target: CallTarget::Direct(0x119c),
+                        effects: None,
+                    },
+                },
+                LlirInstr {
+                    va: 0x119c,
+                    op: Op::Load {
+                        dst: VReg::phys("ebx"),
+                        addr: MemOp {
+                            base: Some(esp.clone()),
+                            index: None,
+                            scale: 0,
+                            disp: 0,
+                            size: 4,
+                            segment: None,
+                            endian: Endian::Little,
+                        },
+                    },
+                },
+                LlirInstr {
+                    va: 0x119c,
+                    op: Op::Bin {
+                        dst: esp.clone(),
+                        op: BinOp::Add,
+                        lhs: Value::Reg(esp),
+                        rhs: Value::Const(4),
+                    },
+                },
+            ],
+            succs: vec![],
+        }];
+        resolve_pc_thunk_calls(&mut blocks, |_| None);
+        assert_eq!(
+            blocks[0].instrs,
+            vec![LlirInstr {
+                va: 0x1197,
+                op: Op::Assign {
+                    dst: VReg::phys("ebx"),
+                    src: Value::Addr(0x119c),
+                },
+            }]
+        );
+    }
+
+    /// A thunk call that terminates its block has no following instruction to
+    /// read the return address from; the block's end VA is that address.
+    #[test]
+    fn a_trailing_pc_thunk_call_uses_the_block_end_as_its_return_address() {
+        let mut blocks = vec![LlirBlock {
+            start_va: 0x1000,
+            end_va: 0x1005,
+            instrs: vec![LlirInstr {
+                va: 0x1000,
+                op: Op::Call {
+                    target: CallTarget::Direct(0x2000),
+                    effects: None,
+                },
+            }],
+            succs: vec![0x1005],
+        }];
+        resolve_pc_thunk_calls(&mut blocks, |_| Some("eax".to_string()));
+        assert_eq!(
+            blocks[0].instrs[0].op,
+            Op::Assign {
+                dst: VReg::phys("eax"),
+                src: Value::Addr(0x1005),
+            }
+        );
+    }
+
+    /// An ordinary callee is not a thunk and must stay a call.
+    #[test]
+    fn a_non_thunk_call_is_left_alone() {
+        let call = Op::Call {
+            target: CallTarget::Direct(0x2000),
+            effects: None,
+        };
+        let mut blocks = vec![LlirBlock {
+            start_va: 0x1000,
+            end_va: 0x1005,
+            instrs: vec![LlirInstr {
+                va: 0x1000,
+                op: call.clone(),
+            }],
+            succs: vec![],
+        }];
+        resolve_pc_thunk_calls(&mut blocks, |_| None);
+        assert_eq!(blocks[0].instrs[0].op, call);
+    }
+
+    /// x86-64 has RIP-relative addressing and never emits the idiom, so the
+    /// image probe must refuse to look at all — the 64-bit lane cannot be
+    /// perturbed by this rewrite even if some callee happened to start with
+    /// those bytes.
+    #[test]
+    fn the_pc_thunk_image_probe_is_thirty_two_bit_only() {
+        // `mov (%esp),%ebx ; ret` at file offset 0 of a byte blob. The probe is
+        // asked about it under both architectures.
+        let data = std::fs::read(
+            "samples/binaries/platforms/linux/amd64/export/native/gcc/O0/hello-c-gcc-O0",
+        )
+        .expect("sample binary");
+        let entry = 0u64;
+        assert_eq!(
+            image_pc_thunk_register(None, &data, CodeMode::X86_64, entry),
+            None
+        );
+        assert_eq!(
+            image_pc_thunk_register(None, &data, CodeMode::ArmA32, entry),
+            None
+        );
+    }
+
+    #[test]
+    fn resolved_gcc_switch_snapshots_the_index_before_table_base_clobber() {
+        let mut blocks = vec![LlirBlock {
+            start_va: 0x118a,
+            end_va: 0x11ad,
+            instrs: vec![
+                LlirInstr {
+                    va: 0x118c,
+                    op: Op::Assign {
+                        dst: VReg::Temp(0),
+                        src: Value::Const(0),
+                    },
+                },
+                LlirInstr {
+                    va: 0x118c,
+                    op: Op::Bin {
+                        dst: VReg::Temp(1),
+                        op: BinOp::Mul,
+                        lhs: Value::Reg(VReg::phys("rax")),
+                        rhs: Value::Const(4),
+                    },
+                },
+                LlirInstr {
+                    va: 0x118c,
+                    op: Op::Bin {
+                        dst: VReg::Temp(0),
+                        op: BinOp::Add,
+                        lhs: Value::Reg(VReg::Temp(0)),
+                        rhs: Value::Reg(VReg::Temp(1)),
+                    },
+                },
+                LlirInstr {
+                    va: 0x118c,
+                    op: Op::Assign {
+                        dst: VReg::phys("rdx"),
+                        src: Value::Reg(VReg::Temp(0)),
+                    },
+                },
+                LlirInstr {
+                    va: 0x1194,
+                    op: Op::Assign {
+                        dst: VReg::phys("rax"),
+                        src: Value::Addr(0x2020),
+                    },
+                },
+                LlirInstr {
+                    va: 0x119b,
+                    op: Op::Load {
+                        dst: VReg::Temp(0),
+                        addr: MemOp::plain(
+                            Some(VReg::phys("rdx")),
+                            Some(VReg::phys("rax")),
+                            1,
+                            0,
+                            4,
+                        ),
+                    },
+                },
+                LlirInstr {
+                    va: 0x11aa,
+                    op: Op::IndirectJump {
+                        target: Value::Reg(VReg::phys("rax")),
+                        index: None,
+                    },
+                },
+            ],
+            succs: (0..8).map(|index| 0x1200 + index * 0x10).collect(),
+        }];
+
+        annotate_resolved_switch_indices(&mut blocks);
+
+        let (snapshot, source) = blocks[0]
+            .instrs
+            .iter()
+            .find_map(|instruction| match &instruction.op {
+                Op::Assign {
+                    dst: snapshot @ VReg::Temp(id),
+                    src: source @ Value::Reg(VReg::Phys(name)),
+                } if *id > 1 && name == "rax" => Some((snapshot.clone(), source.clone())),
+                _ => None,
+            })
+            .expect("snapshot the normalized rax index before assigning the table base to rax");
+        assert_eq!(source, Value::Reg(VReg::phys("rax")));
+        assert!(matches!(
+            blocks[0].instrs.last().map(|instruction| &instruction.op),
+            Some(Op::IndirectJump {
+                index: Some(Value::Reg(index)),
+                ..
+            }) if index == &snapshot
+        ));
+    }
+
+    #[test]
+    fn resolved_switch_snapshots_an_index_with_a_cross_block_table_base() {
+        let mut blocks = vec![LlirBlock {
+            start_va: 0x11bd,
+            end_va: 0x11cc,
+            instrs: vec![
+                LlirInstr {
+                    va: 0x11c1,
+                    op: Op::Assign {
+                        dst: VReg::phys("rax"),
+                        src: Value::Reg(VReg::phys("rdx")),
+                    },
+                },
+                LlirInstr {
+                    va: 0x11c3,
+                    op: Op::Load {
+                        dst: VReg::Temp(0),
+                        addr: MemOp::plain(
+                            Some(VReg::phys("r9")),
+                            Some(VReg::phys("rax")),
+                            4,
+                            0,
+                            4,
+                        ),
+                    },
+                },
+                LlirInstr {
+                    va: 0x11ca,
+                    op: Op::IndirectJump {
+                        target: Value::Reg(VReg::phys("rax")),
+                        index: None,
+                    },
+                },
+            ],
+            succs: vec![0x11cc, 0x11e0, 0x11a0, 0x1224],
+        }];
+
+        annotate_resolved_switch_indices(&mut blocks);
+
+        assert!(matches!(
+            blocks[0].instrs.last().map(|instruction| &instruction.op),
+            Some(Op::IndirectJump {
+                index: Some(Value::Reg(_)),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn resolved_aarch64_byte_switch_snapshots_scale_one_index() {
+        let mut blocks = vec![LlirBlock {
+            start_va: 0x5f0,
+            end_va: 0x608,
+            instrs: vec![
+                LlirInstr {
+                    va: 0x5f0,
+                    op: Op::Assign {
+                        dst: VReg::phys("x3"),
+                        src: Value::Addr(0),
+                    },
+                },
+                LlirInstr {
+                    va: 0x5f4,
+                    op: Op::Bin {
+                        dst: VReg::phys("x3"),
+                        op: BinOp::Add,
+                        lhs: Value::Reg(VReg::phys("x3")),
+                        rhs: Value::Const(0x7a4),
+                    },
+                },
+                LlirInstr {
+                    va: 0x5f8,
+                    op: Op::Load {
+                        dst: VReg::Temp(0),
+                        addr: MemOp::plain(Some(VReg::phys("x3")), Some(VReg::phys("x0")), 1, 0, 1),
+                    },
+                },
+                LlirInstr {
+                    va: 0x604,
+                    op: Op::IndirectJump {
+                        target: Value::Reg(VReg::phys("x3")),
+                        index: None,
+                    },
+                },
+            ],
+            succs: (0..16).map(|index| 0x608 + index * 4).collect(),
+        }];
+
+        annotate_resolved_switch_indices(&mut blocks);
+
+        let snapshot = blocks[0]
+            .instrs
+            .iter()
+            .find_map(|instruction| match &instruction.op {
+                Op::Assign {
+                    dst: snapshot @ VReg::Temp(id),
+                    src: Value::Reg(source),
+                } if *id > 0 && source == &VReg::phys("x0") => Some(snapshot.clone()),
+                _ => None,
+            })
+            .expect("snapshot the compact table's scale-one selector");
+        assert!(matches!(
+            blocks[0].instrs.last().map(|instruction| &instruction.op),
+            Some(Op::IndirectJump {
+                index: Some(Value::Reg(index)),
+                ..
+            }) if index == &snapshot
+        ));
+    }
+
+    #[test]
+    fn resolved_a32_byte_switch_snapshots_an_overwritten_index() {
+        let mut blocks = vec![LlirBlock {
+            start_va: 0x504,
+            end_va: 0x50c,
+            instrs: vec![
+                LlirInstr {
+                    va: 0x504,
+                    op: Op::Load {
+                        dst: VReg::Temp(0),
+                        addr: MemOp::plain(
+                            Some(VReg::phys("r12")),
+                            Some(VReg::phys("r3")),
+                            1,
+                            0,
+                            1,
+                        ),
+                    },
+                },
+                LlirInstr {
+                    va: 0x504,
+                    op: Op::ZExt {
+                        dst: VReg::phys("r3"),
+                        src: Value::Reg(VReg::Temp(0)),
+                        from: Width::W8,
+                        to: Width::W32,
+                    },
+                },
+                LlirInstr {
+                    va: 0x508,
+                    op: Op::IndirectJump {
+                        target: Value::Reg(VReg::phys("r3")),
+                        index: None,
+                    },
+                },
+            ],
+            succs: (0..7).map(|index| 0x518 + index * 0x10).collect(),
+        }];
+
+        annotate_resolved_switch_indices(&mut blocks);
+
+        let snapshot = blocks[0]
+            .instrs
+            .iter()
+            .find_map(|instruction| match &instruction.op {
+                Op::Assign {
+                    dst: snapshot @ VReg::Temp(id),
+                    src: Value::Reg(source),
+                } if *id > 0 && source == &VReg::phys("r3") => Some(snapshot.clone()),
+                _ => None,
+            })
+            .expect("snapshot the A32 selector before ldrb overwrites r3");
+        assert!(matches!(
+            blocks[0].instrs.last().map(|instruction| &instruction.op),
+            Some(Op::IndirectJump {
+                index: Some(Value::Reg(index)),
+                ..
+            }) if index == &snapshot
+        ));
+    }
+
+    #[test]
+    fn proven_nonlocal_direct_jump_becomes_tail_call_before_ssa() {
+        let entry = crate::core::address::Address::new(
+            crate::core::address::AddressKind::VA,
+            0x1000,
+            64,
+            None,
+            None,
+        )
+        .unwrap();
+        let callee = crate::core::address::Address::new(
+            crate::core::address::AddressKind::VA,
+            0x5000,
+            64,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut func = Function::new(
+            "tail_wrapper".to_string(),
+            entry,
+            crate::core::function::FunctionKind::Normal,
+        )
+        .unwrap();
+        func.add_callee(callee);
+        let mut blocks = vec![LlirBlock {
+            start_va: 0x1000,
+            end_va: 0x1010,
+            instrs: vec![
+                LlirInstr {
+                    va: 0x1000,
+                    op: Op::Assign {
+                        dst: VReg::phys("esi"),
+                        src: Value::Const(24),
+                    },
+                },
+                LlirInstr {
+                    va: 0x1005,
+                    op: Op::Jump { target: 0x5000 },
+                },
+            ],
+            succs: vec![],
+        }];
+
+        recover_proven_direct_tail_calls(&mut blocks, &func);
+
+        assert!(matches!(
+            blocks[0].instrs[1].op,
+            Op::Call {
+                target: CallTarget::Direct(0x5000),
+                effects: Some(CallEffects {
+                    is_tail_call: true,
+                    ..
+                })
+            }
+        ));
+        assert!(matches!(blocks[0].instrs[2].op, Op::Return));
+    }
+
+    #[test]
+    fn local_direct_jump_remains_control_flow() {
+        let entry = crate::core::address::Address::new(
+            crate::core::address::AddressKind::VA,
+            0x1000,
+            64,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut func = Function::new(
+            "loop".to_string(),
+            entry,
+            crate::core::function::FunctionKind::Normal,
+        )
+        .unwrap();
+        func.add_callee(
+            crate::core::address::Address::new(
+                crate::core::address::AddressKind::VA,
+                0x1000,
+                64,
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let mut blocks = vec![LlirBlock {
+            start_va: 0x1000,
+            end_va: 0x1010,
+            instrs: vec![LlirInstr {
+                va: 0x1005,
+                op: Op::Jump { target: 0x1000 },
+            }],
+            succs: vec![],
+        }];
+
+        recover_proven_direct_tail_calls(&mut blocks, &func);
+
+        assert!(matches!(
+            blocks[0].instrs.as_slice(),
+            [LlirInstr {
+                op: Op::Jump { target: 0x1000 },
+                ..
+            }]
+        ));
+        assert_eq!(
+            blocks[0].succs,
+            vec![0x1000],
+            "an owned jump target must remain an explicit LLIR CFG edge"
+        );
+    }
+
+    #[test]
+    fn lifts_hello_gcc_entry_function() {
+        // Real-binary end-to-end: discover functions via cfg, lift the one
+        // containing the entry VA, and check that we got sensible LLIR.
+        let path =
+            Path::new("samples/binaries/platforms/linux/amd64/export/native/gcc/O2/hello-gcc-O2");
+        if !path.exists() {
+            eprintln!("sample missing: {}", path.display());
+            return;
+        }
+        let data = std::fs::read(path).expect("read sample");
+        let budgets = Budgets {
+            max_functions: 8,
+            max_blocks: 256,
+            max_instructions: 4000,
+            timeout_ms: 500,
+            total_timeout_ms: 0,
+        };
+        let (funcs, _cg) = analyze_functions_bytes(&data, &budgets);
+        assert!(!funcs.is_empty(), "cfg produced no functions");
+
+        // Lift the first function (entry).
+        let f = &funcs[0];
+        let lf = lift_function_from_bytes(&data, f, Arch::X86_64).expect("lift function");
+        assert_eq!(lf.entry_va, f.entry_point.value);
+        assert!(!lf.blocks.is_empty(), "lifted function has no blocks");
+        // Every block's start VA must match a block in the source function.
+        let src_starts: std::collections::HashSet<u64> = f
+            .basic_blocks
+            .iter()
+            .map(|b| b.start_address.value)
+            .collect();
+        for b in &lf.blocks {
+            assert!(
+                src_starts.contains(&b.start_va),
+                "block start 0x{:x} not in source function",
+                b.start_va
+            );
+            assert!(
+                f.contains_va(b.start_va) && b.end_va > b.start_va && f.contains_va(b.end_va - 1),
+                "lifted block [{:#x}, {:#x}) escaped authoritative chunks {:?}",
+                b.start_va,
+                b.end_va,
+                f.all_ranges()
+            );
+            assert!(
+                !b.instrs.is_empty(),
+                "empty LLIR block at 0x{:x}",
+                b.start_va
+            );
+        }
+        // Entry's block should terminate in some recognised control-flow op.
+        // A real compiler-emitted function body nearly always ends with ret,
+        // call, jmp, or a conditional jump.
+        let entry_block = lf
+            .blocks
+            .iter()
+            .find(|b| b.start_va == lf.entry_va)
+            .expect("entry block lifted");
+        let last = entry_block.instrs.last().expect("entry block has instrs");
+        assert!(
+            matches!(
+                &last.op,
+                Op::Return
+                    | Op::Call { .. }
+                    | Op::Jump { .. }
+                    | Op::CondJump { .. }
+                    | Op::CondReturn { .. }
+                    // Unmodelled terminators are lowered to Intrinsic (task 0.7).
+                    | Op::Intrinsic { .. }
+            ),
+            "unexpected terminator at 0x{:x}: {:?}",
+            last.va,
+            last.op
+        );
+
+        // Phase 0 task 0.7 exit criterion: a lifted function has NO residual
+        // `Op::Unknown` — every unmodelled instruction is a typed Intrinsic.
+        for b in &lf.blocks {
+            for i in &b.instrs {
+                assert!(
+                    !matches!(&i.op, Op::Unknown { .. }),
+                    "residual Op::Unknown at 0x{:x} after lift",
+                    i.va
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lowered_functions_have_no_residual_unknown_x86_and_arm64() {
+        // Stronger, multi-function form of the exit criterion across both arches.
+        for (rel, arch) in [
+            (
+                "samples/binaries/platforms/linux/amd64/export/native/gcc/O2/hello-gcc-O2",
+                Arch::X86_64,
+            ),
+            (
+                "samples/binaries/platforms/linux/arm64/export/cross/arm64/hello-arm64-gcc",
+                Arch::AArch64,
+            ),
+        ] {
+            let path = Path::new(rel);
+            if !path.exists() {
+                continue;
+            }
+            let data = std::fs::read(path).expect("read sample");
+            let budgets = Budgets {
+                max_functions: 32,
+                max_blocks: 256,
+                max_instructions: 20_000,
+                timeout_ms: 2000,
+                total_timeout_ms: 0,
+            };
+            let (funcs, _cg) = analyze_functions_bytes(&data, &budgets);
+            let mut checked = 0;
+            for f in &funcs {
+                if let Ok(lf) = lift_function_from_bytes(&data, f, arch) {
+                    for b in &lf.blocks {
+                        for i in &b.instrs {
+                            assert!(
+                                !matches!(&i.op, Op::Unknown { .. }),
+                                "residual Op::Unknown at 0x{:x} ({:?})",
+                                i.va,
+                                arch
+                            );
+                        }
+                    }
+                    checked += 1;
+                }
+            }
+            assert!(checked > 0, "no functions lifted for {:?}", arch);
+        }
+    }
+
+    /// An architecture with no lifter names itself in the rejection. It is not
+    /// the same answer as "this function lifted nothing", which is the whole
+    /// reason the return type stopped being an `Option`.
+    #[test]
+    fn an_unsupported_arch_is_named_in_the_rejection() {
+        use crate::core::address::{Address, AddressKind};
+        use crate::core::function::{Function, FunctionKind};
+        let entry = Address::new(AddressKind::VA, 0, 64, None, None).unwrap();
+        let f = Function::new("f".into(), entry, FunctionKind::Normal).unwrap();
+        for arch in [Arch::MIPS64, Arch::RISCV64] {
+            assert_eq!(
+                lift_function_from_bytes(&[0u8; 0], &f, arch),
+                Err(LiftError::UnsupportedArchitecture { arch })
+            );
+        }
+        // A *supported* arch with nothing to lift is a different verdict, and
+        // it is per-function rather than per-binary.
+        let empty = lift_function_from_bytes(&[0u8; 0], &f, Arch::X86_64);
+        assert_eq!(
+            empty,
+            Err(LiftError::NoLiftableBlocks {
+                entry_va: 0,
+                considered: 0,
+                disowned: Vec::new(),
+            })
+        );
+        assert!(!empty.unwrap_err().is_whole_binary());
+    }
+
+    /// A Thumb marker on an ISA with no Thumb encoding is rejected up front.
+    ///
+    /// Before the mode was validated, the marker was passed to `lift_window`
+    /// and the x86 arm simply ignored it: the function was decoded as x86-64
+    /// and nothing anywhere recorded that a mode marker had been discarded.
+    #[test]
+    fn a_thumb_marker_on_a_non_arm_arch_is_rejected_before_decoding() {
+        use crate::core::address::{Address, AddressKind};
+        use crate::core::function::{Function, FunctionFlags, FunctionKind};
+        let entry = Address::new(AddressKind::VA, 0x1000, 64, None, None).unwrap();
+        let mut f = Function::new("f".into(), entry, FunctionKind::Normal).unwrap();
+        f.add_flag(FunctionFlags::IS_THUMB);
+        assert_eq!(
+            lift_function_from_bytes(&[0u8; 0], &f, Arch::X86_64),
+            Err(LiftError::IncoherentCodeMode {
+                arch: Arch::X86_64,
+                target: None,
+                thumb: true,
+                entry_va: 0x1000,
+            })
+        );
+        // The same marker on ARM32 selects the Thumb decoder rather than failing.
+        assert_eq!(
+            validate_code_mode(Arch::ARM, true, 0x1000),
+            Ok(CodeMode::ArmThumb)
+        );
+        assert_eq!(
+            validate_code_mode(Arch::ARM, false, 0x1000),
+            Ok(CodeMode::ArmA32)
+        );
+    }
+
+    /// A function whose every block belongs to a neighbour reports the exact
+    /// ranges it disowned, not merely that it produced nothing.
+    #[test]
+    fn a_fully_disowned_function_reports_the_ranges_it_lost() {
+        use crate::core::address::{Address, AddressKind};
+        use crate::core::address_range::AddressRange;
+        use crate::core::basic_block::BasicBlock;
+        use crate::core::function::{Function, FunctionKind};
+
+        let entry = Address::new(AddressKind::VA, 0x1000, 64, None, None).unwrap();
+        let mut f = Function::new("bounded".into(), entry.clone(), FunctionKind::Normal).unwrap();
+        f.range = Some(AddressRange::new(entry, 0x10, None).unwrap());
+        // Both blocks start past the owned range, so both belong to the next
+        // function.
+        for (start, end) in [(0x2000u64, 0x2004u64), (0x3000, 0x3008)] {
+            f.basic_blocks.push(BasicBlock::new(
+                format!("bb{start:x}"),
+                Address::new(AddressKind::VA, start, 64, None, None).unwrap(),
+                Address::new(AddressKind::VA, end, 64, None, None).unwrap(),
+                0,
+                None,
+                None,
+            ));
+        }
+        let error = lift_function_from_bytes(&[0u8; 0], &f, Arch::X86_64).unwrap_err();
+        assert_eq!(
+            error.affected_ranges(),
+            &[(0x2000, 0x2004), (0x3000, 0x3008)]
+        );
+        assert!(matches!(
+            error,
+            LiftError::NoLiftableBlocks {
+                entry_va: 0x1000,
+                considered: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn authoritative_chunks_clip_and_reject_heuristic_blocks() {
+        use crate::core::address::{Address, AddressKind};
+        use crate::core::address_range::AddressRange;
+        use crate::core::function::{Function, FunctionKind};
+
+        let entry = Address::new(AddressKind::VA, 0x1000, 64, None, None).unwrap();
+        let mut f = Function::new("bounded".into(), entry, FunctionKind::Normal).unwrap();
+        f.add_chunk(
+            AddressRange::new(
+                Address::new(AddressKind::VA, 0x1000, 64, None, None).unwrap(),
+                0x10,
+                None,
+            )
+            .unwrap(),
+        );
+        f.add_chunk(
+            AddressRange::new(
+                Address::new(AddressKind::VA, 0x2000, 64, None, None).unwrap(),
+                0x08,
+                None,
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            clip_block_to_owned_ranges(&f, 0x1004, 0x1018),
+            Some((0x1004, 0x1010))
+        );
+        assert_eq!(clip_block_to_owned_ranges(&f, 0x1010, 0x1020), None);
+        assert_eq!(
+            clip_block_to_owned_ranges(&f, 0x2000, 0x2010),
+            Some((0x2000, 0x2008))
+        );
+    }
+
+    #[test]
+    fn supports_arch_enumerates_lifters() {
+        assert!(supports_arch(Arch::X86));
+        assert!(supports_arch(Arch::X86_64));
+        assert!(supports_arch(Arch::AArch64));
+        assert!(supports_arch(Arch::ARM));
+        assert!(!supports_arch(Arch::MIPS));
+    }
+
+    #[test]
+    fn lifts_hello_arm64_entry_function() {
+        let path =
+            Path::new("samples/binaries/platforms/linux/arm64/export/cross/arm64/hello-arm64-gcc");
+        if !path.exists() {
+            eprintln!("sample missing: {}", path.display());
+            return;
+        }
+        let data = std::fs::read(path).expect("read sample");
+        let budgets = Budgets {
+            max_functions: 8,
+            max_blocks: 256,
+            max_instructions: 4000,
+            timeout_ms: 500,
+            total_timeout_ms: 0,
+        };
+        let (funcs, _cg) = analyze_functions_bytes(&data, &budgets);
+        assert!(!funcs.is_empty(), "cfg produced no functions for arm64");
+        let f = &funcs[0];
+        let lf = lift_function_from_bytes(&data, f, Arch::AArch64).expect("lift arm64 function");
+        assert_eq!(lf.entry_va, f.entry_point.value);
+        assert!(!lf.blocks.is_empty(), "no blocks lifted");
+        // At least one block's instr list must be non-empty and contain a
+        // recognised op kind.
+        assert!(lf.blocks.iter().any(|b| b
+            .instrs
+            .iter()
+            .any(|i| !matches!(&i.op, Op::Unknown { .. }))));
+    }
+
+    /// How often does the undecodable path actually fire on real input?
+    ///
+    /// The marker is the honest representation, but a marker that fires
+    /// routinely would mean the lifter is losing real code and the CFG has been
+    /// quietly approximate all along. Measured here rather than assumed: across
+    /// every sample binary this test can find, no owned block fails to decode.
+    /// If that ever stops being true the count is a finding, not a nuisance —
+    /// re-read the failing VAs before relaxing the assertion.
+    #[test]
+    fn no_owned_block_in_the_sample_corpus_is_undecodable() {
+        let mut lifted = 0usize;
+        let mut undecoded = Vec::new();
+        for (rel, arch) in [
+            (
+                "samples/binaries/platforms/linux/amd64/export/native/gcc/O2/hello-gcc-O2",
+                Arch::X86_64,
+            ),
+            (
+                "samples/binaries/platforms/linux/amd64/export/native/gcc/O0/hello-gcc-O0",
+                Arch::X86_64,
+            ),
+            (
+                "samples/binaries/platforms/linux/arm64/export/cross/arm64/hello-arm64-gcc",
+                Arch::AArch64,
+            ),
+        ] {
+            let path = Path::new(rel);
+            if !path.exists() {
+                continue;
+            }
+            let data = std::fs::read(path).expect("read sample");
+            let budgets = Budgets {
+                max_functions: 64,
+                max_blocks: 512,
+                max_instructions: 40_000,
+                timeout_ms: 4000,
+                total_timeout_ms: 0,
+            };
+            let (funcs, _cg) = analyze_functions_bytes(&data, &budgets);
+            for f in &funcs {
+                let Ok(lf) = lift_function_from_bytes(&data, f, arch) else {
+                    continue;
+                };
+                lifted += 1;
+                for block in &lf.blocks {
+                    for instr in &block.instrs {
+                        if matches!(&instr.op, Op::Intrinsic { name, .. } if name == "undecoded_bytes")
+                        {
+                            undecoded.push((rel, instr.va));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(lifted > 0, "no sample binary was available to measure");
+        assert!(
+            undecoded.is_empty(),
+            "{} owned block(s) failed to decode across {lifted} functions: {:x?}",
+            undecoded.len(),
+            undecoded
+        );
+    }
+
+    /// Build a function of `n` adjacent 4-byte blocks, each falling through to
+    /// the next, at VAs that no byte buffer here will ever map.
+    #[cfg(test)]
+    fn chain_at_unmapped_vas(n: usize) -> crate::core::function::Function {
+        use crate::core::address::{Address, AddressKind};
+        use crate::core::basic_block::BasicBlock;
+        use crate::core::function::{Function, FunctionKind};
+
+        let va = |v: u64| Address::new(AddressKind::VA, v, 64, None, None).unwrap();
+        let base = 0x7fff_0000_0000u64;
+        let mut f = Function::new("unmapped".into(), va(base), FunctionKind::Normal).unwrap();
+        for i in 0..n as u64 {
+            let succ = (i + 1 < n as u64).then(|| vec![format!("b{}", i + 1)]);
+            f.basic_blocks.push(BasicBlock::new(
+                format!("b{i}"),
+                va(base + i * 4),
+                va(base + i * 4 + 4),
+                1,
+                succ,
+                None,
+            ));
+        }
+        f
+    }
+
+    /// Design rule 8: a block we own but cannot decode becomes an explicit
+    /// unknown, never a silent omission. Before this, both the block and every
+    /// edge into it disappeared, leaving a CFG strictly better formed than the
+    /// truth — the one shape no consumer can detect, because there is nothing
+    /// left to detect.
+    #[test]
+    fn undecodable_owned_blocks_survive_as_explicit_unknowns() {
+        let f = chain_at_unmapped_vas(3);
+        let data = vec![0u8; 16]; // not an object file: nothing maps
+        let lf = lift_function_from_bytes(&data, &f, Arch::X86_64)
+            .expect("a function of undecodable blocks is still a function");
+
+        assert_eq!(lf.blocks.len(), 3, "every owned block must survive");
+        for block in &lf.blocks {
+            assert!(
+                matches!(
+                    block.instrs.as_slice(),
+                    [LlirInstr {
+                        op: Op::Intrinsic { name, reads_mem: true, writes_mem: true, .. },
+                        ..
+                    }] if name == "undecoded_bytes"
+                ),
+                "undecoded block must carry a maximal-footprint marker, got {:?}",
+                block.instrs
+            );
+        }
+    }
+
+    /// The edges matter as much as the blocks. A dropped block used to take its
+    /// predecessors' edges with it via the `succs.retain` prune below, which is
+    /// how an unreadable block turned into a plausible-looking straight line.
+    #[test]
+    fn edges_into_undecodable_blocks_are_not_pruned() {
+        let f = chain_at_unmapped_vas(3);
+        let data = vec![0u8; 16];
+        let lf = lift_function_from_bytes(&data, &f, Arch::X86_64).expect("lift");
+
+        let succs: Vec<&[u64]> = lf.blocks.iter().map(|b| b.succs.as_slice()).collect();
+        assert_eq!(
+            succs,
+            vec![
+                &[0x7fff_0000_0004u64][..],
+                &[0x7fff_0000_0008u64][..],
+                &[][..],
+            ],
+            "the chain must stay a chain"
+        );
+    }
+}

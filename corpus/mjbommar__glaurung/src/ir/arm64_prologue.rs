@@ -1,0 +1,843 @@
+//! AArch64 prologue / epilogue pattern recognition.
+//!
+//! The canonical Clang/GCC AArch64 prologue pairs a pre-indexed STP of the
+//! frame and link registers with a `mov fp, sp` (or equivalent) to
+//! establish the frame:
+//!
+//! ```text
+//!   stp  x29, x30, [sp, #-0x30]!   (pre-indexed, writeback)
+//!   mov  x29, sp                   (set fp = sp)
+//! ```
+//!
+//! In our AST (after the pre-indexed STP lifter and stack-local naming run),
+//! that lowers to:
+//!
+//! ```text
+//!   store %stack_N = %fp;
+//!   store %stack_M = %lr;
+//!   %sp = (%sp - K);
+//!   %fp = %sp;
+//! ```
+//!
+//! This pass recognises that shape, collapses it into a single prologue
+//! comment, and deletes the underlying stmts. The mirror epilogue — `ldp
+//! x29, x30, [sp], #K; ret` — becomes a simple `return;`.
+
+use crate::ir::ast::{Expr, Function, OriginSet, Stmt};
+use crate::ir::types::{BinOp, VReg};
+
+#[derive(Clone, Copy)]
+enum IdentityAuthority<'a> {
+    Exact(&'a crate::ir::value_number::ValueIdentities),
+    #[cfg(test)]
+    LegacySpelling,
+}
+
+/// Run the pass over `f`'s body. Nested arms are currently left alone —
+/// prologue stmts always sit at the top-level entry to a function.
+#[cfg(test)]
+pub fn recognise_arm64_prologue(f: &mut Function) {
+    recognise_arm64_prologue_impl(f, IdentityAuthority::LegacySpelling);
+}
+
+/// Identity-aware production form of [`recognise_arm64_prologue`].
+pub fn recognise_arm64_prologue_with_identities(
+    f: &mut Function,
+    identities: &crate::ir::value_number::ValueIdentities,
+) {
+    recognise_arm64_prologue_impl(f, IdentityAuthority::Exact(identities));
+}
+
+fn recognise_arm64_prologue_impl(f: &mut Function, authority: IdentityAuthority<'_>) {
+    collapse_prologue(&mut f.body, authority);
+    collapse_epilogue(&mut f.body, authority);
+}
+
+fn collapse_prologue(body: &mut Vec<Stmt>, authority: IdentityAuthority<'_>) {
+    // Stack-object recovery can fold the pre-indexed STP and its writeback
+    // before this pass runs.  The same frame record then has this stronger,
+    // address-explicit spelling:
+    //
+    //   *(u64 *)&frame[0] = fp;
+    //   *(u64 *)&frame[8] = lr;
+    //   fp = &frame[0];
+    //
+    // Both architectural saves plus the frame-pointer anchor distinguish the
+    // record from a source object.  Recognise it before the older scalar-slot
+    // spelling below; otherwise the record becomes an artificial byte array in
+    // emitted C.
+    if let [fp_save, lr_save, fp_set, ..] = body.as_slice() {
+        let fp_object = frame_record_store(fp_save, "fp", 0);
+        let lr_object = frame_record_store(lr_save, "lr", 8);
+        let set_object = match fp_set.semantic() {
+            Stmt::Assign {
+                dst: VReg::Phys(fp),
+                src,
+            } if fp == "fp" || fp == "x29" => stack_object_at(src, 0),
+            _ => None,
+        };
+        if fp_object.is_some() && fp_object == lr_object && fp_object == set_object {
+            let origins = origins_in_range(body, 0, 3);
+            body.drain(0..3);
+            body.insert(
+                0,
+                Stmt::Comment("aarch64 prologue: save fp/lr in promoted frame record".into())
+                    .with_optional_origins((!origins.is_empty()).then_some(origins)),
+            );
+            return;
+        }
+    }
+
+    // Look for up to the first ~6 statements matching the prologue shape.
+    let mut end = 0usize;
+    let mut saw_fp_save = false;
+    let mut saw_lr_save = false;
+    let mut sp_adjust: Option<i64> = None;
+    let mut saw_fp_set = false;
+
+    for (i, s) in body.iter().enumerate() {
+        match s.semantic() {
+            Stmt::Store { addr, src, .. }
+                if matches!(addr.semantic(), Expr::Reg(slot @ VReg::Phys(_))
+                    if is_promoted_stack_object(slot, authority))
+                    && matches!(src.semantic(), Expr::Reg(VReg::Phys(_))) =>
+            {
+                let Expr::Reg(VReg::Phys(reg)) = src.semantic() else {
+                    unreachable!("guard established physical saved register")
+                };
+                if reg == "fp" || reg == "x29" {
+                    saw_fp_save = true;
+                } else if reg == "lr" || reg == "x30" {
+                    saw_lr_save = true;
+                } else {
+                    // The first source-level spills usually follow the frame
+                    // record at -O0 (notably argc/argv). They are not part of
+                    // the prologue merely because stack promotion gave them
+                    // the same `stack_*` namespace.
+                    break;
+                }
+                end = i + 1;
+            }
+            // `sp -= N` or `sp += -N` (the lifter sometimes emits Add with
+            // a negative constant for the pre-indexed writeback).
+            Stmt::Assign { dst, src } if is_sp(dst) => {
+                let Expr::Bin { op, lhs, rhs } = src.semantic() else {
+                    break;
+                };
+                if !matches!(lhs.semantic(), Expr::Reg(r) if r == dst) {
+                    break;
+                }
+                let Expr::Const(n) = rhs.semantic() else {
+                    break;
+                };
+                let delta = match op {
+                    BinOp::Sub if *n > 0 => Some(*n),
+                    BinOp::Add if *n < 0 => Some(-*n),
+                    _ => None,
+                };
+                if let Some(d) = delta {
+                    sp_adjust = Some(d);
+                    end = i + 1;
+                    continue;
+                }
+                break;
+            }
+            Stmt::Assign {
+                dst: VReg::Phys(fp),
+                src,
+            } if fp == "fp" || fp == "x29" => {
+                if matches!(src.semantic(), Expr::Reg(sp_ref) if is_sp(sp_ref)) {
+                    saw_fp_set = true;
+                    end = i + 1;
+                } else {
+                    break;
+                }
+            }
+            // Any other op means the prologue run is over.
+            _ => break,
+        }
+    }
+    // Two sufficient shapes, and the second is not a relaxation of the first.
+    //
+    //  * fp-save + lr-save + sp-sub: the canonical pre-indexed STP. The `mov
+    //    fp, sp` step is optional here — it is often DCE'd away when the
+    //    function doesn't use fp to address locals.
+    //  * sp-sub + `mov fp, sp`: what is left once dead-store elimination has
+    //    pruned the fp/lr spills. Pruning them is right — nothing reloads them
+    //    — but it also deletes the evidence this pass was keyed on, and the
+    //    prologue then survived into the output as raw
+    //    `%sp = (%sp - 48); %fp = %sp`.
+    //
+    // A lone sp-sub is still NOT enough — that is an ordinary stack allocation.
+    //
+    // The two cases differ in what may be DELETED, and that difference is the
+    // whole point. With the spills present, the frame pointer is provably dead
+    // and the run can be dropped wholesale. With the spills pruned we have no
+    // such proof — at -O0 AArch64 keeps `fp` live and addresses every local
+    // through it, so draining `%fp = %sp` there left `fp` undefined and broke
+    // 10 execution-differential cases. The pruned shape annotates and deletes
+    // nothing.
+    let saves_seen = saw_fp_save && saw_lr_save;
+    let Some(frame) = sp_adjust else { return };
+    if saves_seen {
+        let origins = origins_in_range(body, 0, end);
+        body.drain(0..end);
+        body.insert(
+            0,
+            Stmt::Comment(format!("aarch64 prologue: save fp/lr, frame {frame} bytes"))
+                .with_optional_origins((!origins.is_empty()).then_some(origins)),
+        );
+    } else if saw_fp_set {
+        // Only claim what was observed: the frame, not the spills.
+        body.insert(
+            0,
+            Stmt::Comment(format!("aarch64 prologue: frame {frame} bytes")),
+        );
+    }
+}
+
+fn collapse_epilogue(body: &mut Vec<Stmt>, authority: IdentityAuthority<'_>) {
+    // Find every Return and, for each, drop the immediately preceding
+    // ABI bookkeeping: a `sp += K` adjust and/or a run of `%fp = %stack_*`
+    // / `%lr = %stack_*` / `%varN = %stack_*` restore assigns. Back-to-
+    // front so earlier indices stay valid as later ones collapse.
+    let return_positions: Vec<usize> = body
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s.semantic(), Stmt::Return { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    for ret_idx in return_positions.into_iter().rev() {
+        // 1. Drop a single `sp += K` immediately before Return.
+        let mut ret_idx = ret_idx;
+        let mut adjustment_origins = None;
+        if ret_idx > 0
+            && matches!(body[ret_idx - 1].semantic(), Stmt::Assign { dst, src }
+                if is_sp(dst)
+                    && matches!(src.semantic(), Expr::Bin {
+                        op: BinOp::Add,
+                        lhs,
+                        rhs,
+                    } if matches!(lhs.semantic(), Expr::Reg(r) if r == dst)
+                        && matches!(rhs.semantic(), Expr::Const(k) if *k > 0)))
+        {
+            adjustment_origins = body[ret_idx - 1].origins().cloned();
+            body.remove(ret_idx - 1);
+            ret_idx -= 1;
+        }
+        // 2. Walk back over a contiguous run of stack-restore assigns.
+        let mut run_start = ret_idx;
+        while run_start > 0 && is_stack_restore(&body[run_start - 1], authority) {
+            run_start -= 1;
+        }
+        let run = &body[run_start..ret_idx];
+        let mut fp_seen = false;
+        let mut lr_seen = false;
+        for s in run {
+            if let Stmt::Assign {
+                dst: VReg::Phys(n), ..
+            } = s.semantic()
+            {
+                if n == "fp" || n == "x29" {
+                    fp_seen = true;
+                } else if n == "lr" || n == "x30" {
+                    lr_seen = true;
+                }
+            }
+        }
+        if fp_seen && lr_seen && run_start < ret_idx {
+            let mut origins = origins_in_range(body, run_start, ret_idx);
+            if let Some(adjustment_origins) = adjustment_origins {
+                origins.merge(&adjustment_origins);
+            }
+            body.drain(run_start..ret_idx);
+            body.insert(
+                run_start,
+                Stmt::Comment("aarch64 epilogue: restore fp/lr".to_string())
+                    .with_optional_origins((!origins.is_empty()).then_some(origins)),
+            );
+        }
+    }
+}
+
+fn stack_object_at(expr: &Expr, expected_offset: i64) -> Option<&VReg> {
+    match (expr.semantic(), expected_offset) {
+        (Expr::StackAddr { object, .. }, 0) => Some(object),
+        (
+            Expr::Bin {
+                op: BinOp::Add,
+                lhs,
+                rhs,
+            },
+            offset,
+        ) if matches!(rhs.semantic(), Expr::Const(value) if *value == offset) => {
+            stack_object_at(lhs, 0)
+        }
+        _ => None,
+    }
+}
+
+fn frame_record_store<'a>(statement: &'a Stmt, register: &str, offset: i64) -> Option<&'a VReg> {
+    match statement.semantic() {
+        Stmt::Store { addr, src, size: 8 } => match src.semantic() {
+            Expr::Reg(VReg::Phys(source))
+                if source == register
+                    || (register == "fp" && source == "x29")
+                    || (register == "lr" && source == "x30") =>
+            {
+                stack_object_at(addr, offset)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn is_stack_restore(statement: &Stmt, authority: IdentityAuthority<'_>) -> bool {
+    let Stmt::Assign {
+        dst: VReg::Phys(_),
+        src,
+    } = statement.semantic()
+    else {
+        return false;
+    };
+    match src.semantic() {
+        Expr::Reg(source) => is_promoted_stack_object(source, authority),
+        Expr::Deref { addr, size: 8 } => {
+            stack_object_at(addr, 0).is_some() || stack_object_at(addr, 8).is_some()
+        }
+        _ => false,
+    }
+}
+
+fn is_promoted_stack_object(value: &VReg, authority: IdentityAuthority<'_>) -> bool {
+    match authority {
+        IdentityAuthority::Exact(identities) => identities.is_promoted_stack_object(value),
+        #[cfg(test)]
+        IdentityAuthority::LegacySpelling => {
+            matches!(value, VReg::Phys(name) if name.starts_with("stack_"))
+        }
+    }
+}
+
+fn origins_in_range(body: &[Stmt], start: usize, end: usize) -> OriginSet {
+    body[start..end]
+        .iter()
+        .filter_map(Stmt::origins)
+        .fold(OriginSet::empty(), |origins, next| origins.union(next))
+}
+
+fn is_sp(v: &VReg) -> bool {
+    matches!(v, VReg::Phys(n) if n == "sp" || n == "rsp" || n == "esp")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::ast::{Function, Stmt};
+
+    fn reg(n: &str) -> VReg {
+        VReg::phys(n)
+    }
+
+    fn store(stack_name: &str, value_reg: &str) -> Stmt {
+        Stmt::Store {
+            addr: Expr::Reg(reg(stack_name)),
+            src: Expr::Reg(reg(value_reg)),
+            size: 8,
+        }
+    }
+
+    fn sp_sub(n: i64) -> Stmt {
+        Stmt::Assign {
+            dst: reg("sp"),
+            src: Expr::Bin {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Reg(reg("sp"))),
+                rhs: Box::new(Expr::Const(n)),
+            },
+        }
+    }
+
+    fn sp_add(n: i64) -> Stmt {
+        Stmt::Assign {
+            dst: reg("sp"),
+            src: Expr::Bin {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Reg(reg("sp"))),
+                rhs: Box::new(Expr::Const(n)),
+            },
+        }
+    }
+
+    #[test]
+    fn prologue_collapses_to_header_comment() {
+        let mut f = Function {
+            name: "main".into(),
+            entry_va: 0,
+            body: vec![
+                store("stack_0", "fp"),
+                store("stack_1", "lr"),
+                sp_sub(48),
+                Stmt::Assign {
+                    dst: reg("fp"),
+                    src: Expr::Reg(reg("sp")),
+                },
+                Stmt::Nop,
+                Stmt::Return { value: None },
+            ],
+        };
+        recognise_arm64_prologue(&mut f);
+        assert!(matches!(
+            &f.body[0],
+            Stmt::Comment(s) if s.contains("aarch64 prologue") && s.contains("48")
+        ));
+        // The stmts after the prologue must be preserved.
+        assert!(matches!(&f.body[1], Stmt::Nop));
+        assert!(matches!(&f.body[2], Stmt::Return { .. }));
+    }
+
+    #[test]
+    fn identity_aware_prologue_accepts_owned_opaque_frame_slots() {
+        let fp_slot_name = "frame_fp_save".to_string();
+        let lr_slot_name = "frame_lr_save".to_string();
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.attach_promoted_stack_objects([&fp_slot_name, &lr_slot_name]);
+        let mut f = Function {
+            name: "main".into(),
+            entry_va: 0,
+            body: vec![
+                store(&fp_slot_name, "fp"),
+                store(&lr_slot_name, "lr"),
+                sp_sub(48),
+                Stmt::Return { value: None },
+            ],
+        };
+
+        recognise_arm64_prologue_with_identities(&mut f, &identities);
+
+        assert_eq!(f.body.len(), 2, "owned frame saves leaked: {:#?}", f.body);
+        assert!(matches!(&f.body[0], Stmt::Comment(text) if text.contains("prologue")));
+    }
+
+    #[test]
+    fn identity_aware_prologue_rejects_unowned_stack_spelling() {
+        let mut f = Function {
+            name: "main".into(),
+            entry_va: 0,
+            body: vec![
+                store("stack_0", "fp"),
+                store("stack_1", "lr"),
+                sp_sub(48),
+                Stmt::Return { value: None },
+            ],
+        };
+        let original = f.clone();
+
+        recognise_arm64_prologue_with_identities(
+            &mut f,
+            &crate::ir::value_number::ValueIdentities::default(),
+        );
+
+        assert_eq!(f, original);
+    }
+
+    #[test]
+    fn attributed_prologue_collapses_with_exact_machine_owners() {
+        let mut f = Function {
+            name: "main".into(),
+            entry_va: 0x1000,
+            body: vec![
+                Stmt::Store {
+                    addr: Expr::Reg(reg("stack_0")).with_origins(OriginSet::one(0x2000)),
+                    src: Expr::Reg(reg("fp")).with_origins(OriginSet::one(0x2000)),
+                    size: 8,
+                }
+                .with_origins(OriginSet::one(0x1000)),
+                Stmt::Store {
+                    addr: Expr::Reg(reg("stack_1")).with_origins(OriginSet::one(0x2004)),
+                    src: Expr::Reg(reg("lr")).with_origins(OriginSet::one(0x2004)),
+                    size: 8,
+                }
+                .with_origins(OriginSet::one(0x1004)),
+                Stmt::Assign {
+                    dst: reg("sp"),
+                    src: Expr::Bin {
+                        op: BinOp::Sub,
+                        lhs: Box::new(Expr::Reg(reg("sp")).with_origins(OriginSet::one(0x2008))),
+                        rhs: Box::new(Expr::Const(48).with_origins(OriginSet::one(0x2008))),
+                    }
+                    .with_origins(OriginSet::one(0x2008)),
+                }
+                .with_origins(OriginSet::one(0x1008)),
+                Stmt::Assign {
+                    dst: reg("fp"),
+                    src: Expr::Reg(reg("sp")).with_origins(OriginSet::one(0x200c)),
+                }
+                .with_origins(OriginSet::one(0x100c)),
+                Stmt::Return { value: None }.with_origins(OriginSet::one(0x1010)),
+            ],
+        };
+
+        recognise_arm64_prologue(&mut f);
+
+        assert_eq!(f.body.len(), 2, "attributed prologue leaked: {:#?}", f.body);
+        assert_eq!(
+            f.body[0].origins(),
+            Some(&OriginSet::from_addresses([0x1000, 0x1004, 0x1008, 0x100c]))
+        );
+        assert_eq!(f.body[1].origins(), Some(&OriginSet::one(0x1010)));
+    }
+
+    #[test]
+    fn prologue_does_not_consume_following_argument_spills() {
+        let argument_spill = Stmt::Store {
+            addr: Expr::Reg(reg("stack_2")),
+            src: Expr::Reg(reg("arg0")),
+            size: 4,
+        };
+        let mut f = Function {
+            name: "main".into(),
+            entry_va: 0,
+            body: vec![
+                store("stack_0", "fp"),
+                store("stack_1", "lr"),
+                sp_sub(48),
+                Stmt::Assign {
+                    dst: reg("fp"),
+                    src: Expr::Reg(reg("sp")),
+                },
+                argument_spill.clone(),
+                Stmt::Return { value: None },
+            ],
+        };
+
+        recognise_arm64_prologue(&mut f);
+
+        assert!(f.body.contains(&argument_spill), "{:#?}", f.body);
+    }
+
+    #[test]
+    fn prologue_without_fp_set_still_collapses_when_fp_lr_are_saved() {
+        // `mov fp, sp` is optional — the fp-save + lr-save + sp-sub triad
+        // is distinctive enough on its own.
+        let mut f = Function {
+            name: "f".into(),
+            entry_va: 0,
+            body: vec![
+                store("stack_0", "fp"),
+                store("stack_1", "lr"),
+                sp_sub(48),
+                Stmt::Return { value: None },
+            ],
+        };
+        recognise_arm64_prologue(&mut f);
+        assert!(matches!(
+            &f.body[0],
+            Stmt::Comment(s) if s.contains("aarch64 prologue")
+        ));
+    }
+
+    #[test]
+    fn prologue_collapses_after_dead_store_elimination_prunes_the_spills() {
+        // What `prune_callee_saved_spills` leaves behind: the sp adjust and the
+        // frame-pointer copy, with no fp/lr stores at all. This is the shape
+        // real AArch64 output has, and it used to escape the pass entirely —
+        // `%sp = (%sp - 48); %fp = (u64*)%sp;` reached the reader. (The
+        // `(u64*)` there is a print-time type annotation, not an AST cast.)
+        let mut f = Function {
+            name: "main".into(),
+            entry_va: 0,
+            body: vec![
+                sp_sub(48),
+                Stmt::Assign {
+                    dst: reg("fp"),
+                    src: Expr::Reg(reg("sp")),
+                },
+                Stmt::Nop,
+                Stmt::Return { value: None },
+            ],
+        };
+        recognise_arm64_prologue(&mut f);
+        assert!(matches!(
+            &f.body[0],
+            Stmt::Comment(s) if s.contains("aarch64 prologue") && s.contains("48")
+        ));
+        // It must not claim spills it never saw.
+        assert!(matches!(&f.body[0], Stmt::Comment(s) if !s.contains("fp/lr")));
+        // Nothing may be deleted here: without the spills there is no proof the
+        // frame pointer is dead, and at -O0 AArch64 addresses locals through it.
+        assert!(matches!(&f.body[1], Stmt::Assign { .. }));
+        assert!(matches!(
+            &f.body[2],
+            Stmt::Assign { dst, .. } if matches!(dst, VReg::Phys(n) if n == "fp")
+        ));
+        assert!(matches!(&f.body[3], Stmt::Nop));
+        assert!(matches!(&f.body[4], Stmt::Return { .. }));
+    }
+
+    #[test]
+    fn a_bare_stack_allocation_is_not_a_prologue() {
+        // `sp -= N` with no frame-pointer establishment and no spills is an
+        // ordinary alloca-style adjustment. Collapsing it would silently
+        // delete a real statement.
+        let mut f = Function {
+            name: "f".into(),
+            entry_va: 0,
+            body: vec![sp_sub(48), Stmt::Nop, Stmt::Return { value: None }],
+        };
+        let orig = f.clone();
+        recognise_arm64_prologue(&mut f);
+        assert_eq!(f, orig);
+    }
+
+    #[test]
+    fn prologue_without_lr_save_is_not_collapsed() {
+        // If only fp is saved (no lr), the pattern is too ambiguous.
+        let mut f = Function {
+            name: "f".into(),
+            entry_va: 0,
+            body: vec![
+                store("stack_0", "fp"),
+                sp_sub(48),
+                Stmt::Return { value: None },
+            ],
+        };
+        let orig = f.clone();
+        recognise_arm64_prologue(&mut f);
+        assert_eq!(f, orig);
+    }
+
+    #[test]
+    fn epilogue_restore_fp_lr_collapses_to_comment() {
+        let mut f = Function {
+            name: "f".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("fp"),
+                    src: Expr::Reg(reg("stack_0")),
+                },
+                Stmt::Assign {
+                    dst: reg("lr"),
+                    src: Expr::Reg(reg("stack_1")),
+                },
+                Stmt::Return { value: None },
+            ],
+        };
+        recognise_arm64_prologue(&mut f);
+        // Expect: Comment, Return.
+        assert_eq!(f.body.len(), 2);
+        assert!(matches!(
+            &f.body[0],
+            Stmt::Comment(s) if s.contains("epilogue")
+        ));
+        assert!(matches!(&f.body[1], Stmt::Return { .. }));
+    }
+
+    #[test]
+    fn identity_aware_epilogue_accepts_owned_opaque_frame_slots() {
+        let fp_slot_name = "frame_fp_save".to_string();
+        let lr_slot_name = "frame_lr_save".to_string();
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.attach_promoted_stack_objects([&fp_slot_name, &lr_slot_name]);
+        let mut f = Function {
+            name: "f".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("fp"),
+                    src: Expr::Reg(reg(&fp_slot_name)),
+                },
+                Stmt::Assign {
+                    dst: reg("lr"),
+                    src: Expr::Reg(reg(&lr_slot_name)),
+                },
+                Stmt::Return { value: None },
+            ],
+        };
+
+        recognise_arm64_prologue_with_identities(&mut f, &identities);
+
+        assert_eq!(
+            f.body.len(),
+            2,
+            "owned frame restores leaked: {:#?}",
+            f.body
+        );
+        assert!(matches!(&f.body[0], Stmt::Comment(text) if text.contains("epilogue")));
+    }
+
+    #[test]
+    fn identity_aware_epilogue_rejects_unowned_stack_spelling() {
+        let mut f = Function {
+            name: "f".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("fp"),
+                    src: Expr::Reg(reg("stack_0")),
+                },
+                Stmt::Assign {
+                    dst: reg("lr"),
+                    src: Expr::Reg(reg("stack_1")),
+                },
+                Stmt::Return { value: None },
+            ],
+        };
+        let original = f.clone();
+
+        recognise_arm64_prologue_with_identities(
+            &mut f,
+            &crate::ir::value_number::ValueIdentities::default(),
+        );
+
+        assert_eq!(f, original);
+    }
+
+    #[test]
+    fn attributed_epilogue_collapses_with_exact_machine_owners() {
+        let mut f = Function {
+            name: "f".into(),
+            entry_va: 0x1000,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("fp"),
+                    src: Expr::Reg(reg("stack_0")).with_origins(OriginSet::one(0x2010)),
+                }
+                .with_origins(OriginSet::one(0x1010)),
+                Stmt::Assign {
+                    dst: reg("lr"),
+                    src: Expr::Reg(reg("stack_1")).with_origins(OriginSet::one(0x2014)),
+                }
+                .with_origins(OriginSet::one(0x1014)),
+                Stmt::Assign {
+                    dst: reg("sp"),
+                    src: Expr::Bin {
+                        op: BinOp::Add,
+                        lhs: Box::new(Expr::Reg(reg("sp")).with_origins(OriginSet::one(0x2018))),
+                        rhs: Box::new(Expr::Const(48).with_origins(OriginSet::one(0x2018))),
+                    }
+                    .with_origins(OriginSet::one(0x2018)),
+                }
+                .with_origins(OriginSet::one(0x1018)),
+                Stmt::Return { value: None }.with_origins(OriginSet::one(0x101c)),
+            ],
+        };
+
+        recognise_arm64_prologue(&mut f);
+
+        assert_eq!(f.body.len(), 2, "attributed epilogue leaked: {:#?}", f.body);
+        assert_eq!(
+            f.body[0].origins(),
+            Some(&OriginSet::from_addresses([0x1010, 0x1014, 0x1018]))
+        );
+        assert_eq!(f.body[1].origins(), Some(&OriginSet::one(0x101c)));
+    }
+
+    #[test]
+    fn epilogue_without_lr_restore_is_not_collapsed() {
+        // Only fp restore and return — ambiguous, must not fire.
+        let mut f = Function {
+            name: "f".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("fp"),
+                    src: Expr::Reg(reg("stack_0")),
+                },
+                Stmt::Return { value: None },
+            ],
+        };
+        let orig = f.clone();
+        recognise_arm64_prologue(&mut f);
+        assert_eq!(f, orig);
+    }
+
+    #[test]
+    fn epilogue_sp_add_before_return_is_dropped() {
+        let mut f = Function {
+            name: "f".into(),
+            entry_va: 0,
+            body: vec![Stmt::Nop, sp_add(48), Stmt::Return { value: None }],
+        };
+        recognise_arm64_prologue(&mut f);
+        // Expected remaining: Nop, Return (sp_add dropped).
+        assert_eq!(f.body.len(), 2);
+        assert!(matches!(&f.body[0], Stmt::Nop));
+        assert!(matches!(&f.body[1], Stmt::Return { .. }));
+    }
+
+    #[test]
+    fn promoted_frame_record_collapses_before_it_becomes_a_c_array() {
+        let frame = reg("stack_0");
+        let address = |offset| {
+            if offset == 0 {
+                Expr::StackAddr {
+                    object: frame.clone(),
+                    size: 16,
+                }
+                .with_origins(OriginSet::one(0x2000))
+            } else {
+                Expr::Bin {
+                    op: BinOp::Add,
+                    lhs: Box::new(
+                        Expr::StackAddr {
+                            object: frame.clone(),
+                            size: 16,
+                        }
+                        .with_origins(OriginSet::one(0x2000)),
+                    ),
+                    rhs: Box::new(Expr::Const(offset).with_origins(OriginSet::one(0x2008))),
+                }
+                .with_origins(OriginSet::one(0x2008))
+            }
+        };
+        let mut f = Function {
+            name: "main".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Store {
+                    addr: address(0),
+                    src: Expr::Reg(reg("fp")).with_origins(OriginSet::one(0x2010)),
+                    size: 8,
+                },
+                Stmt::Store {
+                    addr: address(8),
+                    src: Expr::Reg(reg("lr")).with_origins(OriginSet::one(0x2014)),
+                    size: 8,
+                },
+                Stmt::Assign {
+                    dst: reg("fp"),
+                    src: address(0),
+                },
+                Stmt::Nop,
+                Stmt::Assign {
+                    dst: reg("fp"),
+                    src: Expr::Deref {
+                        addr: Box::new(address(0)),
+                        size: 8,
+                    }
+                    .with_origins(OriginSet::one(0x2020)),
+                },
+                Stmt::Assign {
+                    dst: reg("lr"),
+                    src: Expr::Deref {
+                        addr: Box::new(address(8)),
+                        size: 8,
+                    }
+                    .with_origins(OriginSet::one(0x2024)),
+                },
+                Stmt::Return { value: None },
+            ],
+        };
+
+        recognise_arm64_prologue(&mut f);
+
+        assert_eq!(f.body.len(), 4, "{:#?}", f.body);
+        assert!(matches!(&f.body[0], Stmt::Comment(text) if text.contains("prologue")));
+        assert!(matches!(&f.body[1], Stmt::Nop));
+        assert!(matches!(&f.body[2], Stmt::Comment(text) if text.contains("epilogue")));
+        assert!(matches!(&f.body[3], Stmt::Return { .. }));
+    }
+}

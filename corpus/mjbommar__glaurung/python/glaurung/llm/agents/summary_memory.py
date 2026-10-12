@@ -1,0 +1,86 @@
+"""Memory-first summarizer agent with BinarySummary output."""
+
+from __future__ import annotations
+
+import os
+
+from pydantic import BaseModel, Field
+from pydantic_ai import Agent, RunContext
+
+from ..config import get_config
+from ..context import MemoryContext
+
+
+class BinarySummary(BaseModel):
+    summary: str
+    purpose: str
+    risk_level: str = Field(default="unknown")
+    key_behaviors: list[str] = Field(default_factory=list)
+    recommendation: str = Field(default="Review further")
+
+
+SYSTEM_PROMPT = (
+    "You are a concise binary analysis assistant.\n"
+    "Provide a high-level summary, purpose, risk assessment,\n"
+    "key behaviors, and a recommendation. Ground answers in facts in the KB."
+)
+
+
+def create_summarizer_agent(
+    model: str | None = None,
+) -> Agent[MemoryContext, BinarySummary]:
+    cfg = get_config()
+    avail = cfg.available_models()
+    chosen = (
+        model
+        or cfg.summarizer_model
+        or (cfg.default_model if any(avail.values()) else "test")
+    )
+    # If no API key for external providers, fall back to test model
+    if not model and not os.environ.get("OPENAI_API_KEY"):
+        chosen = "test"
+    agent = Agent(
+        model=chosen,
+        system_prompt=SYSTEM_PROMPT,
+        deps_type=MemoryContext,
+        output_type=BinarySummary,
+    )
+
+    @agent.system_prompt
+    async def _inject(ctx: RunContext[MemoryContext]) -> str:
+        kb = ctx.deps.kb
+        node_count = sum(1 for _ in kb.nodes())
+        edge_count = sum(1 for _ in kb.edges())
+        return (
+            f"KB nodes: {node_count}, edges: {edge_count}. File: {ctx.deps.file_path}"
+        )
+
+    return agent
+
+
+async def summarize_binary(
+    artifact, file_path: str, model: str | None = None
+) -> BinarySummary:
+    from ..kb.adapters import import_triage
+
+    # Build a minimal MemoryContext and seed KB
+    ctx = MemoryContext(file_path=file_path, artifact=artifact)
+    import_triage(ctx.kb, artifact, file_path)
+    agent = create_summarizer_agent(model=model)
+    from ..usage_limits import build_usage_limits
+
+    res = await agent.run(
+        "Summarize this binary.",
+        deps=ctx,
+        # Summary is one structured-output emission; very few tool turns.
+        usage_limits=build_usage_limits(model_name=model, request_limit=4),
+    )
+    return res.output
+
+
+def summarize_binary_sync(
+    artifact, file_path: str, model: str | None = None
+) -> BinarySummary:
+    import asyncio
+
+    return asyncio.run(summarize_binary(artifact, file_path, model))

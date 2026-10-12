@@ -1,0 +1,106 @@
+/*
+ * Copyright 2004-present the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.springframework.security.oauth2.server.authorization.jackson2;
+
+import java.io.IOException;
+import java.util.Map;
+
+import com.fasterxml.jackson.core.JsonParseException;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.JsonDeserializer;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.jspecify.annotations.Nullable;
+
+import org.springframework.security.oauth2.core.AuthorizationGrantType;
+import org.springframework.security.oauth2.core.endpoint.OAuth2AuthorizationRequest;
+import org.springframework.security.oauth2.core.endpoint.OAuth2AuthorizationRequest.Builder;
+import org.springframework.util.Assert;
+
+/**
+ * A {@code JsonDeserializer} for {@link OAuth2AuthorizationRequest}.
+ *
+ * @author Joe Grandja
+ * @since 7.0
+ * @see OAuth2AuthorizationRequest
+ * @see OAuth2AuthorizationRequestMixin
+ * @deprecated as of 7.0 in favor of
+ * {@code org.springframework.security.oauth2.server.authorization.jackson.OAuth2AuthorizationRequestDeserializer}
+ * based on Jackson 3
+ */
+@SuppressWarnings("removal")
+@Deprecated(forRemoval = true)
+final class OAuth2AuthorizationRequestDeserializer extends JsonDeserializer<OAuth2AuthorizationRequest> {
+
+	@Override
+	public OAuth2AuthorizationRequest deserialize(JsonParser parser, DeserializationContext context)
+			throws IOException {
+		ObjectMapper mapper = (ObjectMapper) parser.getCodec();
+		JsonNode root = mapper.readTree(parser);
+		return deserialize(parser, mapper, root);
+	}
+
+	private OAuth2AuthorizationRequest deserialize(JsonParser parser, ObjectMapper mapper, JsonNode root)
+			throws JsonParseException {
+		AuthorizationGrantType authorizationGrantType = convertAuthorizationGrantType(
+				JsonNodeUtils.findObjectNode(root, "authorizationGrantType"));
+		Builder builder = getBuilder(parser, authorizationGrantType);
+		String authorizationUri = JsonNodeUtils.findStringValue(root, "authorizationUri");
+		Assert.notNull(authorizationUri, "authorizationUri cannot be null");
+		builder.authorizationUri(authorizationUri);
+		String clientId = JsonNodeUtils.findStringValue(root, "clientId");
+		Assert.notNull(clientId, "clientId cannot be null");
+		builder.clientId(clientId);
+		builder.redirectUri(JsonNodeUtils.findStringValue(root, "redirectUri"));
+		builder.scopes(JsonNodeUtils.findValue(root, "scopes", JsonNodeUtils.STRING_SET, mapper));
+		builder.state(JsonNodeUtils.findStringValue(root, "state"));
+		Map<String, Object> additionalParameters = JsonNodeUtils.findValue(root, "additionalParameters",
+				JsonNodeUtils.STRING_OBJECT_MAP, mapper);
+		if (additionalParameters != null) {
+			builder.additionalParameters(additionalParameters);
+		}
+		String authorizationRequestUri = JsonNodeUtils.findStringValue(root, "authorizationRequestUri");
+		if (authorizationRequestUri != null) {
+			builder.authorizationRequestUri(authorizationRequestUri);
+		}
+		Map<String, Object> attributes = JsonNodeUtils.findValue(root, "attributes", JsonNodeUtils.STRING_OBJECT_MAP,
+				mapper);
+		if (attributes != null) {
+			builder.attributes(attributes);
+		}
+		return builder.build();
+	}
+
+	private Builder getBuilder(JsonParser parser, @Nullable AuthorizationGrantType authorizationGrantType)
+			throws JsonParseException {
+		if (authorizationGrantType != null
+				&& authorizationGrantType.equals(AuthorizationGrantType.AUTHORIZATION_CODE)) {
+			return OAuth2AuthorizationRequest.authorizationCode();
+		}
+		throw new JsonParseException(parser, "Invalid authorizationGrantType");
+	}
+
+	private static @Nullable AuthorizationGrantType convertAuthorizationGrantType(@Nullable JsonNode jsonNode) {
+		String value = JsonNodeUtils.findStringValue(jsonNode, "value");
+		if (AuthorizationGrantType.AUTHORIZATION_CODE.getValue().equalsIgnoreCase(value)) {
+			return AuthorizationGrantType.AUTHORIZATION_CODE;
+		}
+		return null;
+	}
+
+}

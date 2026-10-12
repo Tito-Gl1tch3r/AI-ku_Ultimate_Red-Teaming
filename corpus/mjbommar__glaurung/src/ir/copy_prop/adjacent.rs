@@ -1,0 +1,2025 @@
+//! Move one expression into its immediately adjacent sole consumer.
+//!
+//! Five of this module's public entry points live here, and they are one owner
+//! rather than five: each proves the *same* local def-use fact and performs the
+//! *same* edit. The fact is "this definition's value is consumed exactly once,
+//! by the next non-comment statement, and by nothing else that can still run";
+//! the edit is "substitute the expression there and delete the definition".
+//!
+//! # Why this is not the general copy environment
+//!
+//! [`super::env`] records a value and *replays* it at later uses, leaving the
+//! definition alone. That is unsound for anything whose evaluation must happen
+//! exactly once (a call would be invoked twice) and unavailable for anything
+//! whose destination is not globally SSA (a promoted stack local is a mutable C
+//! variable; a physical role name is reused across a function). Deleting the
+//! definition in the same step is what buys those cases: the expression's
+//! evaluation point crosses no observable statement, so it happens exactly once,
+//! at the same place, and no global SSA claim is needed.
+//!
+//! Each entry point is one such shape:
+//!
+//! * [`propagate_adjacent_promoted_values`] / the typed variant -- a promoted
+//!   stack temporary. `Store { addr: Reg(local_*), .. }` is ambiguous between a
+//!   frame-slot assignment and a real write through a pointer held in the slot,
+//!   so the untyped pass rejects every store and the typed one accepts only a
+//!   destination type recovery has proven scalar.
+//! * [`propagate_adjacent_guard_values`] -- a physical scratch consumed by the
+//!   `if` that immediately follows it, when that guard is its only reader in the
+//!   whole function (the whole-function count is what stops a loop-carried
+//!   definition that also reaches a read after the loop).
+//! * [`propagate_adjacent_overwritten_values`] -- `result = predicate; result =
+//!   table[result];`, where the second assignment both consumes and overwrites
+//!   the first.
+//! * [`move_adjacent_effectful_scratch_values`] -- the one case where the value
+//!   contains a call, and therefore the ONLY safe form: move it, never copy it.
+//!
+//! A new adjacent shape, or a new restriction on moving an expression past a
+//! statement, changes this file. Changing an invalidation rule does not.
+
+use crate::ir::ast::{Expr, Function, Stmt};
+use crate::ir::types_recover::{TypeHint, TypeMap};
+
+use super::alias::{
+    contains_deref, contains_reg, contains_select, contains_unknown, is_scratch_reg,
+};
+use super::env::Copies;
+use super::hash::RegMap;
+#[cfg(test)]
+use super::reads::{count_reads_body, count_reads_stmt};
+use super::reads::{
+    count_reads_body_with_identities, count_reads_stmt_with_identities, count_reg_uses,
+};
+use super::subst::subst;
+use super::IdentityAuthority;
+
+fn count_body_reads(body: &[Stmt], reads: &mut RegMap<usize>, identities: IdentityAuthority<'_>) {
+    match identities {
+        IdentityAuthority::Exact(exact) => count_reads_body_with_identities(body, reads, exact),
+        #[cfg(test)]
+        IdentityAuthority::LegacySpelling => count_reads_body(body, reads),
+    }
+}
+
+fn count_statement_reads(
+    statement: &Stmt,
+    reads: &mut RegMap<usize>,
+    identities: IdentityAuthority<'_>,
+) {
+    match identities {
+        IdentityAuthority::Exact(exact) => {
+            count_reads_stmt_with_identities(statement, reads, exact)
+        }
+        #[cfg(test)]
+        IdentityAuthority::LegacySpelling => count_reads_stmt(statement, reads),
+    }
+}
+
+/// Inline an adjacent, one-use promoted-stack value temporary represented as
+/// an explicit assignment.
+///
+/// Promoted locals are mutable variables rather than SSA values, so the general
+/// copy environment must not carry them into a loop condition or across a
+/// control-flow edge. This deliberately narrower transform accepts only:
+///
+/// `local_tmp = narrow_value; <next linear statement reads local_tmp once>`
+///
+/// `Store { addr: Reg(local_*), .. }` is deliberately excluded. Stack promotion
+/// historically overloaded that shape for both a frame-slot assignment and a
+/// real write through a pointer held in the slot; local adjacency cannot prove
+/// which meaning applies. Ambiguous stores remain explicit until stack storage
+/// carries a distinct assignment representation.
+#[cfg(test)]
+pub fn propagate_adjacent_promoted_values(f: &mut Function) {
+    loop {
+        if !fold_one_adjacent_promoted_value(&mut f.body, None, IdentityAuthority::LegacySpelling) {
+            break;
+        }
+    }
+}
+
+/// Identity-aware production form of [`propagate_adjacent_promoted_values`].
+pub fn propagate_adjacent_promoted_values_with_identities(
+    f: &mut Function,
+    identities: &crate::ir::value_number::ValueIdentities,
+) {
+    loop {
+        if !fold_one_adjacent_promoted_value(
+            &mut f.body,
+            None,
+            IdentityAuthority::Exact(identities),
+        ) {
+            break;
+        }
+    }
+}
+
+/// Inline adjacent promoted-stack stores only when recovered source types prove
+/// that the destination is scalar storage rather than a pointer value.
+///
+/// Stack promotion retains `Store { addr: Reg(local_*), .. }` for both a frame
+/// slot assignment and a genuine write through a pointer loaded from that slot.
+/// The untyped pass above therefore rejects every store. Once type recovery has
+/// classified the rendered local as an integer or boolean, pointer and code-
+/// pointer interpretations are excluded and the same local def/use proof is
+/// safe. Unknown, float, pointer, and code-pointer destinations remain explicit.
+#[cfg(test)]
+pub fn propagate_adjacent_typed_promoted_values(f: &mut Function, types: &TypeMap) {
+    loop {
+        if !fold_one_adjacent_promoted_value(
+            &mut f.body,
+            Some(types),
+            IdentityAuthority::LegacySpelling,
+        ) {
+            break;
+        }
+    }
+}
+
+/// Identity-aware production form of [`propagate_adjacent_typed_promoted_values`].
+pub fn propagate_adjacent_typed_promoted_values_with_identities(
+    f: &mut Function,
+    types: &TypeMap,
+    identities: &crate::ir::value_number::ValueIdentities,
+) {
+    loop {
+        if !fold_one_adjacent_promoted_value(
+            &mut f.body,
+            Some(types),
+            IdentityAuthority::Exact(identities),
+        ) {
+            break;
+        }
+    }
+}
+
+/// Inline a physical/scratch value definition into its immediately following,
+/// sole eager guard use.
+///
+/// Explicit machine-width lifting can produce
+/// `ret = zext(load); if ((ret & mask) == 0) break;`. The physical role name is
+/// not globally SSA, so ordinary counted propagation correctly refuses it. This
+/// local def-use proof needs no global SSA claim: only comments may intervene,
+/// the guard is the value's sole read in the whole function, neither arm nor the
+/// remaining linear body reads it, and no conditional [`Expr::Select`] can defer
+/// the moved load. The whole-function count matters for loop-carried values: a
+/// guard definition may also reach a read after the loop. Under these constraints
+/// the expression stays at the same observable evaluation point while the
+/// loop-form pass gets the source-level guard back.
+#[cfg(test)]
+pub fn propagate_adjacent_guard_values(f: &mut Function) {
+    propagate_adjacent_guard_values_impl(f, IdentityAuthority::LegacySpelling);
+}
+
+/// Identity-aware production form of [`propagate_adjacent_guard_values`].
+pub fn propagate_adjacent_guard_values_with_identities(
+    f: &mut Function,
+    identities: &crate::ir::value_number::ValueIdentities,
+) {
+    propagate_adjacent_guard_values_impl(f, IdentityAuthority::Exact(identities));
+}
+
+fn propagate_adjacent_guard_values_impl(f: &mut Function, identities: IdentityAuthority<'_>) {
+    loop {
+        let mut reads = RegMap::default();
+        count_body_reads(&f.body, &mut reads, identities);
+        if !fold_one_adjacent_guard_value(&mut f.body, &reads, identities) {
+            break;
+        }
+    }
+}
+
+/// Inline a pure value into the immediately following assignment that both
+/// consumes and overwrites it.
+///
+/// Optimised conditional indexing commonly becomes `result = predicate;
+/// result = table[result];`. The first value has exactly one observable use:
+/// the second assignment's right-hand side, after which the same destination
+/// is overwritten. Moving a nontrapping, nonselect expression into that RHS is
+/// exact and does not rely on the physical register being globally SSA.
+#[cfg(test)]
+pub fn propagate_adjacent_overwritten_values(function: &mut Function) {
+    propagate_adjacent_overwritten_values_impl(function, IdentityAuthority::LegacySpelling);
+}
+
+/// Identity-aware production form of [`propagate_adjacent_overwritten_values`].
+pub fn propagate_adjacent_overwritten_values_with_identities(
+    function: &mut Function,
+    identities: &crate::ir::value_number::ValueIdentities,
+) {
+    propagate_adjacent_overwritten_values_impl(function, IdentityAuthority::Exact(identities));
+}
+
+fn propagate_adjacent_overwritten_values_impl(
+    function: &mut Function,
+    identities: IdentityAuthority<'_>,
+) {
+    while fold_one_adjacent_overwritten_value(&mut function.body, identities) {}
+}
+
+/// Move one effectful scratch value into its sole adjacent direct consumer.
+///
+/// An [`Expr::Call`] must never be copied: evaluating two structurally equal
+/// call expressions still invokes the callee twice. Late source-shape recovery
+/// can leave `scratch = lazy_call; local = scratch` after the ordinary copy
+/// fixpoint. When the scratch has exactly one whole-function read and only
+/// comments separate that direct read from its definition, moving the
+/// expression is exact: its evaluation point crosses no observable statement,
+/// and removing the definition keeps the call count at one.
+#[cfg(test)]
+pub fn move_adjacent_effectful_scratch_values(function: &mut Function) {
+    move_adjacent_effectful_scratch_values_impl(function, IdentityAuthority::LegacySpelling);
+}
+
+/// Identity-aware production form of [`move_adjacent_effectful_scratch_values`].
+pub fn move_adjacent_effectful_scratch_values_with_identities(
+    function: &mut Function,
+    identities: &crate::ir::value_number::ValueIdentities,
+) {
+    move_adjacent_effectful_scratch_values_impl(function, IdentityAuthority::Exact(identities));
+}
+
+fn move_adjacent_effectful_scratch_values_impl(
+    function: &mut Function,
+    identities: IdentityAuthority<'_>,
+) {
+    loop {
+        let mut reads = RegMap::default();
+        count_body_reads(&function.body, &mut reads, identities);
+        if !move_one_adjacent_effectful_scratch_value(&mut function.body, &reads, identities) {
+            break;
+        }
+    }
+}
+
+fn move_one_adjacent_effectful_scratch_value(
+    body: &mut Vec<Stmt>,
+    reads: &RegMap<usize>,
+    identities: IdentityAuthority<'_>,
+) -> bool {
+    let promoted = |value: &crate::ir::types::VReg| identities.is_promoted_stack_object(value);
+    for index in 0..body.len().saturating_sub(1) {
+        let Some((destination, mut source)) = (match body[index].semantic() {
+            Stmt::Assign { dst, src }
+                if is_scratch_reg(dst, identities)
+                    && !promoted(dst)
+                    && src.contains_call()
+                    && !contains_reg(src, dst)
+                    && reads.get(dst).copied() == Some(1) =>
+            {
+                Some((dst.clone(), src.clone()))
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        let origins = body[index].origins().cloned();
+        if let Some(origins) = &origins {
+            source.merge_origins(origins);
+        }
+        let Some(consumer_index) = (index + 1..body.len())
+            .find(|next| !matches!(body[*next].semantic(), Stmt::Comment(_) | Stmt::Nop))
+        else {
+            continue;
+        };
+        let direct_use = match body[consumer_index].semantic_mut() {
+            Stmt::Assign { src, .. } => Some(src),
+            // A bare promoted-local address denotes the recovered stack object
+            // itself, not an indirect pointer evaluation. Moving into a
+            // general Store would be unsound: C does not sequence evaluation
+            // of the store address and source expression.
+            Stmt::Store { addr, src, .. } if matches!(addr.semantic(), Expr::Reg(address) if promoted(address)) => {
+                Some(src)
+            }
+            _ => None,
+        };
+        let consumed = direct_use.is_some_and(|use_expression| {
+            if !matches!(use_expression.semantic(), Expr::Reg(register) if register == &destination)
+            {
+                return false;
+            }
+            if let Some(use_origins) = use_expression.origins() {
+                source.merge_origins(use_origins);
+            }
+            *use_expression = source;
+            true
+        });
+        if consumed {
+            body.remove(index);
+            if let Some(origins) = origins {
+                body[consumer_index - 1].merge_origins(&origins);
+            }
+            return true;
+        }
+    }
+
+    for statement in body {
+        let changed = match statement.semantic_mut() {
+            Stmt::Origin { .. } => unreachable!("semantic statement cannot be an origin wrapper"),
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                move_one_adjacent_effectful_scratch_value(then_body, reads, identities)
+                    || else_body.as_mut().is_some_and(|else_body| {
+                        move_one_adjacent_effectful_scratch_value(else_body, reads, identities)
+                    })
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => {
+                move_one_adjacent_effectful_scratch_value(body, reads, identities)
+            }
+            Stmt::Switch { cases, default, .. } => {
+                cases.iter_mut().any(|(_, case_body)| {
+                    move_one_adjacent_effectful_scratch_value(case_body, reads, identities)
+                }) || default.as_mut().is_some_and(|default_body| {
+                    move_one_adjacent_effectful_scratch_value(default_body, reads, identities)
+                })
+            }
+            Stmt::TryCatch { try_body, catches } => {
+                move_one_adjacent_effectful_scratch_value(try_body, reads, identities)
+                    || catches.iter_mut().any(|catch| {
+                        move_one_adjacent_effectful_scratch_value(
+                            &mut catch.body,
+                            reads,
+                            identities,
+                        )
+                    })
+            }
+            _ => false,
+        };
+        if changed {
+            return true;
+        }
+    }
+    false
+}
+
+fn fold_one_adjacent_overwritten_value(
+    body: &mut Vec<Stmt>,
+    identities: IdentityAuthority<'_>,
+) -> bool {
+    for statement in body.iter_mut() {
+        let changed = match statement.semantic_mut() {
+            Stmt::Origin { .. } => unreachable!("semantic statement cannot be an origin wrapper"),
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                fold_one_adjacent_overwritten_value(then_body, identities)
+                    || else_body
+                        .as_mut()
+                        .is_some_and(|body| fold_one_adjacent_overwritten_value(body, identities))
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => {
+                fold_one_adjacent_overwritten_value(body, identities)
+            }
+            Stmt::Switch { cases, default, .. } => {
+                cases
+                    .iter_mut()
+                    .any(|(_, body)| fold_one_adjacent_overwritten_value(body, identities))
+                    || default
+                        .as_mut()
+                        .is_some_and(|body| fold_one_adjacent_overwritten_value(body, identities))
+            }
+            Stmt::TryCatch { try_body, catches } => {
+                fold_one_adjacent_overwritten_value(try_body, identities)
+                    || catches.iter_mut().any(|catch| {
+                        fold_one_adjacent_overwritten_value(&mut catch.body, identities)
+                    })
+            }
+            _ => false,
+        };
+        if changed {
+            return true;
+        }
+    }
+
+    for index in 0..body.len().saturating_sub(1) {
+        let Some((destination, mut source)) = (match body[index].semantic() {
+            Stmt::Assign { dst, src }
+                if is_scratch_reg(dst, identities)
+                    && !contains_reg(src, dst)
+                    && !contains_deref(src)
+                    && !contains_unknown(src)
+                    && !contains_select(src) =>
+            {
+                Some((dst.clone(), src.clone()))
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        let origins = body[index].origins().cloned();
+        if let Some(origins) = &origins {
+            source.merge_origins(origins);
+        }
+        let Some(next_index) = (index + 1..body.len())
+            .find(|next| !matches!(body[*next].semantic(), Stmt::Comment(_) | Stmt::Nop))
+        else {
+            continue;
+        };
+        let Stmt::Assign {
+            dst: overwritten,
+            src: consumer,
+        } = body[next_index].semantic_mut()
+        else {
+            continue;
+        };
+        if *overwritten != destination || count_reg_uses(consumer, &destination) != 1 {
+            continue;
+        }
+        subst(consumer, &Copies::single(destination.clone(), source));
+        body.remove(index);
+        if let Some(origins) = origins {
+            body[next_index - 1].merge_origins(&origins);
+        }
+        return true;
+    }
+    false
+}
+
+fn fold_one_adjacent_guard_value(
+    body: &mut Vec<Stmt>,
+    reads: &RegMap<usize>,
+    identities: IdentityAuthority<'_>,
+) -> bool {
+    for statement in body.iter_mut() {
+        let changed = match statement.semantic_mut() {
+            Stmt::Origin { .. } => unreachable!("semantic statement cannot be an origin wrapper"),
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                fold_one_adjacent_guard_value(then_body, reads, identities)
+                    || else_body
+                        .as_mut()
+                        .is_some_and(|body| fold_one_adjacent_guard_value(body, reads, identities))
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => {
+                fold_one_adjacent_guard_value(body, reads, identities)
+            }
+            Stmt::Switch { cases, default, .. } => {
+                cases
+                    .iter_mut()
+                    .any(|(_, body)| fold_one_adjacent_guard_value(body, reads, identities))
+                    || default
+                        .as_mut()
+                        .is_some_and(|body| fold_one_adjacent_guard_value(body, reads, identities))
+            }
+            _ => false,
+        };
+        if changed {
+            return true;
+        }
+    }
+
+    for index in 0..body.len().saturating_sub(1) {
+        let Some((dst, mut source)) = (match body[index].semantic() {
+            Stmt::Assign { dst, src }
+                if is_scratch_reg(dst, identities)
+                    && reads.get(dst).copied() == Some(1)
+                    && !contains_reg(src, dst)
+                    && !contains_unknown(src)
+                    && !contains_select(src) =>
+            {
+                Some((dst.clone(), src.clone()))
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        let origins = body[index].origins().cloned();
+        if let Some(origins) = &origins {
+            source.merge_origins(origins);
+        }
+        let Some(guard_index) = (index + 1..body.len())
+            .find(|next| !matches!(body[*next].semantic(), Stmt::Comment(_) | Stmt::Nop))
+        else {
+            continue;
+        };
+        let Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } = body[guard_index].semantic()
+        else {
+            continue;
+        };
+        if contains_select(cond) || count_reg_uses(cond, &dst) != 1 {
+            continue;
+        }
+        let mut other_reads = RegMap::default();
+        count_body_reads(then_body, &mut other_reads, identities);
+        if let Some(else_body) = else_body {
+            count_body_reads(else_body, &mut other_reads, identities);
+        }
+        count_body_reads(&body[guard_index + 1..], &mut other_reads, identities);
+        if other_reads.get(&dst).copied().unwrap_or(0) != 0 {
+            continue;
+        }
+
+        let Stmt::If { cond, .. } = body[guard_index].semantic_mut() else {
+            unreachable!()
+        };
+        subst(cond, &Copies::single(dst, source));
+        body.remove(index);
+        if let Some(origins) = origins {
+            body[guard_index - 1].merge_origins(&origins);
+        }
+        return true;
+    }
+    false
+}
+
+fn fold_one_adjacent_promoted_value(
+    body: &mut Vec<Stmt>,
+    types: Option<&TypeMap>,
+    identities: IdentityAuthority<'_>,
+) -> bool {
+    let promoted = |value: &crate::ir::types::VReg| identities.is_promoted_stack_object(value);
+    for index in 0..body.len().saturating_sub(1) {
+        let candidate = match body[index].semantic() {
+            Stmt::Assign { dst, src }
+                if promoted(dst)
+                    && is_deferable_promoted_value(src)
+                    && !contains_reg(src, dst)
+                    && promoted_value_width(src).is_some() =>
+            {
+                Some((dst.clone(), src.clone()))
+            }
+            Stmt::Store {
+                addr: Expr::Reg(dst),
+                src,
+                size,
+            } if promoted(dst) && is_deferable_promoted_value(src) && !contains_reg(src, dst) => {
+                types
+                    .and_then(|types| typed_promoted_store_value(dst, src, *size, types))
+                    .map(|value| (dst.clone(), value))
+            }
+            _ => None,
+        };
+        let Some((dst, mut selected)) = candidate else {
+            continue;
+        };
+        let origins = body[index].origins().cloned();
+        if let Some(origins) = &origins {
+            selected.merge_origins(origins);
+        }
+
+        let Some(next_index) = (index + 1..body.len())
+            .find(|next| !matches!(body[*next].semantic(), Stmt::Comment(_) | Stmt::Nop))
+        else {
+            continue;
+        };
+
+        let mut next_reads = RegMap::default();
+        count_statement_reads(&body[next_index], &mut next_reads, identities);
+        if next_reads.get(&dst).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let mut later_reads = RegMap::default();
+        count_body_reads(&body[next_index + 1..], &mut later_reads, identities);
+        if later_reads.get(&dst).copied().unwrap_or(0) != 0 {
+            // Another use in this same structured run still observes the
+            // definition. Other cases/arms live in a different Vec and do not
+            // block an exact local def-use fold.
+            continue;
+        }
+
+        let substituted = match body[next_index].semantic_mut() {
+            Stmt::Assign { src, .. } | Stmt::Store { src, .. } => {
+                let copies = Copies::single(dst, selected);
+                subst(src, &copies);
+                true
+            }
+            Stmt::Return { value: Some(value) } | Stmt::Push { value } | Stmt::Throw { value } => {
+                let copies = Copies::single(dst, selected);
+                subst(value, &copies);
+                true
+            }
+            _ => false,
+        };
+        if substituted {
+            body.remove(index);
+            if let Some(origins) = origins {
+                body[next_index - 1].merge_origins(&origins);
+            }
+            return true;
+        }
+    }
+
+    for statement in body {
+        let changed = match statement.semantic_mut() {
+            Stmt::Origin { .. } => unreachable!("semantic statement cannot be an origin wrapper"),
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                fold_one_adjacent_promoted_value(then_body, types, identities)
+                    || else_body.as_mut().is_some_and(|body| {
+                        fold_one_adjacent_promoted_value(body, types, identities)
+                    })
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => {
+                fold_one_adjacent_promoted_value(body, types, identities)
+            }
+            Stmt::Switch { cases, default, .. } => {
+                cases
+                    .iter_mut()
+                    .any(|(_, body)| fold_one_adjacent_promoted_value(body, types, identities))
+                    || default.as_mut().is_some_and(|body| {
+                        fold_one_adjacent_promoted_value(body, types, identities)
+                    })
+            }
+            Stmt::TryCatch { try_body, catches } => {
+                fold_one_adjacent_promoted_value(try_body, types, identities)
+                    || catches.iter_mut().any(|catch| {
+                        fold_one_adjacent_promoted_value(&mut catch.body, types, identities)
+                    })
+            }
+            _ => false,
+        };
+        if changed {
+            return true;
+        }
+    }
+    false
+}
+
+/// The scalar assignment conversion represented by one promoted-object store.
+///
+/// Moving a store's source into its sole consumer must also move the conversion
+/// performed by assignment to the declared object. A known source no wider
+/// than the store already preserves that conversion. A widthless or wider
+/// integer expression needs an explicit cast to the authoritative destination
+/// type; otherwise deleting a four-byte store could silently delete a
+/// truncation. Boolean-like storage stays on the older, known-width-only path
+/// because an integer cast cannot model `_Bool` normalization.
+fn typed_promoted_store_value(
+    destination: &crate::ir::types::VReg,
+    source: &Expr,
+    store_width: u8,
+    types: &TypeMap,
+) -> Option<Expr> {
+    match types.get(destination)? {
+        TypeHint::Int { signed, width } if width > 0 && width <= store_width => {
+            if promoted_value_width(source).is_some_and(|source_width| source_width <= width) {
+                Some(source.clone())
+            } else {
+                Some(Expr::Cast {
+                    signed,
+                    width,
+                    expr: Box::new(source.clone()),
+                })
+            }
+        }
+        TypeHint::BoolLike
+            if promoted_value_width(source)
+                .is_some_and(|source_width| source_width <= store_width) =>
+        {
+            Some(source.clone())
+        }
+        _ => None,
+    }
+}
+
+fn promoted_value_width(e: &Expr) -> Option<u8> {
+    match e.semantic() {
+        Expr::Const(value) if (0..=127).contains(value) => Some(1),
+        Expr::Cmp { .. } => Some(1),
+        Expr::Select { width, .. } if *width > 0 => Some(*width),
+        Expr::Cast { width, .. } if *width > 0 => Some(*width),
+        _ => None,
+    }
+}
+
+/// Expressions whose evaluation may be moved from a promoted temporary store
+/// to its sole later use. Effectful calls and memory loads are excluded because
+/// moving either can change observable behavior; unknown expressions remain
+/// rooted where the lifter placed them.
+///
+/// A promoted stack slot is represented as a store whose bare-register address
+/// is the source variable itself (`Store local_x = value`). It is assignment
+/// semantics, not an indirect write through a pointer named `local_x`.
+fn is_deferable_promoted_value(e: &Expr) -> bool {
+    !contains_deref(e) && !contains_unknown(e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::propagate_copies;
+    use super::*;
+    use crate::ir::ast::OriginSet;
+    use crate::ir::types::{BinOp, CmpOp, VReg};
+
+    fn reg(n: &str) -> VReg {
+        VReg::phys(n)
+    }
+
+    #[test]
+    fn an_adjacent_single_use_moves_one_effectful_value_without_duplication() {
+        let selected = Expr::Select {
+            cond: Box::new(Expr::Reg(reg("enabled"))),
+            if_true: Box::new(Expr::Call {
+                target: Box::new(Expr::Named {
+                    va: 0x2000,
+                    name: "grow_capacity".into(),
+                }),
+                args: vec![Expr::Reg(reg("capacity"))],
+                call_spec: None,
+                result_width: Some(8),
+            }),
+            if_false: Box::new(Expr::Const(-1)),
+            width: 8,
+        };
+        let mut function = Function {
+            name: "effectful_single_use".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("var14"),
+                    src: selected.clone(),
+                },
+                Stmt::Store {
+                    addr: Expr::Reg(reg("local_10")),
+                    src: Expr::Reg(reg("var14")),
+                    size: 8,
+                },
+            ],
+        };
+
+        move_adjacent_effectful_scratch_values(&mut function);
+
+        assert_eq!(
+            function.body,
+            vec![Stmt::Store {
+                addr: Expr::Reg(reg("local_10")),
+                src: selected,
+                size: 8,
+            }],
+            "the call must move to its sole adjacent consumer, not be copied"
+        );
+    }
+
+    #[test]
+    fn attributed_effectful_move_retains_source_and_consumer_owners() {
+        let definition_owner = OriginSet::one(0x1000);
+        let consumer_owner = OriginSet::one(0x1004);
+        let mut function = Function {
+            name: "effectful_origin".into(),
+            entry_va: 0x1000,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("var14"),
+                    src: Expr::Call {
+                        target: Box::new(Expr::Named {
+                            va: 0x2000,
+                            name: "read_once".into(),
+                        }),
+                        args: Vec::new(),
+                        call_spec: None,
+                        result_width: Some(8),
+                    },
+                }
+                .with_origins(definition_owner.clone()),
+                Stmt::Assign {
+                    dst: reg("local_10"),
+                    src: Expr::Reg(reg("var14")),
+                }
+                .with_origins(consumer_owner.clone()),
+            ],
+        };
+
+        move_adjacent_effectful_scratch_values(&mut function);
+
+        assert_eq!(function.body.len(), 1);
+        assert_eq!(
+            function.body[0].origins(),
+            Some(&definition_owner.union(&consumer_owner))
+        );
+        let Stmt::Assign { src, .. } = function.body[0].semantic() else {
+            panic!("expected moved call: {:#?}", function.body)
+        };
+        assert!(matches!(src.semantic(), Expr::Call { .. }));
+        assert_eq!(src.origins(), Some(&definition_owner));
+    }
+
+    #[test]
+    fn identity_aware_effectful_move_rejects_opaque_stack_destination() {
+        let destination_name = "frame_object".to_string();
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.attach_promoted_stack_objects([&destination_name]);
+        let mut function = Function {
+            name: "owned_destination".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg(&destination_name),
+                    src: Expr::Call {
+                        target: Box::new(Expr::Named {
+                            va: 0x2000,
+                            name: "read_once".into(),
+                        }),
+                        args: Vec::new(),
+                        call_spec: None,
+                        result_width: Some(8),
+                    },
+                },
+                Stmt::Assign {
+                    dst: reg("result"),
+                    src: Expr::Reg(reg(&destination_name)),
+                },
+            ],
+        };
+        let before = function.clone();
+
+        move_adjacent_effectful_scratch_values_with_identities(&mut function, &identities);
+
+        assert_eq!(function, before);
+    }
+
+    #[test]
+    fn identity_aware_effectful_move_accepts_opaque_stack_store() {
+        let object_name = "frame_object".to_string();
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.attach_promoted_stack_objects([&object_name]);
+        let call = Expr::Call {
+            target: Box::new(Expr::Named {
+                va: 0x2000,
+                name: "read_once".into(),
+            }),
+            args: Vec::new(),
+            call_spec: None,
+            result_width: Some(8),
+        };
+        let mut function = Function {
+            name: "owned_store".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("var14"),
+                    src: call.clone(),
+                },
+                Stmt::Store {
+                    addr: Expr::Reg(reg(&object_name)),
+                    src: Expr::Reg(reg("var14")),
+                    size: 8,
+                },
+            ],
+        };
+
+        move_adjacent_effectful_scratch_values_with_identities(&mut function, &identities);
+
+        assert_eq!(
+            function.body,
+            vec![Stmt::Store {
+                addr: Expr::Reg(reg(&object_name)),
+                src: call,
+                size: 8,
+            }]
+        );
+    }
+
+    #[test]
+    fn attributed_effectful_use_moves_with_a_canonical_origin_union() {
+        let definition_owner = OriginSet::one(0x1010);
+        let use_owner = OriginSet::one(0x1014);
+        let consumer_owner = OriginSet::one(0x1018);
+        let mut function = Function {
+            name: "effectful_use_origin".into(),
+            entry_va: 0x1010,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("var14"),
+                    src: Expr::Call {
+                        target: Box::new(Expr::Named {
+                            va: 0x2000,
+                            name: "read_once".into(),
+                        }),
+                        args: Vec::new(),
+                        call_spec: None,
+                        result_width: Some(8),
+                    },
+                }
+                .with_origins(definition_owner.clone()),
+                Stmt::Assign {
+                    dst: reg("local_10"),
+                    src: Expr::Reg(reg("var14")).with_origins(use_owner.clone()),
+                }
+                .with_origins(consumer_owner.clone()),
+            ],
+        };
+
+        move_adjacent_effectful_scratch_values(&mut function);
+
+        let [statement] = function.body.as_slice() else {
+            panic!(
+                "the one-use call temporary should move: {:#?}",
+                function.body
+            )
+        };
+        assert_eq!(
+            statement.origins(),
+            Some(&definition_owner.union(&consumer_owner))
+        );
+        let Stmt::Assign { src, .. } = statement.semantic() else {
+            panic!("expected the moved call: {statement:#?}")
+        };
+        assert!(matches!(src.semantic(), Expr::Call { .. }));
+        assert_eq!(src.origins(), Some(&definition_owner.union(&use_owner)));
+        let Expr::Origin { expr, .. } = src else {
+            panic!("expected one ownership carrier: {src:#?}")
+        };
+        assert!(!matches!(expr.as_ref(), Expr::Origin { .. }));
+    }
+
+    #[test]
+    fn an_effectful_value_with_multiple_reads_is_not_moved() {
+        let mut function = Function {
+            name: "shared_effectful_value".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("var14"),
+                    src: Expr::Call {
+                        target: Box::new(Expr::Named {
+                            va: 0x2000,
+                            name: "read_once".into(),
+                        }),
+                        args: Vec::new(),
+                        call_spec: None,
+                        result_width: Some(8),
+                    },
+                },
+                Stmt::Assign {
+                    dst: reg("local_10"),
+                    src: Expr::Reg(reg("var14")),
+                },
+                Stmt::Return {
+                    value: Some(Expr::Reg(reg("var14"))),
+                },
+            ],
+        };
+        let before = function.clone();
+
+        move_adjacent_effectful_scratch_values(&mut function);
+
+        assert_eq!(function, before);
+    }
+
+    #[test]
+    fn an_effectful_value_is_not_moved_into_an_indirect_store() {
+        let mut function = Function {
+            name: "effectful_indirect_store".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("var14"),
+                    src: Expr::Call {
+                        target: Box::new(Expr::Named {
+                            va: 0x2000,
+                            name: "read_once".into(),
+                        }),
+                        args: Vec::new(),
+                        call_spec: None,
+                        result_width: Some(8),
+                    },
+                },
+                Stmt::Store {
+                    addr: Expr::Reg(reg("var20")),
+                    src: Expr::Reg(reg("var14")),
+                    size: 8,
+                },
+            ],
+        };
+        let before = function.clone();
+
+        move_adjacent_effectful_scratch_values(&mut function);
+
+        assert_eq!(
+            function, before,
+            "moving the call into an indirect store could reorder address evaluation"
+        );
+    }
+
+    #[test]
+    fn single_use_promoted_local_select_folds_into_return() {
+        // A stack-slot assignment diamond has already become one lazy Select.
+        // The explicit local assignment is compiler storage, not source state.
+        let selected = Expr::Select {
+            cond: Box::new(Expr::Reg(reg("cond"))),
+            if_true: Box::new(Expr::Const(1)),
+            if_false: Box::new(Expr::Const(2)),
+            width: 4,
+        };
+        let mut f = Function {
+            name: "f".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("local_tmp"),
+                    src: selected.clone(),
+                },
+                Stmt::Return {
+                    value: Some(Expr::Reg(reg("local_tmp"))),
+                },
+            ],
+        };
+
+        propagate_copies(&mut f);
+
+        propagate_adjacent_promoted_values(&mut f);
+
+        assert_eq!(
+            f.body,
+            vec![Stmt::Return {
+                value: Some(selected),
+            }],
+            "the one-use promoted temporary chain should disappear"
+        );
+    }
+
+    #[test]
+    fn exact_untyped_promoted_value_folds_opaque_owned_storage() {
+        let object_name = "frame_object".to_string();
+        let object = reg(&object_name);
+        let selected = Expr::Select {
+            cond: Box::new(Expr::Reg(reg("cond"))),
+            if_true: Box::new(Expr::Const(1)),
+            if_false: Box::new(Expr::Const(2)),
+            width: 4,
+        };
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.attach_promoted_stack_objects([&object_name]);
+        let mut function = Function {
+            name: "opaque_promoted_select".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: object.clone(),
+                    src: selected.clone(),
+                },
+                Stmt::Return {
+                    value: Some(Expr::Reg(object)),
+                },
+            ],
+        };
+
+        propagate_adjacent_promoted_values_with_identities(&mut function, &identities);
+
+        assert_eq!(
+            function.body,
+            vec![Stmt::Return {
+                value: Some(selected),
+            }]
+        );
+    }
+
+    #[test]
+    fn ambiguous_store_through_promoted_pointer_is_not_value_propagated() {
+        // Stack promotion currently uses the same `Store { addr: local }`
+        // spelling for assigning the frame slot and for writing through a
+        // pointer loaded from it. Local adjacency cannot distinguish these:
+        // folding the second store into the return would change a pointer
+        // return into the stored integer value.
+        let pointer = reg("local_8");
+        let mut function = Function {
+            name: "write_and_return".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Store {
+                    addr: Expr::Reg(pointer.clone()),
+                    src: Expr::Reg(reg("source_pointer")),
+                    size: 8,
+                },
+                Stmt::Store {
+                    addr: Expr::Reg(pointer.clone()),
+                    src: Expr::Const(42),
+                    size: 4,
+                },
+                Stmt::Return {
+                    value: Some(Expr::Reg(pointer)),
+                },
+            ],
+        };
+        let expected = function.clone();
+
+        propagate_adjacent_promoted_values(&mut function);
+        let mut types = crate::ir::types_recover::TypeMap::default();
+        types.upsert_public(
+            reg("local_8"),
+            crate::ir::types_recover::TypeHint::Pointer { pointee_width: 4 },
+        );
+        propagate_adjacent_typed_promoted_values(&mut function, &types);
+
+        assert_eq!(function, expected);
+    }
+
+    #[test]
+    fn typed_scalar_promoted_store_folds_into_return() {
+        let predicate = Expr::Cmp {
+            op: CmpOp::Eq,
+            lhs: Box::new(Expr::Reg(reg("state"))),
+            rhs: Box::new(Expr::Const(3)),
+        };
+        let mut function = Function {
+            name: "finished".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Store {
+                    addr: Expr::Reg(reg("local_4")),
+                    src: predicate.clone(),
+                    size: 4,
+                },
+                Stmt::Return {
+                    value: Some(Expr::Reg(reg("local_4"))),
+                },
+            ],
+        };
+        let mut types = crate::ir::types_recover::TypeMap::default();
+        types.upsert_public(
+            reg("local_4"),
+            crate::ir::types_recover::TypeHint::Int {
+                signed: true,
+                width: 4,
+            },
+        );
+
+        propagate_adjacent_typed_promoted_values(&mut function, &types);
+
+        assert_eq!(
+            function.body,
+            vec![Stmt::Return {
+                value: Some(predicate),
+            }]
+        );
+    }
+
+    #[test]
+    fn typed_scalar_store_preserves_truncation_when_folded_inside_a_catch() {
+        let arithmetic = Expr::Bin {
+            op: BinOp::Sub,
+            lhs: Box::new(Expr::Const(9000)),
+            rhs: Box::new(Expr::Reg(reg("exception_0"))),
+        };
+        let object = "stack_0".to_string();
+        let mut function = Function {
+            name: "caught_value".into(),
+            entry_va: 0x1000,
+            body: vec![Stmt::TryCatch {
+                try_body: vec![],
+                catches: vec![crate::ir::ast::CatchClause {
+                    type_name: "int".into(),
+                    binding: reg("exception_0"),
+                    body: vec![
+                        Stmt::Store {
+                            addr: Expr::Reg(reg(&object)),
+                            src: arithmetic.clone(),
+                            size: 4,
+                        },
+                        Stmt::Return {
+                            value: Some(Expr::Reg(reg(&object))),
+                        },
+                    ],
+                }],
+            }],
+        };
+        let mut types = crate::ir::types_recover::TypeMap::default();
+        types.upsert_public(
+            reg(&object),
+            TypeHint::Int {
+                signed: true,
+                width: 4,
+            },
+        );
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.attach_promoted_stack_objects([&object]);
+
+        propagate_adjacent_typed_promoted_values_with_identities(
+            &mut function,
+            &types,
+            &identities,
+        );
+
+        let Stmt::TryCatch { catches, .. } = function.body[0].semantic() else {
+            panic!("expected recovered handler")
+        };
+        assert_eq!(
+            catches[0].body,
+            vec![Stmt::Return {
+                value: Some(Expr::Cast {
+                    signed: true,
+                    width: 4,
+                    expr: Box::new(arithmetic),
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn typed_scalar_store_preserves_conversion_when_folded_into_throw() {
+        let object = "local_c".to_string();
+        let mut function = Function {
+            name: "throw_value".into(),
+            entry_va: 0x1000,
+            body: vec![
+                Stmt::Store {
+                    addr: Expr::Reg(reg(&object)),
+                    src: Expr::Reg(reg("wide_input")),
+                    size: 4,
+                },
+                Stmt::Throw {
+                    value: Expr::Reg(reg(&object)),
+                },
+            ],
+        };
+        let mut types = TypeMap::default();
+        types.upsert_public(
+            reg(&object),
+            TypeHint::Int {
+                signed: true,
+                width: 4,
+            },
+        );
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.attach_promoted_stack_objects([&object]);
+
+        propagate_adjacent_typed_promoted_values_with_identities(
+            &mut function,
+            &types,
+            &identities,
+        );
+
+        assert_eq!(
+            function.body,
+            vec![Stmt::Throw {
+                value: Expr::Cast {
+                    signed: true,
+                    width: 4,
+                    expr: Box::new(Expr::Reg(reg("wide_input"))),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn typed_promoted_store_accepts_opaque_owned_storage() {
+        let object = "frame_object".to_string();
+        let predicate = Expr::Cmp {
+            op: CmpOp::Eq,
+            lhs: Box::new(Expr::Reg(reg("state"))),
+            rhs: Box::new(Expr::Const(3)),
+        };
+        let mut function = Function {
+            name: "finished".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Store {
+                    addr: Expr::Reg(reg(&object)),
+                    src: predicate.clone(),
+                    size: 4,
+                },
+                Stmt::Return {
+                    value: Some(Expr::Reg(reg(&object))),
+                },
+            ],
+        };
+        let mut types = crate::ir::types_recover::TypeMap::default();
+        types.upsert_public(
+            reg(&object),
+            crate::ir::types_recover::TypeHint::Int {
+                signed: true,
+                width: 4,
+            },
+        );
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.attach_promoted_stack_objects([&object]);
+
+        propagate_adjacent_typed_promoted_values_with_identities(
+            &mut function,
+            &types,
+            &identities,
+        );
+
+        assert_eq!(
+            function.body,
+            vec![Stmt::Return {
+                value: Some(predicate),
+            }]
+        );
+    }
+
+    #[test]
+    fn typed_promoted_store_rejects_unowned_local_spelling() {
+        let mut function = Function {
+            name: "finished".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Store {
+                    addr: Expr::Reg(reg("local_4")),
+                    src: Expr::Const(1),
+                    size: 4,
+                },
+                Stmt::Return {
+                    value: Some(Expr::Reg(reg("local_4"))),
+                },
+            ],
+        };
+        let expected = function.clone();
+        let mut types = crate::ir::types_recover::TypeMap::default();
+        types.upsert_public(
+            reg("local_4"),
+            crate::ir::types_recover::TypeHint::Int {
+                signed: true,
+                width: 4,
+            },
+        );
+
+        propagate_adjacent_typed_promoted_values_with_identities(
+            &mut function,
+            &types,
+            &crate::ir::value_number::ValueIdentities::default(),
+        );
+
+        assert_eq!(function, expected);
+    }
+
+    #[test]
+    fn attributed_typed_scalar_promoted_store_folds_into_return() {
+        let source_owner = OriginSet::one(0x1180);
+        let predicate = Expr::Cmp {
+            op: CmpOp::Eq,
+            lhs: Box::new(Expr::Reg(reg("state"))),
+            rhs: Box::new(Expr::Const(3)),
+        }
+        .with_origins(source_owner.clone());
+        let mut function = Function {
+            name: "finished".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Store {
+                    addr: Expr::Reg(reg("local_4")),
+                    src: predicate,
+                    size: 4,
+                },
+                Stmt::Return {
+                    value: Some(Expr::Reg(reg("local_4"))),
+                },
+            ],
+        };
+        let mut types = crate::ir::types_recover::TypeMap::default();
+        types.upsert_public(
+            reg("local_4"),
+            crate::ir::types_recover::TypeHint::Int {
+                signed: true,
+                width: 4,
+            },
+        );
+
+        propagate_adjacent_typed_promoted_values(&mut function, &types);
+
+        let [Stmt::Return { value: Some(value) }] = function.body.as_slice() else {
+            panic!(
+                "the attributed one-use temporary should fold: {:#?}",
+                function.body
+            );
+        };
+        assert!(matches!(value.semantic(), Expr::Cmp { .. }));
+        assert_eq!(value.origins(), Some(&source_owner));
+    }
+
+    #[test]
+    fn typed_scalar_store_does_not_erase_a_wider_source_truncation() {
+        let mut function = Function {
+            name: "truncate".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Store {
+                    addr: Expr::Reg(reg("local_4")),
+                    src: Expr::Cast {
+                        signed: false,
+                        width: 8,
+                        expr: Box::new(Expr::Reg(reg("wide"))),
+                    },
+                    size: 4,
+                },
+                Stmt::Return {
+                    value: Some(Expr::Reg(reg("local_4"))),
+                },
+            ],
+        };
+        let mut types = crate::ir::types_recover::TypeMap::default();
+        types.upsert_public(
+            reg("local_4"),
+            crate::ir::types_recover::TypeHint::Int {
+                signed: true,
+                width: 4,
+            },
+        );
+
+        propagate_adjacent_typed_promoted_values(&mut function, &types);
+
+        assert_eq!(
+            function.body,
+            vec![Stmt::Return {
+                value: Some(Expr::Cast {
+                    signed: true,
+                    width: 4,
+                    expr: Box::new(Expr::Cast {
+                        signed: false,
+                        width: 8,
+                        expr: Box::new(Expr::Reg(reg("wide"))),
+                    }),
+                }),
+            }],
+            "the temporary may disappear only when its four-byte assignment conversion moves with it"
+        );
+    }
+
+    #[test]
+    fn adjacent_boolean_promoted_local_folds_into_return() {
+        let predicate = Expr::Cmp {
+            op: CmpOp::Eq,
+            lhs: Box::new(Expr::Reg(reg("state"))),
+            rhs: Box::new(Expr::Const(3)),
+        };
+        let mut f = Function {
+            name: "f".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("local_result"),
+                    src: predicate.clone(),
+                },
+                Stmt::Comment("epilogue".into()),
+                Stmt::Return {
+                    value: Some(Expr::Reg(reg("local_result"))),
+                },
+            ],
+        };
+
+        propagate_adjacent_promoted_values(&mut f);
+
+        assert_eq!(
+            f.body,
+            vec![
+                Stmt::Comment("epilogue".into()),
+                Stmt::Return {
+                    value: Some(predicate),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn attributed_promoted_value_retains_definition_owner_after_substitution() {
+        let definition_owner = OriginSet::one(0x1100);
+        let return_owner = OriginSet::one(0x1104);
+        let mut function = Function {
+            name: "promoted_origin".into(),
+            entry_va: 0x1100,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("local_result"),
+                    src: Expr::Const(7),
+                }
+                .with_origins(definition_owner.clone()),
+                Stmt::Return {
+                    value: Some(Expr::Reg(reg("local_result"))),
+                }
+                .with_origins(return_owner.clone()),
+            ],
+        };
+
+        propagate_adjacent_promoted_values(&mut function);
+
+        assert_eq!(function.body.len(), 1);
+        assert_eq!(
+            function.body[0].origins(),
+            Some(&definition_owner.union(&return_owner))
+        );
+        let Stmt::Return { value: Some(value) } = function.body[0].semantic() else {
+            panic!("expected substituted return: {:#?}", function.body)
+        };
+        assert!(matches!(value.semantic(), Expr::Const(7)));
+        assert_eq!(value.origins(), Some(&definition_owner));
+    }
+
+    #[test]
+    fn adjacent_physical_load_folds_into_its_only_eager_guard_use() {
+        // x86-64 `movzx eax, byte ptr [base+index]; test eax,eax` now carries
+        // the architectural zero-extension explicitly. After role naming the
+        // destination is the physical `ret` role rather than an SSA Temp, but
+        // the immediately following guard is still its one reaching use. Keep
+        // the load at the same evaluation point while exposing the loop guard.
+        let loaded = Expr::Cast {
+            signed: false,
+            width: 8,
+            expr: Box::new(Expr::Cast {
+                signed: false,
+                width: 1,
+                expr: Box::new(Expr::Deref {
+                    addr: Box::new(Expr::Reg(reg("cursor"))),
+                    size: 1,
+                }),
+            }),
+        };
+        let mut f = Function {
+            name: "str_len".into(),
+            entry_va: 0,
+            body: vec![Stmt::While {
+                cond: Expr::Const(1),
+                body: vec![
+                    Stmt::Assign {
+                        dst: reg("ret"),
+                        src: loaded.clone(),
+                    },
+                    Stmt::If {
+                        cond: Expr::Cmp {
+                            op: CmpOp::Eq,
+                            lhs: Box::new(Expr::Bin {
+                                op: BinOp::And,
+                                lhs: Box::new(Expr::Reg(reg("ret"))),
+                                rhs: Box::new(Expr::Const(255)),
+                            }),
+                            rhs: Box::new(Expr::Const(0)),
+                        },
+                        then_body: vec![Stmt::Break],
+                        else_body: None,
+                    },
+                    Stmt::Assign {
+                        dst: reg("cursor"),
+                        src: Expr::Bin {
+                            op: BinOp::Add,
+                            lhs: Box::new(Expr::Reg(reg("cursor"))),
+                            rhs: Box::new(Expr::Const(1)),
+                        },
+                    },
+                ],
+            }],
+        };
+
+        propagate_adjacent_guard_values(&mut f);
+
+        let Stmt::While { body, .. } = &f.body[0] else {
+            panic!("expected loop")
+        };
+        assert_eq!(
+            body.len(),
+            2,
+            "the physical scratch definition should disappear"
+        );
+        let Stmt::If { cond, .. } = &body[0] else {
+            panic!("the reconstructed guard must remain first")
+        };
+        let dump = format!("{cond:?}");
+        assert!(
+            dump.contains("Deref"),
+            "the load must move into the guard: {dump}"
+        );
+        assert!(
+            !dump.contains("ret"),
+            "the scratch read must be replaced: {dump}"
+        );
+    }
+
+    #[test]
+    fn attributed_guard_value_retains_definition_owner_in_condition() {
+        let definition_owner = OriginSet::one(0x1200);
+        let guard_owner = OriginSet::one(0x1204);
+        let mut function = Function {
+            name: "guard_origin".into(),
+            entry_va: 0x1200,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("ret"),
+                    src: Expr::Const(7),
+                }
+                .with_origins(definition_owner.clone()),
+                Stmt::If {
+                    cond: Expr::Cmp {
+                        op: CmpOp::Eq,
+                        lhs: Box::new(Expr::Reg(reg("ret"))),
+                        rhs: Box::new(Expr::Const(0)),
+                    },
+                    then_body: vec![Stmt::Break],
+                    else_body: None,
+                }
+                .with_origins(guard_owner.clone()),
+            ],
+        };
+
+        propagate_adjacent_guard_values(&mut function);
+
+        assert_eq!(function.body.len(), 1);
+        assert_eq!(
+            function.body[0].origins(),
+            Some(&definition_owner.union(&guard_owner))
+        );
+        let Stmt::If { cond, .. } = function.body[0].semantic() else {
+            panic!("expected substituted guard: {:#?}", function.body)
+        };
+        let Expr::Cmp { lhs, .. } = cond.semantic() else {
+            panic!("expected comparison guard: {cond:#?}")
+        };
+        assert!(matches!(lhs.semantic(), Expr::Const(7)));
+        assert_eq!(lhs.origins(), Some(&definition_owner));
+    }
+
+    #[test]
+    fn adjacent_predicate_folds_into_the_assignment_that_overwrites_it() {
+        let result = reg("result");
+        let mut function = Function {
+            name: "predicate_index".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: result.clone(),
+                    src: Expr::Cmp {
+                        op: CmpOp::Sle,
+                        lhs: Box::new(Expr::Reg(reg("lhs"))),
+                        rhs: Box::new(Expr::Reg(reg("rhs"))),
+                    },
+                },
+                Stmt::Assign {
+                    dst: result.clone(),
+                    src: Expr::Deref {
+                        addr: Box::new(Expr::Bin {
+                            op: BinOp::Add,
+                            lhs: Box::new(Expr::Reg(reg("base"))),
+                            rhs: Box::new(Expr::Bin {
+                                op: BinOp::Mul,
+                                lhs: Box::new(Expr::Reg(result.clone())),
+                                rhs: Box::new(Expr::Const(4)),
+                            }),
+                        }),
+                        size: 4,
+                    },
+                },
+                Stmt::Return {
+                    value: Some(Expr::Reg(result.clone())),
+                },
+            ],
+        };
+
+        propagate_adjacent_overwritten_values(&mut function);
+
+        assert_eq!(function.body.len(), 2, "{:#?}", function.body);
+        let Stmt::Assign { dst, src } = &function.body[0] else {
+            panic!("overwriting assignment disappeared: {:#?}", function.body);
+        };
+        assert_eq!(dst, &result);
+        assert_eq!(count_reg_uses(src, &result), 0);
+        assert!(format!("{src:#?}").contains("op: Sle"), "{src:#?}");
+    }
+
+    #[test]
+    fn attributed_overwritten_value_retains_definition_owner_in_consumer() {
+        let result = reg("result");
+        let definition_owner = OriginSet::one(0x1300);
+        let consumer_owner = OriginSet::one(0x1304);
+        let mut function = Function {
+            name: "overwrite_origin".into(),
+            entry_va: 0x1300,
+            body: vec![
+                Stmt::Assign {
+                    dst: result.clone(),
+                    src: Expr::Const(3),
+                }
+                .with_origins(definition_owner.clone()),
+                Stmt::Assign {
+                    dst: result.clone(),
+                    src: Expr::Bin {
+                        op: BinOp::Mul,
+                        lhs: Box::new(Expr::Reg(result)),
+                        rhs: Box::new(Expr::Const(4)),
+                    },
+                }
+                .with_origins(consumer_owner.clone()),
+            ],
+        };
+
+        propagate_adjacent_overwritten_values(&mut function);
+
+        assert_eq!(function.body.len(), 1);
+        assert_eq!(
+            function.body[0].origins(),
+            Some(&definition_owner.union(&consumer_owner))
+        );
+        let Stmt::Assign {
+            src: Expr::Bin { lhs, .. },
+            ..
+        } = function.body[0].semantic()
+        else {
+            panic!("expected substituted overwrite: {:#?}", function.body)
+        };
+        assert!(matches!(lhs.semantic(), Expr::Const(3)));
+        assert_eq!(lhs.origins(), Some(&definition_owner));
+    }
+
+    #[test]
+    fn identity_aware_overwrite_fold_rejects_opaque_stack_destination() {
+        let object_name = "frame_object".to_string();
+        let object = reg(&object_name);
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.attach_promoted_stack_objects([&object_name]);
+        let mut function = Function {
+            name: "owned_overwrite".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: object.clone(),
+                    src: Expr::Const(3),
+                },
+                Stmt::Assign {
+                    dst: object.clone(),
+                    src: Expr::Bin {
+                        op: BinOp::Mul,
+                        lhs: Box::new(Expr::Reg(object)),
+                        rhs: Box::new(Expr::Const(4)),
+                    },
+                },
+            ],
+        };
+        let before = function.clone();
+
+        propagate_adjacent_overwritten_values_with_identities(&mut function, &identities);
+
+        assert_eq!(function, before);
+    }
+
+    #[test]
+    fn adjacent_overwrite_keeps_impure_or_multiply_read_values() {
+        let result = reg("result");
+        let overwrite = |source: Expr, consumer: Expr| Function {
+            name: "unsafe_predicate_index".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: result.clone(),
+                    src: source,
+                },
+                Stmt::Assign {
+                    dst: result.clone(),
+                    src: consumer,
+                },
+            ],
+        };
+        let mut memory_source = overwrite(
+            Expr::Deref {
+                addr: Box::new(Expr::Reg(reg("cursor"))),
+                size: 4,
+            },
+            Expr::Bin {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Reg(result.clone())),
+                rhs: Box::new(Expr::Const(1)),
+            },
+        );
+        let mut multiply_read = overwrite(
+            Expr::Cmp {
+                op: CmpOp::Sle,
+                lhs: Box::new(Expr::Reg(reg("lhs"))),
+                rhs: Box::new(Expr::Reg(reg("rhs"))),
+            },
+            Expr::Bin {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Reg(result.clone())),
+                rhs: Box::new(Expr::Reg(result.clone())),
+            },
+        );
+        let expected_memory = memory_source.clone();
+        let expected_multiple = multiply_read.clone();
+
+        propagate_adjacent_overwritten_values(&mut memory_source);
+        propagate_adjacent_overwritten_values(&mut multiply_read);
+
+        assert_eq!(memory_source, expected_memory, "loads must not be moved");
+        assert_eq!(
+            multiply_read, expected_multiple,
+            "a value used twice must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn identity_aware_guard_fold_rejects_opaque_stack_destination() {
+        let object_name = "frame_object".to_string();
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.attach_promoted_stack_objects([&object_name]);
+        let mut function = Function {
+            name: "owned_guard".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg(&object_name),
+                    src: Expr::Const(1),
+                },
+                Stmt::If {
+                    cond: Expr::Reg(reg(&object_name)),
+                    then_body: vec![Stmt::Return { value: None }],
+                    else_body: None,
+                },
+            ],
+        };
+        let before = function.clone();
+
+        propagate_adjacent_guard_values_with_identities(&mut function, &identities);
+
+        assert_eq!(function, before);
+    }
+
+    #[test]
+    fn adjacent_physical_guard_value_with_an_arm_read_is_kept() {
+        let mut f = Function {
+            name: "f".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("ret"),
+                    src: Expr::Deref {
+                        addr: Box::new(Expr::Reg(reg("cursor"))),
+                        size: 1,
+                    },
+                },
+                Stmt::If {
+                    cond: Expr::Cmp {
+                        op: CmpOp::Eq,
+                        lhs: Box::new(Expr::Reg(reg("ret"))),
+                        rhs: Box::new(Expr::Const(0)),
+                    },
+                    then_body: vec![Stmt::Return {
+                        value: Some(Expr::Reg(reg("ret"))),
+                    }],
+                    else_body: None,
+                },
+            ],
+        };
+        let expected = f.clone();
+
+        propagate_adjacent_guard_values(&mut f);
+
+        assert_eq!(
+            f, expected,
+            "a second reaching read must keep the definition"
+        );
+    }
+
+    #[test]
+    fn loop_header_value_read_after_the_loop_is_kept() {
+        // `while_reload_header` uses the last loaded element both to decide
+        // whether to leave the loop and in the joined return. Moving the load
+        // into the loop condition would make that joined read undefined.
+        let mut f = Function {
+            name: "while_reload_header".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::While {
+                    cond: Expr::Const(1),
+                    body: vec![
+                        Stmt::Assign {
+                            dst: reg("var3"),
+                            src: Expr::Deref {
+                                addr: Box::new(Expr::Reg(reg("cursor"))),
+                                size: 4,
+                            },
+                        },
+                        Stmt::If {
+                            cond: Expr::Cmp {
+                                op: CmpOp::Ne,
+                                lhs: Box::new(Expr::Bin {
+                                    op: BinOp::And,
+                                    lhs: Box::new(Expr::Reg(reg("var3"))),
+                                    rhs: Box::new(Expr::Const(1)),
+                                }),
+                                rhs: Box::new(Expr::Const(0)),
+                            },
+                            then_body: vec![Stmt::Break],
+                            else_body: None,
+                        },
+                    ],
+                },
+                Stmt::Return {
+                    value: Some(Expr::Reg(reg("var3"))),
+                },
+            ],
+        };
+        let expected = f.clone();
+
+        propagate_adjacent_guard_values(&mut f);
+
+        assert_eq!(
+            f, expected,
+            "a joined post-loop read must keep the reaching loop definition"
+        );
+    }
+
+    #[test]
+    fn adjacent_physical_value_is_not_moved_across_select_evaluation() {
+        let mut source_select = Function {
+            name: "source_select".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("ret"),
+                    src: Expr::Select {
+                        cond: Box::new(Expr::Reg(reg("choose_load"))),
+                        if_true: Box::new(Expr::Deref {
+                            addr: Box::new(Expr::Reg(reg("cursor"))),
+                            size: 1,
+                        }),
+                        if_false: Box::new(Expr::Const(0)),
+                        width: 1,
+                    },
+                },
+                Stmt::If {
+                    cond: Expr::Cmp {
+                        op: CmpOp::Eq,
+                        lhs: Box::new(Expr::Reg(reg("ret"))),
+                        rhs: Box::new(Expr::Const(0)),
+                    },
+                    then_body: vec![Stmt::Break],
+                    else_body: None,
+                },
+            ],
+        };
+        let expected_source = source_select.clone();
+
+        propagate_adjacent_guard_values(&mut source_select);
+
+        assert_eq!(
+            source_select, expected_source,
+            "a select source must retain its original conditional evaluation"
+        );
+
+        let mut guard_select = Function {
+            name: "guard_select".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("ret"),
+                    src: Expr::Deref {
+                        addr: Box::new(Expr::Reg(reg("cursor"))),
+                        size: 1,
+                    },
+                },
+                Stmt::If {
+                    cond: Expr::Select {
+                        cond: Box::new(Expr::Reg(reg("skip_read"))),
+                        if_true: Box::new(Expr::Const(1)),
+                        if_false: Box::new(Expr::Reg(reg("ret"))),
+                        width: 1,
+                    },
+                    then_body: vec![Stmt::Break],
+                    else_body: None,
+                },
+            ],
+        };
+        let expected_guard = guard_select.clone();
+
+        propagate_adjacent_guard_values(&mut guard_select);
+
+        assert_eq!(
+            guard_select, expected_guard,
+            "a select guard must not make an eager load conditional"
+        );
+    }
+
+    #[test]
+    fn adjacent_promoted_value_with_a_second_read_is_kept() {
+        let selected = Expr::Select {
+            cond: Box::new(Expr::Reg(reg("cond"))),
+            if_true: Box::new(Expr::Const(1)),
+            if_false: Box::new(Expr::Const(2)),
+            width: 4,
+        };
+        let mut f = Function {
+            name: "f".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: reg("local_tmp"),
+                    src: selected,
+                },
+                Stmt::Assign {
+                    dst: reg("first"),
+                    src: Expr::Reg(reg("local_tmp")),
+                },
+                Stmt::Return {
+                    value: Some(Expr::Reg(reg("local_tmp"))),
+                },
+            ],
+        };
+        let expected = f.clone();
+
+        propagate_adjacent_promoted_values(&mut f);
+
+        assert_eq!(
+            f, expected,
+            "a later read still needs the rooted definition"
+        );
+    }
+}

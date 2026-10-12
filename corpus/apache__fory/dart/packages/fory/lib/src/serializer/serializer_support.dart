@@ -1,0 +1,369 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import 'package:fory/src/context/read_context.dart';
+import 'package:fory/src/context/ref_writer.dart';
+import 'package:fory/src/context/write_context.dart';
+import 'package:fory/src/meta/field_info.dart';
+import 'package:fory/src/meta/field_type.dart';
+import 'package:fory/src/meta/type_ids.dart';
+import 'package:fory/src/resolver/type_resolver.dart';
+import 'package:fory/src/serializer/serialization_field_info.dart';
+import 'package:fory/src/types/float32.dart';
+import 'package:fory/src/types/int64.dart';
+import 'package:fory/src/types/uint64.dart';
+
+TypeInfo? fieldDeclaredTypeInfo(
+  TypeResolver resolver,
+  SerializationFieldInfo field,
+) {
+  return field.declaredTypeInfo(resolver);
+}
+
+bool fieldUsesDeclaredType(
+  TypeResolver resolver,
+  SerializationFieldInfo field,
+) {
+  return field.usesDeclaredType(resolver);
+}
+
+Object convertPrimitiveFieldValue(Object value, FieldType fieldType) {
+  if (fieldType.type == int) {
+    switch (fieldType.typeId) {
+      case TypeIds.int64:
+      case TypeIds.varInt64:
+      case TypeIds.taggedInt64:
+        return _declares64BitWrapper(fieldType)
+            ? value
+            : (value as Int64).toInt();
+      case TypeIds.uint64:
+      case TypeIds.varUint64:
+      case TypeIds.taggedUint64:
+        return _declares64BitWrapper(fieldType)
+            ? value
+            : (value as Uint64).toInt();
+      default:
+        return value;
+    }
+  }
+  if (fieldType.type == double && fieldType.typeId == TypeIds.float32) {
+    return (value as Float32).value;
+  }
+  return value;
+}
+
+bool _declares64BitWrapper(FieldType fieldType) {
+  final declaredTypeName = fieldType.declaredTypeName;
+  if (declaredTypeName == null) {
+    return false;
+  }
+  return declaredTypeName == 'Int64' ||
+      declaredTypeName.endsWith('.Int64') ||
+      declaredTypeName == 'Uint64' ||
+      declaredTypeName.endsWith('.Uint64');
+}
+
+Object convertResolvedPrimitiveValue(
+  Object value,
+  TypeInfo resolved, [
+  FieldType? fieldType,
+]) {
+  if (fieldType != null &&
+      _declares64BitWrapper(fieldType) &&
+      (resolved.typeId == TypeIds.int64 ||
+          resolved.typeId == TypeIds.varInt64 ||
+          resolved.typeId == TypeIds.taggedInt64 ||
+          resolved.typeId == TypeIds.uint64 ||
+          resolved.typeId == TypeIds.varUint64 ||
+          resolved.typeId == TypeIds.taggedUint64)) {
+    return value;
+  }
+  if (resolved.type == int) {
+    switch (resolved.typeId) {
+      case TypeIds.int64:
+      case TypeIds.varInt64:
+      case TypeIds.taggedInt64:
+        return (value as Int64).toInt();
+      case TypeIds.uint64:
+      case TypeIds.varUint64:
+      case TypeIds.taggedUint64:
+        return (value as Uint64).toInt();
+      default:
+        break;
+    }
+  }
+  if (resolved.type == double && resolved.typeId == TypeIds.float32) {
+    return (value as Float32).value;
+  }
+  if (fieldType != null) {
+    return convertPrimitiveFieldValue(value, fieldType);
+  }
+  return value;
+}
+
+void writeFieldValue(
+  WriteContext context,
+  SerializationFieldInfo field,
+  Object? value,
+) {
+  final fieldType = field.fieldType;
+  if (fieldType.isDynamic) {
+    if (fieldType.ref) {
+      context.writeRef(value);
+      return;
+    }
+    if (context.writeNullFlag(value)) {
+      return;
+    }
+    context.buffer.writeByte(RefWriter.notNullValueFlag);
+    context.writeNonRef(value as Object);
+    return;
+  }
+  if (fieldType.isPrimitive && !fieldType.nullable) {
+    if (value == null) {
+      throw StateError('Field ${field.name} is not nullable.');
+    }
+    context.writePrimitiveValue(fieldType.typeId, value);
+    return;
+  }
+  final declaredTypeInfo = fieldDeclaredTypeInfo(context.typeResolver, field);
+  final usesDeclaredType = fieldUsesDeclaredType(context.typeResolver, field);
+  if (!usesDeclaredType || declaredTypeInfo == null) {
+    if (fieldType.ref) {
+      context.writeRef(value);
+      return;
+    }
+    if (fieldType.nullable) {
+      if (context.writeNullFlag(value)) {
+        return;
+      }
+      context.buffer.writeByte(RefWriter.notNullValueFlag);
+    } else if (value == null) {
+      throw StateError('Field ${field.name} is not nullable.');
+    }
+    context.writeNonRef(value as Object);
+    return;
+  }
+  final resolved = declaredTypeInfo;
+  if (fieldType.nullable || fieldType.ref) {
+    final handled = context.refWriter.writeRefOrNull(
+      context.buffer,
+      value,
+      trackRef: fieldType.ref && resolved.supportsRef,
+    );
+    if (handled) {
+      return;
+    }
+  }
+  if (value == null) {
+    throw StateError('Field ${field.name} is not nullable.');
+  }
+  context.writeResolvedValue(resolved, value, fieldType);
+}
+
+T readFieldValue<T>(
+  ReadContext context,
+  SerializationFieldInfo field, [
+  T? fallback,
+]) {
+  final fieldType = field.fieldType;
+  if (fieldType.isDynamic) {
+    return context.readRef() as T;
+  }
+  if (fieldType.isPrimitive && !fieldType.nullable) {
+    return convertPrimitiveFieldValue(
+          context.readPrimitiveValue(fieldType.typeId),
+          fieldType,
+        )
+        as T;
+  }
+  final declaredTypeInfo = fieldDeclaredTypeInfo(context.typeResolver, field);
+  final usesDeclaredType = fieldUsesDeclaredType(context.typeResolver, field);
+  if (!usesDeclaredType || declaredTypeInfo == null) {
+    if (fieldType.ref) {
+      return context.readRef() as T;
+    }
+    if (fieldType.nullable) {
+      return context.readNullable() as T;
+    }
+    return context.readNonRef() as T;
+  }
+  final resolved = declaredTypeInfo;
+  if (fieldType.nullable || fieldType.ref) {
+    final flag = context.refReader.tryPreserveRefId(context.buffer);
+    final preservedRefId = flag >= RefWriter.refValueFlag ? flag : null;
+    if (flag == RefWriter.nullFlag) {
+      return fallback as T;
+    }
+    if (flag == RefWriter.refFlag) {
+      return context.refReader.getReadRef() as T;
+    }
+    final value = context.readResolvedValue(
+      resolved,
+      fieldType,
+      hasPreservedRef: preservedRefId != null,
+    );
+    if (preservedRefId != null &&
+        resolved.supportsRef &&
+        context.refReader.readRefAt(preservedRefId) == null) {
+      context.refReader.setReadRef(preservedRefId, value);
+    }
+    return value as T;
+  }
+  return context.readResolvedValue(resolved, fieldType) as T;
+}
+
+Object? readCompatibleField(ReadContext context, FieldInfo field) {
+  final fieldType = field.fieldType;
+  if (fieldType.isDynamic) {
+    return context.readRef();
+  }
+  if (fieldType.isPrimitive) {
+    if (fieldType.nullable) {
+      final flag = context.refReader.tryPreserveRefId(context.buffer);
+      final preservedRefId = flag >= RefWriter.refValueFlag ? flag : null;
+      if (flag == RefWriter.nullFlag) {
+        return null;
+      }
+      if (flag == RefWriter.refFlag) {
+        return context.refReader.getReadRef();
+      }
+      final value = convertPrimitiveFieldValue(
+        context.readPrimitiveValue(fieldType.typeId),
+        fieldType,
+      );
+      if (preservedRefId != null) {
+        context.refReader.setReadRef(preservedRefId, value);
+      }
+      return value;
+    }
+    return convertPrimitiveFieldValue(
+      context.readPrimitiveValue(fieldType.typeId),
+      fieldType,
+    );
+  }
+  if (_compatibleFieldCarriesTypeInfo(fieldType.typeId)) {
+    // Compatible struct/ext fields do not retain a declared child identity in
+    // TypeDef. Their value carries TypeInfo, so a parsed Object host type must
+    // not resolve through an unrelated local Object registration.
+    if (fieldType.ref) {
+      return context.readRef();
+    }
+    if (fieldType.nullable) {
+      return context.readNullable();
+    }
+    return context.readNonRef();
+  }
+  final declaredTypeInfo = _compatibleFieldDeclaredTypeInfo(
+    context.typeResolver,
+    field,
+  );
+  final usesDeclaredType =
+      declaredTypeInfo != null &&
+      usesDeclaredTypeInfo(
+        context.typeResolver.config.compatible,
+        fieldType,
+        declaredTypeInfo,
+      );
+  if (!usesDeclaredType) {
+    if (fieldType.ref) {
+      return context.readRef();
+    }
+    if (fieldType.nullable) {
+      return context.readNullable();
+    }
+    return context.readNonRef();
+  }
+  final resolved = declaredTypeInfo;
+  if (fieldType.nullable || fieldType.ref) {
+    final flag = context.refReader.tryPreserveRefId(context.buffer);
+    final preservedRefId = flag >= RefWriter.refValueFlag ? flag : null;
+    if (flag == RefWriter.nullFlag) {
+      return null;
+    }
+    if (flag == RefWriter.refFlag) {
+      return context.refReader.getReadRef();
+    }
+    final value = context.readResolvedValue(
+      resolved,
+      fieldType,
+      hasPreservedRef: preservedRefId != null,
+    );
+    if (preservedRefId != null &&
+        resolved.supportsRef &&
+        context.refReader.readRefAt(preservedRefId) == null) {
+      context.refReader.setReadRef(preservedRefId, value);
+    }
+    return value;
+  }
+  return context.readResolvedValue(resolved, fieldType);
+}
+
+bool _compatibleFieldCarriesTypeInfo(int typeId) =>
+    typeId == TypeIds.struct ||
+    typeId == TypeIds.compatibleStruct ||
+    typeId == TypeIds.namedStruct ||
+    typeId == TypeIds.namedCompatibleStruct ||
+    typeId == TypeIds.ext ||
+    typeId == TypeIds.namedExt;
+
+TypeInfo? _compatibleFieldDeclaredTypeInfo(
+  TypeResolver resolver,
+  FieldInfo field,
+) {
+  final fieldType = field.fieldType;
+  if (fieldType.isDynamic || (fieldType.isPrimitive && !fieldType.nullable)) {
+    return null;
+  }
+  return resolver.resolveFieldType(fieldType);
+}
+
+FieldInfo mergeCompatibleReadField(
+  FieldInfo localField,
+  FieldInfo remoteField,
+) {
+  FieldType mergeFieldType(FieldType local, FieldType remote) {
+    final mergedArguments = <FieldType>[];
+    final argumentCount = remote.arguments.length;
+    for (var index = 0; index < argumentCount; index += 1) {
+      final remoteArgument = remote.arguments[index];
+      final localArgument =
+          index < local.arguments.length
+              ? local.arguments[index]
+              : remoteArgument;
+      mergedArguments.add(mergeFieldType(localArgument, remoteArgument));
+    }
+    return FieldType(
+      type: local.type,
+      declaredTypeName: local.declaredTypeName,
+      typeId: remote.typeId,
+      nullable: remote.nullable,
+      ref: remote.ref,
+      dynamic: remote.dynamic ?? local.dynamic,
+      arguments: mergedArguments,
+    );
+  }
+
+  return FieldInfo(
+    name: localField.name,
+    identifier: localField.identifier,
+    id: localField.id,
+    fieldType: mergeFieldType(localField.fieldType, remoteField.fieldType),
+  );
+}

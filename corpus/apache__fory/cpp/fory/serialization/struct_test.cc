@@ -1,0 +1,1819 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+/**
+ * Comprehensive struct serialization test suite.
+ *
+ * Tests struct serialization including:
+ * - Edge cases (single field, many fields)
+ * - All primitive types
+ * - Nested structs
+ * - Structs with containers
+ * - Structs with optional fields
+ * - Complex real-world scenarios
+ */
+
+#include "fory/serialization/fory.h"
+#include "fory/type/type.h"
+#include "gtest/gtest.h"
+#include <algorithm>
+#include <cfloat>
+#include <climits>
+#include <limits>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <variant>
+#include <vector>
+
+// ============================================================================
+// FORY_STRUCT can be declared inside the struct/class definition or at
+// namespace scope.
+// ============================================================================
+
+// Edge cases
+struct SingleFieldStruct {
+  int32_t value;
+  bool operator==(const SingleFieldStruct &other) const {
+    return value == other.value;
+  }
+  FORY_STRUCT(SingleFieldStruct, value);
+};
+
+struct TwoFieldStruct {
+  int32_t x;
+  int32_t y;
+  bool operator==(const TwoFieldStruct &other) const {
+    return x == other.x && y == other.y;
+  }
+  FORY_STRUCT(TwoFieldStruct, x, y);
+};
+
+struct ManyFieldsStruct {
+  bool b1;
+  int8_t i8;
+  int16_t i16;
+  int32_t i32;
+  int64_t i64;
+  float f32;
+  double f64;
+  std::string str;
+
+  bool operator==(const ManyFieldsStruct &other) const {
+    return b1 == other.b1 && i8 == other.i8 && i16 == other.i16 &&
+           i32 == other.i32 && i64 == other.i64 && f32 == other.f32 &&
+           f64 == other.f64 && str == other.str;
+  }
+  FORY_STRUCT(ManyFieldsStruct, b1, i8, i16, i32, i64, f32, f64, str);
+};
+
+struct FieldConfigTaggedStruct {
+  int32_t a;
+  int64_t b;
+  std::string c;
+
+  bool operator==(const FieldConfigTaggedStruct &other) const {
+    return a == other.a && b == other.b && c == other.c;
+  }
+  FORY_STRUCT(FieldConfigTaggedStruct, (a, fory::F(1)), (b, fory::F(2)),
+              (c, fory::F(3)));
+};
+
+struct NumericTaggedOrderStruct {
+  std::string tag10;
+  int32_t tag2;
+  int64_t tag1;
+
+  bool operator==(const NumericTaggedOrderStruct &other) const {
+    return tag10 == other.tag10 && tag2 == other.tag2 && tag1 == other.tag1;
+  }
+  FORY_STRUCT(NumericTaggedOrderStruct, (tag10, fory::F(10)),
+              (tag2, fory::F(2)), (tag1, fory::F(1)));
+};
+
+struct TaggedGroupedOrderStruct {
+  std::string string_value;
+  int32_t int_value;
+
+  bool operator==(const TaggedGroupedOrderStruct &other) const {
+    return string_value == other.string_value && int_value == other.int_value;
+  }
+
+  FORY_STRUCT(TaggedGroupedOrderStruct, (string_value, fory::F(1)),
+              (int_value, fory::F(10).varint()));
+};
+
+struct MixedFieldIdentityStruct {
+  std::string beta_value;
+  std::string tagged_value;
+  std::string alpha_value;
+  int32_t count;
+
+  bool operator==(const MixedFieldIdentityStruct &other) const {
+    return beta_value == other.beta_value &&
+           tagged_value == other.tagged_value &&
+           alpha_value == other.alpha_value && count == other.count;
+  }
+
+  FORY_STRUCT(MixedFieldIdentityStruct, beta_value, (tagged_value, fory::F(3)),
+              alpha_value, (count, fory::F(2).varint()));
+};
+
+struct MaximumFieldTagStruct {
+  int32_t value;
+
+  bool operator==(const MaximumFieldTagStruct &other) const {
+    return value == other.value;
+  }
+
+  FORY_STRUCT(MaximumFieldTagStruct, (value, fory::F(536870911)));
+};
+
+struct HighTagCompatibleWriter {
+  std::string removed;
+  int32_t shared;
+
+  FORY_STRUCT(HighTagCompatibleWriter, (removed, fory::F(65551)),
+              (shared, fory::F(536870911)));
+};
+
+struct HighTagCompatibleReader {
+  int32_t shared = 0;
+
+  FORY_STRUCT(HighTagCompatibleReader, (shared, fory::F(536870911)));
+};
+
+struct SignedToUnsignedWriter {
+  int32_t value;
+
+  FORY_STRUCT(SignedToUnsignedWriter, (value, fory::F(1)));
+};
+
+struct UnsignedTargetReader {
+  uint32_t value = 0;
+
+  FORY_STRUCT(UnsignedTargetReader, (value, fory::F(1)));
+};
+
+class PrivateFieldsStruct {
+public:
+  PrivateFieldsStruct() = default;
+  PrivateFieldsStruct(int32_t id, std::string name, std::vector<int32_t> scores)
+      : id_(id), name_(std::move(name)), scores_(std::move(scores)) {}
+
+  bool operator==(const PrivateFieldsStruct &other) const {
+    return id_ == other.id_ && name_ == other.name_ && scores_ == other.scores_;
+  }
+
+private:
+  int32_t id_ = 0;
+  std::string name_;
+  std::vector<int32_t> scores_;
+
+public:
+  FORY_STRUCT(PrivateFieldsStruct, id_, name_, scores_);
+};
+
+struct PimplPropertyImpl {
+  int32_t a = 0;
+};
+
+class PimplPropertyStruct {
+public:
+  PimplPropertyStruct() : impl_(std::make_unique<PimplPropertyImpl>()) {}
+  explicit PimplPropertyStruct(int32_t a) : PimplPropertyStruct() {
+    impl_->a = a;
+  }
+  PimplPropertyStruct(const PimplPropertyStruct &other)
+      : PimplPropertyStruct(other.a()) {}
+  PimplPropertyStruct &operator=(const PimplPropertyStruct &other) {
+    a(other.a());
+    return *this;
+  }
+  PimplPropertyStruct(PimplPropertyStruct &&) noexcept = default;
+  PimplPropertyStruct &operator=(PimplPropertyStruct &&) noexcept = default;
+
+  const int32_t &a() const { return impl_->a; }
+  int32_t &a() { return impl_->a; }
+  PimplPropertyStruct &a(int32_t value) {
+    impl_->a = value;
+    return *this;
+  }
+
+  bool operator==(const PimplPropertyStruct &other) const {
+    return a() == other.a();
+  }
+
+private:
+  std::unique_ptr<PimplPropertyImpl> impl_;
+
+public:
+  FORY_STRUCT(PimplPropertyStruct, FORY_PROPERTY(a));
+};
+
+struct PimplConfiguredPropertyImpl {
+  int32_t value = 0;
+};
+
+class PimplConfiguredPropertyStruct {
+public:
+  PimplConfiguredPropertyStruct()
+      : impl_(std::make_unique<PimplConfiguredPropertyImpl>()) {}
+  explicit PimplConfiguredPropertyStruct(int32_t value)
+      : PimplConfiguredPropertyStruct() {
+    impl_->value = value;
+  }
+
+  const int32_t &get_value() const { return impl_->value; }
+  PimplConfiguredPropertyStruct &set_value(int32_t value) {
+    impl_->value = value;
+    return *this;
+  }
+
+  bool operator==(const PimplConfiguredPropertyStruct &other) const {
+    return get_value() == other.get_value();
+  }
+
+private:
+  std::unique_ptr<PimplConfiguredPropertyImpl> impl_;
+
+public:
+  FORY_STRUCT(PimplConfiguredPropertyStruct,
+              FORY_PROPERTY(value, get_value, set_value, fory::F(1).varint()));
+};
+
+// All primitives
+struct AllPrimitivesStruct {
+  bool bool_val;
+  int8_t int8_val;
+  int16_t int16_val;
+  int32_t int32_val;
+  int64_t int64_val;
+  uint8_t uint8_val;
+  uint16_t uint16_val;
+  uint32_t uint32_val;
+  uint64_t uint64_val;
+  float float_val;
+  double double_val;
+
+  bool operator==(const AllPrimitivesStruct &other) const {
+    return bool_val == other.bool_val && int8_val == other.int8_val &&
+           int16_val == other.int16_val && int32_val == other.int32_val &&
+           int64_val == other.int64_val && uint8_val == other.uint8_val &&
+           uint16_val == other.uint16_val && uint32_val == other.uint32_val &&
+           uint64_val == other.uint64_val && float_val == other.float_val &&
+           double_val == other.double_val;
+  }
+  FORY_STRUCT(AllPrimitivesStruct, bool_val, int8_val, int16_val, int32_val,
+              int64_val, uint8_val, uint16_val, uint32_val, uint64_val,
+              float_val, double_val);
+};
+
+struct UnsignedDefaultEncodingWriter {
+  uint32_t u32;
+  uint64_t u64;
+
+  bool operator==(const UnsignedDefaultEncodingWriter &other) const {
+    return u32 == other.u32 && u64 == other.u64;
+  }
+
+  FORY_STRUCT(UnsignedDefaultEncodingWriter, u32, u64);
+};
+
+struct UnsignedExplicitVarintReader {
+  uint32_t u32 = 0;
+  uint64_t u64 = 0;
+
+  FORY_STRUCT(UnsignedExplicitVarintReader, (u32, fory::F().varint()),
+              (u64, fory::F().varint()));
+};
+
+struct UnsignedEncodingStruct {
+  uint32_t default_u32;
+  uint64_t default_u64;
+  uint32_t id_default_u32;
+  uint64_t id_default_u64;
+  uint32_t var_u32;
+  uint32_t fixed_u32;
+  uint64_t var_u64;
+  uint64_t fixed_u64;
+  uint64_t tagged_u64;
+
+  bool operator==(const UnsignedEncodingStruct &other) const {
+    return default_u32 == other.default_u32 &&
+           default_u64 == other.default_u64 &&
+           id_default_u32 == other.id_default_u32 &&
+           id_default_u64 == other.id_default_u64 && var_u32 == other.var_u32 &&
+           fixed_u32 == other.fixed_u32 && var_u64 == other.var_u64 &&
+           fixed_u64 == other.fixed_u64 && tagged_u64 == other.tagged_u64;
+  }
+
+  FORY_STRUCT(UnsignedEncodingStruct, default_u32, default_u64,
+              (id_default_u32, fory::F(1)), (id_default_u64, fory::F(2)),
+              (var_u32, fory::F().varint()), (fixed_u32, fory::F().fixed()),
+              (var_u64, fory::F().varint()), (fixed_u64, fory::F().fixed()),
+              (tagged_u64, fory::F().tagged()));
+};
+
+struct TaggedIntStruct {
+  int64_t value;
+
+  FORY_STRUCT(TaggedIntStruct, (value, fory::F().tagged()));
+};
+
+struct TaggedUintStruct {
+  uint64_t value;
+
+  FORY_STRUCT(TaggedUintStruct, (value, fory::F().tagged()));
+};
+
+// String handling
+struct StringTestStruct {
+  std::string empty;
+  std::string ascii;
+  std::string utf8;
+  std::string long_text;
+
+  bool operator==(const StringTestStruct &other) const {
+    return empty == other.empty && ascii == other.ascii && utf8 == other.utf8 &&
+           long_text == other.long_text;
+  }
+  FORY_STRUCT(StringTestStruct, empty, ascii, utf8, long_text);
+};
+
+struct HybridVarintStruct {
+  int32_t value;
+  std::string text;
+
+  FORY_STRUCT(HybridVarintStruct, value, text);
+};
+
+// Nested structs
+struct Point2D {
+  int32_t x;
+  int32_t y;
+  bool operator==(const Point2D &other) const {
+    return x == other.x && y == other.y;
+  }
+  FORY_STRUCT(Point2D, x, y);
+};
+
+struct Point3D {
+  int32_t x;
+  int32_t y;
+  int32_t z;
+  bool operator==(const Point3D &other) const {
+    return x == other.x && y == other.y && z == other.z;
+  }
+  FORY_STRUCT(Point3D, x, y, z);
+};
+
+struct Rectangle {
+  Point2D top_left;
+  Point2D bottom_right;
+  bool operator==(const Rectangle &other) const {
+    return top_left == other.top_left && bottom_right == other.bottom_right;
+  }
+  FORY_STRUCT(Rectangle, top_left, bottom_right);
+};
+
+struct BoundingBox {
+  Rectangle bounds;
+  std::string label;
+  bool operator==(const BoundingBox &other) const {
+    return bounds == other.bounds && label == other.label;
+  }
+  FORY_STRUCT(BoundingBox, bounds, label);
+};
+
+struct Scene {
+  Point3D camera;
+  Point3D light;
+  Rectangle viewport;
+  bool operator==(const Scene &other) const {
+    return camera == other.camera && light == other.light &&
+           viewport == other.viewport;
+  }
+  FORY_STRUCT(Scene, camera, light, viewport);
+};
+
+struct EvolvingStruct {
+  int32_t id;
+
+  FORY_STRUCT(EvolvingStruct, id);
+};
+
+struct FixedStruct {
+  int32_t id;
+
+  FORY_STRUCT(FixedStruct, id);
+};
+
+FORY_STRUCT_EVOLVING(FixedStruct, false);
+
+// Containers
+struct VectorStruct {
+  std::vector<int32_t> numbers;
+  std::vector<std::string> strings;
+  std::vector<Point2D> points;
+
+  bool operator==(const VectorStruct &other) const {
+    return numbers == other.numbers && strings == other.strings &&
+           points == other.points;
+  }
+  FORY_STRUCT(VectorStruct, numbers, strings, points);
+};
+
+struct VectorBoolStruct {
+  std::vector<bool> flags;
+
+  bool operator==(const VectorBoolStruct &other) const {
+    return flags == other.flags;
+  }
+  FORY_STRUCT(VectorBoolStruct, flags);
+};
+
+struct NamedItem {
+  int32_t id;
+  std::string name;
+
+  bool operator==(const NamedItem &other) const {
+    return id == other.id && name == other.name;
+  }
+  FORY_STRUCT(NamedItem, id, name);
+};
+
+struct MapStruct {
+  std::map<std::string, int32_t> str_to_int;
+  std::map<int32_t, std::string> int_to_str;
+  std::map<std::string, Point2D> named_points;
+
+  bool operator==(const MapStruct &other) const {
+    return str_to_int == other.str_to_int && int_to_str == other.int_to_str &&
+           named_points == other.named_points;
+  }
+  FORY_STRUCT(MapStruct, str_to_int, int_to_str, named_points);
+};
+
+struct NestedContainerStruct {
+  std::vector<std::vector<int32_t>> matrix;
+  std::map<std::string, std::vector<int32_t>> grouped_numbers;
+
+  bool operator==(const NestedContainerStruct &other) const {
+    return matrix == other.matrix && grouped_numbers == other.grouped_numbers;
+  }
+  FORY_STRUCT(NestedContainerStruct, matrix, grouped_numbers);
+};
+
+namespace T = fory::T;
+
+struct NestedAnnotatedStruct {
+  std::map<uint32_t, std::vector<int64_t>> map;
+
+  bool operator==(const NestedAnnotatedStruct &other) const {
+    return map == other.map;
+  }
+  FORY_STRUCT(NestedAnnotatedStruct,
+              (map,
+               fory::F().map().key(T::varint()).value(T::list(T::tagged()))));
+};
+
+struct PartialMapAnnotatedStruct {
+  std::map<uint32_t, std::vector<int64_t>> key_only;
+  std::map<uint32_t, std::vector<int64_t>> value_only;
+
+  bool operator==(const PartialMapAnnotatedStruct &other) const {
+    return key_only == other.key_only && value_only == other.value_only;
+  }
+  FORY_STRUCT(PartialMapAnnotatedStruct,
+              (key_only, fory::F().map().key(T::varint())),
+              (value_only, fory::F().map().value(T::list(T::tagged()))));
+};
+
+struct OptionalNestedAnnotatedStruct {
+  std::optional<std::vector<uint32_t>> values;
+
+  bool operator==(const OptionalNestedAnnotatedStruct &other) const {
+    return values == other.values;
+  }
+  FORY_STRUCT(OptionalNestedAnnotatedStruct,
+              (values, fory::F().inner(T::list(T::varint()))));
+};
+
+struct UnbackedListField {
+  std::vector<std::monostate> values;
+  FORY_STRUCT(UnbackedListField, values);
+};
+
+struct ConfiguredUnbackedListField {
+  std::vector<std::monostate> values;
+  FORY_STRUCT(ConfiguredUnbackedListField,
+              (values, fory::F().list(T::scalar())));
+};
+
+struct UnbackedMapKey {
+  int32_t id = 0;
+  bool operator<(const UnbackedMapKey &other) const { return id < other.id; }
+  FORY_STRUCT(UnbackedMapKey);
+};
+
+struct ConfiguredUnbackedMapField {
+  std::map<UnbackedMapKey, UnbackedMapKey> values;
+  FORY_STRUCT(ConfiguredUnbackedMapField,
+              (values, fory::F().map(T::scalar(), T::scalar())));
+};
+
+struct ConfiguredPositiveListField {
+  std::vector<int32_t> values;
+  FORY_STRUCT(ConfiguredPositiveListField,
+              (values, fory::F().list(T::int32())));
+};
+
+struct ListArrayAnnotatedStruct {
+  std::vector<int32_t> numbers;
+  std::vector<int8_t> int8_values;
+  std::vector<uint8_t> uint8_values;
+  std::vector<int32_t> dense_numbers;
+  std::vector<uint8_t> pixels;
+
+  bool operator==(const ListArrayAnnotatedStruct &other) const {
+    return numbers == other.numbers && int8_values == other.int8_values &&
+           uint8_values == other.uint8_values &&
+           dense_numbers == other.dense_numbers && pixels == other.pixels;
+  }
+  FORY_STRUCT(ListArrayAnnotatedStruct, (numbers, fory::F(1).list(T::int32())),
+              (int8_values, fory::F(2).list(T::int8())),
+              (uint8_values, fory::F(3).list(T::uint8())),
+              (dense_numbers, fory::F(4).array(T::int32())),
+              (pixels, fory::F(5).array(T::uint8())));
+};
+
+// Optional fields
+struct OptionalFieldsStruct {
+  std::string name;
+  std::optional<int32_t> age;
+  std::optional<std::string> email;
+  std::optional<Point2D> location;
+
+  bool operator==(const OptionalFieldsStruct &other) const {
+    return name == other.name && age == other.age && email == other.email &&
+           location == other.location;
+  }
+  FORY_STRUCT(OptionalFieldsStruct, name, age, email, location);
+};
+
+// Enums
+enum class Color { RED = 0, GREEN = 1, BLUE = 2 };
+enum class Status : int32_t { PENDING = 0, ACTIVE = 1, COMPLETED = 2 };
+
+struct EnumStruct {
+  Color color;
+  Status status;
+  bool operator==(const EnumStruct &other) const {
+    return color == other.color && status == other.status;
+  }
+  FORY_STRUCT(EnumStruct, color, status);
+};
+
+// Real-world scenarios
+struct UserProfile {
+  int64_t user_id;
+  std::string username;
+  std::string email;
+  std::optional<std::string> bio;
+  std::vector<std::string> interests;
+  std::map<std::string, std::string> metadata;
+  int32_t follower_count;
+  bool is_verified;
+
+  bool operator==(const UserProfile &other) const {
+    return user_id == other.user_id && username == other.username &&
+           email == other.email && bio == other.bio &&
+           interests == other.interests && metadata == other.metadata &&
+           follower_count == other.follower_count &&
+           is_verified == other.is_verified;
+  }
+  FORY_STRUCT(UserProfile, user_id, username, email, bio, interests, metadata,
+              follower_count, is_verified);
+};
+
+struct Product {
+  int64_t product_id;
+  std::string name;
+  std::string description;
+  double price;
+  int32_t stock;
+  std::vector<std::string> tags;
+  std::map<std::string, std::string> attributes;
+
+  bool operator==(const Product &other) const {
+    return product_id == other.product_id && name == other.name &&
+           description == other.description && price == other.price &&
+           stock == other.stock && tags == other.tags &&
+           attributes == other.attributes;
+  }
+  FORY_STRUCT(Product, product_id, name, description, price, stock, tags,
+              attributes);
+};
+
+struct OrderItem {
+  int64_t product_id;
+  int32_t quantity;
+  double unit_price;
+
+  bool operator==(const OrderItem &other) const {
+    return product_id == other.product_id && quantity == other.quantity &&
+           unit_price == other.unit_price;
+  }
+  FORY_STRUCT(OrderItem, product_id, quantity, unit_price);
+};
+
+struct Order {
+  int64_t order_id;
+  int64_t customer_id;
+  std::vector<OrderItem> items;
+  double total_amount;
+  Status order_status;
+
+  bool operator==(const Order &other) const {
+    return order_id == other.order_id && customer_id == other.customer_id &&
+           items == other.items && total_amount == other.total_amount &&
+           order_status == other.order_status;
+  }
+  FORY_STRUCT(Order, order_id, customer_id, items, total_amount, order_status);
+};
+
+namespace nested_test {
+namespace inner {
+
+struct InClassStruct {
+  int32_t id;
+  std::string name;
+  bool operator==(const InClassStruct &other) const {
+    return id == other.id && name == other.name;
+  }
+  FORY_STRUCT(InClassStruct, id, name);
+};
+
+struct OutClassStruct {
+  int32_t id;
+  std::string name;
+  bool operator==(const OutClassStruct &other) const {
+    return id == other.id && name == other.name;
+  }
+};
+
+FORY_STRUCT(OutClassStruct, id, name);
+
+} // namespace inner
+} // namespace nested_test
+
+namespace external_test {
+
+struct ExternalStruct {
+  int32_t id;
+  std::string name;
+  bool operator==(const ExternalStruct &other) const {
+    return id == other.id && name == other.name;
+  }
+};
+
+FORY_STRUCT(ExternalStruct, id, name);
+
+struct ExternalEmpty {
+  bool operator==(const ExternalEmpty & /*other*/) const { return true; }
+};
+
+FORY_STRUCT(ExternalEmpty);
+
+} // namespace external_test
+
+// ============================================================================
+// TEST IMPLEMENTATION (Inside namespace)
+// ============================================================================
+
+namespace fory {
+namespace serialization {
+namespace test {
+
+// Helper to register all test struct types on a Fory instance
+inline void register_all_test_types(Fory &fory) {
+  uint32_t type_id = 1;
+
+  // Register all struct types used in tests
+  fory.register_struct<SingleFieldStruct>(type_id++);
+  fory.register_struct<TwoFieldStruct>(type_id++);
+  fory.register_struct<ManyFieldsStruct>(type_id++);
+  fory.register_struct<NumericTaggedOrderStruct>(type_id++);
+  fory.register_struct<TaggedGroupedOrderStruct>(type_id++);
+  fory.register_struct<PrivateFieldsStruct>(type_id++);
+  fory.register_struct<PimplPropertyStruct>(type_id++);
+  fory.register_struct<PimplConfiguredPropertyStruct>(type_id++);
+  fory.register_struct<AllPrimitivesStruct>(type_id++);
+  fory.register_struct<UnsignedDefaultEncodingWriter>(type_id++);
+  fory.register_struct<UnsignedExplicitVarintReader>(type_id++);
+  fory.register_struct<UnsignedEncodingStruct>(type_id++);
+  fory.register_struct<StringTestStruct>(type_id++);
+  fory.register_struct<Point2D>(type_id++);
+  fory.register_struct<Point3D>(type_id++);
+  fory.register_struct<Rectangle>(type_id++);
+  fory.register_struct<BoundingBox>(type_id++);
+  fory.register_struct<Scene>(type_id++);
+  fory.register_struct<VectorStruct>(type_id++);
+  fory.register_struct<VectorBoolStruct>(type_id++);
+  fory.register_struct<MapStruct>(type_id++);
+  fory.register_struct<NestedContainerStruct>(type_id++);
+  fory.register_struct<NestedAnnotatedStruct>(type_id++);
+  fory.register_struct<PartialMapAnnotatedStruct>(type_id++);
+  fory.register_struct<OptionalNestedAnnotatedStruct>(type_id++);
+  fory.register_struct<ListArrayAnnotatedStruct>(type_id++);
+  fory.register_struct<MixedFieldIdentityStruct>(type_id++);
+  fory.register_struct<OptionalFieldsStruct>(type_id++);
+  fory.register_struct<EnumStruct>(type_id++);
+  fory.register_struct<UserProfile>(type_id++);
+  fory.register_struct<Product>(type_id++);
+  fory.register_struct<OrderItem>(type_id++);
+  fory.register_struct<Order>(type_id++);
+  fory.register_struct<nested_test::inner::InClassStruct>(type_id++);
+  fory.register_struct<nested_test::inner::OutClassStruct>(type_id++);
+  fory.register_struct<external_test::ExternalStruct>(type_id++);
+  fory.register_struct<external_test::ExternalEmpty>(type_id++);
+  fory.register_enum<Color>(type_id++);
+  fory.register_enum<Status>(type_id++);
+}
+
+inline FieldType make_test_field_type(TypeId type_id,
+                                      std::vector<FieldType> generics = {}) {
+  return FieldType(static_cast<uint32_t>(type_id), false, false,
+                   std::move(generics));
+}
+
+inline FieldInfo make_test_field_info(std::string name, int32_t field_id,
+                                      FieldType field_type) {
+  FieldInfo info(std::move(name), std::move(field_type));
+  info.field_id = field_id;
+  return info;
+}
+
+template <typename T> void test_roundtrip(const T &original) {
+  auto fory =
+      Fory::builder().xlang(true).compatible(false).track_ref(false).build();
+  register_all_test_types(fory);
+
+  auto serialize_result = fory.serialize(original);
+  ASSERT_TRUE(serialize_result.ok())
+      << "Serialization failed: " << serialize_result.error().to_string();
+
+  std::vector<uint8_t> bytes = std::move(serialize_result).value();
+  ASSERT_GT(bytes.size(), 0);
+
+  auto deserialize_result = fory.deserialize<T>(bytes.data(), bytes.size());
+  ASSERT_TRUE(deserialize_result.ok())
+      << "Deserialization failed: " << deserialize_result.error().to_string();
+
+  T deserialized = std::move(deserialize_result).value();
+  EXPECT_EQ(original, deserialized);
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+TEST(StructComprehensiveTest, SingleFieldStruct) {
+  test_roundtrip(SingleFieldStruct{0});
+  test_roundtrip(SingleFieldStruct{42});
+  test_roundtrip(SingleFieldStruct{-100});
+  test_roundtrip(SingleFieldStruct{INT32_MAX});
+  test_roundtrip(SingleFieldStruct{INT32_MIN});
+}
+
+TEST(StructComprehensiveTest, TwoFieldStruct) {
+  test_roundtrip(TwoFieldStruct{0, 0});
+  test_roundtrip(TwoFieldStruct{10, 20});
+  test_roundtrip(TwoFieldStruct{-5, 15});
+}
+
+TEST(StructComprehensiveTest, ManyFieldsStruct) {
+  test_roundtrip(ManyFieldsStruct{true, 127, 32767, 2147483647,
+                                  9223372036854775807LL, 3.14f, 2.718,
+                                  "Hello, World!"});
+  test_roundtrip(ManyFieldsStruct{false, -128, -32768, INT32_MIN,
+                                  -9223372036854775807LL - 1, -1.0f, -1.0, ""});
+}
+
+TEST(StructComprehensiveTest, PrivateFieldsStruct) {
+  test_roundtrip(PrivateFieldsStruct{42, "secret", {1, 2, 3}});
+}
+
+TEST(StructComprehensiveTest, PimplPropertyStruct) {
+  test_roundtrip(PimplPropertyStruct{12345});
+}
+
+TEST(StructComprehensiveTest, PimplConfiguredPropertyStruct) {
+  test_roundtrip(PimplConfiguredPropertyStruct{-12345});
+}
+
+TEST(StructComprehensiveTest, AllPrimitivesZero) {
+  test_roundtrip(AllPrimitivesStruct{false, 0, 0, 0, 0, 0, 0, 0, 0, 0.0f, 0.0});
+}
+
+TEST(StructComprehensiveTest, AllPrimitivesMax) {
+  test_roundtrip(AllPrimitivesStruct{true, INT8_MAX, INT16_MAX, INT32_MAX,
+                                     INT64_MAX, UINT8_MAX, UINT16_MAX,
+                                     UINT32_MAX, UINT64_MAX, FLT_MAX, DBL_MAX});
+}
+
+TEST(StructComprehensiveTest, AllPrimitivesMin) {
+  test_roundtrip(AllPrimitivesStruct{false, INT8_MIN, INT16_MIN, INT32_MIN,
+                                     INT64_MIN, 0, 0, 0, 0, -FLT_MAX,
+                                     -DBL_MAX});
+}
+
+TEST(StructComprehensiveTest, UnsignedDefaultEncodingRoundTrip) {
+  auto writer =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  auto reader =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  ASSERT_TRUE(writer.register_struct<UnsignedDefaultEncodingWriter>(610).ok());
+  ASSERT_TRUE(reader.register_struct<UnsignedExplicitVarintReader>(610).ok());
+
+  UnsignedDefaultEncodingWriter original{66051u, 0x01020304050607ULL};
+  auto bytes_result = writer.serialize(original);
+  ASSERT_TRUE(bytes_result.ok())
+      << "Serialization failed: " << bytes_result.error().to_string();
+
+  std::vector<uint8_t> bytes = std::move(bytes_result).value();
+  auto result = reader.deserialize<UnsignedExplicitVarintReader>(bytes.data(),
+                                                                 bytes.size());
+  ASSERT_TRUE(result.ok()) << "Deserialization failed: "
+                           << result.error().to_string();
+  EXPECT_EQ(result.value().u32, original.u32);
+  EXPECT_EQ(result.value().u64, original.u64);
+
+  auto explicit_bytes = reader.serialize(
+      UnsignedExplicitVarintReader{original.u32, original.u64});
+  ASSERT_TRUE(explicit_bytes.ok())
+      << "Serialization failed: " << explicit_bytes.error().to_string();
+  auto default_result = writer.deserialize<UnsignedDefaultEncodingWriter>(
+      explicit_bytes.value().data(), explicit_bytes.value().size());
+  ASSERT_TRUE(default_result.ok())
+      << "Deserialization failed: " << default_result.error().to_string();
+  EXPECT_EQ(default_result.value(), original);
+}
+
+TEST(StructComprehensiveTest, UnsignedEncodingsRoundTrip) {
+  test_roundtrip(UnsignedEncodingStruct{
+      66051u,
+      0x01020304050607ULL,
+      131071u,
+      0x02030405060708ULL,
+      262143u,
+      0x03020100u,
+      0x03040506070809ULL,
+      0x0405060708090aULL,
+      0x05060708090a0bULL,
+  });
+}
+
+TEST(StructComprehensiveTest, TaggedIntTruncationFails) {
+  const bool compatible_modes[] = {false, true};
+  for (bool compatible : compatible_modes) {
+    SCOPED_TRACE(::testing::Message() << "compatible=" << compatible);
+    auto check_truncation = [&](auto original, uint32_t type_id,
+                                const char *kind) {
+      using StructType = decltype(original);
+      SCOPED_TRACE(::testing::Message() << "kind=" << kind);
+      auto fory = Fory::builder()
+                      .xlang(true)
+                      .compatible(compatible)
+                      .track_ref(false)
+                      .build();
+      ASSERT_TRUE(fory.register_struct<StructType>(type_id).ok());
+
+      auto serialized = fory.serialize(original);
+      ASSERT_TRUE(serialized.ok()) << serialized.error().to_string();
+      const std::vector<uint8_t> bytes = std::move(serialized).value();
+      ASSERT_GE(bytes.size(), 9u);
+      ASSERT_EQ(bytes[bytes.size() - 9] & 1u, 1u);
+      ASSERT_TRUE(fory.deserialize<StructType>(bytes).ok());
+
+      for (size_t missing_bytes = 1; missing_bytes <= 9; ++missing_bytes) {
+        SCOPED_TRACE(::testing::Message() << "missing_bytes=" << missing_bytes);
+        std::vector<uint8_t> truncated(bytes.begin(),
+                                       bytes.end() - missing_bytes);
+        auto result =
+            fory.deserialize<StructType>(truncated.data(), truncated.size());
+        ASSERT_FALSE(result.ok());
+        EXPECT_EQ(result.error().code(), ErrorCode::BufferOutOfBound);
+      }
+    };
+    check_truncation(TaggedIntStruct{std::numeric_limits<int64_t>::max()}, 612,
+                     "signed");
+    check_truncation(TaggedUintStruct{std::numeric_limits<uint64_t>::max()},
+                     613, "unsigned");
+  }
+}
+
+TEST(StructComprehensiveTest, UnsignedEncodingFieldMeta) {
+  auto fory =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  ASSERT_TRUE(fory.register_struct<UnsignedEncodingStruct>(611).ok());
+  ASSERT_TRUE(fory.serialize(UnsignedEncodingStruct{
+                                 1u,
+                                 2u,
+                                 3u,
+                                 4u,
+                                 5u,
+                                 6u,
+                                 7u,
+                                 8u,
+                                 9u,
+                             })
+                  .ok());
+
+  TypeMeta meta =
+      fory.type_resolver().clone_struct_meta<UnsignedEncodingStruct>();
+  const auto &fields = meta.get_field_infos();
+  ASSERT_EQ(fields.size(), 9);
+
+  auto find_field = [&](const std::string &name) -> const FieldInfo * {
+    auto it =
+        std::find_if(fields.begin(), fields.end(), [&](const FieldInfo &field) {
+          return field.field_name == name;
+        });
+    return it == fields.end() ? nullptr : &*it;
+  };
+  auto find_field_id = [&](int32_t id) -> const FieldInfo * {
+    auto it =
+        std::find_if(fields.begin(), fields.end(), [&](const FieldInfo &field) {
+          return field.field_id == id;
+        });
+    return it == fields.end() ? nullptr : &*it;
+  };
+
+  const FieldInfo *default_u32 = find_field("default_u32");
+  const FieldInfo *default_u64 = find_field("default_u64");
+  const FieldInfo *id_default_u32 = find_field_id(1);
+  const FieldInfo *id_default_u64 = find_field_id(2);
+  const FieldInfo *var_u32 = find_field("var_u32");
+  const FieldInfo *fixed_u32 = find_field("fixed_u32");
+  const FieldInfo *var_u64 = find_field("var_u64");
+  const FieldInfo *fixed_u64 = find_field("fixed_u64");
+  const FieldInfo *tagged_u64 = find_field("tagged_u64");
+
+  ASSERT_NE(default_u32, nullptr);
+  ASSERT_NE(default_u64, nullptr);
+  ASSERT_NE(id_default_u32, nullptr);
+  ASSERT_NE(id_default_u64, nullptr);
+  ASSERT_NE(var_u32, nullptr);
+  ASSERT_NE(fixed_u32, nullptr);
+  ASSERT_NE(var_u64, nullptr);
+  ASSERT_NE(fixed_u64, nullptr);
+  ASSERT_NE(tagged_u64, nullptr);
+
+  EXPECT_EQ(default_u32->field_type.type_id,
+            static_cast<uint32_t>(TypeId::VAR_UINT32));
+  EXPECT_EQ(default_u64->field_type.type_id,
+            static_cast<uint32_t>(TypeId::VAR_UINT64));
+  EXPECT_EQ(id_default_u32->field_type.type_id,
+            static_cast<uint32_t>(TypeId::VAR_UINT32));
+  EXPECT_EQ(id_default_u32->field_id, 1);
+  EXPECT_EQ(id_default_u64->field_type.type_id,
+            static_cast<uint32_t>(TypeId::VAR_UINT64));
+  EXPECT_EQ(id_default_u64->field_id, 2);
+  EXPECT_EQ(var_u32->field_type.type_id,
+            static_cast<uint32_t>(TypeId::VAR_UINT32));
+  EXPECT_EQ(fixed_u32->field_type.type_id,
+            static_cast<uint32_t>(TypeId::UINT32));
+  EXPECT_EQ(var_u64->field_type.type_id,
+            static_cast<uint32_t>(TypeId::VAR_UINT64));
+  EXPECT_EQ(fixed_u64->field_type.type_id,
+            static_cast<uint32_t>(TypeId::UINT64));
+  EXPECT_EQ(tagged_u64->field_type.type_id,
+            static_cast<uint32_t>(TypeId::TAGGED_UINT64));
+}
+
+TEST(StructComprehensiveTest, StringVariations) {
+  test_roundtrip(StringTestStruct{"", "Hello", "UTF-8", "Short"});
+
+  std::string long_str(1000, 'x');
+  test_roundtrip(StringTestStruct{"", "ASCII Text", "Emoji", long_str});
+}
+
+TEST(StructComprehensiveTest, Point2D) {
+  test_roundtrip(Point2D{0, 0});
+  test_roundtrip(Point2D{10, 20});
+  test_roundtrip(Point2D{-5, 15});
+}
+
+TEST(StructComprehensiveTest, Point3D) {
+  test_roundtrip(Point3D{0, 0, 0});
+  test_roundtrip(Point3D{10, 20, 30});
+}
+
+TEST(StructComprehensiveTest, RectangleNested) {
+  test_roundtrip(Rectangle{{0, 0}, {10, 10}});
+  test_roundtrip(Rectangle{{-5, -5}, {5, 5}});
+}
+
+TEST(StructComprehensiveTest, BoundingBoxDoubleNested) {
+  test_roundtrip(BoundingBox{{{0, 0}, {100, 100}}, "Main View"});
+  test_roundtrip(BoundingBox{{{-50, -50}, {50, 50}}, "Centered"});
+}
+
+TEST(StructComprehensiveTest, SceneMultipleNested) {
+  test_roundtrip(Scene{{0, 0, 10}, {100, 100, 200}, {{0, 0}, {800, 600}}});
+}
+
+TEST(StructComprehensiveTest, HybridVarintReservesPhysicalStore) {
+  auto fory =
+      Fory::builder().xlang(true).compatible(false).track_ref(false).build();
+  WriteContext write_ctx(fory.config(), fory.type_resolver().clone());
+  std::array<uint8_t, 8> storage{};
+  write_ctx.buffer() = Buffer(storage.data(), 5, false);
+
+  HybridVarintStruct value{std::numeric_limits<int32_t>::min(), "x"};
+  detail::write_struct_fields_impl(value, write_ctx,
+                                   std::make_index_sequence<2>{}, false);
+
+  EXPECT_FALSE(write_ctx.has_error());
+  EXPECT_NE(write_ctx.buffer().data(), storage.data());
+}
+
+TEST(StructComprehensiveTest, VectorStructEmpty) {
+  test_roundtrip(VectorStruct{{}, {}, {}});
+}
+
+TEST(StructComprehensiveTest, VectorStructMultiple) {
+  test_roundtrip(VectorStruct{{1, 2, 3}, {"foo", "bar"}, {{0, 0}, {10, 10}}});
+}
+
+TEST(StructComprehensiveTest, VectorBoolStruct) {
+  test_roundtrip(VectorBoolStruct{{true, false, false, true}});
+}
+
+TEST(StructComprehensiveTest, NamedStructElementTypeInfo) {
+  std::vector<NamedItem> items{{1, "alpha"}, {2, "beta"}};
+
+  auto fory =
+      Fory::builder().xlang(true).compatible(false).track_ref(false).build();
+  ASSERT_TRUE(fory.register_struct<NamedItem>("test", "NamedItem").ok());
+
+  auto ser_result = fory.serialize(items);
+  ASSERT_TRUE(ser_result.ok())
+      << "Serialization failed: " << ser_result.error().to_string();
+
+  std::vector<uint8_t> bytes = std::move(ser_result).value();
+  auto deser_result =
+      fory.deserialize<std::vector<NamedItem>>(bytes.data(), bytes.size());
+  ASSERT_TRUE(deser_result.ok())
+      << "Deserialization failed: " << deser_result.error().to_string();
+
+  EXPECT_EQ(items, deser_result.value());
+}
+
+TEST(StructComprehensiveTest, LongNamedStructElementTypeInfo) {
+  std::vector<NamedItem> items{{1, "alpha"}, {2, "beta"}};
+  const std::string namespace_name =
+      "org.apache.fory.serialization.longnamespace";
+  const std::string type_name = "RecursiveCollectionNode";
+
+  auto fory =
+      Fory::builder().xlang(true).compatible(false).track_ref(false).build();
+  ASSERT_TRUE(fory.register_struct<NamedItem>(namespace_name, type_name).ok());
+  auto type_info = fory.type_resolver().get_type_info<NamedItem>();
+  ASSERT_TRUE(type_info.ok());
+  ASSERT_NE(type_info.value()->encoded_namespace, nullptr);
+  ASSERT_NE(type_info.value()->encoded_type_name, nullptr);
+  ASSERT_GT(type_info.value()->encoded_namespace->bytes.size(), 16);
+  ASSERT_GT(type_info.value()->encoded_type_name->bytes.size(), 16);
+  EXPECT_NE(type_info.value()->encoded_namespace->hash, 0);
+  EXPECT_NE(type_info.value()->encoded_type_name->hash, 0);
+
+  auto serialized = fory.serialize(items);
+  ASSERT_TRUE(serialized.ok()) << serialized.error().to_string();
+
+  std::vector<uint8_t> bytes = std::move(serialized).value();
+  auto deserialized =
+      fory.deserialize<std::vector<NamedItem>>(bytes.data(), bytes.size());
+  ASSERT_TRUE(deserialized.ok()) << deserialized.error().to_string();
+  EXPECT_EQ(items, deserialized.value());
+}
+
+TEST(StructComprehensiveTest, MapStructEmpty) {
+  test_roundtrip(MapStruct{{}, {}, {}});
+}
+
+TEST(StructComprehensiveTest, MapStructMultiple) {
+  test_roundtrip(MapStruct{{{"one", 1}, {"two", 2}},
+                           {{1, "one"}, {2, "two"}},
+                           {{"A", {0, 0}}, {"B", {10, 10}}}});
+}
+
+TEST(StructComprehensiveTest, NestedContainers) {
+  test_roundtrip(NestedContainerStruct{{{1, 2}, {3, 4}}, {{"a", {10, 20}}}});
+}
+
+TEST(StructComprehensiveTest, NestedAnnotatedContainers) {
+  NestedAnnotatedStruct obj{{{1, {10, -20, 30}}, {2, {40, 50}}}};
+  test_roundtrip(obj);
+
+  auto fory =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  ASSERT_TRUE(fory.register_struct<NestedAnnotatedStruct>(601).ok());
+  ASSERT_TRUE(fory.serialize(obj).ok());
+  TypeMeta meta =
+      fory.type_resolver().clone_struct_meta<NestedAnnotatedStruct>();
+  const auto &fields = meta.get_field_infos();
+  ASSERT_EQ(fields.size(), 1);
+  const auto &field_type = fields[0].field_type;
+  ASSERT_EQ(field_type.type_id, static_cast<uint32_t>(TypeId::MAP));
+  ASSERT_EQ(field_type.generics.size(), 2);
+  EXPECT_EQ(field_type.generics[0].type_id,
+            static_cast<uint32_t>(TypeId::VAR_UINT32));
+  ASSERT_EQ(field_type.generics[1].type_id,
+            static_cast<uint32_t>(TypeId::LIST));
+  ASSERT_EQ(field_type.generics[1].generics.size(), 1);
+  EXPECT_EQ(field_type.generics[1].generics[0].type_id,
+            static_cast<uint32_t>(TypeId::TAGGED_INT64));
+}
+
+TEST(StructComprehensiveTest, PartialMapAnnotations) {
+  PartialMapAnnotatedStruct obj{
+      {{1, {10, 20}}, {2, {30}}},
+      {{3, {40, -50}}, {4, {60}}},
+  };
+  test_roundtrip(obj);
+
+  auto fory =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  ASSERT_TRUE(fory.register_struct<PartialMapAnnotatedStruct>(602).ok());
+  ASSERT_TRUE(fory.serialize(obj).ok());
+  TypeMeta meta =
+      fory.type_resolver().clone_struct_meta<PartialMapAnnotatedStruct>();
+  const auto &fields = meta.get_field_infos();
+  ASSERT_EQ(fields.size(), 2);
+  const FieldInfo *key_only = nullptr;
+  const FieldInfo *value_only = nullptr;
+  for (const auto &field : fields) {
+    if (field.field_name == "key_only") {
+      key_only = &field;
+    } else if (field.field_name == "value_only") {
+      value_only = &field;
+    }
+  }
+  ASSERT_NE(key_only, nullptr);
+  ASSERT_NE(value_only, nullptr);
+  EXPECT_EQ(key_only->field_type.generics[0].type_id,
+            static_cast<uint32_t>(TypeId::VAR_UINT32));
+  EXPECT_EQ(value_only->field_type.generics[1].generics[0].type_id,
+            static_cast<uint32_t>(TypeId::TAGGED_INT64));
+}
+
+TEST(StructComprehensiveTest, OptionalNestedAnnotation) {
+  test_roundtrip(
+      OptionalNestedAnnotatedStruct{{std::vector<uint32_t>{1, 2, 3}}});
+  test_roundtrip(OptionalNestedAnnotatedStruct{std::nullopt});
+
+  auto fory =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  ASSERT_TRUE(fory.register_struct<OptionalNestedAnnotatedStruct>(603).ok());
+  ASSERT_TRUE(
+      fory.serialize(OptionalNestedAnnotatedStruct{{std::vector<uint32_t>{1}}})
+          .ok());
+  TypeMeta meta =
+      fory.type_resolver().clone_struct_meta<OptionalNestedAnnotatedStruct>();
+  const auto &fields = meta.get_field_infos();
+  ASSERT_EQ(fields.size(), 1);
+  EXPECT_TRUE(fields[0].field_type.nullable);
+  ASSERT_EQ(fields[0].field_type.type_id, static_cast<uint32_t>(TypeId::LIST));
+  ASSERT_EQ(fields[0].field_type.generics.size(), 1);
+  EXPECT_EQ(fields[0].field_type.generics[0].type_id,
+            static_cast<uint32_t>(TypeId::VAR_UINT32));
+}
+
+TEST(StructComprehensiveTest, UnbackedContainerFields) {
+  auto fory = Fory::builder()
+                  .xlang(true)
+                  .compatible(false)
+                  .track_ref(false)
+                  .max_unbacked_container_items(2)
+                  .build();
+  ASSERT_TRUE(fory.register_struct<UnbackedListField>(610).ok());
+  ASSERT_TRUE(fory.register_struct<ConfiguredUnbackedListField>(611).ok());
+  ASSERT_TRUE(fory.register_struct<UnbackedMapKey>(612).ok());
+  ASSERT_TRUE(fory.register_struct<ConfiguredUnbackedMapField>(613).ok());
+
+  UnbackedListField list{{{}, {}, {}}};
+  auto bytes = fory.serialize(list);
+  ASSERT_TRUE(bytes.ok()) << bytes.error().to_string();
+  EXPECT_FALSE(fory.deserialize<UnbackedListField>(*bytes).ok());
+
+  ConfiguredUnbackedListField configured_list{{{}, {}, {}}};
+  bytes = fory.serialize(configured_list);
+  ASSERT_TRUE(bytes.ok()) << bytes.error().to_string();
+  EXPECT_FALSE(fory.deserialize<ConfiguredUnbackedListField>(*bytes).ok());
+
+  ConfiguredUnbackedMapField configured_map;
+  configured_map.values.emplace(UnbackedMapKey{1}, UnbackedMapKey{1});
+  configured_map.values.emplace(UnbackedMapKey{2}, UnbackedMapKey{2});
+  configured_map.values.emplace(UnbackedMapKey{3}, UnbackedMapKey{3});
+  bytes = fory.serialize(configured_map);
+  ASSERT_TRUE(bytes.ok()) << bytes.error().to_string();
+  EXPECT_FALSE(fory.deserialize<ConfiguredUnbackedMapField>(*bytes).ok());
+}
+
+TEST(StructComprehensiveTest, ConfiguredPositiveList) {
+  auto fory = Fory::builder()
+                  .xlang(true)
+                  .compatible(false)
+                  .track_ref(false)
+                  .max_unbacked_container_items(0)
+                  .build();
+  ASSERT_TRUE(fory.register_struct<ConfiguredPositiveListField>(614).ok());
+  ConfiguredPositiveListField value{{1, 2, 3}};
+  auto bytes = fory.serialize(value);
+  ASSERT_TRUE(bytes.ok()) << bytes.error().to_string();
+  auto decoded = fory.deserialize<ConfiguredPositiveListField>(*bytes);
+  ASSERT_TRUE(decoded.ok()) << decoded.error().to_string();
+  EXPECT_EQ(decoded->values, value.values);
+}
+
+TEST(StructComprehensiveTest, ListAndArrayAnnotationsUseDistinctTypeIds) {
+  ListArrayAnnotatedStruct obj{
+      {1, 2, 3},
+      {static_cast<int8_t>(1), static_cast<int8_t>(-2), static_cast<int8_t>(3)},
+      {static_cast<uint8_t>(200), static_cast<uint8_t>(250)},
+      {4, 5, 6},
+      {7, 8, 9}};
+  test_roundtrip(obj);
+
+  auto fory =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  ASSERT_TRUE(fory.register_struct<ListArrayAnnotatedStruct>(604).ok());
+  ASSERT_TRUE(fory.serialize(obj).ok());
+  TypeMeta meta =
+      fory.type_resolver().clone_struct_meta<ListArrayAnnotatedStruct>();
+  const auto &fields = meta.get_field_infos();
+  ASSERT_EQ(fields.size(), 5);
+
+  const FieldInfo *numbers = nullptr;
+  const FieldInfo *int8_values = nullptr;
+  const FieldInfo *uint8_values = nullptr;
+  const FieldInfo *dense_numbers = nullptr;
+  const FieldInfo *pixels = nullptr;
+  for (const auto &field : fields) {
+    if (field.field_id == 1) {
+      numbers = &field;
+    } else if (field.field_id == 2) {
+      int8_values = &field;
+    } else if (field.field_id == 3) {
+      uint8_values = &field;
+    } else if (field.field_id == 4) {
+      dense_numbers = &field;
+    } else if (field.field_id == 5) {
+      pixels = &field;
+    }
+  }
+
+  ASSERT_NE(numbers, nullptr);
+  ASSERT_EQ(numbers->field_type.type_id, static_cast<uint32_t>(TypeId::LIST));
+  ASSERT_EQ(numbers->field_type.generics.size(), 1);
+  EXPECT_EQ(numbers->field_type.generics[0].type_id,
+            static_cast<uint32_t>(TypeId::VARINT32));
+
+  ASSERT_NE(int8_values, nullptr);
+  EXPECT_EQ(int8_values->field_type.type_id,
+            static_cast<uint32_t>(TypeId::LIST));
+  ASSERT_EQ(int8_values->field_type.generics.size(), 1);
+  EXPECT_EQ(int8_values->field_type.generics[0].type_id,
+            static_cast<uint32_t>(TypeId::INT8));
+
+  ASSERT_NE(uint8_values, nullptr);
+  EXPECT_EQ(uint8_values->field_type.type_id,
+            static_cast<uint32_t>(TypeId::LIST));
+  ASSERT_EQ(uint8_values->field_type.generics.size(), 1);
+  EXPECT_EQ(uint8_values->field_type.generics[0].type_id,
+            static_cast<uint32_t>(TypeId::UINT8));
+
+  ASSERT_NE(dense_numbers, nullptr);
+  EXPECT_EQ(dense_numbers->field_type.type_id,
+            static_cast<uint32_t>(TypeId::INT32_ARRAY));
+
+  ASSERT_NE(pixels, nullptr);
+  EXPECT_EQ(pixels->field_type.type_id,
+            static_cast<uint32_t>(TypeId::UINT8_ARRAY));
+
+  auto schema_consistent = Fory::builder()
+                               .xlang(true)
+                               .compatible(false)
+                               .check_struct_version(false)
+                               .track_ref(false)
+                               .build();
+  ASSERT_TRUE(
+      schema_consistent.register_struct<ListArrayAnnotatedStruct>(604).ok());
+  auto serialized = schema_consistent.serialize(obj);
+  ASSERT_TRUE(serialized.ok());
+  const std::vector<uint8_t> int8_list_wire = {3, 0x0c, 1,
+                                               static_cast<uint8_t>(0xfe), 3};
+  const std::vector<uint8_t> uint8_list_wire = {
+      2, 0x0c, static_cast<uint8_t>(200), static_cast<uint8_t>(250)};
+  EXPECT_NE(std::search(serialized.value().begin(), serialized.value().end(),
+                        int8_list_wire.begin(), int8_list_wire.end()),
+            serialized.value().end());
+  EXPECT_NE(std::search(serialized.value().begin(), serialized.value().end(),
+                        uint8_list_wire.begin(), uint8_list_wire.end()),
+            serialized.value().end());
+}
+
+TEST(StructComprehensiveTest, FullyTaggedStructsUseNumericTagOrder) {
+  NumericTaggedOrderStruct obj{"ten", 2, 1};
+  test_roundtrip(obj);
+
+  auto fory =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  ASSERT_TRUE(fory.register_struct<NumericTaggedOrderStruct>(605).ok());
+  auto serialized = fory.serialize(obj);
+  ASSERT_TRUE(serialized.ok());
+  auto deserialized =
+      fory.deserialize<NumericTaggedOrderStruct>(serialized.value());
+  ASSERT_TRUE(deserialized.ok());
+  EXPECT_EQ(deserialized.value(), obj);
+  TypeMeta meta =
+      fory.type_resolver().clone_struct_meta<NumericTaggedOrderStruct>();
+  const auto &fields = meta.get_field_infos();
+  ASSERT_EQ(fields.size(), 3);
+  EXPECT_EQ(fields[0].field_id, 1);
+  EXPECT_EQ(fields[1].field_id, 2);
+  EXPECT_EQ(fields[2].field_id, 10);
+
+  std::map<int32_t, const FieldInfo *> fields_by_id;
+  for (const auto &field : fields) {
+    fields_by_id.emplace(field.field_id, &field);
+  }
+  ASSERT_NE(fields_by_id.find(1), fields_by_id.end());
+  ASSERT_NE(fields_by_id.find(2), fields_by_id.end());
+  ASSERT_NE(fields_by_id.find(10), fields_by_id.end());
+
+  auto fingerprint_part = [&](int32_t field_id) {
+    const FieldInfo &field = *fields_by_id[field_id];
+    return std::to_string(field_id) + "," +
+           std::to_string(field.field_type.type_id) + "," +
+           (field.field_type.track_ref ? "1" : "0") + "," +
+           (field.field_type.nullable ? "1" : "0") + ";";
+  };
+  EXPECT_EQ(TypeMeta::compute_struct_fingerprint(fields),
+            fingerprint_part(1) + fingerprint_part(2) + fingerprint_part(10));
+}
+
+TEST(StructComprehensiveTest, TaggedFieldsKeepGroupedPayloadOrder) {
+  TaggedGroupedOrderStruct obj{"first", 10};
+  test_roundtrip(obj);
+
+  auto fory =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  ASSERT_TRUE(fory.register_struct<TaggedGroupedOrderStruct>(606).ok());
+  ASSERT_TRUE(fory.serialize(obj).ok());
+  TypeMeta meta =
+      fory.type_resolver().clone_struct_meta<TaggedGroupedOrderStruct>();
+  const auto &fields = meta.get_field_infos();
+  ASSERT_EQ(fields.size(), 2);
+  EXPECT_EQ(fields[0].field_id, 10);
+  EXPECT_EQ(fields[1].field_id, 1);
+}
+
+TEST(StructComprehensiveTest, MixedFieldIdentifiersUseProtocolOrder) {
+  MixedFieldIdentityStruct obj{"beta", "tagged", "alpha", 7};
+  test_roundtrip(obj);
+
+  auto fory =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  ASSERT_TRUE(fory.register_struct<MixedFieldIdentityStruct>(607).ok());
+  ASSERT_TRUE(fory.serialize(obj).ok());
+  TypeMeta meta =
+      fory.type_resolver().clone_struct_meta<MixedFieldIdentityStruct>();
+  const auto &fields = meta.get_field_infos();
+  ASSERT_EQ(fields.size(), 4);
+  EXPECT_EQ(fields[0].field_id, 2);
+  EXPECT_EQ(fields[1].field_id, 3);
+  EXPECT_EQ(fields[2].field_name, "alpha_value");
+  EXPECT_EQ(fields[2].field_id, -1);
+  EXPECT_EQ(fields[3].field_name, "beta_value");
+  EXPECT_EQ(fields[3].field_id, -1);
+}
+
+TEST(StructComprehensiveTest, FieldTagRange) {
+  MaximumFieldTagStruct value{42};
+  auto fory =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  ASSERT_TRUE(fory.register_struct<MaximumFieldTagStruct>(631).ok());
+  auto encoded = fory.serialize(value);
+  ASSERT_TRUE(encoded.ok()) << encoded.error().to_string();
+  auto decoded = fory.deserialize<MaximumFieldTagStruct>(encoded.value());
+  ASSERT_TRUE(decoded.ok()) << decoded.error().to_string();
+  EXPECT_EQ(decoded.value(), value);
+
+  TypeMeta meta =
+      fory.type_resolver().clone_struct_meta<MaximumFieldTagStruct>();
+  ASSERT_EQ(meta.field_infos.size(), 1);
+  EXPECT_EQ(meta.field_infos[0].field_id, 536870911);
+
+  FieldInfo invalid("value", make_test_field_type(TypeId::INT32));
+  invalid.field_id = 536870912;
+  EXPECT_FALSE(invalid.to_bytes().ok());
+
+  Buffer invalid_wire;
+  invalid_wire.write_uint8(static_cast<uint8_t>((3u << 6) | (15u << 2)));
+  invalid_wire.write_var_uint32(536870912u - 15u);
+  invalid_wire.write_uint8(static_cast<uint8_t>(TypeId::INT32));
+  EXPECT_FALSE(FieldInfo::from_bytes(invalid_wire).ok());
+
+  TypeMeta duplicate;
+  duplicate.type_id = static_cast<uint32_t>(TypeId::COMPATIBLE_STRUCT);
+  duplicate.user_type_id = 632;
+  duplicate.field_infos = {
+      make_test_field_info("first", 7, make_test_field_type(TypeId::INT32)),
+      make_test_field_info("second", 7, make_test_field_type(TypeId::INT32))};
+  EXPECT_FALSE(duplicate.to_bytes().ok());
+}
+
+TEST(StructComprehensiveTest, CompatibleHighTagsRead) {
+  auto writer =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  auto reader =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  ASSERT_TRUE(writer.register_struct<HighTagCompatibleWriter>(633).ok());
+  ASSERT_TRUE(reader.register_struct<HighTagCompatibleReader>(633).ok());
+
+  auto encoded = writer.serialize(HighTagCompatibleWriter{"skip", 42});
+  ASSERT_TRUE(encoded.ok()) << encoded.error().to_string();
+  auto decoded = reader.deserialize<HighTagCompatibleReader>(*encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.error().to_string();
+  EXPECT_EQ(decoded->shared, 42);
+}
+
+TEST(StructComprehensiveTest, NonPrimitiveFieldsSortByFieldIdentifier) {
+  auto fields = TypeMeta::sort_field_infos({
+      make_test_field_info("string_value", 20,
+                           make_test_field_type(TypeId::STRING)),
+      make_test_field_info("map_value", 10, make_test_field_type(TypeId::MAP)),
+      make_test_field_info("custom_value", -1,
+                           make_test_field_type(TypeId::NAMED_STRUCT)),
+      make_test_field_info("binary_value", -1,
+                           make_test_field_type(TypeId::BINARY)),
+  });
+
+  ASSERT_EQ(fields.size(), 4);
+  EXPECT_EQ(fields[0].field_name, "map_value");
+  EXPECT_EQ(fields[1].field_name, "string_value");
+  EXPECT_EQ(fields[2].field_name, "binary_value");
+  EXPECT_EQ(fields[3].field_name, "custom_value");
+}
+
+TEST(StructComprehensiveTest, FieldTypeCompatibilitySeparatesAdapters) {
+  FieldType fixed_i32 = make_test_field_type(TypeId::INT32);
+  FieldType var_i32 = make_test_field_type(TypeId::VARINT32);
+  EXPECT_FALSE(field_types_compatible(fixed_i32, var_i32));
+  EXPECT_TRUE(field_types_compatible_top_level(fixed_i32, var_i32));
+  EXPECT_EQ(fixed_i32.compatible_fingerprint, var_i32.compatible_fingerprint);
+
+  FieldType fixed_list =
+      make_test_field_type(TypeId::LIST, {make_test_field_type(TypeId::INT32)});
+  FieldType var_list = make_test_field_type(
+      TypeId::LIST, {make_test_field_type(TypeId::VARINT32)});
+  EXPECT_FALSE(field_types_compatible(fixed_list, var_list));
+
+  FieldType int64_list = make_test_field_type(
+      TypeId::LIST, {make_test_field_type(TypeId::VARINT64)});
+  EXPECT_FALSE(field_types_compatible(fixed_list, int64_list));
+
+  FieldType nullable_i32(static_cast<uint32_t>(TypeId::INT32), true);
+  FieldType nullable_list = make_test_field_type(TypeId::LIST, {nullable_i32});
+  EXPECT_FALSE(field_types_compatible(fixed_list, nullable_list));
+
+  EXPECT_FALSE(
+      field_types_compatible(make_test_field_type(TypeId::BINARY),
+                             make_test_field_type(TypeId::UINT8_ARRAY)));
+  EXPECT_TRUE(field_types_compatible_top_level(
+      make_test_field_type(TypeId::BINARY),
+      make_test_field_type(TypeId::UINT8_ARRAY)));
+
+  FieldType int32_array = make_test_field_type(TypeId::INT32_ARRAY);
+  EXPECT_TRUE(field_types_compatible_top_level(fixed_list, int32_array));
+  EXPECT_TRUE(field_types_compatible_top_level(nullable_list, int32_array));
+  EXPECT_TRUE(field_types_compatible_top_level(int32_array, nullable_list));
+  FieldType tracked_i32(static_cast<uint32_t>(TypeId::INT32), false, true);
+  FieldType tracked_list = make_test_field_type(TypeId::LIST, {tracked_i32});
+  EXPECT_TRUE(field_types_compatible_top_level(tracked_list, int32_array));
+  EXPECT_FALSE(field_types_compatible_top_level(int32_array, tracked_list));
+  FieldType nullable_int32_array(static_cast<uint32_t>(TypeId::INT32_ARRAY),
+                                 true);
+  EXPECT_FALSE(
+      field_types_compatible_top_level(fixed_list, nullable_int32_array));
+}
+
+TEST(StructComprehensiveTest,
+     LocalDispatchRejectsIncompatibleTaggedNestedTypes) {
+  TypeMeta local_type;
+  local_type.field_infos = {make_test_field_info(
+      "items", 7,
+      make_test_field_type(TypeId::LIST,
+                           {make_test_field_type(TypeId::VAR_UINT32)}))};
+
+  std::vector<FieldInfo> incompatible_remote = {make_test_field_info(
+      "items", 7,
+      make_test_field_type(TypeId::MAP,
+                           {make_test_field_type(TypeId::VAR_UINT32),
+                            make_test_field_type(TypeId::VAR_UINT32)}))};
+  auto incompatible_result =
+      TypeMeta::assign_local_dispatch_ids(&local_type, incompatible_remote);
+  EXPECT_FALSE(incompatible_result.ok());
+
+  std::vector<FieldInfo> nested_scalar_remote = {make_test_field_info(
+      "items", 7,
+      make_test_field_type(TypeId::LIST,
+                           {make_test_field_type(TypeId::UINT32)}))};
+  auto nested_scalar_result =
+      TypeMeta::assign_local_dispatch_ids(&local_type, nested_scalar_remote);
+  EXPECT_FALSE(nested_scalar_result.ok());
+
+  TypeMeta scalar_local;
+  scalar_local.field_infos = {make_test_field_info(
+      "count", 8, make_test_field_type(TypeId::VAR_UINT32))};
+  std::vector<FieldInfo> scalar_remote = {
+      make_test_field_info("count", 8, make_test_field_type(TypeId::UINT32))};
+  auto scalar_result =
+      TypeMeta::assign_local_dispatch_ids(&scalar_local, scalar_remote);
+  ASSERT_TRUE(scalar_result.ok());
+  EXPECT_EQ(scalar_remote[0].field_id, 8);
+  EXPECT_EQ(scalar_remote[0].matched_field_id, 1);
+
+  TypeMeta name_mode_local;
+  name_mode_local.field_infos = {make_test_field_info(
+      "items", -1,
+      make_test_field_type(TypeId::LIST,
+                           {make_test_field_type(TypeId::VAR_UINT32)}))};
+  std::vector<FieldInfo> mixed_mode_remote = {make_test_field_info(
+      "items", 7,
+      make_test_field_type(TypeId::LIST,
+                           {make_test_field_type(TypeId::UINT32)}))};
+  ASSERT_TRUE(
+      TypeMeta::assign_local_dispatch_ids(&name_mode_local, mixed_mode_remote)
+          .ok());
+  EXPECT_EQ(mixed_mode_remote[0].field_id, 7);
+  EXPECT_EQ(mixed_mode_remote[0].matched_field_id, -1);
+
+  std::vector<FieldInfo> name_remote = {make_test_field_info(
+      "items", -1,
+      make_test_field_type(TypeId::LIST,
+                           {make_test_field_type(TypeId::UINT32)}))};
+  ASSERT_TRUE(
+      TypeMeta::assign_local_dispatch_ids(&local_type, name_remote).ok());
+  EXPECT_EQ(name_remote[0].field_id, -1);
+  EXPECT_EQ(name_remote[0].matched_field_id, -1);
+
+  TypeMeta mixed_local;
+  mixed_local.field_infos = {
+      make_test_field_info("tagged", 3, make_test_field_type(TypeId::STRING)),
+      make_test_field_info("alpha", -1, make_test_field_type(TypeId::BINARY)),
+      make_test_field_info("beta", -1, make_test_field_type(TypeId::VARINT32))};
+  std::vector<FieldInfo> mixed_remote = {
+      make_test_field_info("alpha", -1, make_test_field_type(TypeId::BINARY)),
+      make_test_field_info("tagged", 3, make_test_field_type(TypeId::STRING)),
+      make_test_field_info("beta", -1, make_test_field_type(TypeId::VARINT32))};
+  ASSERT_TRUE(
+      TypeMeta::assign_local_dispatch_ids(&mixed_local, mixed_remote).ok());
+  EXPECT_EQ(mixed_remote[0].field_id, -1);
+  EXPECT_EQ(mixed_remote[0].matched_field_id, 2);
+  EXPECT_EQ(mixed_remote[1].field_id, 3);
+  EXPECT_EQ(mixed_remote[1].matched_field_id, 0);
+  EXPECT_EQ(mixed_remote[2].field_id, -1);
+  EXPECT_EQ(mixed_remote[2].matched_field_id, 4);
+
+  std::vector<FieldInfo> untagged_remote_for_tagged_local = {
+      make_test_field_info("tagged", -1, make_test_field_type(TypeId::STRING))};
+  ASSERT_TRUE(TypeMeta::assign_local_dispatch_ids(
+                  &mixed_local, untagged_remote_for_tagged_local)
+                  .ok());
+  EXPECT_EQ(untagged_remote_for_tagged_local[0].field_id, -1);
+  EXPECT_EQ(untagged_remote_for_tagged_local[0].matched_field_id, -1);
+}
+
+TEST(StructComprehensiveTest, CompatibleSignedToUnsignedStructRead) {
+  auto writer =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  auto reader =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  ASSERT_TRUE(writer.register_struct<SignedToUnsignedWriter>(608).ok());
+  ASSERT_TRUE(reader.register_struct<UnsignedTargetReader>(608).ok());
+
+  auto bytes_result = writer.serialize(SignedToUnsignedWriter{123});
+  ASSERT_TRUE(bytes_result.ok())
+      << "Serialization failed: " << bytes_result.error().to_string();
+
+  std::vector<uint8_t> bytes = std::move(bytes_result).value();
+  auto result =
+      reader.deserialize<UnsignedTargetReader>(bytes.data(), bytes.size());
+  ASSERT_TRUE(result.ok()) << "Deserialization failed: "
+                           << result.error().to_string();
+  EXPECT_EQ(result.value().value, 123u);
+}
+
+TEST(StructComprehensiveTest, CompatibleNegativeSignedToUnsignedFails) {
+  auto writer =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  auto reader =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  ASSERT_TRUE(writer.register_struct<SignedToUnsignedWriter>(609).ok());
+  ASSERT_TRUE(reader.register_struct<UnsignedTargetReader>(609).ok());
+
+  auto bytes_result = writer.serialize(SignedToUnsignedWriter{-1});
+  ASSERT_TRUE(bytes_result.ok())
+      << "Serialization failed: " << bytes_result.error().to_string();
+
+  std::vector<uint8_t> bytes = std::move(bytes_result).value();
+  auto result =
+      reader.deserialize<UnsignedTargetReader>(bytes.data(), bytes.size());
+  EXPECT_FALSE(result.ok());
+}
+
+TEST(StructComprehensiveTest, LocalDispatchRejectsMatchedIdOverflow) {
+  constexpr size_t max_compatible_matched_field_index =
+      (static_cast<size_t>(std::numeric_limits<int16_t>::max()) - 1) / 2;
+  const FieldType field_type = make_test_field_type(TypeId::INT32);
+
+  TypeMeta local_type;
+  local_type.field_infos.reserve(max_compatible_matched_field_index + 2);
+  for (size_t index = 0; index <= max_compatible_matched_field_index + 1;
+       ++index) {
+    local_type.field_infos.push_back(
+        make_test_field_info("field_" + std::to_string(index), -1, field_type));
+  }
+
+  std::vector<FieldInfo> remote_fields = {make_test_field_info(
+      "field_" + std::to_string(max_compatible_matched_field_index + 1), -1,
+      field_type)};
+  auto result = TypeMeta::assign_local_dispatch_ids(&local_type, remote_fields);
+
+  ASSERT_FALSE(result.ok());
+  EXPECT_NE(result.error().message().find("exceeds max"), std::string::npos);
+}
+
+TEST(StructComprehensiveTest, OptionalFieldsAllEmpty) {
+  test_roundtrip(
+      OptionalFieldsStruct{"John", std::nullopt, std::nullopt, std::nullopt});
+}
+
+TEST(StructComprehensiveTest, OptionalFieldsSome) {
+  test_roundtrip(OptionalFieldsStruct{"Jane", 25, std::nullopt, std::nullopt});
+}
+
+TEST(StructComprehensiveTest, OptionalFieldsAll) {
+  test_roundtrip(
+      OptionalFieldsStruct{"Alice", 30, "alice@example.com", Point2D{10, 20}});
+}
+
+TEST(StructComprehensiveTest, EnumFields) {
+  test_roundtrip(EnumStruct{Color::RED, Status::PENDING});
+  test_roundtrip(EnumStruct{Color::GREEN, Status::ACTIVE});
+  test_roundtrip(EnumStruct{Color::BLUE, Status::COMPLETED});
+}
+
+TEST(StructComprehensiveTest, UserProfileBasic) {
+  test_roundtrip(UserProfile{
+      12345, "johndoe", "john@example.com", std::nullopt, {}, {}, 0, false});
+}
+
+TEST(StructComprehensiveTest, UserProfileComplete) {
+  test_roundtrip(UserProfile{67890,
+                             "janedoe",
+                             "jane@example.com",
+                             "Engineer",
+                             {"coding", "reading"},
+                             {{"location", "SF"}},
+                             5000,
+                             true});
+}
+
+TEST(StructComprehensiveTest, ProductSimple) {
+  test_roundtrip(Product{1001,
+                         "Widget",
+                         "A useful widget",
+                         19.99,
+                         100,
+                         {"tools"},
+                         {{"color", "blue"}}});
+}
+
+TEST(StructComprehensiveTest, OrderEmpty) {
+  test_roundtrip(Order{1, 12345, {}, 0.0, Status::PENDING});
+}
+
+TEST(StructComprehensiveTest, OrderMultiple) {
+  test_roundtrip(Order{2,
+                       67890,
+                       {{1001, 2, 19.99}, {2002, 1, 299.99}},
+                       389.98,
+                       Status::COMPLETED});
+}
+
+TEST(StructComprehensiveTest, LargeVectorOfStructs) {
+  std::vector<Point2D> points;
+  for (int i = 0; i < 1000; ++i) {
+    points.push_back({i, i * 2});
+  }
+
+  auto fory = Fory::builder().xlang(true).compatible(false).build();
+  // Register Point2D for the vector elements
+  fory.register_struct<Point2D>(1);
+
+  auto ser_result = fory.serialize(points);
+  ASSERT_TRUE(ser_result.ok());
+
+  std::vector<uint8_t> bytes = std::move(ser_result).value();
+  auto deser_result =
+      fory.deserialize<std::vector<Point2D>>(bytes.data(), bytes.size());
+  ASSERT_TRUE(deser_result.ok());
+  EXPECT_EQ(points, deser_result.value());
+}
+
+TEST(StructComprehensiveTest, NestedNamespaceInClassStruct) {
+  test_roundtrip(nested_test::inner::InClassStruct{7, "in"});
+}
+
+TEST(StructComprehensiveTest, NestedNamespaceOutClassStruct) {
+  test_roundtrip(nested_test::inner::OutClassStruct{8, "out"});
+}
+
+TEST(StructComprehensiveTest, ExternalStruct) {
+  test_roundtrip(external_test::ExternalStruct{1, "external"});
+  test_roundtrip(external_test::ExternalStruct{42, ""});
+}
+
+TEST(StructComprehensiveTest, ExternalEmptyStruct) {
+  test_roundtrip(external_test::ExternalEmpty{});
+}
+
+TEST(StructComprehensiveTest, StructEvolvingOverride) {
+  auto fory =
+      Fory::builder().xlang(true).compatible(true).track_ref(false).build();
+  ASSERT_TRUE(fory.register_struct<EvolvingStruct>(1).ok());
+  ASSERT_TRUE(fory.register_struct<FixedStruct>(2).ok());
+
+  auto evolving_info = fory.type_resolver().get_type_info<EvolvingStruct>();
+  ASSERT_TRUE(evolving_info.ok());
+  EXPECT_EQ(evolving_info.value()->type_id,
+            static_cast<uint32_t>(TypeId::COMPATIBLE_STRUCT));
+
+  auto fixed_info = fory.type_resolver().get_type_info<FixedStruct>();
+  ASSERT_TRUE(fixed_info.ok());
+  EXPECT_EQ(fixed_info.value()->type_id, static_cast<uint32_t>(TypeId::STRUCT));
+
+  EvolvingStruct evolving{123};
+  auto evolving_bytes_result = fory.serialize(evolving);
+  ASSERT_TRUE(evolving_bytes_result.ok())
+      << "Serialization failed: " << evolving_bytes_result.error().to_string();
+  std::vector<uint8_t> evolving_bytes =
+      std::move(evolving_bytes_result).value();
+
+  FixedStruct fixed{123};
+  auto fixed_bytes_result = fory.serialize(fixed);
+  ASSERT_TRUE(fixed_bytes_result.ok())
+      << "Serialization failed: " << fixed_bytes_result.error().to_string();
+  std::vector<uint8_t> fixed_bytes = std::move(fixed_bytes_result).value();
+
+  EXPECT_LT(fixed_bytes.size(), evolving_bytes.size());
+
+  auto evolving_result = fory.deserialize<EvolvingStruct>(
+      evolving_bytes.data(), evolving_bytes.size());
+  ASSERT_TRUE(evolving_result.ok())
+      << "Deserialization failed: " << evolving_result.error().to_string();
+  EXPECT_EQ(evolving_result.value().id, evolving.id);
+
+  auto fixed_result =
+      fory.deserialize<FixedStruct>(fixed_bytes.data(), fixed_bytes.size());
+  ASSERT_TRUE(fixed_result.ok())
+      << "Deserialization failed: " << fixed_result.error().to_string();
+  EXPECT_EQ(fixed_result.value().id, fixed.id);
+}
+
+} // namespace test
+} // namespace serialization
+} // namespace fory

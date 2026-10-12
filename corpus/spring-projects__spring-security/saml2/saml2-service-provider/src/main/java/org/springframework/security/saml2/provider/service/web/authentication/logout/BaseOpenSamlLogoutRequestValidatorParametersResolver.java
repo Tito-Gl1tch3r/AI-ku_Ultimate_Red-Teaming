@@ -1,0 +1,217 @@
+/*
+ * Copyright 2004-present the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.springframework.security.saml2.provider.service.web.authentication.logout;
+
+import java.util.Objects;
+
+import jakarta.servlet.http.HttpServletRequest;
+import org.jspecify.annotations.Nullable;
+import org.opensaml.core.xml.schema.XSString;
+import org.opensaml.saml.saml2.core.Issuer;
+import org.opensaml.saml.saml2.core.LogoutRequest;
+
+import org.springframework.http.HttpMethod;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.saml2.core.OpenSamlInitializationService;
+import org.springframework.security.saml2.core.Saml2Error;
+import org.springframework.security.saml2.core.Saml2ParameterNames;
+import org.springframework.security.saml2.provider.service.authentication.Saml2AssertionAuthentication;
+import org.springframework.security.saml2.provider.service.authentication.Saml2AuthenticatedPrincipal;
+import org.springframework.security.saml2.provider.service.authentication.Saml2AuthenticationException;
+import org.springframework.security.saml2.provider.service.authentication.logout.Saml2LogoutRequest;
+import org.springframework.security.saml2.provider.service.authentication.logout.Saml2LogoutRequestValidatorParameters;
+import org.springframework.security.saml2.provider.service.registration.RelyingPartyRegistration;
+import org.springframework.security.saml2.provider.service.registration.RelyingPartyRegistrationRepository;
+import org.springframework.security.saml2.provider.service.registration.Saml2MessageBinding;
+import org.springframework.security.saml2.provider.service.web.RelyingPartyRegistrationPlaceholderResolvers;
+import org.springframework.security.web.util.matcher.OrRequestMatcher;
+import org.springframework.security.web.util.matcher.RequestMatcher;
+import org.springframework.util.Assert;
+
+import static org.springframework.security.web.servlet.util.matcher.PathPatternRequestMatcher.pathPattern;
+
+/**
+ * An OpenSAML-based implementation of
+ * {@link Saml2LogoutRequestValidatorParametersResolver}.
+ */
+final class BaseOpenSamlLogoutRequestValidatorParametersResolver
+		implements Saml2LogoutRequestValidatorParametersResolver {
+
+	static {
+		OpenSamlInitializationService.initialize();
+	}
+
+	private final OpenSamlOperations saml;
+
+	private final RelyingPartyRegistrationRepository registrations;
+
+	private RequestMatcher requestMatcher = new OrRequestMatcher(pathPattern("/logout/saml2/slo/{registrationId}"),
+			pathPattern("/logout/saml2/slo"));
+
+	/**
+	 * Constructs a {@link BaseOpenSamlLogoutRequestValidatorParametersResolver}.
+	 */
+	BaseOpenSamlLogoutRequestValidatorParametersResolver(OpenSamlOperations saml,
+			RelyingPartyRegistrationRepository registrations) {
+		Assert.notNull(registrations, "relyingPartyRegistrationRepository cannot be null");
+		this.saml = saml;
+		this.registrations = registrations;
+	}
+
+	/**
+	 * Construct the parameters necessary for validating an asserting party's
+	 * {@code <saml2:LogoutRequest>} based on the given {@link HttpServletRequest}
+	 *
+	 * <p>
+	 * Uses the configured {@link RequestMatcher} to identify the processing request,
+	 * including looking for any indicated {@code registrationId}.
+	 *
+	 * <p>
+	 * If a {@code registrationId} is found in the request, it will attempt to use that,
+	 * erroring if no {@link RelyingPartyRegistration} is found.
+	 *
+	 * <p>
+	 * If no {@code registrationId} is found in the request, it will look for a currently
+	 * logged-in user and use the associated {@code registrationId}.
+	 *
+	 * <p>
+	 * In the event that neither the URL nor any logged in user could determine a
+	 * {@code registrationId}, this code then will try and derive a
+	 * {@link RelyingPartyRegistration} given the {@code <saml2:LogoutRequest>}'s
+	 * {@code Issuer} value.
+	 * @param request the HTTP request
+	 * @return a {@link Saml2LogoutRequestValidatorParameters} instance, or {@code null}
+	 * if one could not be resolved
+	 * @throws Saml2AuthenticationException if the {@link RequestMatcher} specifies a
+	 * non-existent {@code registrationId}
+	 */
+	@Override
+	public @Nullable Saml2LogoutRequestValidatorParameters resolve(HttpServletRequest request,
+			@Nullable Authentication authentication) {
+		if (request.getParameter(Saml2ParameterNames.SAML_REQUEST) == null) {
+			return null;
+		}
+		RequestMatcher.MatchResult result = this.requestMatcher.matcher(request);
+		if (!result.isMatch()) {
+			return null;
+		}
+		String registrationId = getRegistrationId(result, authentication);
+		if (registrationId == null) {
+			return logoutRequestByEntityId(request, authentication);
+		}
+		return logoutRequestById(request, authentication, registrationId);
+	}
+
+	/**
+	 * The request matcher to use to identify a request to process a
+	 * {@code <saml2:LogoutRequest>}. By default, checks for {@code /logout/saml2/slo} and
+	 * {@code /logout/saml2/slo/{registrationId}}.
+	 *
+	 * <p>
+	 * Generally speaking, the URL does not need to have a {@code registrationId} in it
+	 * since either it can be looked up from the active logged in user or it can be
+	 * derived through the {@code Issuer} in the {@code <saml2:LogoutRequest>}.
+	 * @param requestMatcher the {@link RequestMatcher} to use
+	 */
+	void setRequestMatcher(RequestMatcher requestMatcher) {
+		Assert.notNull(requestMatcher, "requestMatcher cannot be null");
+		this.requestMatcher = requestMatcher;
+	}
+
+	private @Nullable String getRegistrationId(RequestMatcher.MatchResult result,
+			@Nullable Authentication authentication) {
+		String registrationId = result.getVariables().get("registrationId");
+		if (registrationId != null) {
+			return registrationId;
+		}
+		if (authentication == null) {
+			return null;
+		}
+		if (authentication instanceof Saml2AssertionAuthentication saml2) {
+			return saml2.getRelyingPartyRegistrationId();
+		}
+		if (authentication.getPrincipal() instanceof Saml2AuthenticatedPrincipal saml2) {
+			return saml2.getRelyingPartyRegistrationId();
+		}
+		return null;
+	}
+
+	private @Nullable Saml2LogoutRequestValidatorParameters logoutRequestById(HttpServletRequest request,
+			@Nullable Authentication authentication, String registrationId) {
+		RelyingPartyRegistration registration = this.registrations.findByRegistrationId(registrationId);
+		if (registration == null) {
+			throw new Saml2AuthenticationException(
+					Saml2Error.relyingPartyRegistrationNotFound("registration not found"));
+		}
+		return logoutRequestByRegistration(request, registration, authentication);
+	}
+
+	private @Nullable Saml2LogoutRequestValidatorParameters logoutRequestByEntityId(HttpServletRequest request,
+			@Nullable Authentication authentication) {
+		String serialized = request.getParameter(Saml2ParameterNames.SAML_REQUEST);
+		LogoutRequest logoutRequest = this.saml.deserialize(
+				Saml2Utils.withEncoded(serialized).inflate(HttpMethod.GET.matches(request.getMethod())).decode());
+		Issuer issuer = logoutRequest.getIssuer();
+		Assert.notNull(issuer, "LogoutRequest#Issuer cannot be null");
+		RelyingPartyRegistration registration = this.registrations.findUniqueByAssertingPartyEntityId(getValue(issuer));
+		return logoutRequestByRegistration(request, registration, authentication);
+	}
+
+	private @Nullable Saml2LogoutRequestValidatorParameters logoutRequestByRegistration(HttpServletRequest request,
+			@Nullable RelyingPartyRegistration registration, @Nullable Authentication authentication) {
+		if (registration == null) {
+			return null;
+		}
+		Saml2MessageBinding saml2MessageBinding = Saml2MessageBindingUtils.resolveBinding(request);
+		registration = fromRequest(request, registration);
+		String serialized = request.getParameter(Saml2ParameterNames.SAML_REQUEST);
+		String location = registration.getSingleLogoutServiceLocation();
+		Assert.notNull(location, "logoutServiceLocation must be configured");
+		Saml2LogoutRequest logoutRequest = Saml2LogoutRequest.withRelyingPartyRegistration(registration)
+			.samlRequest(serialized)
+			.relayState(request.getParameter(Saml2ParameterNames.RELAY_STATE))
+			.binding(saml2MessageBinding)
+			.location(location)
+			.parameters((params) -> params.put(Saml2ParameterNames.SIG_ALG,
+					request.getParameter(Saml2ParameterNames.SIG_ALG)))
+			.parameters((params) -> params.put(Saml2ParameterNames.SIGNATURE,
+					request.getParameter(Saml2ParameterNames.SIGNATURE)))
+			.parametersQuery((params) -> request.getQueryString())
+			.build();
+		return new Saml2LogoutRequestValidatorParameters(logoutRequest, registration, authentication);
+	}
+
+	private RelyingPartyRegistration fromRequest(HttpServletRequest request, RelyingPartyRegistration registration) {
+		RelyingPartyRegistrationPlaceholderResolvers.UriResolver uriResolver = RelyingPartyRegistrationPlaceholderResolvers
+			.uriResolver(request, registration);
+		String entityId = Objects.requireNonNull(uriResolver.resolve(registration.getEntityId()));
+		String logoutLocation = uriResolver.resolve(registration.getSingleLogoutServiceLocation());
+		String logoutResponseLocation = uriResolver.resolve(registration.getSingleLogoutServiceResponseLocation());
+		return registration.mutate()
+			.entityId(entityId)
+			.singleLogoutServiceLocation(logoutLocation)
+			.singleLogoutServiceResponseLocation(logoutResponseLocation)
+			.build();
+	}
+
+	private String getValue(XSString element) {
+		String value = element.getValue();
+		Assert.notNull(value, "required elements must have a value");
+		return value;
+	}
+
+}

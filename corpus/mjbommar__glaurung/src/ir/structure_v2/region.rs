@@ -1,0 +1,126 @@
+//! Typed, non-rendering region candidate for shadow comparison.
+
+use super::{LocalRegions, LoopForest};
+use crate::ir::structure::{Cfg, SwitchDefaultEvidence, SwitchEvidence};
+
+/// One explicit representation of a CFG edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transfer {
+    Flow {
+        to: usize,
+    },
+    Branch {
+        to: usize,
+        taken: bool,
+    },
+    Continue {
+        header: usize,
+        taken: Option<bool>,
+    },
+    Break {
+        header: usize,
+        to: usize,
+        taken: Option<bool>,
+    },
+    LocalGoto {
+        to: usize,
+        taken: Option<bool>,
+        region: usize,
+    },
+}
+
+/// Why a block has no successor edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Terminal {
+    Return,
+    Unknown,
+}
+
+/// One block, owned once, with every outgoing transfer attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockRegion {
+    pub block: usize,
+    pub transfers: Vec<Transfer>,
+    pub terminal: Option<Terminal>,
+}
+
+/// Initial region algebra: exact block ownership and typed local transfers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionCandidate {
+    pub(super) blocks: Vec<BlockRegion>,
+    pub(super) switches: Vec<SwitchEvidence>,
+}
+
+impl RegionCandidate {
+    pub(super) fn from_cfg(cfg: &Cfg, loops: &LoopForest, locals: &LocalRegions) -> Option<Self> {
+        let blocks = (0..cfg.succs.len())
+            .map(|block| {
+                let conditional = cfg.cond_taken[block].filter(|_| cfg.succs[block].len() == 2);
+                let transfers = cfg.succs[block]
+                    .iter()
+                    .copied()
+                    .map(|to| {
+                        let taken = conditional.map(|target| to == target);
+                        if let Some(region) = locals.region_for_block(to) {
+                            return Transfer::LocalGoto { to, taken, region };
+                        }
+                        if loops.is_back_edge(block, to) {
+                            return Transfer::Continue { header: to, taken };
+                        }
+                        if let Some(loop_info) = loops.innermost_containing(block) {
+                            if loop_info.blocks.binary_search(&to).is_err() {
+                                return Transfer::Break {
+                                    header: loop_info.header,
+                                    to,
+                                    taken,
+                                };
+                            }
+                        }
+                        match taken {
+                            Some(taken) => Transfer::Branch { to, taken },
+                            None => Transfer::Flow { to },
+                        }
+                    })
+                    .collect();
+                let terminal = cfg.succs[block].is_empty().then(|| {
+                    if cfg.ends_in_return[block] {
+                        Terminal::Return
+                    } else {
+                        Terminal::Unknown
+                    }
+                });
+                BlockRegion {
+                    block,
+                    transfers,
+                    terminal,
+                }
+            })
+            .collect();
+        Some(Self {
+            blocks,
+            switches: cfg.switches().to_vec(),
+        })
+    }
+
+    pub fn blocks(&self) -> &[BlockRegion] {
+        &self.blocks
+    }
+
+    pub fn transfers(&self) -> impl Iterator<Item = &Transfer> {
+        self.blocks.iter().flat_map(|block| &block.transfers)
+    }
+
+    pub fn transfer_count(&self) -> usize {
+        self.transfers().count()
+    }
+
+    pub fn switches(&self) -> &[SwitchEvidence] {
+        &self.switches
+    }
+
+    pub fn switch_defaults(&self) -> impl Iterator<Item = &SwitchDefaultEvidence> {
+        self.switches
+            .iter()
+            .filter_map(|switch| switch.default.as_ref())
+    }
+}

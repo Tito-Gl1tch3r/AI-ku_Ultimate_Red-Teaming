@@ -1,0 +1,1649 @@
+//! ARM32 prologue / epilogue recognition.
+//!
+//! AAPCS frame setup and teardown are machine bookkeeping, not source-level
+//! arithmetic on a C local named `sp`.  This pass is intentionally
+//! transactional: it collapses a frame only when its saved-register widths,
+//! local allocation, and every lexical return path balance exactly.
+
+use crate::ir::ast::{Expr, Function, OriginSet, Stmt};
+use crate::ir::types::{BinOp, VReg};
+
+#[derive(Clone, Copy)]
+enum IdentityAuthority<'a> {
+    Exact(&'a crate::ir::value_number::ValueIdentities),
+    #[cfg(test)]
+    LegacySpelling,
+}
+
+impl<'a> IdentityAuthority<'a> {
+    fn exact(self) -> Option<&'a crate::ir::value_number::ValueIdentities> {
+        match self {
+            Self::Exact(identities) => Some(identities),
+            #[cfg(test)]
+            Self::LegacySpelling => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SavedRegister {
+    name: String,
+    slot: StackLocation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StackLocation {
+    object: VReg,
+    offset: i64,
+}
+
+#[derive(Debug)]
+struct SaveGroup {
+    width: i64,
+    registers: Vec<SavedRegister>,
+}
+
+#[derive(Debug)]
+struct Arm32Frame {
+    start: usize,
+    end: usize,
+    local_width: i64,
+    save_groups: Vec<SaveGroup>,
+}
+
+impl Arm32Frame {
+    fn total_width(&self) -> i64 {
+        self.local_width
+            + self
+                .save_groups
+                .iter()
+                .map(|group| group.width)
+                .sum::<i64>()
+    }
+
+    fn saved_names(&self) -> Vec<&str> {
+        self.save_groups
+            .iter()
+            .flat_map(|group| group.registers.iter())
+            .map(|register| register.name.as_str())
+            .collect()
+    }
+}
+
+/// Collapse a proven-balanced AAPCS machine frame in `f`.
+#[cfg(test)]
+pub fn recognise_arm32_frame(f: &mut Function) {
+    recognise_arm32_frame_impl(f, IdentityAuthority::LegacySpelling);
+}
+
+/// Collapse a proven-balanced AAPCS frame using exact SSA value authority.
+pub fn recognise_arm32_frame_with_identities(
+    f: &mut Function,
+    identities: &crate::ir::value_number::ValueIdentities,
+) {
+    recognise_arm32_frame_impl(f, IdentityAuthority::Exact(identities));
+}
+
+fn recognise_arm32_frame_impl(f: &mut Function, authority: IdentityAuthority<'_>) {
+    let Some(frame) = parse_prologue(&f.body, authority) else {
+        return;
+    };
+
+    // Work on a clone so one malformed return path cannot leave a partially
+    // rewritten function behind.
+    let mut candidate = f.body.clone();
+    let Some(return_count) = collapse_epilogues(&mut candidate, &frame, authority) else {
+        return;
+    };
+    if return_count == 0 {
+        return;
+    }
+
+    let prologue_comment = comment_with_origins(
+        format!(
+            "arm32 prologue: save {}, frame {} bytes",
+            frame.saved_names().join("/"),
+            frame.total_width()
+        ),
+        &candidate[frame.start..frame.end],
+    );
+    candidate.drain(frame.start..frame.end);
+    candidate.insert(frame.start, prologue_comment);
+
+    // Stack-local promotion should have converted every source-level object to
+    // a semantic stack slot. A remaining architectural `sp` is therefore a
+    // dynamic or otherwise unproved use; retain the original frame rather than
+    // changing its meaning.
+    if candidate
+        .iter()
+        .any(|statement| stmt_mentions_sp(statement, authority))
+    {
+        return;
+    }
+    f.body = candidate;
+}
+
+fn parse_prologue(body: &[Stmt], identities: IdentityAuthority<'_>) -> Option<Arm32Frame> {
+    let mut start = 0;
+    while body
+        .get(start)
+        .is_some_and(|statement| matches!(statement.semantic(), Stmt::Nop | Stmt::Label(_)))
+    {
+        start += 1;
+    }
+
+    let mut cursor = start;
+    let mut save_groups = Vec::new();
+    while let Some(width) = sp_adjust(body.get(cursor)?, BinOp::Sub, identities) {
+        let mut group_cursor = cursor + 1;
+        let mut stored_width = 0i64;
+        let mut registers = Vec::new();
+        while let Some((slot, name, size)) = body
+            .get(group_cursor)
+            .and_then(|statement| saved_register_store(statement, identities))
+        {
+            if stored_width + i64::from(size) > width {
+                break;
+            }
+            stored_width += i64::from(size);
+            registers.push(SavedRegister { name, slot });
+            group_cursor += 1;
+            if stored_width == width {
+                break;
+            }
+        }
+        // A32 `push {fp, lr}; add fp, sp, #4` can reach stack promotion with
+        // the incoming fp already rewritten as the address of its own save
+        // slot. Recover that first word only when the next word is a proven LR
+        // save and the immediately following setup uses the same address.
+        if registers.is_empty() {
+            if let Some((fp_slot, saved_fp_address)) = body
+                .get(group_cursor)
+                .and_then(|statement| aliased_frame_pointer_store(statement, identities))
+            {
+                if let Some((lr_slot, lr_name, lr_size)) = body
+                    .get(group_cursor + 1)
+                    .and_then(|statement| saved_register_store(statement, identities))
+                {
+                    let setup_matches = body
+                        .get(group_cursor + 2)
+                        .and_then(|statement| frame_pointer_setup(statement, identities))
+                        .is_some_and(|location| location == saved_fp_address);
+                    if lr_name == "lr" && lr_size == 4 && width == 8 && setup_matches {
+                        registers.push(SavedRegister {
+                            name: "fp".to_string(),
+                            slot: fp_slot,
+                        });
+                        registers.push(SavedRegister {
+                            name: lr_name,
+                            slot: lr_slot,
+                        });
+                        stored_width = 8;
+                        group_cursor += 2;
+                    }
+                }
+            }
+        }
+        if registers.is_empty() || stored_width != width {
+            break;
+        }
+        save_groups.push(SaveGroup { width, registers });
+        cursor = group_cursor;
+    }
+
+    // Leaf Thumb functions return through the still-live link register and
+    // commonly save only r7 before establishing it as the frame pointer. The
+    // transaction below already proves that every saved register and stack
+    // adjustment is restored on every lexical return path, so requiring an LR
+    // save here rejects a valid balanced leaf frame without adding safety.
+    if save_groups.is_empty() {
+        return None;
+    }
+
+    // A32 establishes fp immediately after the push, whereas Thumb commonly
+    // allocates locals first and then establishes r7. Accept both exact
+    // orderings.
+    if body.get(cursor).is_some_and(|statement| {
+        frame_pointer_setup(statement, identities).is_some_and(|location| {
+            save_groups
+                .iter()
+                .flat_map(|group| group.registers.iter())
+                .any(|saved| saved.slot.object == location.object)
+        })
+    }) {
+        cursor += 1;
+    }
+
+    let local_width = body
+        .get(cursor)
+        .and_then(|statement| sp_adjust(statement, BinOp::Sub, identities))
+        .unwrap_or(0);
+    if local_width > 0 {
+        cursor += 1;
+    }
+
+    // Stack promotion represents Thumb's `add r7, sp, #0` as the address of
+    // the promoted frame-record object. It is part of the machine frame, not
+    // a source assignment. Require that address to name storage already
+    // proven by the save group so an arbitrary source pointer assignment is
+    // never consumed.
+    if body.get(cursor).is_some_and(|statement| {
+        frame_pointer_setup(statement, identities).is_some_and(|location| {
+            local_width > 0
+                || save_groups
+                    .iter()
+                    .flat_map(|group| group.registers.iter())
+                    .any(|saved| saved.slot.object == location.object)
+        })
+    }) {
+        cursor += 1;
+    }
+
+    Some(Arm32Frame {
+        start,
+        end: cursor,
+        local_width,
+        save_groups,
+    })
+}
+
+fn saved_register_store(
+    statement: &Stmt,
+    identities: IdentityAuthority<'_>,
+) -> Option<(StackLocation, String, u8)> {
+    let Stmt::Store { addr, src, size } = statement.semantic() else {
+        return None;
+    };
+    let Expr::Reg(register) = src.semantic() else {
+        return None;
+    };
+    let slot = stack_location(addr, identities)?;
+    let name = canonical_saved_register(register, identities)?;
+    let expected_size = if name.starts_with('d') { 8 } else { 4 };
+    (*size == expected_size).then(|| (slot, name, *size))
+}
+
+fn aliased_frame_pointer_store(
+    statement: &Stmt,
+    identities: IdentityAuthority<'_>,
+) -> Option<(StackLocation, StackLocation)> {
+    let Stmt::Store { addr, src, size: 4 } = statement.semantic() else {
+        return None;
+    };
+    Some((
+        stack_location(addr, identities)?,
+        stack_location(src, identities)?,
+    ))
+}
+
+fn collapse_epilogues(
+    body: &mut Vec<Stmt>,
+    frame: &Arm32Frame,
+    identities: IdentityAuthority<'_>,
+) -> Option<usize> {
+    let mut return_count = 0;
+    for statement in body.iter_mut() {
+        return_count += match statement.semantic_mut() {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                let then_count = collapse_epilogues(then_body, frame, identities)?;
+                let else_count = else_body.as_mut().map_or(Some(0), |else_body| {
+                    collapse_epilogues(else_body, frame, identities)
+                })?;
+                then_count + else_count
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => {
+                collapse_epilogues(body, frame, identities)?
+            }
+            Stmt::Switch { cases, default, .. } => {
+                let mut nested_count = 0;
+                for (_, case_body) in cases {
+                    nested_count += collapse_epilogues(case_body, frame, identities)?;
+                }
+                if let Some(default_body) = default {
+                    nested_count += collapse_epilogues(default_body, frame, identities)?;
+                }
+                nested_count
+            }
+            _ => 0,
+        };
+    }
+
+    let return_positions: Vec<usize> = body
+        .iter()
+        .enumerate()
+        .filter_map(|(index, statement)| {
+            matches!(statement.semantic(), Stmt::Return { .. }).then_some(index)
+        })
+        .collect();
+    return_count += return_positions.len();
+    for return_index in return_positions.into_iter().rev() {
+        let start = match_epilogue(body, return_index, frame, identities)?;
+        let epilogue_comment = comment_with_origins(
+            "arm32 epilogue: restore machine frame".to_string(),
+            &body[start..return_index],
+        );
+        body.drain(start..return_index);
+        body.insert(start, epilogue_comment);
+    }
+    Some(return_count)
+}
+
+fn match_epilogue(
+    body: &[Stmt],
+    return_index: usize,
+    frame: &Arm32Frame,
+    identities: IdentityAuthority<'_>,
+) -> Option<usize> {
+    // Locate the contiguous machine-only suffix, then validate its exact order
+    // below. Large GCC frames restore SP from the frame pointer rather than by
+    // adding the allocation width, so a numeric-width sum is not sufficient.
+    let mut start = return_index;
+    while start > 0 {
+        let index = start - 1;
+        let statement = &body[index];
+        if sp_adjust(statement, BinOp::Add, identities).is_some()
+            || restored_register(statement, identities).is_some()
+            || frame_deallocation_piece(statement, frame, identities)
+            || (frame.local_width > 0
+                && match_frame_deallocation(body, index, frame, identities) == Some(index + 1))
+        {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+
+    let mut cursor = start;
+    let thumb_restores_sp_to_saved_r7 = body.get(cursor).is_some_and(|statement| {
+        matches!(
+            statement.semantic(),
+            Stmt::Assign { dst, src }
+                if is_sp(dst, identities)
+                    && stack_location_from_linear_definitions(
+                        body,
+                        cursor,
+                        src,
+                        identities,
+                        0,
+                    ).as_ref() == first_saved_slot(frame)
+        )
+    });
+    let a32_restores_sp_from_fp = body.get(cursor).is_some_and(|statement| {
+        matches!(
+            statement.semantic(),
+            Stmt::Assign { dst, src }
+                if is_sp(dst, identities)
+                    && matches!(src.semantic(), Expr::Reg(source)
+                        if canonical_saved_register(source, identities).as_deref() == Some("fp"))
+        )
+    });
+    if frame.local_width > 0 {
+        cursor = match_frame_deallocation(body, cursor, frame, identities)?;
+    }
+
+    for group in frame.save_groups.iter().rev() {
+        for saved in &group.registers {
+            if saved.name == "lr" {
+                // `pop {..., pc}` and `ldr pc, [sp], #4` consume the saved link
+                // slot as the return target, so no assignment to `lr` appears.
+                if body
+                    .get(cursor)
+                    .and_then(|statement| restored_register(statement, identities))
+                    .is_some_and(|(name, slot)| name == "lr" && slot == saved.slot)
+                {
+                    cursor += 1;
+                }
+                continue;
+            }
+            let (name, slot) = body
+                .get(cursor)
+                .and_then(|statement| restored_register(statement, identities))?;
+            let promoted_stack_top_alias = (a32_restores_sp_from_fp && saved.name == "fp"
+                || thumb_restores_sp_to_saved_r7 && saved.name == "r7")
+                && first_saved_slot(frame) == Some(&saved.slot)
+                && slot.offset == 0
+                && matches!(&slot.object, VReg::Phys(name) if name == "stack_top");
+            if name != saved.name || (slot != saved.slot && !promoted_stack_top_alias) {
+                return None;
+            }
+            cursor += 1;
+        }
+        if sp_adjust(body.get(cursor)?, BinOp::Add, identities)? != group.width {
+            return None;
+        }
+        cursor += 1;
+    }
+
+    (cursor == return_index).then_some(start)
+}
+
+fn first_saved_slot(frame: &Arm32Frame) -> Option<&StackLocation> {
+    frame
+        .save_groups
+        .first()
+        .and_then(|group| group.registers.first())
+        .map(|saved| &saved.slot)
+}
+
+fn frame_deallocation_piece(
+    statement: &Stmt,
+    frame: &Arm32Frame,
+    identities: IdentityAuthority<'_>,
+) -> bool {
+    match statement.semantic() {
+        Stmt::Assign { dst, src } if is_sp(dst, identities) => {
+            matches!(src.semantic(), Expr::Reg(register) if matches!(canonical_saved_register(register, identities).as_deref(), Some("r7" | "fp")))
+                || matches!(
+                    src.semantic(),
+                    Expr::Bin { op: BinOp::Sub, lhs, rhs }
+                        if matches!(lhs.semantic(), Expr::Reg(register) if canonical_saved_register(register, identities).as_deref() == Some("fp"))
+                            && matches!(rhs.semantic(), Expr::Const(4))
+                )
+        }
+        Stmt::Assign { dst, src } => {
+            canonical_saved_register(dst, identities).as_deref() == Some("r7")
+                && stack_location(src, identities).as_ref() == first_saved_slot(frame)
+        }
+        _ => false,
+    }
+}
+
+fn match_frame_deallocation(
+    body: &[Stmt],
+    cursor: usize,
+    frame: &Arm32Frame,
+    identities: IdentityAuthority<'_>,
+) -> Option<usize> {
+    if sp_adjust(body.get(cursor)?, BinOp::Add, identities) == Some(frame.local_width) {
+        return Some(cursor + 1);
+    }
+
+    // GCC Thumb may leave the frame-address addition expanded through SSA
+    // temporaries because the same add also feeds flag calculations. Follow
+    // only exact, straight-line definitions back to the first saved slot; this
+    // is the semantic equivalent of `mov sp, r7` after stack promotion.
+    if matches!(
+        body.get(cursor).map(Stmt::semantic),
+        Some(Stmt::Assign { dst, src })
+            if is_sp(dst, identities)
+                && stack_location_from_linear_definitions(
+                    body,
+                    cursor,
+                    src,
+                    identities,
+                    0,
+                ).as_ref() == first_saved_slot(frame)
+    ) {
+        return Some(cursor + 1);
+    }
+
+    // Clang A32 commonly establishes `fp = sp` after the save and tears local
+    // storage down with the exact inverse `sp = fp`.
+    if matches!(
+        body.get(cursor).map(Stmt::semantic),
+        Some(Stmt::Assign { dst, src })
+            if is_sp(dst, identities)
+                && matches!(src.semantic(), Expr::Reg(source)
+                    if canonical_saved_register(source, identities).as_deref() == Some("fp"))
+    ) {
+        return Some(cursor + 1);
+    }
+
+    // Thumb: `add r7, sp, #0` established the bottom of the local allocation;
+    // GCC tears it down as `mov sp, r7`, which promotion spells by first
+    // rematerialising the saved-frame object address into r7.
+    if let (Some(first), Some(second)) = (body.get(cursor), body.get(cursor + 1)) {
+        if let (
+            Stmt::Assign { dst: anchor, src },
+            Stmt::Assign {
+                dst,
+                src: sp_source,
+            },
+        ) = (first.semantic(), second.semantic())
+        {
+            if canonical_saved_register(anchor, identities).as_deref() == Some("r7")
+                && stack_location(src, identities).as_ref() == first_saved_slot(frame)
+                && is_sp(dst, identities)
+                && matches!(sp_source.semantic(), Expr::Reg(source) if source == anchor)
+            {
+                return Some(cursor + 2);
+            }
+        }
+    }
+
+    // A32: `add fp, sp, #4` makes the first pushed word live at `fp - 4`.
+    if matches!(
+        body.get(cursor).map(Stmt::semantic),
+        Some(Stmt::Assign { dst, src })
+            if is_sp(dst, identities)
+                && matches!(src.semantic(), Expr::Bin { op: BinOp::Sub, lhs, rhs }
+                    if matches!(lhs.semantic(), Expr::Reg(register)
+                        if canonical_saved_register(register, identities).as_deref() == Some("fp"))
+                        && matches!(rhs.semantic(), Expr::Const(4)))
+    ) {
+        return Some(cursor + 1);
+    }
+
+    None
+}
+
+fn stack_location_from_linear_definitions(
+    body: &[Stmt],
+    before: usize,
+    expression: &Expr,
+    identities: IdentityAuthority<'_>,
+    depth: usize,
+) -> Option<StackLocation> {
+    if depth > 16 {
+        return None;
+    }
+    if let Some(location) = stack_location(expression, identities) {
+        return Some(location);
+    }
+    match expression.semantic() {
+        Expr::Reg(register) => {
+            let exact_identities = identities.exact()?;
+            exact_identities.exact(register)?;
+            for (index, statement) in body[..before].iter().enumerate().rev() {
+                match statement.semantic() {
+                    Stmt::Assign { dst, src } if dst == register => {
+                        return stack_location_from_linear_definitions(
+                            body,
+                            index,
+                            src,
+                            identities,
+                            depth + 1,
+                        );
+                    }
+                    Stmt::Assign { .. } | Stmt::Nop | Stmt::Comment(_) | Stmt::Label(_) => {}
+                    _ => break,
+                }
+            }
+            None
+        }
+        Expr::Bin {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } => {
+            let mut location =
+                stack_location_from_linear_definitions(body, before, lhs, identities, depth + 1)?;
+            let offset =
+                constant_from_linear_definitions(body, before, rhs, identities, depth + 1)?;
+            location.offset = location.offset.checked_add(offset)?;
+            Some(location)
+        }
+        _ => None,
+    }
+}
+
+fn constant_from_linear_definitions(
+    body: &[Stmt],
+    before: usize,
+    expression: &Expr,
+    identities: IdentityAuthority<'_>,
+    depth: usize,
+) -> Option<i64> {
+    if depth > 16 {
+        return None;
+    }
+    match expression.semantic() {
+        Expr::Const(value) => Some(*value),
+        Expr::Reg(register) => {
+            let exact_identities = identities.exact()?;
+            exact_identities.exact(register)?;
+            for (index, statement) in body[..before].iter().enumerate().rev() {
+                match statement.semantic() {
+                    Stmt::Assign { dst, src } if dst == register => {
+                        return constant_from_linear_definitions(
+                            body,
+                            index,
+                            src,
+                            identities,
+                            depth + 1,
+                        );
+                    }
+                    Stmt::Assign { .. } | Stmt::Nop | Stmt::Comment(_) | Stmt::Label(_) => {}
+                    _ => break,
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn restored_register(
+    statement: &Stmt,
+    identities: IdentityAuthority<'_>,
+) -> Option<(String, StackLocation)> {
+    let Stmt::Assign { dst, src } = statement.semantic() else {
+        return None;
+    };
+    let slot = match src.semantic() {
+        Expr::Reg(slot) if is_promoted_stack_slot(slot, identities) => StackLocation {
+            object: slot.clone(),
+            offset: 0,
+        },
+        Expr::Deref { addr, size } if *size == 4 || *size == 8 => stack_location(addr, identities)?,
+        _ => return None,
+    };
+    canonical_saved_register(dst, identities).map(|name| (name, slot))
+}
+
+fn stack_location(expression: &Expr, identities: IdentityAuthority<'_>) -> Option<StackLocation> {
+    match expression.semantic() {
+        Expr::Reg(slot) if is_promoted_stack_slot(slot, identities) => Some(StackLocation {
+            object: slot.clone(),
+            offset: 0,
+        }),
+        Expr::StackAddr { object, .. } => Some(StackLocation {
+            object: object.clone(),
+            offset: 0,
+        }),
+        Expr::Bin {
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        } => match rhs.semantic() {
+            Expr::Const(offset) => {
+                let mut location = stack_location(lhs, identities)?;
+                location.offset = location.offset.checked_add(*offset)?;
+                Some(location)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn frame_pointer_setup(
+    statement: &Stmt,
+    identities: IdentityAuthority<'_>,
+) -> Option<StackLocation> {
+    let Stmt::Assign { dst, src } = statement.semantic() else {
+        return None;
+    };
+    let name = canonical_saved_register(dst, identities)?;
+    ((name == "r7" || name == "fp") && stack_location(src, identities).is_some())
+        .then(|| stack_location(src, identities))
+        .flatten()
+}
+
+fn sp_adjust(
+    statement: &Stmt,
+    expected_op: BinOp,
+    identities: IdentityAuthority<'_>,
+) -> Option<i64> {
+    let Stmt::Assign { dst, src } = statement.semantic() else {
+        return None;
+    };
+    let Expr::Bin { op, lhs, rhs } = src.semantic() else {
+        return None;
+    };
+    if *op != expected_op
+        || !is_sp(dst, identities)
+        || !matches!(lhs.semantic(), Expr::Reg(register) if register == dst)
+    {
+        return None;
+    }
+    match rhs.semantic() {
+        Expr::Const(width) if *width > 0 => Some(*width),
+        _ => None,
+    }
+}
+
+fn comment_with_origins(text: String, statements: &[Stmt]) -> Stmt {
+    let origins = statements
+        .iter()
+        .filter_map(Stmt::origins)
+        .fold(OriginSet::empty(), |merged, origins| merged.union(origins));
+    let comment = Stmt::Comment(text);
+    if origins.is_empty() {
+        comment
+    } else {
+        comment.with_origins(origins)
+    }
+}
+
+fn register_base<'a>(register: &'a VReg, identities: IdentityAuthority<'a>) -> Option<&'a str> {
+    match identities {
+        // Structural registers intentionally retain one spelling across
+        // several SSA versions. Their exact value is therefore ambiguous, but
+        // the sidecar still proves one architectural storage base. Frame
+        // recognition asks which register this is, not which transient value
+        // it holds, so consume that explicit storage fact.
+        IdentityAuthority::Exact(identities) => identities.unambiguous_physical_base(register),
+        #[cfg(test)]
+        IdentityAuthority::LegacySpelling => match register {
+            VReg::Phys(name) => Some(base_name(name)),
+            _ => None,
+        },
+    }
+}
+
+fn canonical_saved_register(register: &VReg, identities: IdentityAuthority<'_>) -> Option<String> {
+    let name = register_base(register, identities)?;
+    if name == "lr" || name == "r14" {
+        return Some("lr".to_string());
+    }
+    if name == "fp" || name == "r11" {
+        return Some("fp".to_string());
+    }
+    let core = name
+        .strip_prefix('r')
+        .and_then(|index| index.parse::<u8>().ok())
+        .is_some_and(|index| (4..=11).contains(&index));
+    let vfp = name
+        .strip_prefix('d')
+        .and_then(|index| index.parse::<u8>().ok())
+        .is_some_and(|index| (8..=15).contains(&index));
+    (core || vfp).then(|| name.to_string())
+}
+
+fn is_promoted_stack_slot(register: &VReg, identities: IdentityAuthority<'_>) -> bool {
+    match identities {
+        IdentityAuthority::Exact(identities) => identities.is_promoted_stack_object(register),
+        #[cfg(test)]
+        IdentityAuthority::LegacySpelling => {
+            matches!(register, VReg::Phys(name) if name == "stack_top" || name.starts_with("stack_"))
+        }
+    }
+}
+
+fn is_sp(register: &VReg, identities: IdentityAuthority<'_>) -> bool {
+    register_base(register, identities) == Some("sp")
+}
+
+#[cfg(test)]
+fn base_name(name: &str) -> &str {
+    name.split_once('#').map_or(name, |(base, _)| base)
+}
+
+fn expr_mentions_sp(expression: &Expr, identities: IdentityAuthority<'_>) -> bool {
+    match expression {
+        Expr::Origin { expr, .. } => expr_mentions_sp(expr, identities),
+        Expr::Reg(register) => is_sp(register, identities),
+        Expr::StackAddr { object, .. } => is_sp(object, identities),
+        Expr::Lea { base, index, .. } | Expr::PdbFieldAddr { base, index, .. } => base
+            .iter()
+            .chain(index.iter())
+            .any(|register| is_sp(register, identities)),
+        Expr::Deref { addr, .. } => expr_mentions_sp(addr, identities),
+        Expr::Call { target, args, .. } => {
+            expr_mentions_sp(target, identities)
+                || args
+                    .iter()
+                    .any(|argument| expr_mentions_sp(argument, identities))
+        }
+        Expr::Bin { lhs, rhs, .. } | Expr::Cmp { lhs, rhs, .. } => {
+            expr_mentions_sp(lhs, identities) || expr_mentions_sp(rhs, identities)
+        }
+        Expr::Select {
+            cond,
+            if_true,
+            if_false,
+            ..
+        } => {
+            expr_mentions_sp(cond, identities)
+                || expr_mentions_sp(if_true, identities)
+                || expr_mentions_sp(if_false, identities)
+        }
+        Expr::Un { src, .. } => expr_mentions_sp(src, identities),
+        Expr::Cast { expr, .. } | Expr::NumericConvert { expr, .. } => {
+            expr_mentions_sp(expr, identities)
+        }
+        Expr::FunctionTableEntry { index, .. } => expr_mentions_sp(index, identities),
+        Expr::WideArithmetic { args, .. } => args
+            .iter()
+            .any(|argument| expr_mentions_sp(argument, identities)),
+        Expr::Const(_)
+        | Expr::FloatConst { .. }
+        | Expr::Addr(_)
+        | Expr::Named { .. }
+        | Expr::StringLit { .. }
+        | Expr::Unknown(_) => false,
+    }
+}
+
+fn stmt_mentions_sp(statement: &Stmt, identities: IdentityAuthority<'_>) -> bool {
+    match statement {
+        Stmt::Origin { stmt, .. } => stmt_mentions_sp(stmt, identities),
+        Stmt::Assign { dst, src } => is_sp(dst, identities) || expr_mentions_sp(src, identities),
+        Stmt::Store { addr, src, .. } => {
+            expr_mentions_sp(addr, identities) || expr_mentions_sp(src, identities)
+        }
+        Stmt::Call {
+            target, args, dst, ..
+        } => {
+            expr_mentions_sp(target, identities)
+                || args
+                    .iter()
+                    .any(|argument| expr_mentions_sp(argument, identities))
+                || dst
+                    .as_ref()
+                    .is_some_and(|destination| is_sp(destination, identities))
+        }
+        Stmt::Return { value } => value
+            .as_ref()
+            .is_some_and(|value| expr_mentions_sp(value, identities)),
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            expr_mentions_sp(cond, identities)
+                || then_body
+                    .iter()
+                    .any(|statement| stmt_mentions_sp(statement, identities))
+                || else_body.as_ref().is_some_and(|body| {
+                    body.iter()
+                        .any(|statement| stmt_mentions_sp(statement, identities))
+                })
+        }
+        Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+            expr_mentions_sp(cond, identities)
+                || body
+                    .iter()
+                    .any(|statement| stmt_mentions_sp(statement, identities))
+        }
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            stmt_mentions_sp(init, identities)
+                || expr_mentions_sp(cond, identities)
+                || stmt_mentions_sp(step, identities)
+                || body
+                    .iter()
+                    .any(|statement| stmt_mentions_sp(statement, identities))
+        }
+        Stmt::Push { value } => expr_mentions_sp(value, identities),
+        Stmt::Pop { target } => is_sp(target, identities),
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => {
+            expr_mentions_sp(discriminant, identities)
+                || cases.iter().any(|(_, body)| {
+                    body.iter()
+                        .any(|statement| stmt_mentions_sp(statement, identities))
+                })
+                || default.as_ref().is_some_and(|body| {
+                    body.iter()
+                        .any(|statement| stmt_mentions_sp(statement, identities))
+                })
+        }
+        Stmt::IndirectGoto { target } => expr_mentions_sp(target, identities),
+        Stmt::Goto { .. }
+        | Stmt::Label(_)
+        | Stmt::Break
+        | Stmt::Continue
+        | Stmt::Nop
+        | Stmt::Unknown(_)
+        | Stmt::Comment(_)
+        | Stmt::Throw { .. }
+        | Stmt::TryCatch { .. } => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::ast::{Expr, Stmt};
+    use crate::ir::types::{BinOp, VReg};
+
+    fn reg(name: &str) -> VReg {
+        VReg::phys(name)
+    }
+
+    #[test]
+    fn typed_frame_registers_ignore_display_spelling() {
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.record(
+            reg("opaque_sp"),
+            crate::ir::ssa::SsaValue {
+                base: reg("sp"),
+                version: 3,
+            },
+        );
+        identities.record(
+            reg("opaque_lr"),
+            crate::ir::ssa::SsaValue {
+                base: reg("r14"),
+                version: 0,
+            },
+        );
+        identities.record(
+            reg("sp#0"),
+            crate::ir::ssa::SsaValue {
+                base: reg("r0"),
+                version: 0,
+            },
+        );
+        identities.record(
+            reg("lr#0"),
+            crate::ir::ssa::SsaValue {
+                base: reg("r0"),
+                version: 0,
+            },
+        );
+
+        assert!(is_sp(
+            &reg("opaque_sp"),
+            IdentityAuthority::Exact(&identities)
+        ));
+        assert_eq!(
+            canonical_saved_register(&reg("opaque_lr"), IdentityAuthority::Exact(&identities),)
+                .as_deref(),
+            Some("lr")
+        );
+        assert!(!is_sp(&reg("sp#0"), IdentityAuthority::Exact(&identities)));
+        assert_eq!(
+            canonical_saved_register(&reg("lr#0"), IdentityAuthority::Exact(&identities)),
+            None
+        );
+    }
+
+    fn sp_sub(width: i64) -> Stmt {
+        Stmt::Assign {
+            dst: reg("sp"),
+            src: Expr::Bin {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Reg(reg("sp"))),
+                rhs: Box::new(Expr::Const(width)),
+            },
+        }
+    }
+
+    fn sp_add(width: i64) -> Stmt {
+        Stmt::Assign {
+            dst: reg("sp"),
+            src: Expr::Bin {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Reg(reg("sp"))),
+                rhs: Box::new(Expr::Const(width)),
+            },
+        }
+    }
+
+    fn attributed_sp_adjust(op: BinOp, width: i64, owner: u64) -> Stmt {
+        Stmt::Assign {
+            dst: reg("sp"),
+            src: Expr::Bin {
+                op,
+                lhs: Box::new(Expr::Reg(reg("sp")).with_origins(OriginSet::one(owner))),
+                rhs: Box::new(Expr::Const(width).with_origins(OriginSet::one(owner))),
+            }
+            .with_origins(OriginSet::one(owner)),
+        }
+    }
+
+    fn save(slot: &str, register: &str, size: u8) -> Stmt {
+        Stmt::Store {
+            addr: Expr::Reg(reg(slot)),
+            src: Expr::Reg(reg(register)),
+            size,
+        }
+    }
+
+    fn restore(register: &str, slot: &str) -> Stmt {
+        Stmt::Assign {
+            dst: reg(register),
+            src: Expr::Reg(reg(slot)),
+        }
+    }
+
+    fn object_addr(object: &str, offset: i64) -> Expr {
+        let base = Expr::StackAddr {
+            object: reg(object),
+            size: 8,
+        };
+        if offset == 0 {
+            base
+        } else {
+            Expr::Bin {
+                op: BinOp::Add,
+                lhs: Box::new(base),
+                rhs: Box::new(Expr::Const(offset)),
+            }
+        }
+    }
+
+    fn function(body: Vec<Stmt>) -> Function {
+        Function {
+            name: "fixture".into(),
+            entry_va: 0x1000,
+            body,
+        }
+    }
+
+    fn typed_simple_frame_identities() -> crate::ir::value_number::ValueIdentities {
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        for (value, base, version) in [("sp", "sp", 1), ("lr", "lr", 0), ("lr#1", "lr", 1)] {
+            identities.record(
+                reg(value),
+                crate::ir::ssa::SsaValue {
+                    base: reg(base),
+                    version,
+                },
+            );
+        }
+        identities
+    }
+
+    fn base_name(name: &str) -> &str {
+        name.split_once('#').map_or(name, |(base, _)| base)
+    }
+
+    fn mentions_sp(statement: &Stmt) -> bool {
+        fn expr_mentions_sp(expression: &Expr) -> bool {
+            match expression {
+                Expr::Origin { expr, .. } => expr_mentions_sp(expr),
+                Expr::Reg(VReg::Phys(name)) => base_name(name) == "sp",
+                Expr::Lea { base, index, .. } | Expr::PdbFieldAddr { base, index, .. } => {
+                    base.iter().chain(index.iter()).any(
+                        |register| matches!(register, VReg::Phys(name) if base_name(name) == "sp"),
+                    )
+                }
+                Expr::Deref { addr, .. } => expr_mentions_sp(addr),
+                Expr::Call { target, args, .. } => {
+                    expr_mentions_sp(target) || args.iter().any(expr_mentions_sp)
+                }
+                Expr::Bin { lhs, rhs, .. } | Expr::Cmp { lhs, rhs, .. } => {
+                    expr_mentions_sp(lhs) || expr_mentions_sp(rhs)
+                }
+                Expr::Select {
+                    cond,
+                    if_true,
+                    if_false,
+                    ..
+                } => {
+                    expr_mentions_sp(cond)
+                        || expr_mentions_sp(if_true)
+                        || expr_mentions_sp(if_false)
+                }
+                Expr::Un { src, .. } => expr_mentions_sp(src),
+                Expr::Cast { expr, .. } | Expr::NumericConvert { expr, .. } => {
+                    expr_mentions_sp(expr)
+                }
+                Expr::FunctionTableEntry { index, .. } => expr_mentions_sp(index),
+                Expr::WideArithmetic { args, .. } => args.iter().any(expr_mentions_sp),
+                Expr::StackAddr { .. }
+                | Expr::Const(_)
+                | Expr::FloatConst { .. }
+                | Expr::Addr(_)
+                | Expr::Named { .. }
+                | Expr::StringLit { .. }
+                | Expr::Unknown(_)
+                | Expr::Reg(_) => false,
+            }
+        }
+
+        match statement.semantic() {
+            Stmt::Origin { .. } => unreachable!("semantic statement cannot be an origin wrapper"),
+            Stmt::Assign { dst, src } => {
+                matches!(dst, VReg::Phys(name) if base_name(name) == "sp") || expr_mentions_sp(src)
+            }
+            Stmt::Store { addr, src, .. } => expr_mentions_sp(addr) || expr_mentions_sp(src),
+            Stmt::Return { value } => value.as_ref().is_some_and(expr_mentions_sp),
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                expr_mentions_sp(cond)
+                    || then_body.iter().any(mentions_sp)
+                    || else_body
+                        .as_ref()
+                        .is_some_and(|body| body.iter().any(mentions_sp))
+            }
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+                expr_mentions_sp(cond) || body.iter().any(mentions_sp)
+            }
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                mentions_sp(init)
+                    || expr_mentions_sp(cond)
+                    || mentions_sp(step)
+                    || body.iter().any(mentions_sp)
+            }
+            Stmt::Call { target, args, .. } => {
+                expr_mentions_sp(target) || args.iter().any(expr_mentions_sp)
+            }
+            Stmt::Push { value } => expr_mentions_sp(value),
+            Stmt::Pop { target } => matches!(target, VReg::Phys(name) if name == "sp"),
+            Stmt::Switch {
+                discriminant,
+                cases,
+                default,
+            } => {
+                expr_mentions_sp(discriminant)
+                    || cases.iter().any(|(_, body)| body.iter().any(mentions_sp))
+                    || default
+                        .as_ref()
+                        .is_some_and(|body| body.iter().any(mentions_sp))
+            }
+            Stmt::IndirectGoto { target } => expr_mentions_sp(target),
+            Stmt::Goto { .. }
+            | Stmt::Label(_)
+            | Stmt::Break
+            | Stmt::Continue
+            | Stmt::Nop
+            | Stmt::Unknown(_)
+            | Stmt::Comment(_)
+            | Stmt::Throw { .. }
+            | Stmt::TryCatch { .. } => false,
+        }
+    }
+
+    #[test]
+    fn lighthouse_core_vfp_and_local_frame_collapses_exactly() {
+        let mut f = function(vec![
+            sp_sub(4),
+            save("stack_top", "lr", 4),
+            sp_sub(8),
+            save("stack_top", "d8", 8),
+            sp_sub(44),
+            Stmt::Nop,
+            sp_add(44),
+            restore("d8#1", "stack_top"),
+            sp_add(8),
+            sp_add(4),
+            Stmt::Return { value: None },
+        ]);
+
+        recognise_arm32_frame(&mut f);
+
+        assert!(matches!(
+            f.body.first(),
+            Some(Stmt::Comment(text)) if text == "arm32 prologue: save lr/d8, frame 56 bytes"
+        ));
+        assert!(matches!(f.body.last(), Some(Stmt::Return { .. })));
+        assert!(
+            !f.body.iter().any(mentions_sp),
+            "machine stack arithmetic leaked after a balanced collapse: {:#?}",
+            f.body
+        );
+    }
+
+    #[test]
+    fn identity_aware_arm32_frame_accepts_an_owned_opaque_slot() {
+        let slot_name = "frame_link_save".to_string();
+        let mut identities = typed_simple_frame_identities();
+        identities.attach_promoted_stack_objects([&slot_name]);
+        let mut f = function(vec![
+            sp_sub(4),
+            save(&slot_name, "lr", 4),
+            Stmt::Nop,
+            restore("lr#1", &slot_name),
+            sp_add(4),
+            Stmt::Return { value: None },
+        ]);
+
+        recognise_arm32_frame_with_identities(&mut f, &identities);
+
+        assert_eq!(f.body.len(), 4, "owned ARM32 frame leaked: {:#?}", f.body);
+        assert!(matches!(&f.body[0], Stmt::Comment(text) if text.contains("prologue")));
+        assert!(matches!(&f.body[2], Stmt::Comment(text) if text.contains("epilogue")));
+    }
+
+    #[test]
+    fn identity_aware_arm32_frame_rejects_unowned_stack_spelling() {
+        let mut f = function(vec![
+            sp_sub(4),
+            save("stack_0", "lr", 4),
+            Stmt::Nop,
+            restore("lr#1", "stack_0"),
+            sp_add(4),
+            Stmt::Return { value: None },
+        ]);
+        let original = f.clone();
+
+        recognise_arm32_frame_with_identities(&mut f, &typed_simple_frame_identities());
+
+        assert_eq!(f, original);
+    }
+
+    #[test]
+    fn structural_sp_versions_share_one_machine_frame_storage_identity() {
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        for (value, base, version) in [
+            ("sp", "sp", 0),
+            ("sp", "sp", 1),
+            ("sp", "sp", 2),
+            ("r7", "r7", 0),
+            ("r7#1", "r7", 1),
+            ("r7#2", "r7", 2),
+            ("lr", "lr", 0),
+        ] {
+            identities.record(
+                reg(value),
+                crate::ir::ssa::SsaValue {
+                    base: reg(base),
+                    version,
+                },
+            );
+        }
+        let frame_object = "local_8".to_string();
+        identities.attach_promoted_stack_objects([&frame_object]);
+        let mut f = function(vec![
+            sp_sub(8),
+            Stmt::Store {
+                addr: object_addr("local_8", 0),
+                src: Expr::Reg(reg("r7")),
+                size: 4,
+            },
+            Stmt::Store {
+                addr: object_addr("local_8", 4),
+                src: Expr::Reg(reg("lr")),
+                size: 4,
+            },
+            Stmt::Assign {
+                dst: reg("r7#1"),
+                src: object_addr("local_8", 0),
+            },
+            Stmt::Nop,
+            Stmt::Assign {
+                dst: reg("r7#2"),
+                src: Expr::Deref {
+                    addr: Box::new(object_addr("local_8", 0)),
+                    size: 4,
+                },
+            },
+            sp_add(8),
+            Stmt::Return {
+                value: Some(Expr::Const(0)),
+            },
+        ]);
+
+        recognise_arm32_frame_with_identities(&mut f, &identities);
+
+        assert_eq!(f.body.len(), 4, "structural SP frame leaked: {:#?}", f.body);
+        assert!(matches!(
+            f.body.first(),
+            Some(Stmt::Comment(text))
+                if text == "arm32 prologue: save r7/lr, frame 8 bytes"
+        ));
+        assert!(matches!(
+            f.body.get(2),
+            Some(Stmt::Comment(text)) if text == "arm32 epilogue: restore machine frame"
+        ));
+    }
+
+    #[test]
+    fn thumb_leaf_r7_frame_with_expanded_teardown_collapses() {
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        for (value, base, version) in [
+            ("sp", "sp", 0),
+            ("r7", "r7", 0),
+            ("r7#1", "r7", 1),
+            ("r7#2", "r7", 2),
+            ("frame_base", "frame_base", 1),
+            ("frame_width", "frame_width", 1),
+            ("frame_top", "frame_top", 1),
+        ] {
+            identities.record(
+                reg(value),
+                crate::ir::ssa::SsaValue {
+                    base: reg(base),
+                    version,
+                },
+            );
+        }
+        let frame_object = "local_18".to_string();
+        let stack_top = "stack_top".to_string();
+        identities.attach_promoted_stack_objects([&frame_object, &stack_top]);
+        let mut f = function(vec![
+            sp_sub(4),
+            Stmt::Store {
+                addr: object_addr("local_18", 20),
+                src: Expr::Reg(reg("r7")),
+                size: 4,
+            },
+            sp_sub(20),
+            Stmt::Assign {
+                dst: reg("r7#1"),
+                src: object_addr("local_18", 0),
+            },
+            Stmt::Nop,
+            Stmt::Assign {
+                dst: reg("frame_base"),
+                src: object_addr("local_18", 0),
+            },
+            Stmt::Assign {
+                dst: reg("frame_width"),
+                src: Expr::Const(20),
+            },
+            Stmt::Assign {
+                dst: reg("frame_top"),
+                src: Expr::Bin {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::Reg(reg("frame_base"))),
+                    rhs: Box::new(Expr::Reg(reg("frame_width"))),
+                },
+            },
+            Stmt::Assign {
+                dst: reg("sp"),
+                src: Expr::Reg(reg("frame_top")),
+            },
+            restore("r7#2", "stack_top"),
+            sp_add(4),
+            Stmt::Return {
+                value: Some(Expr::Const(0)),
+            },
+        ]);
+
+        recognise_arm32_frame_with_identities(&mut f, &identities);
+
+        assert!(
+            matches!(
+                f.body.first(),
+                Some(Stmt::Comment(text))
+                    if text == "arm32 prologue: save r7, frame 24 bytes"
+            ),
+            "leaf frame did not collapse: {:#?}",
+            f.body
+        );
+        assert!(
+            f.body.iter().any(|statement| matches!(
+                statement,
+                Stmt::Comment(text) if text == "arm32 epilogue: restore machine frame"
+            )),
+            "unexpected collapsed leaf body: {:#?}",
+            f.body
+        );
+        assert!(!f.body.iter().any(mentions_sp), "{:#?}", f.body);
+        assert!(matches!(f.body.last(), Some(Stmt::Return { .. })));
+    }
+
+    #[test]
+    fn multi_register_core_save_and_pop_pc_collapses() {
+        let mut f = function(vec![
+            sp_sub(12),
+            save("stack_0", "r4", 4),
+            save("stack_4", "r5", 4),
+            save("stack_8", "lr", 4),
+            Stmt::Nop,
+            restore("r4#1", "stack_0"),
+            restore("r5#1", "stack_4"),
+            sp_add(12),
+            Stmt::Return { value: None },
+        ]);
+
+        recognise_arm32_frame(&mut f);
+
+        assert!(!f.body.iter().any(mentions_sp), "{:#?}", f.body);
+        assert!(matches!(f.body.last(), Some(Stmt::Return { .. })));
+    }
+
+    #[test]
+    fn promoted_thumb_frame_record_object_collapses_as_one_machine_save() {
+        let mut f = function(vec![
+            sp_sub(8),
+            Stmt::Store {
+                addr: object_addr("local_8", 0),
+                src: Expr::Reg(reg("r7")),
+                size: 4,
+            },
+            Stmt::Store {
+                addr: object_addr("local_8", 4),
+                src: Expr::Reg(reg("lr")),
+                size: 4,
+            },
+            Stmt::Assign {
+                dst: reg("r7#1"),
+                src: object_addr("local_8", 0),
+            },
+            Stmt::Nop,
+            Stmt::Assign {
+                dst: reg("r7#2"),
+                src: Expr::Deref {
+                    addr: Box::new(object_addr("local_8", 0)),
+                    size: 4,
+                },
+            },
+            sp_add(8),
+            Stmt::Return { value: None },
+        ]);
+
+        recognise_arm32_frame(&mut f);
+
+        assert!(matches!(
+            f.body.first(),
+            Some(Stmt::Comment(text))
+                if text == "arm32 prologue: save r7/lr, frame 8 bytes"
+        ));
+        assert!(matches!(f.body.get(1), Some(Stmt::Nop)));
+        assert!(matches!(
+            f.body.get(2),
+            Some(Stmt::Comment(text)) if text == "arm32 epilogue: restore machine frame"
+        ));
+        assert!(matches!(f.body.last(), Some(Stmt::Return { value: None })));
+        assert!(
+            !format!("{:#?}", f.body).contains("local_8"),
+            "promoted frame record leaked after collapse: {:#?}",
+            f.body
+        );
+    }
+
+    #[test]
+    fn attributed_thumb_frame_collapses_with_exact_machine_owners() {
+        use crate::ir::ast::OriginSet;
+
+        let mut f = function(vec![
+            attributed_sp_adjust(BinOp::Sub, 8, 0x2000).with_origins(OriginSet::one(0x1000)),
+            Stmt::Store {
+                addr: object_addr("local_8", 0).with_origins(OriginSet::one(0x2004)),
+                src: Expr::Reg(reg("r7")).with_origins(OriginSet::one(0x2004)),
+                size: 4,
+            }
+            .with_origins(OriginSet::one(0x1004)),
+            Stmt::Store {
+                addr: object_addr("local_8", 4).with_origins(OriginSet::one(0x2008)),
+                src: Expr::Reg(reg("lr")).with_origins(OriginSet::one(0x2008)),
+                size: 4,
+            }
+            .with_origins(OriginSet::one(0x1008)),
+            Stmt::Assign {
+                dst: reg("r7#1"),
+                src: object_addr("local_8", 0).with_origins(OriginSet::one(0x200c)),
+            }
+            .with_origins(OriginSet::one(0x100c)),
+            Stmt::Nop.with_origins(OriginSet::one(0x1010)),
+            Stmt::Assign {
+                dst: reg("r7#2"),
+                src: Expr::Deref {
+                    addr: Box::new(object_addr("local_8", 0).with_origins(OriginSet::one(0x2014))),
+                    size: 4,
+                }
+                .with_origins(OriginSet::one(0x2014)),
+            }
+            .with_origins(OriginSet::one(0x1014)),
+            attributed_sp_adjust(BinOp::Add, 8, 0x2018).with_origins(OriginSet::one(0x1018)),
+            Stmt::Return { value: None }.with_origins(OriginSet::one(0x101c)),
+        ]);
+
+        recognise_arm32_frame(&mut f);
+
+        assert_eq!(
+            f.body.len(),
+            4,
+            "attributed frame did not collapse: {:#?}",
+            f.body
+        );
+        assert!(matches!(
+            f.body[0].semantic(),
+            Stmt::Comment(text) if text == "arm32 prologue: save r7/lr, frame 8 bytes"
+        ));
+        assert_eq!(
+            f.body[0].origins(),
+            Some(&OriginSet::from_addresses([0x1000, 0x1004, 0x1008, 0x100c]))
+        );
+        assert_eq!(f.body[1].origins(), Some(&OriginSet::one(0x1010)));
+        assert!(matches!(
+            f.body[2].semantic(),
+            Stmt::Comment(text) if text == "arm32 epilogue: restore machine frame"
+        ));
+        assert_eq!(
+            f.body[2].origins(),
+            Some(&OriginSet::from_addresses([0x1014, 0x1018]))
+        );
+        assert!(matches!(f.body[3].semantic(), Stmt::Return { value: None }));
+        assert_eq!(f.body[3].origins(), Some(&OriginSet::one(0x101c)));
+    }
+
+    #[test]
+    fn clang_a32_fp_frame_record_collapses_as_machine_bookkeeping() {
+        let mut f = function(vec![
+            sp_sub(8),
+            Stmt::Store {
+                addr: object_addr("local_8", 0),
+                src: Expr::Reg(reg("r11")),
+                size: 4,
+            },
+            Stmt::Store {
+                addr: object_addr("local_8", 4),
+                src: Expr::Reg(reg("lr")),
+                size: 4,
+            },
+            Stmt::Assign {
+                dst: reg("fp"),
+                src: object_addr("local_8", 0),
+            },
+            sp_sub(8),
+            Stmt::Nop,
+            Stmt::Assign {
+                dst: reg("sp"),
+                src: Expr::Reg(reg("r11#1")),
+            },
+            Stmt::Assign {
+                dst: reg("fp"),
+                src: Expr::Reg(reg("stack_top")),
+            },
+            sp_add(8),
+            Stmt::Return {
+                value: Some(Expr::Const(0)),
+            },
+        ]);
+
+        recognise_arm32_frame(&mut f);
+
+        assert!(matches!(
+            f.body.first(),
+            Some(Stmt::Comment(text))
+                if text == "arm32 prologue: save fp/lr, frame 16 bytes"
+        ));
+        assert!(matches!(f.body.get(1), Some(Stmt::Nop)));
+        assert!(matches!(
+            f.body.get(2),
+            Some(Stmt::Comment(text)) if text == "arm32 epilogue: restore machine frame"
+        ));
+        assert!(matches!(
+            f.body.last(),
+            Some(Stmt::Return {
+                value: Some(Expr::Const(0))
+            })
+        ));
+        assert!(!format!("{:#?}", f.body).contains("local_8"));
+    }
+
+    #[test]
+    fn mismatched_vfp_restore_width_leaves_function_untouched() {
+        let mut f = function(vec![
+            sp_sub(4),
+            save("stack_top", "lr", 4),
+            sp_sub(8),
+            save("stack_top", "d8", 8),
+            Stmt::Nop,
+            restore("d8#1", "stack_top"),
+            sp_add(4),
+            sp_add(4),
+            Stmt::Return { value: None },
+        ]);
+        let original = f.clone();
+
+        recognise_arm32_frame(&mut f);
+
+        assert_eq!(f, original);
+    }
+
+    #[test]
+    fn semantic_stack_pointer_use_leaves_function_untouched() {
+        let mut f = function(vec![
+            sp_sub(4),
+            save("stack_top", "lr", 4),
+            Stmt::Assign {
+                dst: reg("r4#1"),
+                src: Expr::Reg(reg("sp")),
+            },
+            sp_add(4),
+            Stmt::Return { value: None },
+        ]);
+        let original = f.clone();
+
+        recognise_arm32_frame(&mut f);
+
+        assert_eq!(f, original);
+    }
+
+    #[test]
+    fn one_unbalanced_nested_return_rejects_the_whole_frame() {
+        let mut f = function(vec![
+            sp_sub(4),
+            save("stack_top", "lr", 4),
+            Stmt::If {
+                cond: Expr::Reg(reg("zf_1")),
+                then_body: vec![sp_add(4), Stmt::Return { value: None }],
+                else_body: Some(vec![Stmt::Return { value: None }]),
+            },
+        ]);
+        let original = f.clone();
+
+        recognise_arm32_frame(&mut f);
+
+        assert_eq!(f, original, "the rewrite must be all-or-nothing");
+    }
+
+    #[test]
+    fn balanced_nested_return_paths_collapse_transactionally() {
+        let mut f = function(vec![
+            sp_sub(4),
+            save("stack_top", "lr", 4),
+            Stmt::If {
+                cond: Expr::Reg(reg("zf_1")),
+                then_body: vec![sp_add(4), Stmt::Return { value: None }],
+                else_body: Some(vec![sp_add(4), Stmt::Return { value: None }]),
+            },
+        ]);
+
+        recognise_arm32_frame(&mut f);
+
+        assert!(
+            !f.body.iter().any(mentions_sp),
+            "balanced branch epilogues leaked machine stack state: {:#?}",
+            f.body
+        );
+        let Stmt::If {
+            then_body,
+            else_body: Some(else_body),
+            ..
+        } = &f.body[1]
+        else {
+            panic!("structured branch was not preserved: {:#?}", f.body);
+        };
+        assert!(matches!(then_body.last(), Some(Stmt::Return { .. })));
+        assert!(matches!(else_body.last(), Some(Stmt::Return { .. })));
+    }
+}

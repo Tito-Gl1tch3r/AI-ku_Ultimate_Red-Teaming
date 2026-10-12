@@ -1,0 +1,820 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package fory
+
+import (
+	"fmt"
+	"reflect"
+)
+
+func skipSizedBytes(ctx *ReadContext, size uint64) {
+	if size > uint64(MaxInt) {
+		ctx.SetError(DeserializationErrorf("skip byte length exceeds supported int range: %d", size))
+		return
+	}
+	ctx.buffer.Skip(int(size), ctx.Err())
+}
+
+func consumeSkippedRefFlag(ctx *ReadContext, readRefFlag bool) bool {
+	if !readRefFlag {
+		return true
+	}
+	err := ctx.Err()
+	refFlag := ctx.buffer.ReadInt8(err)
+	if ctx.HasError() {
+		return false
+	}
+	switch refFlag {
+	case NullFlag:
+		return false
+	case RefFlag:
+		_ = ctx.buffer.ReadVarUint32(err)
+		return false
+	case RefValueFlag:
+		// A skipped first occurrence still consumes a producer ref id. Keep
+		// numbering aligned without adding a pending ref for the next materialized value.
+		if reserveErr := ctx.RefResolver().ReserveSkippedRefId(); reserveErr != nil {
+			ctx.SetError(FromError(reserveErr))
+			return false
+		}
+		return true
+	case NotNullValueFlag:
+		return true
+	default:
+		ctx.SetError(DeserializationErrorf("invalid ref flag %d", refFlag))
+		return false
+	}
+}
+
+// SkipFieldValue skips a field value in compatible mode when the field doesn't exist
+// or is incompatible with the local type.
+// Uses context error state for deferred error checking.
+func SkipFieldValue(ctx *ReadContext, fieldDef FieldDef, readRefFlag bool) {
+	SkipFieldValueWithTypeFlag(ctx, fieldDef, readRefFlag, false)
+}
+
+// SkipFieldValueWithTypeFlag skips a field value with explicit control over type info reading.
+// readTypeInfo should be true if type info was written for this field (struct fields in compatible mode).
+// Uses context error state for deferred error checking.
+func SkipFieldValueWithTypeFlag(ctx *ReadContext, fieldDef FieldDef, readRefFlag bool, readTypeInfo bool) {
+	err := ctx.Err()
+	if readTypeInfo {
+		// Type info was written for this field (struct fields in compatible mode)
+		// Read ref flag first if needed
+		if !consumeSkippedRefFlag(ctx, readRefFlag) {
+			return
+		}
+
+		// Read type info (typeID + meta_index)
+		wroteTypeID := uint32(ctx.buffer.ReadUint8(err))
+		internalID := TypeId(wroteTypeID)
+
+		// Check if it's an EXT type first - EXT types don't have meta info like structs
+		if internalID == EXT {
+			typeInfo := readKnownTypeInfoForSkip(ctx, wroteTypeID)
+			if ctx.HasError() {
+				return
+			}
+			if typeInfo != nil && typeInfo.Serializer != nil {
+				// Use the serializer to read and discard the value
+				if typeInfo.Type == nil {
+					ctx.SetError(DeserializationErrorf("cannot skip EXT type %d without a concrete registered type", wroteTypeID))
+					return
+				}
+				dummyVal := reflect.New(typeInfo.Type).Elem()
+				typeInfo.Serializer.Read(ctx, RefModeNone, false, false, dummyVal)
+				return
+			}
+			// If no serializer is registered, we can't skip this type
+			ctx.SetError(DeserializationErrorf("cannot skip EXT type %d: no serializer registered", wroteTypeID))
+			return
+		}
+
+		// Check if it's a NAMED_EXT type - need to read type info to find serializer
+		if internalID == NAMED_EXT {
+			typeInfo := readKnownTypeInfoForSkip(ctx, wroteTypeID)
+			if ctx.HasError() {
+				return
+			}
+			if typeInfo != nil && typeInfo.Serializer != nil {
+				// Use the serializer to read and discard the value
+				if typeInfo.Type == nil {
+					ctx.SetError(DeserializationError("cannot skip NAMED_EXT type without a concrete registered type"))
+					return
+				}
+				dummyVal := reflect.New(typeInfo.Type).Elem()
+				typeInfo.Serializer.Read(ctx, RefModeNone, false, false, dummyVal)
+				return
+			}
+			ctx.SetError(DeserializationError("cannot skip NAMED_EXT type: no serializer found"))
+			return
+		}
+
+		// Check if it's a struct type - need to read type info and skip struct data
+		if internalID == COMPATIBLE_STRUCT || internalID == STRUCT ||
+			internalID == NAMED_STRUCT || internalID == NAMED_COMPATIBLE_STRUCT {
+			typeInfo := readKnownTypeInfoForSkip(ctx, wroteTypeID)
+			if ctx.HasError() {
+				return
+			}
+			// Now skip the struct data using the typeInfo from the written type
+			skipStruct(ctx, typeInfo)
+			return
+		}
+
+		if IsNamespacedType(internalID) {
+			typeInfo := readKnownTypeInfoForSkip(ctx, wroteTypeID)
+			if ctx.HasError() {
+				return
+			}
+			// Now skip the struct data using the typeInfo from the written type
+			skipStruct(ctx, typeInfo)
+			return
+		}
+	}
+
+	skipValue(ctx, fieldDef, readRefFlag, true, nil)
+}
+
+// isStructTypeId checks if a type ID represents a struct type
+func isStructTypeId(id TypeId) bool {
+	return id == STRUCT || id == NAMED_STRUCT ||
+		id == COMPATIBLE_STRUCT || id == NAMED_COMPATIBLE_STRUCT
+}
+
+// SkipAnyValue skips any value by reading its type info first, then skipping the data.
+// This is used for polymorphic types where the actual type is unknown at compile time.
+// Uses context error state for deferred error checking.
+func SkipAnyValue(ctx *ReadContext, readRefFlag bool) {
+	err := ctx.Err()
+	// Handle ref flag first if needed
+	if !consumeSkippedRefFlag(ctx, readRefFlag) {
+		return
+	}
+
+	// ReadData type_id first
+	typeID := uint32(ctx.buffer.ReadUint8(err))
+	if ctx.HasError() {
+		return
+	}
+	internalID := TypeId(typeID)
+
+	// For struct-like types, also read meta_index to get type_info
+	var fieldDef FieldDef
+	var typeInfo *TypeInfo
+
+	switch internalID {
+	case LIST, SET:
+		fieldDef = FieldDef{
+			typeSpec: NewCollectionTypeSpec(TypeId(typeID), NewSimpleTypeSpec(UNKNOWN)),
+			nullable: true,
+		}
+	case MAP:
+		fieldDef = FieldDef{
+			typeSpec: NewMapTypeSpec(TypeId(typeID), NewSimpleTypeSpec(UNKNOWN), NewSimpleTypeSpec(UNKNOWN)),
+			nullable: true,
+		}
+	case ENUM, NAMED_ENUM, COMPATIBLE_STRUCT, NAMED_COMPATIBLE_STRUCT, STRUCT, NAMED_STRUCT,
+		EXT, NAMED_EXT, TYPED_UNION, NAMED_UNION:
+		// Read type info using the shared meta reader when enabled.
+		typeInfo = ctx.TypeResolver().readTypeInfoWithTypeID(ctx.buffer, typeID, nil, err)
+		if ctx.HasError() {
+			return
+		}
+		if typeInfo == nil {
+			ctx.SetError(DeserializationErrorf("cannot skip type %d: type info not found", typeID))
+			return
+		}
+		fieldDef = FieldDef{
+			typeSpec: NewSimpleTypeSpec(TypeId(typeID)),
+			nullable: true,
+		}
+	default:
+		fieldDef = FieldDef{
+			typeSpec: NewSimpleTypeSpec(TypeId(typeID)),
+			nullable: true,
+		}
+	}
+
+	// Don't read ref flag again since we already handled it
+	skipValue(ctx, fieldDef, false, false, typeInfo)
+}
+
+// readTypeInfoForSkip reads type info from buffer for struct-like fields during skip.
+// Dynamic fields store typeID + meta info (meta index or namespace/typename) in the buffer.
+// Uses context error state for deferred error checking.
+func readTypeInfoForSkip(ctx *ReadContext, fieldTypeId TypeId) *TypeInfo {
+	err := ctx.Err()
+	// Read the actual typeID from buffer (Java writes typeID for struct fields)
+	typeID := uint32(ctx.buffer.ReadUint8(err))
+	if ctx.HasError() {
+		return nil
+	}
+	// Use readTypeInfoWithTypeID which handles both namespaced and non-namespaced types correctly
+	typeInfo := ctx.TypeResolver().readTypeInfoWithTypeID(ctx.buffer, typeID, nil, err)
+	if ctx.HasError() {
+		return nil
+	}
+	if typeInfo == nil {
+		ctx.SetError(DeserializationErrorf("cannot skip type %d: type info not found", typeID))
+	}
+	return typeInfo
+}
+
+func readKnownTypeInfoForSkip(ctx *ReadContext, typeID uint32) *TypeInfo {
+	typeInfo := ctx.TypeResolver().readTypeInfoWithTypeID(ctx.buffer, typeID, nil, ctx.Err())
+	if ctx.HasError() {
+		return nil
+	}
+	if typeInfo == nil {
+		ctx.SetError(DeserializationErrorf("cannot skip type %d: type info not found", typeID))
+	}
+	return typeInfo
+}
+
+func fieldReadAlwaysAdvances(fieldDef FieldDef, typeInfo *TypeInfo) bool {
+	if typeInfo != nil && serializerReadDataAlwaysAdvances(typeInfo.Serializer) {
+		return true
+	}
+	return fieldDef.typeSpec != nil && typeIDReadDataAlwaysAdvances(fieldDef.typeSpec.TypeId())
+}
+
+// skipCollection skips a collection (list/set) value
+// Uses context error state for deferred error checking.
+func skipCollection(ctx *ReadContext, fieldDef FieldDef) {
+	if ctx.HasError() || !ctx.enterDepth() {
+		return
+	}
+	err := ctx.Err()
+	length := uint32(ctx.ReadCollectionLength())
+	if ctx.HasError() {
+		return
+	}
+	if length == 0 {
+		ctx.decDepth()
+		return
+	}
+
+	header := ctx.buffer.ReadByte(err)
+	if ctx.HasError() {
+		return
+	}
+
+	hasNull := (header & CollectionHasNull) != 0
+	isSameType := (header & CollectionIsSameType) != 0
+	trackRef := (header & CollectionTrackingRef) != 0
+	isDeclared := (header & CollectionIsDeclElementType) != 0
+
+	var elemDef FieldDef
+	var elemTypeInfo *TypeInfo
+	if isSameType && !isDeclared {
+		// ReadData element type info - first read the typeID from buffer
+		typeID := uint32(ctx.buffer.ReadUint8(err))
+		if ctx.HasError() {
+			return
+		}
+		elemTypeInfo = readKnownTypeInfoForSkip(ctx, typeID)
+		if ctx.HasError() {
+			return
+		}
+		elemDef = FieldDef{
+			typeSpec: NewSimpleTypeSpec(TypeId(elemTypeInfo.TypeID)),
+			nullable: hasNull,
+			trackRef: trackRef,
+		}
+	} else if isDeclared {
+		// Use declared element type from the collection's field type
+		if fieldDef.typeSpec != nil && fieldDef.typeSpec.elementType != nil {
+			elemDef = FieldDef{
+				typeSpec: fieldDef.typeSpec.elementType,
+				nullable: hasNull,
+				trackRef: trackRef,
+			}
+		} else {
+			// Fallback: use unknown type
+			elemDef = FieldDef{
+				typeSpec: NewSimpleTypeSpec(UNKNOWN),
+				nullable: true,
+				trackRef: trackRef,
+			}
+		}
+	} else {
+		// Not same type - each element has its own type info, use unknown
+		elemDef = FieldDef{
+			typeSpec: NewSimpleTypeSpec(UNKNOWN),
+			nullable: hasNull,
+			trackRef: trackRef,
+		}
+	}
+
+	elementReadAlwaysAdvances := !isSameType || trackRef || hasNull ||
+		fieldReadAlwaysAdvances(elemDef, elemTypeInfo)
+	if elementReadAlwaysAdvances {
+		for i := uint32(0); i < length; i++ {
+			skipValue(ctx, elemDef, trackRef || hasNull, false, elemTypeInfo)
+			if ctx.HasError() {
+				return
+			}
+		}
+	} else {
+		checkpoint := ctx.buffer.logicalReaderIndex()
+		for i := uint32(0); i < length; i++ {
+			skipValue(ctx, elemDef, false, false, elemTypeInfo)
+			if ctx.HasError() {
+				return
+			}
+			if (i+1)&(unbackedContainerCheckInterval-1) == 0 {
+				if !ctx.settleUnbackedContainerItems(unbackedContainerCheckInterval, checkpoint) {
+					return
+				}
+				checkpoint = ctx.buffer.logicalReaderIndex()
+			}
+		}
+		if tail := int(length & (unbackedContainerCheckInterval - 1)); tail != 0 {
+			if !ctx.settleUnbackedContainerItems(tail, checkpoint) {
+				return
+			}
+		}
+	}
+	ctx.decDepth()
+}
+
+// skipMap skips a map value
+// Uses context error state for deferred error checking.
+func skipMap(ctx *ReadContext, fieldDef FieldDef) {
+	if ctx.HasError() || !ctx.enterDepth() {
+		return
+	}
+	bufErr := ctx.Err()
+	length := uint32(ctx.ReadCollectionLength())
+	if ctx.HasError() {
+		return
+	}
+	if length == 0 {
+		ctx.decDepth()
+		return
+	}
+
+	// Extract key/value specs from the declared map type when available.
+	// When KEY_DECL_TYPE/VALUE_DECL_TYPE flags are set, the type info is NOT written
+	// to the buffer, so we must use the declared types from the FieldDef
+	var declaredKeyDef, declaredValueDef FieldDef
+	if fieldDef.typeSpec != nil && fieldDef.typeSpec.keyType != nil && fieldDef.typeSpec.valueType != nil {
+		declaredKeyDef = FieldDef{
+			typeSpec: fieldDef.typeSpec.keyType,
+			nullable: true,
+		}
+		declaredValueDef = FieldDef{
+			typeSpec: fieldDef.typeSpec.valueType,
+			nullable: true,
+		}
+	} else {
+		// Fallback to unknown types when no declared map key/value specs exist.
+		declaredKeyDef = FieldDef{
+			typeSpec: NewSimpleTypeSpec(UNKNOWN),
+			nullable: true,
+		}
+		declaredValueDef = FieldDef{
+			typeSpec: NewSimpleTypeSpec(UNKNOWN),
+			nullable: true,
+		}
+	}
+
+	var lenCounter uint32
+	for lenCounter < length {
+		header := ctx.buffer.ReadByte(bufErr)
+		if ctx.HasError() {
+			return
+		}
+
+		// Both null
+		if (header&KEY_HAS_NULL) != 0 && (header&VALUE_HAS_NULL) != 0 {
+			lenCounter++
+			continue
+		}
+
+		// Only key is null
+		if (header & KEY_HAS_NULL) != 0 {
+			valueDeclared := (header & VALUE_DECL_TYPE) != 0
+			valueTrackRef := (header & TRACKING_VALUE_REF) != 0
+			if valueTrackRef && !valueDeclared {
+				// Polymorphic null chunks write the reference envelope before
+				// TypeInfo; back-references have no TypeInfo or value body.
+				if !consumeSkippedRefFlag(ctx, true) {
+					if ctx.HasError() {
+						return
+					}
+					lenCounter++
+					continue
+				}
+				valueTrackRef = false
+			}
+			var valueDef FieldDef
+			var valueTypeInfo *TypeInfo
+			if !valueDeclared {
+				typeID := uint32(ctx.buffer.ReadUint8(bufErr))
+				if ctx.HasError() {
+					return
+				}
+				valueTypeInfo = readKnownTypeInfoForSkip(ctx, typeID)
+				if ctx.HasError() {
+					return
+				}
+				valueDef = FieldDef{
+					typeSpec: NewSimpleTypeSpec(TypeId(valueTypeInfo.TypeID)),
+					nullable: true,
+				}
+			} else {
+				valueDef = declaredValueDef
+			}
+			skipValue(ctx, valueDef, valueTrackRef, false, valueTypeInfo)
+			if ctx.HasError() {
+				return
+			}
+			lenCounter++
+			continue
+		}
+
+		// Only value is null
+		if (header & VALUE_HAS_NULL) != 0 {
+			keyDeclared := (header & KEY_DECL_TYPE) != 0
+			keyTrackRef := (header & TRACKING_KEY_REF) != 0
+			if keyTrackRef && !keyDeclared {
+				// Polymorphic null chunks write the reference envelope before
+				// TypeInfo; back-references have no TypeInfo or value body.
+				if !consumeSkippedRefFlag(ctx, true) {
+					if ctx.HasError() {
+						return
+					}
+					lenCounter++
+					continue
+				}
+				keyTrackRef = false
+			}
+			var keyDef FieldDef
+			var keyTypeInfo *TypeInfo
+			if !keyDeclared {
+				typeID := uint32(ctx.buffer.ReadUint8(bufErr))
+				if ctx.HasError() {
+					return
+				}
+				keyTypeInfo = readKnownTypeInfoForSkip(ctx, typeID)
+				if ctx.HasError() {
+					return
+				}
+				keyDef = FieldDef{
+					typeSpec: NewSimpleTypeSpec(TypeId(keyTypeInfo.TypeID)),
+					nullable: true,
+				}
+			} else {
+				keyDef = declaredKeyDef
+			}
+			skipValue(ctx, keyDef, keyTrackRef, false, keyTypeInfo)
+			if ctx.HasError() {
+				return
+			}
+			lenCounter++
+			continue
+		}
+
+		// Both key and value are non-null
+		chunkSize := ctx.buffer.ReadByte(bufErr)
+		if ctx.HasError() {
+			return
+		}
+		if chunkSize == 0 || uint32(chunkSize) > length-lenCounter {
+			setInvalidMapChunkSize(ctx, uint64(chunkSize), uint64(length-lenCounter))
+			return
+		}
+
+		keyDeclared := (header & KEY_DECL_TYPE) != 0
+		valueDeclared := (header & VALUE_DECL_TYPE) != 0
+
+		var keyDef, valueDef FieldDef
+		var keyTypeInfo, valueTypeInfo *TypeInfo
+		if !keyDeclared {
+			typeID := uint32(ctx.buffer.ReadUint8(bufErr))
+			if ctx.HasError() {
+				return
+			}
+			keyTypeInfo = readKnownTypeInfoForSkip(ctx, typeID)
+			if ctx.HasError() {
+				return
+			}
+			keyDef = FieldDef{
+				typeSpec: NewSimpleTypeSpec(TypeId(keyTypeInfo.TypeID)),
+				nullable: true,
+			}
+		} else {
+			keyDef = declaredKeyDef
+		}
+
+		if !valueDeclared {
+			typeID := uint32(ctx.buffer.ReadUint8(bufErr))
+			if ctx.HasError() {
+				return
+			}
+			valueTypeInfo = readKnownTypeInfoForSkip(ctx, typeID)
+			if ctx.HasError() {
+				return
+			}
+			valueDef = FieldDef{
+				typeSpec: NewSimpleTypeSpec(TypeId(valueTypeInfo.TypeID)),
+				nullable: true,
+			}
+		} else {
+			valueDef = declaredValueDef
+		}
+
+		// Check if ref tracking is enabled for keys and values
+		keyTrackRef := (header & TRACKING_KEY_REF) != 0
+		valueTrackRef := (header & TRACKING_VALUE_REF) != 0
+		entryReadAlwaysAdvances := keyTrackRef || valueTrackRef ||
+			fieldReadAlwaysAdvances(keyDef, keyTypeInfo) ||
+			fieldReadAlwaysAdvances(valueDef, valueTypeInfo)
+		var checkpoint uint64
+		if !entryReadAlwaysAdvances {
+			checkpoint = ctx.buffer.logicalReaderIndex()
+		}
+
+		for i := byte(0); i < chunkSize; i++ {
+			skipValue(ctx, keyDef, keyTrackRef, false, keyTypeInfo)
+			if ctx.HasError() {
+				return
+			}
+			skipValue(ctx, valueDef, valueTrackRef, false, valueTypeInfo)
+			if ctx.HasError() {
+				return
+			}
+		}
+		if !entryReadAlwaysAdvances &&
+			!ctx.settleUnbackedContainerItems(int(chunkSize), checkpoint) {
+			return
+		}
+		lenCounter += uint32(chunkSize)
+	}
+	ctx.decDepth()
+}
+
+// skipStruct skips a struct value using TypeInfo
+// Uses context error state for deferred error checking.
+func skipStruct(ctx *ReadContext, info *TypeInfo) {
+	if ctx.HasError() || !ctx.enterDepth() {
+		return
+	}
+
+	// Get fieldDefs from the serializer
+	var fieldDefs []FieldDef
+	if info.Serializer != nil {
+		if ss, ok := info.Serializer.(*structSerializer); ok && ss.fieldDefs != nil {
+			fieldDefs = ss.fieldDefs
+		} else if sss, ok := info.Serializer.(*skipStructSerializer); ok && sss.fieldDefs != nil {
+			fieldDefs = sss.fieldDefs
+		}
+	}
+
+	// If we couldn't get fieldDefs from serializer, try getTypeDef as fallback
+	if fieldDefs == nil {
+		typeDef, tdErr := ctx.TypeResolver().getTypeDef(info.Type, false)
+		if tdErr != nil {
+			ctx.SetError(FromError(fmt.Errorf("cannot skip struct without field definitions: %w", tdErr)))
+			return
+		}
+		fieldDefs = typeDef.fieldDefs
+	}
+
+	for _, fieldDef := range fieldDefs {
+		// Use FieldDef's trackRef and nullable to determine if ref flag was written by Java
+		// Java writes ref flag based on its FieldDef, not based on type rules
+		readRefFlag := fieldDef.trackRef || fieldDef.nullable
+		// For struct-like fields (struct, ext), type info is written in the buffer
+		readTypeInfo := isStructFieldType(fieldDef.typeSpec)
+		SkipFieldValueWithTypeFlag(ctx, fieldDef, readRefFlag, readTypeInfo)
+		if ctx.HasError() {
+			return
+		}
+	}
+	ctx.decDepth()
+}
+
+// skipValue is the main dispatcher for skipping values based on their type
+// Uses context error state for deferred error checking.
+func skipValue(ctx *ReadContext, fieldDef FieldDef, readRefFlag bool, isField bool, typeInfo *TypeInfo) {
+	err := ctx.Err()
+	if !consumeSkippedRefFlag(ctx, readRefFlag) {
+		return
+	}
+
+	typeIDNum := uint32(fieldDef.typeSpec.TypeId())
+
+	internalID := TypeId(typeIDNum)
+	// Handle struct-like types
+	if internalID == COMPATIBLE_STRUCT || internalID == STRUCT ||
+		internalID == NAMED_STRUCT || internalID == NAMED_COMPATIBLE_STRUCT {
+		// If type_info is provided (from SkipAnyValue), use skipStruct directly
+		if typeInfo != nil {
+			skipStruct(ctx, typeInfo)
+			return
+		}
+		// Otherwise we need to read type info
+		ti := readKnownTypeInfoForSkip(ctx, typeIDNum)
+		if ctx.HasError() {
+			return
+		}
+		skipStruct(ctx, ti)
+		return
+	}
+	if internalID == ENUM || internalID == NAMED_ENUM {
+		// Enum values are encoded as ordinal only (VarUint32Small7) for xlang.
+		_ = ctx.buffer.ReadVarUint32Small7(err)
+		return
+	}
+	if internalID == EXT || internalID == NAMED_EXT || internalID == TYPED_UNION || internalID == NAMED_UNION {
+		if typeInfo == nil {
+			typeInfo = readKnownTypeInfoForSkip(ctx, typeIDNum)
+			if ctx.HasError() {
+				return
+			}
+		}
+		if typeInfo != nil && typeInfo.Serializer != nil {
+			// Use the serializer to read and discard the value
+			if typeInfo.Type == nil {
+				ctx.SetError(DeserializationErrorf("cannot skip type %d without a concrete registered type", typeIDNum))
+				return
+			}
+			dummyVal := reflect.New(typeInfo.Type).Elem()
+			typeInfo.Serializer.Read(ctx, RefModeNone, false, false, dummyVal)
+			return
+		}
+		ctx.SetError(DeserializationErrorf("cannot skip type %d: no serializer registered", typeIDNum))
+		return
+	}
+
+	// Match on built-in types
+	switch TypeId(typeIDNum) {
+	// Boolean type
+	case BOOL:
+		_ = ctx.buffer.ReadByte(err)
+
+	// Integer types
+	case INT8:
+		_ = ctx.buffer.ReadInt8(err)
+	case INT16:
+		_ = ctx.buffer.ReadInt16(err)
+	case INT32:
+		_ = ctx.buffer.ReadInt32(err)
+	case VARINT32:
+		_ = ctx.buffer.ReadVarint32(err)
+	case INT64:
+		_ = ctx.buffer.ReadInt64(err)
+	case VARINT64:
+		_ = ctx.buffer.ReadVarint64(err)
+	case TAGGED_INT64:
+		_ = ctx.buffer.ReadTaggedInt64(err)
+
+	// Floating point types
+	case BFLOAT16, FLOAT16:
+		_ = ctx.buffer.ReadUint16(err)
+	case FLOAT32:
+		_ = ctx.buffer.ReadFloat32(err)
+	case FLOAT64:
+		_ = ctx.buffer.ReadFloat64(err)
+
+	// String types
+	case STRING:
+		header := ctx.buffer.ReadVaruint36Small(err)
+		if ctx.HasError() {
+			return
+		}
+		skipSizedBytes(ctx, header>>2)
+	case BINARY:
+		length := ctx.ReadBinaryLength()
+		if ctx.HasError() {
+			return
+		}
+		ctx.buffer.Skip(length, err)
+	case BOOL_ARRAY, INT8_ARRAY, UINT8_ARRAY:
+		length := ctx.ReadBinaryLength()
+		if ctx.HasError() {
+			return
+		}
+		ctx.buffer.Skip(length, err)
+	case INT16_ARRAY, UINT16_ARRAY, FLOAT16_ARRAY, BFLOAT16_ARRAY:
+		size := ctx.ReadBinaryLength()
+		if ctx.HasError() {
+			return
+		}
+		ctx.buffer.Skip(size, err)
+	case INT32_ARRAY, UINT32_ARRAY, FLOAT32_ARRAY:
+		size := ctx.ReadBinaryLength()
+		if ctx.HasError() {
+			return
+		}
+		ctx.buffer.Skip(size, err)
+	case INT64_ARRAY, UINT64_ARRAY, FLOAT64_ARRAY:
+		size := ctx.ReadBinaryLength()
+		if ctx.HasError() {
+			return
+		}
+		ctx.buffer.Skip(size, err)
+
+	// Date/Time types
+	case DATE:
+		if ctx.TypeResolver().IsXlang() {
+			_ = ctx.buffer.ReadVarint64(err)
+		} else {
+			_ = ctx.buffer.ReadInt32(err)
+		}
+	case TIMESTAMP:
+		_ = ctx.buffer.ReadInt64(err)
+		_ = ctx.buffer.ReadUint32(err)
+	case DURATION:
+		_ = ctx.buffer.ReadVarint64(err)
+		_ = ctx.buffer.ReadInt32(err)
+
+	// Container types
+	case LIST, SET:
+		skipCollection(ctx, fieldDef)
+	case MAP:
+		skipMap(ctx, fieldDef)
+
+	case UNION, TYPED_UNION, NAMED_UNION:
+		if !ctx.enterDepth() {
+			return
+		}
+		_ = ctx.buffer.ReadVarUint32(err) // case_id
+		if ctx.HasError() {
+			return
+		}
+		SkipAnyValue(ctx, true)
+		if ctx.HasError() {
+			return
+		}
+		ctx.decDepth()
+
+	case NONE:
+		return
+
+	// Struct types
+	case COMPATIBLE_STRUCT, NAMED_COMPATIBLE_STRUCT, STRUCT, NAMED_STRUCT:
+		if typeInfo != nil {
+			skipStruct(ctx, typeInfo)
+			return
+		}
+		// Dynamic fields write type info into the buffer, so read it first.
+		ti := readTypeInfoForSkip(ctx, TypeId(typeIDNum))
+		if ctx.HasError() {
+			return
+		}
+		skipStruct(ctx, ti)
+
+	// Enum types
+	case ENUM:
+		_ = ctx.buffer.ReadVarUint32Small7(err)
+
+	// Unsigned integer types
+	case UINT8:
+		_ = ctx.buffer.ReadByte(err)
+	case UINT16:
+		_ = ctx.buffer.ReadUint16(err)
+	case UINT32:
+		_ = ctx.buffer.ReadUint32(err)
+	case VAR_UINT32:
+		_ = ctx.buffer.ReadVarUint32(err)
+	case UINT64:
+		_ = ctx.buffer.ReadUint64(err)
+	case VAR_UINT64:
+		_ = ctx.buffer.ReadVarUint64(err)
+	case TAGGED_UINT64:
+		_ = ctx.buffer.ReadTaggedUint64(err)
+
+	// Unknown (polymorphic) type - read type info and skip dynamically
+	case UNKNOWN:
+		// UNKNOWN (0) is used for polymorphic types in cross-language serialization
+		// We need to read the actual type info to know how to skip
+		SkipAnyValue(ctx, false)
+
+	// Named extension types - not yet supported
+	case NAMED_EXT:
+		ctx.SetError(DeserializationErrorf("unsupported type for skip: NAMED_EXT (%d)", typeIDNum))
+
+	// Unsupported types
+	default:
+		ctx.SetError(DeserializationErrorf("unsupported type for skip: %d", typeIDNum))
+	}
+}

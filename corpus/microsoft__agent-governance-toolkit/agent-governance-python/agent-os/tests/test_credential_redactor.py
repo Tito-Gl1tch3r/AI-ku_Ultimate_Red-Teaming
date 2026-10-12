@@ -1,0 +1,918 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+"""Tests for credential redaction helpers."""
+
+# cspell:ignore AKIAIOSFODNN Nlcjpw
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from agent_os.credential_redactor import REDACTED_PLACEHOLDER, CredentialRedactor
+
+
+def _fake_github_token(prefix: str) -> str:
+    return f"{prefix}_FAKEFORTESTING000000000000000000"
+
+
+# Fake Google API key built by concatenation so the contiguous literal never
+# appears in source (avoids secret-scanner false positives on a test value).
+_FAKE_GOOGLE_KEY = "AIza" + "SyD1234567890abcdefghijklmnopqrstuv"
+
+# AWS's own documentation example access key ID — deterministic and clearly fake.
+_FAKE_AWS_ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE"
+
+# base64("user:pass123"), used only as a Basic auth credential value fixture.
+_FAKE_BASIC_AUTH_VALUE = "dXNlcjpwYXNzMTIz"
+
+
+def _fake_pem_block(label: str) -> str:
+    return (
+        f"-----BEGIN {label}-----\n"
+        "VGhpcyBpcyBub3QgYSByZWFsIGtleS4=\n"
+        "QWxsIHZhbHVlcyBhcmUgZmFrZSBmb3IgdGVzdGluZy4=\n"
+        f"-----END {label}-----"
+    )
+
+
+@pytest.mark.parametrize(
+    ("input_text", "expected_type"),
+    [
+        ("key=sk-test_abcdefghijklmnopqrstuvwxyz", "OpenAI API key"),
+        ("token=ghp_FAKEFORTESTING000000000000000000", "GitHub token"),
+        (f"aws={_FAKE_AWS_ACCESS_KEY}", "AWS access key"),
+        ("AccountKey=abc123def456ghi789jkl012mno345pqr678stu901vw==", "Azure key"),
+        (
+            "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature",
+            "Bearer token",
+        ),
+        ("-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----", "PEM private key"),
+        ("Server=db;Password=supersecret;", "Connection string secret"),
+        ("https://user:pass123@example.com/resource", "Basic auth secret"),
+        ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature", "JWT"),
+        ("api_key=super-secret-value", "Generic API secret"),
+    ],
+)
+def test_detects_and_redacts_supported_credential_types(input_text: str, expected_type: str):
+    redacted = CredentialRedactor.redact(input_text)
+    detected = CredentialRedactor.detect_credential_types(input_text)
+
+    assert REDACTED_PLACEHOLDER in redacted
+    assert expected_type in detected
+    assert CredentialRedactor.contains_credentials(input_text) is True
+
+
+def test_redact_dictionary_alias_redacts_nested_values():
+    payload = {
+        "headers": {
+            "authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature",
+        },
+        "items": [
+            "safe value",
+            "api_key=secret-value",
+        ],
+    }
+
+    redacted = CredentialRedactor.redact_dictionary(payload)
+
+    assert redacted["headers"]["authorization"] == REDACTED_PLACEHOLDER
+    assert redacted["items"][0] == "safe value"
+    assert redacted["items"][1] == REDACTED_PLACEHOLDER
+
+
+def test_clean_values_remain_unchanged():
+    payload = {
+        "message": "hello world",
+        "list": ["one", "two"],
+    }
+
+    assert CredentialRedactor.redact("hello world") == "hello world"
+    assert CredentialRedactor.redact_data_structure(payload) == payload
+    assert CredentialRedactor.contains_credentials("hello world") is False
+
+
+def test_incomplete_pem_header_is_not_treated_as_full_key():
+    text = "-----BEGIN RSA PRIVATE KEY-----\nmissing footer"
+
+    assert CredentialRedactor.redact(text) == text
+    assert CredentialRedactor.contains_credentials(text) is False
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "RSA PRIVATE KEY",
+        "EC PRIVATE KEY",
+        "DSA PRIVATE KEY",
+        "OPENSSH PRIVATE KEY",
+        "ENCRYPTED PRIVATE KEY",
+        "PRIVATE KEY",
+    ],
+)
+def test_redacts_full_rfc7468_private_key_blocks(label: str):
+    pem_block = _fake_pem_block(label)
+    text = f"before\n{pem_block}\nafter"
+
+    redacted = CredentialRedactor.redact(text)
+    matches = CredentialRedactor.find_matches(text)
+
+    assert redacted == f"before\n{REDACTED_PLACEHOLDER}\nafter"
+    assert any(match.name == "PEM private key" and match.matched_text == pem_block for match in matches)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        _fake_pem_block("PUBLIC KEY"),
+        "-----BEGIN RSA PRIVATE KEY-----\nZmFrZQ==\n-----END EC PRIVATE KEY-----",
+        "BEGIN RSA PRIVATE KEY\nZmFrZQ==\nEND RSA PRIVATE KEY",
+    ],
+)
+def test_does_not_redact_non_private_or_malformed_pem_blocks(text: str):
+    assert CredentialRedactor.redact(text) == text
+    assert CredentialRedactor.contains_credentials(text) is False
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        _fake_github_token("ghp"),
+        _fake_github_token("ghs"),
+        _fake_github_token("gho"),
+        _fake_github_token("ghu"),
+        _fake_github_token("ghr"),
+        "github_pat_FAKE_FOR_TESTING_0000000000000000000000",
+    ],
+)
+def test_redacts_supported_github_token_prefixes(token: str):
+    text = f"token {token} end"
+
+    redacted = CredentialRedactor.redact(text)
+
+    assert redacted == f"token {REDACTED_PLACEHOLDER} end"
+    assert "GitHub token" in CredentialRedactor.detect_credential_types(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"x{_fake_github_token('ghp')}",
+        "gho_short",
+        "github_pat_short",
+        "notgithub_pat_FAKE_FOR_TESTING_0000000000000000000000",
+    ],
+)
+def test_github_token_boundaries_and_lengths_avoid_false_positives(text: str):
+    assert CredentialRedactor.redact(text) == text
+    assert CredentialRedactor.contains_credentials(text) is False
+
+
+def test_github_token_trailing_underscore_is_detected():
+    """A GitHub token followed by a bare underscore (e.g. ``TOKEN_``) must be
+    detected — the trailing ``_`` is not part of the token and must not block
+    detection. Regression for issue #3933."""
+    text = f"{_fake_github_token('ghs')}_"
+    assert CredentialRedactor.contains_credentials(text) is True
+    assert REDACTED_PLACEHOLDER in CredentialRedactor.redact(text)
+
+
+def test_redaction_is_idempotent():
+    text = (
+        f"first {_fake_github_token('ghp')} "
+        f"second {_fake_pem_block('EC PRIVATE KEY')} "
+        "third key=sk-FAKEFORTESTING000000000000000000"
+    )
+
+    once = CredentialRedactor.redact(text)
+    twice = CredentialRedactor.redact(once)
+
+    assert once == twice
+    assert once.count(REDACTED_PLACEHOLDER) == 3
+
+
+def test_private_key_pattern_handles_adversarial_input_quickly():
+    text = "-----BEGIN RSA PRIVATE KEY-----\n" + ("A" * 100_000)
+
+    start = time.perf_counter()
+    redacted = CredentialRedactor.redact(text)
+    elapsed = time.perf_counter() - start
+
+    assert redacted == text
+    assert elapsed < 1.0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "AKIA" + "A" * 100_000,
+        "gh" + "p_" + "a" * 100_000,
+        "AIza" + "A" * 100_000,
+        "sk_live_" + "a" * 100_000,
+    ],
+)
+def test_trailing_lookahead_patterns_handle_adversarial_input_quickly(text: str):
+    # The new trailing lookahead is a single fixed-width check, not a repeated
+    # class, so it does not change the linear-time behavior of these patterns.
+    start = time.perf_counter()
+    CredentialRedactor.redact(text)
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 1.0
+
+
+# AWS's own documentation example secret — deterministic and clearly fake.
+_FAKE_AWS_SECRET = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+# Realistic-length clearly-fake Azure SAS signature. Real Azure sig values are
+# base64(HMAC-SHA256) = 44 chars (longer URL-encoded); the detector requires
+# this realistic floor so short incidental "sig=" params are not flagged.
+_FAKE_SAS_SIG = "abcDEF0123ghiJKL4567mnoPQR89stuVWX%2Fyz01%3D2345"
+
+
+@pytest.mark.parametrize(
+    ("input_text", "expected_type"),
+    [
+        (f"aws_secret_access_key = {_FAKE_AWS_SECRET}", "AWS secret access key"),
+        (f"aws-secret-access-key: {_FAKE_AWS_SECRET}", "AWS secret access key"),
+        (f'"AWS Secret Access Key":"{_FAKE_AWS_SECRET}"', "AWS secret access key"),
+        (
+            "https://a.blob.core.windows.net/c/b?sv=2021-08-06&ss=b&srt=o"
+            f"&sp=rwd&se=2025-01-01T00:00:00Z&sig={_FAKE_SAS_SIG}",
+            "Azure SAS token",
+        ),
+        (
+            # SAS query parameters are not ordered; sig may appear before sv.
+            f"https://a.blob.core.windows.net/c/b?sig={_FAKE_SAS_SIG}"
+            "&sv=2021-08-06&sp=r",
+            "Azure SAS token",
+        ),
+        ("xoxb-FAKE-not-a-real-slack-token-00", "Slack token"),
+        ("xapp-FAKE-not-a-real-slack-token-00", "Slack token"),
+        (_FAKE_GOOGLE_KEY, "Google API key"),
+        ("stripe=sk_live_FakeTestKey0000", "Stripe secret key"),
+        ("rk_test_FakeTestKey0000", "Stripe secret key"),
+    ],
+)
+def test_detects_and_redacts_newly_covered_secret_classes(input_text: str, expected_type: str):
+    redacted = CredentialRedactor.redact(input_text)
+    detected = CredentialRedactor.detect_credential_types(input_text)
+
+    assert REDACTED_PLACEHOLDER in redacted
+    assert expected_type in detected
+    assert CredentialRedactor.contains_credentials(input_text) is True
+
+
+def test_aws_secret_value_is_fully_removed():
+    text = f"aws_secret_access_key = {_FAKE_AWS_SECRET}"
+
+    assert _FAKE_AWS_SECRET not in CredentialRedactor.redact(text)
+
+
+def test_azure_sas_signature_is_removed():
+    url = (
+        "https://a.blob.core.windows.net/c/b?sv=2021-08-06&ss=b&srt=o"
+        f"&sp=rwd&se=2025-01-01T00:00:00Z&sig={_FAKE_SAS_SIG}"
+    )
+
+    redacted = CredentialRedactor.redact(url)
+
+    assert "sig=" not in redacted
+    assert _FAKE_SAS_SIG not in redacted
+    # The non-secret base path survives.
+    assert redacted.startswith("https://a.blob.core.windows.net/c/b?")
+
+
+def test_azure_sas_detected_regardless_of_parameter_order():
+    # SAS query parameters are order-independent; a token with sig before sv
+    # must still be detected and redacted (regression: an sv-anchored pattern
+    # missed this and the signature leaked).
+    url = (
+        f"https://a.blob.core.windows.net/c/b?sig={_FAKE_SAS_SIG}"
+        "&sv=2021-08-06&sp=r"
+    )
+
+    assert CredentialRedactor.contains_credentials(url) is True
+    assert _FAKE_SAS_SIG not in CredentialRedactor.redact(url)
+
+
+def test_azure_sas_pattern_has_no_quadratic_backtracking():
+    # Repeated non-matching markers must not trigger super-linear scanning
+    # (regression: a lazy cross-parameter gap scanned to end from each marker).
+    text = "&".join(["sv=2021-08-06"] * 5000)
+
+    start = time.perf_counter()
+    CredentialRedactor.redact(text)
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 1.0
+
+
+@pytest.mark.parametrize(
+    "scheme",
+    [
+        "1.https",
+        ("Z" * 65) + "https",
+        ("a." * 65) + "https",
+        "a" + ("1" * 100),
+        "a" + ("." * 100),
+    ],
+    ids=[
+        "punctuation-prefix",
+        "long-word-prefix",
+        "separator-dense-prefix",
+        "long-numeric-tail",
+        "long-punctuation-tail",
+    ],
+)
+def test_basic_auth_uri_remains_fail_closed_with_padded_scheme(scheme: str):
+    secret = "user:pass123"
+    url = f"{scheme}://{secret}@example.com/resource"
+
+    redacted, types = CredentialRedactor.scan_and_redact(url)
+
+    assert "Basic auth secret" in types
+    assert REDACTED_PLACEHOLDER in redacted
+    assert secret not in redacted
+
+
+def test_basic_auth_scan_and_redact_handles_separator_dense_input_quickly():
+    text = "a." * 24_000
+
+    start = time.perf_counter()
+    redacted, types = CredentialRedactor.scan_and_redact(text)
+    elapsed = time.perf_counter() - start
+
+    assert redacted == text
+    assert "Basic auth secret" not in types
+    assert elapsed < 1.0
+
+
+def test_slack_token_fully_redacted_when_followed_by_word_char():
+    # Regression: the "-" in the token class let a trailing word boundary
+    # backtrack and redact only a prefix, leaking the final secret segment.
+    secret_tail = "abcdefghijklmnopqrstuvwx"
+    text = f"slack=xoxb-111111111111-222222222222-{secret_tail}_rotated"
+
+    redacted = CredentialRedactor.redact(text)
+
+    assert secret_tail not in redacted
+
+
+def test_bare_sig_query_param_without_sas_context_is_not_flagged():
+    # A short "sig=" that is not an Azure SAS token must not false-positive.
+    text = "https://example.com/callback?sig=abcdefghijklmnopqrstuvwxyz123456"
+
+    assert CredentialRedactor.contains_credentials(text) is False
+    assert CredentialRedactor.redact(text) == text
+
+
+def test_detection_and_redaction_agree_on_adjacent_anchored_secrets():
+    # Regression: sequential subn on a mutating string let the greedy OpenAI
+    # pattern consume the "aws_secret_access_key" anchor of a following pattern,
+    # so redaction removed less than detection reported and the secret survived.
+    secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    text = "sk-abcDEF012345678901234567890-aws_secret_access_key=" + secret
+
+    detected = CredentialRedactor.detect_credential_types(text)
+    redacted = CredentialRedactor.redact(text)
+
+    assert "AWS secret access key" in detected
+    assert secret not in redacted
+    assert CredentialRedactor.contains_credentials(redacted) is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "session_sk-abcdefghijklmnopqrstuvwx0123",
+        "prefix_ghp_FAKEFORTESTING000000000000000000",
+        "x_xoxb-FAKE-not-a-real-slack-token",
+        "svc_" + _FAKE_GOOGLE_KEY,
+        "env_sk_live_FakeTestKey0000",
+        "db_password=Hunter2xyz",
+        f"auth_Basic {_FAKE_BASIC_AUTH_VALUE}",
+        "url_https://user:pass123@example.com/resource",
+    ],
+)
+def test_detects_secret_glued_to_preceding_word_character(text: str):
+    # Regression: a leading \b treats "_" as a word character, so a secret glued
+    # directly after "_" was missed. The (?<![A-Za-z0-9]) anchor detects it.
+    # The Basic auth secret pattern kept a plain \b on its left edge after
+    # every other prefix-anchored pattern had already moved to the lookbehind,
+    # so both of its branches were still missing this case until now.
+    assert CredentialRedactor.contains_credentials(text) is True
+    assert REDACTED_PLACEHOLDER in CredentialRedactor.redact(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_type"),
+    [
+        (f"{_FAKE_AWS_ACCESS_KEY}_old", "AWS access key"),
+        (f"{_fake_github_token('ghp')}_old", "GitHub token"),
+        (f"{_fake_github_token('ghs')}_deprecated", "GitHub token"),
+        (f"{_fake_github_token('gho')}_backup", "GitHub token"),
+        (f"{_fake_github_token('ghu')}_rotated", "GitHub token"),
+        (f"{_fake_github_token('ghr')}_v2", "GitHub token"),
+        (f"{_FAKE_GOOGLE_KEY}_old", "Google API key"),
+        ("stripe=sk_live_FakeTestKey0000_rotated", "Stripe secret key"),
+        (f"Basic {_FAKE_BASIC_AUTH_VALUE}_old", "Basic auth secret"),
+    ],
+)
+def test_redacts_secret_glued_to_a_following_word_character(text: str, expected_type: str):
+    # Regression: AWS access key, GitHub token, Google API key and Stripe secret
+    # key either have a fixed length or a value class that excludes "_". A
+    # trailing \b (or, for GitHub, a lookahead that still excluded "_") after
+    # one of those finds no shorter match to back off to when the secret is
+    # followed by an annotation like "_old", so the entire pattern failed and
+    # the complete, valid secret passed through unredacted. Basic auth secret
+    # had the same right-edge gap once its left edge was anchored correctly.
+    redacted = CredentialRedactor.redact(text)
+
+    assert REDACTED_PLACEHOLDER in redacted
+    assert expected_type in CredentialRedactor.detect_credential_types(text)
+    assert CredentialRedactor.contains_credentials(text) is True
+    # The suffix is annotation, not part of the secret, and must survive.
+    assert text.rsplit("_", 1)[-1] in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"{_FAKE_AWS_ACCESS_KEY}X",
+        f"{_FAKE_GOOGLE_KEY}9",
+        "sk_live_short",
+        f"Basic {_FAKE_BASIC_AUTH_VALUE[:6]}",
+        "https://example.com/resource",
+    ],
+)
+def test_trailing_anchor_does_not_widen_the_match(text: str):
+    # The mirror assertion on the right edge is exactly as strict about what
+    # may follow as the fixed length or value class already was: one more
+    # alphanumeric character after a fixed-length key is a longer, different
+    # token, not the same key with an annotation, and must stay unmatched.
+    assert CredentialRedactor.redact(text) == text
+    assert CredentialRedactor.contains_credentials(text) is False
+
+
+def test_redacts_google_api_key_ending_in_hyphen_when_glued():
+    # Regression: the 35 char value class includes "-", so a real key can end
+    # in one. A trailing \b treats "-" as an automatic boundary on its own,
+    # since "-" is not a word character, so a key ending in "-" and glued
+    # straight to more text was redacted before the #3494 fix. The mirror
+    # assertion by itself loses that shape, since it only looks at what
+    # follows, not at what was actually consumed. The pattern now also
+    # accepts whenever the last character consumed is "-", so this case is
+    # redacted the same as it was before, while a key ending in a plain
+    # alphanumeric character glued to more text still correctly stays
+    # unmatched (see test_trailing_anchor_does_not_widen_the_match above).
+    key_ending_in_hyphen = "AIza" + "A" * 34 + "-"
+    text = f"{key_ending_in_hyphen}X"
+
+    redacted = CredentialRedactor.redact(text)
+
+    assert REDACTED_PLACEHOLDER in redacted
+    assert "Google API key" in CredentialRedactor.detect_credential_types(text)
+    assert CredentialRedactor.contains_credentials(text) is True
+    # The unrelated glued character is not part of the secret and must survive.
+    assert redacted == f"{REDACTED_PLACEHOLDER}X"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "basketball-court-schedule-1234567",
+        "the disk-usage-report is ready",
+        "a risky-business-plan draft",
+        "the tokenizer=fast setting is nice",
+    ],
+)
+def test_loosened_anchor_does_not_match_inside_words(text: str):
+    # The (?<![A-Za-z0-9]) anchor still refuses to match a secret prefix that is
+    # embedded in an alphanumeric word (e.g. the "sk-" inside "disk-").
+    assert CredentialRedactor.contains_credentials(text) is False
+    assert CredentialRedactor.redact(text) == text
+
+
+def test_scan_and_redact_reports_types_without_raw_secret():
+    secret = "xoxb-FAKE-not-a-real-slack-token-00"
+    redacted, types = CredentialRedactor.scan_and_redact(f"token {secret}")
+
+    assert REDACTED_PLACEHOLDER in redacted
+    assert secret not in redacted
+    assert types == ["Slack token"]
+    # The returned metadata must never carry the raw secret value.
+    assert all(secret not in name for name in types)
+
+
+def test_scan_and_redact_empty_input():
+    assert CredentialRedactor.scan_and_redact(None) == ("", [])
+    assert CredentialRedactor.scan_and_redact("") == ("", [])
+
+
+@pytest.mark.parametrize(
+    "ssn",
+    [
+        "123-45-6789",   # dash
+        "123 45 6789",   # space
+        "123.45.6789",   # dot
+    ],
+)
+def test_ssn_detected_across_separators(ssn: str):
+    """The dash-only pattern missed the space and dot forms used elsewhere in the
+    codebase. Regression for issue #3239."""
+    matches = CredentialRedactor.find_pii_matches(f"employee ssn {ssn} on file")
+    assert any(m.name == "US SSN" and m.matched_text == ssn for m in matches)
+
+
+def test_ssn_glued_to_a_word_character_is_detected():
+    """A word boundary treats ``_`` as a word character, so an SSN glued to one
+    escaped detection. The lookaround anchor catches it."""
+    matches = CredentialRedactor.find_pii_matches("employee_123-45-6789")
+    assert any(m.name == "US SSN" for m in matches)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Tracking: 123456789",       # bare nine digits, not an SSN
+        "order_123456789",           # nine-digit id glued to an underscore
+        "ZIP 12345-6789",            # ZIP+4
+        "ABA 021000021",             # routing number
+        "order 1234567890 shipped",  # ten digits
+        "build 12-34-5678 tagged",   # wrong digit grouping
+    ],
+)
+def test_ssn_pattern_rejects_bare_nine_digit_forms(text: str):
+    """pii_leak is a hard-block category in the MCP gateway, so a bare nine-digit
+    match would deny ordinary traffic. A separator is required here."""
+    assert not any(
+        m.name == "US SSN" for m in CredentialRedactor.find_pii_matches(text)
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "SSN: 745102386",
+        "ssn=745102386",
+        "social security number 745102386",
+        '{"ssn": "745102386"}',
+        '"ssn":"745102386"',
+        "'ssn': '745102386'",
+    ],
+)
+def test_cued_bare_ssn_detected_in_lockstep(text: str):
+    """Regression (#3592): a bare nine-digit SSN next to an explicit cue
+    (``SSN:``, ``ssn=``, ``social security number``) evaded both the gateway
+    redactor and the adapter SSN detector, which require a separator. Both
+    detectors now flag the cued-bare form, kept in lockstep (#3591)."""
+    from agent_os.integrations.base import PII_PATTERNS as ADAPTER_PII_PATTERNS
+
+    assert any(
+        m.name == "US SSN" for m in CredentialRedactor.find_pii_matches(text)
+    ), f"gateway redactor missed cued-bare SSN: {text!r}"
+    assert any(
+        p.search(text) for p in ADAPTER_PII_PATTERNS
+    ), f"adapter detector missed cued-bare SSN: {text!r}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Tracking: 123456789",
+        "ABA 021000021",
+        "ZIP 12345-6789",
+        "ssn_lookup_id=123456789",
+        "ssn service ticket 123456789",
+        "no ssn on file; case 123456789",
+        "SSN:     745102386",
+    ],
+)
+def test_uncued_bare_ssn_rejected_in_lockstep(text: str):
+    """The cued branch must not broaden the bare-uncued corpus: numbers with
+    no SSN cue stay non-matching on both detectors so pii_leak does not
+    hard-block ordinary traffic (#3592)."""
+    from agent_os.integrations.base import PII_PATTERNS as ADAPTER_PII_PATTERNS
+
+    assert not any(
+        m.name == "US SSN" for m in CredentialRedactor.find_pii_matches(text)
+    ), f"gateway redactor over-matched uncued number: {text!r}"
+    assert not any(
+        p.search(text) for p in ADAPTER_PII_PATTERNS
+    ), f"adapter detector over-matched uncued number: {text!r}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "SSN: 745102386",  # cued-bare positive, kept for the parity anchor below
+    ],
+)
+def test_ssn_patterns_byte_identical_across_detectors(text: str):
+    """Both SSN forms (separated and cued-bare) must stay byte-identical between
+    the gateway redactor and the adapter detector, so a later edit to one is a CI
+    failure rather than a silent divergence (#3591/#3592)."""
+    from agent_os.integrations.base import PII_PATTERNS as ADAPTER_PII_PATTERNS
+
+    gateway_ssn = [
+        (p.pattern.pattern, p.pattern.flags)
+        for p in CredentialRedactor.PII_PATTERNS
+        if p.name == "US SSN"
+    ]
+    adapter = {(p.pattern, p.flags) for p in ADAPTER_PII_PATTERNS}
+    assert len(gateway_ssn) == 2, "expected a separated and a cued-bare US SSN pattern"
+    for pattern, flags in gateway_ssn:
+        assert (pattern, flags) in adapter, f"adapter is missing the SSN pattern {pattern!r}"
+    # The text arg keeps this a positive smoke check too.
+    assert any(m.name == "US SSN" for m in CredentialRedactor.find_pii_matches(text))
+
+# ---------------------------------------------------------------
+# Boundary regression tests for issue #3933
+# A valid credential glued to a preceding or following word
+# character via ``_`` must still be detected and redacted. The
+# left-edge anchor was already ``(?<![A-Za-z0-9])``; the right-edge
+# previously used ``\b`` or ``(?![A-Za-z0-9_])``, both of which
+# treat ``_`` as a boundary-blocker and silently pass the secret
+# through.
+# ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"{_fake_github_token('ghp')}_old",
+        f"{_fake_github_token('ghp')}_deprecated",
+        f"{_fake_github_token('ghp')}_rotated",
+    ],
+)
+def test_github_token_right_edge_underscore_is_detected(text: str):
+    """A GitHub token followed by ``_old`` etc. must be detected."""
+    assert CredentialRedactor.contains_credentials(text) is True
+    assert REDACTED_PLACEHOLDER in CredentialRedactor.redact(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_email"),
+    [
+        ("Contact john.doe@corp.com", "john.doe@corp.com"),
+        ("Contact -john.doe@corp.com", "john.doe@corp.com"),
+        ("Contact +tag@example.com", "tag@example.com"),
+        ("Contact .john.doe@corp.com", "john.doe@corp.com"),
+        ("Contact %john.doe@corp.com", "john.doe@corp.com"),
+        ("Contact:-jane.roe@contoso.com", "jane.roe@contoso.com"),
+    ],
+)
+def test_email_detection_remains_fail_closed_next_to_punctuation(
+    text: str, expected_email: str
+):
+    matches = CredentialRedactor.find_pii_matches(text)
+
+    assert any(
+        match.name == "Email address" and expected_email in match.matched_text
+        for match in matches
+    )
+
+
+def test_email_detection_remains_fail_closed_with_uninterrupted_prefix():
+    readable_email = "john@corp.com"
+    attacker_controlled_text = f"{'Z' * 61}{readable_email}"
+
+    assert CredentialRedactor.contains_pii(attacker_controlled_text)
+
+    matches = CredentialRedactor.find_pii_matches(attacker_controlled_text)
+
+    assert any(
+        match.name == "Email address" and readable_email in match.matched_text
+        for match in matches
+    )
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    ["1", "_", "\N{CYRILLIC SMALL LETTER YA}"],
+    ids=["digit", "underscore", "unicode-word-character"],
+)
+def test_email_detection_remains_fail_closed_with_uninterrupted_suffix(suffix: str):
+    readable_email = "john@corp.com"
+    attacker_controlled_text = f"{readable_email}{suffix}"
+
+    assert CredentialRedactor.contains_pii(attacker_controlled_text)
+
+    matches = CredentialRedactor.find_pii_matches(attacker_controlled_text)
+
+    assert any(
+        match.name == "Email address" and readable_email in match.matched_text
+        for match in matches
+    )
+
+
+def test_email_detection_prefers_bounded_suffix_match_to_punctuation_bypass():
+    bounded_suffix = f"{'a' * 64}@example.com"
+    invalid_overlong_email = f"x.{bounded_suffix}"
+
+    matches = CredentialRedactor.find_pii_matches(invalid_overlong_email)
+
+    assert any(
+        match.name == "Email address" and match.matched_text == bounded_suffix
+        for match in matches
+    )
+
+
+def test_email_redaction_leaves_overlong_local_part_prefix_visible():
+    text = f"{'a' * 300}@example.com"
+
+    redacted = CredentialRedactor.redact(text, redact_pii=True)
+
+    assert redacted == ("a" * 236) + REDACTED_PLACEHOLDER
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_match"),
+    [
+        ("pkg@1.0.0.dev1", "pkg@1.0.0.dev"),
+        ("pkg@1.2.3.rc1", "pkg@1.2.3.rc"),
+    ],
+)
+def test_email_detection_intentionally_matches_package_prerelease_versions(
+    text: str, expected_match: str
+):
+    assert CredentialRedactor.contains_pii(text)
+    matches = CredentialRedactor.find_pii_matches(text)
+
+    assert any(
+        match.name == "Email address" and match.matched_text == expected_match
+        for match in matches
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "AKIAIOSFODNN7EXAMPLE_old",
+        "AKIAIOSFODNN7EXAMPLE_deprecated",
+        "AKIAIOSFODNN7EXAMPLE_rotated",
+    ],
+)
+def test_aws_key_right_edge_underscore_is_detected(text: str):
+    """An AWS access key followed by ``_old`` etc. must be detected."""
+    assert CredentialRedactor.contains_credentials(text) is True
+    redacted = CredentialRedactor.redact(text)
+    assert "AKIAIOSFODNN7EXAMPLE" not in redacted
+    assert REDACTED_PLACEHOLDER in redacted
+
+
+def test_google_key_right_edge_underscore_is_detected():
+    text = _FAKE_GOOGLE_KEY + "_old"
+    assert CredentialRedactor.contains_credentials(text) is True
+    redacted = CredentialRedactor.redact(text)
+    assert _FAKE_GOOGLE_KEY not in redacted
+    assert REDACTED_PLACEHOLDER in redacted
+
+
+def test_google_key_left_edge_underscore_is_detected():
+    text = "svc_" + _FAKE_GOOGLE_KEY
+    assert CredentialRedactor.contains_credentials(text) is True
+    redacted = CredentialRedactor.redact(text)
+    assert _FAKE_GOOGLE_KEY not in redacted
+
+
+def test_openai_key_right_edge_underscore_is_detected():
+    token = "sk-abcdefghijklmnopqrstuvwxyz0123"
+    text = f"{token}_old"
+    assert CredentialRedactor.contains_credentials(text) is True
+    redacted = CredentialRedactor.redact(text)
+    assert token not in redacted
+    assert REDACTED_PLACEHOLDER in redacted
+
+
+def test_stripe_key_right_edge_underscore_is_detected():
+    text = "sk_live_FakeTestKey0000_old"
+    assert CredentialRedactor.contains_credentials(text) is True
+    redacted = CredentialRedactor.redact(text)
+    assert "sk_live_FakeTestKey0000" not in redacted
+
+
+def test_multiple_underscore_glued_credentials_all_detected():
+    """Multiple credentials each glued to ``_`` must all be detected in one pass."""
+    aws = "AKIAIOSFODNN7EXAMPLE"
+    github = _fake_github_token("ghp")
+    google = _FAKE_GOOGLE_KEY
+    openai = "sk-abcdefghijklmnopqrstuvwxyz0123"
+
+    text = f"env_{aws}_old cfg_{github}_rotated svc_{google}_deprecated session_{openai}_bak"
+    types = CredentialRedactor.detect_credential_types(text)
+
+    assert "AWS access key" in types
+    assert "GitHub token" in types
+    assert "Google API key" in types
+    assert "OpenAI API key" in types
+
+    redacted = CredentialRedactor.redact(text)
+    assert aws not in redacted
+    assert github not in redacted
+    assert google not in redacted
+    assert openai not in redacted
+
+
+def test_underscore_glued_credential_does_not_false_positive_inside_alphanumeric():
+    """The fix must not match inside a contiguous alphanumeric word."""
+    for text in [
+        "fooAKIAIOSFODNN7EXAMPLE",
+        "0AKIAIOSFODNN7EXAMPLE",
+        f"x{_fake_github_token('ghp')}",
+    ]:
+        assert CredentialRedactor.contains_credentials(text) is False
+# ---------------------------------------------------------------------------
+# Opt-in PII redaction (issue #3239): redact() is secrets-only by default, and
+# only strips PII/CRI when the caller passes redact_pii=True.
+# ---------------------------------------------------------------------------
+
+# Documentation/reserved-range values, so no real PII appears in source.
+_PII_SAMPLES = [
+    ("email", "user@example.com"),
+    ("ssn", "123-45-6789"),
+    ("phone", "+1 415-555-0100"),
+    ("credit_card", "4111 1111 1111 1111"),
+    ("ipv4", "192.0.2.1"),
+]
+
+
+@pytest.mark.parametrize("label, sample", _PII_SAMPLES, ids=[s[0] for s in _PII_SAMPLES])
+def test_redact_leaves_pii_untouched_by_default(label: str, sample: str):
+    # Sanity: each sample is detected as PII but is NOT a secret...
+    assert CredentialRedactor.contains_pii(sample) is True
+    assert CredentialRedactor.contains_credentials(sample) is False
+    # ...so the secrets-only default must pass it through unchanged.
+    assert CredentialRedactor.redact(sample) == sample
+
+
+@pytest.mark.parametrize("label, sample", _PII_SAMPLES, ids=[s[0] for s in _PII_SAMPLES])
+def test_redact_pii_opt_in_scrubs_pii(label: str, sample: str):
+    text = f"the value is {sample} today"
+    redacted = CredentialRedactor.redact(text, redact_pii=True)
+    assert sample not in redacted
+    assert REDACTED_PLACEHOLDER in redacted
+
+
+def test_redact_pii_opt_in_still_scrubs_secrets():
+    text = "contact user@example.com with api_key=super-secret-value"
+    redacted = CredentialRedactor.redact(text, redact_pii=True)
+    # Both the PII and the secret are removed.
+    assert "user@example.com" not in redacted
+    assert "super-secret-value" not in redacted
+
+    # With the default, the secret is still removed but the PII remains.
+    secrets_only = CredentialRedactor.redact(text)
+    assert "super-secret-value" not in secrets_only
+    assert "user@example.com" in secrets_only
+
+
+def test_redact_data_structure_pii_opt_in_is_recursive():
+    payload = {
+        "profile": {"email": "user@example.com"},
+        "notes": ["ssn 123-45-6789", "api_key=super-secret-value"],
+    }
+
+    # Default: secrets scrubbed, PII preserved.
+    default = CredentialRedactor.redact_data_structure(payload)
+    assert default["profile"]["email"] == "user@example.com"
+    assert "super-secret-value" not in default["notes"][1]
+
+    # Opt-in: PII scrubbed too, at every depth.
+    scrubbed = CredentialRedactor.redact_data_structure(payload, redact_pii=True)
+    assert "user@example.com" not in scrubbed["profile"]["email"]
+    assert "123-45-6789" not in scrubbed["notes"][0]
+    assert "super-secret-value" not in scrubbed["notes"][1]
+
+
+def test_redact_dictionary_and_mapping_accept_pii_flag():
+    payload = {"email": "user@example.com"}
+    assert CredentialRedactor.redact_dictionary(payload)["email"] == "user@example.com"
+    assert CredentialRedactor.redact_mapping(payload)["email"] == "user@example.com"
+    assert (
+        "user@example.com"
+        not in CredentialRedactor.redact_dictionary(payload, redact_pii=True)["email"]
+    )
+    assert (
+        "user@example.com"
+        not in CredentialRedactor.redact_mapping(payload, redact_pii=True)["email"]
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "1.1.1." * 8_000,
+        "123-45-" * 8_000,
+        "a." * 24_000,
+    ],
+    ids=["ipv4-shaped", "ssn-shaped", "email-dots"],
+)
+def test_pii_scan_handles_separator_dense_input_quickly(text: str):
+    start = time.perf_counter()
+    matches = CredentialRedactor.find_pii_matches(text)
+    elapsed = time.perf_counter() - start
+    assert not any(match.name == "Email address" for match in matches)
+    assert elapsed < 1.0

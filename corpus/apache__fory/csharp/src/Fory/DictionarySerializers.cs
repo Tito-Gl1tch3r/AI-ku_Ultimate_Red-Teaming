@@ -1,0 +1,666 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
+
+namespace Apache.Fory;
+
+internal static class DictionaryBits
+{
+    public const byte TrackingKeyRef = 0b0000_0001;
+    public const byte KeyNull = 0b0000_0010;
+    public const byte DeclaredKeyType = 0b0000_0100;
+    public const byte TrackingValueRef = 0b0000_1000;
+    public const byte ValueNull = 0b0001_0000;
+    public const byte DeclaredValueType = 0b0010_0000;
+}
+
+public abstract class DictionaryLikeSerializer<TDictionary, TKey, TValue> : Serializer<TDictionary>
+    where TDictionary : class, IDictionary<TKey, TValue>
+    where TKey : notnull
+{
+    private const int ReferenceBytes = 4;
+    // Lower-bound shallow owner cost for the retained CLR Dictionary object itself. The two
+    // IntPtr slots approximate the CLR object header/method table; key/value entry storage is
+    // charged separately by count below. This is not a Fory wire header size.
+    private static readonly int DictionaryOwnerBytes =
+        IntPtr.Size + IntPtr.Size + 4 * ReferenceBytes + 4 * sizeof(int);
+    private static readonly long MapElementBytes = (long)ElementBytes<TKey>() + ElementBytes<TValue>();
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int ElementBytes<T>() => typeof(T).IsValueType ? Unsafe.SizeOf<T>() : ReferenceBytes;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ReserveMapStorage(ReadContext context, int count)
+    {
+        context.ReserveGraphMemory(DictionaryOwnerBytes + count * MapElementBytes);
+    }
+
+    public override TDictionary DefaultValue => null!;
+
+    protected abstract TDictionary CreateMap(int capacity);
+
+    protected virtual KeyValuePair<TKey, TValue>[] SnapshotPairs(TDictionary map)
+    {
+        return [.. map];
+    }
+
+    protected virtual void SetValue(TDictionary map, TKey key, TValue value)
+    {
+        map[key] = value;
+    }
+
+    public override void WriteData(WriteContext context, in TDictionary value, bool hasGenerics)
+    {
+        Serializer<TKey> keySerializer = context.TypeResolver.GetSerializer<TKey>();
+        Serializer<TValue> valueSerializer = context.TypeResolver.GetSerializer<TValue>();
+        TypeInfo keyTypeInfo = context.TypeResolver.GetTypeInfo<TKey>();
+        TypeInfo valueTypeInfo = context.TypeResolver.GetTypeInfo<TValue>();
+        TDictionary map = value ?? CreateMap(0);
+        context.Writer.WriteVarUInt32((uint)map.Count);
+        if (map.Count == 0)
+        {
+            return;
+        }
+
+        bool trackKeyRef = context.TrackRef && keyTypeInfo.IsRefType;
+        bool trackValueRef = context.TrackRef && valueTypeInfo.IsRefType;
+        bool keyDeclared = hasGenerics && !TypeResolver.NeedToWriteTypeInfoForField(keyTypeInfo);
+        bool valueDeclared = hasGenerics && !TypeResolver.NeedToWriteTypeInfoForField(valueTypeInfo);
+        bool keyDynamicType = keyTypeInfo.IsDynamicType;
+        bool valueDynamicType = valueTypeInfo.IsDynamicType;
+
+        KeyValuePair<TKey, TValue>[] pairs = SnapshotPairs(map);
+        if (keyDynamicType || valueDynamicType)
+        {
+            WriteDynamicMapPairs(
+                pairs,
+                context,
+                hasGenerics,
+                trackKeyRef,
+                trackValueRef,
+                keyDeclared,
+                valueDeclared,
+                keyDynamicType,
+                valueDynamicType,
+                keyTypeInfo,
+                valueTypeInfo,
+                keySerializer,
+                valueSerializer);
+            return;
+        }
+
+        int index = 0;
+        while (index < pairs.Length)
+        {
+            KeyValuePair<TKey, TValue> pair = pairs[index];
+            bool keyIsNull = context.TypeResolver.IsNoneObject(keyTypeInfo, pair.Key);
+            bool valueIsNull = context.TypeResolver.IsNoneObject(valueTypeInfo, pair.Value);
+            if (keyIsNull || valueIsNull)
+            {
+                byte header = 0;
+                if (trackKeyRef)
+                {
+                    header |= DictionaryBits.TrackingKeyRef;
+                }
+
+                if (trackValueRef)
+                {
+                    header |= DictionaryBits.TrackingValueRef;
+                }
+
+                if (keyIsNull)
+                {
+                    header |= DictionaryBits.KeyNull;
+                }
+
+                if (valueIsNull)
+                {
+                    header |= DictionaryBits.ValueNull;
+                }
+
+                if (!keyIsNull && keyDeclared)
+                {
+                    header |= DictionaryBits.DeclaredKeyType;
+                }
+
+                if (!valueIsNull && valueDeclared)
+                {
+                    header |= DictionaryBits.DeclaredValueType;
+                }
+
+                context.Writer.WriteUInt8(header);
+                if (!keyIsNull)
+                {
+                    if (!keyDeclared)
+                    {
+                        context.TypeResolver.WriteTypeInfo(keySerializer, context);
+                    }
+
+                    keySerializer.Write(context, pair.Key, trackKeyRef ? RefMode.Tracking : RefMode.None, false, hasGenerics);
+                }
+
+                if (!valueIsNull)
+                {
+                    if (!valueDeclared)
+                    {
+                        context.TypeResolver.WriteTypeInfo(valueSerializer, context);
+                    }
+
+                    valueSerializer.Write(context, pair.Value, trackValueRef ? RefMode.Tracking : RefMode.None, false, hasGenerics);
+                }
+
+                index += 1;
+                continue;
+            }
+
+            byte blockHeader = 0;
+            if (trackKeyRef)
+            {
+                blockHeader |= DictionaryBits.TrackingKeyRef;
+            }
+
+            if (trackValueRef)
+            {
+                blockHeader |= DictionaryBits.TrackingValueRef;
+            }
+
+            if (keyDeclared)
+            {
+                blockHeader |= DictionaryBits.DeclaredKeyType;
+            }
+
+            if (valueDeclared)
+            {
+                blockHeader |= DictionaryBits.DeclaredValueType;
+            }
+
+            context.Writer.WriteUInt8(blockHeader);
+            int chunkSizeOffset = context.Writer.Count;
+            context.Writer.WriteUInt8(0);
+            if (!keyDeclared)
+            {
+                context.TypeResolver.WriteTypeInfo(keySerializer, context);
+            }
+
+            if (!valueDeclared)
+            {
+                context.TypeResolver.WriteTypeInfo(valueSerializer, context);
+            }
+
+            byte chunkSize = 0;
+            while (index < pairs.Length && chunkSize < byte.MaxValue)
+            {
+                KeyValuePair<TKey, TValue> current = pairs[index];
+                if (context.TypeResolver.IsNoneObject(keyTypeInfo, current.Key) ||
+                    context.TypeResolver.IsNoneObject(valueTypeInfo, current.Value))
+                {
+                    break;
+                }
+
+                keySerializer.Write(context, current.Key, trackKeyRef ? RefMode.Tracking : RefMode.None, false, hasGenerics);
+                valueSerializer.Write(context, current.Value, trackValueRef ? RefMode.Tracking : RefMode.None, false, hasGenerics);
+                chunkSize += 1;
+                index += 1;
+            }
+
+            context.Writer.SetByte(chunkSizeOffset, chunkSize);
+        }
+    }
+
+    public override TDictionary ReadData(ReadContext context)
+    {
+        return ReadData(context, publishRef: false, refId: 0);
+    }
+
+    public override TDictionary Read(ReadContext context, RefMode refMode, bool readTypeInfo)
+    {
+        if (refMode != RefMode.None)
+        {
+            RefFlag flag = context.RefReader.ReadRefFlag(context.Reader);
+            switch (flag)
+            {
+                case RefFlag.Null:
+                    return DefaultValue;
+                case RefFlag.Ref:
+                    return context.RefReader.GetRef<TDictionary>(context.RefReader.ReadRefId(context.Reader));
+                case RefFlag.RefValue:
+                    {
+                        uint refId = context.RefReader.ReserveRefId();
+                        if (readTypeInfo)
+                        {
+                            context.TypeResolver.ReadTypeInfo(this, context);
+                        }
+
+                        return ReadData(context, publishRef: true, refId);
+                    }
+                case RefFlag.NotNullValue:
+                    break;
+                default:
+                    throw new RefException($"invalid ref flag {(sbyte)flag}");
+            }
+        }
+
+        if (readTypeInfo)
+        {
+            context.TypeResolver.ReadTypeInfo(this, context);
+        }
+
+        return ReadData(context);
+    }
+
+    // Map owners can be reached again while keys or values are being read. The ref-aware path
+    // publishes the concrete map immediately after allocation, not after the entry loop.
+    private TDictionary ReadData(ReadContext context, bool publishRef, uint refId)
+    {
+        Serializer<TKey> keySerializer = context.TypeResolver.GetSerializer<TKey>();
+        Serializer<TValue> valueSerializer = context.TypeResolver.GetSerializer<TValue>();
+        TypeInfo keyTypeInfo = context.TypeResolver.GetTypeInfo<TKey>();
+        TypeInfo valueTypeInfo = context.TypeResolver.GetTypeInfo<TValue>();
+        int totalLength = checked((int)context.Reader.ReadVarUInt32());
+        if (totalLength == 0)
+        {
+            ReserveMapStorage(context, totalLength);
+            TDictionary empty = CreateMap(0);
+            if (publishRef)
+            {
+                context.RefReader.StoreRefAt(refId, empty);
+            }
+
+            return empty;
+        }
+
+        ReserveMapStorage(context, totalLength);
+        bool keyReadDataAlwaysAdvances = keyTypeInfo.ReadDataAlwaysAdvancesFor(keySerializer);
+        bool valueReadDataAlwaysAdvances = valueTypeInfo.ReadDataAlwaysAdvancesFor(valueSerializer);
+        bool entryReadDataAlwaysAdvances = keyReadDataAlwaysAdvances || valueReadDataAlwaysAdvances;
+        bool keyMayHaveRemoteSchema = context.Compatible &&
+                                      keyTypeInfo.UserTypeKind == UserTypeKind.Struct &&
+                                      keyTypeInfo.Evolving;
+        bool valueMayHaveRemoteSchema = context.Compatible &&
+                                        valueTypeInfo.UserTypeKind == UserTypeKind.Struct &&
+                                        valueTypeInfo.Evolving;
+        if (keyReadDataAlwaysAdvances && !keyMayHaveRemoteSchema ||
+            valueReadDataAlwaysAdvances && !valueMayHaveRemoteSchema)
+        {
+            context.Reader.CheckBound(totalLength);
+        }
+        else
+        {
+            context.CheckUnbackedContainerAllocation(totalLength);
+        }
+
+        TDictionary map = CreateMap(totalLength);
+        if (publishRef)
+        {
+            context.RefReader.StoreRefAt(refId, map);
+        }
+
+        bool keyDynamicType = keyTypeInfo.IsDynamicType;
+        bool valueDynamicType = valueTypeInfo.IsDynamicType;
+        int readCount = 0;
+        while (readCount < totalLength)
+        {
+            byte header = context.Reader.ReadUInt8();
+            // IMPORTANT: dictionary readers must obey the sender-written
+            // key/value ref bits in the wire header. Local C# field metadata
+            // must not override that decision while reading. Shared xlang
+            // tests intentionally deserialize one ref policy and then
+            // serialize another local payload. DO NOT REMOVE this comment.
+            bool trackKeyRef = (header & DictionaryBits.TrackingKeyRef) != 0;
+            bool keyNull = (header & DictionaryBits.KeyNull) != 0;
+            bool keyDeclared = (header & DictionaryBits.DeclaredKeyType) != 0;
+            bool trackValueRef = (header & DictionaryBits.TrackingValueRef) != 0;
+            bool valueNull = (header & DictionaryBits.ValueNull) != 0;
+            bool valueDeclared = (header & DictionaryBits.DeclaredValueType) != 0;
+
+            if (keyNull && valueNull)
+            {
+                // Dictionary-like containers cannot represent a null key.
+                // Drop this entry instead of mapping it to default(TKey), which would corrupt key semantics.
+                readCount += 1;
+                continue;
+            }
+
+            if (keyNull)
+            {
+                _ = ReadValueElement(
+                    context,
+                    trackValueRef,
+                    !valueDeclared,
+                    valueSerializer);
+
+                // Preserve stream/reference state by reading value payload, then skip null-key entry.
+                readCount += 1;
+                continue;
+            }
+
+            if (valueNull)
+            {
+                TKey key = keySerializer.Read(
+                    context,
+                    trackKeyRef ? RefMode.Tracking : RefMode.None,
+                    !keyDeclared);
+
+                SetValue(map, key, (TValue)valueSerializer.DefaultObject!);
+                readCount += 1;
+                continue;
+            }
+
+            int chunkSize = context.Reader.ReadUInt8();
+            if (chunkSize == 0 || chunkSize > totalLength - readCount)
+            {
+                ThrowInvalidChunkSize(chunkSize, totalLength - readCount);
+            }
+
+            if (keyDynamicType || valueDynamicType)
+            {
+                bool guardUnbackedItems = !trackKeyRef &&
+                                           !trackValueRef &&
+                                           keyDeclared &&
+                                           valueDeclared &&
+                                           !entryReadDataAlwaysAdvances;
+                int checkpoint = guardUnbackedItems ? context.Reader.Cursor : 0;
+                for (int i = 0; i < chunkSize; i++)
+                {
+                    TypeInfo? keyTypeInfoForRead = null;
+                    TypeInfo? valueTypeInfoForRead = null;
+
+                    if (!keyDeclared)
+                    {
+                        if (keyDynamicType)
+                        {
+                            keyTypeInfoForRead = context.TypeResolver.ReadAnyTypeInfo(context);
+                        }
+                        else
+                        {
+                            context.TypeResolver.ReadTypeInfo(keySerializer, context);
+                        }
+                    }
+
+                    if (!valueDeclared)
+                    {
+                        if (valueDynamicType)
+                        {
+                            valueTypeInfoForRead = context.TypeResolver.ReadAnyTypeInfo(context);
+                        }
+                        else
+                        {
+                            context.TypeResolver.ReadTypeInfo(valueSerializer, context);
+                        }
+                    }
+
+                    if (keyTypeInfoForRead is not null)
+                    {
+                        context.SetReadTypeInfo(typeof(TKey), keyTypeInfoForRead);
+                    }
+
+                    TKey key = keySerializer.Read(context, trackKeyRef ? RefMode.Tracking : RefMode.None, false);
+                    if (keyTypeInfoForRead is not null)
+                    {
+                        context.ClearReadTypeInfo(typeof(TKey));
+                    }
+
+                    if (valueTypeInfoForRead is not null)
+                    {
+                        context.SetReadTypeInfo(typeof(TValue), valueTypeInfoForRead);
+                    }
+
+                    TValue value = ReadValueElement(
+                        context,
+                        trackValueRef,
+                        false,
+                        valueSerializer);
+                    if (valueTypeInfoForRead is not null)
+                    {
+                        context.ClearReadTypeInfo(typeof(TValue));
+                    }
+
+                    SetValue(map, key, value);
+                }
+
+                if (guardUnbackedItems)
+                {
+                    context.SettleUnbackedContainerItems(
+                        chunkSize,
+                        context.Reader.Cursor - checkpoint);
+                }
+
+                readCount += chunkSize;
+                continue;
+            }
+
+            if (!keyDeclared)
+            {
+                context.TypeResolver.ReadTypeInfo(keySerializer, context);
+            }
+
+            if (!valueDeclared)
+            {
+                context.TypeResolver.ReadTypeInfo(valueSerializer, context);
+            }
+
+            TypeMeta? keyTypeMeta = !keyDeclared && context.Compatible
+                ? context.GetTypeMeta<TKey>()
+                : null;
+            TypeMeta? valueTypeMeta = !valueDeclared && context.Compatible
+                ? context.GetTypeMeta<TValue>()
+                : null;
+            bool chunkReadDataAlwaysAdvances =
+                keyTypeInfo.ReadDataAlwaysAdvancesFor(keySerializer, keyTypeMeta) ||
+                valueTypeInfo.ReadDataAlwaysAdvancesFor(valueSerializer, valueTypeMeta);
+            bool guardChunk = !trackKeyRef &&
+                              !trackValueRef &&
+                              !chunkReadDataAlwaysAdvances;
+            int chunkCheckpoint = guardChunk ? context.Reader.Cursor : 0;
+
+            for (int i = 0; i < chunkSize; i++)
+            {
+                TKey key = keySerializer.Read(context, trackKeyRef ? RefMode.Tracking : RefMode.None, false);
+                TValue value = ReadValueElement(context, trackValueRef, false, valueSerializer);
+                SetValue(map, key, value);
+            }
+
+            if (guardChunk)
+            {
+                context.SettleUnbackedContainerItems(
+                    chunkSize,
+                    context.Reader.Cursor - chunkCheckpoint);
+            }
+
+            if (!keyDeclared)
+            {
+                context.ClearReadTypeInfo(typeof(TKey));
+            }
+
+            if (!valueDeclared)
+            {
+                context.ClearReadTypeInfo(typeof(TValue));
+            }
+
+            readCount += chunkSize;
+        }
+
+        return map;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ThrowInvalidChunkSize(int chunkSize, int remaining)
+    {
+        throw new InvalidDataException(
+            $"invalid map chunk size {chunkSize} with {remaining} entries remaining");
+    }
+
+    private static void WriteDynamicMapPairs(
+        KeyValuePair<TKey, TValue>[] pairs,
+        WriteContext context,
+        bool hasGenerics,
+        bool trackKeyRef,
+        bool trackValueRef,
+        bool keyDeclared,
+        bool valueDeclared,
+        bool keyDynamicType,
+        bool valueDynamicType,
+        TypeInfo keyTypeInfo,
+        TypeInfo valueTypeInfo,
+        Serializer<TKey> keySerializer,
+        Serializer<TValue> valueSerializer)
+    {
+        foreach (KeyValuePair<TKey, TValue> pair in pairs)
+        {
+            bool keyIsNull = context.TypeResolver.IsNoneObject(keyTypeInfo, pair.Key);
+            bool valueIsNull = context.TypeResolver.IsNoneObject(valueTypeInfo, pair.Value);
+            byte header = 0;
+            if (trackKeyRef)
+            {
+                header |= DictionaryBits.TrackingKeyRef;
+            }
+
+            if (trackValueRef)
+            {
+                header |= DictionaryBits.TrackingValueRef;
+            }
+
+            if (keyIsNull)
+            {
+                header |= DictionaryBits.KeyNull;
+            }
+            else if (!keyDynamicType && keyDeclared)
+            {
+                header |= DictionaryBits.DeclaredKeyType;
+            }
+
+            if (valueIsNull)
+            {
+                header |= DictionaryBits.ValueNull;
+            }
+            else if (!valueDynamicType && valueDeclared)
+            {
+                header |= DictionaryBits.DeclaredValueType;
+            }
+
+            context.Writer.WriteUInt8(header);
+            if (keyIsNull && valueIsNull)
+            {
+                continue;
+            }
+
+            if (keyIsNull)
+            {
+                valueSerializer.Write(
+                    context,
+                    pair.Value,
+                    trackValueRef ? RefMode.Tracking : RefMode.None,
+                    !valueDeclared,
+                    hasGenerics);
+                continue;
+            }
+
+            if (valueIsNull)
+            {
+                keySerializer.Write(
+                    context,
+                    pair.Key,
+                    trackKeyRef ? RefMode.Tracking : RefMode.None,
+                    !keyDeclared,
+                    hasGenerics);
+                continue;
+            }
+
+            context.Writer.WriteUInt8(1);
+            if (!keyDeclared)
+            {
+                if (keyDynamicType)
+                {
+                    DynamicAnyCodec.WriteAnyTypeInfo(pair.Key!, context);
+                }
+                else
+                {
+                    context.TypeResolver.WriteTypeInfo(keySerializer, context);
+                }
+            }
+
+            if (!valueDeclared)
+            {
+                if (valueDynamicType)
+                {
+                    DynamicAnyCodec.WriteAnyTypeInfo(pair.Value!, context);
+                }
+                else
+                {
+                    context.TypeResolver.WriteTypeInfo(valueSerializer, context);
+                }
+            }
+
+            keySerializer.Write(context, pair.Key, trackKeyRef ? RefMode.Tracking : RefMode.None, false, hasGenerics);
+            valueSerializer.Write(context, pair.Value, trackValueRef ? RefMode.Tracking : RefMode.None, false, hasGenerics);
+        }
+    }
+
+    private static TValue ReadValueElement(
+        ReadContext context,
+        bool trackValueRef,
+        bool readTypeInfo,
+        Serializer<TValue> valueSerializer)
+    {
+        return valueSerializer.Read(context, trackValueRef ? RefMode.Tracking : RefMode.None, readTypeInfo);
+    }
+}
+
+public class DictionarySerializer<TKey, TValue> : DictionaryLikeSerializer<Dictionary<TKey, TValue>, TKey, TValue>
+    where TKey : notnull
+{
+    protected override Dictionary<TKey, TValue> CreateMap(int capacity)
+    {
+        return new Dictionary<TKey, TValue>(capacity);
+    }
+}
+
+public class SortedDictionarySerializer<TKey, TValue> : DictionaryLikeSerializer<SortedDictionary<TKey, TValue>, TKey, TValue>
+    where TKey : notnull
+{
+    protected override SortedDictionary<TKey, TValue> CreateMap(int capacity)
+    {
+        _ = capacity;
+        return new SortedDictionary<TKey, TValue>();
+    }
+}
+
+public class SortedListSerializer<TKey, TValue> : DictionaryLikeSerializer<SortedList<TKey, TValue>, TKey, TValue>
+    where TKey : notnull
+{
+    protected override SortedList<TKey, TValue> CreateMap(int capacity)
+    {
+        return new SortedList<TKey, TValue>(capacity);
+    }
+}
+
+public class ConcurrentDictionarySerializer<TKey, TValue> : DictionaryLikeSerializer<ConcurrentDictionary<TKey, TValue>, TKey, TValue>
+    where TKey : notnull
+{
+    protected override ConcurrentDictionary<TKey, TValue> CreateMap(int capacity)
+    {
+        int initialCapacity = Math.Max(capacity, 1);
+        return new ConcurrentDictionary<TKey, TValue>(Environment.ProcessorCount, initialCapacity);
+    }
+
+    protected override KeyValuePair<TKey, TValue>[] SnapshotPairs(ConcurrentDictionary<TKey, TValue> map)
+    {
+        return map.ToArray();
+    }
+}

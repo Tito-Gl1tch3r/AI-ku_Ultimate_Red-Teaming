@@ -1,0 +1,1698 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+using System.Numerics;
+using System.Text;
+using Apache.Fory;
+using Fory.ExternalTypes;
+using ForyRuntime = Apache.Fory.Fory;
+using S = Apache.Fory.Schema.Types;
+
+namespace Apache.Fory.XlangPeer;
+
+internal static class Program
+{
+    private const string DataFileEnv = "DATA_FILE";
+
+    private static readonly string[] StringSamples =
+    [
+        "ab",
+        "Rust123",
+        "Çüéâäàåçêëèïî",
+        "こんにちは",
+        "Привет",
+        "𝄞🎵🎶",
+        "Hello, 世界",
+    ];
+
+    private static readonly int[] VarInt32Values =
+    [
+        int.MinValue,
+        int.MinValue + 1,
+        -1_000_000,
+        -1000,
+        -128,
+        -1,
+        0,
+        1,
+        127,
+        128,
+        16_383,
+        16_384,
+        2_097_151,
+        2_097_152,
+        268_435_455,
+        268_435_456,
+        int.MaxValue - 1,
+        int.MaxValue,
+    ];
+
+    private static readonly uint[] VarUInt32Values =
+    [
+        0,
+        1,
+        127,
+        128,
+        16_383,
+        16_384,
+        2_097_151,
+        2_097_152,
+        268_435_455,
+        268_435_456,
+        2_147_483_646,
+        2_147_483_647,
+    ];
+
+    private static readonly ulong[] VarUInt64Values =
+    [
+        0UL,
+        1UL,
+        127UL,
+        128UL,
+        16_383UL,
+        16_384UL,
+        2_097_151UL,
+        2_097_152UL,
+        268_435_455UL,
+        268_435_456UL,
+        34_359_738_367UL,
+        34_359_738_368UL,
+        4_398_046_511_103UL,
+        4_398_046_511_104UL,
+        562_949_953_421_311UL,
+        562_949_953_421_312UL,
+        72_057_594_037_927_935UL,
+        72_057_594_037_927_936UL,
+        long.MaxValue,
+    ];
+
+    private static readonly long[] VarInt64Values =
+    [
+        long.MinValue,
+        long.MinValue + 1,
+        -1_000_000_000_000L,
+        -1_000_000L,
+        -1000L,
+        -128L,
+        -1L,
+        0L,
+        1L,
+        127L,
+        1000L,
+        1_000_000L,
+        1_000_000_000_000L,
+        long.MaxValue - 1,
+        long.MaxValue,
+    ];
+
+    private static readonly ForyDecimal[] DecimalValues =
+    [
+        new(BigInteger.Zero, 0),
+        new(BigInteger.Zero, 3),
+        new(BigInteger.One, 0),
+        new(BigInteger.MinusOne, 0),
+        new(new BigInteger(12345), 2),
+        new(BigInteger.Parse("9223372036854775807"), 0),
+        new(BigInteger.Parse("-9223372036854775808"), 0),
+        new(BigInteger.Parse("4611686018427387903"), 0),
+        new(BigInteger.Parse("-4611686018427387904"), 0),
+        new(BigInteger.Parse("9223372036854775808"), 0),
+        new(BigInteger.Parse("-9223372036854775809"), 0),
+        new(BigInteger.Parse("123456789012345678901234567890123456789"), 37),
+        new(BigInteger.Parse("-123456789012345678901234567890123456789"), -17),
+    ];
+
+    private static int Main(string[] args)
+    {
+        try
+        {
+            string caseName = ParseCaseName(args);
+            string dataFile = RequireDataFile();
+            byte[] input = File.ReadAllBytes(dataFile);
+            byte[] output = ExecuteCase(caseName, input);
+            File.WriteAllBytes(dataFile, output);
+            Console.WriteLine($"case {caseName} passed");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"xlang peer failed: {ex}");
+            return 1;
+        }
+    }
+
+    private static string ParseCaseName(string[] args)
+    {
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i] == "--case" && i + 1 < args.Length)
+            {
+                return args[i + 1];
+            }
+        }
+
+        if (args.Length == 1)
+        {
+            return args[0];
+        }
+
+        throw new InvalidOperationException("Usage: Fory.XlangPeer --case <case_name>");
+    }
+
+    private static string RequireDataFile()
+    {
+        string? dataFile = Environment.GetEnvironmentVariable(DataFileEnv);
+        if (string.IsNullOrWhiteSpace(dataFile))
+        {
+            throw new InvalidOperationException($"{DataFileEnv} environment variable is required");
+        }
+
+        return dataFile;
+    }
+
+    private static byte[] ExecuteCase(string caseName, byte[] input)
+    {
+        return caseName switch
+        {
+            "test_buffer" => CaseBuffer(input),
+            "test_buffer_var" => CaseBufferVar(input),
+            "test_murmurhash3" => CaseMurmurHash3(input),
+            "test_string_serializer" => CaseStringSerializer(input),
+            "test_cross_language_serializer" => CaseCrossLanguageSerializer(input),
+            "test_simple_struct" => CaseSimpleStruct(input),
+            "test_exact_field_tags" => CaseExactFieldTags(input),
+            "test_named_simple_struct" => CaseNamedSimpleStruct(input),
+            "test_struct_evolving_override" => CaseStructEvolvingOverride(input),
+            "test_list" => CaseList(input),
+            "test_map" => CaseMap(input),
+            "test_integer" => CaseInteger(input),
+            "test_decimal" => CaseDecimal(input),
+            "test_item" => CaseItem(input),
+            "test_color" => CaseColor(input),
+            "test_union_xlang" => CaseUnionXlang(input),
+            "test_struct_with_list" => CaseStructWithList(input),
+            "test_struct_with_map" => CaseStructWithMap(input),
+            "test_skip_id_custom" => CaseSkipIdCustom(input),
+            "test_skip_name_custom" => CaseSkipNameCustom(input),
+            "test_consistent_named" => CaseConsistentNamed(input),
+            "test_struct_version_check" => CaseStructVersionCheck(input),
+            "test_polymorphic_list" => CasePolymorphicList(input),
+            "test_polymorphic_map" => CasePolymorphicMap(input),
+            "test_one_field_struct_compatible" => CaseOneFieldStructCompatible(input),
+            "test_one_field_struct_schema" => CaseOneFieldStructSchema(input),
+            "test_one_string_field_schema" => CaseOneStringFieldSchema(input),
+            "test_one_string_field_compatible" => CaseOneStringFieldCompatible(input),
+            "test_two_string_field_compatible" => CaseTwoStringFieldCompatible(input),
+            "test_schema_evolution_compatible" => CaseSchemaEvolutionCompatible(input),
+            "test_schema_evolution_compatible_reverse" => CaseSchemaEvolutionCompatibleReverse(input),
+            "test_reduced_precision_float_struct" => CaseReducedPrecisionFloatStruct(input),
+            "test_reduced_precision_float_struct_compatible_skip" => CaseReducedPrecisionFloatStructCompatibleSkip(input),
+            "test_list_array_compatible_list_to_array" => CaseListArrayCompatibleListToArray(input),
+            "test_list_array_compatible_array_to_list" => CaseListArrayCompatibleArrayToList(input),
+            "test_list_array_compatible_nullable_list_to_array_error" => CaseListArrayCompatibleNullableListToArrayError(input),
+            "test_one_enum_field_schema" => CaseOneEnumFieldSchema(input),
+            "test_one_enum_field_compatible" => CaseOneEnumFieldCompatible(input),
+            "test_two_enum_field_compatible" => CaseTwoEnumFieldCompatible(input),
+            "test_enum_schema_evolution_compatible" => CaseEnumSchemaEvolutionCompatible(input),
+            "test_enum_schema_evolution_compatible_reverse" => CaseEnumSchemaEvolutionCompatibleReverse(input),
+            "test_nullable_field_schema_consistent_not_null" => CaseNullableFieldSchemaConsistentNotNull(input),
+            "test_nullable_field_schema_consistent_null" => CaseNullableFieldSchemaConsistentNull(input),
+            "test_nullable_field_compatible_not_null" => CaseNullableFieldCompatibleNotNull(input),
+            "test_nullable_field_compatible_null" => CaseNullableFieldCompatibleNull(input),
+            "test_ref_schema_consistent" => CaseRefSchemaConsistent(input),
+            "test_ref_compatible" => CaseRefCompatible(input),
+            "test_collection_element_ref_override" => CaseCollectionElementRefOverride(input),
+            "test_collection_element_ref_remote_tracking" => CaseCollectionElementRefRemoteTracking(input),
+            "test_circular_ref_schema_consistent" => CaseCircularRefSchemaConsistent(input),
+            "test_circular_ref_compatible" => CaseCircularRefCompatible(input),
+            "test_unsigned_schema_consistent_simple" => CaseUnsignedSchemaConsistentSimple(input),
+            "test_unsigned_schema_consistent" => CaseUnsignedSchemaConsistent(input),
+            "test_unsigned_schema_compatible" => CaseUnsignedSchemaCompatible(input),
+            "test_nested_annotated_container_schema_consistent" => CaseNestedAnnotatedContainerSchemaConsistent(input),
+            "test_nested_annotated_container_compatible" => CaseNestedAnnotatedContainerCompatible(input),
+            "test_csharp_external_id" => CaseCSharpExternalId(input),
+            "test_csharp_external_name" => CaseCSharpExternalName(input),
+            "test_csharp_ordinary_inheritance_id" =>
+                CaseCSharpOrdinaryInheritanceId(input),
+            "test_csharp_external_inheritance_name" =>
+                CaseCSharpExternalInheritanceName(input),
+            _ => throw new InvalidOperationException($"unknown test case {caseName}"),
+        };
+    }
+
+    private static byte[] CaseBuffer(byte[] input)
+    {
+        ByteReader reader = new(input);
+        Ensure(reader.ReadUInt8() == 1, "bool mismatch");
+        Ensure(reader.ReadInt8() == sbyte.MaxValue, "byte mismatch");
+        Ensure(reader.ReadInt16() == short.MaxValue, "int16 mismatch");
+        Ensure(reader.ReadInt32() == int.MaxValue, "int32 mismatch");
+        Ensure(reader.ReadInt64() == long.MaxValue, "int64 mismatch");
+        Ensure(Math.Abs(reader.ReadFloat32() - (-1.1f)) < 0.0001f, "float32 mismatch");
+        Ensure(Math.Abs(reader.ReadFloat64() - (-1.1d)) < 0.000001d, "float64 mismatch");
+        Ensure(reader.ReadVarUInt32() == 100, "varuint32 mismatch");
+        int size = reader.ReadInt32();
+        byte[] payload = reader.ReadBytes(size);
+        Ensure(payload.SequenceEqual("ab"u8.ToArray()), "binary mismatch");
+        Ensure(reader.Remaining == 0, "buffer should be fully consumed");
+
+        ByteWriter writer = new();
+        writer.WriteUInt8(1);
+        writer.WriteInt8(sbyte.MaxValue);
+        writer.WriteInt16(short.MaxValue);
+        writer.WriteInt32(int.MaxValue);
+        writer.WriteInt64(long.MaxValue);
+        writer.WriteFloat32(-1.1f);
+        writer.WriteFloat64(-1.1d);
+        writer.WriteVarUInt32(100);
+        writer.WriteInt32(2);
+        writer.WriteBytes("ab"u8);
+        return writer.ToArray();
+    }
+
+    private static byte[] CaseBufferVar(byte[] input)
+    {
+        ByteReader reader = new(input);
+        foreach (int expected in VarInt32Values)
+        {
+            Ensure(reader.ReadVarInt32() == expected, $"varint32 mismatch {expected}");
+        }
+
+        foreach (uint expected in VarUInt32Values)
+        {
+            Ensure(reader.ReadVarUInt32() == expected, $"varuint32 mismatch {expected}");
+        }
+
+        foreach (ulong expected in VarUInt64Values)
+        {
+            Ensure(reader.ReadVarUInt64() == expected, $"varuint64 mismatch {expected}");
+        }
+
+        foreach (long expected in VarInt64Values)
+        {
+            Ensure(reader.ReadVarInt64() == expected, $"varint64 mismatch {expected}");
+        }
+
+        Ensure(reader.Remaining == 0, "buffer var should be fully consumed");
+
+        ByteWriter writer = new();
+        foreach (int value in VarInt32Values)
+        {
+            writer.WriteVarInt32(value);
+        }
+
+        foreach (uint value in VarUInt32Values)
+        {
+            writer.WriteVarUInt32(value);
+        }
+
+        foreach (ulong value in VarUInt64Values)
+        {
+            writer.WriteVarUInt64(value);
+        }
+
+        foreach (long value in VarInt64Values)
+        {
+            writer.WriteVarInt64(value);
+        }
+
+        return writer.ToArray();
+    }
+
+    private static byte[] CaseMurmurHash3(byte[] input)
+    {
+        if (input.Length == 32)
+        {
+            (ulong h1a, ulong h1b) = MurmurHash3.X64_128([1, 2, 8], 47);
+            (ulong h2a, ulong h2b) = MurmurHash3.X64_128(Encoding.UTF8.GetBytes("01234567890123456789"), 47);
+            ByteWriter writer = new();
+            writer.WriteInt64(unchecked((long)h1a));
+            writer.WriteInt64(unchecked((long)h1b));
+            writer.WriteInt64(unchecked((long)h2a));
+            writer.WriteInt64(unchecked((long)h2b));
+            return writer.ToArray();
+        }
+
+        if (input.Length == 16)
+        {
+            ByteReader reader = new(input);
+            long h1 = reader.ReadInt64();
+            long h2 = reader.ReadInt64();
+            (ulong expected1, ulong expected2) = MurmurHash3.X64_128([1, 2, 8], 47);
+            Ensure(h1 == unchecked((long)expected1), "murmur hash h1 mismatch");
+            Ensure(h2 == unchecked((long)expected2), "murmur hash h2 mismatch");
+            return [];
+        }
+
+        throw new InvalidOperationException($"unexpected murmur hash input length {input.Length}");
+    }
+
+    private static byte[] CaseStringSerializer(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        ByteReader inputReader = new(input);
+        foreach (string expected in StringSamples)
+        {
+            string value = fory.DeserializeFromReader<string>(inputReader);
+            Ensure(value == expected, "string value mismatch");
+        }
+
+        EnsureConsumed(inputReader, nameof(CaseStringSerializer));
+        List<byte> output = [];
+        foreach (string sample in StringSamples)
+        {
+            Append(output, fory.Serialize<object?>(sample));
+        }
+
+        return output.ToArray();
+    }
+
+    private static byte[] CaseCrossLanguageSerializer(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<Color>(101);
+        ByteReader inputReader = new(input);
+
+        bool b1 = fory.DeserializeFromReader<bool>(inputReader);
+        bool b2 = fory.DeserializeFromReader<bool>(inputReader);
+        int i32 = fory.DeserializeFromReader<int>(inputReader);
+        sbyte i8a = fory.DeserializeFromReader<sbyte>(inputReader);
+        sbyte i8b = fory.DeserializeFromReader<sbyte>(inputReader);
+        short i16a = fory.DeserializeFromReader<short>(inputReader);
+        short i16b = fory.DeserializeFromReader<short>(inputReader);
+        int i32a = fory.DeserializeFromReader<int>(inputReader);
+        int i32b = fory.DeserializeFromReader<int>(inputReader);
+        long i64a = fory.DeserializeFromReader<long>(inputReader);
+        long i64b = fory.DeserializeFromReader<long>(inputReader);
+        float f32 = fory.DeserializeFromReader<float>(inputReader);
+        double f64 = fory.DeserializeFromReader<double>(inputReader);
+        string str = fory.DeserializeFromReader<string>(inputReader);
+        DateOnly day = fory.DeserializeFromReader<DateOnly>(inputReader);
+        DateTimeOffset timestamp = fory.DeserializeFromReader<DateTimeOffset>(inputReader);
+        bool[] bools = fory.DeserializeFromReader<bool[]>(inputReader);
+        byte[] bytes = fory.DeserializeFromReader<byte[]>(inputReader);
+        short[] int16s = fory.DeserializeFromReader<short[]>(inputReader);
+        int[] int32s = fory.DeserializeFromReader<int[]>(inputReader);
+        long[] int64s = fory.DeserializeFromReader<long[]>(inputReader);
+        float[] floats = fory.DeserializeFromReader<float[]>(inputReader);
+        double[] doubles = fory.DeserializeFromReader<double[]>(inputReader);
+        List<string> list = fory.DeserializeFromReader<List<string>>(inputReader);
+        HashSet<string> set = fory.DeserializeFromReader<HashSet<string>>(inputReader);
+        Dictionary<string, string> map = fory.DeserializeFromReader<Dictionary<string, string>>(inputReader);
+        Color color = fory.DeserializeFromReader<Color>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseCrossLanguageSerializer));
+
+        Ensure(b1, "bool1 mismatch");
+        Ensure(!b2, "bool2 mismatch");
+        Ensure(i32 == -1, "int mismatch");
+        Ensure(str == "str", "string mismatch");
+        Ensure(day == new DateOnly(2021, 11, 23), "date mismatch");
+        Ensure(timestamp.ToUnixTimeSeconds() == 100, "timestamp mismatch");
+        Ensure(color == Color.White, "color mismatch");
+
+        List<byte> output = [];
+        Append(output, fory.Serialize<object?>(b1));
+        Append(output, fory.Serialize<object?>(b2));
+        Append(output, fory.Serialize<object?>(i32));
+        Append(output, fory.Serialize<object?>(i8a));
+        Append(output, fory.Serialize<object?>(i8b));
+        Append(output, fory.Serialize<object?>(i16a));
+        Append(output, fory.Serialize<object?>(i16b));
+        Append(output, fory.Serialize<object?>(i32a));
+        Append(output, fory.Serialize<object?>(i32b));
+        Append(output, fory.Serialize<object?>(i64a));
+        Append(output, fory.Serialize<object?>(i64b));
+        Append(output, fory.Serialize<object?>(f32));
+        Append(output, fory.Serialize<object?>(f64));
+        Append(output, fory.Serialize<object?>(str));
+        Append(output, fory.Serialize<object?>(day));
+        Append(output, fory.Serialize<object?>(timestamp));
+        Append(output, fory.Serialize<object?>(bools));
+        Append(output, fory.Serialize<object?>(bytes));
+        Append(output, fory.Serialize<object?>(int16s));
+        Append(output, fory.Serialize<object?>(int32s));
+        Append(output, fory.Serialize<object?>(int64s));
+        Append(output, fory.Serialize<object?>(floats));
+        Append(output, fory.Serialize<object?>(doubles));
+        Append(output, fory.Serialize<object?>(list));
+        Append(output, fory.Serialize<object?>(set));
+        Append(output, fory.Serialize<object?>(map));
+        Append(output, fory.Serialize<object?>(color));
+        return output.ToArray();
+    }
+
+    private static byte[] CaseSimpleStruct(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        RegisterSimpleById(fory);
+        return RoundTripSingle<SimpleStruct>(input, fory);
+    }
+
+    private static byte[] CaseExactFieldTags(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false);
+        fory.Register<ExactFieldTags>(104);
+        return RoundTripSingle<ExactFieldTags>(input, fory);
+    }
+
+    private static byte[] CaseNamedSimpleStruct(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        RegisterSimpleByName(fory);
+        return RoundTripSingle<SimpleStruct>(input, fory);
+    }
+
+    private static byte[] CaseStructEvolvingOverride(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<EvolvingOverrideStruct>("test.evolving_yes");
+        fory.Register<FixedOverrideStruct>("test.evolving_off");
+
+        ByteReader inputReader = new(input);
+        EvolvingOverrideStruct evolving = fory.DeserializeFromReader<EvolvingOverrideStruct>(inputReader);
+        FixedOverrideStruct fixedValue = fory.DeserializeFromReader<FixedOverrideStruct>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseStructEvolvingOverride));
+        Ensure(evolving.F1 == "payload", "evolving override struct mismatch");
+        Ensure(fixedValue.F1 == "payload", "fixed override struct mismatch");
+
+        List<byte> output = [];
+        Append(output, fory.Serialize<object?>(evolving));
+        Append(output, fory.Serialize<object?>(fixedValue));
+        return output.ToArray();
+    }
+
+    private static byte[] CaseList(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<Item>(102);
+        ByteReader inputReader = new(input);
+        List<string?> strList = fory.DeserializeFromReader<List<string?>>(inputReader);
+        List<string?> strList2 = fory.DeserializeFromReader<List<string?>>(inputReader);
+        List<Item?> itemList = fory.DeserializeFromReader<List<Item?>>(inputReader);
+        List<Item?> itemList2 = fory.DeserializeFromReader<List<Item?>>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseList));
+
+        List<byte> output = [];
+        Append(output, fory.Serialize<object?>(strList));
+        Append(output, fory.Serialize<object?>(strList2));
+        Append(output, fory.Serialize<object?>(itemList));
+        Append(output, fory.Serialize<object?>(itemList2));
+        return output.ToArray();
+    }
+
+    private static byte[] CaseMap(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<Item>(102);
+        ByteReader inputReader = new(input);
+        NullableKeyDictionary<string, string?> strMap = fory.DeserializeFromReader<NullableKeyDictionary<string, string?>>(inputReader);
+        NullableKeyDictionary<string, Item?> itemMap = fory.DeserializeFromReader<NullableKeyDictionary<string, Item?>>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseMap));
+
+        List<byte> output = [];
+        Append(output, fory.Serialize<object?>(strMap));
+        Append(output, fory.Serialize<object?>(itemMap));
+        return output.ToArray();
+    }
+
+    private static byte[] CaseInteger(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<Item1>(101);
+        ByteReader inputReader = new(input);
+        Item1 obj = fory.DeserializeFromReader<Item1>(inputReader);
+        int f1 = fory.DeserializeFromReader<int>(inputReader);
+        int f2 = fory.DeserializeFromReader<int>(inputReader);
+        int f3 = fory.DeserializeFromReader<int>(inputReader);
+        int f4 = fory.DeserializeFromReader<int>(inputReader);
+        int f5 = fory.DeserializeFromReader<int>(inputReader);
+        int f6 = fory.DeserializeFromReader<int>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseInteger));
+
+        Ensure(obj.F1 == 1 && obj.F2 == 2, "item1 primitive fields mismatch");
+        Ensure(obj.F3 == 3 && obj.F4 == 4 && obj.F5 == 0 && obj.F6 == 0, "item1 boxed fields mismatch");
+
+        List<byte> output = [];
+        Append(output, fory.Serialize<object?>(obj));
+        Append(output, fory.Serialize<object?>(f1));
+        Append(output, fory.Serialize<object?>(f2));
+        Append(output, fory.Serialize<object?>(f3));
+        Append(output, fory.Serialize<object?>(f4));
+        Append(output, fory.Serialize<object?>(f5));
+        Append(output, fory.Serialize<object?>(f6));
+        return output.ToArray();
+    }
+
+    private static byte[] CaseDecimal(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        ByteReader inputReader = new(input);
+        List<byte> output = [];
+
+        for (int i = 0; i < DecimalValues.Length; i++)
+        {
+            ForyDecimal value = fory.DeserializeFromReader<ForyDecimal>(inputReader);
+            Ensure(value == DecimalValues[i], $"decimal {i} mismatch");
+            Append(output, fory.Serialize<object?>(value));
+        }
+
+        EnsureConsumed(inputReader, nameof(CaseDecimal));
+        return output.ToArray();
+    }
+
+    private static byte[] CaseItem(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<Item>(102);
+        ByteReader inputReader = new(input);
+        Item i1 = fory.DeserializeFromReader<Item>(inputReader);
+        Item i2 = fory.DeserializeFromReader<Item>(inputReader);
+        Item i3 = fory.DeserializeFromReader<Item>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseItem));
+
+        List<byte> output = [];
+        Append(output, fory.Serialize<object?>(i1));
+        Append(output, fory.Serialize<object?>(i2));
+        Append(output, fory.Serialize<object?>(i3));
+        return output.ToArray();
+    }
+
+    private static byte[] CaseColor(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<Color>(101);
+        ByteReader inputReader = new(input);
+        Color c1 = fory.DeserializeFromReader<Color>(inputReader);
+        Color c2 = fory.DeserializeFromReader<Color>(inputReader);
+        Color c3 = fory.DeserializeFromReader<Color>(inputReader);
+        Color c4 = fory.DeserializeFromReader<Color>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseColor));
+
+        List<byte> output = [];
+        Append(output, fory.Serialize<object?>(c1));
+        Append(output, fory.Serialize<object?>(c2));
+        Append(output, fory.Serialize<object?>(c3));
+        Append(output, fory.Serialize<object?>(c4));
+        return output.ToArray();
+    }
+
+    private static byte[] CaseStructWithList(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<StructWithList>(201);
+        ByteReader inputReader = new(input);
+        StructWithList s1 = fory.DeserializeFromReader<StructWithList>(inputReader);
+        StructWithList s2 = fory.DeserializeFromReader<StructWithList>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseStructWithList));
+
+        List<byte> output = [];
+        Append(output, fory.Serialize<object?>(s1));
+        Append(output, fory.Serialize<object?>(s2));
+        return output.ToArray();
+    }
+
+    private static byte[] CaseStructWithMap(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<StructWithMap>(202);
+        ByteReader inputReader = new(input);
+        StructWithMap s1 = fory.DeserializeFromReader<StructWithMap>(inputReader);
+        StructWithMap s2 = fory.DeserializeFromReader<StructWithMap>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseStructWithMap));
+
+        List<byte> output = [];
+        Append(output, fory.Serialize<object?>(s1));
+        Append(output, fory.Serialize<object?>(s2));
+        return output.ToArray();
+    }
+
+    private static byte[] CaseUnionXlang(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<StructWithUnion2>(301);
+
+        ByteReader inputReader = new(input);
+        StructWithUnion2 first = fory.DeserializeFromReader<StructWithUnion2>(inputReader);
+        StructWithUnion2 second = fory.DeserializeFromReader<StructWithUnion2>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseUnionXlang));
+
+        Ensure(first.Union.Index == 0, "union case index mismatch for first value");
+        Ensure(first.Union.Value is string firstValue && firstValue == "hello", "union case value mismatch for first value");
+        Ensure(second.Union.Index == 1, "union case index mismatch for second value");
+        Ensure(second.Union.Value is long secondValue && secondValue == 42L, "union case value mismatch for second value");
+
+        List<byte> output = [];
+        Append(output, fory.Serialize<object?>(first));
+        Append(output, fory.Serialize<object?>(second));
+        return output.ToArray();
+    }
+
+    private static byte[] CaseSkipIdCustom(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<Color>(101);
+        fory.Register<MyStruct>(102);
+        fory.Register<MyExt, MyExtSerializer>(103);
+        fory.Register<MyWrapper>(104);
+        return RoundTripSingle<MyWrapper>(input, fory);
+    }
+
+    private static byte[] CaseSkipNameCustom(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<Color>("color");
+        fory.Register<MyStruct>("my_struct");
+        fory.Register<MyExt, MyExtSerializer>("my_ext");
+        fory.Register<MyWrapper>("my_wrapper");
+        return RoundTripSingle<MyWrapper>(input, fory);
+    }
+
+    private static byte[] CaseConsistentNamed(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false, checkStructVersion: true);
+        fory.Register<Color>("color");
+        fory.Register<MyStruct>("my_struct");
+        fory.Register<MyExt, MyExtSerializer>("my_ext");
+
+        ByteReader inputReader = new(input);
+        List<byte> output = [];
+        for (int i = 0; i < 3; i++)
+        {
+            Color color = fory.DeserializeFromReader<Color>(inputReader);
+            Append(output, fory.Serialize<object?>(color));
+        }
+
+        for (int i = 0; i < 3; i++)
+        {
+            MyStruct myStruct = fory.DeserializeFromReader<MyStruct>(inputReader);
+            Append(output, fory.Serialize<object?>(myStruct));
+        }
+
+        for (int i = 0; i < 3; i++)
+        {
+            MyExt myExt = fory.DeserializeFromReader<MyExt>(inputReader);
+            Append(output, fory.Serialize<object?>(myExt));
+        }
+
+        EnsureConsumed(inputReader, nameof(CaseConsistentNamed));
+        return output.ToArray();
+    }
+
+    private static byte[] CaseStructVersionCheck(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false, checkStructVersion: true);
+        fory.Register<VersionCheckStruct>(201);
+        return RoundTripSingle<VersionCheckStruct>(input, fory);
+    }
+
+    private static byte[] CasePolymorphicList(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<Dog>(302);
+        fory.Register<Cat>(303);
+        fory.Register<AnimalListHolder>(304);
+
+        ByteReader inputReader = new(input);
+        List<object?> animals = fory.DeserializeFromReader<List<object?>>(inputReader);
+        AnimalListHolder holder = fory.DeserializeFromReader<AnimalListHolder>(inputReader);
+        EnsureConsumed(inputReader, nameof(CasePolymorphicList));
+
+        List<byte> output = [];
+        Append(output, fory.Serialize<object?>(animals));
+        Append(output, fory.Serialize<object?>(holder));
+        return output.ToArray();
+    }
+
+    private static byte[] CasePolymorphicMap(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<Dog>(302);
+        fory.Register<Cat>(303);
+        fory.Register<AnimalMapHolder>(305);
+
+        ByteReader inputReader = new(input);
+        Dictionary<string, object?> map = fory.DeserializeFromReader<Dictionary<string, object?>>(inputReader);
+        AnimalMapHolder holder = fory.DeserializeFromReader<AnimalMapHolder>(inputReader);
+        EnsureConsumed(inputReader, nameof(CasePolymorphicMap));
+
+        List<byte> output = [];
+        Append(output, fory.Serialize<object?>(map));
+        Append(output, fory.Serialize<object?>(holder));
+        return output.ToArray();
+    }
+
+    private static byte[] CaseOneFieldStructCompatible(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<OneFieldStruct>(200);
+        return RoundTripSingle<OneFieldStruct>(input, fory);
+    }
+
+    private static byte[] CaseOneFieldStructSchema(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false);
+        fory.Register<OneFieldStruct>(200);
+        return RoundTripSingle<OneFieldStruct>(input, fory);
+    }
+
+    private static byte[] CaseOneStringFieldSchema(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false);
+        fory.Register<OneStringFieldStruct>(200);
+        return RoundTripSingle<OneStringFieldStruct>(input, fory);
+    }
+
+    private static byte[] CaseOneStringFieldCompatible(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<OneStringFieldStruct>(200);
+        return RoundTripSingle<OneStringFieldStruct>(input, fory);
+    }
+
+    private static byte[] CaseTwoStringFieldCompatible(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<TwoStringFieldStruct>(201);
+        return RoundTripSingle<TwoStringFieldStruct>(input, fory);
+    }
+
+    private static byte[] CaseSchemaEvolutionCompatible(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<TwoStringFieldStruct>(200);
+        return RoundTripSingle<TwoStringFieldStruct>(input, fory);
+    }
+
+    private static byte[] CaseSchemaEvolutionCompatibleReverse(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<OneStringFieldStruct>(200);
+        return RoundTripSingle<OneStringFieldStruct>(input, fory);
+    }
+
+    private static byte[] CaseReducedPrecisionFloatStruct(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false);
+        fory.Register<ReducedPrecisionFloatStruct>(213);
+
+        ByteReader inputReader = new(input);
+        ReducedPrecisionFloatStruct value = fory.DeserializeFromReader<ReducedPrecisionFloatStruct>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseReducedPrecisionFloatStruct));
+        Ensure(BitConverter.HalfToUInt16Bits(value.Float16Value) == 0x3E00, "float16_value mismatch");
+        Ensure(value.BFloat16Value.Bits == 0x3FC0, "bfloat16_value mismatch");
+        Ensure(
+            value.Float16Array is { Count: 3 }
+            && BitConverter.HalfToUInt16Bits(value.Float16Array[0]) == 0x0000
+            && BitConverter.HalfToUInt16Bits(value.Float16Array[1]) == 0x3C00
+            && BitConverter.HalfToUInt16Bits(value.Float16Array[2]) == 0xBC00,
+            "float16_array mismatch");
+        Ensure(
+            value.BFloat16Array is { Count: 3 }
+            && value.BFloat16Array[0].Bits == 0x0000
+            && value.BFloat16Array[1].Bits == 0x3F80
+            && value.BFloat16Array[2].Bits == 0xBF80,
+            "bfloat16_array mismatch");
+        return fory.Serialize<object?>(value);
+    }
+
+    private static byte[] CaseReducedPrecisionFloatStructCompatibleSkip(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<EmptyStruct>(213);
+        return RoundTripSingle<EmptyStruct>(input, fory);
+    }
+
+    private static byte[] CaseListArrayCompatibleListToArray(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<CompatibleInt32ArrayField>(901);
+        return RoundTripSingle<CompatibleInt32ArrayField>(input, fory);
+    }
+
+    private static byte[] CaseListArrayCompatibleArrayToList(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<CompatibleInt32ListField>(901);
+        return RoundTripSingle<CompatibleInt32ListField>(input, fory);
+    }
+
+    private static byte[] CaseListArrayCompatibleNullableListToArrayError(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<CompatibleInt32ArrayField>(901);
+
+        ByteReader inputReader = new(input);
+        try
+        {
+            _ = fory.DeserializeFromReader<CompatibleInt32ArrayField>(inputReader);
+        }
+        catch (Apache.Fory.InvalidDataException)
+        {
+            return input;
+        }
+        throw new InvalidOperationException("Expected nullable list payload to fail compatible array read");
+    }
+
+    private static byte[] CaseOneEnumFieldSchema(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false);
+        fory.Register<TestEnum>(210);
+        fory.Register<OneEnumFieldStruct>(211);
+        return RoundTripSingle<OneEnumFieldStruct>(input, fory);
+    }
+
+    private static byte[] CaseOneEnumFieldCompatible(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<TestEnum>(210);
+        fory.Register<OneEnumFieldStruct>(211);
+        return RoundTripSingle<OneEnumFieldStruct>(input, fory);
+    }
+
+    private static byte[] CaseTwoEnumFieldCompatible(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<TestEnum>(210);
+        fory.Register<TwoEnumFieldStruct>(212);
+        return RoundTripSingle<TwoEnumFieldStruct>(input, fory);
+    }
+
+    private static byte[] CaseEnumSchemaEvolutionCompatible(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<TestEnum>(210);
+        fory.Register<TwoEnumFieldStruct>(211);
+        return RoundTripSingle<TwoEnumFieldStruct>(input, fory);
+    }
+
+    private static byte[] CaseEnumSchemaEvolutionCompatibleReverse(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<TestEnum>(210);
+        fory.Register<TwoEnumFieldStruct>(211);
+
+        ByteReader inputReader = new(input);
+        TwoEnumFieldStruct value = fory.DeserializeFromReader<TwoEnumFieldStruct>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseEnumSchemaEvolutionCompatibleReverse));
+        Ensure(value.F1 == TestEnum.ValueC, "enum schema evolution reverse F1 mismatch");
+        Ensure(value.F2 == TestEnum.ValueA, "enum schema evolution reverse F2 default mismatch");
+        return fory.Serialize<object?>(value);
+    }
+
+    private static byte[] CaseNullableFieldSchemaConsistentNotNull(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false);
+        fory.Register<NullableComprehensiveSchemaConsistent>(401);
+        return RoundTripSingle<NullableComprehensiveSchemaConsistent>(input, fory);
+    }
+
+    private static byte[] CaseNullableFieldSchemaConsistentNull(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false);
+        fory.Register<NullableComprehensiveSchemaConsistent>(401);
+        return RoundTripSingle<NullableComprehensiveSchemaConsistent>(input, fory);
+    }
+
+    private static byte[] CaseNullableFieldCompatibleNotNull(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<NullableComprehensiveCompatible>(402);
+        return RoundTripSingle<NullableComprehensiveCompatible>(input, fory);
+    }
+
+    private static byte[] CaseNullableFieldCompatibleNull(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<NullableComprehensiveCompatible>(402);
+        return RoundTripSingle<NullableComprehensiveCompatible>(input, fory);
+    }
+
+    private static byte[] CaseRefSchemaConsistent(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false, trackRef: true);
+        fory.Register<RefInnerSchemaConsistent>(501);
+        fory.Register<RefOuterSchemaConsistent>(502);
+
+        ByteReader inputReader = new(input);
+        RefOuterSchemaConsistent outer = fory.DeserializeFromReader<RefOuterSchemaConsistent>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseRefSchemaConsistent));
+        Ensure(ReferenceEquals(outer.Inner1, outer.Inner2), "reference tracking mismatch");
+        return fory.Serialize<object?>(outer);
+    }
+
+    private static byte[] CaseRefCompatible(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true, trackRef: true);
+        fory.Register<RefInnerCompatible>(503);
+        fory.Register<RefOuterCompatible>(504);
+
+        ByteReader inputReader = new(input);
+        RefOuterCompatible outer = fory.DeserializeFromReader<RefOuterCompatible>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseRefCompatible));
+        Ensure(ReferenceEquals(outer.Inner1, outer.Inner2), "reference tracking mismatch");
+        return fory.Serialize<object?>(outer);
+    }
+
+    private static byte[] CaseCollectionElementRefOverride(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false, trackRef: true);
+        fory.Register<RefOverrideElement>(701);
+        fory.Register<RefOverrideContainer>(702);
+
+        ByteReader inputReader = new(input);
+        RefOverrideContainer container = fory.DeserializeFromReader<RefOverrideContainer>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseCollectionElementRefOverride));
+
+        if (container.ListField.Count > 0)
+        {
+            RefOverrideElement? shared = container.ListField[0];
+            if (shared is not null)
+            {
+                foreach (RefOverrideElement? setValue in container.SetField)
+                {
+                    Ensure(!ReferenceEquals(setValue, shared), "SetField should honor remote ref=false metadata");
+                    break;
+                }
+
+                if (container.ListField.Count > 1)
+                {
+                    Ensure(!ReferenceEquals(container.ListField[1], shared), "ListField should honor remote ref=false metadata");
+                    container.ListField[1] = shared;
+                }
+
+                if (container.MapField.ContainsKey("k1"))
+                {
+                    Ensure(!ReferenceEquals(container.MapField["k1"], shared), "MapField[k1] should honor remote ref=false metadata");
+                    container.MapField["k1"] = shared;
+                }
+
+                if (container.MapField.ContainsKey("k2"))
+                {
+                    Ensure(!ReferenceEquals(container.MapField["k2"], shared), "MapField[k2] should honor remote ref=false metadata");
+                    container.MapField["k2"] = shared;
+                }
+
+                container.SetField.Clear();
+                container.SetField.Add(shared);
+            }
+        }
+
+        return fory.Serialize<object?>(container);
+    }
+
+    private static byte[] CaseCollectionElementRefRemoteTracking(byte[] input)
+    {
+        _ = input;
+        ForyRuntime fory = BuildFory(compatible: false, trackRef: true);
+        fory.Register<RefOverrideElement>(701);
+        fory.Register<RefOverrideContainer>(702);
+
+        RefOverrideElement shared = new()
+        {
+            Id = 7,
+            Name = "shared_element",
+        };
+
+        // IMPORTANT: this peer intentionally writes a shared-reference payload
+        // with its default local ref-tracked schema. The Java reader uses
+        // ref-disabled element annotations and must still honor the wire
+        // metadata. DO NOT REMOVE this comment.
+        RefOverrideContainer container = new()
+        {
+            ListField = [shared, shared],
+            SetField = [shared],
+            MapField = new Dictionary<string, RefOverrideElement?> { ["k1"] = shared, ["k2"] = shared },
+        };
+        return fory.Serialize<object?>(container);
+    }
+
+    private static byte[] CaseCircularRefSchemaConsistent(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false, trackRef: true);
+        fory.Register<CircularRefStruct>(601);
+
+        ByteReader inputReader = new(input);
+        CircularRefStruct value = fory.DeserializeFromReader<CircularRefStruct>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseCircularRefSchemaConsistent));
+        Ensure(ReferenceEquals(value, value.SelfRef), "circular ref mismatch");
+        return fory.Serialize<object?>(value);
+    }
+
+    private static byte[] CaseCircularRefCompatible(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true, trackRef: true);
+        fory.Register<CircularRefStruct>(602);
+
+        ByteReader inputReader = new(input);
+        CircularRefStruct value = fory.DeserializeFromReader<CircularRefStruct>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseCircularRefCompatible));
+        Ensure(ReferenceEquals(value, value.SelfRef), "circular ref mismatch");
+        return fory.Serialize<object?>(value);
+    }
+
+    private static byte[] CaseUnsignedSchemaConsistentSimple(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false);
+        fory.Register<UnsignedSchemaConsistentSimple>(1);
+        return RoundTripSingle<UnsignedSchemaConsistentSimple>(input, fory);
+    }
+
+    private static byte[] CaseUnsignedSchemaConsistent(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false);
+        fory.Register<UnsignedSchemaConsistent>(501);
+        return RoundTripSingle<UnsignedSchemaConsistent>(input, fory);
+    }
+
+    private static byte[] CaseUnsignedSchemaCompatible(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<UnsignedSchemaCompatible>(502);
+        return RoundTripSingle<UnsignedSchemaCompatible>(input, fory);
+    }
+
+    private static byte[] CaseNestedAnnotatedContainerSchemaConsistent(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false);
+        fory.Register<NestedAnnotatedContainerSchemaConsistent>(801);
+        return RoundTripSingle<NestedAnnotatedContainerSchemaConsistent>(input, fory);
+    }
+
+    private static byte[] CaseNestedAnnotatedContainerCompatible(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<NestedAnnotatedContainerCompatible>(802);
+        return RoundTripSingle<NestedAnnotatedContainerCompatible>(input, fory);
+    }
+
+    private static byte[] CaseCSharpExternalId(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        RegisterCSharpTypesById(fory);
+        return ExchangeExternalValues(input, fory, nameof(CaseCSharpExternalId));
+    }
+
+    private static byte[] CaseCSharpExternalName(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false);
+        RegisterCSharpTypesByName(fory);
+        return ExchangeExternalValues(input, fory, nameof(CaseCSharpExternalName));
+    }
+
+    private static byte[] CaseCSharpOrdinaryInheritanceId(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: true);
+        fory.Register<XlangOrdinaryLeaf>(1311);
+        ByteReader inputReader = new(input);
+        XlangOrdinaryLeaf value =
+            fory.DeserializeFromReader<XlangOrdinaryLeaf>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseCSharpOrdinaryInheritanceId));
+        Ensure(value.Identifier == 17, "ordinary inherited identifier mismatch");
+        Ensure(value.Name == "ordinary", "ordinary inherited name mismatch");
+        Ensure(value.Score == 19, "ordinary leaf score mismatch");
+        return fory.Serialize<object?>(value);
+    }
+
+    private static byte[] CaseCSharpExternalInheritanceName(byte[] input)
+    {
+        ForyRuntime fory = BuildFory(compatible: false);
+        fory.Register<XlangExternalLeaf>("csharp.inheritance.ExternalLeaf");
+        ByteReader inputReader = new(input);
+        XlangExternalLeaf value =
+            fory.DeserializeFromReader<XlangExternalLeaf>(inputReader);
+        EnsureConsumed(inputReader, nameof(CaseCSharpExternalInheritanceName));
+        Ensure(
+            value.ReadPrivateState() == (23L, "external", 29),
+            "external inherited private state mismatch");
+        Ensure(value.PublicValue == 31, "external inherited public value mismatch");
+        Ensure(value.LeafName == "leaf", "external leaf name mismatch");
+        return fory.Serialize<object?>(value);
+    }
+
+    private static byte[] ExchangeExternalValues(
+        byte[] input,
+        ForyRuntime fory,
+        string caseName)
+    {
+        ByteReader inputReader = new(input);
+        XlangUser user = fory.DeserializeFromReader<XlangUser>(inputReader);
+        XlangPoint point = fory.DeserializeFromReader<XlangPoint>(inputReader);
+        XlangStatus status = fory.DeserializeFromReader<XlangStatus>(inputReader);
+        XlangHolder holder = fory.DeserializeFromReader<XlangHolder>(inputReader);
+        List<XlangUser> users = fory.DeserializeFromReader<List<XlangUser>>(inputReader);
+        Dictionary<string, XlangUser> usersByName =
+            fory.DeserializeFromReader<Dictionary<string, XlangUser>>(inputReader);
+        EnsureConsumed(inputReader, caseName);
+
+        EnsureUser(user, 7, "root", "class root");
+        Ensure(point.X == 3 && point.Y == -4, "struct root mismatch");
+        Ensure(status == XlangStatus.Done, "enum root mismatch");
+
+        Ensure(holder.Users.Count == 2, "holder list size mismatch");
+        EnsureUser(holder.Users[0], 11, "holder-a", "holder list element 0");
+        EnsureUser(holder.Users[1], 12, "holder-b", "holder list element 1");
+        Ensure(holder.UsersByName.Count == 2, "holder map size mismatch");
+        EnsureUser(holder.UsersByName["first"], 13, "map-a", "holder map first");
+        EnsureUser(holder.UsersByName["second"], 14, "map-b", "holder map second");
+
+        Ensure(users.Count == 2, "root list size mismatch");
+        EnsureUser(users[0], 21, "list-a", "root list element 0");
+        EnsureUser(users[1], 22, "list-b", "root list element 1");
+
+        Ensure(usersByName.Count == 2, "root map size mismatch");
+        EnsureUser(usersByName["left"], 31, "root-map-a", "root map left");
+        EnsureUser(usersByName["right"], 32, "root-map-b", "root map right");
+
+        List<byte> output = [];
+        Append(output, fory.Serialize(user));
+        Append(output, fory.Serialize(point));
+        Append(output, fory.Serialize(status));
+        Append(output, fory.Serialize(holder));
+        Append(output, fory.Serialize(users));
+        Append(output, fory.Serialize(usersByName));
+        return output.ToArray();
+    }
+
+    private static void EnsureUser(XlangUser user, int id, string name, string label)
+    {
+        Ensure(user.Id == id && user.Name == name, $"{label} mismatch");
+    }
+
+    private static byte[] RoundTripSingle<T>(byte[] input, ForyRuntime fory)
+    {
+        ByteReader inputReader = new(input);
+        T value = fory.DeserializeFromReader<T>(inputReader);
+        EnsureConsumed(inputReader, typeof(T).Name);
+        return fory.Serialize<object?>(value);
+    }
+
+    private static void RegisterSimpleById(ForyRuntime fory)
+    {
+        fory.Register<Color>(101);
+        fory.Register<Item>(102);
+        fory.Register<SimpleStruct>(103);
+    }
+
+    private static void RegisterSimpleByName(ForyRuntime fory)
+    {
+        fory.Register<Color>("demo.color");
+        fory.Register<Item>("demo.item");
+        fory.Register<SimpleStruct>("demo.simple_struct");
+    }
+
+    private static void RegisterCSharpTypesById(ForyRuntime fory)
+    {
+        fory.Register<XlangUser>(1301);
+        fory.Register<XlangPoint>(1302);
+        fory.Register<XlangStatus>(1303);
+        fory.Register<XlangHolder>(1304);
+    }
+
+    private static void RegisterCSharpTypesByName(ForyRuntime fory)
+    {
+        fory.Register<XlangUser>("csharp.external.User");
+        fory.Register<XlangPoint>("csharp.external.Point");
+        fory.Register<XlangStatus>("csharp.external.Status");
+        fory.Register<XlangHolder>("csharp.external.Holder");
+    }
+
+    private static ForyRuntime BuildFory(bool compatible, bool trackRef = false, bool checkStructVersion = false)
+    {
+        return ForyRuntime.Builder()
+            .Compatible(compatible)
+            .TrackRef(trackRef)
+            .CheckStructVersion(checkStructVersion)
+            .Build();
+    }
+
+    private static void Append(List<byte> target, byte[] payload)
+    {
+        target.AddRange(payload);
+    }
+
+    private static void EnsureConsumed(ByteReader reader, string caseName)
+    {
+        Ensure(reader.Remaining == 0, $"case {caseName} did not consume full payload");
+    }
+
+    private static void Ensure(bool condition, string message)
+    {
+        if (!condition)
+        {
+            throw new InvalidOperationException(message);
+        }
+    }
+}
+
+[ForyEnum]
+public enum Color
+{
+    Green,
+    Red,
+    Blue,
+    White,
+}
+
+[ForyStruct]
+public sealed class Item
+{
+    public string Name { get; set; } = string.Empty;
+}
+
+[ForyStruct]
+public sealed class SimpleStruct
+{
+    public Dictionary<int, double> F1 { get; set; } = [];
+    [ForyField(15)]
+    public int F2 { get; set; }
+    public Item F3 { get; set; } = new();
+    public string F4 { get; set; } = string.Empty;
+    public Color F5 { get; set; }
+    public List<string> F6 { get; set; } = [];
+    [ForyField(65551)]
+    public int F7 { get; set; }
+    public int F8 { get; set; }
+    [ForyField(536870911)]
+    public int Last { get; set; }
+}
+
+[ForyStruct]
+public sealed class ExactFieldTags
+{
+    [ForyField(15)]
+    public int First { get; set; }
+    [ForyField(65551)]
+    public int Second { get; set; }
+    [ForyField(536870911)]
+    public int Last { get; set; }
+}
+
+[ForyStruct]
+public sealed class EvolvingOverrideStruct
+{
+    public string F1 { get; set; } = string.Empty;
+}
+
+[ForyStruct(Evolving = false)]
+public sealed class FixedOverrideStruct
+{
+    public string F1 { get; set; } = string.Empty;
+}
+
+[ForyStruct]
+public sealed class Item1
+{
+    public int F1 { get; set; }
+    public int F2 { get; set; }
+    public int F3 { get; set; }
+    public int F4 { get; set; }
+    public int F5 { get; set; }
+    public int F6 { get; set; }
+}
+
+[ForyStruct]
+public sealed class StructWithList
+{
+    public List<string?> Items { get; set; } = [];
+}
+
+[ForyStruct]
+public sealed class StructWithMap
+{
+    public NullableKeyDictionary<string, string?> Data { get; set; } = new();
+}
+
+[ForyStruct]
+public sealed class StructWithUnion2
+{
+    public Union2<string, long> Union { get; set; } = Union2<string, long>.OfT1(string.Empty);
+}
+
+[ForyStruct]
+public sealed class MyStruct
+{
+    public int Id { get; set; }
+}
+
+[ForyStruct]
+public sealed class MyExt
+{
+    public int Id { get; set; }
+}
+
+public sealed class MyExtSerializer : Serializer<MyExt>
+{
+    public override MyExt DefaultValue => null!;
+
+    public override void WriteData(WriteContext context, in MyExt value, bool hasGenerics)
+    {
+        _ = hasGenerics;
+        context.Writer.WriteVarInt32((value ?? new MyExt()).Id);
+    }
+
+    public override MyExt ReadData(ReadContext context)
+    {
+        return new MyExt { Id = context.Reader.ReadVarInt32() };
+    }
+}
+
+[ForyStruct]
+public sealed class MyWrapper
+{
+    public Color Color { get; set; }
+    public MyExt MyExt { get; set; } = new();
+    public MyStruct MyStruct { get; set; } = new();
+}
+
+[ForyStruct]
+public sealed class EmptyWrapper
+{
+}
+
+[ForyStruct]
+public sealed class VersionCheckStruct
+{
+    public int F1 { get; set; }
+    public string? F2 { get; set; }
+    public double F3 { get; set; }
+}
+
+[ForyStruct]
+public sealed class Dog
+{
+    public int Age { get; set; }
+    public string? Name { get; set; }
+}
+
+[ForyStruct]
+public sealed class Cat
+{
+    public int Age { get; set; }
+    public int Lives { get; set; }
+}
+
+[ForyStruct]
+public sealed class AnimalListHolder
+{
+    public List<object?> Animals { get; set; } = [];
+}
+
+[ForyStruct]
+public sealed class AnimalMapHolder
+{
+    public Dictionary<string, object?> AnimalMap { get; set; } = [];
+}
+
+[ForyStruct]
+public sealed class OneFieldStruct
+{
+    public int Value { get; set; }
+}
+
+[ForyStruct]
+public sealed class OneStringFieldStruct
+{
+    public string? F1 { get; set; }
+}
+
+[ForyStruct]
+public sealed class TwoStringFieldStruct
+{
+    public string F1 { get; set; } = string.Empty;
+    public string F2 { get; set; } = string.Empty;
+}
+
+[ForyStruct]
+public sealed class EmptyStruct
+{
+}
+
+[ForyStruct]
+public sealed class ReducedPrecisionFloatStruct
+{
+    public Half Float16Value { get; set; }
+    public BFloat16 BFloat16Value { get; set; }
+    public List<Half> Float16Array { get; set; } = [];
+    public List<BFloat16> BFloat16Array { get; set; } = [];
+}
+
+[ForyStruct]
+public sealed class CompatibleInt32ListField
+{
+    [ForyField(1, Type = typeof(S.List<S.Fixed<S.Int32>>))]
+    public List<int> Values { get; set; } = [];
+}
+
+[ForyStruct]
+public sealed class CompatibleNullableInt32ListField
+{
+    [ForyField(1, Type = typeof(S.List<S.Fixed<S.Int32>>))]
+    public List<int?> Values { get; set; } = [];
+}
+
+[ForyStruct]
+public sealed class CompatibleInt32ArrayField
+{
+    [ForyField(1, Type = typeof(S.Array<S.Int32>))]
+    public int[] Values { get; set; } = [];
+}
+
+[ForyEnum]
+public enum TestEnum
+{
+    ValueA,
+    ValueB,
+    ValueC,
+}
+
+[ForyStruct]
+public sealed class OneEnumFieldStruct
+{
+    public TestEnum F1 { get; set; }
+}
+
+[ForyStruct]
+public sealed class TwoEnumFieldStruct
+{
+    public TestEnum F1 { get; set; }
+    public TestEnum F2 { get; set; }
+}
+
+[ForyStruct]
+public sealed class NullableComprehensiveSchemaConsistent
+{
+    public sbyte ByteField { get; set; }
+    public short ShortField { get; set; }
+    public int IntField { get; set; }
+    public long LongField { get; set; }
+    public float FloatField { get; set; }
+    public double DoubleField { get; set; }
+    public bool BoolField { get; set; }
+
+    public string StringField { get; set; } = string.Empty;
+    public List<string> ListField { get; set; } = [];
+    public HashSet<string> SetField { get; set; } = [];
+    public NullableKeyDictionary<string, string> MapField { get; set; } = new();
+
+    public int? NullableInt { get; set; }
+    public long? NullableLong { get; set; }
+    public float? NullableFloat { get; set; }
+    public double? NullableDouble { get; set; }
+    public bool? NullableBool { get; set; }
+    public string? NullableString { get; set; }
+    public List<string>? NullableList { get; set; }
+    public HashSet<string>? NullableSet { get; set; }
+    public NullableKeyDictionary<string, string>? NullableMap { get; set; }
+}
+
+[ForyStruct]
+public sealed class NullableComprehensiveCompatible
+{
+    public sbyte ByteField { get; set; }
+    public short ShortField { get; set; }
+    public int IntField { get; set; }
+    public long LongField { get; set; }
+    public float FloatField { get; set; }
+    public double DoubleField { get; set; }
+    public bool BoolField { get; set; }
+
+    public int BoxedInt { get; set; }
+    public long BoxedLong { get; set; }
+    public float BoxedFloat { get; set; }
+    public double BoxedDouble { get; set; }
+    public bool BoxedBool { get; set; }
+
+    public string StringField { get; set; } = string.Empty;
+    public List<string> ListField { get; set; } = [];
+    public HashSet<string> SetField { get; set; } = [];
+    public NullableKeyDictionary<string, string> MapField { get; set; } = new();
+
+    public int NullableInt1 { get; set; }
+    public long NullableLong1 { get; set; }
+    public float NullableFloat1 { get; set; }
+    public double NullableDouble1 { get; set; }
+    public bool NullableBool1 { get; set; }
+
+    public string NullableString2 { get; set; } = string.Empty;
+    public List<string> NullableList2 { get; set; } = [];
+    public HashSet<string> NullableSet2 { get; set; } = [];
+    public NullableKeyDictionary<string, string> NullableMap2 { get; set; } = new();
+}
+
+[ForyStruct]
+public sealed class RefInnerSchemaConsistent
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+}
+
+[ForyStruct]
+public sealed class RefOuterSchemaConsistent
+{
+    public RefInnerSchemaConsistent? Inner1 { get; set; }
+    public RefInnerSchemaConsistent? Inner2 { get; set; }
+}
+
+[ForyStruct]
+public sealed class RefInnerCompatible
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+}
+
+[ForyStruct]
+public sealed class RefOuterCompatible
+{
+    public RefInnerCompatible? Inner1 { get; set; }
+    public RefInnerCompatible? Inner2 { get; set; }
+}
+
+[ForyStruct]
+public sealed class RefOverrideElement
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+}
+
+[ForyStruct]
+public sealed class RefOverrideContainer
+{
+    public List<RefOverrideElement?> ListField { get; set; } = [];
+    public HashSet<RefOverrideElement?> SetField { get; set; } = [];
+    public Dictionary<string, RefOverrideElement?> MapField { get; set; } = [];
+}
+
+[ForyStruct]
+public sealed class CircularRefStruct
+{
+    public string Name { get; set; } = string.Empty;
+    public CircularRefStruct? SelfRef { get; set; }
+}
+
+[ForyStruct]
+public sealed class UnsignedSchemaConsistentSimple
+{
+    [ForyField(Type = typeof(S.Tagged<S.UInt64>))]
+    public ulong U64Tagged { get; set; }
+
+    [ForyField(Type = typeof(S.Tagged<S.UInt64>))]
+    public ulong? U64TaggedNullable { get; set; }
+}
+
+[ForyStruct]
+public sealed class UnsignedSchemaConsistent
+{
+    public byte U8Field { get; set; }
+    public ushort U16Field { get; set; }
+    public uint U32VarField { get; set; }
+
+    [ForyField(Type = typeof(S.Fixed<S.UInt32>))]
+    public uint U32FixedField { get; set; }
+
+    public ulong U64VarField { get; set; }
+
+    [ForyField(Type = typeof(S.Fixed<S.UInt64>))]
+    public ulong U64FixedField { get; set; }
+
+    [ForyField(Type = typeof(S.Tagged<S.UInt64>))]
+    public ulong U64TaggedField { get; set; }
+
+    public byte? U8NullableField { get; set; }
+    public ushort? U16NullableField { get; set; }
+    public uint? U32VarNullableField { get; set; }
+
+    [ForyField(Type = typeof(S.Fixed<S.UInt32>))]
+    public uint? U32FixedNullableField { get; set; }
+
+    public ulong? U64VarNullableField { get; set; }
+
+    [ForyField(Type = typeof(S.Fixed<S.UInt64>))]
+    public ulong? U64FixedNullableField { get; set; }
+
+    [ForyField(Type = typeof(S.Tagged<S.UInt64>))]
+    public ulong? U64TaggedNullableField { get; set; }
+}
+
+[ForyStruct]
+public sealed class UnsignedSchemaCompatible
+{
+    public byte? U8Field1 { get; set; }
+    public ushort? U16Field1 { get; set; }
+    public uint? U32VarField1 { get; set; }
+
+    [ForyField(Type = typeof(S.Fixed<S.UInt32>))]
+    public uint? U32FixedField1 { get; set; }
+
+    public ulong? U64VarField1 { get; set; }
+
+    [ForyField(Type = typeof(S.Fixed<S.UInt64>))]
+    public ulong? U64FixedField1 { get; set; }
+
+    [ForyField(Type = typeof(S.Tagged<S.UInt64>))]
+    public ulong? U64TaggedField1 { get; set; }
+
+    public byte U8Field2 { get; set; }
+    public ushort U16Field2 { get; set; }
+    public uint U32VarField2 { get; set; }
+
+    [ForyField(Type = typeof(S.Fixed<S.UInt32>))]
+    public uint U32FixedField2 { get; set; }
+
+    public ulong U64VarField2 { get; set; }
+
+    [ForyField(Type = typeof(S.Fixed<S.UInt64>))]
+    public ulong U64FixedField2 { get; set; }
+
+    [ForyField(Type = typeof(S.Tagged<S.UInt64>))]
+    public ulong U64TaggedField2 { get; set; }
+}
+
+#pragma warning disable CS8714
+[ForyStruct]
+public sealed class NestedAnnotatedContainerSchemaConsistent
+{
+    [ForyField(Type = typeof(S.Map<S.Fixed<S.UInt32>, S.List<S.Tagged<S.UInt64>>>))]
+    public NullableKeyDictionary<uint?, List<ulong?>?> Values { get; set; } = new();
+}
+
+[ForyStruct]
+public sealed class NestedAnnotatedContainerCompatible
+{
+    [ForyField(Type = typeof(S.Map<S.Fixed<S.UInt32>, S.List<S.Tagged<S.UInt64>>>))]
+    public NullableKeyDictionary<uint?, List<ulong?>?> Values { get; set; } = new();
+}
+#pragma warning restore CS8714

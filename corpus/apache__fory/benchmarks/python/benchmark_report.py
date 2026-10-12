@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+"""Generate plots and Markdown report from Python benchmark JSON results."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import platform
+import sys
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+from typing import Dict
+
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from plot_style import (  # noqa: E402
+    BAR_EDGE_COLOR,
+    GROUP_BAR_WIDTH,
+    GROUP_X,
+    PLOT_RC_PARAMS,
+    add_compact_legend,
+    format_markdown_with_prettier,
+    format_throughput_tick,
+    save_benchmark_figure,
+    serializer_offset,
+    set_grouped_operation_axis,
+    style_throughput_axis,
+)
+
+try:
+    import psutil
+
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+
+COLORS = {
+    "fory": "#FF6F01",
+    "protobuf": "#55BCC2",
+    "pickle": (0.55, 0.40, 0.45),
+}
+SERIALIZER_ORDER = ["fory", "protobuf", "pickle"]
+SERIALIZER_LABELS = {
+    "fory": "fory",
+    "protobuf": "protobuf",
+    "pickle": "pickle",
+}
+DATATYPE_ORDER = [
+    "struct",
+    "sample",
+    "mediacontent",
+    "structlist",
+    "samplelist",
+    "mediacontentlist",
+]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate markdown report and plots for Python benchmark suite"
+    )
+    parser.add_argument(
+        "--json-file",
+        default="results/benchmark_results.json",
+        help="Benchmark JSON file produced by benchmark.py",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="results/report",
+        help="Output directory for report and plots",
+    )
+    parser.add_argument(
+        "--plot-prefix",
+        default="",
+        help="Optional image path prefix used in markdown",
+    )
+    return parser.parse_args()
+
+
+def load_json(path: Path) -> Dict:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def get_system_info() -> Dict[str, str]:
+    info = {
+        "OS": f"{platform.system()} {platform.release()}",
+        "Machine": platform.machine(),
+        "Processor": platform.processor() or "Unknown",
+        "Python": platform.python_version(),
+    }
+    if HAS_PSUTIL:
+        info["CPU Cores (Physical)"] = str(psutil.cpu_count(logical=False))
+        info["CPU Cores (Logical)"] = str(psutil.cpu_count(logical=True))
+        info["Total RAM (GB)"] = str(
+            round(psutil.virtual_memory().total / (1024**3), 2)
+        )
+    return info
+
+
+def format_datatype_label(datatype: str) -> str:
+    mapping = {
+        "struct": "NumericStruct",
+        "sample": "Sample",
+        "mediacontent": "MediaContent",
+        "structlist": "NumericStruct\nList",
+        "samplelist": "Sample\nList",
+        "mediacontentlist": "MediaContent\nList",
+    }
+    return mapping.get(datatype, datatype)
+
+
+def format_datatype_table_label(datatype: str) -> str:
+    mapping = {
+        "struct": "NumericStruct",
+        "sample": "Sample",
+        "mediacontent": "MediaContent",
+        "structlist": "NumericStructList",
+        "samplelist": "SampleList",
+        "mediacontentlist": "MediaContentList",
+    }
+    return mapping.get(datatype, datatype)
+
+
+def format_tps_tick(tps: float, _position) -> str:
+    return format_throughput_tick(tps, _position)
+
+
+def build_benchmark_matrix(benchmarks):
+    data = defaultdict(lambda: defaultdict(dict))
+    for bench in benchmarks:
+        datatype = bench["datatype"]
+        operation = bench["operation"]
+        serializer = bench["serializer"]
+        data[datatype][operation][serializer] = bench["mean_ns"]
+    return data
+
+
+def plot_throughput_grid_subplot(ax, data, datatype: str):
+    if datatype not in data:
+        ax.set_title(f"{format_datatype_table_label(datatype)}\nNo Data")
+        ax.axis("off")
+        return
+
+    available_libs = [
+        lib
+        for lib in SERIALIZER_ORDER
+        if any(
+            data.get(datatype, {}).get(operation, {}).get(lib, 0) > 0
+            for operation in ["serialize", "deserialize"]
+        )
+    ]
+    if not available_libs:
+        ax.set_title(f"{format_datatype_table_label(datatype)}\nNo Data")
+        ax.axis("off")
+        return
+
+    operations = ["serialize", "deserialize"]
+    x = GROUP_X
+    for idx, lib in enumerate(available_libs):
+        times = [
+            data.get(datatype, {}).get(operation, {}).get(lib, 0)
+            for operation in operations
+        ]
+        tps = [1e9 / val if val > 0 else 0 for val in times]
+        offset = serializer_offset(idx, len(available_libs))
+        ax.bar(
+            x + offset,
+            tps,
+            GROUP_BAR_WIDTH,
+            label=SERIALIZER_LABELS.get(lib, lib),
+            color=COLORS.get(lib, "#999999"),
+            edgecolor=BAR_EDGE_COLOR,
+            linewidth=0.8,
+        )
+
+    max_tps = max(
+        1e9 / data[datatype][operation][lib]
+        for operation in operations
+        for lib in available_libs
+        if data.get(datatype, {}).get(operation, {}).get(lib, 0) > 0
+    )
+    ax.set_ylim(0, max_tps * 1.12)
+    ax.set_title(format_datatype_table_label(datatype), pad=8)
+    set_grouped_operation_axis(ax)
+    style_throughput_axis(ax)
+    ax.yaxis.set_major_formatter(FuncFormatter(format_tps_tick))
+    add_compact_legend(ax)
+
+
+def generate_plots(data, output_dir: Path):
+    with plt.rc_context(PLOT_RC_PARAMS):
+        fig, axes = plt.subplots(2, 3, figsize=(16.5, 9.0))
+        for index, (ax, datatype) in enumerate(zip(axes.flat, DATATYPE_ORDER)):
+            plot_throughput_grid_subplot(ax, data, datatype)
+            if index % 3 == 0:
+                ax.set_ylabel("Throughput (ops/sec)", labelpad=10)
+
+        fig.suptitle(
+            "Python Serialization Throughput",
+            fontsize=15,
+            fontweight="normal",
+            y=0.955,
+        )
+        fig.tight_layout(rect=[0.02, 0.02, 0.995, 0.965], w_pad=1.2, h_pad=1.25)
+        throughput_path = output_dir / "throughput.png"
+        save_benchmark_figure(fig, throughput_path)
+        plt.close()
+
+    return throughput_path
+
+
+def generate_markdown_report(raw, data, sizes, output_dir: Path, plot_prefix: str):
+    context = raw.get("context", {})
+    system_info = get_system_info()
+
+    if context.get("python_implementation"):
+        system_info["Python Implementation"] = context["python_implementation"]
+    if context.get("platform"):
+        system_info["Benchmark Platform"] = context["platform"]
+
+    datatypes = [dt for dt in DATATYPE_ORDER if dt in data]
+    operations = ["serialize", "deserialize"]
+
+    md = [
+        "# Python Benchmark Performance Report\n\n",
+        f"_Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_\n\n",
+        "## How to Generate This Report\n\n",
+        "```bash\n",
+        "cd benchmarks/python\n",
+        "./run.sh\n",
+        "```\n\n",
+        "## Benchmark Plot\n\n",
+        "The plot shows throughput (ops/sec); higher is better.\n\n",
+        f"![Throughput]({plot_prefix}throughput.png)\n\n",
+        "## Hardware & OS Info\n\n",
+        "| Key | Value |\n",
+        "|-----|-------|\n",
+    ]
+
+    for key, value in system_info.items():
+        md.append(f"| {key} | {value} |\n")
+
+    md.append("\n## Benchmark Configuration\n\n")
+    md.append("| Key | Value |\n")
+    md.append("|-----|-------|\n")
+    for key in ["warmup", "iterations", "repeat", "number", "list_size"]:
+        if key in context:
+            md.append(f"| {key} | {context[key]} |\n")
+
+    md.append("\n## Benchmark Results\n\n")
+    md.append("### Timing Results (nanoseconds)\n\n")
+    timing_headers = [
+        f"{SERIALIZER_LABELS.get(lib, lib)} (ns)" for lib in SERIALIZER_ORDER
+    ]
+    md.append(
+        "| Datatype | Operation | " + " | ".join(timing_headers) + " | Fastest |\n"
+    )
+    md.append(
+        "|----------|-----------|"
+        + "|".join("-" * (len(header) + 2) for header in timing_headers)
+        + "|---------|\n"
+    )
+
+    for datatype in datatypes:
+        for operation in operations:
+            times = {
+                lib: data.get(datatype, {}).get(operation, {}).get(lib, 0)
+                for lib in SERIALIZER_ORDER
+            }
+            valid = {lib: val for lib, val in times.items() if val > 0}
+            fastest = min(valid, key=valid.get) if valid else "N/A"
+            md.append(
+                "| "
+                + f"{format_datatype_table_label(datatype)} | {operation.capitalize()} | "
+                + " | ".join(
+                    f"{times[lib]:.1f}" if times[lib] > 0 else "N/A"
+                    for lib in SERIALIZER_ORDER
+                )
+                + f" | {SERIALIZER_LABELS.get(fastest, fastest)} |\n"
+            )
+
+    md.append("\n### Throughput Results (ops/sec)\n\n")
+    throughput_headers = [
+        f"{SERIALIZER_LABELS.get(lib, lib)} TPS" for lib in SERIALIZER_ORDER
+    ]
+    md.append(
+        "| Datatype | Operation | " + " | ".join(throughput_headers) + " | Fastest |\n"
+    )
+    md.append(
+        "|----------|-----------|"
+        + "|".join("-" * (len(header) + 2) for header in throughput_headers)
+        + "|---------|\n"
+    )
+
+    for datatype in datatypes:
+        for operation in operations:
+            times = {
+                lib: data.get(datatype, {}).get(operation, {}).get(lib, 0)
+                for lib in SERIALIZER_ORDER
+            }
+            tps = {lib: (1e9 / val if val > 0 else 0) for lib, val in times.items()}
+            valid_tps = {lib: val for lib, val in tps.items() if val > 0}
+            fastest = max(valid_tps, key=valid_tps.get) if valid_tps else "N/A"
+            md.append(
+                "| "
+                + f"{format_datatype_table_label(datatype)} | {operation.capitalize()} | "
+                + " | ".join(
+                    f"{tps[lib]:,.0f}" if tps[lib] > 0 else "N/A"
+                    for lib in SERIALIZER_ORDER
+                )
+                + f" | {SERIALIZER_LABELS.get(fastest, fastest)} |\n"
+            )
+
+    if sizes:
+        md.append("\n### Serialized Data Sizes (bytes)\n\n")
+        size_headers = [SERIALIZER_LABELS.get(lib, lib) for lib in SERIALIZER_ORDER]
+        md.append("| Datatype | " + " | ".join(size_headers) + " |\n")
+        md.append(
+            "|----------|"
+            + "|".join("-" * (len(header) + 2) for header in size_headers)
+            + "|\n"
+        )
+
+        for datatype in datatypes:
+            datatype_sizes = sizes.get(datatype, {})
+            row = []
+            for lib in SERIALIZER_ORDER:
+                value = datatype_sizes.get(lib, -1)
+                row.append(str(value) if value is not None and value >= 0 else "N/A")
+            md.append(
+                f"| {format_datatype_table_label(datatype)} | "
+                + " | ".join(row)
+                + " |\n"
+            )
+
+    report_path = output_dir / "README.md"
+    report_path.write_text("".join(md), encoding="utf-8")
+
+    format_markdown_with_prettier(report_path)
+
+    return report_path
+
+
+def main() -> int:
+    args = parse_args()
+
+    json_file = Path(args.json_file)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    raw = load_json(json_file)
+    benchmarks = raw.get("benchmarks", [])
+    sizes = raw.get("sizes", {})
+
+    data = build_benchmark_matrix(benchmarks)
+    generate_plots(data, output_dir)
+
+    report_path = generate_markdown_report(
+        raw,
+        data,
+        sizes,
+        output_dir,
+        args.plot_prefix,
+    )
+
+    print(f"Plots saved in: {output_dir}")
+    print(f"Markdown report generated at: {report_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

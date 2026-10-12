@@ -1,0 +1,131 @@
+/*
+ * Copyright 2004-present the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.springframework.security.oauth2.server.resource.authentication;
+
+import java.io.Serial;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+
+import org.springframework.core.convert.converter.Converter;
+import org.springframework.security.authentication.AbstractAuthenticationToken;
+import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.core.authority.FactorGrantedAuthority;
+import org.springframework.security.oauth2.core.OAuth2AuthenticatedPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.security.oauth2.jwt.JwtClaimNames;
+import org.springframework.util.Assert;
+
+/**
+ * A {@link Converter} that converts a {@link Jwt} to an
+ * {@link AbstractAuthenticationToken}.
+ *
+ * @author Rob Winch
+ * @author Josh Cummings
+ * @author Evgeniy Cheban
+ * @author Olivier Antoine
+ * @author Andrey Litvitski
+ * @since 5.1
+ */
+public class JwtAuthenticationConverter implements Converter<Jwt, AbstractAuthenticationToken> {
+
+	private static final String AUTHORITY = FactorGrantedAuthority.BEARER_AUTHORITY;
+
+	private Converter<Jwt, OAuth2AuthenticatedPrincipal> jwtPrincipalConverter = JwtAuthenticatedPrincipal::new;
+
+	private Converter<Jwt, Collection<GrantedAuthority>> jwtGrantedAuthoritiesConverter = new JwtGrantedAuthoritiesConverter();
+
+	@Override
+	public final AbstractAuthenticationToken convert(Jwt jwt) {
+		Collection<GrantedAuthority> authorities = new HashSet<>(this.jwtGrantedAuthoritiesConverter.convert(jwt));
+		authorities.add(FactorGrantedAuthority.fromAuthority(AUTHORITY));
+		OAuth2AuthenticatedPrincipal principal = this.jwtPrincipalConverter.convert(jwt);
+		authorities.addAll(principal.getAuthorities());
+		return new JwtAuthenticationToken(jwt, principal, authorities);
+	}
+
+	/**
+	 * Sets the {@link Converter Converter&lt;Jwt, OAuth2AuthenticatedPrincipal&gt;} to
+	 * use.
+	 * @param jwtPrincipalConverter The converter
+	 * @since 7.1
+	 */
+	public void setJwtPrincipalConverter(Converter<Jwt, OAuth2AuthenticatedPrincipal> jwtPrincipalConverter) {
+		Assert.notNull(jwtPrincipalConverter, "jwtPrincipalConverter cannot be null");
+		this.jwtPrincipalConverter = jwtPrincipalConverter;
+	}
+
+	/**
+	 * Sets the {@link Converter Converter&lt;Jwt, Collection&lt;GrantedAuthority&gt;&gt;}
+	 * to use. Defaults to {@link JwtGrantedAuthoritiesConverter}.
+	 * @param jwtGrantedAuthoritiesConverter The converter
+	 * @since 5.2
+	 * @see JwtGrantedAuthoritiesConverter
+	 */
+	public void setJwtGrantedAuthoritiesConverter(
+			Converter<Jwt, Collection<GrantedAuthority>> jwtGrantedAuthoritiesConverter) {
+		Assert.notNull(jwtGrantedAuthoritiesConverter, "jwtGrantedAuthoritiesConverter cannot be null");
+		this.jwtGrantedAuthoritiesConverter = jwtGrantedAuthoritiesConverter;
+	}
+
+	/**
+	 * Sets the principal claim name. Defaults to {@link JwtClaimNames#SUB}.
+	 * @param principalClaimName The principal claim name
+	 * @since 5.4
+	 */
+	public void setPrincipalClaimName(String principalClaimName) {
+		Assert.hasText(principalClaimName, "principalClaimName cannot be empty");
+		this.jwtPrincipalConverter = (jwt) -> new JwtAuthenticatedPrincipal(jwt, principalClaimName);
+	}
+
+	@SuppressWarnings("serial") // suppress warnings in serialization tests
+	private static final class JwtAuthenticatedPrincipal extends Jwt implements OAuth2AuthenticatedPrincipal {
+
+		@Serial
+		private static final long serialVersionUID = 2236855178032591277L;
+
+		private final String principalClaimName;
+
+		JwtAuthenticatedPrincipal(Jwt jwt) {
+			this(jwt, JwtClaimNames.SUB);
+		}
+
+		JwtAuthenticatedPrincipal(Jwt jwt, String principalClaimName) {
+			super(jwt.getTokenValue(), jwt.getIssuedAt(), jwt.getExpiresAt(), jwt.getHeaders(), jwt.getClaims());
+			this.principalClaimName = principalClaimName;
+		}
+
+		@Override
+		public Map<String, Object> getAttributes() {
+			return getClaims();
+		}
+
+		@Override
+		public Collection<? extends GrantedAuthority> getAuthorities() {
+			return List.of();
+		}
+
+		@Override
+		public String getName() {
+			String name = this.getClaimAsString(this.principalClaimName);
+			return (name != null) ? name : "";
+		}
+
+	}
+
+}

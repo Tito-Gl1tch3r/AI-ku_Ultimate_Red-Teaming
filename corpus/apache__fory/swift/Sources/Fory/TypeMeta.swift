@@ -1,0 +1,1175 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+import Foundation
+
+private let smallNumFieldsThreshold = 0b1_1111
+private let registerByNameFlag: UInt8 = 0b10_0000
+private let compatibleTypeMetaFlag: UInt8 = 0b0100_0000
+private let structTypeMetaFlag: UInt8 = 0b1000_0000
+private let fieldNameSizeThreshold = 0b1111
+private let bigNameThreshold = 0b11_1111
+
+private let typeMetaCompressedFlag: UInt64 = 1 << 8
+private let typeMetaReservedFlags: UInt64 = 0b111 << 9
+private let typeMetaSizeMask: UInt64 = 0xFF
+private let typeMetaNumHashBits: UInt64 = 52
+private let typeMetaHashSeed: UInt64 = 47
+private let noUserTypeID: UInt32 = UInt32.max
+private let typeMetaMaxDepth = 20
+private let maxTaggedFieldID: Int32 = (1 << 29) - 1
+
+@inline(__always)
+internal func typeMetaHashFromHeader(_ header: UInt64) -> UInt64 {
+    // The top 52 bits are the schema identity; the low 12 bits belong to current-frame framing.
+    header >> (64 - typeMetaNumHashBits)
+}
+
+public let namespaceMetaStringEncodings: [MetaStringEncoding] = [
+    .utf8,
+    .allToLowerSpecial,
+    .lowerUpperDigitSpecial
+]
+
+public let typeNameMetaStringEncodings: [MetaStringEncoding] = [
+    .utf8,
+    .allToLowerSpecial,
+    .lowerUpperDigitSpecial,
+    .firstToLowerSpecial
+]
+
+public let fieldNameMetaStringEncodings: [MetaStringEncoding] = [
+    .utf8,
+    .allToLowerSpecial,
+    .lowerUpperDigitSpecial
+]
+
+public final class TypeMeta: Equatable, @unchecked Sendable {
+
+    public struct FieldType: Equatable, Sendable {
+        public var typeID: UInt32
+        public var nullable: Bool
+        public var trackRef: Bool
+        public var generics: [FieldType]
+
+        public init(
+            typeID: UInt32,
+            nullable: Bool,
+            trackRef: Bool = false,
+            generics: [FieldType] = []
+        ) {
+            self.typeID = typeID
+            self.nullable = nullable
+            self.trackRef = trackRef
+            self.generics = generics
+        }
+
+        internal var readDataAlwaysAdvances: Bool {
+            nullable || trackRef
+                || TypeId(rawValue: typeID)?.readDataAlwaysAdvances == true
+        }
+
+        fileprivate func write(
+            _ buffer: ByteBuffer,
+            writeFlags: Bool,
+            nullableOverride: Bool? = nil
+        ) {
+            if writeFlags {
+                var header = typeID << 2
+                if nullableOverride ?? nullable {
+                    header |= 0b10
+                }
+                if trackRef {
+                    header |= 0b1
+                }
+                buffer.writeVarUInt32(header)
+            } else {
+                buffer.writeUInt8(UInt8(truncatingIfNeeded: typeID))
+            }
+
+            if typeID == TypeId.list.rawValue || typeID == TypeId.set.rawValue {
+                let element = generics.first ?? FieldType(typeID: TypeId.unknown.rawValue, nullable: true)
+                element.write(buffer, writeFlags: true, nullableOverride: element.nullable)
+            } else if typeID == TypeId.map.rawValue {
+                let key = generics.first ?? FieldType(typeID: TypeId.unknown.rawValue, nullable: true)
+                let value =
+                    generics.dropFirst().first ?? FieldType(typeID: TypeId.unknown.rawValue, nullable: true)
+                key.write(buffer, writeFlags: true, nullableOverride: key.nullable)
+                value.write(buffer, writeFlags: true, nullableOverride: value.nullable)
+            }
+        }
+
+        @inline(never)
+        fileprivate static func read(
+            _ buffer: ByteBuffer,
+            readFlags: Bool,
+            nullable: Bool? = nil,
+            trackRef: Bool? = nil
+        ) throws -> FieldType {
+            let root = try readHeader(
+                buffer,
+                readFlags: readFlags,
+                nullable: nullable,
+                trackRef: trackRef
+            )
+            let rootChildren = genericCount(root.typeID)
+            if rootChildren == 0 {
+                return root
+            }
+            // Keep parsing iterative so the fixed TypeMeta metadata limit, rather
+            // than the native call stack, bounds recursive FieldType consumers.
+            var pending = [root]
+            var remainingChildren = [rootChildren]
+            while true {
+                let parentIndex = pending.count - 1
+                if remainingChildren[parentIndex] != 0 {
+                    remainingChildren[parentIndex] -= 1
+                    let child = try readHeader(buffer, readFlags: true)
+                    let childCount = genericCount(child.typeID)
+                    if childCount == 0 {
+                        pending[parentIndex].generics.append(child)
+                    } else {
+                        let childDepth = pending.count + 1
+                        if childDepth > typeMetaMaxDepth {
+                            try decodingNestingDepthExceeded(childDepth)
+                        }
+                        pending.append(child)
+                        remainingChildren.append(childCount)
+                    }
+                    continue
+                }
+
+                let completed = pending.removeLast()
+                remainingChildren.removeLast()
+                if pending.isEmpty {
+                    return completed
+                }
+                pending[pending.count - 1].generics.append(completed)
+            }
+        }
+
+        @inline(never)
+        private static func decodingNestingDepthExceeded(_ depth: Int) throws -> Never {
+            throw ForyError.invalidData(
+                "TypeMeta generic nesting depth \(depth) exceeds limit \(typeMetaMaxDepth)")
+        }
+
+        @inline(never)
+        private static func encodingNestingDepthExceeded(_ depth: Int) throws -> Never {
+            throw ForyError.encodingError(
+                "TypeMeta generic nesting depth \(depth) exceeds limit \(typeMetaMaxDepth)")
+        }
+
+        private static func readHeader(
+            _ buffer: ByteBuffer,
+            readFlags: Bool,
+            nullable: Bool? = nil,
+            trackRef: Bool? = nil
+        ) throws -> FieldType {
+            let header =
+                readFlags
+                ? try buffer.readVarUInt32()
+                : UInt32(try buffer.readUInt8())
+            if readFlags {
+                return FieldType(
+                    typeID: header >> 2,
+                    nullable: (header & 0b10) != 0,
+                    trackRef: (header & 0b1) != 0
+                )
+            }
+            return FieldType(
+                typeID: header,
+                nullable: nullable ?? false,
+                trackRef: trackRef ?? false
+            )
+        }
+
+        private static func genericCount(_ typeID: UInt32) -> Int {
+            if typeID == TypeId.list.rawValue || typeID == TypeId.set.rawValue {
+                return 1
+            }
+            return typeID == TypeId.map.rawValue ? 2 : 0
+        }
+    }
+
+    public struct FieldInfo: Equatable, Sendable {
+        /// The protocol tag ID, or `-1` when the field is identified by name.
+        public var fieldID: Int32
+        public var fieldName: String
+        public var fieldType: FieldType
+        /// Local compatible-reader dispatch ordinal. This is not part of wire field identity.
+        public internal(set) var matchedFieldID: Int16
+
+        public init(fieldID: Int32, fieldName: String, fieldType: FieldType) {
+            self.fieldID = fieldID
+            self.fieldName = fieldName
+            self.fieldType = fieldType
+            self.matchedFieldID = -1
+        }
+
+        private init(fieldName: String, fieldType: FieldType) {
+            self.fieldID = -1
+            self.fieldName = fieldName
+            self.fieldType = fieldType
+            self.matchedFieldID = -1
+        }
+
+        @inline(never)
+        private static func invalidTaggedFieldID(_ fieldID: Int32) -> ForyError {
+            ForyError.encodingError(
+                "tagged field id \(fieldID) exceeds protocol maximum \(maxTaggedFieldID)"
+            )
+        }
+
+        fileprivate func write(_ buffer: ByteBuffer) throws {
+            var header: UInt8 = 0
+            if fieldType.trackRef {
+                header |= 0b1
+            }
+            if fieldType.nullable {
+                header |= 0b10
+            }
+
+            guard fieldID >= -1 else {
+                throw ForyError.encodingError("field id must be -1 or non-negative")
+            }
+            if fieldID >= 0 {
+                guard fieldID <= maxTaggedFieldID else {
+                    throw Self.invalidTaggedFieldID(fieldID)
+                }
+                header |= UInt8(0b11 << 6)
+                if fieldID >= Int32(fieldNameSizeThreshold) {
+                    header |= 0b0011_1100
+                    buffer.writeUInt8(header)
+                    buffer.writeVarUInt32(UInt32(fieldID - Int32(fieldNameSizeThreshold)))
+                } else {
+                    header |= UInt8(fieldID << 2)
+                    buffer.writeUInt8(header)
+                }
+                fieldType.write(buffer, writeFlags: false)
+                return
+            }
+
+            let snakeName = lowerCamelToLowerUnderscore(fieldName)
+            let encoded = try MetaStringEncoder.fieldName.encode(
+                snakeName, allowedEncodings: fieldNameMetaStringEncodings)
+            guard let encodingIndex = fieldNameMetaStringEncodings.firstIndex(of: encoded.encoding) else {
+                throw ForyError.encodingError("unsupported field name encoding")
+            }
+
+            let size = encoded.bytes.count - 1
+            header |= UInt8(encodingIndex << 6)
+            if size >= fieldNameSizeThreshold {
+                header |= 0b0011_1100
+                buffer.writeUInt8(header)
+                buffer.writeVarUInt32(UInt32(size - fieldNameSizeThreshold))
+            } else {
+                header |= UInt8(size << 2)
+                buffer.writeUInt8(header)
+            }
+
+            fieldType.write(buffer, writeFlags: false)
+            buffer.writeBytes(encoded.bytes)
+        }
+
+        fileprivate static func read(_ buffer: ByteBuffer) throws -> FieldInfo {
+            let header = try buffer.readUInt8()
+            let encodingFlags = Int((header >> 6) & 0b11)
+            let inlineSize = Int32((header >> 2) & 0b1111)
+            var nameSize = Int(inlineSize)
+            var fieldID: Int32 = encodingFlags == 3 ? inlineSize : -1
+            if inlineSize == Int32(fieldNameSizeThreshold) {
+                let extensionSize = try buffer.readVarUInt32()
+                if encodingFlags == 3 {
+                    guard extensionSize <= UInt32(maxTaggedFieldID - inlineSize) else {
+                        throw ForyError.invalidData("tagged field id exceeds protocol maximum")
+                    }
+                    fieldID += Int32(extensionSize)
+                } else {
+                    nameSize += Int(extensionSize)
+                }
+            }
+
+            let nullable = (header & 0b10) != 0
+            let trackRef = (header & 0b1) != 0
+            let fieldType = try FieldType.read(
+                buffer,
+                readFlags: false,
+                nullable: nullable,
+                trackRef: trackRef
+            )
+
+            if encodingFlags == 3 {
+                return FieldInfo(
+                    fieldID: fieldID,
+                    fieldName: "$tag\(fieldID)",
+                    fieldType: fieldType
+                )
+            }
+
+            guard encodingFlags < fieldNameMetaStringEncodings.count else {
+                throw ForyError.invalidData("invalid field name encoding id")
+            }
+            let nameBytes = try buffer.readBytes(count: nameSize + 1)
+            let name = try MetaStringDecoder.fieldName
+                .decode(bytes: nameBytes, encoding: fieldNameMetaStringEncodings[encodingFlags])
+                .value
+
+            return FieldInfo(fieldName: name, fieldType: fieldType)
+        }
+
+        public static func == (lhs: FieldInfo, rhs: FieldInfo) -> Bool {
+            lhs.fieldID == rhs.fieldID
+                && lhs.fieldName == rhs.fieldName
+                && lhs.fieldType == rhs.fieldType
+        }
+    }
+
+    public let typeID: UInt32?
+    public let userTypeID: UInt32?
+    public let namespace: MetaString
+    public let typeName: MetaString
+    public let registerByName: Bool
+    public let fields: [FieldInfo]
+    public let compressed: Bool
+    /// The protocol-defined 52-bit schema identity. Equal values identify the same schema,
+    /// so readers do not need to compare the field array again.
+    public let headerHash: UInt64
+
+    internal var readDataAlwaysAdvances: Bool {
+        for field in fields where field.fieldType.readDataAlwaysAdvances {
+            return true
+        }
+        return false
+    }
+
+    public init(
+        typeID: UInt32?,
+        userTypeID: UInt32?,
+        namespace: MetaString,
+        typeName: MetaString,
+        registerByName: Bool,
+        fields: [FieldInfo],
+        compressed: Bool = false,
+        headerHash: UInt64 = 0
+    ) throws {
+        guard typeID != nil else {
+            throw ForyError.encodingError("type id is required in type metadata")
+        }
+        if registerByName {
+            if typeName.value.isEmpty {
+                throw ForyError.encodingError("type name is required in register-by-name mode")
+            }
+        } else {
+            guard let userTypeID, userTypeID != noUserTypeID else {
+                throw ForyError.encodingError("user type id is required in register-by-id mode")
+            }
+        }
+        try Self.validateFieldTags(fields)
+
+        self.typeID = typeID
+        self.userTypeID = userTypeID
+        self.namespace = namespace
+        self.typeName = typeName
+        self.registerByName = registerByName
+        self.fields = fields
+        self.compressed = compressed
+        self.headerHash = headerHash
+    }
+
+    public static func == (lhs: TypeMeta, rhs: TypeMeta) -> Bool {
+        lhs.typeID == rhs.typeID && lhs.userTypeID == rhs.userTypeID && lhs.namespace == rhs.namespace
+            && lhs.typeName == rhs.typeName && lhs.registerByName == rhs.registerByName
+            && lhs.fields == rhs.fields && lhs.compressed == rhs.compressed
+            && lhs.headerHash == rhs.headerHash
+    }
+
+    public func encode() throws -> [UInt8] {
+        if compressed {
+            throw ForyError.encodingError("compressed TypeMeta is not supported yet")
+        }
+
+        // TypeMeta decoding uses the same fixed limit. Validate iteratively before
+        // the recursive encoder writes any bytes so public and registered metadata
+        // cannot produce a value that the cache-miss reader rejects.
+        for field in fields {
+            try field.fieldType.validateDepth()
+        }
+
+        let body = try encodeBody()
+        var headerLowBits = UInt64(min(body.count, Int(typeMetaSizeMask)))
+        if compressed {
+            headerLowBits |= typeMetaCompressedFlag
+        }
+        let header = Self.typeMetaHeaderHash(body, headerLowBits: headerLowBits) | headerLowBits
+
+        let buffer = ByteBuffer(capacity: body.count + 16)
+        buffer.writeUInt64(header)
+        if body.count >= Int(typeMetaSizeMask) {
+            buffer.writeVarUInt32(UInt32(body.count - Int(typeMetaSizeMask)))
+        }
+        buffer.writeBytes(body)
+        return Array(buffer.storage.prefix(buffer.count))
+    }
+
+    public static func decode(
+        _ bytes: [UInt8],
+        maxTypeFields: Int = 512,
+        maxTypeMetaBytes: Int = 4096
+    ) throws -> TypeMeta {
+        try decode(
+            ByteBuffer(bytes: bytes),
+            maxTypeFields: maxTypeFields,
+            maxTypeMetaBytes: maxTypeMetaBytes)
+    }
+
+    public static func decode(
+        _ buffer: ByteBuffer,
+        maxTypeFields: Int = 512,
+        maxTypeMetaBytes: Int = 4096
+    ) throws -> TypeMeta {
+        let header = try buffer.readUInt64()
+        if (header & typeMetaReservedFlags) != 0 {
+            throw ForyError.invalidData("invalid TypeMeta global header")
+        }
+        let compressed = (header & typeMetaCompressedFlag) != 0
+        if compressed {
+            throw ForyError.encodingError("compressed TypeMeta is not supported yet")
+        }
+
+        var metaSize = Int(header & typeMetaSizeMask)
+        if metaSize == Int(typeMetaSizeMask) {
+            metaSize += Int(try buffer.readVarUInt32())
+        }
+        if metaSize > maxTypeMetaBytes {
+            throw ForyError.invalidData(
+                "Type metadata body size \(metaSize) exceeds maxTypeMetaBytes \(maxTypeMetaBytes). "
+                    + "The data may be malicious. If the data is not malicious, please increase maxTypeMetaBytes."
+            )
+        }
+
+        // maxTypeMetaBytes is only a size cap. readBytes performs the buffer
+        // bound check before allocating/copying the declared body bytes.
+        let encodedBody = try buffer.readBytes(count: metaSize)
+        let bodyReader = ByteBuffer(bytes: encodedBody)
+        let metaHeader = try bodyReader.readUInt8()
+
+        let isStruct = (metaHeader & structTypeMetaFlag) != 0
+        var numFields = 0
+        let registerByName: Bool
+        let typeID: UInt32
+        let userTypeID: UInt32?
+        let namespace: MetaString
+        let typeName: MetaString
+
+        if isStruct {
+            registerByName = (metaHeader & registerByNameFlag) != 0
+            let compatible = (metaHeader & compatibleTypeMetaFlag) != 0
+            numFields = Int(metaHeader & UInt8(smallNumFieldsThreshold))
+            if numFields == smallNumFieldsThreshold {
+                numFields += Int(try bodyReader.readVarUInt32())
+            }
+            if numFields > maxTypeFields {
+                throw ForyError.invalidData(
+                    "Type metadata field count \(numFields) exceeds maxTypeFields \(maxTypeFields). "
+                        + "The data may be malicious. If the data is not malicious, please increase maxTypeFields."
+                )
+            }
+            if registerByName {
+                typeID = compatible ? TypeId.namedCompatibleStruct.rawValue : TypeId.namedStruct.rawValue
+            } else {
+                typeID = compatible ? TypeId.compatibleStruct.rawValue : TypeId.structType.rawValue
+            }
+        } else {
+            if (metaHeader & 0b0111_0000) != 0 {
+                throw ForyError.invalidData("invalid non-struct TypeMeta kind header")
+            }
+            let kind = try Self.typeID(forNonStructKindCode: metaHeader & 0b1111)
+            registerByName = Self.isNamedTypeMetaKind(kind)
+            typeID = kind.rawValue
+        }
+
+        if registerByName {
+            namespace = try readName(
+                bodyReader, decoder: .namespace, encodings: namespaceMetaStringEncodings)
+            typeName = try readName(
+                bodyReader, decoder: .typeName, encodings: typeNameMetaStringEncodings)
+            userTypeID = nil
+        } else {
+            userTypeID = try bodyReader.readVarUInt32()
+            namespace = MetaString.empty(specialChar1: ".", specialChar2: "_")
+            typeName = MetaString.empty(specialChar1: "$", specialChar2: "_")
+        }
+
+        var fieldInfos: [FieldInfo] = []
+        if numFields > bodyReader.remaining {
+            throw ForyError.invalidData(
+                "type meta field count \(numFields) exceeds remaining bytes \(bodyReader.remaining)"
+            )
+        }
+        fieldInfos.reserveCapacity(numFields)
+        for _ in 0..<numFields {
+            fieldInfos.append(try FieldInfo.read(bodyReader))
+        }
+
+        if !isStruct && !fieldInfos.isEmpty {
+            throw ForyError.invalidData("non-struct TypeMeta cannot carry field metadata")
+        }
+        if bodyReader.remaining != 0 {
+            throw ForyError.invalidData("unexpected trailing bytes in TypeMeta body")
+        }
+        if (header & Self.hashMask())
+            != Self.typeMetaHeaderHash(encodedBody, headerLowBits: header & ~Self.hashMask())
+        {
+            throw ForyError.invalidData("invalid TypeMeta metadata hash")
+        }
+
+        return try TypeMeta(
+            typeID: typeID,
+            userTypeID: userTypeID,
+            namespace: namespace,
+            typeName: typeName,
+            registerByName: registerByName,
+            fields: fieldInfos,
+            compressed: compressed,
+            headerHash: typeMetaHashFromHeader(header)
+        )
+    }
+
+    private func encodeBody() throws -> [UInt8] {
+        let buffer = ByteBuffer(capacity: 128)
+        guard let rawTypeID = typeID, let resolvedTypeID = TypeId(rawValue: rawTypeID) else {
+            throw ForyError.encodingError("unsupported TypeMeta kind \(String(describing: typeID))")
+        }
+
+        if Self.isStructTypeMetaKind(resolvedTypeID) {
+            var metaHeader = structTypeMetaFlag | UInt8(min(fields.count, smallNumFieldsThreshold))
+            if resolvedTypeID == .compatibleStruct || resolvedTypeID == .namedCompatibleStruct {
+                metaHeader |= compatibleTypeMetaFlag
+            }
+            if registerByName {
+                metaHeader |= registerByNameFlag
+            }
+            buffer.writeUInt8(metaHeader)
+
+            if fields.count >= smallNumFieldsThreshold {
+                buffer.writeVarUInt32(UInt32(fields.count - smallNumFieldsThreshold))
+            }
+        } else {
+            if !fields.isEmpty {
+                throw ForyError.encodingError("non-struct TypeMeta cannot carry field metadata")
+            }
+            buffer.writeUInt8(try Self.nonStructKindCode(resolvedTypeID))
+        }
+
+        if registerByName {
+            try Self.writeName(buffer, name: namespace, encodings: namespaceMetaStringEncodings)
+            try Self.writeName(buffer, name: typeName, encodings: typeNameMetaStringEncodings)
+        } else {
+            guard let userTypeID, userTypeID != noUserTypeID else {
+                throw ForyError.encodingError("user type id is required in register-by-id mode")
+            }
+            buffer.writeVarUInt32(userTypeID)
+        }
+
+        for field in fields {
+            try field.write(buffer)
+        }
+
+        return Array(buffer.storage.prefix(buffer.count))
+    }
+
+    private static func hashMask() -> UInt64 {
+        UInt64.max << (64 - typeMetaNumHashBits)
+    }
+
+    private static func typeMetaHeaderHash(_ body: [UInt8], headerLowBits: UInt64) -> UInt64 {
+        var hashInput = body
+        hashInput.append(UInt8(truncatingIfNeeded: headerLowBits))
+        hashInput.append(UInt8(truncatingIfNeeded: headerLowBits >> 8))
+        let bodyHash = MurmurHash3.x64_128(hashInput, seed: typeMetaHashSeed).0
+        let shifted = bodyHash << (64 - typeMetaNumHashBits)
+        let signed = Int64(bitPattern: shifted)
+        let absSigned = signed == Int64.min ? signed : Swift.abs(signed)
+        return UInt64(bitPattern: absSigned) & hashMask()
+    }
+
+    private static func isStructTypeMetaKind(_ typeID: TypeId) -> Bool {
+        switch typeID {
+        case .structType, .compatibleStruct, .namedStruct, .namedCompatibleStruct:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func isNamedTypeMetaKind(_ typeID: TypeId) -> Bool {
+        switch typeID {
+        case .namedStruct, .namedCompatibleStruct, .namedEnum, .namedExt, .namedUnion:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func nonStructKindCode(_ typeID: TypeId) throws -> UInt8 {
+        switch typeID {
+        case .enumType:
+            return 0
+        case .namedEnum:
+            return 1
+        case .ext:
+            return 2
+        case .namedExt:
+            return 3
+        case .typedUnion:
+            return 4
+        case .namedUnion:
+            return 5
+        default:
+            throw ForyError.encodingError("unsupported TypeMeta kind \(typeID)")
+        }
+    }
+
+    private static func typeID(forNonStructKindCode code: UInt8) throws -> TypeId {
+        switch code {
+        case 0:
+            return .enumType
+        case 1:
+            return .namedEnum
+        case 2:
+            return .ext
+        case 3:
+            return .namedExt
+        case 4:
+            return .typedUnion
+        case 5:
+            return .namedUnion
+        default:
+            throw ForyError.invalidData("unsupported TypeMeta kind code \(code)")
+        }
+    }
+
+    private static func writeName(
+        _ buffer: ByteBuffer,
+        name: MetaString,
+        encodings: [MetaStringEncoding]
+    ) throws {
+        let normalizedName: MetaString
+        if encodings.contains(name.encoding) {
+            normalizedName = name
+        } else {
+            let encoder: MetaStringEncoder
+            if encodings == namespaceMetaStringEncodings {
+                encoder = .namespace
+            } else if encodings == typeNameMetaStringEncodings {
+                encoder = .typeName
+            } else {
+                encoder = .fieldName
+            }
+            normalizedName = try encoder.encode(name.value, allowedEncodings: encodings)
+        }
+
+        guard let encodingIndex = encodings.firstIndex(of: normalizedName.encoding) else {
+            throw ForyError.encodingError("failed to normalize meta string encoding")
+        }
+
+        let bytes = normalizedName.bytes
+        if bytes.count >= bigNameThreshold {
+            buffer.writeUInt8(UInt8((bigNameThreshold << 2) | encodingIndex))
+            buffer.writeVarUInt32(UInt32(bytes.count - bigNameThreshold))
+        } else {
+            buffer.writeUInt8(UInt8((bytes.count << 2) | encodingIndex))
+        }
+        buffer.writeBytes(bytes)
+    }
+
+    private static func readName(
+        _ buffer: ByteBuffer,
+        decoder: MetaStringDecoder,
+        encodings: [MetaStringEncoding]
+    ) throws -> MetaString {
+        let header = try buffer.readUInt8()
+        let encodingIndex = Int(header & 0b11)
+        guard encodingIndex < encodings.count else {
+            throw ForyError.invalidData("invalid meta string encoding index")
+        }
+
+        var length = Int(header >> 2)
+        if length >= bigNameThreshold {
+            length = bigNameThreshold + Int(try buffer.readVarUInt32())
+        }
+        let bytes = try buffer.readBytes(count: length)
+        return try decoder.decode(bytes: bytes, encoding: encodings[encodingIndex])
+    }
+
+    func assigningFieldIDs(from localTypeMeta: TypeMeta) throws -> TypeMeta {
+        guard !fields.isEmpty else {
+            return self
+        }
+
+        let localFields = localTypeMeta.fields
+        guard !localFields.isEmpty else {
+            var resolvedFields = fields
+            var changed = false
+            for index in resolvedFields.indices where resolvedFields[index].matchedFieldID != -1 {
+                resolvedFields[index].matchedFieldID = -1
+                changed = true
+            }
+            guard changed else {
+                return self
+            }
+            return try TypeMeta(
+                typeID: typeID,
+                userTypeID: userTypeID,
+                namespace: namespace,
+                typeName: typeName,
+                registerByName: registerByName,
+                fields: resolvedFields,
+                compressed: compressed,
+                headerHash: headerHash
+            )
+        }
+
+        var fieldIndexByName: [String: (Int, FieldInfo)] = [:]
+        var fieldIndexByID: [Int32: (Int, FieldInfo)] = [:]
+        fieldIndexByName.reserveCapacity(localFields.count)
+        fieldIndexByID.reserveCapacity(localFields.count)
+
+        for (index, localField) in localFields.enumerated() {
+            if localField.fieldID >= 0 {
+                fieldIndexByID[localField.fieldID] = (index, localField)
+            } else {
+                fieldIndexByName[toSnakeCase(localField.fieldName)] = (index, localField)
+            }
+        }
+
+        var resolvedFields = fields
+        var changed = false
+        var usedLocalFields = Array(repeating: false, count: localFields.count)
+
+        for index in resolvedFields.indices {
+            let field = resolvedFields[index]
+
+            var localMatch: (Int, FieldInfo)?
+            if field.fieldID >= 0 {
+                if let candidate = fieldIndexByID[field.fieldID] {
+                    guard Self.isCompatibleFieldType(field.fieldType, candidate.1.fieldType) else {
+                        throw ForyError.invalidData(
+                            "compatible field \(field.fieldName) cannot be read as local field \(candidate.1.fieldName)"
+                        )
+                    }
+                    localMatch = candidate
+                }
+            }
+
+            if localMatch == nil && field.fieldID == -1 {
+                if let candidate = fieldIndexByName[toSnakeCase(field.fieldName)] {
+                    guard Self.isCompatibleFieldType(field.fieldType, candidate.1.fieldType) else {
+                        throw ForyError.invalidData(
+                            "compatible field \(field.fieldName) cannot be read as local field \(candidate.1.fieldName)"
+                        )
+                    }
+                    localMatch = candidate
+                }
+            }
+
+            // Only anonymous legacy fields may fall back by exact type. Named or
+            // tagged remote-only fields must stay unmatched so the reader skips them.
+            if localMatch == nil && field.fieldID == -1 && field.fieldName.isEmpty {
+                for localIndex in localFields.indices where !usedLocalFields[localIndex] {
+                    if Self.isCompatibleFieldType(
+                        field.fieldType,
+                        localFields[localIndex].fieldType,
+                        topLevel: false,
+                        allowScalarConversion: false
+                    ) {
+                        localMatch = (localIndex, localFields[localIndex])
+                        break
+                    }
+                }
+            }
+
+            guard let (sortedIndex, _) = localMatch else {
+                if field.matchedFieldID != -1 {
+                    resolvedFields[index].matchedFieldID = -1
+                    changed = true
+                }
+                continue
+            }
+            guard sortedIndex <= Int(Int16.max) / 2 else {
+                throw ForyError.invalidData(
+                    "compatible field \(field.fieldName) matched local field index \(sortedIndex) beyond Int16 dispatch range"
+                )
+            }
+            if usedLocalFields[sortedIndex] {
+                throw ForyError.invalidData(
+                    "compatible field \(field.fieldName) duplicates local field \(localFields[sortedIndex].fieldName)"
+                )
+            }
+
+            let localField = localFields[sortedIndex]
+            let exactField = field.fieldType == localField.fieldType
+            let resolvedFieldID = Int16(sortedIndex * 2 + (exactField ? 0 : 1))
+            if field.matchedFieldID != resolvedFieldID {
+                resolvedFields[index].matchedFieldID = resolvedFieldID
+                changed = true
+            }
+            usedLocalFields[sortedIndex] = true
+        }
+
+        guard changed else {
+            return self
+        }
+
+        return try TypeMeta(
+            typeID: typeID,
+            userTypeID: userTypeID,
+            namespace: namespace,
+            typeName: typeName,
+            registerByName: registerByName,
+            fields: resolvedFields,
+            compressed: compressed,
+            headerHash: headerHash
+        )
+    }
+
+    private static func isCompatibleFieldType(
+        _ remoteType: FieldType,
+        _ localType: FieldType,
+        topLevel: Bool = true,
+        allowScalarConversion: Bool = true
+    ) -> Bool {
+        if topLevel, isCompatibleTopLevelListArrayFieldType(remoteType, localType) {
+            return true
+        }
+        if topLevel, isCompatibleByteSequenceFieldType(remoteType, localType) {
+            return true
+        }
+        if topLevel,
+            remoteType.trackRef != localType.trackRef,
+            compatibleScalarKind(remoteType.typeID) != nil,
+            compatibleScalarKind(localType.typeID) != nil
+        {
+            return false
+        }
+        if topLevel,
+            remoteType.trackRef || localType.trackRef,
+            compatibleScalarKind(remoteType.typeID) != nil,
+            compatibleScalarKind(localType.typeID) != nil,
+            remoteType.typeID != localType.typeID || remoteType.nullable != localType.nullable
+        {
+            return false
+        }
+        if topLevel, allowScalarConversion, isCompatibleScalarFieldType(remoteType, localType) {
+            return true
+        }
+        if normalizeUserTypeIDForComparison(remoteType.typeID)
+            != normalizeUserTypeIDForComparison(localType.typeID)
+        {
+            return false
+        }
+        if !topLevel,
+            compatibleScalarKind(remoteType.typeID) != nil
+                || compatibleScalarKind(localType.typeID) != nil
+        {
+            // Untracked nested scalar payloads carry null markers at read time. A nullable schema can
+            // match a non-null local container element; the container reader owns actual-null semantics.
+            return remoteType.typeID == localType.typeID
+                && remoteType.trackRef == localType.trackRef
+                && (!remoteType.trackRef || remoteType.nullable == localType.nullable)
+                && remoteType.generics.isEmpty
+                && localType.generics.isEmpty
+        }
+        if remoteType.generics.count != localType.generics.count {
+            return false
+        }
+        for (remoteGeneric, localGeneric) in zip(remoteType.generics, localType.generics)
+        where !isCompatibleFieldType(
+            remoteGeneric,
+            localGeneric,
+            topLevel: false,
+            allowScalarConversion: false
+        ) {
+            return false
+        }
+        return true
+    }
+
+    private static func isCompatibleTopLevelListArrayFieldType(
+        _ remoteType: FieldType,
+        _ localType: FieldType
+    ) -> Bool {
+        guard !remoteType.nullable, !localType.nullable, !remoteType.trackRef, !localType.trackRef
+        else {
+            return false
+        }
+        if remoteType.typeID == TypeId.list.rawValue {
+            return listElementMatchesDenseArrayTypeID(
+                remoteType,
+                arrayTypeID: localType.typeID,
+                requireUnframedElement: true
+            )
+        }
+        if localType.typeID == TypeId.list.rawValue {
+            return listElementMatchesDenseArrayTypeID(
+                localType,
+                arrayTypeID: remoteType.typeID,
+                requireUnframedElement: false
+            )
+        }
+        return false
+    }
+
+    private static func listElementMatchesDenseArrayTypeID(
+        _ listType: FieldType,
+        arrayTypeID: UInt32,
+        requireUnframedElement: Bool
+    ) -> Bool {
+        guard listType.typeID == TypeId.list.rawValue,
+            let elementType = listType.generics.first
+        else {
+            return false
+        }
+        // Nullable element schema is allowed for list<T?> -> array<T>; actual
+        // null payload elements fail in the dense-array reader. Ref-tracked
+        // element framing is rejected here because this path stays primitive-only.
+        if requireUnframedElement, elementType.trackRef {
+            return false
+        }
+        return TypeId.listElementTypeID(elementType.typeID, matchesDenseArrayTypeID: arrayTypeID)
+    }
+
+    private static func isCompatibleByteSequenceFieldType(
+        _ remoteType: FieldType,
+        _ localType: FieldType
+    ) -> Bool {
+        guard !remoteType.trackRef,
+            !localType.trackRef,
+            remoteType.nullable == localType.nullable
+        else {
+            return false
+        }
+        return
+            (remoteType.typeID == TypeId.binary.rawValue
+            && localType.typeID == TypeId.uint8Array.rawValue)
+            || (remoteType.typeID == TypeId.uint8Array.rawValue
+                && localType.typeID == TypeId.binary.rawValue)
+    }
+
+    private static func isCompatibleScalarFieldType(
+        _ remoteType: FieldType,
+        _ localType: FieldType
+    ) -> Bool {
+        guard remoteType.generics.isEmpty,
+            localType.generics.isEmpty,
+            !remoteType.trackRef,
+            !localType.trackRef,
+            remoteType.typeID != localType.typeID,
+            let remoteKind = compatibleScalarKind(remoteType.typeID),
+            let localKind = compatibleScalarKind(localType.typeID)
+        else {
+            return false
+        }
+        if remoteKind == .bool {
+            return localKind == .string || localKind.isNumeric
+        }
+        if localKind == .bool {
+            return remoteKind == .string || remoteKind.isNumeric
+        }
+        if remoteKind == .string {
+            return localKind.isNumeric
+        }
+        if localKind == .string {
+            return remoteKind.isNumeric
+        }
+        return remoteKind.isNumeric && localKind.isNumeric
+    }
+
+    private enum CompatibleScalarKind {
+        case bool
+        case string
+        case signedInteger
+        case unsignedInteger
+        case floatingPoint
+        case decimal
+
+        var isNumeric: Bool {
+            switch self {
+            case .signedInteger, .unsignedInteger, .floatingPoint, .decimal:
+                return true
+            case .bool, .string:
+                return false
+            }
+        }
+    }
+
+    private static func compatibleScalarKind(_ typeID: UInt32) -> CompatibleScalarKind? {
+        switch typeID {
+        case TypeId.bool.rawValue:
+            return .bool
+        case TypeId.string.rawValue:
+            return .string
+        case TypeId.int8.rawValue,
+            TypeId.int16.rawValue,
+            TypeId.int32.rawValue,
+            TypeId.varint32.rawValue,
+            TypeId.int64.rawValue,
+            TypeId.varint64.rawValue,
+            TypeId.taggedInt64.rawValue:
+            return .signedInteger
+        case TypeId.uint8.rawValue,
+            TypeId.uint16.rawValue,
+            TypeId.uint32.rawValue,
+            TypeId.varUInt32.rawValue,
+            TypeId.uint64.rawValue,
+            TypeId.varUInt64.rawValue,
+            TypeId.taggedUInt64.rawValue:
+            return .unsignedInteger
+        case TypeId.float16.rawValue,
+            TypeId.bfloat16.rawValue,
+            TypeId.float32.rawValue,
+            TypeId.float64.rawValue:
+            return .floatingPoint
+        case TypeId.decimal.rawValue:
+            return .decimal
+        default:
+            return nil
+        }
+    }
+
+    private static func normalizeUserTypeIDForComparison(_ typeID: UInt32) -> UInt32 {
+        switch typeID {
+        case TypeId.structType.rawValue,
+            TypeId.compatibleStruct.rawValue,
+            TypeId.namedStruct.rawValue,
+            TypeId.namedCompatibleStruct.rawValue,
+            TypeId.unknown.rawValue:
+            return TypeId.structType.rawValue
+        case TypeId.enumType.rawValue,
+            TypeId.namedEnum.rawValue:
+            return TypeId.enumType.rawValue
+        case TypeId.ext.rawValue,
+            TypeId.namedExt.rawValue:
+            return TypeId.ext.rawValue
+        case TypeId.union.rawValue,
+            TypeId.typedUnion.rawValue,
+            TypeId.namedUnion.rawValue:
+            return TypeId.union.rawValue
+        default:
+            return typeID
+        }
+    }
+}
+
+extension TypeMeta {
+    private static func validateFieldTags(_ fields: [FieldInfo]) throws {
+        var fieldIDs = Set<Int32>()
+        for field in fields {
+            guard field.fieldID >= -1, field.fieldID <= maxTaggedFieldID else {
+                throw ForyError.invalidData("invalid compatible field tag \(field.fieldID)")
+            }
+            if field.fieldID >= 0, !fieldIDs.insert(field.fieldID).inserted {
+                throw ForyError.invalidData("duplicate compatible field tag \(field.fieldID)")
+            }
+        }
+    }
+}
+
+fileprivate extension TypeMeta.FieldType {
+    func validateDepth() throws {
+        var pending: [(fieldType: Self, parentDepth: Int)] = [(self, 0)]
+        while let current = pending.popLast() {
+            let childCount = Self.genericCount(current.fieldType.typeID)
+            if childCount == 0 {
+                continue
+            }
+
+            let depth = current.parentDepth + 1
+            if depth > typeMetaMaxDepth {
+                try Self.encodingNestingDepthExceeded(depth)
+            }
+
+            if childCount == 1 {
+                if let child = current.fieldType.generics.first {
+                    pending.append((child, depth))
+                }
+            } else {
+                if current.fieldType.generics.count > 1 {
+                    pending.append((current.fieldType.generics[1], depth))
+                }
+                if let child = current.fieldType.generics.first {
+                    pending.append((child, depth))
+                }
+            }
+        }
+    }
+}
+
+private func lowerCamelToLowerUnderscore(_ name: String) -> String {
+    if name.isEmpty {
+        return name
+    }
+
+    let chars = Array(name)
+    var result = String()
+    result.reserveCapacity(name.count + 4)
+
+    for (index, char) in chars.enumerated() {
+        if char.isUppercase {
+            if index > 0 {
+                let prevUpper = chars[index - 1].isUppercase
+                let nextUpperOrEnd = (index + 1 >= chars.count) || chars[index + 1].isUppercase
+                if !prevUpper || !nextUpperOrEnd {
+                    result.append("_")
+                }
+            }
+            result.append(char.lowercased())
+        } else {
+            result.append(char)
+        }
+    }
+
+    return result
+}
+
+private func toSnakeCase(_ name: String) -> String {
+    if name.isEmpty {
+        return name
+    }
+
+    let chars = Array(name)
+    var result = String()
+    result.reserveCapacity(name.count + 4)
+
+    for (index, char) in chars.enumerated() {
+        if char.isUppercase {
+            if index > 0 {
+                let prevUpper = chars[index - 1].isUppercase
+                let nextUpperOrEnd = (index + 1 >= chars.count) || chars[index + 1].isUppercase
+                if !prevUpper || !nextUpperOrEnd {
+                    result.append("_")
+                }
+            }
+            result.append(char.lowercased())
+        } else {
+            result.append(char)
+        }
+    }
+
+    return result
+}

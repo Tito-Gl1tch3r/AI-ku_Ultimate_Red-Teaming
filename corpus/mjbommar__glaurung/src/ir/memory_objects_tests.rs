@@ -1,0 +1,342 @@
+use super::{infer_from_ast_with_identities, AccessRole, LayoutConflict};
+use crate::ir::ast::{Expr, Function, OriginSet, Stmt};
+use crate::ir::types::{BinOp, VReg};
+
+fn reg(name: &str) -> VReg {
+    VReg::phys(name)
+}
+
+fn infer_from_ast(function: &Function) -> super::MemoryObjectModel {
+    let mut identities = crate::ir::value_number::ValueIdentities::default();
+    let promoted_objects = ["local_4".to_string(), "local_8".to_string()];
+    identities.attach_promoted_stack_objects(&promoted_objects);
+    infer_from_ast_with_identities(function, &identities)
+}
+
+fn x86_image() -> crate::program::image::ProgramImage {
+    crate::program::image::ProgramImage::from_path(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("samples/binaries/platforms/linux/amd64/export/native/gcc/O0/hello-gcc-O0"),
+    )
+    .expect("index real x86-64 ELF")
+}
+
+fn cursor_address(name: &str, offset: i64) -> Expr {
+    Expr::Bin {
+        op: BinOp::Add,
+        lhs: Box::new(Expr::Reg(reg(name))),
+        rhs: Box::new(Expr::Const(offset)),
+    }
+}
+
+fn cursor_step(name: &str, stride: i64) -> Stmt {
+    Stmt::Store {
+        addr: Expr::Reg(reg(name)),
+        src: cursor_address(name, stride),
+        size: 8,
+    }
+}
+
+fn object_cursor_body(name: &str, stride: i64) -> Vec<Stmt> {
+    vec![
+        Stmt::Store {
+            addr: Expr::Reg(reg(name)),
+            src: Expr::Deref {
+                addr: Box::new(Expr::Addr(0x4000)),
+                size: 8,
+            },
+            size: 8,
+        },
+        Stmt::While {
+            cond: Expr::Const(1),
+            body: vec![
+                Stmt::Store {
+                    addr: cursor_address(name, 44),
+                    src: Expr::Const(7),
+                    size: 4,
+                },
+                Stmt::Store {
+                    addr: cursor_address(name, 40),
+                    src: Expr::Const(3),
+                    size: 4,
+                },
+                cursor_step(name, stride),
+            ],
+        },
+    ]
+}
+
+fn function(body: Vec<Stmt>) -> Function {
+    Function {
+        name: "walk_records".into(),
+        entry_va: 0x1000,
+        body,
+    }
+}
+
+#[test]
+fn promoted_cursor_recovers_one_object_stride_and_ordered_access_paths() {
+    let model = infer_from_ast(&function(object_cursor_body("local_8", 64)));
+    let object = model
+        .object_for_base(&reg("local_8"))
+        .expect("cursor object");
+
+    assert_eq!(object.extent, Some(64));
+    assert_eq!(object.stride, Some(64));
+    assert!(object.conflicts.is_empty());
+    assert_eq!(
+        object
+            .accesses
+            .iter()
+            .map(|access| (access.offset, access.width, access.role))
+            .collect::<Vec<_>>(),
+        vec![(40, 4, AccessRole::Write), (44, 4, AccessRole::Write)]
+    );
+    assert!(model.has_conflict_free_extent(&reg("local_8")));
+}
+
+#[test]
+fn opaque_promoted_cursor_recovers_object_by_identity() {
+    let object_name = "record_cursor".to_string();
+    let mut identities = crate::ir::value_number::ValueIdentities::default();
+    identities.attach_promoted_stack_objects([&object_name]);
+
+    let mut body = object_cursor_body(&object_name, 64);
+    for statement in &mut body {
+        let statements = match statement {
+            Stmt::Store { .. } => std::slice::from_mut(statement),
+            Stmt::While { body, .. } => body.as_mut_slice(),
+            _ => continue,
+        };
+        for statement in statements {
+            let Stmt::Store { addr, .. } = statement else {
+                continue;
+            };
+            if matches!(addr, Expr::Reg(_)) {
+                *addr =
+                    std::mem::replace(addr, Expr::Const(0)).with_origins(OriginSet::one(0x1010));
+            }
+        }
+    }
+
+    let model = infer_from_ast_with_identities(&function(body), &identities);
+    let object = model
+        .object_for_base(&reg(&object_name))
+        .expect("cursor object");
+
+    assert_eq!(object.extent, Some(64));
+    assert_eq!(object.stride, Some(64));
+    assert!(object.conflicts.is_empty());
+    assert_eq!(object.accesses.len(), 2);
+}
+
+#[test]
+fn unowned_local_spelling_is_observed_as_a_pointer_store() {
+    let local = "local_looks_promoted";
+    let identities = crate::ir::value_number::ValueIdentities::default();
+    let body = vec![Stmt::Store {
+        addr: Expr::Reg(reg(local)),
+        src: Expr::Addr(0x4000),
+        size: 8,
+    }];
+
+    let model = infer_from_ast_with_identities(&function(body), &identities);
+    let object = model
+        .object_for_base(&reg(local))
+        .expect("pointer store object");
+
+    assert_eq!(object.accesses.len(), 1);
+    assert_eq!(object.accesses[0].offset, 0);
+    assert_eq!(object.accesses[0].role, AccessRole::Write);
+}
+
+#[test]
+fn access_past_stride_fails_closed_instead_of_inventing_an_extent() {
+    let mut body = object_cursor_body("local_8", 64);
+    let Stmt::While {
+        body: loop_body, ..
+    } = &mut body[1]
+    else {
+        panic!("fixture loop");
+    };
+    loop_body.insert(
+        0,
+        Stmt::Store {
+            addr: cursor_address("local_8", 60),
+            src: Expr::Const(0),
+            size: 8,
+        },
+    );
+
+    let model = infer_from_ast(&function(body));
+    let object = model
+        .object_for_base(&reg("local_8"))
+        .expect("observed object");
+
+    assert_eq!(object.extent, None);
+    assert!(object.conflicts.contains(&LayoutConflict::AccessPastStride));
+    assert!(!model.has_conflict_free_extent(&reg("local_8")));
+}
+
+#[test]
+fn conflicting_cursor_steps_remain_explicit_layout_conflicts() {
+    let mut body = object_cursor_body("local_8", 64);
+    let Stmt::While {
+        body: loop_body, ..
+    } = &mut body[1]
+    else {
+        panic!("fixture loop");
+    };
+    loop_body.push(cursor_step("local_8", 32));
+
+    let model = infer_from_ast(&function(body));
+    let object = model
+        .object_for_base(&reg("local_8"))
+        .expect("observed object");
+
+    assert_eq!(object.stride, None);
+    assert!(object
+        .conflicts
+        .contains(&LayoutConflict::ConflictingStrides));
+    assert!(!model.has_conflict_free_extent(&reg("local_8")));
+}
+
+#[test]
+fn integer_use_rejects_an_otherwise_pointer_shaped_cursor() {
+    let mut body = object_cursor_body("local_8", 64);
+    body.push(Stmt::Assign {
+        dst: reg("var0"),
+        src: Expr::Bin {
+            op: BinOp::Xor,
+            lhs: Box::new(Expr::Reg(reg("local_8"))),
+            rhs: Box::new(Expr::Const(0x55)),
+        },
+    });
+
+    let model = infer_from_ast(&function(body));
+    let object = model
+        .object_for_base(&reg("local_8"))
+        .expect("observed object");
+
+    assert!(object.conflicts.contains(&LayoutConflict::NonAddressUse));
+    assert!(!model.has_conflict_free_extent(&reg("local_8")));
+}
+
+#[test]
+fn access_path_collection_is_register_spelling_and_pointer_width_independent() {
+    let model = infer_from_ast(&function(object_cursor_body("local_4", 48)));
+    let object = model
+        .object_for_base(&reg("local_4"))
+        .expect("cursor object");
+
+    // Neither a 32-bit-looking promoted slot name nor a non-eight-byte object
+    // stride changes the byte-offset proof.
+    assert_eq!(object.extent, Some(48));
+    assert!(object.conflicts.is_empty());
+    assert!(model.has_conflict_free_extent(&reg("local_4")));
+}
+
+#[test]
+fn distinct_call_result_origins_do_not_collapse_into_one_object() {
+    let call = |target| Expr::Call {
+        target: Box::new(Expr::Addr(target)),
+        args: Vec::new(),
+        call_spec: None,
+        result_width: Some(8),
+    };
+    let mut body = object_cursor_body("local_8", 64);
+    body[0] = Stmt::Store {
+        addr: Expr::Reg(reg("local_8")),
+        src: call(0x2000),
+        size: 8,
+    };
+    body.insert(
+        1,
+        Stmt::Store {
+            addr: Expr::Reg(reg("local_8")),
+            src: call(0x3000),
+            size: 8,
+        },
+    );
+
+    let model = infer_from_ast(&function(body));
+    let object = model
+        .object_for_base(&reg("local_8"))
+        .expect("observed object");
+
+    assert!(object
+        .conflicts
+        .contains(&LayoutConflict::ConflictingOrigins));
+    assert!(!model.has_conflict_free_extent(&reg("local_8")));
+}
+
+#[test]
+fn exact_self_copy_does_not_invent_a_conflicting_origin() {
+    let mut body = object_cursor_body("local_8", 64);
+    body.insert(
+        1,
+        Stmt::Store {
+            addr: Expr::Reg(reg("local_8")),
+            src: Expr::Reg(reg("local_8")),
+            size: 8,
+        },
+    );
+
+    let model = infer_from_ast(&function(body));
+    let object = model
+        .object_for_base(&reg("local_8"))
+        .expect("observed object");
+
+    assert!(object.conflicts.is_empty());
+    assert!(model.has_conflict_free_extent(&reg("local_8")));
+}
+
+#[test]
+fn zero_width_access_fails_closed() {
+    let mut body = object_cursor_body("local_8", 64);
+    let Stmt::While {
+        body: loop_body, ..
+    } = &mut body[1]
+    else {
+        panic!("fixture loop");
+    };
+    loop_body.insert(
+        0,
+        Stmt::Store {
+            addr: cursor_address("local_8", 12),
+            src: Expr::Const(0),
+            size: 0,
+        },
+    );
+
+    let model = infer_from_ast(&function(body));
+    let object = model
+        .object_for_base(&reg("local_8"))
+        .expect("observed object");
+
+    assert!(object.conflicts.contains(&LayoutConflict::ZeroWidthAccess));
+    assert!(!model.has_conflict_free_extent(&reg("local_8")));
+}
+
+#[test]
+fn scalar_redefinition_is_an_explicit_object_conflict() {
+    let mut body = object_cursor_body("local_8", 64);
+    body.insert(
+        1,
+        Stmt::Store {
+            addr: Expr::Reg(reg("local_8")),
+            src: Expr::Const(42),
+            size: 8,
+        },
+    );
+
+    let model = infer_from_ast(&function(body));
+    let object = model
+        .object_for_base(&reg("local_8"))
+        .expect("observed object");
+
+    assert!(object
+        .conflicts
+        .contains(&LayoutConflict::UnclassifiedDefinition));
+    assert!(!model.has_conflict_free_extent(&reg("local_8")));
+}

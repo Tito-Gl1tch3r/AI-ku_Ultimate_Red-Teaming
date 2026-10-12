@@ -1,0 +1,2045 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.fory.serializer.collection;
+
+import static org.apache.fory.collection.Collections.ofArrayList;
+import static org.apache.fory.collection.Collections.ofHashMap;
+import static org.apache.fory.collection.Collections.ofHashSet;
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertSame;
+
+import com.google.common.collect.ImmutableBiMap;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.ImmutableSortedSet;
+import java.io.Externalizable;
+import java.io.IOException;
+import java.io.ObjectInput;
+import java.io.ObjectOutput;
+import java.io.Serializable;
+import java.lang.reflect.Field;
+import java.lang.reflect.ParameterizedType;
+import java.util.AbstractCollection;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.BitSet;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.PriorityQueue;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import java.util.Vector;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
+import java.util.stream.LongStream;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import org.apache.fory.Fory;
+import org.apache.fory.ForyTestBase;
+import org.apache.fory.annotation.Ref;
+import org.apache.fory.config.CompatibleMode;
+import org.apache.fory.config.Int64Encoding;
+import org.apache.fory.config.Language;
+import org.apache.fory.context.ReadContext;
+import org.apache.fory.exception.DeserializationException;
+import org.apache.fory.exception.InsecureException;
+import org.apache.fory.exception.SerializationException;
+import org.apache.fory.memory.MemoryBuffer;
+import org.apache.fory.memory.MemoryUtils;
+import org.apache.fory.meta.FieldTypes;
+import org.apache.fory.platform.JdkVersion;
+import org.apache.fory.reflect.FieldAccessor;
+import org.apache.fory.reflect.TypeRef;
+import org.apache.fory.resolver.TypeResolver;
+import org.apache.fory.serializer.GraphMemoryEstimates;
+import org.apache.fory.serializer.collection.CollectionSerializers.JDKCompatibleCollectionSerializer;
+import org.apache.fory.test.bean.Cyclic;
+import org.apache.fory.type.GenericType;
+import org.apache.fory.type.Types;
+import org.testng.Assert;
+import org.testng.SkipException;
+import org.testng.annotations.Test;
+import org.testng.collections.Maps;
+
+@SuppressWarnings("rawtypes")
+public class CollectionSerializersTest extends ForyTestBase {
+  private static final List<String> SORTED_COLLECTION_INPUT = ImmutableList.of("bbb", "a", "cc");
+  private static final List<String> NATURAL_SORT_ORDER = ImmutableList.of("a", "bbb", "cc");
+  private static final List<String> LENGTH_SORT_ORDER = ImmutableList.of("a", "cc", "bbb");
+
+  private static final class LengthThenNaturalComparator
+      implements Comparator<String>, Serializable {
+    @Override
+    public int compare(String left, String right) {
+      int delta = left.length() - right.length();
+      return delta != 0 ? delta : left.compareTo(right);
+    }
+  }
+
+  public static final class NonComparableSetItem {
+    public int id;
+
+    public NonComparableSetItem() {}
+
+    private NonComparableSetItem(int id) {
+      this.id = id;
+    }
+  }
+
+  public static final class SetItemComparator
+      implements Comparator<NonComparableSetItem>, Serializable {
+    @Override
+    public int compare(NonComparableSetItem left, NonComparableSetItem right) {
+      return Integer.compare(left.id, right.id);
+    }
+  }
+
+  private static final class SortedSetConstructorCase {
+    private final String name;
+    private final Class<?> expectedType;
+    private final boolean comparatorExpected;
+    private final List<String> expectedOrder;
+    private final Supplier<SortedSet<String>> factory;
+
+    private SortedSetConstructorCase(
+        String name,
+        Class<?> expectedType,
+        boolean comparatorExpected,
+        List<String> expectedOrder,
+        Supplier<SortedSet<String>> factory) {
+      this.name = name;
+      this.expectedType = expectedType;
+      this.comparatorExpected = comparatorExpected;
+      this.expectedOrder = expectedOrder;
+      this.factory = factory;
+    }
+  }
+
+  private static final class PriorityQueueConstructorCase {
+    private final String name;
+    private final boolean comparatorExpected;
+    private final List<String> expectedOrder;
+    private final Supplier<PriorityQueue<String>> factory;
+
+    private PriorityQueueConstructorCase(
+        String name,
+        boolean comparatorExpected,
+        List<String> expectedOrder,
+        Supplier<PriorityQueue<String>> factory) {
+      this.name = name;
+      this.comparatorExpected = comparatorExpected;
+      this.expectedOrder = expectedOrder;
+      this.factory = factory;
+    }
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void testBasicList(boolean referenceTrackingConfig) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTrackingConfig)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    List<String> data = new ArrayList<>(ImmutableList.of("a", "b", "c"));
+    serDeCheckSerializer(fory, data, "ArrayList");
+    serDeCheckSerializer(fory, Arrays.asList("a", "b", "c"), "ArraysAsList");
+    serDeCheckSerializer(fory, new HashSet<>(data), "HashSet");
+    serDeCheckSerializer(fory, new LinkedHashSet<>(data), "LinkedHashSet");
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testBasicList(Fory fory) {
+    List<Object> data = Arrays.asList(1, true, "test", Cyclic.create(true));
+    copyCheck(fory, new ArrayList<>(data));
+    copyCheck(fory, data);
+    copyCheck(fory, new HashSet<>(data));
+    copyCheck(fory, new LinkedHashSet<>(data));
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void testBasicListNested(boolean referenceTrackingConfig) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTrackingConfig)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    List<String> data0 = new ArrayList<>(ImmutableList.of("a", "b", "c"));
+    List<List<String>> data = new ArrayList<>(ImmutableList.of(data0, data0));
+    serDeCheckSerializer(fory, data, "ArrayList");
+    serDeCheckSerializer(fory, Arrays.asList("a", "b", "c"), "ArraysAsList");
+    serDeCheckSerializer(fory, new HashSet<>(data), "HashSet");
+    serDeCheckSerializer(fory, new LinkedHashSet<>(data), "LinkedHashSet");
+  }
+
+  @Data
+  public static class BasicListNestedJIT {
+    public Set<List<List<String>>> data;
+    public Set<Set<List<String>>> data1;
+    public Collection<ArrayList<Object>> data2;
+    public Collection<Set<Collection<String>>> data3;
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void testBasicListNestedJIT(boolean referenceTracking) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTracking)
+            .withCodegen(true)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    List<List<List<String>>> list = new ArrayList<>();
+    list.add(ofArrayList(ofArrayList("a", "b")));
+    list.add(ofArrayList(ofArrayList("a", "b")));
+    BasicListNestedJIT o = new BasicListNestedJIT();
+    o.data = new HashSet<>(list);
+    o.data1 = ofHashSet(ofHashSet(ofArrayList("a", "b")), ofHashSet(ofArrayList("a", "b")));
+    o.data2 = ofHashSet(ofArrayList("a", "b"));
+    o.data3 = ofHashSet(ofHashSet(ofArrayList("a", "b")), ofHashSet(ofArrayList("a", "b")));
+    serDeCheckSerializer(fory, o, "Codec");
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void testCollectionGenerics(boolean referenceTrackingConfig) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTrackingConfig)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    List<String> data = new ArrayList<>(ImmutableList.of("a", "b", "c"));
+    byte[] bytes1 = fory.serialize(data);
+    GenericType genericType = GenericType.build(new TypeRef<List<String>>() {});
+    fory.getWriteContext()
+        .getGenerics()
+        .pushGenericType(genericType, fory.getWriteContext().getDepth());
+    fory.getReadContext()
+        .getGenerics()
+        .pushGenericType(genericType, fory.getReadContext().getDepth());
+    byte[] bytes2 = fory.serialize(data);
+    Assert.assertTrue(bytes1.length > bytes2.length);
+    assertEquals(fory.deserialize(bytes2), data);
+    fory.getWriteContext().getGenerics().popGenericType(fory.getWriteContext().getDepth());
+    fory.getReadContext().getGenerics().popGenericType(fory.getReadContext().getDepth());
+    assertThrowsCause(RuntimeException.class, () -> fory.deserialize(bytes2));
+  }
+
+  public static class MultiParamList<A, E> extends ArrayList<E> {
+    private A metadata;
+
+    public MultiParamList() {}
+
+    public MultiParamList(A metadata) {
+      this.metadata = metadata;
+    }
+
+    public A getMetadata() {
+      return metadata;
+    }
+
+    public void setMetadata(A metadata) {
+      this.metadata = metadata;
+    }
+  }
+
+  public static class MultiParamListHolder {
+    private String name;
+    private MultiParamList<String, Integer> numbers;
+
+    public MultiParamListHolder() {}
+
+    public MultiParamListHolder(String name, MultiParamList<String, Integer> numbers) {
+      this.name = name;
+      this.numbers = numbers;
+    }
+
+    public String getName() {
+      return name;
+    }
+
+    public MultiParamList<String, Integer> getNumbers() {
+      return numbers;
+    }
+  }
+
+  public static class CollectionRefItem {
+    public int id;
+  }
+
+  public static class MultiParamListRefHolder {
+    private MultiParamList<String, @Ref(enable = false) CollectionRefItem> noRefItems;
+    private MultiParamList<String, @Ref(enable = true) CollectionRefItem> refItems;
+
+    public MultiParamListRefHolder() {}
+  }
+
+  public static class NestedMultiParamListHolder {
+    private MultiParamList<String, List<@Ref(enable = false) CollectionRefItem>> nestedItems;
+
+    public NestedMultiParamListHolder() {}
+  }
+
+  public static class FixedElementList<A> extends ArrayList<CollectionRefItem> {
+    private A metadata;
+
+    public FixedElementList() {}
+
+    public FixedElementList(A metadata) {
+      this.metadata = metadata;
+    }
+  }
+
+  public static class FixedElementListHolder {
+    private FixedElementList<@Ref(enable = false) CollectionRefItem> items;
+
+    public FixedElementListHolder() {}
+  }
+
+  @Test(dataProvider = "enableCodegen")
+  public void testMultiParamCollectionRoundTrip(boolean enableCodegen) {
+    MultiParamList<String, Integer> list = new MultiParamList<>("my-metadata");
+    list.add(1);
+    list.add(2);
+    list.add(3);
+
+    MultiParamListHolder holder = new MultiParamListHolder("test-container", list);
+    Fory fory = collectionGenericFory(enableCodegen);
+    MultiParamListHolder cloned = (MultiParamListHolder) fory.deserialize(fory.serialize(holder));
+
+    Assert.assertEquals(cloned.getName(), "test-container");
+    Assert.assertNotNull(cloned.getNumbers());
+    Assert.assertEquals(cloned.getNumbers().getMetadata(), "my-metadata");
+    Assert.assertEquals(cloned.getNumbers().size(), 3);
+    Assert.assertEquals(cloned.getNumbers().get(0), Integer.valueOf(1));
+    Assert.assertEquals(cloned.getNumbers().get(1), Integer.valueOf(2));
+    Assert.assertEquals(cloned.getNumbers().get(2), Integer.valueOf(3));
+  }
+
+  @Test(dataProvider = "enableCodegen")
+  public void testMultiParamCollectionRefOverride(boolean enableCodegen) {
+    skipMemberGenericTypeUseOnJdk11();
+    CollectionRefItem noRefItem = new CollectionRefItem();
+    noRefItem.id = 1;
+    CollectionRefItem refItem = new CollectionRefItem();
+    refItem.id = 2;
+
+    MultiParamListRefHolder holder = new MultiParamListRefHolder();
+    holder.noRefItems = new MultiParamList<>("no-ref");
+    holder.noRefItems.add(noRefItem);
+    holder.noRefItems.add(noRefItem);
+    holder.refItems = new MultiParamList<>("ref");
+    holder.refItems.add(refItem);
+    holder.refItems.add(refItem);
+
+    Fory fory = collectionGenericFory(enableCodegen);
+    MultiParamListRefHolder cloned =
+        (MultiParamListRefHolder) fory.deserialize(fory.serialize(holder));
+    Assert.assertNotSame(cloned.noRefItems.get(0), cloned.noRefItems.get(1));
+    Assert.assertSame(cloned.refItems.get(0), cloned.refItems.get(1));
+  }
+
+  @Test(dataProvider = "enableCodegen")
+  public void testNestedMultiParamCollectionRef(boolean enableCodegen) {
+    skipMemberGenericTypeUseOnJdk11();
+    CollectionRefItem item = new CollectionRefItem();
+    item.id = 1;
+
+    NestedMultiParamListHolder holder = new NestedMultiParamListHolder();
+    holder.nestedItems = new MultiParamList<>("nested");
+    List<CollectionRefItem> inner = new ArrayList<>();
+    inner.add(item);
+    inner.add(item);
+    holder.nestedItems.add(inner);
+
+    Fory fory = collectionGenericFory(enableCodegen);
+    NestedMultiParamListHolder cloned =
+        (NestedMultiParamListHolder) fory.deserialize(fory.serialize(holder));
+    Assert.assertNotSame(cloned.nestedItems.get(0).get(0), cloned.nestedItems.get(0).get(1));
+  }
+
+  private static void skipMemberGenericTypeUseOnJdk11() {
+    if (JdkVersion.MAJOR_VERSION <= 11) {
+      throw new SkipException(
+          "JDK 11 and earlier do not expose member-class generic field type-use metadata");
+    }
+  }
+
+  @Test(dataProvider = "enableCodegen")
+  public void testFixedElementCollectionRefMeta(boolean enableCodegen) {
+    CollectionRefItem element = new CollectionRefItem();
+    element.id = 1;
+    CollectionRefItem metadata = new CollectionRefItem();
+    metadata.id = 2;
+
+    FixedElementListHolder holder = new FixedElementListHolder();
+    holder.items = new FixedElementList<>(metadata);
+    holder.items.add(element);
+    holder.items.add(element);
+
+    Fory fory = collectionGenericFory(enableCodegen);
+    FixedElementListHolder cloned =
+        (FixedElementListHolder) fory.deserialize(fory.serialize(holder));
+    Assert.assertSame(cloned.items.get(0), cloned.items.get(1));
+  }
+
+  @Test
+  public void testCollectionFieldTypeKeepsDeclaredType() {
+    Fory fory = builder().withXlang(false).requireClassRegistration(false).build();
+    TypeRef<?> declared = new TypeRef<List<Integer>>() {};
+    FieldTypes.CollectionFieldType fieldType =
+        new FieldTypes.CollectionFieldType(
+            Types.LIST,
+            true,
+            true,
+            new FieldTypes.RegisteredFieldType(true, false, Types.INT32, -1));
+
+    TypeRef<?> rebuilt = fieldType.toTypeToken(fory.getTypeResolver(), declared);
+
+    Assert.assertTrue(rebuilt.getType() instanceof ParameterizedType);
+    Assert.assertEquals(rebuilt.getRawType(), List.class);
+    Assert.assertEquals(rebuilt.getTypeArguments().size(), 1);
+    Assert.assertEquals(rebuilt.getTypeExtMeta().typeId(), Types.LIST);
+    Assert.assertTrue(rebuilt.getTypeExtMeta().nullable());
+    Assert.assertTrue(rebuilt.getTypeExtMeta().trackingRef());
+  }
+
+  private static Fory collectionGenericFory(boolean enableCodegen) {
+    return Fory.builder()
+        .withLanguage(Language.JAVA)
+        .requireClassRegistration(false)
+        .withRefTracking(true)
+        .withCompatibleMode(CompatibleMode.COMPATIBLE)
+        .withAsyncCompilation(false)
+        .withIntCompressed(true)
+        .withCodegen(enableCodegen)
+        .withLongCompressed(Int64Encoding.VARINT)
+        .withIntArrayCompressed(true)
+        .withLongArrayCompressed(true)
+        .build();
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void testSortedSet(boolean referenceTrackingConfig) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTrackingConfig)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    // Test serialize Comparator
+    TreeSet<String> set =
+        new TreeSet<>(
+            (Comparator<? super String> & Serializable)
+                (s1, s2) -> {
+                  int delta = s1.length() - s2.length();
+                  if (delta == 0) {
+                    return s1.compareTo(s2);
+                  } else {
+                    return delta;
+                  }
+                });
+    set.add("str11");
+    set.add("str2");
+    assertEquals(set, serDe(fory, set));
+    TreeSet<String> data = new TreeSet<>(ImmutableSet.of("a", "b", "c"));
+    serDeCheckSerializer(fory, data, "SortedSet");
+    byte[] bytes1 = fory.serialize(data);
+    fory.getWriteContext()
+        .getGenerics()
+        .pushGenericType(
+            GenericType.build(new TypeRef<List<String>>() {}), fory.getWriteContext().getDepth());
+    byte[] bytes2 = fory.serialize(data);
+    Assert.assertTrue(bytes1.length > bytes2.length);
+    fory.getWriteContext().getGenerics().popGenericType(fory.getWriteContext().getDepth());
+    assertThrowsCause(RuntimeException.class, () -> fory.deserialize(bytes2));
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testSortedSet(Fory fory) {
+    AtomicInteger i = new AtomicInteger(1);
+    TreeSet<String> set = new TreeSet<>(new TestComparator(i));
+
+    TreeSet<String> copy = fory.copy(set);
+
+    Comparator<? super String> comparator1 = set.comparator();
+    Comparator<? super String> comparator2 = copy.comparator();
+    Assert.assertEquals(comparator1, comparator2);
+    set.add("str11");
+    copy.add("str11");
+    Assert.assertEquals(copy, set);
+    Assert.assertNotSame(copy, set);
+    i.set(-1);
+    Assert.assertNotEquals(comparator1, comparator2);
+    set.add("str2");
+    copy.add("str2");
+    Assert.assertNotEquals(Arrays.toString(copy.toArray()), Arrays.toString(set.toArray()));
+    copy.add("str");
+    Assert.assertEquals(Arrays.toString(copy.toArray()), "[str, str2, str11]");
+  }
+
+  @Test
+  public void testXlangTreeSetCopy() {
+    Fory fory =
+        builder().withXlang(true).withRefTracking(false).requireClassRegistration(true).build();
+    TreeSet<String> set = new TreeSet<>(Collections.reverseOrder());
+    set.addAll(sortedCollectionInput());
+
+    Assert.assertTrue(
+        fory.getSerializer(TreeSet.class) instanceof CollectionSerializers.SortedSetSerializer);
+    TreeSet<String> copy = fory.copy(set);
+
+    Assert.assertNotSame(copy, set);
+    Assert.assertEquals(copy, set);
+    Assert.assertNotNull(copy.comparator());
+    Assert.assertTrue(copy.comparator().compare("a", "b") > 0);
+  }
+
+  @Test
+  public void testXlangTreeSetNaturalComparator() {
+    Fory fory =
+        builder().withXlang(true).withRefTracking(false).requireClassRegistration(true).build();
+    TreeSet<String> set = new TreeSet<>(Comparator.naturalOrder());
+    set.addAll(sortedCollectionInput());
+
+    Object decoded = fory.deserialize(fory.serialize(set));
+
+    Assert.assertEquals(decoded, set);
+  }
+
+  @Test
+  public void testXlangTreeSetComparatorWrite() {
+    Fory fory =
+        builder().withXlang(true).withRefTracking(false).requireClassRegistration(true).build();
+    TreeSet<NonComparableSetItem> set = new TreeSet<>(new SetItemComparator());
+    set.add(new NonComparableSetItem(1));
+
+    SerializationException exception =
+        Assert.expectThrows(SerializationException.class, () -> fory.serialize(set));
+    Assert.assertTrue(exception.getCause() instanceof UnsupportedOperationException);
+  }
+
+  @Test
+  public void testXlangTreeSetObjectCopy() {
+    Fory fory =
+        builder().withXlang(true).withRefTracking(false).requireClassRegistration(true).build();
+    fory.register(NonComparableSetItem.class);
+    fory.register(SetItemComparator.class);
+    TreeSet<NonComparableSetItem> set = new TreeSet<>(new SetItemComparator());
+    set.add(new NonComparableSetItem(2));
+    set.add(new NonComparableSetItem(1));
+
+    TreeSet<NonComparableSetItem> copy = fory.copy(set);
+
+    Assert.assertNotSame(copy, set);
+    Assert.assertEquals(copy.size(), set.size());
+    Assert.assertNotNull(copy.comparator());
+    Assert.assertEquals(copy.first().id, 1);
+    Assert.assertEquals(copy.last().id, 2);
+  }
+
+  private class TestComparator implements Comparator<String> {
+    AtomicInteger i;
+
+    public TestComparator(AtomicInteger i) {
+      this.i = i;
+    }
+
+    @Override
+    public int compare(String s1, String s2) {
+      int delta = s1.length() - s2.length();
+      if (delta == i.get()) {
+        return s1.compareTo(s2);
+      } else {
+        return delta;
+      }
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      return ((TestComparator) obj).i.get() == this.i.get();
+    }
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void testTreeSetConstructorMatrix(boolean referenceTrackingConfig) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTrackingConfig)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    for (SortedSetConstructorCase testCase : treeSetConstructorCases()) {
+      SortedSet<String> original = testCase.factory.get();
+      assertSortedSetState(testCase, original);
+      SortedSet<String> deserialized = serDe(fory, original);
+      assertSortedSetState(testCase, deserialized);
+      Assert.assertEquals(deserialized, original, testCase.name);
+      Assert.assertNotSame(deserialized, original, testCase.name);
+    }
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testTreeSetConstructorMatrix(Fory fory) {
+    for (SortedSetConstructorCase testCase : treeSetConstructorCases()) {
+      SortedSet<String> original = testCase.factory.get();
+      assertSortedSetState(testCase, original);
+      SortedSet<String> copy = fory.copy(original);
+      assertSortedSetState(testCase, copy);
+      Assert.assertEquals(copy, original, testCase.name);
+      Assert.assertNotSame(copy, original, testCase.name);
+    }
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void testSkipListSetCtorSerde(boolean referenceTrackingConfig) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTrackingConfig)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    for (SortedSetConstructorCase testCase : concurrentSkipListSetConstructorCases()) {
+      SortedSet<String> original = testCase.factory.get();
+      assertSortedSetState(testCase, original);
+      SortedSet<String> deserialized = serDe(fory, original);
+      assertSortedSetState(testCase, deserialized);
+      Assert.assertEquals(deserialized, original, testCase.name);
+      Assert.assertNotSame(deserialized, original, testCase.name);
+    }
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testSkipListSetCtorCopy(Fory fory) {
+    for (SortedSetConstructorCase testCase : concurrentSkipListSetConstructorCases()) {
+      SortedSet<String> original = testCase.factory.get();
+      assertSortedSetState(testCase, original);
+      SortedSet<String> copy = fory.copy(original);
+      assertSortedSetState(testCase, copy);
+      Assert.assertEquals(copy, original, testCase.name);
+      Assert.assertNotSame(copy, original, testCase.name);
+    }
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void testPriorityQueueConstructorMatrix(boolean referenceTrackingConfig) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTrackingConfig)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    for (PriorityQueueConstructorCase testCase : priorityQueueConstructorCases()) {
+      PriorityQueue<String> original = testCase.factory.get();
+      assertPriorityQueueState(testCase, original);
+      PriorityQueue<String> deserialized = serDe(fory, original);
+      assertPriorityQueueState(testCase, deserialized);
+      Assert.assertEquals(
+          drainPriorityQueue(deserialized), drainPriorityQueue(original), testCase.name);
+      Assert.assertNotSame(deserialized, original, testCase.name);
+    }
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testPriorityQueueConstructorMatrix(Fory fory) {
+    for (PriorityQueueConstructorCase testCase : priorityQueueConstructorCases()) {
+      PriorityQueue<String> original = testCase.factory.get();
+      assertPriorityQueueState(testCase, original);
+      PriorityQueue<String> copy = fory.copy(original);
+      assertPriorityQueueState(testCase, copy);
+      Assert.assertEquals(drainPriorityQueue(copy), drainPriorityQueue(original), testCase.name);
+      Assert.assertNotSame(copy, original, testCase.name);
+    }
+  }
+
+  // TreeSet subclass without a Comparator constructor (natural ordering only)
+  public static class ChildTreeSet extends TreeSet<String> {
+    public ChildTreeSet() {
+      super();
+    }
+  }
+
+  // TreeSet subclass with a Comparator constructor
+  public static class ChildTreeSetWithComparator extends TreeSet<String> {
+    public ChildTreeSetWithComparator() {
+      super();
+    }
+
+    public ChildTreeSetWithComparator(Comparator<? super String> comparator) {
+      super(comparator);
+    }
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void testSortedSetSubclassNoComparatorCtor(boolean referenceTrackingConfig) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTrackingConfig)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    ChildTreeSet set = new ChildTreeSet();
+    set.add("b");
+    set.add("a");
+    set.add("c");
+    ChildTreeSet deserialized = serDe(fory, set);
+    assertEquals(deserialized, set);
+    assertEquals(deserialized.getClass(), ChildTreeSet.class);
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void testSortedSetSubclassWithComparatorCtor(boolean referenceTrackingConfig) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTrackingConfig)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    ChildTreeSetWithComparator set = new ChildTreeSetWithComparator();
+    set.add("b");
+    set.add("a");
+    set.add("c");
+    ChildTreeSetWithComparator deserialized = serDe(fory, set);
+    assertEquals(deserialized, set);
+    assertEquals(deserialized.getClass(), ChildTreeSetWithComparator.class);
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void testSortedSetSubclassRegistered(boolean referenceTrackingConfig) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTrackingConfig)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    // Subclass without Comparator constructor should not throw when registered with
+    // SortedSetSerializer
+    fory.registerSerializer(
+        ChildTreeSet.class,
+        new CollectionSerializers.SortedSetSerializer<>(
+            fory.getTypeResolver(), ChildTreeSet.class));
+    ChildTreeSet set = new ChildTreeSet();
+    set.add("b");
+    set.add("a");
+    set.add("c");
+    ChildTreeSet deserialized = serDe(fory, set);
+    assertEquals(deserialized, set);
+    assertEquals(deserialized.getClass(), ChildTreeSet.class);
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void testSortedSetComparatorRegistered(boolean referenceTrackingConfig) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTrackingConfig)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    fory.registerSerializer(
+        ChildTreeSetWithComparator.class,
+        new CollectionSerializers.SortedSetSerializer<>(
+            fory.getTypeResolver(), ChildTreeSetWithComparator.class));
+    ChildTreeSetWithComparator set = new ChildTreeSetWithComparator();
+    set.add("b");
+    set.add("a");
+    set.add("c");
+    ChildTreeSetWithComparator deserialized = serDe(fory, set);
+    assertEquals(deserialized, set);
+    assertEquals(deserialized.getClass(), ChildTreeSetWithComparator.class);
+  }
+
+  @Test
+  public void testEmptyCollection() {
+    serDeCheckSerializer(getJavaFory(), Collections.EMPTY_LIST, "EmptyListSerializer");
+    serDeCheckSerializer(getJavaFory(), Collections.emptySortedSet(), "EmptySortedSetSerializer");
+    serDeCheckSerializer(getJavaFory(), Collections.EMPTY_SET, "EmptySetSerializer");
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testEmptyCollection(Fory fory) {
+    copyCheckWithoutSame(fory, Collections.EMPTY_LIST);
+    copyCheckWithoutSame(fory, Collections.emptySortedSet());
+    copyCheckWithoutSame(fory, Collections.EMPTY_SET);
+  }
+
+  @Test
+  public void testSingleCollection() {
+    serDeCheckSerializer(getJavaFory(), Collections.singletonList(1), "SingletonList");
+    serDeCheckSerializer(getJavaFory(), Collections.singleton(1), "SingletonSet");
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testSingleCollection(Fory fory) {
+    copyCheck(fory, Collections.singletonList(Cyclic.create(true)));
+    copyCheck(fory, Collections.singleton(Cyclic.create(true)));
+  }
+
+  @Test
+  public void tesSkipList() {
+    serDeCheckSerializer(
+        getJavaFory(),
+        new ConcurrentSkipListSet<>(Arrays.asList("a", "b", "c")),
+        "ConcurrentSkipListSet");
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void tesSkipList(Fory fory) {
+    copyCheck(fory, new ConcurrentSkipListSet<>(Arrays.asList("a", "b", "c")));
+  }
+
+  @Test
+  public void tesVectorSerializer() {
+    serDeCheckSerializer(
+        getJavaFory(), new Vector<>(Arrays.asList("a", "b", "c")), "VectorSerializer");
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void tesVectorSerializer(Fory fory) {
+    copyCheck(fory, new Vector<>(Arrays.asList("a", 1, Cyclic.create(true))));
+  }
+
+  @Test
+  public void tesArrayDequeSerializer() {
+    serDeCheckSerializer(
+        getJavaFory(), new ArrayDeque<>(Arrays.asList("a", "b", "c")), "ArrayDeque");
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void tesArrayDequeSerializer(Fory fory) {
+    ImmutableList<Object> list = ImmutableList.of("a", 1, Cyclic.create(true));
+    ArrayDeque<Object> deque = new ArrayDeque<>(list);
+    ArrayDeque<Object> copy = fory.copy(deque);
+    Assert.assertEquals(ImmutableList.copyOf(copy), list);
+    Assert.assertNotSame(deque, copy);
+  }
+
+  public enum TestEnum {
+    A,
+    B,
+    C,
+    D
+  }
+
+  @Test
+  public void tesEnumSetSerializer() {
+    serDe(getJavaFory(), EnumSet.allOf(TestEnum.class));
+    Assert.assertEquals(
+        getJavaFory()
+            .getTypeResolver()
+            .getSerializerClass(EnumSet.allOf(TestEnum.class).getClass()),
+        CollectionSerializers.EnumSetSerializer.class);
+    serDe(getJavaFory(), EnumSet.of(TestEnum.A));
+    Assert.assertEquals(
+        getJavaFory().getTypeResolver().getSerializerClass(EnumSet.of(TestEnum.A).getClass()),
+        CollectionSerializers.EnumSetSerializer.class);
+    serDe(getJavaFory(), EnumSet.of(TestEnum.A, TestEnum.B));
+    Assert.assertEquals(
+        getJavaFory()
+            .getTypeResolver()
+            .getSerializerClass(EnumSet.of(TestEnum.A, TestEnum.B).getClass()),
+        CollectionSerializers.EnumSetSerializer.class);
+    // TODO test enum which has enums exceed 128.
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void tesEnumSetSerializer(Fory fory) {
+    copyCheck(fory, EnumSet.allOf(TestEnum.class));
+    copyCheck(fory, EnumSet.of(TestEnum.A));
+    copyCheck(fory, EnumSet.of(TestEnum.A, TestEnum.B));
+  }
+
+  enum TestEnumWithMethods {
+    A {
+      @Override
+      public void foo() {
+        System.out.println("A");
+      }
+    },
+    B,
+    C {
+      @Override
+      public void foo() {}
+    },
+    D;
+
+    public void foo() {
+      System.out.println("default");
+    }
+  }
+
+  @Test
+  public void tesEnumSetSerializerWithMethods() {
+    serDe(getJavaFory(), EnumSet.noneOf(TestEnumWithMethods.class));
+    serDe(getJavaFory(), EnumSet.of(TestEnumWithMethods.A));
+    serDe(getJavaFory(), EnumSet.of(TestEnumWithMethods.B));
+    serDe(getJavaFory(), EnumSet.of(TestEnumWithMethods.A, TestEnumWithMethods.B));
+    serDe(getJavaFory(), EnumSet.of(TestEnumWithMethods.A, TestEnumWithMethods.C));
+    serDe(getJavaFory(), EnumSet.allOf(TestEnumWithMethods.class));
+  }
+
+  @Test
+  public void tesBitSetSerializer() {
+    serDe(getJavaFory(), BitSet.valueOf(LongStream.range(0, 2).toArray()));
+    Assert.assertEquals(
+        getJavaFory()
+            .getTypeResolver()
+            .getSerializerClass(BitSet.valueOf(LongStream.range(0, 2).toArray()).getClass()),
+        CollectionSerializers.BitSetSerializer.class);
+    serDe(getJavaFory(), BitSet.valueOf(LongStream.range(0, 128).toArray()));
+    Assert.assertEquals(
+        getJavaFory()
+            .getTypeResolver()
+            .getSerializerClass(BitSet.valueOf(LongStream.range(0, 128).toArray()).getClass()),
+        CollectionSerializers.BitSetSerializer.class);
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void tesBitSetSerializer(Fory fory) {
+    copyCheck(fory, BitSet.valueOf(LongStream.range(0, 2).toArray()));
+    copyCheck(fory, BitSet.valueOf(LongStream.range(0, 128).toArray()));
+  }
+
+  @Test
+  public void tesPriorityQueueSerializer() {
+    serDe(getJavaFory(), new PriorityQueue<>(Arrays.asList("a", "b", "c")));
+    Assert.assertEquals(
+        getJavaFory().getTypeResolver().getSerializerClass(PriorityQueue.class),
+        CollectionSerializers.PriorityQueueSerializer.class);
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void tesPriorityQueueSerializer(Fory fory) {
+    ImmutableList<String> list = ImmutableList.of("a", "b", "c");
+    PriorityQueue<String> copy = fory.copy(new PriorityQueue<>(list));
+    Assert.assertEquals(ImmutableList.sortedCopyOf(copy), list);
+  }
+
+  private List<SortedSetConstructorCase> treeSetConstructorCases() {
+    return Arrays.asList(
+        new SortedSetConstructorCase(
+            "TreeSet()",
+            TreeSet.class,
+            false,
+            NATURAL_SORT_ORDER,
+            () -> {
+              TreeSet<String> set = new TreeSet<>();
+              set.addAll(sortedCollectionInput());
+              return set;
+            }),
+        new SortedSetConstructorCase(
+            "TreeSet(Comparator)",
+            TreeSet.class,
+            true,
+            LENGTH_SORT_ORDER,
+            () -> {
+              TreeSet<String> set = new TreeSet<>(new LengthThenNaturalComparator());
+              set.addAll(sortedCollectionInput());
+              return set;
+            }),
+        new SortedSetConstructorCase(
+            "TreeSet(Collection)",
+            TreeSet.class,
+            false,
+            NATURAL_SORT_ORDER,
+            () -> new TreeSet<>(new ArrayList<>(sortedCollectionInput()))),
+        new SortedSetConstructorCase(
+            "TreeSet(SortedSet)",
+            TreeSet.class,
+            true,
+            LENGTH_SORT_ORDER,
+            () -> new TreeSet<>(newComparatorSortedSetSource())));
+  }
+
+  private List<SortedSetConstructorCase> concurrentSkipListSetConstructorCases() {
+    return Arrays.asList(
+        new SortedSetConstructorCase(
+            "ConcurrentSkipListSet()",
+            ConcurrentSkipListSet.class,
+            false,
+            NATURAL_SORT_ORDER,
+            () -> {
+              ConcurrentSkipListSet<String> set = new ConcurrentSkipListSet<>();
+              set.addAll(sortedCollectionInput());
+              return set;
+            }),
+        new SortedSetConstructorCase(
+            "ConcurrentSkipListSet(Comparator)",
+            ConcurrentSkipListSet.class,
+            true,
+            LENGTH_SORT_ORDER,
+            () -> {
+              ConcurrentSkipListSet<String> set =
+                  new ConcurrentSkipListSet<>(new LengthThenNaturalComparator());
+              set.addAll(sortedCollectionInput());
+              return set;
+            }),
+        new SortedSetConstructorCase(
+            "ConcurrentSkipListSet(Collection)",
+            ConcurrentSkipListSet.class,
+            false,
+            NATURAL_SORT_ORDER,
+            () -> new ConcurrentSkipListSet<>(new ArrayList<>(sortedCollectionInput()))),
+        new SortedSetConstructorCase(
+            "ConcurrentSkipListSet(SortedSet)",
+            ConcurrentSkipListSet.class,
+            true,
+            LENGTH_SORT_ORDER,
+            () -> new ConcurrentSkipListSet<>(newComparatorSortedSetSource())));
+  }
+
+  private List<PriorityQueueConstructorCase> priorityQueueConstructorCases() {
+    return Arrays.asList(
+        new PriorityQueueConstructorCase(
+            "PriorityQueue()",
+            false,
+            NATURAL_SORT_ORDER,
+            () -> {
+              PriorityQueue<String> queue = new PriorityQueue<>();
+              queue.addAll(sortedCollectionInput());
+              return queue;
+            }),
+        new PriorityQueueConstructorCase(
+            "PriorityQueue(int)",
+            false,
+            NATURAL_SORT_ORDER,
+            () -> {
+              PriorityQueue<String> queue = new PriorityQueue<>(32);
+              queue.addAll(sortedCollectionInput());
+              return queue;
+            }),
+        new PriorityQueueConstructorCase(
+            "PriorityQueue(Comparator)",
+            true,
+            LENGTH_SORT_ORDER,
+            () -> {
+              PriorityQueue<String> queue = new PriorityQueue<>(new LengthThenNaturalComparator());
+              queue.addAll(sortedCollectionInput());
+              return queue;
+            }),
+        new PriorityQueueConstructorCase(
+            "PriorityQueue(int, Comparator)",
+            true,
+            LENGTH_SORT_ORDER,
+            () -> {
+              PriorityQueue<String> queue =
+                  new PriorityQueue<>(32, new LengthThenNaturalComparator());
+              queue.addAll(sortedCollectionInput());
+              return queue;
+            }),
+        new PriorityQueueConstructorCase(
+            "PriorityQueue(Collection)",
+            false,
+            NATURAL_SORT_ORDER,
+            () -> new PriorityQueue<>(new ArrayList<>(sortedCollectionInput()))),
+        new PriorityQueueConstructorCase(
+            "PriorityQueue(PriorityQueue)",
+            true,
+            LENGTH_SORT_ORDER,
+            () -> new PriorityQueue<>(newComparatorPriorityQueueSource())),
+        new PriorityQueueConstructorCase(
+            "PriorityQueue(SortedSet)",
+            true,
+            LENGTH_SORT_ORDER,
+            () -> new PriorityQueue<>(newComparatorSortedSetSource())));
+  }
+
+  private void assertSortedSetState(SortedSetConstructorCase testCase, SortedSet<String> set) {
+    Assert.assertEquals(set.getClass(), testCase.expectedType, testCase.name);
+    Assert.assertEquals(new ArrayList<>(set), testCase.expectedOrder, testCase.name);
+    if (testCase.comparatorExpected) {
+      Assert.assertNotNull(set.comparator(), testCase.name);
+      Assert.assertEquals(
+          set.comparator().getClass(), LengthThenNaturalComparator.class, testCase.name);
+    } else {
+      Assert.assertNull(set.comparator(), testCase.name);
+    }
+  }
+
+  private void assertPriorityQueueState(
+      PriorityQueueConstructorCase testCase, PriorityQueue<String> queue) {
+    Assert.assertEquals(queue.getClass(), PriorityQueue.class, testCase.name);
+    Assert.assertEquals(drainPriorityQueue(queue), testCase.expectedOrder, testCase.name);
+    if (testCase.comparatorExpected) {
+      Assert.assertNotNull(queue.comparator(), testCase.name);
+      Assert.assertEquals(
+          queue.comparator().getClass(), LengthThenNaturalComparator.class, testCase.name);
+    } else {
+      Assert.assertNull(queue.comparator(), testCase.name);
+    }
+  }
+
+  private static PriorityQueue<String> newComparatorPriorityQueueSource() {
+    PriorityQueue<String> queue = new PriorityQueue<>(new LengthThenNaturalComparator());
+    queue.addAll(sortedCollectionInput());
+    return queue;
+  }
+
+  private static SortedSet<String> newComparatorSortedSetSource() {
+    SortedSet<String> set = new TreeSet<>(new LengthThenNaturalComparator());
+    set.addAll(sortedCollectionInput());
+    return set;
+  }
+
+  private static List<String> drainPriorityQueue(PriorityQueue<String> queue) {
+    PriorityQueue<String> copy = new PriorityQueue<>(queue);
+    List<String> ordered = new ArrayList<>(copy.size());
+    while (!copy.isEmpty()) {
+      ordered.add(copy.poll());
+    }
+    return ordered;
+  }
+
+  private static List<String> sortedCollectionInput() {
+    return new ArrayList<>(SORTED_COLLECTION_INPUT);
+  }
+
+  @Test
+  public void testCopyOnWriteArrayList() {
+    final CopyOnWriteArrayList<String> list =
+        new CopyOnWriteArrayList<>(new String[] {"a", "b", "c"});
+    Assert.assertEquals(list, serDe(getJavaFory(), list));
+    Assert.assertEquals(
+        getJavaFory().getTypeResolver().getSerializerClass(CopyOnWriteArrayList.class),
+        CollectionSerializers.CopyOnWriteArrayListSerializer.class);
+  }
+
+  @EqualsAndHashCode
+  public static class NestedCopyOnWriteArrayList {
+    private final CopyOnWriteArrayList<String> list;
+
+    public NestedCopyOnWriteArrayList(CopyOnWriteArrayList<String> list) {
+      this.list = list;
+    }
+  }
+
+  @Test
+  public void testCopyOnWriteArrayListNested() {
+    final CopyOnWriteArrayList<String> list =
+        new CopyOnWriteArrayList<>(Arrays.asList("a", "b", "c"));
+    NestedCopyOnWriteArrayList nestedObject = new NestedCopyOnWriteArrayList(list);
+    Assert.assertEquals(nestedObject, serDe(getJavaFory(), nestedObject));
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testCopyOnWriteArrayList(Fory fory) {
+    final CopyOnWriteArrayList<Object> list =
+        new CopyOnWriteArrayList<>(new Object[] {"a", "b", Cyclic.create(true)});
+    copyCheck(fory, list);
+  }
+
+  @Data
+  public static class CollectionViewTestStruct {
+    Collection<String> collection;
+    Set<String> set;
+
+    public CollectionViewTestStruct(Collection<String> collection, Set<String> set) {
+      this.collection = collection;
+      this.set = set;
+    }
+  }
+
+  @Test(dataProvider = "javaFory")
+  public void testSetFromMap(Fory fory) {
+    Set<String> set = Collections.newSetFromMap(Maps.newConcurrentMap());
+    set.add("a");
+    set.add("b");
+    set.add("c");
+    serDeCheck(fory, set);
+    Assert.assertEquals(
+        fory.getTypeResolver().getSerializerClass(set.getClass()),
+        CollectionSerializers.SetFromMapSerializer.class);
+    CollectionViewTestStruct struct1 = serDeCheck(fory, new CollectionViewTestStruct(set, set));
+    if (fory.getConfig().trackingRef()) {
+      assertSame(struct1.collection, struct1.set);
+    }
+    set = Collections.newSetFromMap(new HashMap<String, Boolean>() {});
+    set.add("a");
+    set.add("b");
+    serDeCheck(fory, set);
+    CollectionViewTestStruct struct2 = serDeCheck(fory, new CollectionViewTestStruct(set, set));
+    if (fory.getConfig().trackingRef()) {
+      assertSame(struct2.collection, struct2.set);
+    }
+    Map<String, Boolean> synchronizedMap = Collections.synchronizedMap(new HashMap<>());
+    set = Collections.newSetFromMap(synchronizedMap);
+    set.add("a");
+    set.add("b");
+    serDeCheck(fory, set);
+  }
+
+  @Test
+  public void testSetFromMapExternalizableRefs() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(true)
+            .withCodegen(false)
+            .requireClassRegistration(true)
+            .suppressClassRegistrationWarnings(true)
+            .withCompatible(false)
+            .build();
+    fory.register(ExternalizableSetFromMapHolder.class);
+    fory.register(RefMarker.class);
+
+    Set<String> set = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    RefMarker marker = new RefMarker("after-set");
+    ExternalizableSetFromMapHolder holder = new ExternalizableSetFromMapHolder(set, marker, marker);
+
+    ExternalizableSetFromMapHolder deserialized = serDe(fory, holder);
+    assertSame(deserialized.after, deserialized.afterAgain);
+  }
+
+  public static final class ExternalizableSetFromMapHolder implements Externalizable {
+    private Set<?> set;
+    private RefMarker after;
+    private RefMarker afterAgain;
+
+    public ExternalizableSetFromMapHolder() {}
+
+    private ExternalizableSetFromMapHolder(Set<?> set, RefMarker after, RefMarker afterAgain) {
+      this.set = set;
+      this.after = after;
+      this.afterAgain = afterAgain;
+    }
+
+    @Override
+    public void writeExternal(ObjectOutput out) throws IOException {
+      out.writeObject(set);
+      out.writeObject(after);
+      out.writeObject(afterAgain);
+    }
+
+    @Override
+    public void readExternal(ObjectInput in) throws IOException, ClassNotFoundException {
+      set = (Set<?>) in.readObject();
+      after = (RefMarker) in.readObject();
+      afterAgain = (RefMarker) in.readObject();
+    }
+  }
+
+  public static final class RefMarker {
+    private String value;
+
+    public RefMarker() {}
+
+    private RefMarker(String value) {
+      this.value = value;
+    }
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testSetFromMapCopy(Fory fory) throws Exception {
+    final Set<Object> set = Collections.newSetFromMap(Maps.newConcurrentMap());
+    set.add("a");
+    set.add("b");
+    set.add(Cyclic.create(true));
+    copyCheck(fory, set);
+
+    final Map<Object, Boolean> synchronizedMap = Collections.synchronizedMap(new HashMap<>());
+    final Set<Object> synchronizedSet = Collections.newSetFromMap(synchronizedMap);
+    synchronizedSet.add("a");
+    synchronizedSet.add("b");
+    synchronizedSet.add(Cyclic.create(true));
+    Set<?> copied = fory.copy(synchronizedSet);
+    assertEquals(copied, synchronizedSet);
+    if (MemoryUtils.JDK_COLLECTION_FIELD_ACCESS) {
+      assertEquals(setFromMapBackingMap(copied).getClass(), synchronizedMap.getClass());
+    }
+  }
+
+  private static Map<?, Boolean> setFromMapBackingMap(Set<?> set) throws Exception {
+    Field mapField = set.getClass().getDeclaredField("m");
+    return (Map<?, Boolean>) FieldAccessor.createAccessor(mapField).getObject(set);
+  }
+
+  @Test(dataProvider = "javaFory")
+  public void testConcurrentMapKeySetViewMap(Fory fory) {
+    final ConcurrentHashMap.KeySetView<String, Boolean> set = ConcurrentHashMap.newKeySet();
+    set.add("a");
+    set.add("b");
+    set.add("c");
+    Assert.assertEquals(set, serDe(fory, set));
+    Assert.assertEquals(
+        fory.getTypeResolver().getSerializerClass(set.getClass()),
+        CollectionSerializers.ConcurrentHashMapKeySetViewSerializer.class);
+    CollectionViewTestStruct o = serDeCheck(fory, new CollectionViewTestStruct(set, set));
+    if (fory.getConfig().trackingRef()) {
+      assertSame(o.collection, o.set);
+    }
+    ConcurrentHashMap<String, String> map = new ConcurrentHashMap<>();
+    map.put("k1", "v1");
+    if (fory.getConfig().trackingRef()) {
+      ArrayList<Serializable> list = serDeCheck(fory, ofArrayList(map.keySet("v0"), map));
+      assertSame(((ConcurrentHashMap.KeySetView) (list.get(0))).getMap(), list.get(1));
+    }
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testConcurrentMapKeySetViewMapCopy(Fory fory) {
+    final ConcurrentHashMap.KeySetView<Object, Boolean> set = ConcurrentHashMap.newKeySet();
+    set.add("a");
+    set.add("b");
+    set.add(Cyclic.create(true));
+    copyCheck(fory, set);
+  }
+
+  @Test
+  public void testSerializeJavaBlockingQueue() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(true)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    {
+      ArrayBlockingQueue<Integer> queue = new ArrayBlockingQueue<>(3);
+      queue.add(1);
+      queue.add(2);
+      queue.add(3);
+      ArrayBlockingQueue<Integer> deserialized = serDe(fory, queue);
+      assertEquals(new ArrayList<>(deserialized), new ArrayList<>(queue));
+      assertEquals(deserialized.remainingCapacity() + deserialized.size(), 3);
+    }
+    {
+      LinkedBlockingQueue<Integer> queue = new LinkedBlockingQueue<>(3);
+      queue.add(1);
+      queue.add(2);
+      queue.add(3);
+      LinkedBlockingQueue<Integer> deserialized = serDe(fory, queue);
+      assertEquals(new ArrayList<>(deserialized), new ArrayList<>(queue));
+      assertEquals(deserialized.remainingCapacity() + deserialized.size(), 3);
+    }
+    {
+      LinkedBlockingQueue<Integer> queue = new LinkedBlockingQueue<>();
+      queue.add(1);
+      queue.add(2);
+      LinkedBlockingQueue<Integer> deserialized = serDe(fory, queue);
+      assertEquals(new ArrayList<>(deserialized), new ArrayList<>(queue));
+      assertEquals(deserialized.remainingCapacity() + deserialized.size(), Integer.MAX_VALUE);
+    }
+  }
+
+  @Test
+  public void testBlockingQueueBadCapacity() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(true)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    CollectionSerializers.LinkedBlockingQueueSerializer linkedSerializer =
+        new CollectionSerializers.LinkedBlockingQueueSerializer(
+            fory.getTypeResolver(), LinkedBlockingQueue.class);
+
+    MemoryBuffer undersizedCapacity = MemoryUtils.buffer(8);
+    undersizedCapacity.writeVarUInt32Small7(2);
+    undersizedCapacity.writeVarUInt32Small7(1);
+    Assert.expectThrows(
+        DeserializationException.class,
+        () ->
+            withReadContext(
+                fory,
+                undersizedCapacity,
+                context -> linkedSerializer.newCollection(context, false)));
+
+    CollectionSerializers.ArrayBlockingQueueSerializer arraySerializer =
+        new CollectionSerializers.ArrayBlockingQueueSerializer(
+            fory.getTypeResolver(), ArrayBlockingQueue.class);
+    MemoryBuffer sparseCapacity = MemoryUtils.buffer(8);
+    sparseCapacity.writeVarUInt32Small7(2);
+    sparseCapacity.writeVarUInt32Small7(10);
+    Assert.expectThrows(
+        IndexOutOfBoundsException.class,
+        () ->
+            withReadContext(
+                fory, sparseCapacity, context -> arraySerializer.newCollection(context, false)));
+  }
+
+  @Test
+  public void testCollectionReadRequiresBodyByte() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(true)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    CollectionSerializers.ArrayListSerializer serializer =
+        new CollectionSerializers.ArrayListSerializer(fory.getTypeResolver());
+    MemoryBuffer buffer = MemoryUtils.buffer(8);
+    buffer.writeVarUInt32Small7(2);
+    Assert.expectThrows(
+        IndexOutOfBoundsException.class,
+        () -> withReadContext(fory, buffer, context -> serializer.newCollection(context, false)));
+  }
+
+  @Test
+  public void testBitSetRejectsNegativeBinary() {
+    Fory fory = Fory.builder().withXlang(false).withCompatible(false).build();
+    MemoryBuffer buffer = MemoryBuffer.newHeapBuffer(5);
+    writeNegativeDecodedVarUInt32(buffer);
+    ReadContext readContext = fory.getReadContext();
+    readContext.prepare(buffer, null, false);
+    Assert.expectThrows(
+        DeserializationException.class, () -> fory.getSerializer(BitSet.class).read(readContext));
+  }
+
+  private static void writeNegativeDecodedVarUInt32(MemoryBuffer buffer) {
+    buffer.writeByte(0x80);
+    buffer.writeByte(0x80);
+    buffer.writeByte(0x80);
+    buffer.writeByte(0x80);
+    buffer.writeByte(0x08);
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testSerializeJavaBlockingQueue(Fory fory) {
+    {
+      ArrayBlockingQueue<Integer> queue = new ArrayBlockingQueue<>(10);
+      queue.add(1);
+      queue.add(2);
+      queue.add(3);
+      ArrayBlockingQueue<Integer> copy = fory.copy(queue);
+      Assert.assertEquals(Arrays.toString(copy.toArray()), "[1, 2, 3]");
+      // Verify capacity is preserved
+      Assert.assertEquals(copy.remainingCapacity() + copy.size(), 10);
+    }
+    {
+      LinkedBlockingQueue<Integer> queue = new LinkedBlockingQueue<>(10);
+      queue.add(1);
+      queue.add(2);
+      queue.add(3);
+      LinkedBlockingQueue<Integer> copy = fory.copy(queue);
+      Assert.assertEquals(Arrays.toString(copy.toArray()), "[1, 2, 3]");
+      // Verify capacity is preserved
+      Assert.assertEquals(copy.remainingCapacity() + copy.size(), 10);
+    }
+  }
+
+  @Test
+  public void testCollectionNoJIT() {
+    Fory fory = Fory.builder().withXlang(false).withCodegen(false).withCompatible(false).build();
+    serDeCheck(fory, new ArrayList<>(ImmutableList.of("a", "b", "c")));
+    serDeCheck(fory, new ArrayList<>(ImmutableList.of(1, 2, 3)));
+    serDeCheck(fory, new ArrayList<>(ImmutableList.of("a", 1, "b", 2)));
+  }
+
+  @Data
+  public static class SimpleBeanCollectionFields {
+    public List<String> list;
+  }
+
+  @Test(dataProvider = "javaFory")
+  public void testSimpleBeanCollectionFields(Fory fory) {
+    SimpleBeanCollectionFields obj = new SimpleBeanCollectionFields();
+    obj.list = new ArrayList<>();
+    obj.list.add("a");
+    obj.list.add("b");
+    Assert.assertEquals(serDe(fory, obj).toString(), obj.toString());
+    if (fory.getConfig().isCodeGenEnabled()) {
+      Assert.assertTrue(
+          fory.getTypeResolver()
+              .getSerializerClass(SimpleBeanCollectionFields.class)
+              .getName()
+              .contains("Codec"));
+    }
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testSimpleBeanCollectionFieldsCopy(Fory fory) {
+    SimpleBeanCollectionFields obj = new SimpleBeanCollectionFields();
+    obj.list = new ArrayList<>();
+    obj.list.add("a");
+    obj.list.add("b");
+    Assert.assertEquals(fory.copy(obj).toString(), obj.toString());
+  }
+
+  @Data
+  @AllArgsConstructor
+  public static class NotFinal {
+    int f1;
+  }
+
+  @Data
+  public static class Container {
+    public List<NotFinal> list1;
+    public Map<String, NotFinal> map1;
+  }
+
+  @Test(dataProvider = "javaFory")
+  public void testContainer(Fory fory) {
+    Container container = new Container();
+    container.list1 = ofArrayList(new NotFinal(1));
+    container.map1 = ofHashMap("k", new NotFinal(2));
+    serDeCheck(fory, container);
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testContainerCopy(Fory fory) {
+    Container container = new Container();
+    container.list1 = ofArrayList(new NotFinal(1));
+    container.map1 = ofHashMap("k", new NotFinal(2));
+    copyCheck(fory, container);
+  }
+
+  @Data
+  public static class CollectionFieldsClass {
+    public ArrayList<String> arrayList;
+    public List<String> arrayList2;
+    public Collection<String> arrayList3;
+    public List<String> arrayAsList;
+    public Collection<String> arrayAsList2;
+    public LinkedList<String> linkedList;
+    public List<String> linkedList2;
+    public Collection<String> linkedList3;
+    public HashSet<String> hashSet;
+    public Set<String> hashSet2;
+    public LinkedHashSet<String> linkedHashSet;
+    public Set<String> linkedHashSet2;
+    public TreeSet<String> treeSet;
+    public SortedSet<String> treeSet2;
+    public ConcurrentSkipListSet<String> skipListSet;
+    public Set<String> skipListSet2;
+    public Vector<String> vector;
+    public List<String> vector2;
+    public ArrayDeque<Integer> arrayDeque;
+    public Collection<Integer> arrayDeque2;
+    public BitSet bitSet1;
+    public BitSet bitSet2;
+    public PriorityQueue<String> priorityQueue;
+    public Collection<String> priorityQueue2;
+    public EnumSet<TestEnum> enumSet1;
+    public EnumSet<TestEnum> enumSet2;
+    public List<String> emptyList1;
+    public Set<String> emptySet1;
+    // TODO add support for common empty
+    public Set<String> emptySortedSet;
+    public List<String> singleList1;
+    public Set<String> singleSet1;
+  }
+
+  public static CollectionFieldsClass createCollectionFieldsObject() {
+    CollectionFieldsClass obj = new CollectionFieldsClass();
+    ArrayList<String> arrayList = new ArrayList<>(ImmutableList.of("a", "b"));
+    obj.arrayList = arrayList;
+    obj.arrayList2 = arrayList;
+    obj.arrayList3 = arrayList;
+    obj.arrayAsList = Arrays.asList("a", "b");
+    obj.arrayAsList2 = Arrays.asList("a", "b");
+    LinkedList<String> linkedList = new LinkedList<>(Arrays.asList("a", "b"));
+    obj.linkedList = linkedList;
+    obj.linkedList2 = linkedList;
+    obj.linkedList3 = linkedList;
+    HashSet<String> hashSet = new HashSet<>(ImmutableSet.of("a", "b"));
+    obj.hashSet = hashSet;
+    obj.hashSet2 = hashSet;
+    obj.linkedHashSet = new LinkedHashSet<>(hashSet);
+    obj.linkedHashSet2 = new LinkedHashSet<>(hashSet);
+    obj.treeSet = new TreeSet<>(hashSet);
+    obj.treeSet2 = new TreeSet<>(hashSet);
+    ConcurrentSkipListSet<String> skipListSet =
+        new ConcurrentSkipListSet<>(Arrays.asList("a", "b", "c"));
+    obj.skipListSet = skipListSet;
+    obj.skipListSet2 = skipListSet;
+    Vector<String> vector = new Vector<>(Arrays.asList("a", "b", "c"));
+    obj.vector = vector;
+    obj.vector2 = vector;
+    ArrayDeque<Integer> arrayDeque = new ArrayDeque<>(Arrays.asList(1, 2));
+    obj.arrayDeque = arrayDeque;
+    obj.arrayDeque2 = arrayDeque;
+    obj.bitSet1 = BitSet.valueOf(LongStream.range(0, 2).toArray());
+    obj.bitSet2 = BitSet.valueOf(LongStream.range(0, 128).toArray());
+    PriorityQueue<String> priorityQueue = new PriorityQueue<>(Arrays.asList("a", "b", "c"));
+    obj.priorityQueue = priorityQueue;
+    obj.priorityQueue2 = priorityQueue;
+    obj.enumSet1 = EnumSet.allOf(TestEnum.class);
+    obj.enumSet2 = EnumSet.of(TestEnum.A);
+    obj.emptyList1 = Collections.emptyList();
+    obj.emptySet1 = Collections.emptySet();
+    obj.emptySortedSet = Collections.emptySortedSet();
+    obj.singleList1 = Collections.singletonList("");
+    obj.singleSet1 = Collections.singleton("");
+    return obj;
+  }
+
+  public static void testCollectionFieldsObjectEqual(
+      CollectionFieldsClass got, CollectionFieldsClass obj) throws IllegalAccessException {
+    // Fields that can cause flakiness need to be compared separately
+    Set<String> special = ImmutableSet.of("hashSet", "hashSet2", "priorityQueue", "priorityQueue2");
+    // Compare fields with deterministic ordering
+    for (Field f : CollectionSerializersTest.CollectionFieldsClass.class.getDeclaredFields()) {
+      if (special.contains(f.getName())) continue;
+      f.setAccessible(true);
+      Object gv = f.get(got);
+      Object ov = f.get(obj);
+      Assert.assertEquals(String.valueOf(gv), String.valueOf(ov));
+    }
+    // Compare everything else
+    String hsGot = new TreeSet<>(got.hashSet).toString();
+    String hsObj = new TreeSet<>(obj.hashSet).toString();
+    Assert.assertEquals(hsGot, hsObj);
+    hsGot = new TreeSet<>(got.hashSet2).toString();
+    hsObj = new TreeSet<>(obj.hashSet2).toString();
+    Assert.assertEquals(hsGot, hsObj);
+    List<String> pqGot = new ArrayList<>(got.priorityQueue);
+    List<String> pqExp = new ArrayList<>(obj.priorityQueue);
+    Collections.sort(pqGot);
+    Collections.sort(pqExp);
+    Assert.assertEquals(pqGot.toString(), pqExp.toString());
+    pqGot = new ArrayList<>(got.priorityQueue2);
+    pqExp = new ArrayList<>(obj.priorityQueue2);
+    Collections.sort(pqGot);
+    Collections.sort(pqExp);
+    Assert.assertEquals(pqGot.toString(), pqExp.toString());
+  }
+
+  @Test(dataProvider = "javaFory")
+  public void testCollectionFieldSerializers(Fory fory) throws Exception {
+    CollectionFieldsClass obj = createCollectionFieldsObject();
+    testCollectionFieldsObjectEqual(serDe(fory, obj), obj);
+    if (fory.getConfig().isCodeGenEnabled()) {
+      Assert.assertTrue(
+          fory.getTypeResolver()
+              .getSerializerClass(CollectionFieldsClass.class)
+              .getName()
+              .contains("Codec"));
+    }
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testCollectionFieldSerializersCopy(Fory fory) throws Exception {
+    CollectionFieldsClass obj = createCollectionFieldsObject();
+    testCollectionFieldsObjectEqual(fory.copy(obj), obj);
+  }
+
+  @Data
+  @AllArgsConstructor
+  public static class NestedCollection1 {
+    public List<Collection<Integer>> list1;
+  }
+
+  @Test(dataProvider = "javaFory")
+  public void testNestedCollection1(Fory fory) {
+    ArrayList<Integer> list = ofArrayList(1, 2);
+    NestedCollection1 o = new NestedCollection1(ofArrayList(list));
+    Assert.assertEquals(serDe(fory, o), o);
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testNestedCollection1Copy(Fory fory) {
+    ArrayList<Integer> list = ofArrayList(1, 2);
+    NestedCollection1 o = new NestedCollection1(ofArrayList(list));
+    copyCheck(fory, o);
+  }
+
+  @Data
+  @AllArgsConstructor
+  public static class NestedCollection2 {
+    public List<Collection<Collection<Integer>>> list1;
+  }
+
+  @Test(dataProvider = "javaFory")
+  public void testNestedCollection2(Fory fory) {
+    ArrayList<Integer> list = ofArrayList(1, 2);
+    NestedCollection2 o = new NestedCollection2(ofArrayList(ofArrayList(list)));
+    Assert.assertEquals(serDe(fory, o), o);
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testNestedCollection2Copy(Fory fory) {
+    ArrayList<Integer> list = ofArrayList(1, 2);
+    NestedCollection2 o = new NestedCollection2(ofArrayList(ofArrayList(list)));
+    copyCheck(fory, o);
+  }
+
+  public static class TestClassForDefaultCollectionSerializer extends AbstractCollection<String> {
+    private final List<String> data;
+
+    public TestClassForDefaultCollectionSerializer() {
+      this(new ArrayList<>());
+    }
+
+    public TestClassForDefaultCollectionSerializer(List<String> data) {
+      this.data = data;
+    }
+
+    @Override
+    public Iterator<String> iterator() {
+      return data.iterator();
+    }
+
+    @Override
+    public int size() {
+      return data.size();
+    }
+
+    @Override
+    public boolean add(String s) {
+      return data.add(s);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (o == null || getClass() != o.getClass()) return false;
+      TestClassForDefaultCollectionSerializer strings = (TestClassForDefaultCollectionSerializer) o;
+      return Objects.equals(data, strings.data);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hashCode(data);
+    }
+  }
+
+  @Test
+  public void testDefaultCollectionSerializer() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    TestClassForDefaultCollectionSerializer collection =
+        new TestClassForDefaultCollectionSerializer();
+    collection.add("a");
+    collection.add("b");
+    serDeCheck(fory, collection);
+    Assert.assertSame(
+        fory.getTypeResolver().getSerializerClass(TestClassForDefaultCollectionSerializer.class),
+        CollectionSerializers.DefaultJavaCollectionSerializer.class);
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testDefaultCollectionSerializer(Fory fory) {
+    TestClassForDefaultCollectionSerializer collection =
+        new TestClassForDefaultCollectionSerializer();
+    collection.add("a");
+    collection.add("b");
+    copyCheck(fory, collection);
+  }
+
+  @Test
+  public void testDefaultCollectionAsyncCompile() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withCompatible(true)
+            .withCodegen(true)
+            .withAsyncCompilation(true)
+            .requireClassRegistration(false)
+            .build();
+    fory.register(TestClassForDefaultCollectionSerializer.class);
+    fory.ensureSerializersCompiled();
+
+    TestClassForDefaultCollectionSerializer collection =
+        new TestClassForDefaultCollectionSerializer();
+    collection.add("a");
+    collection.add("b");
+    Assert.assertSame(
+        fory.getTypeResolver().getSerializerClass(TestClassForDefaultCollectionSerializer.class),
+        CollectionSerializers.DefaultJavaCollectionSerializer.class);
+    serDeCheck(fory, collection);
+  }
+
+  @SuppressWarnings("unchecked")
+  @Test
+  public void testJavaSerialization() {
+    ImmutableSortedSet<Integer> set = ImmutableSortedSet.of(1, 2, 3);
+    Class<? extends ImmutableSortedSet> setClass = set.getClass();
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(false)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    MemoryBuffer buffer = MemoryUtils.buffer(32);
+    JDKCompatibleCollectionSerializer javaSerializer =
+        new JDKCompatibleCollectionSerializer(fory.getTypeResolver(), setClass);
+    writeSerializer(fory, javaSerializer, buffer, set);
+    Object read = readSerializer(fory, javaSerializer, buffer);
+    assertEquals(set, read);
+
+    assertSame(
+        fory.getTypeResolver().getSerializer(setClass).getClass(),
+        GuavaCollectionSerializers.ImmutableSortedSetSerializer.class);
+    buffer.writerIndex(0);
+    buffer.readerIndex(0);
+    assertEquals(set, fory.deserialize(fory.serialize(buffer, set)));
+  }
+
+  @Test
+  public void testGuavaListOwnerBudget() {
+    ImmutableList<String> list = ImmutableList.of("fory");
+    int ownerBytes = GraphMemoryEstimates.shallowObjectBytes(list.getClass());
+    long requiredBytes = ownerBytes + GraphMemoryEstimates.REFERENCE_BYTES;
+    MemoryBuffer buffer = MemoryUtils.buffer(32);
+    Fory fory = graphBudgetFory(requiredBytes);
+    GuavaCollectionSerializers.ImmutableListSerializer serializer =
+        new GuavaCollectionSerializers.ImmutableListSerializer(
+            fory.getTypeResolver(), SingletonListSlot.class, ownerBytes);
+    writeSerializer(fory, serializer, buffer, list);
+
+    Fory limitedFory = graphBudgetFory(requiredBytes - 1);
+    GuavaCollectionSerializers.ImmutableListSerializer limitedSerializer =
+        new GuavaCollectionSerializers.ImmutableListSerializer(
+            limitedFory.getTypeResolver(), SingletonListSlot.class, ownerBytes);
+    Assert.assertThrows(
+        InsecureException.class, () -> readSerializer(limitedFory, limitedSerializer, buffer));
+    buffer.readerIndex(0);
+    assertEquals(readSerializer(fory, serializer, buffer), list);
+  }
+
+  @Test
+  public void testGuavaBiMapOwnerBudget() {
+    ImmutableBiMap<String, Integer> biMap = ImmutableBiMap.of("fory", 1);
+    int ownerBytes = GraphMemoryEstimates.shallowObjectBytes(biMap.getClass());
+    long requiredBytes = ownerBytes + 2L * GraphMemoryEstimates.REFERENCE_BYTES;
+    MemoryBuffer buffer = MemoryUtils.buffer(32);
+    Fory fory = graphBudgetFory(requiredBytes);
+    GuavaCollectionSerializers.ImmutableBiMapSerializer serializer =
+        new GuavaCollectionSerializers.ImmutableBiMapSerializer(
+            fory.getTypeResolver(), SingletonBiMapSlot.class, ownerBytes);
+    writeSerializer(fory, serializer, buffer, biMap);
+
+    Fory limitedFory = graphBudgetFory(requiredBytes - 1);
+    GuavaCollectionSerializers.ImmutableBiMapSerializer limitedSerializer =
+        new GuavaCollectionSerializers.ImmutableBiMapSerializer(
+            limitedFory.getTypeResolver(), SingletonBiMapSlot.class, ownerBytes);
+    Assert.assertThrows(
+        InsecureException.class, () -> readSerializer(limitedFory, limitedSerializer, buffer));
+    buffer.readerIndex(0);
+    assertEquals(readSerializer(fory, serializer, buffer), biMap);
+  }
+
+  private static Fory graphBudgetFory(long maxGraphMemoryBytes) {
+    return Fory.builder()
+        .withXlang(false)
+        .registerGuavaTypes(true)
+        .requireClassRegistration(false)
+        .suppressClassRegistrationWarnings(true)
+        .withCompatible(false)
+        .withMaxGraphMemoryBytes(maxGraphMemoryBytes)
+        .build();
+  }
+
+  private static final class SingletonListSlot {}
+
+  private static final class SingletonBiMapSlot {}
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testJavaSerialization(Fory fory) {
+    ImmutableSortedSet<Integer> set = ImmutableSortedSet.of(1, 2, 3);
+    Class<? extends ImmutableSortedSet> setClass = set.getClass();
+    JDKCompatibleCollectionSerializer javaSerializer =
+        new JDKCompatibleCollectionSerializer(fory.getTypeResolver(), setClass);
+    Object copy = withCopyContext(fory, context -> javaSerializer.copy(context, set));
+    assertEquals(set, copy);
+    Assert.assertNotSame(set, copy);
+  }
+
+  public static class SubListSerializer extends CollectionSerializer {
+
+    public SubListSerializer(TypeResolver typeResolver, Class cls) {
+      super(typeResolver, cls, true);
+    }
+
+    @Override
+    public Collection newCollection(ReadContext readContext, boolean elementReadAlwaysAdvances) {
+      MemoryBuffer buffer = readContext.getBuffer();
+      int numElements = buffer.readVarUInt32();
+      setNumElements(numElements);
+      return new ArrayList<>(numElements);
+    }
+  }
+
+  @Test
+  public void testSubList() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .requireClassRegistration(false)
+            .withJdkClassSerializableCheck(false)
+            .withCompatible(false)
+            .build();
+    ArrayList<Integer> list = new ArrayList<>(ImmutableList.of(1, 2, 3, 4));
+    fory.registerSerializer(
+        list.subList(0, 2).getClass(),
+        new SubListSerializer(fory.getTypeResolver(), list.subList(0, 2).getClass()));
+    serDeCheck(fory, list.subList(0, 2));
+
+    //     ArrayList<Integer> list = new ArrayList<>(ImmutableList.of(1, 2, 3, 4));
+    //     ByteArrayOutputStream bas = new ByteArrayOutputStream();
+    //     Hessian2Output hessian2Output = new Hessian2Output(bas);
+    //     serialize(hessian2Output, list.subList(0 ,2));
+    //     Object o = deserialize(new Hessian2Input(new ByteArrayInputStream(bas.toByteArray())));
+    //     System.out.println(o.getClass());
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void testCollectionNullElements(boolean refTracking) {
+    // When serialize a collection with all elements null directly, the declare type
+    // will be equal to element type: null
+    List data = new ArrayList<>();
+    data.add(null);
+    Fory f =
+        Fory.builder().withXlang(false).withRefTracking(refTracking).withCompatible(false).build();
+    serDeCheck(f, data);
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testCollectionNullElements(Fory fory) {
+    List data = new ArrayList<>();
+    data.add(null);
+    copyCheck(fory, data);
+  }
+
+  @Data
+  abstract static class Foo {
+    private int f1;
+  }
+
+  static class Foo1 extends Foo {}
+
+  @Data
+  static class CollectionAbstractTest {
+    private List<Foo> fooList;
+  }
+
+  @Test(dataProvider = "enableCodegen")
+  public void testAbstractCollectionElementsSerde(boolean enableCodegen) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withCodegen(enableCodegen)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    {
+      CollectionAbstractTest test = new CollectionAbstractTest();
+      test.fooList = new ArrayList<>(ImmutableList.of(new Foo1(), new Foo1()));
+      serDeCheck(fory, test);
+    }
+    {
+      CollectionAbstractTest test = new CollectionAbstractTest();
+      test.fooList = new ArrayList<>(ofArrayList(new Foo1(), new Foo1()));
+      serDeCheck(fory, test);
+    }
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testAbstractCollectionElementsCopy(Fory fory) {
+    {
+      CollectionAbstractTest test = new CollectionAbstractTest();
+      test.fooList = new ArrayList<>(ImmutableList.of(new Foo1(), new Foo1()));
+      copyCheck(fory, test);
+    }
+    {
+      CollectionAbstractTest test = new CollectionAbstractTest();
+      test.fooList = new ArrayList<>(ofArrayList(new Foo1(), new Foo1()));
+      copyCheck(fory, test);
+    }
+  }
+
+  @Test(dataProvider = "enableCodegen")
+  public void testCollectionAllNullElements(boolean enableCodegen) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withCodegen(true)
+            .withRefTracking(true)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    List<Foo> fooList = new ArrayList<>();
+    fooList.add(null);
+    // serDeCheck(fory, fooList);
+
+    CollectionAbstractTest obj = new CollectionAbstractTest();
+    // fill elemTypeCache
+    obj.fooList = ofArrayList(new Foo1());
+    serDeCheck(fory, obj);
+
+    obj.fooList = fooList;
+    serDeCheck(fory, obj);
+
+    fory =
+        Fory.builder()
+            .withXlang(false)
+            .withCodegen(enableCodegen)
+            .withRefTracking(true)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    serDeCheck(fory, obj);
+  }
+
+  @Test
+  public void testCopyOnWriteArraySet() {
+    final CopyOnWriteArraySet<String> set =
+        new CopyOnWriteArraySet<>(Arrays.asList("Value1", "Value2"));
+    Assert.assertEquals(set, serDe(getJavaFory(), set));
+    Assert.assertEquals(
+        getJavaFory().getTypeResolver().getSerializerClass(CopyOnWriteArraySet.class),
+        CollectionSerializers.CopyOnWriteArraySetSerializer.class);
+  }
+
+  @Test(dataProvider = "foryCopyConfig")
+  public void testCopyOnWriteArraySet(Fory fory) {
+    final CopyOnWriteArraySet<Object> set =
+        new CopyOnWriteArraySet<>(Arrays.asList("a", "b", Cyclic.create(true)));
+    copyCheck(fory, set);
+  }
+}

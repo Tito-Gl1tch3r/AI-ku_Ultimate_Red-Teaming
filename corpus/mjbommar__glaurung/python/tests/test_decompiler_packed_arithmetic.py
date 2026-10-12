@@ -1,0 +1,65 @@
+"""Round-trip coverage for packed integer arithmetic lowered by compilers."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(ROOT / "tests" / "decompiler_fixtures"))
+sys.path.insert(0, str(ROOT / "tools"))
+
+import fixture_harness as H  # added above
+import manifest as M  # added above
+
+pytestmark = pytest.mark.slow
+
+
+def test_clang_vectorized_byte_accumulator_round_trips() -> None:
+    """PSLLD/PSUBD must preserve the vectorized seed-times-31 calculation."""
+    observed = H.run_lanes(
+        [("11_call_shapes", "clang", "O2", ("call_accumulate_bytes",))],
+        fuzz=M.FIXTURE_FUZZ,
+        jobs=1,
+    )
+
+    lane = observed["11_call_shapes:clang:O2"]
+    assert lane == {"call_accumulate_bytes": "pass"}, lane
+
+
+def test_clang_qword_horizontal_sum_round_trips() -> None:
+    """Packed qword reduction must retain both partial sums and every carry."""
+    observed = H.run_lanes(
+        [("12_loop_rotation", "clang", "O2", ("skip_odd_sum",))],
+        fuzz=M.FIXTURE_FUZZ,
+        jobs=1,
+    )
+
+    lane = observed["12_loop_rotation:clang:O2"]
+    assert lane == {"skip_odd_sum": "pass"}, lane
+
+
+def test_clang_packed_sign_mask_round_trips() -> None:
+    """Packed arithmetic shifts must preserve signed per-element selection."""
+    observed = H.run_lanes(
+        [("03_loop_shapes", "clang", "O2", ("two_latches",))],
+        fuzz=M.FIXTURE_FUZZ,
+        jobs=1,
+    )
+
+    lane = observed["03_loop_shapes:clang:O2"]
+    assert lane == {"two_latches": "pass"}, lane
+
+
+def test_clang_packed_qword_unpack_round_trips() -> None:
+    """Low-qword unpacking must preserve every nested-pair contribution."""
+    observed = H.run_lanes(
+        [("03_loop_shapes", "clang", "O2", ("nested_pairs",))],
+        fuzz=M.FIXTURE_FUZZ,
+        jobs=1,
+    )
+
+    lane = observed["03_loop_shapes:clang:O2"]
+    assert lane == {"nested_pairs": "pass"}, lane

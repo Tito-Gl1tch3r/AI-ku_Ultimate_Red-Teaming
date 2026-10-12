@@ -1,0 +1,4345 @@
+//! SSA value numbering for the LLIR (Stage 2 of the value-model refactor —
+//! docs/history/design/plans-superseded/decompiler-refactors.md #1).
+//!
+//! Naming and typing key on the *physical register*, so a register reused for
+//! two purposes (an argument spilled then reused as a scratch integer; the
+//! return register used as an address-computation scratch and then as the
+//! result) is one variable with one type — the source of the int↔pointer
+//! conflicts and of the incorrect address folding an AST rewrite cannot avoid.
+//!
+//! This pass rewrites each physical register occurrence to a snapshot-owned,
+//! opaque value key using the already-computed [`SsaInfo`], so every SSA value
+//! becomes a distinct variable without encoding machine storage in its name.
+//! Version 0 is the implicit entry-def (a live-in
+//! parameter), which stays the bare register so downstream argument/return
+//! naming is unchanged; explicit definitions (version ≥ 1) and the uses that
+//! read them get the tagged name. Reused temporaries are split by version, and
+//! flags become typed `FlagValue` instances so a consumer names its exact
+//! reaching predicate definition.
+//!
+//! This pass is pure (returns a rewritten copy) and is validated in isolation
+//! before being threaded into the lowering pipeline.
+//!
+//! # What is in this file
+//!
+//! The four public entry points, the width bookkeeping they thread, and
+//! `insert_phi_copies` -- the step that gives every phi result an executable
+//! definition. The analyses it drives each own their own module:
+//!
+//! * `architectural_reads` -- which names a genuine machine operand reads,
+//!   with out-of-SSA plumbing excluded. Two consumers, one definition.
+//! * `parameter_slots` -- which argument slots are live-in parameters.
+//! * `keep_bare` -- which return-register definitions must stay unversioned,
+//!   and the reaching-return proofs that decide it.
+//! * `temp_remap` -- splitting a reused lifter temporary per SSA version.
+//!   Its ids reach the rendered artifact, so it carries a determinism contract.
+//! * `tagging` -- spelling one register occurrence at one SSA version.
+//! * `vreg_walk` -- the order-free mutable walk over an operation's registers.
+//! * `coalesce` -- merging the phi copies liveness and width prove removable.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+use crate::ir::call_args::CallConv;
+use crate::ir::ssa::{ssa_def_width, SsaValue, ValueId};
+use crate::ir::types::{LlirFunction, LlirInstr, Op, VReg, Value};
+use crate::ir::use_def::{def_mut, def_ref, for_each_def, for_each_use, use_count, InstrAddr};
+
+mod architectural_reads;
+mod coalesce;
+mod keep_bare;
+mod parameter_slots;
+mod tagging;
+mod temp_remap;
+mod vreg_walk;
+
+pub use coalesce::SourceRegisterLifetime;
+pub(crate) use keep_bare::{def_reaches_return, def_reaches_unresolved_return};
+pub use parameter_slots::{live_in_arg_slots_llir, live_in_arg_slots_llir_with_identities};
+pub(crate) use vreg_walk::for_each_vreg_mut;
+
+use coalesce::{coalesce_phi_copies_with_definition_sites, DefinitionWidthsBySite};
+use tagging::{key_value, tag_op, VnCtx};
+use temp_remap::build_temp_remap;
+
+/// Exact SSA identities carried beside value-numbered LLIR and its lowered AST.
+///
+/// A rendered variable may represent several non-interfering SSA values after
+/// phi-copy coalescing. Callers therefore receive an exact identity only when
+/// the numbered name has one candidate; ambiguity stays explicit rather than
+/// being guessed from a `register#version` display spelling.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ValueIdentities {
+    by_numbered_value: HashMap<VReg, BTreeSet<SsaValue>>,
+    value_id_by_ssa: HashMap<SsaValue, ValueId>,
+    definition_widths_by_value_id: HashMap<ValueId, BTreeSet<u8>>,
+    /// Values COMPUTED at 64 bits: the destination of a 64-bit arithmetic,
+    /// logical, shift or sign-extending operation. A 32-bit x86 write's
+    /// implicit zero-extension and a plain copy are deliberately absent -- the
+    /// first is a 32-bit value in a 64-bit carrier, the second has its own
+    /// source.
+    wide_computations: HashSet<ValueId>,
+    #[cfg(test)]
+    next_value_id: u32,
+    physical_bases_by_value: HashMap<VReg, BTreeSet<String>>,
+    parameter_slots_by_value: HashMap<VReg, BTreeSet<usize>>,
+    result_roles: HashSet<VReg>,
+    machine_saved_slots: HashSet<VReg>,
+    promoted_stack_objects: HashSet<VReg>,
+}
+
+impl ValueIdentities {
+    /// Whether this sidecar carries no authoritative value facts at all.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_numbered_value.is_empty()
+            && self.physical_bases_by_value.is_empty()
+            && self.parameter_slots_by_value.is_empty()
+            && self.result_roles.is_empty()
+            && self.machine_saved_slots.is_empty()
+            && self.promoted_stack_objects.is_empty()
+    }
+
+    /// Return the sole SSA identity represented by `value`, if unambiguous.
+    pub fn exact(&self, value: &VReg) -> Option<&SsaValue> {
+        let candidates = self.by_numbered_value.get(value)?;
+        (candidates.len() == 1)
+            .then(|| candidates.first())
+            .flatten()
+    }
+
+    /// Return every SSA identity represented by a coalesced numbered value.
+    pub fn candidates(&self, value: &VReg) -> Option<&BTreeSet<SsaValue>> {
+        self.by_numbered_value.get(value)
+    }
+
+    /// Every numbered value for which the pipeline owns an SSA identity.
+    pub(crate) fn numbered_values(&self) -> impl Iterator<Item = &VReg> {
+        self.by_numbered_value.keys()
+    }
+
+    /// Return the sole opaque value identity represented by `value`.
+    #[cfg(test)]
+    pub(crate) fn exact_value_id(&self, value: &VReg) -> Option<ValueId> {
+        self.value_id_by_ssa.get(self.exact(value)?).copied()
+    }
+
+    /// Return every opaque value identity represented by a coalesced value.
+    pub(crate) fn value_ids(&self, value: &VReg) -> Option<BTreeSet<ValueId>> {
+        let candidates = self.candidates(value)?;
+        candidates
+            .iter()
+            .map(|identity| self.value_id_by_ssa.get(identity).copied())
+            .collect()
+    }
+
+    /// Return the one machine width on which every represented value agrees.
+    pub(crate) fn unambiguous_definition_width(&self, value: &VReg) -> Option<u8> {
+        let value_ids = self.value_ids(value)?;
+        let mut widths = BTreeSet::new();
+        for value_id in value_ids {
+            widths.extend(self.definition_widths_by_value_id.get(&value_id)?);
+        }
+        (widths.len() == 1)
+            .then(|| widths.first().copied())
+            .flatten()
+    }
+
+    /// Return the sole canonical machine-storage base represented by `value`.
+    ///
+    /// This fact is deliberately separate from [`Self::exact`]: phi-copy
+    /// coalescing may combine several non-interfering SSA versions of the same
+    /// physical register. Such a value has no exact SSA identity, but it still
+    /// has one unambiguous architectural storage base.
+    pub(crate) fn unambiguous_physical_base(&self, value: &VReg) -> Option<&str> {
+        let bases = self.physical_bases_by_value.get(value)?;
+        (bases.len() == 1)
+            .then(|| bases.first().map(String::as_str))
+            .flatten()
+    }
+
+    /// Publish a canonical physical-storage fact for a pipeline-minted value.
+    pub(crate) fn attach_physical_base(&mut self, value: VReg, base: impl Into<String>) {
+        self.physical_bases_by_value
+            .entry(value)
+            .or_default()
+            .insert(base.into());
+    }
+
+    /// Copy the exact SSA and physical-storage facts carried by one value.
+    pub(crate) fn inherit_value_facts(&mut self, source: &VReg, destination: VReg) {
+        if let Some(identities) = self.by_numbered_value.get(source).cloned() {
+            self.by_numbered_value
+                .entry(destination.clone())
+                .or_default()
+                .extend(identities);
+        }
+        if let Some(bases) = self.physical_bases_by_value.get(source).cloned() {
+            self.physical_bases_by_value
+                .entry(destination)
+                .or_default()
+                .extend(bases);
+        }
+    }
+
+    /// Return the authoritative source-parameter slot represented by `value`.
+    pub(crate) fn parameter_slot(&self, value: &VReg) -> Option<usize> {
+        let slots = self.parameter_slots_by_value.get(value)?;
+        (slots.len() == 1).then(|| slots.first().copied()).flatten()
+    }
+
+    /// Whether `value` carries the pipeline-owned source result role.
+    pub(crate) fn is_result_role(&self, value: &VReg) -> bool {
+        self.result_roles.contains(value)
+    }
+
+    /// Whether stack promotion proved this object stores ABI entry state.
+    pub(crate) fn is_machine_saved_slot(&self, value: &VReg) -> bool {
+        self.machine_saved_slots.contains(value)
+    }
+
+    /// Whether stack promotion minted `value` as a source-level storage object.
+    pub(crate) fn is_promoted_stack_object(&self, value: &VReg) -> bool {
+        self.promoted_stack_objects.contains(value)
+    }
+
+    /// Publish machine-save storage identities discovered during promotion.
+    pub(crate) fn attach_machine_saved_slots(&mut self, slots: &HashSet<String>) {
+        self.machine_saved_slots
+            .extend(slots.iter().cloned().map(VReg::phys));
+    }
+
+    /// Publish every storage identity minted by stack promotion.
+    pub(crate) fn attach_promoted_stack_objects<'a>(
+        &mut self,
+        objects: impl IntoIterator<Item = &'a String>,
+    ) {
+        self.promoted_stack_objects
+            .extend(objects.into_iter().cloned().map(VReg::phys));
+    }
+
+    /// Publish source-parameter roles proved by stack-coordinate promotion.
+    pub(crate) fn attach_promoted_stack_parameter_slots(
+        &mut self,
+        parameter_slots: &HashMap<String, usize>,
+    ) {
+        for (object, slot) in parameter_slots {
+            self.parameter_slots_by_value
+                .entry(VReg::phys(object))
+                .or_default()
+                .insert(*slot);
+        }
+    }
+
+    /// Carry an SSA-snapshot-owned opaque identity into value-numbered LLIR.
+    fn record_with_value_id(&mut self, numbered: VReg, identity: SsaValue, value_id: ValueId) {
+        let previous = self.value_id_by_ssa.insert(identity.clone(), value_id);
+        debug_assert!(
+            previous.is_none() || previous == Some(value_id),
+            "one SSA value received conflicting snapshot-owned IDs"
+        );
+        if let Some(base) = identity.canonical_physical_base() {
+            self.physical_bases_by_value
+                .entry(numbered.clone())
+                .or_default()
+                .insert(base.to_string());
+        }
+        self.by_numbered_value
+            .entry(numbered)
+            .or_default()
+            .insert(identity);
+    }
+
+    /// Test-only compatibility helper for constructing isolated identity maps.
+    #[cfg(test)]
+    pub(crate) fn record(&mut self, numbered: VReg, identity: SsaValue) {
+        let value_id = self
+            .value_id_by_ssa
+            .get(&identity)
+            .copied()
+            .unwrap_or_else(|| {
+                let value_id = ValueId::from_index(self.next_value_id);
+                self.next_value_id = self
+                    .next_value_id
+                    .checked_add(1)
+                    .expect("opaque SSA value identity space exhausted");
+                value_id
+            });
+        self.record_with_value_id(numbered, identity, value_id);
+    }
+
+    /// Attach a proved definition width to the stable identity already interned
+    /// for `identity`. Conflicting evidence remains explicitly ambiguous.
+    pub(crate) fn attach_definition_width(&mut self, identity: &SsaValue, width: u8) {
+        let Some(value_id) = self.value_id_by_ssa.get(identity).copied() else {
+            return;
+        };
+        self.definition_widths_by_value_id
+            .entry(value_id)
+            .or_default()
+            .insert(width);
+    }
+
+    /// Record that the SSA value `identity` was computed by a 64-bit operation.
+    pub(crate) fn attach_wide_computation(&mut self, identity: &SsaValue) {
+        if let Some(value_id) = self.value_id_by_ssa.get(identity).copied() {
+            self.wide_computations.insert(value_id);
+        }
+    }
+
+    /// Whether any SSA value represented by `value` was computed at 64 bits.
+    ///
+    /// A phi-coalesced variable is only as narrow as its widest member: a
+    /// loop-carried `rax` that starts as `xor %eax,%eax` and is then advanced
+    /// by `shr $1,%rax` / `add %rdx,%rax` holds 64-bit data, whatever the
+    /// function eventually returns from it.
+    pub(crate) fn represents_wide_computation(&self, value: &VReg) -> bool {
+        self.candidates(value).is_some_and(|candidates| {
+            candidates.iter().any(|identity| {
+                self.value_id_by_ssa
+                    .get(identity)
+                    .is_some_and(|value_id| self.wide_computations.contains(value_id))
+            })
+        })
+    }
+
+    /// Attach ABI parameter slots to exact version-zero values.
+    fn attach_abi_parameter_slots(&mut self, cc: CallConv, live_slots: &HashSet<usize>) {
+        for (numbered, candidates) in &self.by_numbered_value {
+            let slots = candidates
+                .iter()
+                .filter(|identity| identity.version == 0)
+                .filter_map(|identity| {
+                    identity
+                        .canonical_physical_base()
+                        .and_then(|name| crate::ir::abi::argument_slot_of(cc, name))
+                })
+                .filter(|slot| live_slots.contains(slot))
+                .collect::<BTreeSet<_>>();
+            if !slots.is_empty() {
+                self.parameter_slots_by_value
+                    .entry(numbered.clone())
+                    .or_default()
+                    .extend(slots);
+            }
+        }
+    }
+
+    /// Clone this sidecar into the AST's presentation-name key space.
+    ///
+    /// `aliases` is the exact raw-name to role-name map returned by naming.
+    /// The original keys remain available because later type projection still
+    /// consumes storage spellings. Multiple raw values mapped to one role are
+    /// unioned, preserving explicit ambiguity rather than choosing one.
+    pub(crate) fn with_role_aliases(&self, aliases: &HashMap<String, String>) -> Self {
+        let mut projected = self.clone();
+        for (value, identities) in &self.by_numbered_value {
+            let VReg::Phys(storage) = value else {
+                continue;
+            };
+            let Some(role) = aliases.get(storage) else {
+                continue;
+            };
+            projected
+                .by_numbered_value
+                .entry(VReg::Phys(role.clone()))
+                .or_default()
+                .extend(identities.iter().cloned());
+            if role == "ret" {
+                projected.result_roles.insert(VReg::Phys(role.clone()));
+            }
+        }
+        for (value, bases) in &self.physical_bases_by_value {
+            let VReg::Phys(storage) = value else {
+                continue;
+            };
+            let Some(role) = aliases.get(storage) else {
+                continue;
+            };
+            projected
+                .physical_bases_by_value
+                .entry(VReg::Phys(role.clone()))
+                .or_default()
+                .extend(bases.iter().cloned());
+        }
+        for (value, slots) in &self.parameter_slots_by_value {
+            let VReg::Phys(storage) = value else {
+                continue;
+            };
+            let Some(role) = aliases.get(storage) else {
+                continue;
+            };
+            projected
+                .parameter_slots_by_value
+                .entry(VReg::Phys(role.clone()))
+                .or_default()
+                .extend(slots.iter().copied());
+        }
+        for value in &self.machine_saved_slots {
+            let VReg::Phys(storage) = value else {
+                continue;
+            };
+            if let Some(role) = aliases.get(storage) {
+                projected
+                    .machine_saved_slots
+                    .insert(VReg::Phys(role.clone()));
+            }
+        }
+        for value in &self.promoted_stack_objects {
+            let VReg::Phys(storage) = value else {
+                continue;
+            };
+            if let Some(role) = aliases.get(storage) {
+                projected
+                    .promoted_stack_objects
+                    .insert(VReg::Phys(role.clone()));
+            }
+        }
+        projected
+    }
+
+    /// Project identities and attach pipeline-owned source-parameter slots.
+    pub(crate) fn with_role_aliases_and_parameter_slots(
+        &self,
+        aliases: &HashMap<String, String>,
+        parameter_slots: &HashSet<usize>,
+    ) -> Self {
+        self.with_role_aliases(aliases)
+            .with_parameter_slots(parameter_slots)
+    }
+
+    /// Attach pipeline-owned stack-parameter roles without parsing a name.
+    pub(crate) fn with_parameter_slots(&self, parameter_slots: &HashSet<usize>) -> Self {
+        let mut projected = self.clone();
+        for slot in parameter_slots {
+            projected
+                .parameter_slots_by_value
+                .entry(VReg::Phys(format!("arg{slot}")))
+                .or_default()
+                .insert(*slot);
+        }
+        projected
+    }
+
+    /// Replace projected ABI-bank slots with authoritative source-role slots.
+    ///
+    /// In a mixed-bank ABI, machine slot zero is not necessarily source slot
+    /// zero: AAPCS hard-float may place source `arg0` in `s0` and source
+    /// `arg1` in core register `r0`. Naming has already established the source
+    /// roles when this is called, so each `argN` row is authoritative and must
+    /// replace a stale machine-bank slot rather than become ambiguous with it.
+    pub(crate) fn with_source_parameter_slots(
+        mut self,
+        parameter_slots: impl IntoIterator<Item = usize>,
+    ) -> Self {
+        for slot in parameter_slots {
+            self.parameter_slots_by_value
+                .insert(VReg::Phys(format!("arg{slot}")), BTreeSet::from([slot]));
+        }
+        self
+    }
+
+    pub(crate) fn apply_renames(&mut self, renames: &HashMap<VReg, VReg>) {
+        if renames.is_empty() {
+            return;
+        }
+        let previous = std::mem::take(&mut self.by_numbered_value);
+        for (value, identities) in previous {
+            let numbered = renames.get(&value).cloned().unwrap_or(value);
+            self.by_numbered_value
+                .entry(numbered)
+                .or_default()
+                .extend(identities);
+        }
+        let previous = std::mem::take(&mut self.physical_bases_by_value);
+        for (value, bases) in previous {
+            let numbered = renames.get(&value).cloned().unwrap_or(value);
+            self.physical_bases_by_value
+                .entry(numbered)
+                .or_default()
+                .extend(bases);
+        }
+        let previous = std::mem::take(&mut self.parameter_slots_by_value);
+        for (value, slots) in previous {
+            let numbered = renames.get(&value).cloned().unwrap_or(value);
+            self.parameter_slots_by_value
+                .entry(numbered)
+                .or_default()
+                .extend(slots);
+        }
+        let previous = std::mem::take(&mut self.machine_saved_slots);
+        self.machine_saved_slots.extend(
+            previous
+                .into_iter()
+                .map(|value| renames.get(&value).cloned().unwrap_or(value)),
+        );
+        let previous = std::mem::take(&mut self.promoted_stack_objects);
+        self.promoted_stack_objects.extend(
+            previous
+                .into_iter()
+                .map(|value| renames.get(&value).cloned().unwrap_or(value)),
+        );
+        let previous = std::mem::take(&mut self.result_roles);
+        for value in previous {
+            self.result_roles
+                .insert(renames.get(&value).cloned().unwrap_or(value));
+        }
+    }
+
+    /// Move identity candidates through an AST presentation-name rewrite.
+    ///
+    /// Naming owns physical role spellings only. Converting the exact map here
+    /// keeps that string boundary out of semantic consumers while preserving
+    /// [`Self::apply_renames`]'s explicit collision/ambiguity behavior.
+    pub(crate) fn apply_role_renames(&mut self, renames: &HashMap<String, String>) {
+        let renames = renames
+            .iter()
+            .map(|(from, to)| (VReg::Phys(from.clone()), VReg::Phys(to.clone())))
+            .collect();
+        self.apply_renames(&renames);
+    }
+}
+
+#[cfg(test)]
+use coalesce::{
+    coalesce_phi_copies, coalesce_phi_copies_with_identities, coalesce_phi_copies_with_lifetimes,
+};
+
+/// Return a copy of `lf` with every physical register occurrence rewritten to
+/// its SSA-value-tagged name. `cc` identifies the return registers whose final
+/// (returned) value is kept bare so it still names `ret`.
+pub fn value_number(
+    lf: &LlirFunction,
+    ssa: &crate::ir::ssa::SsaInfo,
+    cc: CallConv,
+) -> LlirFunction {
+    value_number_with_definition_widths(lf, ssa, cc).0
+}
+
+fn width_bytes(width: crate::ir::types::Width) -> u8 {
+    ((width.bits().saturating_add(7)) / 8).min(u8::MAX as u16) as u8
+}
+
+/// Exact machine width keyed by SSA value identity.
+///
+/// This is the bridge from a phi incoming `(base, version)` to the particular
+/// raw definition site that reaches that predecessor edge. It is what lets two
+/// copies from the same kept-bare register spelling carry different, exact
+/// widths without joining every definition of that spelling first.
+type DefinitionWidthsByValue = HashMap<SsaValue, u8>;
+
+/// Return the one exact machine width shared by every incoming phi value.
+///
+/// This query stays in the SSA identity space. Numbered register spellings are
+/// presentation output and may be kept bare, coalesced, or renamed independently.
+fn agreed_phi_width(
+    phi: &crate::ir::ssa::Phi,
+    definition_widths_by_value: &DefinitionWidthsByValue,
+) -> Option<u8> {
+    let mut agreed = None;
+    for (_predecessor, version) in &phi.incoming {
+        let width = definition_widths_by_value.get(&SsaValue {
+            base: phi.base.clone(),
+            version: *version,
+        })?;
+        match agreed {
+            None => agreed = Some(*width),
+            Some(existing) if existing == *width => {}
+            Some(_) => return None,
+        }
+    }
+    agreed
+}
+
+/// Materialized phi copies and the width of each incoming SSA value.
+///
+/// `incoming_widths` is parallel to `pairs`. `None` denotes a live-in or a
+/// definition whose width the lifter could not prove; it is not permission to
+/// assume the destination's width.
+#[derive(Debug, Default)]
+struct PhiCopies {
+    pairs: Vec<(VReg, VReg)>,
+    incoming_widths: Vec<Option<u8>>,
+}
+
+/// Machine width of the value defined by one raw LLIR operation.
+///
+/// Most operations inherit the physical destination view (`edi` = 4 bytes).
+/// Explicit conversion operations are the important exception: their result
+/// width is the conversion target even when the lifter writes it through the
+/// source sub-register spelling before value numbering canonicalises that
+/// spelling to its full-width parent.
+fn operation_definition_width(op: &Op) -> Option<u8> {
+    match op {
+        Op::ZExt { to, .. } | Op::SExt { to, .. } | Op::Trunc { to, .. } => Some(width_bytes(*to)),
+        Op::Extract { hi, lo, .. } if hi > lo => {
+            Some((hi.saturating_sub(*lo).saturating_add(7) / 8).min(u8::MAX as u16) as u8)
+        }
+        Op::Ite { width, .. } => Some(width_bytes(*width)),
+        Op::Load { addr, .. } => Some(addr.size.max(1)),
+        Op::Intrinsic { outs, .. } if outs.len() == 1 => Some(width_bytes(outs[0].1)),
+        _ => def_ref(op).and_then(|dst| dst.width()).map(width_bytes),
+    }
+}
+
+/// Value-number `lf` and retain the exact storage width of each numbered
+/// definition.
+///
+/// SSA deliberately gives aliased register views one identity (`edi` and `rdi`
+/// both become `rdi#N`). That is correct for dataflow, but the spelling erased by
+/// canonicalisation is also the only proof that an arithmetic definition wraps
+/// at 32 bits. Keeping this companion map makes width part of the value model
+/// without coupling source-level role names (`var0`, `ret`) to machine registers.
+pub fn value_number_with_definition_widths(
+    lf: &LlirFunction,
+    ssa: &crate::ir::ssa::SsaInfo,
+    cc: CallConv,
+) -> (LlirFunction, HashMap<VReg, u8>) {
+    let (numbered, widths, _) = value_number_with_parameter_slots(lf, ssa, cc);
+    (numbered, widths)
+}
+
+/// Value-number `lf` while retaining parameter evidence from before phi-copy
+/// coalescing.
+///
+/// Coalescing is allowed to reuse a dead phi destination for a later scratch
+/// definition. That is semantically correct and removes declarations, but it
+/// deliberately erases the distinction used by [`live_in_arg_slots_llir`]: a
+/// call-only phi destination and a later genuinely-read scratch may then share
+/// one name. Parameter evidence is therefore sampled after phi insertion (when
+/// call-only plumbing is identifiable) and returned beside the coalesced LLIR.
+pub fn value_number_with_parameter_slots(
+    lf: &LlirFunction,
+    ssa: &crate::ir::ssa::SsaInfo,
+    cc: CallConv,
+) -> (LlirFunction, HashMap<VReg, u8>, HashSet<usize>) {
+    value_number_with_parameter_slots_and_lifetimes(lf, ssa, cc, &[])
+}
+
+/// Value-number while preserving authoritative source-register lifetime splits.
+pub fn value_number_with_parameter_slots_and_lifetimes(
+    lf: &LlirFunction,
+    ssa: &crate::ir::ssa::SsaInfo,
+    cc: CallConv,
+    source_lifetimes: &[SourceRegisterLifetime],
+) -> (LlirFunction, HashMap<VReg, u8>, HashSet<usize>) {
+    let (numbered, widths, slots, _) =
+        value_number_with_parameter_slots_lifetimes_and_identities(lf, ssa, cc, source_lifetimes);
+    (numbered, widths, slots)
+}
+
+/// Value-number while retaining opaque SSA identities for downstream AST
+/// consumers.
+pub fn value_number_with_parameter_slots_lifetimes_and_identities(
+    lf: &LlirFunction,
+    ssa: &crate::ir::ssa::SsaInfo,
+    cc: CallConv,
+    source_lifetimes: &[SourceRegisterLifetime],
+) -> (
+    LlirFunction,
+    HashMap<VReg, u8>,
+    HashSet<usize>,
+    ValueIdentities,
+) {
+    value_number_with_parameter_evidence(lf, ssa, cc, source_lifetimes, true)
+}
+
+fn value_number_with_parameter_evidence(
+    lf: &LlirFunction,
+    ssa: &crate::ir::ssa::SsaInfo,
+    cc: CallConv,
+    source_lifetimes: &[SourceRegisterLifetime],
+    keep_result_names: bool,
+) -> (
+    LlirFunction,
+    HashMap<VReg, u8>,
+    HashSet<usize>,
+    ValueIdentities,
+) {
+    let keep = if keep_result_names {
+        keep_bare::definitions(lf, ssa, cc)
+    } else {
+        keep_bare::KeepBare::default()
+    };
+    // A compatibility result name can denote several SSA definitions. Sample
+    // signature evidence in a fully versioned view when that projection is
+    // present in an argument register, so a later result cannot erase a genuine
+    // incoming parameter. Projection only merges versions of the same physical
+    // base; a return register outside the argument slots cannot erase their
+    // identities and does not need another value-numbering pass.
+    let exact_parameter_slots = keep
+        .overlaps_argument_slots(cc)
+        .then(|| value_number_with_parameter_evidence(lf, ssa, cc, source_lifetimes, false).2);
+    let ctx = VnCtx::new(lf, keep, build_temp_remap(lf, ssa), ssa);
+
+    let mut out = lf.clone();
+    let mut definition_widths = HashMap::new();
+    let mut definition_widths_by_site = DefinitionWidthsBySite::new();
+    let mut definition_widths_by_value = DefinitionWidthsByValue::new();
+    let mut identities = ValueIdentities::default();
+    // One buffer for every instruction's use versions. The per-instruction
+    // `Vec` was a heap allocation for a list that is normally one or two long.
+    let mut def_values: Vec<Option<SsaValue>> = Vec::new();
+    let mut use_values: Vec<Option<SsaValue>> = Vec::new();
+    for (bi, block) in out.blocks.iter_mut().enumerate() {
+        for (ii, ins) in block.instrs.iter_mut().enumerate() {
+            let addr = InstrAddr {
+                block_idx: bi,
+                instr_idx: ii,
+            };
+            // Read out of the indexed SSA tables rather than the
+            // address-keyed maps: same answer, no hashing. Keep the base as
+            // well as the version so target-qualified aliases stay coherent.
+            def_values.clear();
+            def_values.extend(
+                (0..ssa_def_width(&ins.op))
+                    .map(|output_index| ssa.def_value_ref_at(lf, addr, output_index).cloned()),
+            );
+            // Only the use ARITY is wanted here; `def_uses` would allocate a
+            // vector of cloned register spellings to report it.
+            use_values.clear();
+            use_values.extend((0..use_count(&ins.op)).map(|k| ssa.use_value(lf, addr, k)));
+            // SSA definitions and uses must agree on their target-qualified
+            // base. The ordinary tagger already handles x86/AArch64 view
+            // parents; adopt the side-car base only when that compatibility
+            // path cannot express the target alias (currently ARM32 fp/r11).
+            if matches!(cc, CallConv::Arm | CallConv::ArmHardFloat) {
+                if let (
+                    Some(VReg::Phys(definition)),
+                    Some(SsaValue {
+                        base: VReg::Phys(canonical),
+                        ..
+                    }),
+                ) = (def_mut(&mut ins.op), ssa.def_value_ref(lf, addr))
+                {
+                    let compatibility = crate::ir::ssa::parent64(definition).unwrap_or(definition);
+                    if compatibility != canonical {
+                        *definition = canonical.clone();
+                    }
+                }
+            }
+            tag_op(&mut ins.op, &def_values, &use_values, &ctx);
+            let mut output_index = 0usize;
+            for_each_def(&ins.op, |numbered| {
+                if let Some(identity) = ssa.def_value_ref_at(lf, addr, output_index) {
+                    let value_id = ssa
+                        .value_id(identity)
+                        .expect("SSA definition must have a snapshot-owned value ID");
+                    identities.record_with_value_id(numbered.clone(), identity.clone(), value_id);
+                }
+                output_index += 1;
+            });
+            let mut use_index = 0usize;
+            for_each_use(&ins.op, |numbered| {
+                if let Some(Some(identity)) = use_values.get(use_index) {
+                    let value_id = ssa
+                        .value_id(identity)
+                        .expect("SSA use must have a snapshot-owned value ID");
+                    identities.record_with_value_id(numbered.clone(), identity.clone(), value_id);
+                }
+                use_index += 1;
+            });
+            let raw_op = &lf.blocks[bi].instrs[ii].op;
+            if let (Op::Intrinsic { outs: numbered, .. }, Op::Intrinsic { outs: raw, .. }) =
+                (&ins.op, raw_op)
+            {
+                for (output_index, ((destination, _), (_, width))) in
+                    numbered.iter().zip(raw).enumerate()
+                {
+                    let width = width_bytes(*width);
+                    definition_widths.insert(destination.clone(), width);
+                    definition_widths_by_site.insert((addr, output_index), width);
+                    if let Some(value) = ssa.def_value_ref_at(lf, addr, output_index) {
+                        definition_widths_by_value.insert(value.clone(), width);
+                        identities.attach_definition_width(value, width);
+                    }
+                }
+            } else if let (Some(dst), Some(width)) =
+                (def_ref(&ins.op), operation_definition_width(raw_op))
+            {
+                definition_widths.insert(dst.clone(), width);
+                definition_widths_by_site.insert((addr, 0), width);
+                if let Some(value) = ssa.def_value_ref(lf, addr) {
+                    definition_widths_by_value.insert(value.clone(), width);
+                    identities.attach_definition_width(value, width);
+                    if width == 8
+                        && matches!(raw_op, Op::Bin { .. } | Op::Un { .. } | Op::SExt { .. })
+                    {
+                        identities.attach_wide_computation(value);
+                    }
+                }
+            }
+        }
+    }
+    let phi_copies = insert_phi_copies(
+        &mut out,
+        lf,
+        ssa,
+        &ctx,
+        &mut definition_widths,
+        &definition_widths_by_value,
+        &mut identities,
+    );
+    let parameter_slots = exact_parameter_slots
+        .unwrap_or_else(|| live_in_arg_slots_llir_with_identities(&out, cc, &identities));
+    if !keep_result_names {
+        // Only the pre-coalescing evidence is consumed by the compatibility
+        // view above. No presentation/coalescing work is needed in this view.
+        return (out, definition_widths, parameter_slots, identities);
+    }
+    let renames = coalesce_phi_copies_with_definition_sites(
+        &mut out,
+        &phi_copies.pairs,
+        &mut definition_widths,
+        &definition_widths_by_site,
+        &phi_copies.incoming_widths,
+        source_lifetimes,
+        &identities,
+    );
+    identities.apply_renames(&renames);
+    identities.attach_abi_parameter_slots(cc, &parameter_slots);
+    (out, definition_widths, parameter_slots, identities)
+}
+
+/// Translate *out* of SSA: give every phi result an actual definition.
+///
+/// [`compute_ssa`](crate::ir::ssa::compute_ssa) places phis on the dominance
+/// frontier and hands each merged read the phi's result version, but a phi is not
+/// an executable instruction — nothing above emitted a definition for it. The
+/// merged read therefore named a value no instruction produced, and the arm
+/// definitions feeding it became dead. Dead-code elimination then removed them,
+/// correctly, and the emitted C read uninitialised stack:
+///
+/// ```c
+/// // arith:signs, gcc -O0 — return (a<0 ? -a : a) + (b>a ? b-a : a-b)
+/// if ((arg0 < arg1)) {
+/// } else {
+/// }
+/// return (var9 + var3);   // var9: declared, never assigned
+/// ```
+///
+/// The standard resolution, and the one used here: replace each phi with a copy
+/// `dst = incoming` at the end of every predecessor block. The copies restore the
+/// dataflow, which keeps the arm definitions live; copy propagation then folds most
+/// of them back into the arms, so the usual rendered result is the natural C rather
+/// than a visible temporary.
+///
+/// Three details that make this correct rather than approximately correct:
+///
+/// * **Before the terminator.** A copy appended after a block's branch would never
+///   execute, and would leave a branch mid-block where the structurer expects a
+///   terminator.
+/// * **Critical edges need no split.** A copy at the end of a predecessor with
+///   several successors also executes on the paths that bypass the merge — but the
+///   phi result is only live from the merge block downward (SSA guarantees its uses
+///   are dominated by that block), so on any other path the assignment is dead
+///   rather than wrong. Splitting the edge would add a basic block, and an invented
+///   block is exactly the kind of structural noise the graph-edit-distance metric
+///   charges for.
+/// * **No swap hazard.** Phi semantics are parallel, so sequential copies would be
+///   wrong if one phi's source were another's destination in the same block. It
+///   cannot happen here: there is at most one phi per (block, base register), and a
+///   phi destination is a version fresh at its own block while incoming versions all
+///   come from strictly earlier definitions.
+///
+/// Only phis whose result is actually READ get copies. Liveness is transitive
+/// through other phis: in a nested loop, an outer carried value may be read only
+/// as an incoming operand of the inner loop's phi. An unread phi is dead, and
+/// materialising it would add statements to both arms that no source line
+/// corresponds to.
+///
+/// Returns every `(destination, source)` pair it materialised, in insertion
+/// order, together with the exact width of that incoming SSA value when one is
+/// known. Phi-copy coalescing consumes both parallel lists: these copies exist
+/// only to leave SSA, and most can be removed again by giving the two values one
+/// name once liveness and width compatibility prove that is safe.
+fn insert_phi_copies(
+    out: &mut LlirFunction,
+    lf: &LlirFunction,
+    ssa: &crate::ir::ssa::SsaInfo,
+    ctx: &VnCtx,
+    definition_widths: &mut HashMap<VReg, u8>,
+    definition_widths_by_value: &DefinitionWidthsByValue,
+    identities: &mut ValueIdentities,
+) -> PhiCopies {
+    let mut created = PhiCopies::default();
+    if ssa.phis.is_empty() {
+        return created;
+    }
+
+    // Which versioned values does the renamed body actually read? Computed on the
+    // OUTPUT, so it sees the tagged values the copies must match. Keep the typed
+    // VReg rather than a string: predicate SSA values are deliberately not Phys
+    // registers and must receive phi copies too.
+    let mut read: HashSet<VReg> = HashSet::new();
+    for b in &out.blocks {
+        for ins in &b.instrs {
+            for_each_use(&ins.op, |u| {
+                if !read.contains(u) {
+                    read.insert(u.clone());
+                }
+            });
+        }
+    }
+
+    // Phi instructions do not exist in `out` yet, so their incoming operands
+    // cannot seed `read` above. Propagate liveness backwards through the phi
+    // graph to a fixed point before deciding which copies to materialise. One
+    // pass is insufficient for nested loops: inner_phi <- outer_phi <- entry.
+    loop {
+        let mut changed = false;
+        for phi in &ssa.phis {
+            let mut dst = phi.base.clone();
+            key_value(&mut dst, phi.dst_version, ctx);
+            if !read.contains(&dst) {
+                continue;
+            }
+            for (_pred, version) in &phi.incoming {
+                let mut src = phi.base.clone();
+                key_value(&mut src, *version, ctx);
+                changed |= read.insert(src);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Pending copies per predecessor block index, appended in phi order so the
+    // result is deterministic.
+    let mut pending: Vec<Vec<Op>> = vec![Vec::new(); out.blocks.len()];
+    for phi in &ssa.phis {
+        let mut dst = phi.base.clone();
+        key_value(&mut dst, phi.dst_version, ctx);
+        let dst_identity = SsaValue {
+            base: phi.base.clone(),
+            version: phi.dst_version,
+        };
+        let dst_value_id = ssa
+            .value_id(&dst_identity)
+            .expect("SSA phi result must have a snapshot-owned value ID");
+        identities.record_with_value_id(dst.clone(), dst_identity, dst_value_id);
+        if !matches!(dst, VReg::Phys(_) | VReg::FlagValue { .. }) {
+            // A temp phi would need the remap to agree across blocks, which
+            // `build_temp_remap` does not guarantee, so leave it alone rather than
+            // emit a wrong copy. Phys and predicate values use stable SSA versions.
+            continue;
+        }
+        if !read.contains(&dst) {
+            continue;
+        }
+        let scalarized_dword_lane = matches!(
+            &phi.base,
+            VReg::Phys(name)
+                if name
+                    .strip_prefix("xmm")
+                    .and_then(|rest| rest.rsplit_once("_d"))
+                    .is_some_and(|(register, lane)| {
+                        register.parse::<u8>().is_ok()
+                            && lane.parse::<u8>().is_ok_and(|lane| lane < 4)
+                    })
+        );
+        let phi_width = scalarized_dword_lane
+            .then(|| agreed_phi_width(phi, definition_widths_by_value))
+            .flatten();
+        if let Some(width) = phi_width {
+            // Phi copies are synthetic and are inserted after the ordinary
+            // instruction-width scan. Propagate a width only when every
+            // incoming lane definition proves the same width. Keep this narrow
+            // to the lifter's scalarised XMM dword representation: generic GPR
+            // phi bases canonicalise 32-bit views to their 64-bit parents and
+            // therefore need a richer mixed-view value model. This prevents
+            // packed signed comparisons from silently becoming `long` without
+            // perturbing unrelated loop-carried integer types.
+            definition_widths.insert(dst.clone(), width);
+            identities.attach_definition_width(
+                &SsaValue {
+                    base: phi.base.clone(),
+                    version: phi.dst_version,
+                },
+                width,
+            );
+        }
+        for (pred, ver) in &phi.incoming {
+            if *pred >= out.blocks.len() {
+                continue;
+            }
+            let mut src = phi.base.clone();
+            key_value(&mut src, *ver, ctx);
+            let src_identity = SsaValue {
+                base: phi.base.clone(),
+                version: *ver,
+            };
+            let src_value_id = ssa
+                .value_id(&src_identity)
+                .expect("SSA phi input must have a snapshot-owned value ID");
+            identities.record_with_value_id(src.clone(), src_identity, src_value_id);
+            if src == dst {
+                continue; // a version kept bare on both sides: `rax = rax`
+            }
+            created.pairs.push((dst.clone(), src.clone()));
+            created.incoming_widths.push(
+                definition_widths_by_value
+                    .get(&SsaValue {
+                        base: phi.base.clone(),
+                        version: *ver,
+                    })
+                    .copied(),
+            );
+            pending[*pred].push(Op::Assign {
+                dst: dst.clone(),
+                src: Value::Reg(src),
+            });
+        }
+    }
+
+    for (bi, ops) in pending.into_iter().enumerate() {
+        if ops.is_empty() {
+            continue;
+        }
+        let block = &mut out.blocks[bi];
+        // Insert before a trailing terminator; a block that falls through simply
+        // takes them at the end.
+        let at = match block.instrs.last().map(|i| &i.op) {
+            Some(Op::Jump { .. } | Op::CondJump { .. }) => block.instrs.len() - 1,
+            Some(op) if op.is_return() => block.instrs.len() - 1,
+            _ => block.instrs.len(),
+        };
+        // Share the VA of the instruction the copies precede: these are not real
+        // instructions, and inventing an address would make them look like decoded
+        // code to anything keyed on VA.
+        let va = block
+            .instrs
+            .get(at)
+            .or_else(|| block.instrs.last())
+            .map(|i| i.va)
+            .unwrap_or(lf.blocks[bi].start_va);
+        for (k, op) in ops.into_iter().enumerate() {
+            block.instrs.insert(at + k, LlirInstr { va, op });
+        }
+    }
+    created
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::ssa::{compute_ssa, compute_ssa_for_target};
+    use crate::ir::use_def::def_uses;
+
+    /// The shape of `61_fixed_point:gcc:O2:fixed_sqrt`'s loop-carried root:
+    /// `xor %eax,%eax` (a 32-bit write, lifted with its implicit
+    /// zero-extension) and then `shr $1,%rax` (a 64-bit computation).
+    #[test]
+    fn wide_computations_exclude_the_implicit_zero_extension() {
+        use crate::ir::types::{BinOp, LlirBlock, Width};
+        let instr = |va, op| LlirInstr { va, op };
+        let raw = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![LlirBlock {
+                start_va: 0x1000,
+                end_va: 0x100c,
+                instrs: vec![
+                    instr(
+                        0x1000,
+                        Op::Bin {
+                            dst: VReg::phys("eax"),
+                            op: BinOp::Xor,
+                            lhs: Value::Reg(VReg::phys("eax")),
+                            rhs: Value::Reg(VReg::phys("eax")),
+                        },
+                    ),
+                    instr(
+                        0x1000,
+                        Op::ZExt {
+                            dst: VReg::phys("rax"),
+                            src: Value::Reg(VReg::phys("eax")),
+                            from: Width::W32,
+                            to: Width::W64,
+                        },
+                    ),
+                    instr(
+                        0x1004,
+                        Op::Bin {
+                            dst: VReg::phys("rax"),
+                            op: BinOp::Shr,
+                            lhs: Value::Reg(VReg::phys("rax")),
+                            rhs: Value::Const(1),
+                        },
+                    ),
+                    instr(
+                        0x1008,
+                        Op::Store {
+                            addr: crate::ir::types::MemOp {
+                                base: Some(VReg::phys("rdi")),
+                                index: None,
+                                scale: 1,
+                                disp: 0,
+                                size: 8,
+                                segment: None,
+                                endian: crate::ir::types::Endian::Little,
+                            },
+                            src: Value::Reg(VReg::phys("rax")),
+                        },
+                    ),
+                ],
+                succs: vec![],
+            }],
+        };
+        let ssa = compute_ssa(&raw);
+        let (numbered, _, _, identities) =
+            value_number_with_parameter_slots_lifetimes_and_identities(
+                &raw,
+                &ssa,
+                CallConv::SysVAmd64,
+                &[],
+            );
+        let destination = |index: usize| {
+            def_ref(&numbered.blocks[0].instrs[index].op)
+                .cloned()
+                .expect("numbered definition")
+        };
+
+        assert!(!identities.represents_wide_computation(&destination(1)));
+        assert!(identities.represents_wide_computation(&destination(2)));
+    }
+
+    #[test]
+    fn real_arm_entry_pointer_survives_later_result_storage_reuse() {
+        use crate::program::image::ProgramImage;
+        let directory = tempfile::tempdir().expect("ARM input fixture directory");
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cfg/arm_input_return_reuse.S");
+        let binary = directory.path().join("input_reuse.elf");
+        let output = std::process::Command::new("clang")
+            .args([
+                "--target=armv7-none-eabi",
+                "-nostdlib",
+                "-fuse-ld=lld",
+                "-Wl,-e,entry",
+                "-o",
+            ])
+            .arg(&binary)
+            .arg(source)
+            .output()
+            .expect("compile real ARM fixture");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let image = ProgramImage::from_bytes(std::fs::read(binary).expect("read fixture"))
+            .expect("index ARM fixture");
+        let function = crate::analysis::cfg::discover_function_image_at(
+            &image,
+            &crate::analysis::cfg::Budgets::default(),
+            image.entry_va(),
+        )
+        .expect("ARM CFG");
+        let mut lifted = crate::ir::lift_function::lift_function_from_image(&image, &function)
+            .expect("lift ARM instructions");
+        let cc = CallConv::Arm;
+        crate::ir::abi::annotate_calls(&mut lifted, cc);
+        let ssa = crate::ir::ssa::compute_ssa_for_target(&lifted, *image.target());
+        let (_, _, slots, _) =
+            value_number_with_parameter_slots_lifetimes_and_identities(&lifted, &ssa, cc, &[]);
+        assert!(
+            slots.contains(&0),
+            "incoming r0 pointer was lost to later return-storage definitions"
+        );
+    }
+
+    #[test]
+    fn opaque_ssa_identity_survives_llir_to_ast_lowering() {
+        let lf = mk(vec![
+            Op::Assign {
+                dst: VReg::phys("rax"),
+                src: Value::Const(7),
+            },
+            Op::Assign {
+                dst: VReg::phys("rbx"),
+                src: Value::Reg(VReg::phys("rax")),
+            },
+        ]);
+        let ssa = compute_ssa(&lf);
+        let (numbered, _, _, identities) =
+            value_number_with_parameter_slots_lifetimes_and_identities(
+                &lf,
+                &ssa,
+                CallConv::SysVAmd64,
+                &[],
+            );
+        let (_, _, _, repeated_identities) =
+            value_number_with_parameter_slots_lifetimes_and_identities(
+                &lf,
+                &ssa,
+                CallConv::SysVAmd64,
+                &[],
+            );
+        assert_eq!(
+            identities, repeated_identities,
+            "opaque value IDs must be deterministic across repeated numbering"
+        );
+        let ast = crate::ir::ast::lower(
+            &numbered,
+            &crate::ir::structure::Region::Block(0),
+            "identity",
+        );
+        let numbered_use = ast
+            .body
+            .iter()
+            .find_map(|statement| match statement.semantic() {
+                crate::ir::ast::Stmt::Assign {
+                    src: crate::ir::ast::Expr::Reg(value),
+                    ..
+                } => Some(value),
+                _ => None,
+            })
+            .expect("lowered AST keeps the numbered register occurrence");
+
+        let VReg::Phys(numbered_name) = numbered_use else {
+            panic!("physical SSA value must retain a C variable key");
+        };
+        assert!(
+            !numbered_name.contains("rax") && !numbered_name.contains('#'),
+            "numbered value keys must be opaque, not encoded machine identity: {numbered_name}"
+        );
+        assert_eq!(
+            identities.exact(numbered_use),
+            Some(&SsaValue {
+                base: VReg::phys("rax"),
+                version: 1,
+            })
+        );
+        let semantic_value = SsaValue {
+            base: VReg::phys("rax"),
+            version: 1,
+        };
+        assert_eq!(
+            identities.exact_value_id(numbered_use),
+            ssa.value_id(&semantic_value),
+            "value numbering must carry the SSA snapshot's exact opaque ID"
+        );
+    }
+
+    #[test]
+    fn coalesced_value_with_multiple_ssa_candidates_is_not_exact() {
+        let numbered = VReg::phys("rax#1");
+        let mut identities = ValueIdentities::default();
+        identities.record(
+            numbered.clone(),
+            SsaValue {
+                base: VReg::phys("rax"),
+                version: 1,
+            },
+        );
+        identities.record(
+            numbered.clone(),
+            SsaValue {
+                base: VReg::phys("rax"),
+                version: 2,
+            },
+        );
+
+        assert_eq!(identities.exact(&numbered), None);
+        assert_eq!(identities.candidates(&numbered).map(BTreeSet::len), Some(2));
+        assert_eq!(identities.exact_value_id(&numbered), None);
+        assert_eq!(
+            identities.value_ids(&numbered).map(|ids| ids.len()),
+            Some(2)
+        );
+        assert_eq!(identities.unambiguous_physical_base(&numbered), Some("rax"));
+    }
+
+    #[test]
+    fn opaque_value_ids_are_deterministic_and_ignore_display_spelling() {
+        let first = SsaValue {
+            base: VReg::phys("rax"),
+            version: 1,
+        };
+        let second = SsaValue {
+            base: VReg::phys("rdi"),
+            version: 4,
+        };
+        let build = || {
+            let mut identities = ValueIdentities::default();
+            identities.record(VReg::phys("misleading#name"), first.clone());
+            identities.record(VReg::phys("opaque"), second.clone());
+            identities
+        };
+
+        let left = build();
+        let right = build();
+        let left_first = left
+            .exact_value_id(&VReg::phys("misleading#name"))
+            .expect("first value id");
+        let left_second = left
+            .exact_value_id(&VReg::phys("opaque"))
+            .expect("second value id");
+
+        assert_eq!(left_first.index(), 0);
+        assert_eq!(left_second.index(), 1);
+        assert_ne!(left_first, left_second);
+        assert_eq!(
+            right.exact_value_id(&VReg::phys("misleading#name")),
+            Some(left_first)
+        );
+        assert_eq!(
+            right.exact_value_id(&VReg::phys("opaque")),
+            Some(left_second)
+        );
+    }
+
+    #[test]
+    fn opaque_value_ids_follow_coalescing_and_role_projection() {
+        let first_name = VReg::phys("opaque-a");
+        let second_name = VReg::phys("opaque-b");
+        let merged_name = VReg::phys("merged");
+        let mut identities = ValueIdentities::default();
+        let first_identity = SsaValue {
+            base: VReg::phys("rax"),
+            version: 1,
+        };
+        identities.record(first_name.clone(), first_identity.clone());
+        let second_identity = SsaValue {
+            base: VReg::phys("rax"),
+            version: 2,
+        };
+        identities.record(second_name.clone(), second_identity.clone());
+        identities.attach_definition_width(&first_identity, 4);
+        identities.attach_definition_width(&second_identity, 4);
+        let first_id = identities.exact_value_id(&first_name).expect("first id");
+        let second_id = identities.exact_value_id(&second_name).expect("second id");
+
+        identities.apply_renames(&HashMap::from([
+            (first_name, merged_name.clone()),
+            (second_name, merged_name.clone()),
+        ]));
+        assert_eq!(
+            identities.value_ids(&merged_name),
+            Some(BTreeSet::from([first_id, second_id]))
+        );
+
+        let projected = identities
+            .with_role_aliases(&HashMap::from([("merged".to_string(), "var0".to_string())]));
+        assert_eq!(
+            projected.value_ids(&VReg::phys("var0")),
+            Some(BTreeSet::from([first_id, second_id]))
+        );
+        assert_eq!(
+            projected.value_ids(&merged_name),
+            Some(BTreeSet::from([first_id, second_id]))
+        );
+        assert_eq!(
+            projected.unambiguous_definition_width(&merged_name),
+            Some(4)
+        );
+
+        identities.attach_definition_width(&second_identity, 8);
+        assert_eq!(identities.unambiguous_definition_width(&merged_name), None);
+    }
+
+    #[test]
+    fn conflicting_physical_bases_remain_explicitly_ambiguous() {
+        let numbered = VReg::phys("coalesced");
+        let mut identities = ValueIdentities::default();
+        identities.record(
+            numbered.clone(),
+            SsaValue {
+                base: VReg::phys("rax"),
+                version: 1,
+            },
+        );
+        identities.record(
+            numbered.clone(),
+            SsaValue {
+                base: VReg::phys("rbx"),
+                version: 2,
+            },
+        );
+
+        assert_eq!(identities.unambiguous_physical_base(&numbered), None);
+    }
+
+    #[test]
+    fn role_projection_preserves_original_keys_and_explicit_ambiguity() {
+        let first = SsaValue {
+            base: VReg::phys("rax"),
+            version: 1,
+        };
+        let second = SsaValue {
+            base: VReg::phys("rbx"),
+            version: 2,
+        };
+        let mut identities = ValueIdentities::default();
+        identities.record(VReg::phys("opaque-a"), first.clone());
+        identities.record(VReg::phys("opaque-b"), second.clone());
+        let aliases = HashMap::from([
+            ("opaque-a".to_string(), "var0".to_string()),
+            ("opaque-b".to_string(), "var0".to_string()),
+        ]);
+
+        let projected = identities.with_role_aliases(&aliases);
+
+        assert_eq!(projected.exact(&VReg::phys("opaque-a")), Some(&first));
+        assert_eq!(projected.exact(&VReg::phys("opaque-b")), Some(&second));
+        assert_eq!(
+            projected.candidates(&VReg::phys("var0")).map(BTreeSet::len),
+            Some(2)
+        );
+        assert_eq!(projected.exact(&VReg::phys("var0")), None);
+    }
+
+    #[test]
+    fn role_projection_records_parameter_slots_without_parsing_alias_spelling() {
+        let identities = ValueIdentities::default();
+        let aliases = HashMap::from([("stale".to_string(), "arg99".to_string())]);
+        let slots = std::collections::HashSet::from([0]);
+
+        let projected = identities.with_role_aliases_and_parameter_slots(&aliases, &slots);
+
+        assert_eq!(projected.parameter_slot(&VReg::phys("arg0")), Some(0));
+        assert_eq!(projected.parameter_slot(&VReg::phys("arg99")), None);
+    }
+
+    #[test]
+    fn source_parameter_slots_override_machine_bank_slots_after_role_projection() {
+        let mut identities = ValueIdentities::default();
+        identities
+            .parameter_slots_by_value
+            .insert(VReg::phys("r0"), BTreeSet::from([0]));
+        let aliases = HashMap::from([("r0".to_string(), "arg1".to_string())]);
+
+        let projected = identities
+            .with_role_aliases(&aliases)
+            .with_source_parameter_slots([1]);
+
+        assert_eq!(projected.parameter_slot(&VReg::phys("r0")), Some(0));
+        assert_eq!(projected.parameter_slot(&VReg::phys("arg1")), Some(1));
+    }
+
+    #[test]
+    fn stack_parameter_projection_records_only_owned_slots() {
+        let projected = ValueIdentities::default().with_parameter_slots(&HashSet::from([0, 2]));
+
+        assert_eq!(projected.parameter_slot(&VReg::phys("arg0")), Some(0));
+        assert_eq!(projected.parameter_slot(&VReg::phys("arg1")), None);
+        assert_eq!(projected.parameter_slot(&VReg::phys("arg2")), Some(2));
+        assert_eq!(projected.parameter_slot(&VReg::phys("arg99")), None);
+    }
+
+    #[test]
+    fn abi_parameter_slots_attach_only_to_live_version_zero_values() {
+        let function = mk(vec![
+            Op::Assign {
+                dst: VReg::phys("rbx"),
+                src: Value::Reg(VReg::phys("rdi")),
+            },
+            Op::Assign {
+                dst: VReg::phys("rdi"),
+                src: Value::Const(5),
+            },
+        ]);
+        let ssa = compute_ssa(&function);
+        let (_, _, live_slots, identities) =
+            value_number_with_parameter_slots_lifetimes_and_identities(
+                &function,
+                &ssa,
+                CallConv::SysVAmd64,
+                &[],
+            );
+
+        assert_eq!(live_slots, HashSet::from([0]));
+        assert_eq!(identities.parameter_slot(&VReg::phys("rdi")), Some(0));
+        assert_eq!(identities.parameter_slot(&VReg::phys("rdi#1")), None);
+        assert_eq!(identities.parameter_slot(&VReg::phys("rsi")), None);
+    }
+
+    #[test]
+    fn abi_parameter_slots_decline_a_noncanonical_identity_base() {
+        let mut identities = ValueIdentities::default();
+        identities.record(
+            VReg::phys("valid_entry"),
+            SsaValue {
+                base: VReg::phys("rdi"),
+                version: 0,
+            },
+        );
+        identities.record(
+            VReg::phys("malformed_entry"),
+            SsaValue {
+                base: VReg::phys("rdi#not_canonical"),
+                version: 0,
+            },
+        );
+
+        identities.attach_abi_parameter_slots(CallConv::SysVAmd64, &HashSet::from([0]));
+
+        assert_eq!(
+            identities.parameter_slot(&VReg::phys("valid_entry")),
+            Some(0)
+        );
+        assert_eq!(
+            identities.parameter_slot(&VReg::phys("malformed_entry")),
+            None
+        );
+    }
+
+    #[test]
+    fn presentation_renames_move_identity_candidates_to_the_rendered_name() {
+        let identity = SsaValue {
+            base: VReg::phys("rax"),
+            version: 1,
+        };
+        let mut identities = ValueIdentities::default();
+        identities.record(VReg::phys("local_8"), identity.clone());
+
+        identities.apply_role_renames(&HashMap::from([("local_8".to_string(), "sum".to_string())]));
+
+        assert!(identities.candidates(&VReg::phys("local_8")).is_none());
+        assert_eq!(identities.exact(&VReg::phys("sum")), Some(&identity));
+    }
+
+    #[test]
+    fn presentation_aliases_project_promoted_stack_ownership() {
+        let object = "stack_object_7".to_string();
+        let mut identities = ValueIdentities::default();
+        identities.attach_promoted_stack_objects([&object]);
+
+        let projected =
+            identities.with_role_aliases(&HashMap::from([(object, "local_8".to_string())]));
+
+        assert!(projected.is_promoted_stack_object(&VReg::phys("local_8")));
+    }
+
+    #[test]
+    fn colliding_presentation_renames_preserve_explicit_identity_ambiguity() {
+        let mut identities = ValueIdentities::default();
+        identities.record(
+            VReg::phys("local_8"),
+            SsaValue {
+                base: VReg::phys("rax"),
+                version: 1,
+            },
+        );
+        identities.record(
+            VReg::phys("local_c"),
+            SsaValue {
+                base: VReg::phys("rbx"),
+                version: 2,
+            },
+        );
+
+        identities.apply_role_renames(&HashMap::from([
+            ("local_8".to_string(), "sum".to_string()),
+            ("local_c".to_string(), "sum".to_string()),
+        ]));
+
+        assert_eq!(
+            identities.candidates(&VReg::phys("sum")).map(BTreeSet::len),
+            Some(2)
+        );
+        assert!(identities.exact(&VReg::phys("sum")).is_none());
+    }
+
+    #[test]
+    fn target_aware_numbering_preserves_the_parent_identity_of_partial_reads() {
+        use crate::core::binary::{Arch, Endianness, Format};
+        use crate::ir::types::Width;
+        use crate::target::TargetSpec;
+
+        // `cx` is a view of the current `rcx`, not an independent live-in.
+        // The operation's W16 source width carries the extraction semantics;
+        // its SSA name must still identify the reaching whole-register value.
+        let lf = mk(vec![
+            Op::Assign {
+                dst: VReg::phys("rcx"),
+                src: Value::Const(7),
+            },
+            Op::SExt {
+                dst: VReg::phys("rbx"),
+                src: Value::Reg(VReg::phys("cx")),
+                from: Width::W16,
+                to: Width::W64,
+            },
+        ]);
+        let target =
+            TargetSpec::from_image_metadata(Arch::X86_64, Endianness::Little, Format::ELF, false);
+        let ssa = compute_ssa_for_target(&lf, target);
+
+        let numbered = value_number(&lf, &ssa, CallConv::SysVAmd64);
+
+        match &numbered.blocks[0].instrs[1].op {
+            Op::SExt { src, from, to, .. } => {
+                assert_eq!(*src, Value::Reg(opaque_value(&ssa, "rcx", 1)));
+                assert_eq!((*from, *to), (Width::W16, Width::W64));
+            }
+            other => panic!("expected sign extension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn target_aware_numbering_uses_the_arm32_parent_for_defs_and_uses() {
+        use crate::core::binary::{Arch, Endianness, Format};
+        use crate::ir::types::MemOp;
+        use crate::target::TargetSpec;
+
+        let lf = mk(vec![
+            Op::Assign {
+                dst: VReg::phys("fp"),
+                src: Value::Reg(VReg::phys("sp")),
+            },
+            Op::Load {
+                dst: VReg::phys("r0"),
+                addr: MemOp {
+                    base: Some(VReg::phys("r11")),
+                    index: None,
+                    scale: 0,
+                    disp: -16,
+                    size: 4,
+                    segment: None,
+                    endian: crate::ir::types::Endian::Little,
+                },
+            },
+        ]);
+        let target =
+            TargetSpec::from_image_metadata(Arch::ARM, Endianness::Little, Format::ELF, false);
+        let ssa = compute_ssa_for_target(&lf, target);
+
+        let numbered = value_number(&lf, &ssa, CallConv::Arm);
+
+        assert_eq!(
+            def_uses(&numbered.blocks[0].instrs[0].op).0,
+            Some(opaque_value(&ssa, "r11", 1))
+        );
+        let Op::Load { addr, .. } = &numbered.blocks[0].instrs[1].op else {
+            panic!("expected ARM frame load: {numbered:#?}")
+        };
+        assert_eq!(addr.base, Some(opaque_value(&ssa, "r11", 1)));
+    }
+
+    #[test]
+    fn exact_definition_widths_survive_parent_register_canonicalisation() {
+        let lf = mk(vec![
+            Op::Bin {
+                dst: VReg::phys("edi"),
+                op: crate::ir::types::BinOp::Add,
+                lhs: Value::Reg(VReg::phys("edi")),
+                rhs: Value::Const(3),
+            },
+            Op::ZExt {
+                dst: VReg::phys("edi"),
+                src: Value::Reg(VReg::phys("edi")),
+                from: crate::ir::types::Width::W32,
+                to: crate::ir::types::Width::W64,
+            },
+        ]);
+        let ssa = compute_ssa(&lf);
+
+        let (numbered, widths) =
+            value_number_with_definition_widths(&lf, &ssa, CallConv::SysVAmd64);
+
+        assert_eq!(
+            def_uses(&numbered.blocks[0].instrs[0].op).0,
+            Some(opaque_value(&ssa, "rdi", 1))
+        );
+        assert_eq!(widths.get(&opaque_value(&ssa, "rdi", 1)), Some(&4));
+        assert_eq!(
+            def_uses(&numbered.blocks[0].instrs[1].op).0,
+            Some(opaque_value(&ssa, "rdi", 2))
+        );
+        assert_eq!(widths.get(&opaque_value(&ssa, "rdi", 2)), Some(&8));
+    }
+
+    #[test]
+    fn phi_width_agreement_uses_ssa_values_not_numbered_spellings() {
+        let phi = crate::ir::ssa::Phi {
+            block_idx: 2,
+            base: VReg::phys("opaque_lane"),
+            dst_version: 3,
+            incoming: vec![(0, 1), (1, 2)],
+        };
+        let widths = DefinitionWidthsByValue::from([
+            (
+                SsaValue {
+                    base: VReg::phys("opaque_lane"),
+                    version: 1,
+                },
+                4,
+            ),
+            (
+                SsaValue {
+                    base: VReg::phys("opaque_lane"),
+                    version: 2,
+                },
+                4,
+            ),
+        ]);
+
+        assert_eq!(agreed_phi_width(&phi, &widths), Some(4));
+    }
+
+    #[test]
+    fn loop_phi_copies_retain_scalarized_lane_widths() {
+        let block = |va: u64, ops: Vec<Op>, succs: Vec<u64>| LlirBlock {
+            start_va: va,
+            end_va: va + 0x10,
+            instrs: ops
+                .into_iter()
+                .enumerate()
+                .map(|(index, op)| LlirInstr {
+                    va: va + (index as u64) * 4,
+                    op,
+                })
+                .collect(),
+            succs,
+        };
+        let lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![
+                block(
+                    0x1000,
+                    vec![Op::Assign {
+                        dst: VReg::phys("xmm0_d0"),
+                        src: Value::Const(-9),
+                    }],
+                    vec![0x1010],
+                ),
+                block(
+                    0x1010,
+                    vec![Op::CondJump {
+                        cond: VReg::phys("rdi"),
+                        target: 0x1030,
+                        inverted: false,
+                    }],
+                    vec![0x1020, 0x1030],
+                ),
+                block(
+                    0x1020,
+                    vec![Op::Bin {
+                        dst: VReg::phys("xmm0_d0"),
+                        op: crate::ir::types::BinOp::Add,
+                        lhs: Value::Reg(VReg::phys("xmm0_d0")),
+                        rhs: Value::Const(1),
+                    }],
+                    vec![0x1010],
+                ),
+                block(
+                    0x1030,
+                    vec![
+                        Op::Assign {
+                            dst: VReg::phys("rbx"),
+                            src: Value::Reg(VReg::phys("xmm0_d0")),
+                        },
+                        Op::Return,
+                    ],
+                    vec![],
+                ),
+            ],
+        };
+        let ssa = compute_ssa(&lf);
+        let phi = ssa
+            .phis
+            .iter()
+            .find(|phi| phi.base == VReg::phys("xmm0_d0"))
+            .expect("loop must carry an XMM dword lane through a phi");
+        let phi_name = opaque_value(&ssa, "xmm0_d0", phi.dst_version);
+
+        let (numbered, widths, _, identities) =
+            value_number_with_parameter_slots_lifetimes_and_identities(
+                &lf,
+                &ssa,
+                CallConv::SysVAmd64,
+                &[],
+            );
+
+        // The merged lane value is what the loop exit reads. Look the name up in
+        // the numbered body rather than assuming the phi's own version survives:
+        // `coalesce_phi_copies` may give the whole web one name, and the contract
+        // being pinned here is that the WIDTH survives, not the spelling.
+        let merged = numbered
+            .blocks
+            .iter()
+            .flat_map(|b| b.instrs.iter())
+            .find_map(|i| match &i.op {
+                Op::Assign {
+                    dst: VReg::Phys(dst),
+                    src: Value::Reg(VReg::Phys(src)),
+                } if identities.unambiguous_physical_base(&VReg::phys(dst)) == Some("rbx")
+                    && identities.unambiguous_physical_base(&VReg::phys(src))
+                        == Some("xmm0_d0") =>
+                {
+                    Some(VReg::phys(src.clone()))
+                }
+                _ => None,
+            })
+            .unwrap_or(phi_name);
+
+        assert_eq!(
+            widths.get(&merged),
+            Some(&4),
+            "synthetic phi copies must preserve the lane's 32-bit definition"
+        );
+    }
+    use crate::ir::types::{LlirBlock, LlirFunction, LlirInstr, Op, VReg, Value};
+
+    fn mk(ops: Vec<Op>) -> LlirFunction {
+        LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![LlirBlock {
+                start_va: 0x1000,
+                end_va: 0x1100,
+                instrs: ops
+                    .into_iter()
+                    .enumerate()
+                    .map(|(j, op)| LlirInstr {
+                        va: 0x1000 + (j as u64) * 4,
+                        op,
+                    })
+                    .collect(),
+                succs: vec![],
+            }],
+        }
+    }
+
+    fn opaque_value(ssa: &crate::ir::ssa::SsaInfo, base: &str, version: u32) -> VReg {
+        VReg::phys(
+            ssa.value_id(&SsaValue {
+                base: VReg::phys(base),
+                version,
+            })
+            .expect("test SSA value must own an opaque ID")
+            .opaque_name(),
+        )
+    }
+
+    #[test]
+    fn explicit_return_preserves_exact_result_definition_identity() {
+        let lf = mk(vec![
+            Op::Assign {
+                dst: VReg::phys("eax"),
+                src: Value::Const(42),
+            },
+            Op::ReturnValue {
+                value: Value::Reg(VReg::phys("rax")),
+            },
+        ]);
+        let ssa = compute_ssa(&lf);
+        let numbered = value_number(&lf, &ssa, CallConv::SysVAmd64);
+
+        assert_eq!(
+            numbered.blocks[0].instrs[0].op,
+            Op::Assign {
+                dst: opaque_value(&ssa, "rax", 1),
+                src: Value::Const(42),
+            }
+        );
+        assert_eq!(
+            numbered.blocks[0].instrs[1].op,
+            Op::ReturnValue {
+                value: Value::Reg(opaque_value(&ssa, "rax", 1)),
+            }
+        );
+    }
+
+    #[test]
+    fn callee_saved_rbp_reused_as_data_keeps_instruction_order() {
+        let lf = mk(vec![
+            Op::Assign {
+                dst: VReg::phys("ebp"),
+                src: Value::Const(7),
+            },
+            Op::Assign {
+                dst: VReg::phys("edx"),
+                src: Value::Reg(VReg::phys("ebp")),
+            },
+            Op::Assign {
+                dst: VReg::phys("rbp"),
+                src: Value::Reg(VReg::phys("r11")),
+            },
+            Op::Call {
+                target: crate::ir::types::CallTarget::Direct(0x2000),
+                effects: Some(crate::ir::types::CallEffects {
+                    args: vec![VReg::phys("rdx")],
+                    proven_args: Vec::new(),
+                    result: None,
+                    result_is_source_value: false,
+                    args_are_exact: true,
+                    is_tail_call: false,
+                }),
+            },
+        ]);
+        let ssa = compute_ssa(&lf);
+
+        let numbered = value_number(&lf, &ssa, CallConv::SysVAmd64);
+
+        assert_eq!(
+            def_uses(&numbered.blocks[0].instrs[0].op).0,
+            Some(opaque_value(&ssa, "rbp", 1))
+        );
+        assert!(matches!(
+            &numbered.blocks[0].instrs[1].op,
+            Op::Assign {
+                src: Value::Reg(source),
+                ..
+            } if source == &opaque_value(&ssa, "rbp", 1)
+        ));
+        assert_eq!(
+            def_uses(&numbered.blocks[0].instrs[2].op).0,
+            Some(opaque_value(&ssa, "rbp", 2)),
+            "the later rbp value must not overwrite an earlier call-input dependency"
+        );
+    }
+
+    #[test]
+    fn proven_nonexact_call_inputs_are_signature_evidence_but_all_args_remain_uses() {
+        let all_args = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+            .into_iter()
+            .map(VReg::phys)
+            .collect::<Vec<_>>();
+        let lf = mk(vec![Op::Call {
+            target: crate::ir::types::CallTarget::Direct(0x2000),
+            effects: Some(crate::ir::types::CallEffects {
+                result: Some(VReg::phys("rax")),
+                result_is_source_value: true,
+                args: all_args.clone(),
+                proven_args: vec![VReg::phys("rdi")],
+                args_are_exact: false,
+                is_tail_call: false,
+            }),
+        }]);
+
+        let (_, uses) = def_uses(&lf.blocks[0].instrs[0].op);
+        assert_eq!(
+            uses, all_args,
+            "conservative call liveness must be retained"
+        );
+        assert_eq!(
+            live_in_arg_slots_llir(&lf, CallConv::SysVAmd64),
+            std::collections::HashSet::from([0]),
+            "only the callee-proven input is source-signature evidence"
+        );
+    }
+
+    #[test]
+    fn established_rbp_frame_base_remains_structural() {
+        let lf = mk(vec![
+            Op::Assign {
+                dst: VReg::phys("rbp"),
+                src: Value::Reg(VReg::phys("rsp")),
+            },
+            Op::Load {
+                dst: VReg::phys("eax"),
+                addr: crate::ir::types::MemOp {
+                    base: Some(VReg::phys("rbp")),
+                    index: None,
+                    scale: 1,
+                    disp: -4,
+                    size: 4,
+                    ..Default::default()
+                },
+            },
+        ]);
+        let ssa = compute_ssa(&lf);
+
+        let numbered = value_number(&lf, &ssa, CallConv::SysVAmd64);
+
+        assert!(matches!(
+            &numbered.blocks[0].instrs[0].op,
+            Op::Assign { dst, .. } if dst == &VReg::phys("rbp")
+        ));
+        assert!(matches!(
+            &numbered.blocks[0].instrs[1].op,
+            Op::Load { addr, .. } if addr.base.as_ref() == Some(&VReg::phys("rbp"))
+        ));
+    }
+
+    /// A diamond: both arms write `rbx`, the join reads it.
+    ///
+    ///   B0: cmp/branch          -> B1, B2
+    ///   B1: rbx = 10            -> B3
+    ///   B2: rbx = 20            -> B3
+    ///   B3: rcx = rbx ; return
+    fn diamond() -> LlirFunction {
+        let blk = |va: u64, ops: Vec<Op>, succs: Vec<u64>| LlirBlock {
+            start_va: va,
+            end_va: va + 0x10,
+            instrs: ops
+                .into_iter()
+                .enumerate()
+                .map(|(j, op)| LlirInstr {
+                    va: va + (j as u64) * 4,
+                    op,
+                })
+                .collect(),
+            succs,
+        };
+        LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![
+                blk(
+                    0x1000,
+                    vec![Op::CondJump {
+                        cond: VReg::phys("rdi"),
+                        target: 0x1020,
+                        inverted: false,
+                    }],
+                    vec![0x1010, 0x1020],
+                ),
+                blk(
+                    0x1010,
+                    vec![Op::Assign {
+                        dst: VReg::phys("rbx"),
+                        src: Value::Const(10),
+                    }],
+                    vec![0x1030],
+                ),
+                blk(
+                    0x1020,
+                    vec![Op::Assign {
+                        dst: VReg::phys("rbx"),
+                        src: Value::Const(20),
+                    }],
+                    vec![0x1030],
+                ),
+                blk(
+                    0x1030,
+                    vec![
+                        Op::Assign {
+                            dst: VReg::phys("rcx"),
+                            src: Value::Reg(VReg::phys("rbx")),
+                        },
+                        Op::Return,
+                    ],
+                    vec![],
+                ),
+            ],
+        }
+    }
+
+    /// Every versioned register a body READS must be DEFINED somewhere in that body.
+    ///
+    /// This is the invariant that translating out of SSA exists to preserve, and it
+    /// was being violated at every merge point. `compute_ssa` places phis on the
+    /// dominance frontier and hands each merged read the phi's *result* version, but
+    /// `value_number` only ever renamed existing instructions — nothing emitted a
+    /// definition for that result. So the join read `rbx#3`, a name no instruction
+    /// wrote, and the two arm definitions `rbx#1`/`rbx#2` became dead.
+    ///
+    /// What that looks like in emitted C, from `arith:signs` in the DecBench corpus:
+    ///
+    /// ```c
+    /// if ((arg0 < arg1)) {
+    /// } else {
+    /// }
+    /// return (var9 + var3);   // var9 declared, never assigned
+    /// ```
+    ///
+    /// Both arms emptied out by dead-code elimination — correctly, given the IR it
+    /// was handed — and the function returned uninitialised stack. Nothing in the
+    /// structural accounting flagged it, and it was right not to: every block and
+    /// edge WAS accounted for. The defect was one layer down, in the dataflow.
+    fn undefined_reads(lf: &LlirFunction) -> Vec<String> {
+        let mut defined: HashSet<String> = HashSet::new();
+        for b in &lf.blocks {
+            for ins in &b.instrs {
+                if let (Some(VReg::Phys(n)), _) = def_uses(&ins.op) {
+                    defined.insert(n.clone());
+                }
+            }
+        }
+        let mut bad = Vec::new();
+        for b in &lf.blocks {
+            for ins in &b.instrs {
+                let (_, uses) = def_uses(&ins.op);
+                for u in uses {
+                    if let VReg::Phys(n) = u {
+                        // A bare (unversioned) name is the live-in value — a
+                        // parameter — and is defined by the caller, not here.
+                        if n.contains('#') && !defined.contains(&n) {
+                            bad.push(n.clone());
+                        }
+                    }
+                }
+            }
+        }
+        bad.sort();
+        bad.dedup();
+        bad
+    }
+
+    #[test]
+    fn a_merged_register_read_is_defined_on_every_path() {
+        let lf = diamond();
+        let ssa = compute_ssa(&lf);
+        assert!(
+            !ssa.phis.is_empty(),
+            "the fixture must actually produce a phi, else it tests nothing"
+        );
+        let out = value_number(&lf, &ssa, CallConv::SysVAmd64);
+        assert_eq!(
+            undefined_reads(&out),
+            Vec::<String>::new(),
+            "the join reads a phi result that nothing defines"
+        );
+    }
+
+    /// Count `x = y` register copies, which is what phi destruction emits and
+    /// what coalescing exists to remove.
+    fn register_copies(lf: &LlirFunction) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for b in &lf.blocks {
+            for ins in &b.instrs {
+                if let Op::Assign {
+                    dst: VReg::Phys(d),
+                    src: Value::Reg(VReg::Phys(s)),
+                } = &ins.op
+                {
+                    out.push((d.clone(), s.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// The two arm definitions and the phi result are one variable: nothing
+    /// reads an arm value after the join, so the out-of-SSA copies are pure
+    /// overhead and must not reach the renderer.
+    #[test]
+    fn a_non_interfering_phi_web_needs_no_copies_at_all() {
+        let lf = diamond();
+        let ssa = compute_ssa(&lf);
+        let (out, _, _, identities) = value_number_with_parameter_slots_lifetimes_and_identities(
+            &lf,
+            &ssa,
+            CallConv::SysVAmd64,
+            &[],
+        );
+        let carried: Vec<(String, String)> = register_copies(&out)
+            .into_iter()
+            .filter(|(d, _)| identities.unambiguous_physical_base(&VReg::phys(d)) == Some("rbx"))
+            .collect();
+        assert_eq!(
+            carried,
+            Vec::<(String, String)>::new(),
+            "a phi web with no interference must coalesce to one name: {out:#?}"
+        );
+        assert_eq!(
+            undefined_reads(&out),
+            Vec::<String>::new(),
+            "coalescing must not orphan a read"
+        );
+        // The join still reads the merged value, and both arms still write it.
+        let names: HashSet<String> = out
+            .blocks
+            .iter()
+            .flat_map(|b| b.instrs.iter())
+            .filter_map(|i| match def_uses(&i.op).0 {
+                Some(VReg::Phys(n))
+                    if identities.unambiguous_physical_base(&VReg::phys(&n)) == Some("rbx") =>
+                {
+                    Some(n)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names.len(), 1, "both arms must define one name: {names:?}");
+    }
+
+    /// The safety condition, stated as a test rather than as a comment: when the
+    /// value feeding a merge is still read *after* the merge, the two names hold
+    /// different values at the same point and MUST NOT be given one name.
+    ///
+    ///   B0: rbx#1 = 7 ; branch          -> B1, B2
+    ///   B1: rbx#2 = 20                  -> B3
+    ///   B2: (nothing)                   -> B3
+    ///   B3: rcx = phi(rbx) ; rdx = rbx#1 ; return
+    ///
+    /// `rbx#1` is live across B3's phi definition, so coalescing it with the phi
+    /// result would make `rdx` read 20 on the B1 path.
+    #[test]
+    fn a_value_still_read_after_the_merge_is_not_coalesced() {
+        let blk = |va: u64, ops: Vec<Op>, succs: Vec<u64>| LlirBlock {
+            start_va: va,
+            end_va: va + 0x10,
+            instrs: ops
+                .into_iter()
+                .enumerate()
+                .map(|(j, op)| LlirInstr {
+                    va: va + (j as u64) * 4,
+                    op,
+                })
+                .collect(),
+            succs,
+        };
+        let lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![
+                blk(
+                    0x1000,
+                    vec![
+                        Op::Assign {
+                            dst: VReg::phys("rbx"),
+                            src: Value::Const(7),
+                        },
+                        Op::CondJump {
+                            cond: VReg::phys("rdi"),
+                            target: 0x1020,
+                            inverted: false,
+                        },
+                    ],
+                    vec![0x1010, 0x1020],
+                ),
+                blk(
+                    0x1010,
+                    vec![Op::Assign {
+                        dst: VReg::phys("rbx"),
+                        src: Value::Const(20),
+                    }],
+                    vec![0x1030],
+                ),
+                blk(0x1020, vec![Op::Nop], vec![0x1030]),
+                blk(
+                    0x1030,
+                    vec![
+                        Op::Assign {
+                            dst: VReg::phys("rcx"),
+                            src: Value::Reg(VReg::phys("rbx")),
+                        },
+                        Op::Return,
+                    ],
+                    vec![],
+                ),
+            ],
+        };
+        // Read the *first* definition again after the join by appending a use of
+        // its version explicitly: build the versioned form first, then check.
+        let ssa = compute_ssa(&lf);
+        let (out, _, _, identities) = value_number_with_parameter_slots_lifetimes_and_identities(
+            &lf,
+            &ssa,
+            CallConv::SysVAmd64,
+            &[],
+        );
+        // The phi result and `rbx#1` (the B0 definition, live into B2's path)
+        // must stay distinct, because B2 contributes `rbx#1` to the merge while
+        // B1 contributes `rbx#2` — coalescing all three would let B1's 20 be
+        // observed as B0's 7.
+        let defined: HashSet<String> = out
+            .blocks
+            .iter()
+            .flat_map(|b| b.instrs.iter())
+            .filter_map(|i| match def_uses(&i.op).0 {
+                Some(VReg::Phys(n))
+                    if identities.unambiguous_physical_base(&VReg::phys(&n)) == Some("rbx") =>
+                {
+                    Some(n)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            defined.len() >= 1,
+            "the merged value must still be defined: {defined:?}"
+        );
+        assert_eq!(
+            undefined_reads(&out),
+            Vec::<String>::new(),
+            "coalescing must not orphan a read"
+        );
+    }
+
+    /// Interference is what blocks a merge, and a definition of one name while
+    /// the other is live is what creates interference. Pinned directly on the
+    /// primitive so the rule cannot silently invert.
+    #[test]
+    fn interference_blocks_a_merge_and_absence_of_it_permits_one() {
+        let mut widths = HashMap::new();
+        let mut lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![LlirBlock {
+                start_va: 0x1000,
+                end_va: 0x1010,
+                instrs: vec![
+                    // a#1 = 1 ; b#1 = a#1 ; a#1 is dead here -> mergeable
+                    LlirInstr {
+                        va: 0x1000,
+                        op: Op::Assign {
+                            dst: VReg::phys("rax#1"),
+                            src: Value::Const(1),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1004,
+                        op: Op::Assign {
+                            dst: VReg::phys("rax#2"),
+                            src: Value::Reg(VReg::phys("rax#1")),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1008,
+                        op: Op::Assign {
+                            dst: VReg::phys("rcx"),
+                            src: Value::Reg(VReg::phys("rax#2")),
+                        },
+                    },
+                ],
+                succs: vec![],
+            }],
+        };
+        coalesce_phi_copies(
+            &mut lf,
+            &[(VReg::phys("rax#2"), VReg::phys("rax#1"))],
+            &mut widths,
+        );
+        assert_eq!(
+            register_copies(&lf),
+            vec![("rcx".to_string(), "rax#1".to_string())],
+            "a dead source must be coalesced away: {lf:#?}"
+        );
+
+        // Now make the source live past the copy: `rdx = rax#1` afterwards.
+        let mut widths = HashMap::new();
+        let mut lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![LlirBlock {
+                start_va: 0x1000,
+                end_va: 0x1010,
+                instrs: vec![
+                    LlirInstr {
+                        va: 0x1000,
+                        op: Op::Assign {
+                            dst: VReg::phys("rax#1"),
+                            src: Value::Const(1),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1004,
+                        op: Op::Assign {
+                            dst: VReg::phys("rax#2"),
+                            src: Value::Reg(VReg::phys("rax#1")),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1008,
+                        op: Op::Assign {
+                            dst: VReg::phys("rax#2"),
+                            src: Value::Const(9),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x100c,
+                        op: Op::Assign {
+                            dst: VReg::phys("rdx"),
+                            src: Value::Reg(VReg::phys("rax#1")),
+                        },
+                    },
+                ],
+                succs: vec![],
+            }],
+        };
+        coalesce_phi_copies(
+            &mut lf,
+            &[(VReg::phys("rax#2"), VReg::phys("rax#1"))],
+            &mut widths,
+        );
+        assert!(
+            register_copies(&lf).contains(&("rax#2".to_string(), "rax#1".to_string())),
+            "the copy must survive: rax#1 is live across a later definition of \
+             rax#2, so one name would report 9 where 1 was written: {lf:#?}"
+        );
+    }
+
+    #[test]
+    fn source_register_lifetime_blocks_cross_variable_phi_coalescing() {
+        let mut widths = HashMap::new();
+        let mut lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![LlirBlock {
+                start_va: 0x1000,
+                end_va: 0x1030,
+                instrs: vec![
+                    LlirInstr {
+                        va: 0x1000,
+                        op: Op::Assign {
+                            dst: VReg::phys("r4#1"),
+                            src: Value::Const(1),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1020,
+                        op: Op::Assign {
+                            dst: VReg::phys("r4#2"),
+                            src: Value::Reg(VReg::phys("r4#1")),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1024,
+                        op: Op::Assign {
+                            dst: VReg::phys("r0#1"),
+                            src: Value::Reg(VReg::phys("r4#2")),
+                        },
+                    },
+                ],
+                succs: vec![],
+            }],
+        };
+
+        coalesce_phi_copies_with_lifetimes(
+            &mut lf,
+            &[(VReg::phys("r4#2"), VReg::phys("r4#1"))],
+            &mut widths,
+            &[SourceRegisterLifetime {
+                register: "r4".to_string(),
+                ranges: vec![(0x1020, 0x1030)],
+            }],
+        );
+
+        assert_eq!(
+            register_copies(&lf),
+            vec![
+                ("r4#2".to_string(), "r4#1".to_string()),
+                ("r0#1".to_string(), "r4#2".to_string()),
+            ]
+        );
+    }
+
+    /// A class may not mix arithmetic widths: plain moves are width-neutral, but
+    /// two operations that genuinely wrap at 32 and 64 bits cannot share one C
+    /// declaration without explicit per-definition casts.
+    #[test]
+    fn a_width_disagreement_blocks_the_merge() {
+        let mut widths = HashMap::new();
+        widths.insert(VReg::phys("rax#1"), 4u8);
+        widths.insert(VReg::phys("rax#2"), 8u8);
+        let mut lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![LlirBlock {
+                start_va: 0x1000,
+                end_va: 0x1010,
+                instrs: vec![
+                    LlirInstr {
+                        va: 0x1000,
+                        op: Op::Bin {
+                            dst: VReg::phys("rax#1"),
+                            op: crate::ir::types::BinOp::Add,
+                            lhs: Value::Const(1),
+                            rhs: Value::Const(2),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1004,
+                        op: Op::Assign {
+                            dst: VReg::phys("rax#2"),
+                            src: Value::Reg(VReg::phys("rax#1")),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1008,
+                        op: Op::Bin {
+                            dst: VReg::phys("rax#2"),
+                            op: crate::ir::types::BinOp::Mul,
+                            lhs: Value::Const(3),
+                            rhs: Value::Const(4),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x100c,
+                        op: Op::Assign {
+                            dst: VReg::phys("rcx"),
+                            src: Value::Reg(VReg::phys("rax#2")),
+                        },
+                    },
+                ],
+                succs: vec![],
+            }],
+        };
+        coalesce_phi_copies(
+            &mut lf,
+            &[(VReg::phys("rax#2"), VReg::phys("rax#1"))],
+            &mut widths,
+        );
+        assert!(
+            register_copies(&lf).contains(&("rax#2".to_string(), "rax#1".to_string())),
+            "4-byte and 8-byte arithmetic must not share a name: {lf:#?}"
+        );
+    }
+
+    #[test]
+    fn width_neutral_moves_do_not_block_phi_coalescing() {
+        let mut widths = HashMap::from([(VReg::phys("rax#1"), 4u8), (VReg::phys("rax#2"), 8u8)]);
+        let mut lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![LlirBlock {
+                start_va: 0x1000,
+                end_va: 0x1010,
+                instrs: vec![
+                    LlirInstr {
+                        va: 0x1000,
+                        op: Op::Assign {
+                            dst: VReg::phys("rax#1"),
+                            src: Value::Const(1),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1004,
+                        op: Op::Assign {
+                            dst: VReg::phys("rax#2"),
+                            src: Value::Reg(VReg::phys("rax#1")),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1008,
+                        op: Op::Assign {
+                            dst: VReg::phys("rcx"),
+                            src: Value::Reg(VReg::phys("rax#2")),
+                        },
+                    },
+                ],
+                succs: vec![],
+            }],
+        };
+        coalesce_phi_copies(
+            &mut lf,
+            &[(VReg::phys("rax#2"), VReg::phys("rax#1"))],
+            &mut widths,
+        );
+        assert_eq!(
+            register_copies(&lf),
+            vec![("rcx".to_string(), "rax#1".to_string())],
+            "storage-width-only moves must not split one value: {lf:#?}"
+        );
+        assert_eq!(widths.get(&VReg::phys("rax#1")), Some(&8));
+    }
+
+    #[test]
+    fn a_late_phi_snapshot_does_not_merge_a_consumed_live_in_with_scratch_state() {
+        let mut widths = HashMap::new();
+        let mut lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![
+                LlirBlock {
+                    start_va: 0x1000,
+                    end_va: 0x1008,
+                    instrs: vec![
+                        // The ABI value has already served its source-level role.
+                        LlirInstr {
+                            va: 0x1000,
+                            op: Op::Bin {
+                                dst: VReg::Temp(0),
+                                op: crate::ir::types::BinOp::Add,
+                                lhs: Value::Reg(VReg::phys("rdi")),
+                                rhs: Value::Const(0),
+                            },
+                        },
+                        // A later synthetic snapshot must not make unrelated
+                        // scratch state one long-lived source variable.
+                        LlirInstr {
+                            va: 0x1004,
+                            op: Op::Assign {
+                                dst: VReg::phys("rdi#3"),
+                                src: Value::Reg(VReg::phys("rdi")),
+                            },
+                        },
+                    ],
+                    succs: vec![2],
+                },
+                LlirBlock {
+                    start_va: 0x1010,
+                    end_va: 0x1018,
+                    instrs: vec![
+                        LlirInstr {
+                            va: 0x1010,
+                            op: Op::Assign {
+                                dst: VReg::phys("rdi#2"),
+                                src: Value::Const(7),
+                            },
+                        },
+                        LlirInstr {
+                            va: 0x1014,
+                            op: Op::Assign {
+                                dst: VReg::phys("rdi#3"),
+                                src: Value::Reg(VReg::phys("rdi#2")),
+                            },
+                        },
+                    ],
+                    succs: vec![2],
+                },
+                LlirBlock {
+                    start_va: 0x1020,
+                    end_va: 0x1024,
+                    instrs: vec![LlirInstr {
+                        va: 0x1020,
+                        op: Op::Nop,
+                    }],
+                    succs: vec![],
+                },
+            ],
+        };
+        let copies = vec![
+            (VReg::phys("rdi#3"), VReg::phys("rdi")),
+            (VReg::phys("rdi#3"), VReg::phys("rdi#2")),
+        ];
+
+        coalesce_phi_copies(&mut lf, &copies, &mut widths);
+
+        assert!(
+            register_copies(&lf).contains(&("rdi#3".to_string(), "rdi#2".to_string())),
+            "a consumed live-in must keep the later scratch phi class separate: {lf:#?}"
+        );
+    }
+
+    #[test]
+    fn an_unread_live_in_does_not_merge_with_later_scratch_state() {
+        let mut widths = HashMap::new();
+        let mut lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![
+                LlirBlock {
+                    start_va: 0x1000,
+                    end_va: 0x1004,
+                    instrs: vec![LlirInstr {
+                        va: 0x1000,
+                        op: Op::Assign {
+                            dst: VReg::phys("rcx#3"),
+                            src: Value::Reg(VReg::phys("rcx")),
+                        },
+                    }],
+                    succs: vec![2],
+                },
+                LlirBlock {
+                    start_va: 0x1010,
+                    end_va: 0x1018,
+                    instrs: vec![
+                        LlirInstr {
+                            va: 0x1010,
+                            op: Op::Assign {
+                                dst: VReg::phys("rcx#2"),
+                                src: Value::Const(7),
+                            },
+                        },
+                        LlirInstr {
+                            va: 0x1014,
+                            op: Op::Assign {
+                                dst: VReg::phys("rcx#3"),
+                                src: Value::Reg(VReg::phys("rcx#2")),
+                            },
+                        },
+                    ],
+                    succs: vec![2],
+                },
+                LlirBlock {
+                    start_va: 0x1020,
+                    end_va: 0x1024,
+                    instrs: vec![LlirInstr {
+                        va: 0x1020,
+                        op: Op::Nop,
+                    }],
+                    succs: vec![],
+                },
+            ],
+        };
+        let copies = vec![
+            (VReg::phys("rcx#3"), VReg::phys("rcx")),
+            (VReg::phys("rcx#3"), VReg::phys("rcx#2")),
+        ];
+
+        coalesce_phi_copies(&mut lf, &copies, &mut widths);
+
+        assert!(
+            register_copies(&lf).contains(&("rcx#3".to_string(), "rcx#2".to_string())),
+            "an unproven version-zero value is undefined, not a parameter: {lf:#?}"
+        );
+    }
+
+    #[test]
+    fn a_live_in_reached_through_a_read_phi_coalesces_with_its_loop_carrier() {
+        let carrier = VReg::phys("rdi#1");
+        let next = VReg::phys("rdi#2");
+        let mut widths = HashMap::from([(next.clone(), 8)]);
+        let mut lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![
+                LlirBlock {
+                    start_va: 0x1000,
+                    end_va: 0x1008,
+                    instrs: vec![
+                        LlirInstr {
+                            va: 0x1000,
+                            op: Op::Bin {
+                                dst: VReg::Temp(1),
+                                op: crate::ir::types::BinOp::Add,
+                                lhs: Value::Reg(VReg::phys("rdi")),
+                                rhs: Value::Const(0),
+                            },
+                        },
+                        LlirInstr {
+                            va: 0x1004,
+                            op: Op::Assign {
+                                dst: carrier.clone(),
+                                src: Value::Reg(VReg::phys("rdi")),
+                            },
+                        },
+                    ],
+                    succs: vec![0x1010],
+                },
+                LlirBlock {
+                    start_va: 0x1010,
+                    end_va: 0x1020,
+                    instrs: vec![
+                        LlirInstr {
+                            va: 0x1010,
+                            op: Op::Load {
+                                dst: VReg::Temp(0),
+                                addr: crate::ir::types::MemOp {
+                                    base: Some(carrier.clone()),
+                                    index: None,
+                                    scale: 1,
+                                    disp: 0,
+                                    size: 1,
+                                    ..Default::default()
+                                },
+                            },
+                        },
+                        LlirInstr {
+                            va: 0x1014,
+                            op: Op::Bin {
+                                dst: next.clone(),
+                                op: crate::ir::types::BinOp::Add,
+                                lhs: Value::Reg(carrier.clone()),
+                                rhs: Value::Const(1),
+                            },
+                        },
+                        LlirInstr {
+                            va: 0x1018,
+                            op: Op::Assign {
+                                dst: carrier.clone(),
+                                src: Value::Reg(next.clone()),
+                            },
+                        },
+                    ],
+                    succs: vec![0x1010],
+                },
+            ],
+        };
+        let copies = vec![
+            (carrier.clone(), VReg::phys("rdi")),
+            (carrier.clone(), next.clone()),
+        ];
+
+        coalesce_phi_copies(&mut lf, &copies, &mut widths);
+
+        assert!(
+            !register_copies(&lf).contains(&("rdi#1".to_string(), "rdi#2".to_string())),
+            "the bare live-in is genuinely consumed through the phi destination: {lf:#?}"
+        );
+    }
+
+    /// Bare names are ABI identities (live-in parameters, the frame register,
+    /// a kept return value). Coalescing must never move one.
+    #[test]
+    fn a_bare_name_is_never_coalesced() {
+        let mut widths = HashMap::new();
+        let mut lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![LlirBlock {
+                start_va: 0x1000,
+                end_va: 0x1010,
+                instrs: vec![
+                    LlirInstr {
+                        va: 0x1000,
+                        op: Op::Assign {
+                            dst: VReg::phys("rax#1"),
+                            src: Value::Reg(VReg::phys("rdi")),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1004,
+                        op: Op::Assign {
+                            dst: VReg::phys("rcx"),
+                            src: Value::Reg(VReg::phys("rax#1")),
+                        },
+                    },
+                ],
+                succs: vec![],
+            }],
+        };
+        coalesce_phi_copies(
+            &mut lf,
+            &[(VReg::phys("rax#1"), VReg::phys("rdi"))],
+            &mut widths,
+        );
+        assert!(
+            register_copies(&lf).contains(&("rax#1".to_string(), "rdi".to_string())),
+            "the live-in parameter must keep its own identity: {lf:#?}"
+        );
+    }
+
+    #[test]
+    fn production_phi_coalescing_uses_opaque_ssa_identity() {
+        let first = VReg::phys("opaque_first");
+        let second = VReg::phys("opaque_second");
+        let mut lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![LlirBlock {
+                start_va: 0x1000,
+                end_va: 0x100c,
+                instrs: vec![
+                    LlirInstr {
+                        va: 0x1000,
+                        op: Op::Assign {
+                            dst: first.clone(),
+                            src: Value::Const(7),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1004,
+                        op: Op::Assign {
+                            dst: second.clone(),
+                            src: Value::Reg(first.clone()),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1008,
+                        op: Op::Assign {
+                            dst: VReg::phys("sink"),
+                            src: Value::Reg(second.clone()),
+                        },
+                    },
+                ],
+                succs: vec![],
+            }],
+        };
+        let mut identities = ValueIdentities::default();
+        identities.record(
+            first.clone(),
+            SsaValue {
+                base: VReg::phys("rax"),
+                version: 1,
+            },
+        );
+        identities.record(
+            second.clone(),
+            SsaValue {
+                base: VReg::phys("rax"),
+                version: 2,
+            },
+        );
+
+        let renames = coalesce_phi_copies_with_identities(
+            &mut lf,
+            &[(second.clone(), first.clone())],
+            &mut HashMap::new(),
+            &identities,
+        );
+
+        assert_eq!(renames.get(&second), Some(&first));
+        assert_eq!(
+            register_copies(&lf),
+            vec![("sink".into(), "opaque_first".into())]
+        );
+    }
+
+    #[test]
+    fn production_phi_coalescing_rejects_unowned_version_spelling() {
+        let first = VReg::phys("rax#1");
+        let second = VReg::phys("rax#2");
+        let mut lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![LlirBlock {
+                start_va: 0x1000,
+                end_va: 0x100c,
+                instrs: vec![
+                    LlirInstr {
+                        va: 0x1000,
+                        op: Op::Assign {
+                            dst: first.clone(),
+                            src: Value::Const(7),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1004,
+                        op: Op::Assign {
+                            dst: second.clone(),
+                            src: Value::Reg(first.clone()),
+                        },
+                    },
+                    LlirInstr {
+                        va: 0x1008,
+                        op: Op::Assign {
+                            dst: VReg::phys("sink"),
+                            src: Value::Reg(second.clone()),
+                        },
+                    },
+                ],
+                succs: vec![],
+            }],
+        };
+
+        let renames = coalesce_phi_copies_with_identities(
+            &mut lf,
+            &[(second.clone(), first.clone())],
+            &mut HashMap::new(),
+            &ValueIdentities::default(),
+        );
+
+        assert!(renames.is_empty());
+        assert!(register_copies(&lf).contains(&("rax#2".into(), "rax#1".into())));
+    }
+
+    #[test]
+    fn real_gcc_o2_nested_loop_defines_every_loop_carried_register() {
+        use object::{Object, ObjectSymbol};
+        use std::io::Write;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().expect("temporary nested-loop build directory");
+        let source = tmp.path().join("03_loop_shapes.c");
+        let binary = tmp.path().join("03_loop_shapes.so");
+        std::fs::File::create(&source)
+            .and_then(|mut file| {
+                file.write_all(include_bytes!(
+                    "../../tests/decompiler_fixtures/src/03_loop_shapes.c"
+                ))
+            })
+            .expect("write the real loop fixture source");
+        let build = match Command::new("gcc")
+            .args(["-shared", "-fPIC", "-g", "-O2", "-o"])
+            .arg(&binary)
+            .arg(&source)
+            .output()
+        {
+            Ok(build) => build,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                crate::testing::missing_tool("gcc");
+                return;
+            }
+            Err(error) => panic!("launch GCC: {error}"),
+        };
+        assert!(
+            build.status.success(),
+            "compile the real loop fixture with GCC -O2: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let data = std::fs::read(&binary).expect("read GCC output");
+        let object =
+            crate::decompile::profile::parse_object(data.as_slice()).expect("parse GCC ELF");
+        let entry = object
+            .dynamic_symbols()
+            .find(|symbol| symbol.name().ok() == Some("nested_carry"))
+            .map(|symbol| symbol.address())
+            .expect("exported nested_carry symbol");
+        let (functions, _) = crate::analysis::cfg::analyze_functions_bytes(
+            &data,
+            &crate::analysis::cfg::Budgets::default(),
+        );
+        let function = functions
+            .iter()
+            .find(|function| function.entry_point.value == entry)
+            .expect("discovered nested_carry function");
+        let lifted = crate::ir::lift_function::lift_function_from_bytes(
+            &data,
+            function,
+            crate::core::binary::Arch::X86_64,
+        )
+        .expect("lift nested_carry");
+        let ssa = compute_ssa(&lifted);
+        let numbered = value_number(&lifted, &ssa, CallConv::SysVAmd64);
+
+        assert_eq!(
+            undefined_reads(&numbered),
+            Vec::<String>::new(),
+            "a loop-carried phi read has no incoming edge definition; phis: {:#?}",
+            ssa.phis
+        );
+    }
+
+    #[test]
+    fn real_gcc_o2_call_chain_keeps_the_iteration_value_at_the_call() {
+        use object::{Object, ObjectSymbol};
+        use std::io::Write;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().expect("temporary call-shape build directory");
+        let source = tmp.path().join("11_call_shapes.c");
+        let binary = tmp.path().join("11_call_shapes.so");
+        std::fs::File::create(&source)
+            .and_then(|mut file| {
+                file.write_all(include_bytes!(
+                    "../../tests/decompiler_fixtures/src/11_call_shapes.c"
+                ))
+            })
+            .expect("write the real call-shape fixture source");
+        let build = match Command::new("gcc")
+            .args(["-shared", "-fPIC", "-g", "-O2", "-o"])
+            .arg(&binary)
+            .arg(&source)
+            .output()
+        {
+            Ok(build) => build,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                crate::testing::missing_tool("gcc");
+                return;
+            }
+            Err(error) => panic!("launch GCC: {error}"),
+        };
+        assert!(
+            build.status.success(),
+            "compile the real call fixture with GCC -O2: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let data = std::fs::read(&binary).expect("read GCC output");
+        let object =
+            crate::decompile::profile::parse_object(data.as_slice()).expect("parse GCC ELF");
+        let entry = object
+            .dynamic_symbols()
+            .find(|symbol| symbol.name().ok() == Some("call_chain_in_loop"))
+            .map(|symbol| symbol.address())
+            .expect("exported call_chain_in_loop symbol");
+        let (functions, _) = crate::analysis::cfg::analyze_functions_bytes(
+            &data,
+            &crate::analysis::cfg::Budgets::default(),
+        );
+        let function = functions
+            .iter()
+            .find(|function| function.entry_point.value == entry)
+            .expect("discovered call_chain_in_loop function");
+        let mut lifted = crate::ir::lift_function::lift_function_from_bytes(
+            &data,
+            function,
+            crate::core::binary::Arch::X86_64,
+        )
+        .expect("lift call_chain_in_loop");
+        crate::ir::abi::annotate_calls(&mut lifted, CallConv::SysVAmd64);
+        let ssa = compute_ssa(&lifted);
+        let numbered = value_number(&lifted, &ssa, CallConv::SysVAmd64);
+
+        let first_call_argument = numbered
+            .blocks
+            .iter()
+            .flat_map(|block| block.instrs.iter())
+            .find_map(|instruction| match &instruction.op {
+                Op::Call {
+                    effects: Some(effects),
+                    ..
+                } => effects.args.first().cloned(),
+                _ => None,
+            })
+            .expect("the loop must call signed_step with a first argument");
+        assert_ne!(
+            first_call_argument,
+            VReg::phys("rdi"),
+            "the loop call must not be frozen to the bare entry parameter"
+        );
+        let definitions = numbered
+            .blocks
+            .iter()
+            .flat_map(|block| block.instrs.iter())
+            .filter(|instruction| {
+                def_uses(&instruction.op).0.as_ref() == Some(&first_call_argument)
+            })
+            .count();
+        assert!(
+            definitions >= 2,
+            "the call argument needs an entry definition and a loop-carried \
+             backedge definition, got {definitions}: {numbered:#?}"
+        );
+        assert_eq!(
+            undefined_reads(&numbered),
+            Vec::<String>::new(),
+            "coalescing must not orphan the loop-carried call argument"
+        );
+    }
+
+    #[test]
+    fn a_merged_predicate_read_is_defined_on_every_path() {
+        use crate::ir::types::{CmpOp, Flag};
+
+        let blk = |va: u64, ops: Vec<Op>, succs: Vec<u64>| LlirBlock {
+            start_va: va,
+            end_va: va + 0x10,
+            instrs: ops
+                .into_iter()
+                .enumerate()
+                .map(|(j, op)| LlirInstr {
+                    va: va + (j as u64) * 4,
+                    op,
+                })
+                .collect(),
+            succs,
+        };
+        let zf_from = |value: i64| Op::Cmp {
+            dst: VReg::Flag(Flag::Z),
+            op: CmpOp::Eq,
+            lhs: Value::Reg(VReg::phys("rax")),
+            rhs: Value::Const(value),
+        };
+        let lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![
+                blk(
+                    0x1000,
+                    vec![Op::CondJump {
+                        cond: VReg::Flag(Flag::C),
+                        target: 0x1020,
+                        inverted: false,
+                    }],
+                    vec![0x1010, 0x1020],
+                ),
+                blk(
+                    0x1010,
+                    vec![zf_from(0), Op::Jump { target: 0x1030 }],
+                    vec![0x1030],
+                ),
+                blk(
+                    0x1020,
+                    vec![zf_from(1), Op::Jump { target: 0x1030 }],
+                    vec![0x1030],
+                ),
+                blk(
+                    0x1030,
+                    vec![Op::CondJump {
+                        cond: VReg::Flag(Flag::Z),
+                        target: 0x1050,
+                        inverted: false,
+                    }],
+                    vec![0x1040, 0x1050],
+                ),
+                blk(0x1040, vec![Op::Return], vec![]),
+                blk(0x1050, vec![Op::Return], vec![]),
+            ],
+        };
+        let ssa = compute_ssa(&lf);
+        assert!(
+            ssa.phis.iter().any(|phi| phi.base == VReg::Flag(Flag::Z)),
+            "fixture must place a ZF phi"
+        );
+
+        let out = value_number(&lf, &ssa, CallConv::SysVAmd64);
+        let defined: HashSet<VReg> = out
+            .blocks
+            .iter()
+            .flat_map(|block| block.instrs.iter())
+            .filter_map(|ins| def_uses(&ins.op).0)
+            .collect();
+        let undefined: Vec<VReg> = out
+            .blocks
+            .iter()
+            .flat_map(|block| block.instrs.iter())
+            .flat_map(|ins| def_uses(&ins.op).1)
+            .filter(|used| {
+                matches!(used, VReg::FlagValue { version, .. } if *version > 0)
+                    && !defined.contains(used)
+            })
+            .collect();
+        assert!(
+            undefined.is_empty(),
+            "merged predicate uses undefined SSA values: {undefined:?}"
+        );
+    }
+
+    #[test]
+    fn the_phi_copy_lands_before_the_terminator() {
+        // A copy appended AFTER a block's branch would never execute (and would
+        // leave the branch in the middle of the block, which the structurer reads
+        // as a terminator position). Insert before it.
+        let lf = diamond();
+        let ssa = compute_ssa(&lf);
+        let out = value_number(&lf, &ssa, CallConv::SysVAmd64);
+        for (bi, b) in out.blocks.iter().enumerate() {
+            if let Some(pos) = b
+                .instrs
+                .iter()
+                .position(|i| matches!(i.op, Op::CondJump { .. } | Op::Jump { .. }))
+            {
+                assert_eq!(
+                    pos,
+                    b.instrs.len() - 1,
+                    "block {bi}: a branch must stay last, got {:?}",
+                    b.instrs.iter().map(|i| &i.op).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_phi_result_nobody_reads_gets_no_copy() {
+        // The join's read is what makes the copy necessary. Drop the read and the
+        // phi is dead: emitting copies for it would add statements to both arms
+        // that no C programmer wrote, which is exactly the graph-edit-distance
+        // noise the renderer works to avoid.
+        let mut lf = diamond();
+        lf.blocks[3].instrs.retain(|i| matches!(i.op, Op::Return));
+        let ssa = compute_ssa(&lf);
+        let out = value_number(&lf, &ssa, CallConv::SysVAmd64);
+        let before: usize = lf.blocks.iter().map(|b| b.instrs.len()).sum();
+        let after: usize = out.blocks.iter().map(|b| b.instrs.len()).sum();
+        assert_eq!(
+            before,
+            after,
+            "an unread phi must not add copies:\n{:#?}",
+            out.blocks
+                .iter()
+                .map(|b| b.instrs.iter().map(|i| &i.op).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A predecessor with MORE THAN ONE successor — the critical edge.
+    ///
+    /// The copy lands at the end of a block that does not always continue to the
+    /// merge, so on the bypassing path it executes an assignment the merge never
+    /// reads. The correctness argument is that this is dead rather than wrong: the
+    /// phi result is live only from the merge block down. This test states it as a
+    /// property instead of a comment — every versioned read still has a definition,
+    /// and the block's branch stays last.
+    ///
+    ///   b0 -> b1, b2
+    ///   b1 -> b3, b4     <- CRITICAL: b1 feeds the merge b3 *and* bypasses to b4
+    ///   b2 -> b3
+    ///   b3 reads rbx (merge of b1's and b2's writes)
+    ///   b4 reads rbx too, on the path that never went through b3
+    #[test]
+    fn a_critical_edge_predecessor_still_defines_the_phi_result() {
+        use crate::ir::types::Flag;
+        let blk = |va: u64, ops: Vec<Op>, succs: Vec<u64>| LlirBlock {
+            start_va: va,
+            end_va: va + 0x10,
+            instrs: ops
+                .into_iter()
+                .enumerate()
+                .map(|(j, op)| LlirInstr {
+                    va: va + (j as u64) * 4,
+                    op,
+                })
+                .collect(),
+            succs,
+        };
+        let cj = |t: u64| Op::CondJump {
+            cond: VReg::Flag(Flag::Z),
+            target: t,
+            inverted: false,
+        };
+        let lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![
+                blk(0x1000, vec![cj(0x1020)], vec![0x1010, 0x1020]),
+                blk(
+                    0x1010,
+                    vec![
+                        Op::Assign {
+                            dst: VReg::phys("rbx"),
+                            src: Value::Const(10),
+                        },
+                        cj(0x1040),
+                    ],
+                    vec![0x1030, 0x1040],
+                ),
+                blk(
+                    0x1020,
+                    vec![Op::Assign {
+                        dst: VReg::phys("rbx"),
+                        src: Value::Const(20),
+                    }],
+                    vec![0x1030],
+                ),
+                blk(
+                    0x1030,
+                    vec![
+                        Op::Assign {
+                            dst: VReg::phys("rcx"),
+                            src: Value::Reg(VReg::phys("rbx")),
+                        },
+                        Op::Return,
+                    ],
+                    vec![],
+                ),
+                blk(
+                    0x1040,
+                    vec![
+                        Op::Assign {
+                            dst: VReg::phys("rdx"),
+                            src: Value::Reg(VReg::phys("rbx")),
+                        },
+                        Op::Return,
+                    ],
+                    vec![],
+                ),
+            ],
+        };
+        let ssa = compute_ssa(&lf);
+        assert!(!ssa.phis.is_empty(), "fixture must produce a phi");
+        let out = value_number(&lf, &ssa, CallConv::SysVAmd64);
+        assert_eq!(
+            undefined_reads(&out),
+            Vec::<String>::new(),
+            "a critical-edge predecessor left the phi result undefined"
+        );
+        for (bi, b) in out.blocks.iter().enumerate() {
+            if let Some(pos) = b
+                .instrs
+                .iter()
+                .position(|i| matches!(i.op, Op::CondJump { .. } | Op::Jump { .. }))
+            {
+                assert_eq!(pos, b.instrs.len() - 1, "block {bi}: branch must stay last");
+            }
+        }
+    }
+
+    /// Two phis in the SAME merge block, on different registers, whose sources cross.
+    ///
+    /// Phi semantics are parallel, so emitting the copies sequentially is only sound
+    /// if no phi's source is another phi's destination. The claim is that SSA
+    /// guarantees this — destinations are versions fresh at the merge, sources come
+    /// from strictly earlier definitions — but "guaranteed by construction" is the
+    /// kind of claim that deserves a test rather than a paragraph. A swap
+    /// (`rbx, rcx = rcx, rbx` across the arms) is the shape that would break it.
+    #[test]
+    fn two_crossing_phis_in_one_block_do_not_clobber_each_other() {
+        use crate::ir::types::Flag;
+        let blk = |va: u64, ops: Vec<Op>, succs: Vec<u64>| LlirBlock {
+            start_va: va,
+            end_va: va + 0x20,
+            instrs: ops
+                .into_iter()
+                .enumerate()
+                .map(|(j, op)| LlirInstr {
+                    va: va + (j as u64) * 4,
+                    op,
+                })
+                .collect(),
+            succs,
+        };
+        let mov = |d: &str, s: &str| Op::Assign {
+            dst: VReg::phys(d),
+            src: Value::Reg(VReg::phys(s)),
+        };
+        let lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![
+                blk(
+                    0x1000,
+                    vec![
+                        Op::Assign {
+                            dst: VReg::phys("rbx"),
+                            src: Value::Const(1),
+                        },
+                        Op::Assign {
+                            dst: VReg::phys("rcx"),
+                            src: Value::Const(2),
+                        },
+                        Op::CondJump {
+                            cond: VReg::Flag(Flag::Z),
+                            target: 0x1020,
+                            inverted: false,
+                        },
+                    ],
+                    vec![0x1010, 0x1020],
+                ),
+                // then: swap them
+                blk(
+                    0x1010,
+                    vec![mov("rbx", "rcx"), mov("rcx", "rbx")],
+                    vec![0x1030],
+                ),
+                // else: swap them the other way
+                blk(
+                    0x1020,
+                    vec![mov("rcx", "rbx"), mov("rbx", "rcx")],
+                    vec![0x1030],
+                ),
+                blk(
+                    0x1030,
+                    vec![
+                        Op::Bin {
+                            dst: VReg::phys("rax"),
+                            op: crate::ir::types::BinOp::Add,
+                            lhs: Value::Reg(VReg::phys("rbx")),
+                            rhs: Value::Reg(VReg::phys("rcx")),
+                        },
+                        Op::Return,
+                    ],
+                    vec![],
+                ),
+            ],
+        };
+        let ssa = compute_ssa(&lf);
+        let out = value_number(&lf, &ssa, CallConv::SysVAmd64);
+        assert_eq!(
+            undefined_reads(&out),
+            Vec::<String>::new(),
+            "crossing phis left a read undefined"
+        );
+        // No copy may read a name that a LATER copy in the same block defines —
+        // that is precisely the sequentialisation hazard.
+        for b in &out.blocks {
+            let copies: Vec<(String, String)> = b
+                .instrs
+                .iter()
+                .filter_map(|i| match &i.op {
+                    Op::Assign {
+                        dst: VReg::Phys(d),
+                        src: Value::Reg(VReg::Phys(s)),
+                    } => Some((d.clone(), s.clone())),
+                    _ => None,
+                })
+                .collect();
+            for (k, (_, src)) in copies.iter().enumerate() {
+                for (dst_later, _) in &copies[k + 1..] {
+                    assert_ne!(
+                        src, dst_later,
+                        "copy reads {src}, which a later copy in the same block \
+                         overwrites — the parallel-phi swap hazard:\n{copies:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A phi on the RETURN register, whose versions `value_number` keeps bare.
+    ///
+    /// Value keying collapses a kept-bare version to the plain register name, so a phi
+    /// whose destination and source both collapse would emit `rax = rax`, and a
+    /// chain of them could in principle form a cycle. The insertion skips
+    /// `src == dst` for exactly this reason; this pins that no self-copy and no
+    /// two-copy cycle survives.
+    #[test]
+    fn a_kept_bare_return_register_phi_emits_no_self_copy_or_cycle() {
+        use crate::ir::types::Flag;
+        let blk = |va: u64, ops: Vec<Op>, succs: Vec<u64>| LlirBlock {
+            start_va: va,
+            end_va: va + 0x10,
+            instrs: ops
+                .into_iter()
+                .enumerate()
+                .map(|(j, op)| LlirInstr {
+                    va: va + (j as u64) * 4,
+                    op,
+                })
+                .collect(),
+            succs,
+        };
+        // if (c) rax = 1; else rax = 2;  return rax;
+        let lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![
+                blk(
+                    0x1000,
+                    vec![Op::CondJump {
+                        cond: VReg::Flag(Flag::Z),
+                        target: 0x1020,
+                        inverted: false,
+                    }],
+                    vec![0x1010, 0x1020],
+                ),
+                blk(
+                    0x1010,
+                    vec![Op::Assign {
+                        dst: VReg::phys("rax"),
+                        src: Value::Const(1),
+                    }],
+                    vec![0x1030],
+                ),
+                blk(
+                    0x1020,
+                    vec![Op::Assign {
+                        dst: VReg::phys("rax"),
+                        src: Value::Const(2),
+                    }],
+                    vec![0x1030],
+                ),
+                blk(0x1030, vec![Op::Return], vec![]),
+            ],
+        };
+        let ssa = compute_ssa(&lf);
+        let out = value_number(&lf, &ssa, CallConv::SysVAmd64);
+        for b in &out.blocks {
+            for i in &b.instrs {
+                if let Op::Assign {
+                    dst: VReg::Phys(d),
+                    src: Value::Reg(VReg::Phys(s)),
+                } = &i.op
+                {
+                    assert_ne!(d, s, "emitted a self-copy `{d} = {s}`");
+                }
+            }
+        }
+        assert_eq!(
+            undefined_reads(&out),
+            Vec::<String>::new(),
+            "kept-bare return phi left a read undefined"
+        );
+    }
+
+    #[test]
+    fn distinct_defs_of_a_register_get_distinct_tags() {
+        // rbx = 1 ; rbx = 2 ; rcx = rbx  -> rbx#1, rbx#2, rcx#1 = rbx#2
+        // (rbx is not a return register, so no version is kept bare here.)
+        let lf = mk(vec![
+            Op::Assign {
+                dst: VReg::phys("rbx"),
+                src: Value::Const(1),
+            },
+            Op::Assign {
+                dst: VReg::phys("rbx"),
+                src: Value::Const(2),
+            },
+            Op::Assign {
+                dst: VReg::phys("rcx"),
+                src: Value::Reg(VReg::phys("rbx")),
+            },
+        ]);
+        let ssa = compute_ssa(&lf);
+        let out = value_number(&lf, &ssa, CallConv::SysVAmd64);
+        let ops = &out.blocks[0].instrs;
+        assert_eq!(
+            ops[0].op,
+            Op::Assign {
+                dst: opaque_value(&ssa, "rbx", 1),
+                src: Value::Const(1)
+            }
+        );
+        assert_eq!(
+            ops[1].op,
+            Op::Assign {
+                dst: opaque_value(&ssa, "rbx", 2),
+                src: Value::Const(2)
+            }
+        );
+        assert_eq!(
+            ops[2].op,
+            Op::Assign {
+                dst: opaque_value(&ssa, "rcx", 1),
+                src: Value::Reg(opaque_value(&ssa, "rbx", 2))
+            }
+        );
+    }
+
+    #[test]
+    fn single_output_intrinsic_uses_the_reaching_ssa_value() {
+        let lf = mk(vec![
+            Op::Load {
+                dst: VReg::phys("s15"),
+                addr: crate::ir::types::MemOp::plain(Some(VReg::phys("sp")), None, 0, 8, 4),
+            },
+            Op::Intrinsic {
+                name: "vneg.f32".into(),
+                ins: vec![Value::Reg(VReg::phys("s15"))],
+                outs: vec![(VReg::phys("s15"), crate::ir::types::Width::W32)],
+                reads_mem: false,
+                writes_mem: false,
+            },
+        ]);
+        let ssa = compute_ssa(&lf);
+        let out = value_number(&lf, &ssa, CallConv::Arm);
+
+        assert_eq!(
+            out.blocks[0].instrs[1].op,
+            Op::Intrinsic {
+                name: "vneg.f32".into(),
+                ins: vec![Value::Reg(opaque_value(&ssa, "s15", 1))],
+                outs: vec![(opaque_value(&ssa, "s15", 2), crate::ir::types::Width::W32)],
+                reads_mem: false,
+                writes_mem: false,
+            }
+        );
+    }
+
+    #[test]
+    fn every_multi_output_intrinsic_definition_keeps_its_ssa_identity() {
+        let lf = mk(vec![
+            Op::Intrinsic {
+                name: "pair.result".into(),
+                ins: Vec::new(),
+                outs: vec![
+                    (VReg::phys("rax"), crate::ir::types::Width::W32),
+                    (VReg::phys("rdx"), crate::ir::types::Width::W64),
+                ],
+                reads_mem: false,
+                writes_mem: false,
+            },
+            Op::Assign {
+                dst: VReg::phys("rcx"),
+                src: Value::Reg(VReg::phys("rdx")),
+            },
+        ]);
+        let ssa = compute_ssa(&lf);
+
+        let (numbered, definition_widths, _, identities) =
+            value_number_with_parameter_slots_lifetimes_and_identities(
+                &lf,
+                &ssa,
+                CallConv::SysVAmd64,
+                &[],
+            );
+
+        let Op::Intrinsic { outs, .. } = &numbered.blocks[0].instrs[0].op else {
+            panic!("expected intrinsic");
+        };
+        assert_eq!(outs[0].0, opaque_value(&ssa, "rax", 1));
+        assert_eq!(outs[1].0, opaque_value(&ssa, "rdx", 1));
+        assert_eq!(definition_widths.get(&outs[0].0), Some(&4));
+        assert_eq!(definition_widths.get(&outs[1].0), Some(&8));
+        assert!(matches!(
+            &numbered.blocks[0].instrs[1].op,
+            Op::Assign {
+                src: Value::Reg(source),
+                ..
+            } if source == &outs[1].0
+        ));
+        assert_eq!(
+            identities.exact(&outs[0].0),
+            Some(&SsaValue {
+                base: VReg::phys("rax"),
+                version: 1,
+            })
+        );
+        assert_eq!(
+            identities.exact(&outs[1].0),
+            Some(&SsaValue {
+                base: VReg::phys("rdx"),
+                version: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn effect_only_intrinsic_uses_every_reaching_ssa_value() {
+        let lf = mk(vec![
+            Op::Assign {
+                dst: VReg::phys("rdi"),
+                src: Value::Const(0x1000),
+            },
+            Op::Assign {
+                dst: VReg::phys("rcx"),
+                src: Value::Const(16),
+            },
+            Op::Intrinsic {
+                name: "memory.fill.4.word8".into(),
+                ins: vec![Value::Reg(VReg::phys("rdi")), Value::Reg(VReg::phys("rcx"))],
+                outs: Vec::new(),
+                reads_mem: false,
+                writes_mem: true,
+            },
+        ]);
+        let ssa = compute_ssa(&lf);
+        let out = value_number(&lf, &ssa, CallConv::SysVAmd64);
+
+        assert!(matches!(
+            &out.blocks[0].instrs[2].op,
+            Op::Intrinsic { ins, outs, .. }
+                if ins == &[
+                    Value::Reg(opaque_value(&ssa, "rdi", 1)),
+                    Value::Reg(opaque_value(&ssa, "rcx", 1)),
+                ] && outs.is_empty()
+        ));
+    }
+
+    #[test]
+    fn arm_float_result_that_reaches_return_keeps_its_abi_name() {
+        let lf = mk(vec![
+            Op::Assign {
+                dst: VReg::phys("s0"),
+                src: Value::Reg(VReg::phys("s15")),
+            },
+            Op::Return,
+        ]);
+        let ssa = compute_ssa(&lf);
+        let out = value_number(&lf, &ssa, CallConv::Arm);
+
+        assert_eq!(
+            out.blocks[0].instrs[0].op,
+            Op::Assign {
+                dst: VReg::phys("s0"),
+                src: Value::Reg(VReg::phys("s15")),
+            }
+        );
+    }
+
+    #[test]
+    fn live_in_use_keeps_bare_register() {
+        // rbx = rdi ; rdi = 5   -> rbx#1 = rdi (v0, bare) ; rdi#1 = 5
+        // The parameter read (live-in rdi) stays bare; the reassignment is a new
+        // distinct value.
+        let lf = mk(vec![
+            Op::Assign {
+                dst: VReg::phys("rbx"),
+                src: Value::Reg(VReg::phys("rdi")),
+            },
+            Op::Assign {
+                dst: VReg::phys("rdi"),
+                src: Value::Const(5),
+            },
+        ]);
+        let ssa = compute_ssa(&lf);
+        let out = value_number(&lf, &ssa, CallConv::SysVAmd64);
+        let ops = &out.blocks[0].instrs;
+        assert_eq!(
+            ops[0].op,
+            Op::Assign {
+                dst: opaque_value(&ssa, "rbx", 1),
+                src: Value::Reg(VReg::phys("rdi")) // bare: the live-in parameter
+            }
+        );
+        assert_eq!(
+            ops[1].op,
+            Op::Assign {
+                dst: opaque_value(&ssa, "rdi", 1),
+                src: Value::Const(5)
+            }
+        );
+    }
+
+    #[test]
+    fn return_reg_def_read_via_subregister_stays_bare() {
+        // The `return (uint8_t)x` shape:
+        //   eax = rdi      (return-reg def; overwritten below, so it does NOT
+        //                   reach the Return — normally scratch-versioned)
+        //   rcx = al       (its value read back via the sub-register `al`)
+        //   eax = 5        (the real returned value)
+        //   return
+        // Versioning the first `eax` to `eax#1` would orphan the bare `al` read
+        // (SSA tracks al independently), which the naming pass then mis-maps to
+        // `ret` -> use-before-def. So the first def must stay BARE.
+        let lf = mk(vec![
+            Op::Assign {
+                dst: VReg::phys("eax"),
+                src: Value::Reg(VReg::phys("rdi")),
+            },
+            Op::Assign {
+                dst: VReg::phys("rcx"),
+                src: Value::Reg(VReg::phys("al")),
+            },
+            Op::Assign {
+                dst: VReg::phys("eax"),
+                src: Value::Const(5),
+            },
+            Op::Return,
+        ]);
+        let ssa = compute_ssa(&lf);
+        let out = value_number(&lf, &ssa, CallConv::SysVAmd64);
+        // First def stays bare (not versioned) because `al` reads it — and the
+        // GP sub-register `eax` is canonicalized to its 64-bit parent `rax`.
+        assert_eq!(
+            out.blocks[0].instrs[0].op,
+            Op::Assign {
+                dst: VReg::phys("rax"),
+                src: Value::Reg(VReg::phys("rdi")),
+            }
+        );
+    }
+
+    #[test]
+    fn live_in_arg_slots_excludes_subregister_scratch() {
+        use crate::ir::types::BinOp;
+        // The -O2 shape that fools an AST-based analysis:
+        //   rax = rdi + 1   ; reads rdi  (slot 0 -> parameter)
+        //   edx = rsi - 2   ; writes edx (a sub-register of rdx / slot 2) FIRST
+        //   r8  = rdx * 4   ; reads rdx  (slot 2) — but it was already written
+        // rdi/rsi are parameters; rdx is scratch (its 32-bit view was written
+        // before any read) and must NOT be a parameter.
+        let lf = mk(vec![
+            Op::Bin {
+                op: BinOp::Add,
+                dst: VReg::phys("rax"),
+                lhs: Value::Reg(VReg::phys("rdi")),
+                rhs: Value::Const(1),
+            },
+            Op::Bin {
+                op: BinOp::Sub,
+                dst: VReg::phys("edx"),
+                lhs: Value::Reg(VReg::phys("rsi")),
+                rhs: Value::Const(2),
+            },
+            Op::Bin {
+                op: BinOp::Mul,
+                dst: VReg::phys("r8"),
+                lhs: Value::Reg(VReg::phys("rdx")),
+                rhs: Value::Const(4),
+            },
+        ]);
+        let params = live_in_arg_slots_llir(&lf, CallConv::SysVAmd64);
+        assert!(
+            params.contains(&0),
+            "rdi (slot 0) is a parameter: {:?}",
+            params
+        );
+        assert!(
+            params.contains(&1),
+            "rsi (slot 1) is a parameter: {:?}",
+            params
+        );
+        assert!(
+            !params.contains(&2),
+            "rdx (slot 2) is sub-register scratch, not a parameter: {:?}",
+            params
+        );
+    }
+
+    #[test]
+    fn live_in_arg_slots_use_exact_identity_not_display_spelling() {
+        use crate::ir::types::BinOp;
+
+        let lf = mk(vec![
+            Op::Bin {
+                op: BinOp::Add,
+                dst: VReg::phys("tmp0"),
+                lhs: Value::Reg(VReg::phys("opaque_entry")),
+                rhs: Value::Const(1),
+            },
+            Op::Bin {
+                op: BinOp::Add,
+                dst: VReg::phys("tmp1"),
+                lhs: Value::Reg(VReg::phys("rdi#looks_entry")),
+                rhs: Value::Const(1),
+            },
+        ]);
+        let mut identities = ValueIdentities::default();
+        identities.record(
+            VReg::phys("opaque_entry"),
+            SsaValue {
+                base: VReg::phys("rsi"),
+                version: 0,
+            },
+        );
+        identities.record(
+            VReg::phys("rdi#looks_entry"),
+            SsaValue {
+                base: VReg::phys("rdi"),
+                version: 3,
+            },
+        );
+
+        let params = live_in_arg_slots_llir_with_identities(&lf, CallConv::SysVAmd64, &identities);
+        assert!(params.contains(&1), "opaque version-zero rsi is arg1");
+        assert!(
+            !params.contains(&0),
+            "versioned rdi is not an entry value despite its spelling"
+        );
+    }
+
+    #[test]
+    fn live_in_arg_slots_treats_zero_idiom_as_a_definition() {
+        use crate::ir::types::BinOp;
+        // Real GCC -O2 shape from `sum_to`: `xor edx, edx` establishes the
+        // accumulator before a later block reads rdx. Although the generic
+        // Bin op has two syntactic uses, this machine idiom is independent of
+        // the incoming register and therefore cannot prove a third parameter.
+        let lf = mk(vec![
+            Op::Bin {
+                op: BinOp::Xor,
+                dst: VReg::phys("edx"),
+                lhs: Value::Reg(VReg::phys("edx")),
+                rhs: Value::Reg(VReg::phys("edx")),
+            },
+            Op::Bin {
+                op: BinOp::Add,
+                dst: VReg::phys("rax"),
+                lhs: Value::Reg(VReg::phys("rdx")),
+                rhs: Value::Const(1),
+            },
+        ]);
+
+        let params = live_in_arg_slots_llir(&lf, CallConv::SysVAmd64);
+        assert!(
+            !params.contains(&2),
+            "zero-initialized rdx is scratch, not a parameter: {:?}",
+            params
+        );
+    }
+
+    #[test]
+    fn live_in_arg_slots_follow_cfg_paths_instead_of_block_address_order() {
+        use crate::ir::types::BinOp;
+
+        // The lower-address arm initializes rcx, while a sibling arm reads the
+        // incoming rcx. A linear block scan sees the write first and loses the
+        // fourth parameter even though one executable path reads it before any
+        // definition (the shape used by Rust enum jump-table constructors).
+        let lf = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![
+                LlirBlock {
+                    start_va: 0x1000,
+                    end_va: 0x1004,
+                    instrs: Vec::new(),
+                    succs: vec![0x1010, 0x1020],
+                },
+                LlirBlock {
+                    start_va: 0x1010,
+                    end_va: 0x1014,
+                    instrs: vec![LlirInstr {
+                        va: 0x1010,
+                        op: Op::Assign {
+                            dst: VReg::phys("ecx"),
+                            src: Value::Const(0),
+                        },
+                    }],
+                    succs: Vec::new(),
+                },
+                LlirBlock {
+                    start_va: 0x1020,
+                    end_va: 0x1024,
+                    instrs: vec![LlirInstr {
+                        va: 0x1020,
+                        op: Op::Bin {
+                            op: BinOp::Add,
+                            dst: VReg::phys("rax"),
+                            lhs: Value::Reg(VReg::phys("rcx")),
+                            rhs: Value::Const(1),
+                        },
+                    }],
+                    succs: Vec::new(),
+                },
+            ],
+        };
+
+        let params = live_in_arg_slots_llir(&lf, CallConv::SysVAmd64);
+
+        assert!(
+            params.contains(&3),
+            "the sibling path reads incoming rcx before any definition: {params:?}"
+        );
+    }
+
+    #[test]
+    fn cfg_path_parameter_analysis_covers_every_register_argument_abi() {
+        use crate::ir::types::BinOp;
+
+        for (cc, register, slot) in [
+            (CallConv::SysVAmd64, "rcx", 3),
+            (CallConv::Win64, "r9", 3),
+            (CallConv::Aarch64, "x3", 3),
+            (CallConv::Arm, "r3", 3),
+            (CallConv::ArmHardFloat, "r3", 3),
+        ] {
+            let lf = LlirFunction {
+                entry_va: 0x1000,
+                blocks: vec![
+                    LlirBlock {
+                        start_va: 0x1000,
+                        end_va: 0x1004,
+                        instrs: Vec::new(),
+                        succs: vec![0x1010, 0x1020],
+                    },
+                    LlirBlock {
+                        start_va: 0x1010,
+                        end_va: 0x1014,
+                        instrs: vec![LlirInstr {
+                            va: 0x1010,
+                            op: Op::Assign {
+                                dst: VReg::phys(register),
+                                src: Value::Const(0),
+                            },
+                        }],
+                        succs: Vec::new(),
+                    },
+                    LlirBlock {
+                        start_va: 0x1020,
+                        end_va: 0x1024,
+                        instrs: vec![LlirInstr {
+                            va: 0x1020,
+                            op: Op::Bin {
+                                op: BinOp::Add,
+                                dst: VReg::phys("tmp"),
+                                lhs: Value::Reg(VReg::phys(register)),
+                                rhs: Value::Const(1),
+                            },
+                        }],
+                        succs: Vec::new(),
+                    },
+                ],
+            };
+
+            assert!(
+                live_in_arg_slots_llir(&lf, cc).contains(&slot),
+                "{cc:?} must retain the incoming {register} value on its reading arm"
+            );
+        }
+
+        // IA-32 cdecl passes ordinary arguments on the stack, so there is no
+        // register slot for this analysis to classify.
+        assert!(crate::ir::abi::argument_slots(CallConv::Cdecl32).is_empty());
+    }
+
+    #[test]
+    fn real_arm_alignment_save_does_not_invent_four_parameters() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("samples/binaries/platforms/linux/amd64/cross/armhf/hello-armhf-gcc");
+        let image = crate::program::image::ProgramImage::from_path(&path)
+            .expect("index checked-in ARM ELF");
+        let budgets = crate::analysis::cfg::Budgets {
+            max_functions: 1,
+            max_blocks: 16,
+            max_instructions: 128,
+            timeout_ms: 1_000,
+            total_timeout_ms: 0,
+        };
+        let (functions, _) =
+            crate::analysis::cfg::analyze_functions_image_with_seeds(&image, &budgets, &[0x5d4]);
+        let function = functions
+            .iter()
+            .find(|function| function.entry_point.value == 0x5d4)
+            .expect("discover real _fini");
+        let lifted = crate::ir::lift_function::lift_function_from_image(&image, function)
+            .expect("lift real _fini");
+
+        assert_eq!(
+            live_in_arg_slots_llir(&lifted, CallConv::ArmHardFloat),
+            HashSet::new(),
+            "the balanced push/pop of caller-saved r3 is stack alignment, not arg3"
+        );
+    }
+
+    #[test]
+    fn arm_r3_save_restored_and_used_remains_parameter_evidence() {
+        use crate::ir::types::MemOp;
+
+        let saved_r3 = MemOp::plain(Some(VReg::phys("sp")), None, 0, 0, 4);
+        let saved_lr = MemOp::plain(Some(VReg::phys("sp")), None, 0, 4, 4);
+        let mut function = mk(vec![
+            Op::Store {
+                addr: saved_r3.clone(),
+                src: Value::Reg(VReg::phys("r3")),
+            },
+            Op::Store {
+                addr: saved_lr,
+                src: Value::Reg(VReg::phys("lr")),
+            },
+            Op::Load {
+                dst: VReg::phys("r3"),
+                addr: saved_r3,
+            },
+            Op::Assign {
+                dst: VReg::phys("r0"),
+                src: Value::Reg(VReg::phys("r3")),
+            },
+            Op::Return,
+        ]);
+        // Both stores are the expansion of one `push {r3, lr}` instruction.
+        function.blocks[0].instrs[1].va = function.blocks[0].instrs[0].va;
+
+        assert!(
+            live_in_arg_slots_llir(&function, CallConv::ArmHardFloat).contains(&3),
+            "a restored value consumed by the function is not alignment padding"
+        );
+    }
+
+    #[test]
+    fn arm_r3_alignment_padding_survives_explicit_return_materialization() {
+        use crate::ir::types::MemOp;
+
+        let saved_r3 = MemOp::plain(Some(VReg::phys("sp")), None, 0, 0, 4);
+        let saved_lr = MemOp::plain(Some(VReg::phys("sp")), None, 0, 4, 4);
+        let mut function = mk(vec![
+            Op::Store {
+                addr: saved_r3.clone(),
+                src: Value::Reg(VReg::phys("r3")),
+            },
+            Op::Store {
+                addr: saved_lr,
+                src: Value::Reg(VReg::phys("lr")),
+            },
+            Op::Load {
+                dst: VReg::phys("r3"),
+                addr: saved_r3,
+            },
+            Op::Assign {
+                dst: VReg::phys("r0"),
+                src: Value::Const(0),
+            },
+            Op::ReturnValue {
+                value: Value::Reg(VReg::phys("r0")),
+            },
+        ]);
+        // Both stores are the expansion of one `push {r3, lr}` instruction.
+        function.blocks[0].instrs[1].va = function.blocks[0].instrs[0].va;
+
+        assert_eq!(
+            live_in_arg_slots_llir(&function, CallConv::ArmHardFloat),
+            HashSet::new(),
+            "a balanced alignment save stays machine state after return materialization"
+        );
+    }
+
+    #[test]
+    fn arm_r3_save_with_a_conditional_exit_is_not_proven_alignment_padding() {
+        use crate::ir::types::MemOp;
+
+        let saved_r3 = MemOp::plain(Some(VReg::phys("sp")), None, 0, 0, 4);
+        let saved_lr = MemOp::plain(Some(VReg::phys("sp")), None, 0, 4, 4);
+        let mut function = mk(vec![
+            Op::Store {
+                addr: saved_r3.clone(),
+                src: Value::Reg(VReg::phys("r3")),
+            },
+            Op::Store {
+                addr: saved_lr,
+                src: Value::Reg(VReg::phys("lr")),
+            },
+            Op::Load {
+                dst: VReg::phys("r3"),
+                addr: saved_r3,
+            },
+            Op::CondJump {
+                cond: VReg::phys("z"),
+                inverted: false,
+                target: 0x2000,
+            },
+            Op::Return,
+        ]);
+        // Both stores are the expansion of one `push {r3, lr}` instruction.
+        function.blocks[0].instrs[1].va = function.blocks[0].instrs[0].va;
+
+        assert!(
+            live_in_arg_slots_llir(&function, CallConv::ArmHardFloat).contains(&3),
+            "a conditional control-flow suffix is not a proven balanced exit"
+        );
+    }
+
+    #[test]
+    fn a_phi_copy_read_only_by_a_call_may_use_is_not_a_parameter() {
+        use crate::ir::types::{CallTarget, MemOp};
+        // The AArch64 `getconf` main shape, reduced. The entry block ends in a
+        // call; `abi::annotate_calls` hangs x0..x7 on it as a may-use, so the
+        // loop-header phi for x3 counts as READ and `insert_phi_copies`
+        // materialises `x3#1 = x3` right there. x3 is only ever DEFINED (a load)
+        // and then tested, so the function does not take a fourth argument —
+        // the copy is SSA plumbing, not an architectural read.
+        let lf = mk(vec![
+            Op::Assign {
+                dst: VReg::phys("x19#1"),
+                src: Value::Reg(VReg::phys("x0")),
+            },
+            Op::Assign {
+                dst: VReg::phys("x3#1"),
+                src: Value::Reg(VReg::phys("x3")),
+            },
+            Op::Call {
+                target: CallTarget::Direct(0x2000),
+                effects: Some(crate::ir::abi::call_effects(CallConv::Aarch64)),
+            },
+            Op::Load {
+                dst: VReg::phys("w3#2"),
+                addr: MemOp {
+                    base: Some(VReg::phys("x21#1")),
+                    index: None,
+                    scale: 0,
+                    disp: 64,
+                    size: 4,
+                    segment: None,
+                    endian: crate::ir::types::Endian::Little,
+                },
+            },
+            Op::Cmp {
+                dst: VReg::phys("flags"),
+                op: crate::ir::types::CmpOp::Ne,
+                lhs: Value::Reg(VReg::phys("w3#2")),
+                rhs: Value::Const(0),
+            },
+        ]);
+
+        let params = live_in_arg_slots_llir(&lf, CallConv::Aarch64);
+        assert!(
+            params.contains(&0),
+            "x0 is spilled by a real move and is a parameter: {params:?}"
+        );
+        assert!(
+            !params.contains(&3),
+            "x3's only version-zero read is a phi copy no real operand consumes: \
+             {params:?}"
+        );
+    }
+
+    #[test]
+    fn opaque_phi_copy_uses_identity_instead_of_display_spelling() {
+        use crate::ir::types::{CallTarget, MemOp};
+
+        let lf = mk(vec![
+            Op::Assign {
+                dst: VReg::phys("opaque_phi"),
+                src: Value::Reg(VReg::phys("opaque_entry")),
+            },
+            Op::Call {
+                target: CallTarget::Direct(0x2000),
+                effects: Some(crate::ir::abi::call_effects(CallConv::Aarch64)),
+            },
+            Op::Load {
+                dst: VReg::phys("opaque_later"),
+                addr: MemOp {
+                    base: Some(VReg::phys("x21")),
+                    index: None,
+                    scale: 0,
+                    disp: 64,
+                    size: 4,
+                    segment: None,
+                    endian: crate::ir::types::Endian::Little,
+                },
+            },
+        ]);
+        let mut identities = ValueIdentities::default();
+        for (name, version) in [("opaque_entry", 0), ("opaque_phi", 1), ("opaque_later", 2)] {
+            identities.record(
+                VReg::phys(name),
+                SsaValue {
+                    base: VReg::phys("x3"),
+                    version,
+                },
+            );
+        }
+
+        let params = live_in_arg_slots_llir_with_identities(&lf, CallConv::Aarch64, &identities);
+        assert!(
+            !params.contains(&3),
+            "opaque SSA phi plumbing is not an architectural read: {params:?}"
+        );
+    }
+
+    #[test]
+    fn a_phi_copy_a_real_operand_consumes_still_proves_a_parameter() {
+        use crate::ir::types::{BinOp, CallTarget};
+        // The same plumbing, but the phi destination is genuinely read: the
+        // loop body adds it. Refusing the copy outright would DELETE a real
+        // parameter, which is exactly as wrong as inventing one.
+        let lf = mk(vec![
+            Op::Assign {
+                dst: VReg::phys("x3#1"),
+                src: Value::Reg(VReg::phys("x3")),
+            },
+            Op::Call {
+                target: CallTarget::Direct(0x2000),
+                effects: Some(crate::ir::abi::call_effects(CallConv::Aarch64)),
+            },
+            Op::Bin {
+                op: BinOp::Add,
+                dst: VReg::phys("x9#1"),
+                lhs: Value::Reg(VReg::phys("x3#1")),
+                rhs: Value::Const(1),
+            },
+        ]);
+
+        let params = live_in_arg_slots_llir(&lf, CallConv::Aarch64);
+        assert!(
+            params.contains(&3),
+            "the phi destination is added to, so x3 really is live-in: {params:?}"
+        );
+    }
+
+    #[test]
+    fn a_versioned_read_of_a_later_definition_is_not_a_parameter() {
+        use crate::ir::types::{BinOp, MemOp};
+        // `37_heapsort`'s `sift_down` at gcc -O2, stripped, reduced to its two
+        // relevant blocks. The entry block jumps PAST the loop body to the
+        // header, which computes `r8`; the body then reads it. In the block
+        // LIST the reading block comes first (it sits at the lower address), so
+        // a first-touch-wins scan over that list sees a read of `r8` before any
+        // write and reports a fifth parameter that does not exist.
+        //
+        // Value numbering already settled the question: the read is `r8#1`, the
+        // header's definition, not the version-zero name a live-in would carry.
+        let mut lf = mk(vec![Op::Jump { target: 0x2000 }]);
+        lf.blocks[0].succs = vec![0x2000];
+        lf.blocks.push(LlirBlock {
+            start_va: 0x1100,
+            end_va: 0x1200,
+            instrs: vec![LlirInstr {
+                va: 0x1100,
+                op: Op::Load {
+                    dst: VReg::phys("r10#1"),
+                    addr: MemOp {
+                        base: Some(VReg::phys("r8#1")),
+                        index: None,
+                        scale: 0,
+                        disp: 0,
+                        size: 4,
+                        segment: None,
+                        endian: crate::ir::types::Endian::Little,
+                    },
+                },
+            }],
+            succs: vec![],
+        });
+        lf.blocks.push(LlirBlock {
+            start_va: 0x2000,
+            end_va: 0x2100,
+            instrs: vec![LlirInstr {
+                va: 0x2000,
+                op: Op::Bin {
+                    dst: VReg::phys("r8#1"),
+                    op: BinOp::Add,
+                    lhs: Value::Reg(VReg::phys("rsi")),
+                    rhs: Value::Const(1),
+                },
+            }],
+            succs: vec![0x1100],
+        });
+
+        let params = live_in_arg_slots_llir(&lf, CallConv::SysVAmd64);
+        assert!(
+            params.contains(&1),
+            "rsi is read at version zero and is a parameter: {params:?}"
+        );
+        assert!(
+            !params.contains(&4),
+            "r8 is only ever read as `r8#1`, the header's own definition: \
+             {params:?}"
+        );
+    }
+
+    #[test]
+    fn address_chain_reuse_becomes_distinct_values() {
+        // The exact reused-`rax` shape that made AST folding unsafe:
+        //   rax = rax + rcx ; rax = load[rax] ; rbx = rbx + rax
+        // Each rax def is a distinct value, so no folding can conflate them.
+        use crate::ir::types::{BinOp, MemOp};
+        let lf = mk(vec![
+            Op::Bin {
+                dst: VReg::phys("rbx"),
+                op: BinOp::Add,
+                lhs: Value::Reg(VReg::phys("rbx")),
+                rhs: Value::Reg(VReg::phys("rcx")),
+            },
+            Op::Load {
+                dst: VReg::phys("rbx"),
+                addr: MemOp {
+                    base: Some(VReg::phys("rbx")),
+                    index: None,
+                    scale: 0,
+                    disp: 0,
+                    size: 4,
+                    ..Default::default()
+                },
+            },
+            Op::Bin {
+                dst: VReg::phys("rdx"),
+                op: BinOp::Add,
+                lhs: Value::Reg(VReg::phys("rdx")),
+                rhs: Value::Reg(VReg::phys("rbx")),
+            },
+        ]);
+        let ssa = compute_ssa(&lf);
+        let out = value_number(&lf, &ssa, CallConv::SysVAmd64);
+        let ops = &out.blocks[0].instrs;
+        // First rax def is version 1 (its lhs reads the live-in rax v0).
+        match &ops[0].op {
+            Op::Bin { dst, lhs, .. } => {
+                assert_eq!(*dst, opaque_value(&ssa, "rbx", 1));
+                assert_eq!(*lhs, Value::Reg(VReg::phys("rbx"))); // live-in
+            }
+            other => panic!("{:?}", other),
+        }
+        match &ops[1].op {
+            Op::Load { dst, addr } => {
+                assert_eq!(*dst, opaque_value(&ssa, "rbx", 2));
+                assert_eq!(addr.base, Some(opaque_value(&ssa, "rbx", 1)));
+            }
+            other => panic!("{:?}", other),
+        }
+        match &ops[2].op {
+            Op::Bin { rhs, .. } => {
+                assert_eq!(*rhs, Value::Reg(opaque_value(&ssa, "rbx", 2)))
+            }
+            other => panic!("{:?}", other),
+        }
+    }
+}

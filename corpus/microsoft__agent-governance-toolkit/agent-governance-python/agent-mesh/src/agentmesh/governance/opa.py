@@ -1,0 +1,550 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+"""
+OPA/Rego Policy Adapter
+
+Evaluates policies written in Rego (Open Policy Agent's policy language)
+alongside the existing YAML/JSON engine.
+
+OPAPolicyBackend is a standalone adapter: BackendRegistry registration only
+makes it available for explicit lookup and evaluation. It does not configure
+govern() or PolicyEngine. Use govern(rego_path=...) or govern(rego_content=...)
+to configure Rego for a governed callable, or load_rego() on an engine you manage.
+
+Two modes:
+  1. **Remote OPA** — Sends queries to an OPA server (e.g., http://localhost:8181)
+  2. **Embedded Rego** — Evaluates .rego files locally via subprocess call to `opa eval`
+
+Why OPA/Rego?
+  Every Kubernetes platform engineer knows OPA. Supporting Rego lets
+  teams reuse their existing infra policies for agent governance.
+
+Usage:
+    from agentmesh.governance.opa import OPAEvaluator
+
+    # Remote OPA server
+    evaluator = OPAEvaluator(mode="remote", opa_url="http://localhost:8181")
+    decision = evaluator.evaluate("agentmesh/allow", {"agent": {"role": "analyst"}, "action": "export"})
+
+    # Local rego file
+    evaluator = OPAEvaluator(mode="local", rego_path="policies/mesh.rego")
+    decision = evaluator.evaluate("data.agentmesh.allow", {"input": {...}})
+
+    # Integrated with PolicyEngine
+    from agentmesh.governance.policy import PolicyEngine
+    engine = PolicyEngine()
+    engine.load_rego("policies/mesh.rego", package="agentmesh")
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+import shutil
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, Optional
+
+if TYPE_CHECKING:
+    from agentmesh.governance.backend import PolicyDecisionResult
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class OPADecision:
+    """Result from an OPA policy evaluation.
+
+    Attributes:
+        allowed: Whether the policy permits the action.
+        raw_result: Raw response from the OPA engine.
+        query: The Rego query that was evaluated.
+        evaluation_ms: Evaluation latency in milliseconds.
+        source: How the evaluation was performed
+            (``"remote"``, ``"local"``, or ``"fallback"``).
+        error: Error message if evaluation failed, otherwise ``None``.
+        defined: Whether the query resolved to anything at all, as
+            opposed to the path being undefined (e.g. no such package).
+            ``allowed`` is ``False`` either way; this is what tells them
+            apart (see PolicyEngine.load_rego).
+    """
+    allowed: bool
+    raw_result: Any = None
+    query: str = ""
+    evaluation_ms: float = 0.0
+    source: Literal["remote", "local", "fallback"] = "local"
+    error: Optional[str] = None
+    defined: bool = True
+
+
+def _require_boolean_decision(value: Any) -> tuple[bool, Optional[str]]:
+    """Require *value* to be a real bool, not just truthy - Rego output is
+    a security decision, and e.g. `allow := "deny"` must not be read as
+    permit."""
+    if isinstance(value, bool):
+        return value, None
+    return False, (
+        f"rego policy must evaluate to a boolean, got {value!r} "
+        f"({type(value).__name__})"
+    )
+
+
+class OPAEvaluator:
+    """
+    Evaluate Rego policies via OPA.
+
+    Supports two modes:
+    - remote: Queries an OPA REST API
+    - local: Runs `opa eval` subprocess on .rego files
+    """
+
+    def __init__(
+        self,
+        mode: Literal["remote", "local"] = "local",
+        opa_url: str = "http://localhost:8181",
+        rego_path: Optional[str] = None,
+        rego_content: Optional[str] = None,
+        timeout_seconds: float = 5.0,
+    ):
+        """Initialise the OPA evaluator.
+
+        Args:
+            mode: Evaluation mode — ``"remote"`` queries an OPA REST
+                API, ``"local"`` uses the ``opa eval`` CLI or a
+                built-in fallback parser.
+            opa_url: Base URL of the OPA server (remote mode only).
+            rego_path: Path to a ``.rego`` policy file (local mode).
+            rego_content: Inline Rego policy string (local mode).
+            timeout_seconds: Maximum time to wait for evaluation.
+        """
+        self.mode = mode
+        self.opa_url = opa_url.rstrip("/")
+        self.rego_path = rego_path
+        self.rego_content = rego_content
+        self.timeout_seconds = timeout_seconds
+
+        # Check if opa CLI is available for local mode
+        self._opa_available = shutil.which("opa") is not None
+        # rego_content has no filesystem path of its own but `opa eval` only
+        # reads files; materialized lazily, once, and reused for the life of
+        # this evaluator instead of once per evaluate() call.
+        self._materialized_rego_path: Optional[str] = None
+
+    @property
+    def opa_available(self) -> bool:
+        """Whether the ``opa`` CLI was found on PATH at construction time."""
+        return self._opa_available
+
+    def _rego_file_for_cli(self) -> Optional[str]:
+        """Return the file `opa eval` should read the rego source from.
+
+        rego_path is returned as-is. rego_content is written to a private
+        temp file the first time it is needed and reused after that: the
+        previous implementation wrote a fresh ``NamedTemporaryFile(delete=
+        False)`` on every evaluate() call and never removed it, leaking one
+        0600 file per governed call for the life of the process.
+        """
+        if self.rego_path:
+            return self.rego_path
+        if self.rego_content is None:
+            return None
+        if self._materialized_rego_path is None:
+            fd, path = tempfile.mkstemp(suffix=".rego")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(self.rego_content)
+            except Exception:
+                os.close(fd)
+                raise
+            self._materialized_rego_path = path
+        return self._materialized_rego_path
+
+    def close(self) -> None:
+        """Remove the temp file backing rego_content, if one was created."""
+        if self._materialized_rego_path is not None:
+            try:
+                os.remove(self._materialized_rego_path)
+            except OSError:
+                pass
+            self._materialized_rego_path = None
+
+    def __del__(self) -> None:
+        self.close()
+
+    def evaluate(self, query: str, input_data: dict) -> OPADecision:
+        """
+        Evaluate a Rego query against input data.
+
+        Args:
+            query: Rego query (e.g., "data.agentmesh.allow")
+            input_data: Input context for evaluation
+
+        Returns:
+            OPADecision with the result
+        """
+        start = datetime.now(timezone.utc)
+
+        try:
+            if self.mode == "remote":
+                result = self._evaluate_remote(query, input_data)
+            else:
+                result = self._evaluate_local(query, input_data)
+
+            elapsed = (datetime.now(timezone.utc) - start).total_seconds() * 1000
+            result.evaluation_ms = elapsed
+            return result
+
+        except Exception as e:
+            elapsed = (datetime.now(timezone.utc) - start).total_seconds() * 1000
+            logger.error(f"OPA evaluation failed: {e}")
+            return OPADecision(
+                allowed=False,
+                query=query,
+                evaluation_ms=elapsed,
+                source="fallback",
+                error=str(e),
+            )
+
+    def _evaluate_remote(self, query: str, input_data: dict) -> OPADecision:
+        """Query a remote OPA server via REST API."""
+        import urllib.request
+        from urllib.parse import quote
+
+        # V32: Sanitise query path to prevent URL injection
+        # Only allow alphanumeric, dots, underscores, hyphens in query
+        import re as _re
+        if not _re.fullmatch(r"[a-zA-Z0-9._\-]+", query):
+            return OPADecision(
+                allowed=False,
+                query=query,
+                source="remote",
+                error=f"Invalid OPA query path: {query}",
+            )
+
+        # Convert query path to URL: "data.agentmesh.allow" -> "/v1/data/agentmesh/allow"
+        path_parts = query.replace("data.", "", 1).replace(".", "/") if query.startswith("data.") else query.replace(".", "/")
+        # URL-encode each segment as a safety net
+        safe_path = "/".join(quote(seg, safe="") for seg in path_parts.split("/"))
+        url = f"{self.opa_url}/v1/data/{safe_path}"
+
+        payload = json.dumps({"input": input_data}).encode("utf-8")
+        req = urllib.request.Request(  # noqa: S310 — OPA server URL from configuration
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:  # noqa: S310 — OPA server URL from configuration
+                body = json.loads(resp.read().decode("utf-8"))
+                defined = "result" in body
+                result_value = body.get("result", False)
+                allowed, type_error = _require_boolean_decision(result_value) if defined else (False, None)
+
+                return OPADecision(
+                    allowed=allowed,
+                    raw_result=body,
+                    query=query,
+                    source="remote",
+                    error=type_error,
+                    defined=defined,
+                )
+        except Exception as e:
+            return OPADecision(
+                allowed=False,
+                query=query,
+                source="remote",
+                error=f"OPA server error: {e}",
+            )
+
+    def _evaluate_local(self, query: str, input_data: dict) -> OPADecision:
+        """Evaluate using local `opa eval` CLI.
+
+        When the OPA CLI is not available, returns a deny decision with
+        an explicit error instead of silently falling back to a mock
+        evaluator that cannot handle non-trivial Rego.
+        """
+        if self._opa_available and (self.rego_path or self.rego_content):
+            return self._evaluate_opa_cli(query, input_data)
+
+        if self.rego_content or (self.rego_path and Path(self.rego_path).exists()):
+            return OPADecision(
+                allowed=False,
+                query=query,
+                source="fallback",
+                error=(
+                    "OPA CLI not available; install opa for policy evaluation: "
+                    "https://www.openpolicyagent.org/docs/latest/#running-opa"
+                ),
+            )
+
+        return OPADecision(
+            allowed=False,
+            query=query,
+            source="fallback",
+            error="No rego file or OPA CLI available",
+        )
+
+    def _evaluate_opa_cli(self, query: str, input_data: dict) -> OPADecision:
+        """Run `opa eval` subprocess."""
+        input_json = json.dumps(input_data)
+
+        # `--stdin-input` (not `--input /dev/stdin`) reads the input document
+        # from the process's actual stdin. `/dev/stdin` is a real special file
+        # on Linux/macOS, where this previously worked by coincidence, but it
+        # doesn't exist on Windows: every call failed with "open /dev/stdin:
+        # The system cannot find the path specified.", and because that
+        # failure is caught below and turned into an ordinary
+        # OPADecision(allowed=False, ...) rather than raised, every policy
+        # check silently came back denied on Windows, including cases that
+        # should have been allowed. See #3913.
+        cmd = ["opa", "eval", "--format", "json", "--v0-compatible", "--stdin-input", "--data"]
+        cmd.append(self._rego_file_for_cli())
+        cmd.append(query)
+
+        try:
+            proc = subprocess.run(  # noqa: S603 — trusted subprocess for OPA policy engine
+                cmd,
+                input=input_json,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+            )
+
+            if proc.returncode != 0:
+                # Parse/compile errors print as JSON to stdout with stderr
+                # empty (exit 2); only runtime/usage errors go to stderr.
+                # Reporting stderr alone left compile errors with an empty
+                # reason.
+                detail = proc.stderr.strip() or proc.stdout.strip()
+                return OPADecision(
+                    allowed=False,
+                    query=query,
+                    source="local",
+                    error=f"opa eval failed: {detail}",
+                )
+
+            result = json.loads(proc.stdout)
+            # OPA eval output: {"result": [{"expressions": [{"value": true}]}]}.
+            # An empty "result" list means the query resolved to no value —
+            # e.g. the query package doesn't match this file's `package`
+            # declaration — which is undefined, not a Rego error: opa eval
+            # still exits 0. Treat it as a definite deny rather than
+            # indexing into the empty list.
+            results = result.get("result") or []
+            defined = bool(results)
+            expressions = results[0].get("expressions", [{}]) if results else []
+            value = expressions[0].get("value", False) if expressions else False
+            allowed, type_error = _require_boolean_decision(value)
+
+            return OPADecision(
+                allowed=allowed,
+                defined=defined,
+                raw_result=result,
+                query=query,
+                source="local",
+                error=type_error,
+            )
+        except subprocess.TimeoutExpired:
+            return OPADecision(
+                allowed=False, query=query, source="local", error="opa eval timed out"
+            )
+
+    def _evaluate_mock(self, query: str, input_data: dict) -> OPADecision:
+        """Mock Rego evaluator for testing/dev only.
+
+        Supports only simple ``==``, ``!=``, and ``not`` conditions.
+        Does NOT support comprehensions, set operations, function calls,
+        builtins, virtual documents, or any non-trivial Rego feature.
+        Use a real OPA server or CLI for production.
+        """
+        if not self.rego_content:
+            return OPADecision(allowed=False, query=query, source="fallback", error="No rego content")
+
+        # Determine what we're querying
+        target_rule = query.split(".")[-1]  # e.g., "allow" from "data.agentmesh.allow"
+
+        # Parse defaults
+        defaults = {}
+        for line in self.rego_content.split("\n"):
+            line = line.strip()
+            if line.startswith("default "):
+                # default allow = false
+                parts = line.replace("default ", "").split("=")
+                if len(parts) == 2:
+                    key = parts[0].strip()
+                    val = parts[1].strip().lower()
+                    defaults[key] = val == "true"
+
+        # Parse rule bodies
+        result = defaults.get(target_rule, False)
+        in_rule = False
+        rule_conditions = []
+
+        for line in self.rego_content.split("\n"):
+            stripped = line.strip()
+
+            # Match: allow { ... } or allow { (multiline)
+            if stripped.startswith(f"{target_rule} {{"):
+                # Single-line rule: allow { input.role == "admin" }
+                if stripped.endswith("}"):
+                    body = stripped[len(target_rule)+2:-1].strip()
+                    if self._eval_rego_condition(body, input_data):
+                        result = True
+                else:
+                    in_rule = True
+                    rule_conditions = []
+                continue
+
+            if in_rule:
+                if stripped == "}":
+                    # Evaluate all conditions (AND)
+                    if rule_conditions and all(
+                        self._eval_rego_condition(c, input_data) for c in rule_conditions
+                    ):
+                        result = True
+                    in_rule = False
+                    rule_conditions = []
+                elif stripped and not stripped.startswith("#"):
+                    rule_conditions.append(stripped)
+
+        return OPADecision(allowed=result, query=query, source="local", raw_result={"parsed": True})
+
+    def _eval_rego_condition(self, condition: str, input_data: dict) -> bool:
+        """Evaluate a single Rego condition line."""
+        condition = condition.strip().rstrip(";")
+
+        # not input.xxx
+        if condition.startswith("not "):
+            return not self._eval_rego_condition(condition[4:], input_data)
+
+        # input.xxx == "value"
+        if "==" in condition:
+            left, right = [x.strip() for x in condition.split("==", 1)]
+            left_val = self._resolve_rego_path(left, input_data)
+            right_val = right.strip('"').strip("'")
+            # Handle booleans
+            if right_val == "true":
+                return left_val is True
+            if right_val == "false":
+                return left_val is False
+            return str(left_val) == right_val
+
+        # input.xxx != "value"
+        if "!=" in condition:
+            left, right = [x.strip() for x in condition.split("!=", 1)]
+            left_val = self._resolve_rego_path(left, input_data)
+            right_val = right.strip('"').strip("'")
+            return str(left_val) != right_val
+
+        # input.xxx (truthy check)
+        val = self._resolve_rego_path(condition, input_data)
+        return bool(val)
+
+    def _resolve_rego_path(self, path: str, input_data: dict) -> Any:
+        """Resolve a Rego path like 'input.agent.role' to a value."""
+        parts = path.split(".")
+        current = input_data
+
+        for part in parts:
+            if part == "input":
+                continue  # Skip the 'input' prefix
+            if isinstance(current, dict):
+                current = current.get(part)
+            else:
+                return None
+        return current
+
+
+# ── Integration with PolicyEngine ─────────────────────────────────
+
+
+class OPAPolicyBackend:
+    """Adapter wrapping OPAEvaluator to satisfy ExternalPolicyBackend protocol.
+
+    Registration enables lookup only. The caller must evaluate the backend
+    and enforce its decision; govern() does not consult BackendRegistry.
+
+    Usage:
+        from agentmesh.governance.opa import OPAPolicyBackend
+        from agentmesh.governance.backend import BackendRegistry
+
+        backend = OPAPolicyBackend(rego_content=MY_REGO)
+        BackendRegistry.register(backend)
+        decision = BackendRegistry.get("opa").evaluate("export", context)
+    """
+
+    def __init__(
+        self,
+        evaluator: Optional["OPAEvaluator"] = None,
+        query_prefix: str = "data.agentmesh.allow",
+        **kwargs: Any,
+    ):
+        """Initialize the OPA policy backend.
+
+        Args:
+            evaluator: An existing OPAEvaluator instance. If not provided,
+                one is created from the remaining keyword arguments.
+            query_prefix: Default Rego query path used when evaluate() is called.
+            **kwargs: Passed to OPAEvaluator constructor if evaluator is None.
+        """
+        self._evaluator = evaluator or OPAEvaluator(**kwargs)
+        self._query_prefix = query_prefix
+
+    @property
+    def name(self) -> str:
+        return "opa"
+
+    def evaluate(self, action: str, context: dict) -> "PolicyDecisionResult":
+        from agentmesh.governance.backend import PolicyDecisionResult
+
+        decision = self._evaluator.evaluate(self._query_prefix, context)
+        return PolicyDecisionResult(
+            allowed=decision.allowed,
+            reason=decision.error or ("allowed" if decision.allowed else "denied by policy"),
+            backend="opa",
+            latency_ms=decision.evaluation_ms,
+            raw_response=decision.raw_result,
+        )
+
+    def healthy(self) -> bool:
+        if self._evaluator.mode == "remote":
+            try:
+                import urllib.request
+                req = urllib.request.Request(
+                    f"{self._evaluator.opa_url}/health",
+                    method="GET",
+                )
+                with urllib.request.urlopen(req, timeout=2) as resp:  # noqa: S310
+                    return resp.status == 200
+            except Exception:
+                return False
+        return self._evaluator._opa_available or self._evaluator.rego_content is not None
+
+
+def load_rego_into_engine(engine: Any, rego_path: str, package: str = "agentmesh") -> OPAEvaluator:
+    """
+    Register a .rego file with the existing PolicyEngine.
+
+    Usage:
+        from agentmesh.governance.policy import PolicyEngine
+        from agentmesh.governance.opa import load_rego_into_engine
+
+        engine = PolicyEngine()
+        opa = load_rego_into_engine(engine, "policies/mesh.rego")
+
+        # Now evaluate via OPA
+        decision = opa.evaluate(f"data.{package}.allow", {"agent": {"role": "admin"}})
+    """
+    content = Path(rego_path).read_text() if Path(rego_path).exists() else None
+    evaluator = OPAEvaluator(
+        mode="local",
+        rego_path=rego_path,
+        rego_content=content,
+    )
+    return evaluator

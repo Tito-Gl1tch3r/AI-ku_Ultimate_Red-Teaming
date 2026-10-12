@@ -1,0 +1,341 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+import { resolve } from "node:path";
+
+import {
+  checkArbitraryText,
+  evaluateOpenCodePrompt,
+  evaluateOpenCodeTool,
+  evaluateOpenCodeToolOutput,
+  cleanupOpenCodeSessionState,
+  finalizeOpenCodeSessionState,
+  getPolicyStatus,
+  loadPolicy,
+} from "../lib/opencode-policy.mjs";
+
+// Track registrations by OpenCode client instance and normalized workspace.
+// The WeakMap lets registrations disappear with their host client instead of
+// keeping process-wide workspace state alive indefinitely.
+const registrationsByClient = new WeakMap();
+
+/**
+ * AGT governance plugin for OpenCode.
+ *
+ * Loads the AGT policy once per effective plugin registration and wires it into
+ * the OpenCode plugin contract:
+ *
+ *  - session.created           — log AGT governance status at session start
+ *  - event (chat.params/start) — scan submitted prompts; throw to block
+ *  - tool.execute.before       — enforce policy; throw to deny, mark args
+ *                                for OpenCode's permission prompt on review
+ *  - tool.execute.after        — scan tool output for known secret patterns
+ *                                and redact in enforce mode
+ *  - tool.agt_policy_status    — return current policy snapshot
+ *  - tool.agt_policy_check_text — inspect arbitrary text for poisoning
+ *
+ * The plugin fails closed: if AGT cannot evaluate a request and the active
+ * policy has `denyOnPolicyError: true` (the default), the request is denied.
+ *
+ * @typedef {(context: object) => Promise<object>} Plugin
+ * @type {Plugin}
+ */
+export const AgtGovernance = async (ctx) => {
+  // Cache the compiled policy for this effective registration so we do not
+  // re-read it on every hook invocation.
+  let stateCache;
+  let stateError;
+
+  async function getState() {
+    if (stateCache) {
+      return stateCache;
+    }
+    if (stateError) {
+      throw stateError;
+    }
+    try {
+      stateCache = await loadPolicy();
+      return stateCache;
+    } catch (error) {
+      stateError = error instanceof Error ? error : new Error(String(error));
+      throw stateError;
+    }
+  }
+
+  const initialState = await getState();
+  const initializationError = getPolicyInitializationError(initialState);
+  if (initializationError && initialState.policy.denyOnPolicyError && !initialState.sessionStateError) {
+    throw new Error(initializationError);
+  }
+
+  // Base-policy initialization errors still fail registration. Session-state
+  // restore errors keep fail-closed hooks active so OpenCode does not drop AGT.
+  const registration = claimRegistration(ctx);
+  if (registration.duplicate) {
+    await logDuplicateRegistration(ctx, registration.workspace);
+    return {};
+  }
+
+  return {
+    "session.created": async () => {
+      try {
+        const state = await getState();
+        const status = await getPolicyStatus(state);
+        if (typeof ctx?.client?.app?.log === "function") {
+          await ctx.client.app.log({
+            body: {
+              service: "agt-governance",
+              level: "info",
+              message:
+                `[AGT] OpenCode governance active — mode=${status.mode} source=${status.source} ` +
+                `promptDefenseEffective=${status.promptDefenseGrade} ` +
+                `promptDefenseConfigured=${status.configuredPromptDefenseGrade} ` +
+                `sessionStateEnabled=${status.sessionState.enabled} ` +
+                `audit=${status.auditEntries}`,
+            },
+          });
+        }
+      } catch {
+        // best-effort — do not block session creation
+      }
+    },
+
+    event: async ({ event } = {}) => {
+      const lifecycleSessionId = extractLifecycleSessionId(event);
+      if (event?.type === "session.deleted" && lifecycleSessionId) {
+        const state = await getState();
+        await cleanupOpenCodeSessionState(state, lifecycleSessionId);
+      } else if (event?.type === "session.idle" && lifecycleSessionId) {
+        const state = await getState();
+        await finalizeOpenCodeSessionState(state, lifecycleSessionId);
+      }
+
+      // OpenCode emits a wide range of events. Only inspect prompt-bearing
+      // events; ignore the rest cheaply.
+      const prompt = extractPromptFromEvent(event);
+      if (!prompt) {
+        return;
+      }
+
+      const state = await getState();
+      const result = await evaluateOpenCodePrompt(state, {
+        prompt,
+        sessionId: event?.properties?.sessionID ?? event?.properties?.sessionId,
+      });
+
+      if (result.effect === "deny") {
+        const reason = result.reason || "AGT governance blocked the submitted prompt.";
+        await surfaceGovernanceDenial(ctx, reason);
+        throw new Error(reason);
+      }
+    },
+    "tool.execute.before": async (input, output) => {
+      const state = await getState();
+      const result = await evaluateOpenCodeTool(state, {
+        tool: input?.tool,
+        args: output?.args,
+        cwd: ctx?.directory ?? ctx?.worktree,
+        sessionId: input?.sessionID,
+        callID: input?.callID,
+      });
+
+      if (result.effect === "deny") {
+        throw new Error(result.reason || `AGT policy denied tool '${input?.tool}'.`);
+      }
+      if (result.effect === "review") {
+        // OpenCode does not currently expose a server-side "ask"
+        // permission decision from inside a plugin hook. We mark the
+        // request as requiring review by appending a hint to the args
+        // so downstream permission integrations can pick it up, and we
+        // still record the audit entry. Operators who want hard-deny
+        // behaviour on review should switch the policy mode or set
+        // `defaultEffect` to `deny`.
+        if (output && typeof output === "object" && output.args && typeof output.args === "object") {
+          output.args.__agt_review_reason = result.reason || "AGT review required.";
+        }
+      }
+    },
+
+    "tool.execute.after": async (input, output) => {
+      const state = await getState();
+      const text =
+        output && typeof output === "object" && typeof output.output === "string"
+          ? output.output
+          : "";
+      let result;
+      try {
+        result = await evaluateOpenCodeToolOutput(state, {
+          tool: input?.tool,
+          output: text,
+          sessionId: input?.sessionID,
+          callID: input?.callID,
+        });
+      } catch (error) {
+        if (error && typeof error === "object") {
+          applyToolOutputResult(output, error.outputResult);
+        }
+        throw error;
+      }
+      applyToolOutputResult(output, result);
+    },
+
+    tool: {
+      agt_policy_status: {
+        description: "Return the active AGT OpenCode governance policy status and source.",
+        args: {},
+        async execute() {
+          const state = await getState();
+          return JSON.stringify(await getPolicyStatus(state), null, 2);
+        },
+      },
+      agt_policy_check_text: {
+        description:
+          "Check text against AGT prompt, context-poisoning, and MCP-style threat detectors.",
+        args: {
+          text: { type: "string", description: "Text to inspect." },
+        },
+        async execute(args) {
+          const state = await getState();
+          const text = typeof args?.text === "string" ? args.text : "";
+          return JSON.stringify(checkArbitraryText(state, text, "opencode-check"), null, 2);
+        },
+      },
+    },
+  };
+};
+
+function getPolicyInitializationError(state) {
+  if (state.sessionStateError) {
+    return `AGT session-scoped policy could not be initialized: ${state.sessionStateError.message}`;
+  }
+  if (state.configuredPolicyError) {
+    return `AGT policy could not be loaded from ${state.configuredPolicyPath}: ${state.configuredPolicyError.message}`;
+  }
+  if (state.bundledDefaultError) {
+    return `AGT bundled default policy could not be loaded from ${state.path}: ${state.bundledDefaultError.message}`;
+  }
+  return "";
+}
+
+async function surfaceGovernanceDenial(ctx, reason) {
+  const notifications = [];
+  if (typeof ctx?.client?.tui?.showToast === "function") {
+    notifications.push(
+      ctx.client.tui.showToast({
+        body: {
+          title: "AGT governance blocked the prompt",
+          message: reason,
+          variant: "error",
+        },
+      }),
+    );
+  }
+  if (typeof ctx?.client?.app?.log === "function") {
+    notifications.push(
+      ctx.client.app.log({
+        body: {
+          service: "agt-governance",
+          level: "warn",
+          message: `[AGT] Prompt denied: ${reason}`,
+        },
+      }),
+    );
+  }
+  await Promise.allSettled(notifications);
+}
+
+export default AgtGovernance;
+
+function claimRegistration(ctx) {
+  const client = ctx?.client;
+  const clientType = typeof client;
+  const workspaceValue =
+    typeof ctx?.worktree === "string" && ctx.worktree.trim()
+      ? ctx.worktree
+      : typeof ctx?.directory === "string" && ctx.directory.trim()
+        ? ctx.directory
+        : undefined;
+  const workspace = workspaceValue ? resolve(workspaceValue) : undefined;
+
+  // Without both a stable client object and workspace path, do not suppress a
+  // registration because independent OpenCode instances cannot be distinguished.
+  if ((clientType !== "object" && clientType !== "function") || client === null || !workspace) {
+    return { duplicate: false, workspace };
+  }
+
+  let workspaces = registrationsByClient.get(client);
+  if (!workspaces) {
+    workspaces = new Set();
+    registrationsByClient.set(client, workspaces);
+  }
+
+  if (workspaces.has(workspace)) {
+    return { duplicate: true, workspace };
+  }
+
+  workspaces.add(workspace);
+  return { duplicate: false, workspace };
+}
+
+async function logDuplicateRegistration(ctx, workspace) {
+  const message =
+    `[AGT] Duplicate OpenCode governance registration ignored for workspace ${workspace}. ` +
+    "Remove duplicate AGT workspace shims or package registrations.";
+
+  if (typeof ctx?.client?.app?.log !== "function") {
+    console.warn(message);
+    return;
+  }
+
+  try {
+    await ctx.client.app.log({
+      body: {
+        service: "agt-governance",
+        level: "warn",
+        message,
+      },
+    });
+  } catch {
+    console.warn(message);
+  }
+}
+
+function extractPromptFromEvent(event) {
+  if (!event || typeof event !== "object") {
+    return "";
+  }
+  if (event.type === "message.part.updated") {
+    const part = event.properties?.part;
+    if (part?.type === "text" && typeof part.text === "string") {
+      return part.text.trim();
+    }
+  }
+  return "";
+}
+
+function extractLifecycleSessionId(event) {
+  if (event?.type === "session.deleted") {
+    return event.properties?.info?.id;
+  }
+  if (event?.type === "session.idle") {
+    return event.properties?.sessionID;
+  }
+  return undefined;
+}
+
+function applyToolOutputResult(output, result) {
+  if (
+    !output ||
+    typeof output !== "object" ||
+    !result?.redact ||
+    typeof result.redactedOutput !== "string"
+  ) {
+    return;
+  }
+
+  output.output = result.redactedOutput;
+  if (typeof output.metadata === "object" && output.metadata !== null) {
+    output.metadata.agtRedacted = true;
+    output.metadata.agtRedactionReason = result.reason;
+  }
+}

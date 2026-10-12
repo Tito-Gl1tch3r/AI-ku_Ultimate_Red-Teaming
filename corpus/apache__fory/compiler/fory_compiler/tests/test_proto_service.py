@@ -1,0 +1,226 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+"""Tests for Proto service parsing."""
+
+from fory_compiler.frontend.proto.lexer import Lexer
+from fory_compiler.frontend.proto.parser import Parser
+from fory_compiler.frontend.proto.translator import ProtoTranslator
+from fory_compiler.ir.validator import SchemaValidator
+
+
+def parse_and_translate(source):
+    lexer = Lexer(source)
+    parser = Parser(lexer.tokenize())
+    schema = parser.parse()
+    translator = ProtoTranslator(schema)
+    return translator.translate()
+
+
+def test_service_parsing():
+    source = """
+    syntax = "proto3";
+    package demo;
+
+    message Request {
+        int32 id = 1;
+    }
+
+    message Response {
+        string result = 1;
+    }
+
+    service Greeter {
+        rpc SayHello (Request) returns (Response);
+        rpc SayGoodbye (Request) returns (Response) {
+            option deprecated = true;
+        }
+    }
+    """
+    schema = parse_and_translate(source)
+    assert len(schema.services) == 1
+    service = schema.services[0]
+    assert service.name == "Greeter"
+    assert len(service.methods) == 2
+
+    m1 = service.methods[0]
+    assert m1.name == "SayHello"
+    assert m1.request_type.name == "Request"
+    assert m1.response_type.name == "Response"
+    assert not m1.client_streaming
+    assert not m1.server_streaming
+
+    m2 = service.methods[1]
+    assert m2.name == "SayGoodbye"
+    assert m2.options["deprecated"] is True
+
+
+def test_streaming_rpc():
+    source = """
+    syntax = "proto3";
+    package demo;
+
+    message Request {}
+    message Response {}
+
+    service Streamer {
+        rpc ClientStream (stream Request) returns (Response);
+        rpc ServerStream (Request) returns (stream Response);
+        rpc BidiStream (stream Request) returns (stream Response);
+    }
+    """
+    schema = parse_and_translate(source)
+    service = schema.services[0]
+
+    # Client streaming
+    m1 = service.methods[0]
+    assert m1.name == "ClientStream"
+    assert m1.client_streaming is True
+    assert m1.server_streaming is False
+
+    # Server streaming
+    m2 = service.methods[1]
+    assert m2.name == "ServerStream"
+    assert m2.client_streaming is False
+    assert m2.server_streaming is True
+
+    # Bidi streaming
+    m3 = service.methods[2]
+    assert m3.name == "BidiStream"
+    assert m3.client_streaming is True
+    assert m3.server_streaming is True
+
+
+def test_fully_qualified_rpc_types_pass_validation():
+    source = """
+    syntax = "proto3";
+    package demo;
+
+    message Request {}
+    message Response {}
+
+    service Greeter {
+        rpc SayHello (.demo.Request) returns (.demo.Response);
+    }
+    """
+    schema = parse_and_translate(source)
+    method = schema.services[0].methods[0]
+    assert method.request_type.name == ".demo.Request"
+    assert method.response_type.name == ".demo.Response"
+
+    validator = SchemaValidator(schema)
+    assert validator.validate(), [issue.message for issue in validator.errors]
+
+
+def test_absolute_rpc_type_prefers_package_qualified_type_over_nested_shadow():
+    source = """
+    syntax = "proto3";
+    package demo;
+
+    message demo {
+        message Request {}
+    }
+    message Request {}
+    message Response {}
+
+    service Greeter {
+        rpc SayHello (.demo.Request) returns (.demo.Response);
+    }
+    """
+    schema = parse_and_translate(source)
+    method = schema.services[0].methods[0]
+    assert schema.resolve_type_name(method.request_type.name) == "Request"
+
+    validator = SchemaValidator(schema)
+    assert validator.validate(), [issue.message for issue in validator.errors]
+
+
+def test_wrong_package_qualified_rpc_type_fails_validation():
+    source = """
+    syntax = "proto3";
+    package demo;
+
+    message other {
+        message Request {}
+    }
+    message Request {}
+    message Response {}
+
+    service Greeter {
+        rpc SayHello (.other.Request) returns (.demo.Response);
+    }
+    """
+    schema = parse_and_translate(source)
+    validator = SchemaValidator(schema)
+    assert not validator.validate()
+    assert any(
+        "Unknown type '.other.Request'" in err.message for err in validator.errors
+    )
+
+
+def test_service_options():
+    source = """
+    syntax = "proto3";
+    package demo;
+
+    service OptionsService {
+        option deprecated = true;
+        rpc Method (Req) returns (Res);
+    }
+    
+    message Req {}
+    message Res {}
+    """
+    schema = parse_and_translate(source)
+    service = schema.services[0]
+    assert service.options["deprecated"] is True
+
+
+def test_service_unknown_request_type_fails_validation():
+    source = """
+    syntax = "proto3";
+    package demo;
+
+    message Response {}
+
+    service Greeter {
+        rpc SayHello (UnknownRequest) returns (Response);
+    }
+    """
+    schema = parse_and_translate(source)
+    validator = SchemaValidator(schema)
+    assert not validator.validate()
+    assert any(
+        "Unknown type 'UnknownRequest'" in err.message for err in validator.errors
+    )
+
+
+def test_service_unknown_response_type_fails_validation():
+    source = """
+    syntax = "proto3";
+    package demo;
+
+    message Request {}
+
+    service Greeter {
+        rpc SayHello (Request) returns (UnknownReply);
+    }
+    """
+    schema = parse_and_translate(source)
+    validator = SchemaValidator(schema)
+    assert not validator.validate()
+    assert any("Unknown type 'UnknownReply'" in err.message for err in validator.errors)

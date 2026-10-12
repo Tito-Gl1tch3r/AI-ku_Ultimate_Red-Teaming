@@ -1,0 +1,23 @@
+package sqlite.kripton58.array;
+
+import com.abubusoft.kripton.android.sqlite.BindDaoFactory;
+
+/**
+ * <p>
+ * Represents dao factory interface for IntDataSource.
+ * This class expose database interface through Dao attribute.
+ * </p>
+ *
+ * @see IntDataSource
+ * @see IntDao
+ * @see IntDaoImpl
+ * @see IntBean
+ */
+public interface BindIntDaoFactory extends BindDaoFactory {
+  /**
+   * Retrieve dao IntDao.
+   *
+   * @return dao implementation
+   */
+  IntDaoImpl getIntDao();
+}

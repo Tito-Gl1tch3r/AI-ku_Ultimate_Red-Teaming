@@ -1,0 +1,538 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use proc_macro2::{Ident, TokenStream};
+use quote::{format_ident, quote};
+use syn::{Field, Fields};
+
+use super::field_codec::{build_bindings, FieldBinding};
+use super::util::{gen_struct_version_hash_ts, get_struct_name, is_debug_enabled};
+use crate::util::SourceField;
+
+/// Create a private variable name for a field during deserialization.
+/// For named fields: `_field_name`
+/// For tuple struct fields: `_0`, `_1`, etc.
+pub(crate) fn create_private_field_name(field: &Field, index: usize) -> Ident {
+    match &field.ident {
+        Some(ident) => format_ident!("_{}", ident),
+        None => format_ident!("_{}", index),
+    }
+}
+
+pub(crate) fn declare_var(source_fields: &[SourceField<'_>]) -> Vec<TokenStream> {
+    let bindings = match build_bindings(source_fields) {
+        Ok(bindings) => bindings,
+        Err(err) => return vec![err.to_compile_error()],
+    };
+    bindings
+        .iter()
+        .map(|binding| match binding {
+            FieldBinding::Codec(binding) => binding.declare_compatible_var(),
+            FieldBinding::Skipped(binding) => binding.read_default(),
+        })
+        .collect()
+}
+
+pub(crate) fn assign_value(source_fields: &[SourceField<'_>]) -> Vec<TokenStream> {
+    let is_tuple = source_fields
+        .first()
+        .map(|sf| sf.is_tuple_struct)
+        .unwrap_or(false);
+    let bindings = match build_bindings(source_fields) {
+        Ok(bindings) => bindings,
+        Err(err) => return vec![err.to_compile_error()],
+    };
+
+    // Generate field value expressions with original index for sorting
+    let mut indexed: Vec<_> = source_fields
+        .iter()
+        .zip(bindings.iter())
+        .map(|(sf, binding)| {
+            let value_expr = match binding {
+                FieldBinding::Codec(binding) => binding.assign_value(),
+                FieldBinding::Skipped(binding) => binding.assign_value(),
+            };
+            (sf.original_index, sf.field_init(value_expr))
+        })
+        .collect();
+
+    // For tuple structs, sort by original index to construct Self(field0, field1, ...) correctly
+    if is_tuple {
+        indexed.sort_by_key(|(idx, _)| *idx);
+    }
+
+    indexed.into_iter().map(|(_, ts)| ts).collect()
+}
+
+pub fn gen_read_type_info() -> TokenStream {
+    quote! {
+        fory_core::serializer::struct_::read_type_info_fast::<Self>(context)
+    }
+}
+
+fn target_construction(
+    target_path: &TokenStream,
+    fields: &Fields,
+    field_inits: &[TokenStream],
+) -> TokenStream {
+    match fields {
+        Fields::Named(_) => quote! { #target_path { #(#field_inits),* } },
+        Fields::Unnamed(_) => quote! { #target_path( #(#field_inits),* ) },
+        Fields::Unit => quote! { #target_path },
+    }
+}
+
+fn get_source_fields_loop_ts(source_fields: &[SourceField<'_>]) -> TokenStream {
+    let bindings = match build_bindings(source_fields) {
+        Ok(bindings) => bindings,
+        Err(err) => return err.to_compile_error(),
+    };
+    let read_fields_ts: Vec<_> = bindings
+        .iter()
+        .map(|binding| match binding {
+            FieldBinding::Codec(binding) => {
+                let base = binding.read_field();
+                if is_debug_enabled() {
+                    let struct_name = get_struct_name().expect("struct context not set");
+                    let struct_name_lit =
+                        syn::LitStr::new(&struct_name, proc_macro2::Span::call_site());
+                    let field_name_lit = syn::LitStr::new(
+                        &binding.source.field_name,
+                        proc_macro2::Span::call_site(),
+                    );
+                    let private_ident = &binding.private_ident;
+                    quote! {
+                        fory_core::serializer::struct_::struct_before_read_field(
+                            #struct_name_lit,
+                            #field_name_lit,
+                            context,
+                        );
+                        #base
+                        fory_core::serializer::struct_::struct_after_read_field(
+                            #struct_name_lit,
+                            #field_name_lit,
+                            (&#private_ident) as &dyn ::std::any::Any,
+                            context,
+                        );
+                    }
+                } else {
+                    base
+                }
+            }
+            FieldBinding::Skipped(binding) => binding.read_default(),
+        })
+        .collect();
+    quote! {
+        #(#read_fields_ts)*
+    }
+}
+
+pub fn gen_read_data(
+    fields: &Fields,
+    source_fields: &[SourceField<'_>],
+    target_path: &TokenStream,
+) -> TokenStream {
+    let schema_fields: Vec<&Field> = source_fields.iter().map(|sf| sf.field).collect();
+    // Generate runtime version hash computation that detects enum fields
+    let version_hash_ts = gen_struct_version_hash_ts(&schema_fields);
+    let read_fields = if source_fields.is_empty() {
+        quote! {}
+    } else {
+        let loop_ts = get_source_fields_loop_ts(source_fields);
+        quote! {
+            #loop_ts
+        }
+    };
+
+    let is_tuple = source_fields
+        .first()
+        .map(|sf| sf.is_tuple_struct)
+        .unwrap_or(false);
+
+    // Generate field initializations, sorted by original index for tuple structs
+    let mut indexed: Vec<_> = source_fields
+        .iter()
+        .map(|sf| {
+            let private_ident = create_private_field_name(sf.field, sf.original_index);
+            let value = quote! { #private_ident };
+            (sf.original_index, sf.field_init(value))
+        })
+        .collect();
+
+    if is_tuple {
+        indexed.sort_by_key(|(idx, _)| *idx);
+    }
+
+    let field_inits: Vec<_> = indexed.into_iter().map(|(_, ts)| ts).collect();
+    let construction = target_construction(target_path, fields, &field_inits);
+
+    quote! {
+        // Read and check version hash when class version checking is enabled
+        if context.is_check_struct_version() {
+            let read_version = context.reader.read_i32()?;
+            let type_name = ::std::any::type_name::<Self::Target>();
+            let local_version: i32 = #version_hash_ts;
+            fory_core::meta::TypeMeta::check_struct_version(read_version, local_version, type_name)?;
+        }
+        #read_fields
+        Ok(#construction)
+    }
+}
+
+pub fn gen_default_value(
+    fields: &Fields,
+    source_fields: &[SourceField<'_>],
+    target_path: &TokenStream,
+) -> TokenStream {
+    let bindings = match build_bindings(source_fields) {
+        Ok(bindings) => bindings,
+        Err(err) => return err.to_compile_error(),
+    };
+    let mut values: Vec<_> = source_fields
+        .iter()
+        .zip(bindings.iter())
+        .map(|(source, binding)| {
+            (
+                source.original_index,
+                source.field_init(binding.default_value_expr()),
+            )
+        })
+        .collect();
+    if matches!(fields, Fields::Unnamed(_)) {
+        values.sort_by_key(|(index, _)| *index);
+    }
+    let field_inits: Vec<_> = values.into_iter().map(|(_, value)| value).collect();
+    let construction = target_construction(target_path, fields, &field_inits);
+    quote! {
+        let _ = &*context;
+        Ok(#construction)
+    }
+}
+
+pub fn gen_read() -> TokenStream {
+    quote! {
+        let ref_flag = if ref_mode != fory_core::RefMode::None {
+            context.reader.read_i8()?
+        } else {
+            fory_core::RefFlag::NotNullValue as i8
+        };
+        if ref_flag == (fory_core::RefFlag::NotNullValue as i8) || ref_flag == (fory_core::RefFlag::RefValue as i8) {
+            // For RefValueFlag with Tracking mode, reserve a ref_id to participate in ref tracking.
+            // This is needed for xlang compatibility where all objects (not just Rc/Arc)
+            // participate in reference tracking when ref tracking is enabled.
+            // Only reserve for Tracking mode, not NullOnly mode.
+            if ref_flag == (fory_core::RefFlag::RefValue as i8) && ref_mode == fory_core::RefMode::Tracking {
+                context.ref_reader.reserve_ref_id();
+            }
+            // Rust structs are inline values. Generated struct serializers only
+            // read fields; parent fields, collection/map backing storage, and
+            // Box/Rc/Arc/dynamic-box owners account for the storage they own.
+            if context.is_compatible() {
+                let type_info = if read_type_info {
+                    // Compatible structural mapping must retain unregistered remote TypeMeta.
+                    // A registered harness must own this concrete target before resolver state is
+                    // published; only an unregistered structural stub may be mapped or skipped.
+                    fory_core::serializer::struct_::read_compatible_type_info::<Self>(context)?
+                } else {
+                    let provider_type_id = ::std::any::TypeId::of::<Self>();
+                    context.get_provider_type_info(&provider_type_id)?
+                };
+                <Self as fory_core::StructSerializer>::read_compatible(context, &type_info)
+            } else {
+                if read_type_info {
+                    <Self as fory_core::Serializer>::read_type_info(context)?;
+                }
+                <Self as fory_core::Serializer>::read_data(context)
+            }
+        } else if ref_flag == (fory_core::RefFlag::Null as i8) {
+            <Self as fory_core::Serializer>::default_value(context)
+        } else {
+            Err(fory_core::serializer::struct_::invalid_ref_flag(ref_flag))
+        }
+    }
+}
+
+pub fn gen_read_with_type_info() -> TokenStream {
+    quote! {
+        let ref_flag = if ref_mode != fory_core::RefMode::None {
+            context.reader.read_i8()?
+        } else {
+            fory_core::RefFlag::NotNullValue as i8
+        };
+        if ref_flag == (fory_core::RefFlag::NotNullValue as i8) || ref_flag == (fory_core::RefFlag::RefValue as i8) {
+            // The pre-read type-info path still owns the structural value's reference slot.
+            // Skipping this reservation would shift every later tracked reference id.
+            if ref_flag == (fory_core::RefFlag::RefValue as i8)
+                && ref_mode == fory_core::RefMode::Tracking
+            {
+                context.ref_reader.reserve_ref_id();
+            }
+            if context.is_compatible() {
+                <Self as fory_core::StructSerializer>::read_compatible(context, type_info)
+            } else {
+                <Self as fory_core::Serializer>::read_data(context)
+            }
+        } else if ref_flag == (fory_core::RefFlag::Null as i8) {
+            <Self as fory_core::Serializer>::default_value(context)
+        } else {
+            Err(fory_core::serializer::struct_::invalid_ref_flag(ref_flag))
+        }
+    }
+}
+
+pub fn gen_read_compatible(
+    fields: &Fields,
+    source_fields: &[SourceField<'_>],
+    target_path: &TokenStream,
+) -> TokenStream {
+    gen_read_compatible_target(fields, source_fields, target_path, None, None)
+}
+
+pub(crate) fn gen_read_compatible_target(
+    fields: &Fields,
+    source_fields: &[SourceField<'_>],
+    target_path: &TokenStream,
+    variant_ident: Option<&Ident>,
+    variant_meta_type: Option<&TokenStream>,
+) -> TokenStream {
+    let bindings = match build_bindings(source_fields) {
+        Ok(bindings) => bindings,
+        Err(err) => return err.to_compile_error(),
+    };
+    let declare_ts: Vec<TokenStream> = declare_var(source_fields);
+    let assign_ts: Vec<TokenStream> = assign_value(source_fields);
+    let construction = if let Some(variant) = variant_ident {
+        quote! {
+            Ok(#target_path::#variant {
+                #(#assign_ts),*
+            })
+        }
+    } else {
+        let value = target_construction(target_path, fields, &assign_ts);
+        quote! { Ok(#value) }
+    };
+    let mut same_schema_values: Vec<_> = source_fields
+        .iter()
+        .map(|source| {
+            let private_ident = create_private_field_name(source.field, source.original_index);
+            (
+                source.original_index,
+                source.field_init(quote! { #private_ident }),
+            )
+        })
+        .collect();
+    if matches!(fields, Fields::Unnamed(_)) {
+        same_schema_values.sort_by_key(|(index, _)| *index);
+    }
+    let same_schema_inits: Vec<_> = same_schema_values
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect();
+    let same_schema_construction = if let Some(variant) = variant_ident {
+        quote! {
+            Ok(#target_path::#variant {
+                #(#same_schema_inits),*
+            })
+        }
+    } else {
+        let value = target_construction(target_path, fields, &same_schema_inits);
+        quote! { Ok(#value) }
+    };
+    let same_schema_read_ts: Vec<TokenStream> = bindings
+        .iter()
+        .map(|binding| match binding {
+            FieldBinding::Codec(binding) => binding.read_field(),
+            FieldBinding::Skipped(binding) => binding.read_default(),
+        })
+        .collect();
+
+    let match_arms: Vec<TokenStream> = bindings
+        .iter()
+        .filter_map(|binding| match binding {
+            FieldBinding::Codec(binding) => Some(binding),
+            FieldBinding::Skipped(_) => None,
+        })
+        .enumerate()
+        .flat_map(|(sorted_idx, binding)| {
+            let direct_field_id = (sorted_idx * 2) as i32;
+            let compatible_field_id = (sorted_idx * 2 + 1) as i32;
+            let field_index = sorted_idx;
+            let direct_body = binding.read_compatible_direct();
+            let compatible_body = binding.read_compatible_conversion();
+            let direct_arm = quote! {
+                #direct_field_id => {
+                    #direct_body
+                }
+            };
+            let compatible_arm = if binding.compatible_needs_local_field_type() {
+                quote! {
+                    #compatible_field_id => {
+                        let local_field_type = unsafe {
+                            &(*local_fields_ptr.add(#field_index)).field_type
+                        };
+                        #compatible_body
+                    }
+                }
+            } else {
+                quote! {
+                    #compatible_field_id => {
+                        #compatible_body
+                    }
+                }
+            };
+            [direct_arm, compatible_arm]
+        })
+        .collect();
+    let skip_arm = if is_debug_enabled() {
+        let struct_name = get_struct_name().expect("struct context not set");
+        let struct_name_lit = syn::LitStr::new(&struct_name, proc_macro2::Span::call_site());
+        quote! {
+            -1 => {
+                let field_type = &_field.field_type;
+                let read_ref_flag = fory_core::serializer::util::field_need_write_ref_into(
+                    field_type.type_id,
+                    field_type.nullable,
+                );
+                let field_name = _field.field_name.as_str();
+                fory_core::serializer::struct_::struct_before_read_field(
+                    #struct_name_lit,
+                    field_name,
+                    context,
+                );
+                fory_core::serializer::skip::skip_field_value(context, &field_type, read_ref_flag)?;
+                let placeholder: &dyn ::std::any::Any = &();
+                fory_core::serializer::struct_::struct_after_read_field(
+                    #struct_name_lit,
+                    field_name,
+                    placeholder,
+                    context,
+                );
+            }
+        }
+    } else {
+        quote! {
+            -1 => {
+                let field_type = &_field.field_type;
+                let read_ref_flag = fory_core::serializer::util::field_need_write_ref_into(
+                    field_type.type_id,
+                    field_type.nullable,
+                );
+                fory_core::serializer::skip::skip_field_value(context, field_type, read_ref_flag)?;
+            }
+        }
+    };
+
+    let invalid_arm = quote! {
+        field_id => {
+            return Err(fory_core::Error::invalid_data(format!(
+                "invalid compatible matched id {} for field '{}'",
+                field_id,
+                _field.field_name.as_str(),
+            )));
+        }
+    };
+
+    let variant_field_remap = if let Some(variant) = variant_ident {
+        let variant_name = variant.to_string();
+        let meta_type = variant_meta_type.expect("variant metadata type is required");
+        let variant_name_lit = syn::LitStr::new(&variant_name, proc_macro2::Span::call_site());
+        quote! {
+            let local_variant_type_info = context
+                .get_type_resolver()
+                .get_provider_type_info(&::std::any::TypeId::of::<#meta_type>())
+                .map_err(|_| fory_core::Error::type_error(
+                    concat!("Local enum variant metadata not found for ", #variant_name_lit)
+                ))?;
+            let local_variant_type_meta = local_variant_type_info.get_type_meta();
+            let local_fields = local_variant_type_meta.get_field_infos();
+        }
+    } else {
+        quote! {}
+    };
+
+    let fields_binding = if variant_ident.is_some() {
+        quote! {
+            #variant_field_remap
+            let mut remapped_fields: ::std::vec::Vec<fory_core::meta::FieldInfo>;
+            let fields = if remote_meta.get_namespace().original.as_str()
+                == local_variant_type_meta.get_namespace().original.as_str()
+                && remote_meta.get_type_name().original.as_str()
+                    == local_variant_type_meta.get_type_name().original.as_str()
+            {
+                // Same-name variant TypeMeta is resolved by the synthetic variant TypeInfo during
+                // parsing, so matched_field_id already contains local dispatch while field_id
+                // still preserves wire identity. Reuse that owner result instead of rebuilding the
+                // same matching maps and compatibility decisions here.
+                remote_meta.get_field_infos()
+            } else {
+                // Compatible enums match variants by tag first. If that tag now names a different
+                // local variant, the remote synthetic variant TypeMeta could not be classified by
+                // name during parsing, so the selected local variant owns the field remap here.
+                remapped_fields = remote_meta.get_field_infos().clone();
+                fory_core::meta::match_remote_fields(local_fields, &mut remapped_fields)?;
+                &remapped_fields
+            };
+            let local_fields_ptr = local_fields.as_ptr();
+        }
+    } else {
+        quote! {
+            let local_fields_ptr = meta.get_field_infos().as_ptr();
+            let fields = remote_meta.get_field_infos();
+        }
+    };
+    let schema_setup = if variant_ident.is_some() {
+        quote! {
+            let remote_meta = type_info.get_type_meta_ref();
+            let remote_type_hash = remote_meta.get_hash();
+            #fields_binding
+            if remote_type_hash == local_variant_type_meta.get_hash() {
+                // The payload is still only the variant fields. Reading the whole enum data here
+                // would consume field bytes as a fresh enum tag, so exact variant schemas use the
+                // local sorted field reader directly.
+                #(#same_schema_read_ts)*
+                return #same_schema_construction;
+            }
+        }
+    } else {
+        quote! {
+            let remote_meta = type_info.get_type_meta_ref();
+            // Metadata resolution selects the local schema by the validated 52-bit TypeMeta hash.
+            // Reusing that result avoids another local metadata lookup or body comparison.
+            if type_info.has_exact_local_schema() {
+                return <Self as fory_core::Serializer>::read_data(context);
+            }
+            let meta = context.get_type_resolver().get_type_meta_by_index_ref(
+                &::std::any::TypeId::of::<Self>(),
+                <Self as fory_core::StructSerializer>::type_index(),
+            )?;
+            #fields_binding
+        }
+    };
+
+    quote! {
+        #schema_setup
+        #(#declare_ts)*
+        for _field in fields.iter() {
+            match _field.matched_field_id {
+                #(#match_arms)*
+                #skip_arm
+                #invalid_arm
+            }
+        }
+        #construction
+    }
+}

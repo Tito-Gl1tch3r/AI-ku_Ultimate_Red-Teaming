@@ -1,0 +1,340 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.fory.serializer;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
+import java.util.stream.Collectors;
+import org.apache.fory.context.ReadContext;
+import org.apache.fory.context.RefReader;
+import org.apache.fory.context.RefWriter;
+import org.apache.fory.context.WriteContext;
+import org.apache.fory.exception.ForyException;
+import org.apache.fory.logging.Logger;
+import org.apache.fory.logging.LoggerFactory;
+import org.apache.fory.memory.MemoryBuffer;
+import org.apache.fory.meta.TypeDef;
+import org.apache.fory.reflect.ObjectInstantiator;
+import org.apache.fory.resolver.TypeResolver;
+import org.apache.fory.serializer.FieldGroups.SerializationFieldInfo;
+import org.apache.fory.serializer.struct.Fingerprint;
+import org.apache.fory.type.Descriptor;
+import org.apache.fory.type.DescriptorGrouper;
+import org.apache.fory.type.Generics;
+import org.apache.fory.util.MurmurHash3;
+import org.apache.fory.util.StringUtils;
+import org.apache.fory.util.Utils;
+import org.apache.fory.util.record.RecordInfo;
+import org.apache.fory.util.record.RecordUtils;
+
+/**
+ * A schema-consistent serializer used only for java serialization.
+ *
+ * <ul>
+ *   <li>non-public class
+ *   <li>non-static class
+ *   <li>lambda
+ *   <li>inner class
+ *   <li>local class
+ *   <li>anonymous class
+ *   <li>class that can't be handled by other serializers or codegen-based serializers
+ * </ul>
+ */
+public final class ObjectSerializer<T> extends AbstractObjectSerializer<T> {
+  private static final Logger LOG = LoggerFactory.getLogger(ObjectSerializer.class);
+
+  private final RecordInfo recordInfo;
+  private final SerializationFieldInfo[] allFields;
+  private final int classVersionHash;
+  private final boolean trackingRef;
+  private final boolean checkClassVersion;
+
+  public ObjectSerializer(TypeResolver typeResolver, Class<T> cls) {
+    this(typeResolver, cls, true);
+  }
+
+  public ObjectSerializer(TypeResolver typeResolver, Class<T> cls, boolean resolveParent) {
+    this(typeResolver, cls, resolveParent, typeResolver.getObjectInstantiator(cls));
+  }
+
+  public ObjectSerializer(
+      TypeResolver typeResolver,
+      Class<T> cls,
+      boolean resolveParent,
+      ObjectInstantiator<T> objectInstantiator) {
+    super(typeResolver, cls, objectInstantiator);
+    trackingRef = config.trackingRef();
+    checkClassVersion = typeResolver.checkClassVersion();
+    // avoid recursive building serializers.
+    // Use `setSerializerIfAbsent` to avoid overwriting existing serializer for class when used
+    // as data serializer.
+    if (resolveParent) {
+      typeResolver.setSerializerIfAbsent(cls, this);
+    }
+    Collection<Descriptor> descriptors;
+    DescriptorGrouper grouper;
+    boolean shareMeta = config.isMetaShareEnabled();
+    if (shareMeta) {
+      TypeDef typeDef = typeResolver.getTypeDef(cls, resolveParent);
+      if (Utils.DEBUG_OUTPUT_ENABLED) {
+        LOG.info("========== ObjectSerializer TypeDef for {} ==========", cls.getName());
+        LOG.info("TypeDef fieldsInfo count: {}", typeDef.getFieldsInfo().size());
+        for (int i = 0; i < typeDef.getFieldsInfo().size(); i++) {
+          LOG.info("  [{}] {}", i, typeDef.getFieldsInfo().get(i));
+        }
+      }
+      descriptors = typeDef.getDescriptors(typeResolver, cls);
+      grouper = typeResolver.createDescriptorGrouper(typeDef, cls);
+    } else {
+      grouper = typeResolver.getFieldDescriptorGrouper(cls, resolveParent, false);
+      descriptors = grouper.getSortedDescriptors();
+    }
+    if (shareMeta) {
+      descriptors = grouper.getSortedDescriptors();
+    }
+    if (Utils.DEBUG_OUTPUT_ENABLED) {
+      LOG.info(
+          "========== ObjectSerializer {} sorted descriptors for {} ==========",
+          descriptors.size(),
+          cls.getName());
+      for (Descriptor d : descriptors) {
+        LOG.info(
+            "  {} -> {}, ref {}, nullable {}",
+            StringUtils.toSnakeCase(d.getName()),
+            d.getTypeName(),
+            d.isTrackingRef(),
+            d.isNullable());
+      }
+    }
+    if (isRecord) {
+      List<String> fieldNames =
+          descriptors.stream().map(Descriptor::getName).collect(Collectors.toList());
+      recordInfo = new RecordInfo(cls, fieldNames);
+    } else {
+      recordInfo = null;
+    }
+    if (typeResolver.checkClassVersion()) {
+      classVersionHash = computeStructHash(typeResolver, grouper);
+    } else {
+      classVersionHash = 0;
+    }
+    FieldGroups fieldGroups = FieldGroups.buildFieldInfos(typeResolver, grouper);
+    allFields = fieldGroups.allFields;
+  }
+
+  @Override
+  public void write(WriteContext writeContext, T value) {
+    MemoryBuffer buffer = writeContext.getBuffer();
+    if (typeResolver.checkClassVersion()) {
+      buffer.writeInt32(classVersionHash);
+    }
+    // Protocol order: primitive, nullable primitive, then all non-primitives by field identifier.
+    RefWriter refWriter = writeContext.getRefWriter();
+    Generics generics = writeContext.getGenerics();
+    writeFields(writeContext, value, refWriter, generics);
+  }
+
+  private void writeFields(
+      WriteContext writeContext, T value, RefWriter refWriter, Generics generics) {
+    for (SerializationFieldInfo fieldInfo : allFields) {
+      writeFieldByCodecCategory(writeContext, value, refWriter, generics, fieldInfo);
+    }
+  }
+
+  private void printWriteFieldDebugInfo(SerializationFieldInfo fieldInfo, MemoryBuffer buffer) {
+    LOG.info(
+        "[Java] write field {} of type {}, writer index {}",
+        fieldInfo.descriptor.getName(),
+        fieldInfo.typeRef,
+        buffer.writerIndex());
+  }
+
+  private void printReadFieldDebugInfo(SerializationFieldInfo fieldInfo, MemoryBuffer buffer) {
+    LOG.info(
+        "[Java] read field {} of type {}, reader index {}",
+        fieldInfo.descriptor.getName(),
+        fieldInfo.typeRef,
+        buffer.readerIndex());
+  }
+
+  private void writeFieldByCodecCategory(
+      WriteContext writeContext,
+      T value,
+      RefWriter refWriter,
+      Generics generics,
+      SerializationFieldInfo fieldInfo) {
+    MemoryBuffer buffer = writeContext.getBuffer();
+    if (Utils.DEBUG_OUTPUT_VERBOSE) {
+      printWriteFieldDebugInfo(fieldInfo, buffer);
+    }
+    switch (fieldInfo.codecCategory) {
+      case BUILD_IN:
+        AbstractObjectSerializer.writeBuildInField(
+            writeContext, typeResolver, refWriter, fieldInfo, buffer, value);
+        return;
+      case CONTAINER:
+        {
+          Object fieldValue = fieldInfo.fieldAccessor.getObject(value);
+          writeContainerFieldValue(
+              writeContext, typeResolver, refWriter, generics, fieldInfo, buffer, fieldValue);
+          return;
+        }
+      case OTHER:
+        {
+          Object fieldValue = fieldInfo.fieldAccessor.getObject(value);
+          AbstractObjectSerializer.writeField(
+              writeContext, typeResolver, refWriter, fieldInfo, buffer, fieldValue);
+          return;
+        }
+      default:
+        throw new IllegalStateException("Unknown field codec category " + fieldInfo.codecCategory);
+    }
+  }
+
+  @Override
+  public T read(ReadContext readContext) {
+    readContext.reserveGraphMemory((long) objectGraphMemoryBytes);
+    MemoryBuffer buffer = readContext.getBuffer();
+    if (isRecord) {
+      Object[] fields = readFields(readContext);
+      fields = RecordUtils.remapping(recordInfo, fields);
+      T obj = objectInstantiator.newInstanceWithArguments(fields);
+      Arrays.fill(recordInfo.getRecordComponents(), null);
+      return obj;
+    }
+    T obj = newBean();
+    if (trackingRef) {
+      readContext.reference(obj);
+    }
+    return readAndSetFields(readContext, obj);
+  }
+
+  public Object[] readFields(ReadContext readContext) {
+    MemoryBuffer buffer = readContext.getBuffer();
+    RefReader refReader = readContext.getRefReader();
+    if (checkClassVersion) {
+      int hash = buffer.readInt32();
+      checkClassVersion(type, hash, classVersionHash);
+    }
+    Object[] fieldValues = new Object[allFields.length];
+    int counter = 0;
+    Generics generics = readContext.getGenerics();
+    for (SerializationFieldInfo fieldInfo : allFields) {
+      fieldValues[counter++] =
+          readFieldByCodecCategory(readContext, refReader, generics, fieldInfo, buffer);
+    }
+    return fieldValues;
+  }
+
+  public T readAndSetFields(ReadContext readContext, T obj) {
+    MemoryBuffer buffer = readContext.getBuffer();
+    RefReader refReader = readContext.getRefReader();
+    if (checkClassVersion) {
+      int hash = buffer.readInt32();
+      checkClassVersion(type, hash, classVersionHash);
+    }
+    Generics generics = readContext.getGenerics();
+    for (SerializationFieldInfo fieldInfo : allFields) {
+      readAndSetFieldByCodecCategory(readContext, refReader, generics, fieldInfo, buffer, obj);
+    }
+    return obj;
+  }
+
+  private Object readFieldByCodecCategory(
+      ReadContext readContext,
+      RefReader refReader,
+      Generics generics,
+      SerializationFieldInfo fieldInfo,
+      MemoryBuffer buffer) {
+    if (Utils.DEBUG_OUTPUT_VERBOSE) {
+      printReadFieldDebugInfo(fieldInfo, buffer);
+    }
+    switch (fieldInfo.codecCategory) {
+      case BUILD_IN:
+        return readBuildInFieldValue(readContext, typeResolver, refReader, fieldInfo, buffer);
+      case CONTAINER:
+        return readContainerFieldValue(
+            readContext, typeResolver, refReader, generics, fieldInfo, buffer);
+      case OTHER:
+        return readField(readContext, typeResolver, refReader, fieldInfo, buffer);
+      default:
+        throw new IllegalStateException("Unknown field codec category " + fieldInfo.codecCategory);
+    }
+  }
+
+  private void readAndSetFieldByCodecCategory(
+      ReadContext readContext,
+      RefReader refReader,
+      Generics generics,
+      SerializationFieldInfo fieldInfo,
+      MemoryBuffer buffer,
+      T obj) {
+    if (Utils.DEBUG_OUTPUT_VERBOSE) {
+      printReadFieldDebugInfo(fieldInfo, buffer);
+    }
+    switch (fieldInfo.codecCategory) {
+      case BUILD_IN:
+        // a numeric type can have only three kinds: primitive, not_null_boxed, nullable_boxed
+        readBuildInFieldValue(readContext, typeResolver, refReader, fieldInfo, buffer, obj);
+        return;
+      case CONTAINER:
+        {
+          Object fieldValue =
+              readContainerFieldValue(
+                  readContext, typeResolver, refReader, generics, fieldInfo, buffer);
+          checkFieldValueType(fieldInfo, fieldValue);
+          fieldInfo.fieldAccessor.putObject(obj, fieldValue);
+          return;
+        }
+      case OTHER:
+        {
+          Object fieldValue = readField(readContext, typeResolver, refReader, fieldInfo, buffer);
+          checkFieldValueType(fieldInfo, fieldValue);
+          fieldInfo.fieldAccessor.putObject(obj, fieldValue);
+          return;
+        }
+      default:
+        throw new IllegalStateException("Unknown field codec category " + fieldInfo.codecCategory);
+    }
+  }
+
+  int getNumFields() {
+    return allFields.length;
+  }
+
+  public static int computeStructHash(TypeResolver typeResolver, DescriptorGrouper grouper) {
+    List<Descriptor> sorted = grouper.getSortedDescriptors();
+    String fingerprint = Fingerprint.computeStructFingerprint(typeResolver, sorted);
+    byte[] bytes = fingerprint.getBytes(StandardCharsets.UTF_8);
+    long hashLong = MurmurHash3.murmurhash3_x64_128(bytes, 0, bytes.length, 47)[0];
+    return (int) (hashLong & 0xffffffffL);
+  }
+
+  public static void checkClassVersion(Class<?> cls, int readHash, int classVersionHash) {
+    if (readHash != classVersionHash) {
+      throw new ForyException(
+          String.format(
+              "Read class %s version %s is not consistent with %s",
+              cls, readHash, classVersionHash));
+    }
+  }
+}

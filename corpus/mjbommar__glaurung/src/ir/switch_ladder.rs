@@ -1,0 +1,2328 @@
+//! Recover a `switch` from the comparison ladder gcc emits at `-O0`.
+//!
+//! A `switch` over a small dense range does not have to become a jump table. At
+//! `-O0` gcc routinely emits a binary-search decision tree instead:
+//!
+//! ```text
+//!     cmpl $0x7,-0x4(%rbp); je   case7
+//!     cmpl $0x7,-0x4(%rbp); jg   default
+//!     cmpl $0x6,-0x4(%rbp); je   case6
+//!     cmpl $0x6,-0x4(%rbp); jg   default
+//!     ...
+//! ```
+//!
+//! Structuring that faithfully produces deeply nested `if`/`else` with one `goto`
+//! per range-prune edge into the shared `default` arm. It is correct, and it is
+//! nothing like the `switch` in the source: on the DecBench corpus the single
+//! function `dispatch` scores a graph edit distance of 84 that way.
+//!
+//! There is no jump table here to recover — the machine really did compare — so
+//! this works on the structured AST rather than the CFG. It matches a tree whose
+//! every test is against ONE side-effect-free value, collects the `== constant`
+//! arms as cases, treats the relational tests as range prunes that lead to the
+//! default, and rewrites the whole tree as `Stmt::Switch`. The `goto`s and their
+//! label disappear with it.
+//!
+//! Conservative by construction: anything that does not fit the shape exactly —
+//! a second discriminant, a duplicate case constant, more than one distinct
+//! default, a surviving `goto` into the label from outside the tree — leaves the
+//! function untouched.
+
+use crate::ir::ast::{Expr, Function, OriginSet, Stmt};
+use crate::ir::types::{BinOp, CmpOp, VReg};
+
+/// Fewer arms than this stay nested `if`/`else`. Two or three equality tests read
+/// as what they are in the source, and are not what blows up the graph distance.
+const MIN_CASES: usize = 4;
+
+/// Rewrite every comparison ladder in `f` as a `switch`.
+pub fn recover_switches(f: &mut Function) {
+    recover_top_level_goto_switches(&mut f.body);
+    rewrite_body(&mut f.body);
+    // A label is only dropped once nothing references it any more.
+    let live = goto_targets(&f.body);
+    prune_labels(&mut f.body, &live);
+}
+
+/// Replace case-local gotos to an immediately following switch join with
+/// source-level `break` after every other semantic AST pass has finished.
+///
+/// Running this at the final semantic boundary matters: an earlier `Break` can
+/// change how copy and fallthrough passes reason about neighbouring cases even
+/// though the rendered C is equivalent. The adjacency proof also matters. If
+/// any effect lies between the switch and label, a `break` would execute it
+/// while the original goto skipped it, so that shape is left untouched.
+pub fn recover_existing_switch_join_breaks(f: &mut Function) {
+    recover_existing_switch_join_breaks_body(&mut f.body);
+}
+
+fn recover_existing_switch_join_breaks_body(body: &mut [Stmt]) {
+    for statement in body.iter_mut() {
+        match statement.semantic_mut() {
+            Stmt::Origin { .. } => unreachable!("semantic statement cannot be an origin wrapper"),
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                recover_existing_switch_join_breaks_body(then_body);
+                if let Some(else_body) = else_body {
+                    recover_existing_switch_join_breaks_body(else_body);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+                recover_existing_switch_join_breaks_body(body)
+            }
+            Stmt::For {
+                init, step, body, ..
+            } => {
+                recover_existing_switch_join_breaks_body(std::slice::from_mut(init.as_mut()));
+                recover_existing_switch_join_breaks_body(body);
+                recover_existing_switch_join_breaks_body(std::slice::from_mut(step.as_mut()));
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for (_, case_body) in cases {
+                    recover_existing_switch_join_breaks_body(case_body);
+                }
+                if let Some(default_body) = default {
+                    recover_existing_switch_join_breaks_body(default_body);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for index in 0..body.len().saturating_sub(1) {
+        let (prefix, suffix) = body.split_at_mut(index + 1);
+        let Some(Stmt::Label(join)) = suffix.first().map(Stmt::semantic) else {
+            continue;
+        };
+        let join = *join;
+        let Stmt::Switch { cases, default, .. } = prefix[index].semantic_mut() else {
+            continue;
+        };
+        for (_, case_body) in cases {
+            replace_join_gotos(case_body, join);
+            drop_renderer_supplied_break(case_body);
+        }
+        if let Some(default_body) = default {
+            replace_join_gotos(default_body, join);
+            drop_renderer_supplied_break(default_body);
+        }
+    }
+}
+
+/// Recover the other form produced when region structuring cannot nest GCC's
+/// comparisons: a linear run of guarded gotos followed by labelled case bodies.
+///
+/// This is not a generic "labels look like cases" heuristic.  The dispatch must
+/// prove the same range/equality partition as [`try_ladder`], every case label
+/// must have exactly one incoming goto (the dispatch edge), and each carved case
+/// body must end in an unconditional transfer.  Those conditions make moving
+/// the bodies under a `Switch` control-flow preserving.
+///
+/// Only the function's top-level statement list is eligible. For a nested list,
+/// an incoming goto may live in an enclosing list and would be invisible to the
+/// exact-reference proof below; declining that shape is safer than guessing.
+fn recover_top_level_goto_switches(body: &mut Vec<Stmt>) {
+    while recover_one_goto_switch(body) {}
+}
+
+#[derive(Clone)]
+struct GotoCase {
+    value: i64,
+    label: u64,
+}
+
+struct GotoDispatch {
+    discriminant: VReg,
+    end: usize,
+    cases: Vec<GotoCase>,
+    /// GCC may leave the final singleton case directly after the decision
+    /// tree instead of jumping to a label.  The value is proven by the false
+    /// edge of an exact `discriminant != constant` partition.
+    inline_case: Option<i64>,
+    join: u64,
+}
+
+fn recover_one_goto_switch(body: &mut Vec<Stmt>) -> bool {
+    for start in 0..body.len() {
+        let Some(dispatch) = parse_goto_dispatch(body, start) else {
+            continue;
+        };
+        let Some(join_position) = unique_label_position(body, dispatch.join) else {
+            continue;
+        };
+        if join_position < dispatch.end {
+            continue;
+        }
+
+        let mut positioned = Vec::with_capacity(dispatch.cases.len());
+        let mut valid = true;
+        for case in &dispatch.cases {
+            let Some(position) = unique_label_position(body, case.label) else {
+                valid = false;
+                break;
+            };
+            if position < dispatch.end
+                || position >= join_position
+                || count_gotos_body(body, case.label) != 1
+            {
+                valid = false;
+                break;
+            }
+            positioned.push((position, case.clone()));
+        }
+        if !valid {
+            continue;
+        }
+        positioned.sort_by_key(|(position, _)| *position);
+        if positioned.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            continue;
+        }
+        let Some((first_case_position, _)) = positioned.first() else {
+            continue;
+        };
+        let inline_body = body[dispatch.end..*first_case_position].to_vec();
+        let mut cases =
+            Vec::with_capacity(positioned.len() + usize::from(dispatch.inline_case.is_some()));
+        if let Some(value) = dispatch.inline_case {
+            if inline_body
+                .iter()
+                .any(|statement| matches!(statement.semantic(), Stmt::Label(_)))
+                || !ends_in_unconditional_transfer(&inline_body)
+            {
+                continue;
+            }
+            let mut inline_body = inline_body;
+            replace_join_gotos(&mut inline_body, dispatch.join);
+            drop_renderer_supplied_break(&mut inline_body);
+            cases.push((Some(value), inline_body));
+        } else if inline_body
+            .iter()
+            .any(|statement| !matches!(statement.semantic(), Stmt::Nop | Stmt::Comment(_)))
+        {
+            continue;
+        }
+
+        for (case_index, (position, case)) in positioned.iter().enumerate() {
+            let next_position = positioned
+                .get(case_index + 1)
+                .map(|(next, _)| *next)
+                .unwrap_or(join_position);
+            let mut case_body = body[position + 1..next_position].to_vec();
+            if !ends_in_unconditional_transfer(&case_body) {
+                valid = false;
+                break;
+            }
+            replace_join_gotos(&mut case_body, dispatch.join);
+            drop_renderer_supplied_break(&mut case_body);
+            cases.push((Some(case.value), case_body));
+        }
+        if !valid {
+            continue;
+        }
+        // Source case order is the clearest stable spelling; dispatch-tree order
+        // is an implementation detail of GCC's binary search.
+        cases.sort_by_key(|(value, _)| *value);
+        let origins = statements_origins(&body[start..=join_position]);
+        let switch = Stmt::Switch {
+            discriminant: Expr::Reg(dispatch.discriminant),
+            cases,
+            default: None,
+        }
+        .with_optional_origins(origins);
+        body.splice(start..join_position, std::iter::once(switch));
+        return true;
+    }
+    false
+}
+
+fn parse_goto_dispatch(body: &[Stmt], start: usize) -> Option<GotoDispatch> {
+    let mut discriminant = None;
+    let mut cases = Vec::new();
+    let mut inline_case = None;
+    let mut join = None;
+    let mut reachable = Range::full();
+    let mut index = start;
+
+    loop {
+        match body.get(index)?.semantic() {
+            Stmt::Origin { .. } => unreachable!("semantic statement cannot be an origin wrapper"),
+            Stmt::If {
+                cond,
+                then_body,
+                else_body: None,
+            } => {
+                let Some(target) = sole_goto(then_body) else {
+                    let value = inequality_on_reg(cond, &mut discriminant)?;
+                    if inline_case.is_some()
+                        || !reachable.contains(value)
+                        || cases.iter().any(|case: &GotoCase| case.value == value)
+                    {
+                        return None;
+                    }
+                    let nested_join =
+                        parse_non_equal_partition(then_body, &mut discriminant, value, &mut cases)?;
+                    if join.is_some_and(|seen| seen != nested_join) {
+                        return None;
+                    }
+                    join = Some(nested_join);
+                    inline_case = Some(value);
+                    index += 1;
+                    break;
+                };
+                match classify(cond, &mut discriminant)? {
+                    Test::Case(value) => {
+                        if !reachable.contains(value)
+                            || cases
+                                .iter()
+                                .any(|case: &GotoCase| case.value == value || case.label == target)
+                        {
+                            return None;
+                        }
+                        cases.push(GotoCase {
+                            value,
+                            label: target,
+                        });
+                    }
+                    Test::Prune(bound) => {
+                        if join.is_some_and(|seen| seen != target) {
+                            return None;
+                        }
+                        join = Some(target);
+                        reachable.narrow(&bound);
+                    }
+                }
+                index += 1;
+            }
+            Stmt::Goto { target } => {
+                if join.is_some_and(|seen| seen != *target) {
+                    return None;
+                }
+                join = Some(*target);
+                index += 1;
+                break;
+            }
+            _ => return None,
+        }
+    }
+
+    if cases.len() + usize::from(inline_case.is_some()) < MIN_CASES
+        || cases.iter().any(|case| Some(case.label) == join)
+    {
+        return None;
+    }
+    Some(GotoDispatch {
+        discriminant: discriminant?,
+        end: index,
+        cases,
+        inline_case,
+        join: join?,
+    })
+}
+
+/// Parse the taken arm of `discriminant != inline_value`.
+///
+/// Every nested equality names one labelled case and the final goto is the
+/// common default/join.  No relational test or executable statement is
+/// accepted here: the false edge is used as an implicit inline case, so the
+/// taken edge must account for every other value without side effects.
+fn parse_non_equal_partition(
+    body: &[Stmt],
+    discriminant: &mut Option<VReg>,
+    inline_value: i64,
+    cases: &mut Vec<GotoCase>,
+) -> Option<u64> {
+    let (last, prefix) = body.split_last()?;
+    let Stmt::Goto { target: join } = last.semantic() else {
+        return None;
+    };
+    if prefix.is_empty() {
+        return None;
+    }
+    for statement in prefix {
+        let Stmt::If {
+            cond,
+            then_body,
+            else_body: None,
+        } = statement.semantic()
+        else {
+            return None;
+        };
+        let target = sole_goto(then_body)?;
+        let Test::Case(value) = classify(cond, discriminant)? else {
+            return None;
+        };
+        if value == inline_value
+            || cases
+                .iter()
+                .any(|case| case.value == value || case.label == target)
+        {
+            return None;
+        }
+        cases.push(GotoCase {
+            value,
+            label: target,
+        });
+    }
+    Some(*join)
+}
+
+fn unique_label_position(body: &[Stmt], target: u64) -> Option<usize> {
+    let mut positions = body.iter().enumerate().filter_map(|(index, statement)| {
+        matches!(statement.semantic(), Stmt::Label(label) if *label == target).then_some(index)
+    });
+    let position = positions.next()?;
+    positions.next().is_none().then_some(position)
+}
+
+fn count_gotos_body(body: &[Stmt], target: u64) -> usize {
+    body.iter()
+        .map(|statement| count_gotos_stmt(statement, target))
+        .sum()
+}
+
+fn count_gotos_stmt(statement: &Stmt, target: u64) -> usize {
+    match statement.semantic() {
+        Stmt::Origin { .. } => unreachable!("semantic statement cannot be an origin wrapper"),
+        Stmt::Goto { target: seen } => usize::from(*seen == target),
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            count_gotos_body(then_body, target)
+                + else_body
+                    .as_deref()
+                    .map(|body| count_gotos_body(body, target))
+                    .unwrap_or(0)
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => {
+            count_gotos_body(body, target)
+        }
+        Stmt::Switch { cases, default, .. } => {
+            cases
+                .iter()
+                .map(|(_, body)| count_gotos_body(body, target))
+                .sum::<usize>()
+                + default
+                    .as_deref()
+                    .map(|body| count_gotos_body(body, target))
+                    .unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
+fn ends_in_unconditional_transfer(body: &[Stmt]) -> bool {
+    body.iter()
+        .rev()
+        .find(|statement| {
+            !matches!(
+                statement.semantic(),
+                Stmt::Nop | Stmt::Comment(_) | Stmt::Label(_)
+            )
+        })
+        .is_some_and(|statement| {
+            matches!(
+                statement.semantic(),
+                Stmt::Goto { .. } | Stmt::IndirectGoto { .. } | Stmt::Return { .. } | Stmt::Break
+            )
+        })
+}
+
+/// A join goto directly inside a case (possibly under an `if`) is the source
+/// `break`. Do not descend through a nested loop/switch: there the same goto may
+/// intentionally escape a different control construct and must remain explicit.
+fn replace_join_gotos(body: &mut [Stmt], join: u64) {
+    for statement in body {
+        if matches!(statement.semantic(), Stmt::Goto { target } if *target == join) {
+            let origins = statement.origins().cloned();
+            *statement = Stmt::Break.with_optional_origins(origins);
+            continue;
+        }
+        match statement.semantic_mut() {
+            Stmt::Origin { .. } => unreachable!("semantic statement cannot be an origin wrapper"),
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                replace_join_gotos(then_body, join);
+                if let Some(else_body) = else_body {
+                    replace_join_gotos(else_body, join);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The C renderer appends the ordinary case-ending `break` itself. Keep breaks
+/// under an internal conditional, but remove the redundant terminal one created
+/// from the case's unconditional join edge.
+fn drop_renderer_supplied_break(body: &mut Vec<Stmt>) {
+    let Some(position) = body
+        .iter()
+        .rposition(|statement| !matches!(statement.semantic(), Stmt::Nop | Stmt::Comment(_)))
+    else {
+        return;
+    };
+    if matches!(body[position].semantic(), Stmt::Break) {
+        body.remove(position);
+    }
+}
+
+/// Rewrite OUTSIDE-IN: try the widest ladder rooted at each statement before
+/// looking inside it.
+///
+/// Inside-out is wrong here, and quietly so. Every suffix of a ladder is itself a
+/// ladder, so recursing first lets the subtree below `case 7` match on its own —
+/// producing a `switch` over cases 0..6 nested in an `if (v == 7)`, which is a
+/// partial recovery that is worse than either whole answer. Matching the root
+/// first takes the longest chain; the arms are then rewritten in turn, so a
+/// genuinely nested ladder inside a case body is still found.
+fn rewrite_body(body: &mut [Stmt]) {
+    for index in 0..body.len() {
+        let replacement = {
+            let (prefix, suffix) = body.split_at(index + 1);
+            try_ladder(&prefix[index], suffix)
+        };
+        if let Some(sw) = replacement {
+            body[index] = sw;
+        }
+        rewrite_stmt(&mut body[index]);
+    }
+}
+
+fn rewrite_stmt(s: &mut Stmt) {
+    match s.semantic_mut() {
+        Stmt::Origin { .. } => unreachable!("semantic statement cannot be an origin wrapper"),
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            rewrite_body(then_body);
+            if let Some(b) = else_body {
+                rewrite_body(b);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => rewrite_body(body),
+        Stmt::For {
+            init, step, body, ..
+        } => {
+            rewrite_body(std::slice::from_mut(init.as_mut()));
+            rewrite_body(body);
+            rewrite_body(std::slice::from_mut(step.as_mut()));
+        }
+        Stmt::Switch { cases, default, .. } => {
+            for (_, b) in cases.iter_mut() {
+                rewrite_body(b);
+            }
+            if let Some(b) = default {
+                rewrite_body(b);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What a single test in the ladder says about the discriminant.
+enum Test {
+    /// `v == c` — the `then` arm is case `c`.
+    Case(i64),
+    /// A relational test whose `then` arm is a route to the default. The payload
+    /// is what taking the `else` arm proves about the discriminant: an inclusive
+    /// bound that narrows the range still reachable further down the ladder.
+    Prune(Bound),
+}
+
+/// What the `else` arm of a prune proves: the discriminant is at most, or at
+/// least, this value.
+enum Bound {
+    AtMost(i64),
+    AtLeast(i64),
+}
+
+/// The range of discriminant values still reachable at a point in the walk.
+///
+/// This is what makes the rewrite sound rather than merely plausible. A `switch`
+/// dispatches on equality alone, so it is only equivalent to the tree if every
+/// equality test the tree performs is actually REACHABLE for its constant. A tree
+/// like `if (5 < v) default; else if (v == 7) A7` sends `v == 7` to the default,
+/// while the switch would take `A7`. gcc's binary search never emits that, but
+/// "the compiler would not do that" is not a soundness argument.
+#[derive(Clone, Copy)]
+struct Range {
+    lo: i64,
+    hi: i64,
+}
+
+impl Range {
+    fn full() -> Self {
+        Range {
+            lo: i64::MIN,
+            hi: i64::MAX,
+        }
+    }
+    fn contains(&self, k: i64) -> bool {
+        k >= self.lo && k <= self.hi
+    }
+    /// Narrow by what the `else` arm of a prune proved. Saturating: a bound at the
+    /// extreme of the type cannot be stepped past, and an empty range simply stops
+    /// containing anything.
+    fn narrow(&mut self, b: &Bound) {
+        match b {
+            Bound::AtMost(c) => self.hi = self.hi.min(*c),
+            Bound::AtLeast(c) => self.lo = self.lo.max(*c),
+        }
+    }
+}
+
+/// Classify a condition as a test on `disc`, binding `disc` on the first one.
+///
+/// Only the SIGNED relational forms are accepted. An unsigned prune would need the
+/// range tracked in unsigned space, and mixing the two in one ladder is not a
+/// shape we can reason about — better to leave those trees alone.
+fn classify(cond: &Expr, disc: &mut Option<VReg>) -> Option<Test> {
+    let cond = cond.semantic();
+    // x86 `jg` is reconstructed from flags as `!(ZF || SF^OF)`. Once the flag
+    // expressions are folded, the exact AST is:
+    //
+    //   ((v == k) | ((long)(int)v < k)) == 0
+    //
+    // Both inner nodes are boolean, so this is precisely `v > k`; taking the
+    // else arm therefore proves `v <= k`. Match the whole identity rather than
+    // teaching the ladder walker about machine flags or accepting arbitrary
+    // zero-tests of bitwise expressions.
+    if let Some((v, k)) = lifted_signed_greater(cond) {
+        match disc {
+            Some(seen) if seen != &v => return None,
+            Some(_) => {}
+            None => *disc = Some(v),
+        }
+        return Some(Test::Prune(Bound::AtMost(k)));
+    }
+
+    if let Some((v, k)) = equality_on_reg(cond) {
+        match disc {
+            Some(seen) if seen != v => return None,
+            Some(_) => {}
+            None => *disc = Some(v.clone()),
+        }
+        return Some(Test::Case(k));
+    }
+
+    let Expr::Cmp { op, lhs, rhs } = cond else {
+        return None;
+    };
+    // Exactly one side must be the discriminant and the other a constant, and
+    // which side it is decides the direction of the bound.
+    let (v, k, disc_on_left) = match (lhs.semantic(), rhs.semantic()) {
+        (Expr::Reg(v), Expr::Const(k)) => (v, *k, true),
+        (Expr::Const(k), Expr::Reg(v)) => (v, *k, false),
+        (view, Expr::Const(k)) => (signed_i32_view(view)?, *k, true),
+        (Expr::Const(k), view) => (signed_i32_view(view)?, *k, false),
+        _ => return None,
+    };
+    match disc {
+        Some(seen) if seen != v => return None,
+        Some(_) => {}
+        None => *disc = Some(v.clone()),
+    }
+    match op {
+        CmpOp::Eq => Some(Test::Case(k)),
+        CmpOp::Ne => None, // an inverted test would swap the arms; not this shape
+        // `v < k` taken means default, so not taken proves `v >= k`.
+        CmpOp::Slt if disc_on_left => Some(Test::Prune(Bound::AtLeast(k))),
+        // `k < v` taken means default, so not taken proves `v <= k`.
+        CmpOp::Slt => Some(Test::Prune(Bound::AtMost(k))),
+        // `v <= k` not taken proves `v > k`, i.e. `v >= k+1`.
+        CmpOp::Sle if disc_on_left => Some(Test::Prune(Bound::AtLeast(k.checked_add(1)?))),
+        // `k <= v` not taken proves `v < k`, i.e. `v <= k-1`.
+        CmpOp::Sle => Some(Test::Prune(Bound::AtMost(k.checked_sub(1)?))),
+        CmpOp::Ult | CmpOp::Ule => None,
+    }
+}
+
+/// The exact sign-preserving 32-to-64-bit view emitted for a signed x86
+/// comparison of a 32-bit switch discriminant.
+fn signed_i32_view(expr: &Expr) -> Option<&VReg> {
+    let Expr::Cast {
+        signed: true,
+        width: 8,
+        expr,
+    } = expr.semantic()
+    else {
+        return None;
+    };
+    let Expr::Cast {
+        signed: true,
+        width: 4,
+        expr,
+    } = expr.semantic()
+    else {
+        return None;
+    };
+    let Expr::Reg(register) = expr.semantic() else {
+        return None;
+    };
+    Some(register)
+}
+
+/// The exact zero-extending 32-to-64-bit view used for x86 equality/carry
+/// flags. Equality still compares the same signed switch word; only its
+/// canonical parent representation is unsigned.
+fn unsigned_i32_view(expr: &Expr) -> Option<&VReg> {
+    let Expr::Cast {
+        signed: false,
+        width: 8,
+        expr,
+    } = expr.semantic()
+    else {
+        return None;
+    };
+    let Expr::Cast {
+        signed: false,
+        width: 4,
+        expr,
+    } = expr.semantic()
+    else {
+        return None;
+    };
+    let Expr::Reg(register) = expr.semantic() else {
+        return None;
+    };
+    Some(register)
+}
+
+fn equality_on_reg(expr: &Expr) -> Option<(&VReg, i64)> {
+    let Expr::Cmp {
+        op: CmpOp::Eq,
+        lhs,
+        rhs,
+    } = expr.semantic()
+    else {
+        return None;
+    };
+    match (lhs.semantic(), rhs.semantic()) {
+        (Expr::Reg(register), Expr::Const(value)) | (Expr::Const(value), Expr::Reg(register)) => {
+            Some((register, *value))
+        }
+        (view, Expr::Const(value)) | (Expr::Const(value), view) => {
+            unsigned_i32_view(view).map(|register| (register, i64::from(*value as u32 as i32)))
+        }
+        _ => None,
+    }
+}
+
+/// Bind the discriminant of an exact `v != constant` test and return the
+/// singleton value proven by its false/fallthrough edge.
+fn inequality_on_reg(expr: &Expr, disc: &mut Option<VReg>) -> Option<i64> {
+    let Expr::Cmp {
+        op: CmpOp::Ne,
+        lhs,
+        rhs,
+    } = expr.semantic()
+    else {
+        return None;
+    };
+    let (register, value) = match (lhs.semantic(), rhs.semantic()) {
+        (Expr::Reg(register), Expr::Const(value)) | (Expr::Const(value), Expr::Reg(register)) => {
+            (register, *value)
+        }
+        (view, Expr::Const(value)) | (Expr::Const(value), view) => {
+            (unsigned_i32_view(view)?, i64::from(*value as u32 as i32))
+        }
+        _ => return None,
+    };
+    match disc {
+        Some(seen) if seen != register => None,
+        Some(_) => Some(value),
+        None => {
+            *disc = Some(register.clone());
+            Some(value)
+        }
+    }
+}
+
+fn signed_less_on_same_reg(expr: &Expr, register: &VReg, value: i64) -> bool {
+    let Expr::Cmp {
+        op: CmpOp::Slt,
+        lhs,
+        rhs,
+    } = expr.semantic()
+    else {
+        return false;
+    };
+    matches!(rhs.semantic(), Expr::Const(k) if *k == value)
+        && signed_i32_view(lhs).is_some_and(|seen| seen == register)
+}
+
+fn lifted_signed_greater(cond: &Expr) -> Option<(VReg, i64)> {
+    let Expr::Cmp {
+        op: CmpOp::Eq,
+        lhs,
+        rhs,
+    } = cond.semantic()
+    else {
+        return None;
+    };
+    let inner = match (lhs.semantic(), rhs.semantic()) {
+        (inner, Expr::Const(0)) | (Expr::Const(0), inner) => inner,
+        _ => return None,
+    };
+    let Expr::Bin {
+        op: BinOp::Or,
+        lhs,
+        rhs,
+    } = inner.semantic()
+    else {
+        return None;
+    };
+    for (equality, less) in [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())] {
+        let Some((register, value)) = equality_on_reg(equality) else {
+            continue;
+        };
+        if signed_less_on_same_reg(less, register, value) {
+            return Some((register.clone(), value));
+        }
+    }
+    None
+}
+
+/// The label a body consists of nothing but a jump to, if that is all it is.
+fn sole_goto(body: &[Stmt]) -> Option<u64> {
+    let mut target = None;
+    for s in body {
+        match s.semantic() {
+            Stmt::Origin { .. } => unreachable!("semantic statement cannot be an origin wrapper"),
+            Stmt::Goto { target: t } if target.is_none() => target = Some(*t),
+            Stmt::Nop | Stmt::Comment(_) | Stmt::Label(_) => {}
+            _ => return None,
+        }
+    }
+    target
+}
+
+struct Ladder {
+    disc: VReg,
+    cases: Vec<(i64, Vec<Stmt>)>,
+    default: Vec<Stmt>,
+}
+
+/// Speculatively express a sequential terminal guard as the equivalent nested
+/// `else` continuation expected by the ladder walker.
+///
+/// Region recovery emits both spellings below, depending on whether a shared
+/// return was cloned before or after the surrounding conditional was built:
+///
+/// ```text
+/// if (v > k) return default;
+/// if (v == next) ...
+/// ```
+///
+/// and `if (v > k) return default; else if (v == next) ...` have identical
+/// control flow only when the taken body is proven terminal.  This helper works
+/// on a clone used solely for exact switch matching; a failed match leaves the
+/// original AST untouched.
+fn nest_terminal_guard_continuations(statement: &Stmt) -> Stmt {
+    let Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    } = statement.semantic()
+    else {
+        return statement.clone();
+    };
+    Stmt::If {
+        cond: cond.clone(),
+        then_body: then_body.clone(),
+        else_body: else_body.as_deref().map(nest_terminal_guard_sequence),
+    }
+    .with_optional_origins(statement.origins().cloned())
+}
+
+fn nest_terminal_guard_sequence(body: &[Stmt]) -> Vec<Stmt> {
+    if body.len() > 1 {
+        if let Stmt::If {
+            cond,
+            then_body,
+            else_body: None,
+        } = body[0].semantic()
+        {
+            if ends_in_unconditional_transfer(then_body) {
+                return vec![Stmt::If {
+                    cond: cond.clone(),
+                    then_body: then_body.clone(),
+                    else_body: Some(nest_terminal_guard_sequence(&body[1..])),
+                }
+                .with_optional_origins(body[0].origins().cloned())];
+            }
+        }
+    }
+    body.iter().map(nest_terminal_guard_continuations).collect()
+}
+
+fn try_ladder(s: &Stmt, common_suffix: &[Stmt]) -> Option<Stmt> {
+    let normalized = nest_terminal_guard_continuations(s);
+    let origins = statement_tree_origins(&normalized);
+    let mut disc = None;
+    let mut cases: Vec<(i64, Vec<Stmt>)> = Vec::new();
+    // Bodies reached by a prune arm, keyed by the label they jump to. The first
+    // prune arm holds the default inline and later ones `goto` its label.
+    let mut default: Option<Vec<Stmt>> = None;
+    let mut default_label: Option<u64> = None;
+
+    let mut reachable = Range::full();
+    let mut cur = &normalized;
+    loop {
+        let Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } = cur.semantic()
+        else {
+            // The innermost `else` with no further test on the discriminant is the
+            // default, unless a prune arm already supplied one.
+            let tail = std::slice::from_ref(cur);
+            match (&default, sole_goto(tail)) {
+                (Some(_), Some(l)) if Some(l) == default_label => {}
+                (None, None) => default = Some(tail.to_vec()),
+                (Some(d), None) if default_bodies_equivalent(d, tail, common_suffix) => {}
+                _ => return None,
+            }
+            break;
+        };
+        let test = classify(cond, &mut disc)?;
+        match test {
+            Test::Case(k) => {
+                if cases.iter().any(|(c, _)| *c == k) {
+                    return None; // a repeated constant is not this shape
+                }
+                if !reachable.contains(k) {
+                    // An earlier prune already sent this value to the default, so
+                    // the tree and a `switch` would disagree about it.
+                    return None;
+                }
+                cases.push((k, then_body.clone()));
+            }
+            Test::Prune(bound) => {
+                reachable.narrow(&bound);
+                // Either this arm holds the default inline (with its label), or it
+                // jumps to the label of the one that does.
+                if let Some(l) = sole_goto(then_body) {
+                    match default_label {
+                        Some(seen) if seen == l => {}
+                        Some(_) => return None,
+                        None => return None, // a jump to a label we have not seen
+                    }
+                } else if default
+                    .as_ref()
+                    .is_some_and(|seen| default_bodies_equivalent(seen, then_body, common_suffix))
+                {
+                    // Region recovery may clone a shared terminating default
+                    // epilogue into every range-prune arm.  Exact AST equality
+                    // proves these are still one semantic default; retain the
+                    // first copy and consume the duplicates with the ladder.
+                } else if default.is_none() {
+                    // The label STAYS in the body. Stripping it here would dangle
+                    // any `goto` from outside the tree — the renderer would pin the
+                    // orphan target past the end of the function and control flow
+                    // would be wrong. `prune_labels` drops it at the end iff
+                    // nothing references it any more, which is the same decision
+                    // made with the whole function in view.
+                    default_label = leading_label(then_body);
+                    default = Some(then_body.clone());
+                } else {
+                    return None; // a second, different default
+                }
+            }
+        }
+        // Descend into the `else`; a ladder always continues there.
+        let Some(e) = else_body else { return None };
+        if e.len() != 1 {
+            // The tail is a sequence, not another test: it is the default.
+            match &default {
+                None => default = Some(e.clone()),
+                Some(d) if default_bodies_equivalent(d, e, common_suffix) => {}
+                _ => return None,
+            }
+            break;
+        }
+        cur = &e[0];
+    }
+
+    let l = Ladder {
+        disc: disc?,
+        cases,
+        default: default?,
+    };
+    if l.cases.len() < MIN_CASES {
+        return None;
+    }
+    // `default_label` is not carried out: the label lived inside the tree we are
+    // replacing, and every `goto` to it was a prune arm we just consumed.
+    // `recover_switches` prunes it once nothing references it.
+    Some(
+        Stmt::Switch {
+            discriminant: Expr::Reg(l.disc),
+            cases: l.cases.into_iter().map(|(k, b)| (Some(k), b)).collect(),
+            default: Some(l.default),
+        }
+        .with_optional_origins(origins),
+    )
+}
+
+/// Compare two spellings of one switch default under a proven common return.
+///
+/// Shared-return cloning can produce `ret = -1; return ret;` in range-prune
+/// arms while the final default is `ret = -1;` followed by the ladder's common
+/// `return ret`.  They are equivalent only when the lexical suffix proves that
+/// exact common return; without it this deliberately falls back to exact AST
+/// equality.
+fn default_bodies_equivalent(a: &[Stmt], b: &[Stmt], common_suffix: &[Stmt]) -> bool {
+    if semantic_body_eq(a, b) {
+        return true;
+    }
+    let a_canonical = default_before_common_return(a, common_suffix);
+    let b_canonical = default_before_common_return(b, common_suffix);
+    a_canonical
+        .as_deref()
+        .is_some_and(|canonical| semantic_body_eq(canonical, b))
+        || b_canonical
+            .as_deref()
+            .is_some_and(|canonical| semantic_body_eq(canonical, a))
+        || matches!((a_canonical, b_canonical), (Some(a), Some(b)) if semantic_body_eq(&a, &b))
+}
+
+fn default_before_common_return(body: &[Stmt], common_suffix: &[Stmt]) -> Option<Vec<Stmt>> {
+    let common_result = sole_common_return_reg(common_suffix)?;
+    let return_index = body
+        .iter()
+        .rposition(|statement| !matches!(statement.semantic(), Stmt::Nop | Stmt::Comment(_)))?;
+    let Stmt::Return {
+        value: Some(returned),
+    } = body[return_index].semantic()
+    else {
+        return None;
+    };
+    let assignment_index = body[..return_index]
+        .iter()
+        .rposition(|statement| !matches!(statement.semantic(), Stmt::Nop | Stmt::Comment(_)))?;
+    if body[assignment_index + 1..return_index]
+        .iter()
+        .any(|statement| !is_epilogue_residue(statement))
+    {
+        return None;
+    }
+    let Stmt::Assign { dst, src } = body[assignment_index].semantic() else {
+        return None;
+    };
+    if dst != common_result
+        || (returned != src && expression_root_reg(returned).is_none_or(|reg| reg != dst))
+    {
+        return None;
+    }
+    Some(body[..=assignment_index].to_vec())
+}
+
+fn sole_common_return_reg(body: &[Stmt]) -> Option<&VReg> {
+    let meaningful: Vec<&Stmt> = body
+        .iter()
+        .filter(|statement| !is_epilogue_residue(statement))
+        .collect();
+    let [statement] = meaningful.as_slice() else {
+        return None;
+    };
+    let Stmt::Return { value: Some(value) } = statement.semantic() else {
+        return None;
+    };
+    expression_root_reg(value)
+}
+
+fn is_epilogue_residue(statement: &Stmt) -> bool {
+    matches!(statement.semantic(), Stmt::Nop)
+        || matches!(statement.semantic(), Stmt::Comment(text) if text.contains("epilogue"))
+}
+
+fn expression_root_reg(mut expression: &Expr) -> Option<&VReg> {
+    loop {
+        match expression {
+            Expr::Reg(register) => return Some(register),
+            Expr::Cast { expr, .. } => expression = expr,
+            _ => return None,
+        }
+    }
+}
+
+fn leading_label(body: &[Stmt]) -> Option<u64> {
+    body.iter().find_map(|s| match s.semantic() {
+        Stmt::Label(l) => Some(*l),
+        _ => None,
+    })
+}
+
+fn semantic_body_eq(left: &[Stmt], right: &[Stmt]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.semantic() == right.semantic())
+}
+
+fn statement_tree_origins(statement: &Stmt) -> Option<OriginSet> {
+    fn merge(out: &mut Option<OriginSet>, origins: Option<&OriginSet>) {
+        let Some(origins) = origins else { return };
+        match out {
+            Some(out) => out.merge(origins),
+            None => *out = Some(origins.clone()),
+        }
+    }
+
+    fn walk_expression(expression: &Expr, out: &mut Option<OriginSet>) {
+        merge(out, expression.origins());
+        match expression.semantic() {
+            Expr::Origin { .. } => unreachable!("semantic expression cannot be an origin wrapper"),
+            Expr::FunctionTableEntry { index, .. } | Expr::Deref { addr: index, .. } => {
+                walk_expression(index, out);
+            }
+            Expr::Bin { lhs, rhs, .. } | Expr::Cmp { lhs, rhs, .. } => {
+                walk_expression(lhs, out);
+                walk_expression(rhs, out);
+            }
+            Expr::Un { src, .. }
+            | Expr::Cast { expr: src, .. }
+            | Expr::NumericConvert { expr: src, .. } => walk_expression(src, out),
+            Expr::Call { target, args, .. } => {
+                walk_expression(target, out);
+                for argument in args {
+                    walk_expression(argument, out);
+                }
+            }
+            Expr::Select {
+                cond,
+                if_true,
+                if_false,
+                ..
+            } => {
+                walk_expression(cond, out);
+                walk_expression(if_true, out);
+                walk_expression(if_false, out);
+            }
+            Expr::WideArithmetic { args, .. } => {
+                for argument in args {
+                    walk_expression(argument, out);
+                }
+            }
+            Expr::Reg(_)
+            | Expr::Const(_)
+            | Expr::FloatConst { .. }
+            | Expr::Addr(_)
+            | Expr::Named { .. }
+            | Expr::StringLit { .. }
+            | Expr::StackAddr { .. }
+            | Expr::Lea { .. }
+            | Expr::PdbFieldAddr { .. }
+            | Expr::Unknown(_) => {}
+        }
+    }
+
+    fn walk(statement: &Stmt, out: &mut Option<OriginSet>) {
+        merge(out, statement.origins());
+        match statement.semantic() {
+            Stmt::Origin { .. } => unreachable!("semantic statement cannot be an origin wrapper"),
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                walk_expression(cond, out);
+                for child in then_body {
+                    walk(child, out);
+                }
+                if let Some(else_body) = else_body {
+                    for child in else_body {
+                        walk(child, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut origins = None;
+    walk(statement, &mut origins);
+    origins
+}
+
+fn statements_origins(statements: &[Stmt]) -> Option<OriginSet> {
+    let mut merged: Option<OriginSet> = None;
+    for statement in statements {
+        let Some(origins) = statement_tree_origins(statement) else {
+            continue;
+        };
+        match &mut merged {
+            Some(merged) => merged.merge(&origins),
+            None => merged = Some(origins),
+        }
+    }
+    merged
+}
+
+/// Every label still jumped to anywhere in `body`.
+fn goto_targets(body: &[Stmt]) -> std::collections::BTreeSet<u64> {
+    let mut out = std::collections::BTreeSet::new();
+    fn walk(body: &[Stmt], out: &mut std::collections::BTreeSet<u64>) {
+        for s in body {
+            match s.semantic() {
+                Stmt::Origin { .. } => {
+                    unreachable!("semantic statement cannot be an origin wrapper")
+                }
+                Stmt::Goto { target } => {
+                    out.insert(*target);
+                }
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    walk(then_body, out);
+                    if let Some(b) = else_body {
+                        walk(b, out);
+                    }
+                }
+                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => walk(body, out),
+                Stmt::For {
+                    init, step, body, ..
+                } => {
+                    walk(std::slice::from_ref(init.as_ref()), out);
+                    walk(body, out);
+                    walk(std::slice::from_ref(step.as_ref()), out);
+                }
+                Stmt::Switch { cases, default, .. } => {
+                    for (_, b) in cases {
+                        walk(b, out);
+                    }
+                    if let Some(b) = default {
+                        walk(b, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(body, &mut out);
+    out
+}
+
+/// Drop labels nothing jumps to any more. A `switch` that swallowed a ladder also
+/// swallowed every `goto` into its default arm, and an orphan label left behind
+/// renders as a stray `L_11a9: ;`.
+fn prune_labels(body: &mut Vec<Stmt>, live: &std::collections::BTreeSet<u64>) {
+    body.retain(|s| !matches!(s.semantic(), Stmt::Label(l) if !live.contains(l)));
+    for s in body.iter_mut() {
+        match s.semantic_mut() {
+            Stmt::Origin { .. } => unreachable!("semantic statement cannot be an origin wrapper"),
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                prune_labels(then_body, live);
+                if let Some(b) = else_body {
+                    prune_labels(b, live);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => prune_labels(body, live),
+            Stmt::For { body, .. } => prune_labels(body, live),
+            Stmt::Switch { cases, default, .. } => {
+                for (_, b) in cases.iter_mut() {
+                    prune_labels(b, live);
+                }
+                if let Some(b) = default {
+                    prune_labels(b, live);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::ast::OriginSet;
+    use crate::ir::types::VReg;
+
+    fn reg(n: &str) -> Expr {
+        Expr::Reg(VReg::phys(n))
+    }
+
+    fn cmp(op: CmpOp, l: Expr, r: Expr) -> Expr {
+        Expr::Cmp {
+            op,
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        }
+    }
+
+    fn unsigned_i32(v: &str) -> Expr {
+        Expr::Cast {
+            signed: false,
+            width: 8,
+            expr: Box::new(Expr::Cast {
+                signed: false,
+                width: 4,
+                expr: Box::new(reg(v)),
+            }),
+        }
+    }
+
+    fn assign(dst: &str, k: i64) -> Stmt {
+        Stmt::Assign {
+            dst: VReg::phys(dst),
+            src: Expr::Const(k),
+        }
+    }
+
+    fn attribute_control_tree(statement: &mut Stmt, next: &mut u64) {
+        match statement.semantic_mut() {
+            Stmt::Origin { .. } => unreachable!("semantic statement cannot be an origin wrapper"),
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                for child in then_body {
+                    attribute_control_tree(child, next);
+                }
+                if let Some(else_body) = else_body {
+                    for child in else_body {
+                        attribute_control_tree(child, next);
+                    }
+                }
+                if let Expr::Cmp { lhs, rhs, .. } = cond.semantic_mut() {
+                    for operand in [lhs, rhs] {
+                        let origin = OriginSet::one(*next);
+                        *next += 4;
+                        let owned = std::mem::replace(operand.as_mut(), Expr::Const(0));
+                        **operand = owned.with_origins(origin);
+                    }
+                }
+                let origin = OriginSet::one(*next);
+                *next += 4;
+                let owned = std::mem::replace(cond, Expr::Const(0));
+                *cond = owned.with_origins(origin);
+            }
+            _ => {}
+        }
+        if matches!(
+            statement.semantic(),
+            Stmt::If { .. } | Stmt::Goto { .. } | Stmt::Label(_)
+        ) {
+            let origin = OriginSet::one(*next);
+            *next += 4;
+            let owned = std::mem::replace(statement, Stmt::Nop);
+            *statement = owned.with_origins(origin);
+        }
+    }
+
+    fn collect_origins(statement: &Stmt, out: &mut OriginSet) {
+        if let Some(origins) = statement.origins() {
+            out.merge(origins);
+        }
+        if let Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } = statement.semantic()
+        {
+            if let Some(origins) = cond.origins() {
+                out.merge(origins);
+            }
+            if let Expr::Cmp { lhs, rhs, .. } = cond.semantic() {
+                for operand in [lhs, rhs] {
+                    if let Some(origins) = operand.origins() {
+                        out.merge(origins);
+                    }
+                }
+            }
+            for child in then_body {
+                collect_origins(child, out);
+            }
+            if let Some(else_body) = else_body {
+                for child in else_body {
+                    collect_origins(child, out);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn switch_cleanup_preserves_origin_wrapped_referenced_labels() {
+        let mut function = Function {
+            name: "wrapped_non_switch_goto".into(),
+            entry_va: 0,
+            body: vec![
+                Stmt::If {
+                    cond: reg("condition"),
+                    then_body: vec![
+                        Stmt::Goto { target: 0x1200 }.with_origins(OriginSet::one(0x1100))
+                    ],
+                    else_body: None,
+                }
+                .with_origins(OriginSet::one(0x10f8)),
+                Stmt::Label(0x1200).with_origins(OriginSet::one(0x1200)),
+                Stmt::Return { value: None }.with_origins(OriginSet::one(0x1204)),
+            ],
+        };
+
+        recover_switches(&mut function);
+
+        assert!(function
+            .body
+            .iter()
+            .any(|statement| matches!(statement.semantic(), Stmt::Label(0x1200))));
+    }
+
+    #[test]
+    fn an_attributed_gcc_comparison_ladder_becomes_an_attributed_switch() {
+        let mut ladder = gcc_ladder(8);
+        let mut next = 0x1000;
+        attribute_control_tree(&mut ladder, &mut next);
+        let mut expected = OriginSet::empty();
+        collect_origins(&ladder, &mut expected);
+        let mut function = Function {
+            name: "attributed_ladder".into(),
+            entry_va: 0x1000,
+            body: vec![ladder, Stmt::Return { value: None }],
+        };
+
+        recover_switches(&mut function);
+
+        assert!(matches!(function.body[0].semantic(), Stmt::Switch { .. }));
+        assert_eq!(function.body[0].origins(), Some(&expected));
+    }
+
+    /// gcc -O0's binary-search shape: `== k` alternating with a range prune, the
+    /// first prune holding the default inline behind a label and the rest jumping
+    /// to it.
+    fn gcc_ladder(n: i64) -> Stmt {
+        const L: u64 = 0x11a9;
+        // Innermost first, then wrap outwards.
+        let mut inner = Stmt::Goto { target: L };
+        for k in 0..n {
+            let case = Stmt::If {
+                cond: cmp(CmpOp::Eq, reg("arg0"), Expr::Const(k)),
+                then_body: vec![assign("ret", 100 + k)],
+                else_body: Some(vec![inner]),
+            };
+            let prune_then = if k == n - 1 {
+                vec![Stmt::Label(L), assign("ret", -1)]
+            } else {
+                vec![Stmt::Goto { target: L }]
+            };
+            inner = Stmt::If {
+                cond: cmp(CmpOp::Slt, Expr::Const(k), reg("arg0")),
+                then_body: prune_then,
+                else_body: Some(vec![case]),
+            };
+        }
+        inner
+    }
+
+    /// The order gcc actually emits: the equality test comes FIRST at each level,
+    /// then the range prune. `gcc_ladder` builds the mirror of this; both must be
+    /// recovered, and this is the one that appears in real output.
+    fn gcc_ladder_case_first(n: i64) -> Stmt {
+        const L: u64 = 0x11a9;
+        let mut inner = Stmt::Goto { target: L };
+        for k in 0..n {
+            let prune_then = if k == n - 1 {
+                vec![Stmt::Label(L), assign("ret", -1)]
+            } else {
+                vec![Stmt::Goto { target: L }]
+            };
+            let prune = Stmt::If {
+                cond: cmp(CmpOp::Slt, Expr::Const(k), reg("arg0")),
+                then_body: prune_then,
+                else_body: Some(vec![inner]),
+            };
+            inner = Stmt::If {
+                cond: cmp(CmpOp::Eq, reg("arg0"), Expr::Const(k)),
+                then_body: vec![assign("ret", 100 + k)],
+                else_body: Some(vec![prune]),
+            };
+        }
+        inner
+    }
+
+    /// The x86 `jg` lowering that reaches this AST after flag reconstruction:
+    /// `!(ZF || SF^OF)` becomes `((v == k) | ((long)(int)v < k)) == 0`.
+    fn lifted_signed_greater(v: &str, k: i64) -> Expr {
+        let signed_i32 = Expr::Cast {
+            signed: true,
+            width: 8,
+            expr: Box::new(Expr::Cast {
+                signed: true,
+                width: 4,
+                expr: Box::new(reg(v)),
+            }),
+        };
+        cmp(
+            CmpOp::Eq,
+            Expr::Bin {
+                op: crate::ir::types::BinOp::Or,
+                lhs: Box::new(cmp(CmpOp::Eq, unsigned_i32(v), Expr::Const(k))),
+                rhs: Box::new(cmp(CmpOp::Slt, signed_i32, Expr::Const(k))),
+            },
+            Expr::Const(0),
+        )
+    }
+
+    /// The same signed comparison after typed comparison folding has removed
+    /// the x86 flag identity but retained the exact sign-preserving view.
+    fn typed_signed_greater(v: &str, k: i64) -> Expr {
+        let signed_i32 = Expr::Cast {
+            signed: true,
+            width: 8,
+            expr: Box::new(Expr::Cast {
+                signed: true,
+                width: 4,
+                expr: Box::new(reg(v)),
+            }),
+        };
+        cmp(CmpOp::Slt, Expr::Const(k), signed_i32)
+    }
+
+    fn real_lifted_gcc_ladder(n: i64) -> Stmt {
+        const L: u64 = 0x11a9;
+        let mut inner = Stmt::Goto { target: L };
+        for k in 0..n {
+            let prune_then = if k == n - 1 {
+                vec![Stmt::Label(L), assign("ret", -1)]
+            } else {
+                vec![Stmt::Goto { target: L }]
+            };
+            let prune = Stmt::If {
+                cond: lifted_signed_greater("arg0", k),
+                then_body: prune_then,
+                else_body: Some(vec![inner]),
+            };
+            inner = Stmt::If {
+                cond: cmp(CmpOp::Eq, unsigned_i32("arg0"), Expr::Const(k)),
+                then_body: vec![assign("ret", 100 + k)],
+                else_body: Some(vec![prune]),
+            };
+        }
+        inner
+    }
+
+    /// The same comparison tree after region recovery has cloned the shared
+    /// default return into every range-prune arm.
+    fn real_lifted_gcc_ladder_with_cloned_defaults(n: i64) -> Stmt {
+        let default = vec![
+            assign("ret", -1),
+            Stmt::Return {
+                value: Some(Expr::Const(-1)),
+            },
+        ];
+        let mut inner = default.clone();
+        for k in 0..n {
+            let prune = Stmt::If {
+                cond: lifted_signed_greater("arg0", k),
+                then_body: default.clone(),
+                else_body: Some(inner),
+            };
+            inner = vec![Stmt::If {
+                cond: cmp(CmpOp::Eq, unsigned_i32("arg0"), Expr::Const(k)),
+                then_body: vec![assign("ret", 100 + k)],
+                else_body: Some(vec![prune]),
+            }];
+        }
+        inner.pop().expect("one ladder root")
+    }
+
+    /// Region recovery can also spell each cloned range-prune default as a
+    /// terminal guard followed by the next equality test in the same lexical
+    /// body.  This is control-equivalent to the nested-else form above.
+    fn real_lifted_gcc_ladder_with_linear_cloned_defaults(n: i64) -> Stmt {
+        let default = vec![
+            assign("ret", -1),
+            Stmt::Return {
+                value: Some(Expr::Const(-1)),
+            },
+        ];
+        let mut inner = vec![assign("ret", -1)];
+        for k in 0..n {
+            let prune = Stmt::If {
+                cond: lifted_signed_greater("arg0", k),
+                then_body: default.clone(),
+                else_body: None,
+            };
+            let mut otherwise = vec![prune];
+            otherwise.extend(inner);
+            inner = vec![Stmt::If {
+                cond: cmp(CmpOp::Eq, unsigned_i32("arg0"), Expr::Const(k)),
+                then_body: vec![assign("ret", 100 + k)],
+                else_body: Some(otherwise),
+            }];
+        }
+        inner.pop().expect("one ladder root")
+    }
+
+    fn goto_case(value: i64, label: u64) -> Stmt {
+        Stmt::If {
+            cond: cmp(CmpOp::Eq, unsigned_i32("state"), Expr::Const(value)),
+            then_body: vec![Stmt::Goto { target: label }],
+            else_body: None,
+        }
+    }
+
+    fn linear_goto_dispatch() -> Vec<Stmt> {
+        const JOIN: u64 = 0x200;
+        let mut body = vec![
+            goto_case(3, 0x130),
+            Stmt::If {
+                cond: typed_signed_greater("state", 3),
+                then_body: vec![Stmt::Goto { target: JOIN }],
+                else_body: None,
+            },
+            goto_case(2, 0x120),
+            Stmt::If {
+                cond: typed_signed_greater("state", 2),
+                then_body: vec![Stmt::Goto { target: JOIN }],
+                else_body: None,
+            },
+            goto_case(0, 0x100),
+            goto_case(1, 0x110),
+            Stmt::Goto { target: JOIN },
+        ];
+        for (label, value) in [(0x100, 0), (0x110, 1), (0x120, 2), (0x130, 3)] {
+            body.extend([
+                Stmt::Label(label),
+                assign("ret", value),
+                Stmt::Goto { target: JOIN },
+            ]);
+        }
+        body.extend([Stmt::Label(JOIN), Stmt::Return { value: None }]);
+        body
+    }
+
+    fn linear_goto_dispatch_with_inline_zero() -> Vec<Stmt> {
+        const JOIN: u64 = 0x200;
+        let mut body = vec![
+            goto_case(3, 0x130),
+            Stmt::If {
+                cond: lifted_signed_greater("state", 3),
+                then_body: vec![Stmt::Goto { target: JOIN }],
+                else_body: None,
+            },
+            goto_case(2, 0x120),
+            Stmt::If {
+                cond: lifted_signed_greater("state", 2),
+                then_body: vec![Stmt::Goto { target: JOIN }],
+                else_body: None,
+            },
+            Stmt::If {
+                cond: cmp(CmpOp::Ne, unsigned_i32("state"), Expr::Const(0)),
+                then_body: vec![goto_case(1, 0x110), Stmt::Goto { target: JOIN }],
+                else_body: None,
+            },
+            assign("ret", 0),
+            Stmt::Goto { target: JOIN },
+        ];
+        for (label, value) in [(0x110, 1), (0x120, 2), (0x130, 3)] {
+            body.extend([
+                Stmt::Label(label),
+                assign("ret", value),
+                Stmt::Goto { target: JOIN },
+            ]);
+        }
+        body.extend([Stmt::Label(JOIN), Stmt::Return { value: None }]);
+        body
+    }
+
+    #[test]
+    fn a_linear_goto_dispatch_becomes_a_switch() {
+        let mut f = Function {
+            name: "fsm".into(),
+            entry_va: 0x1000,
+            body: linear_goto_dispatch(),
+        };
+        recover_switches(&mut f);
+
+        let Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } = &f.body[0]
+        else {
+            panic!("expected a switch, got:\n{:#?}", f.body);
+        };
+        assert_eq!(*discriminant, reg("state"));
+        assert_eq!(
+            cases
+                .iter()
+                .filter_map(|(value, _)| *value)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert!(default.is_none());
+        assert!(cases.iter().all(|(_, body)| {
+            !matches!(body.last(), Some(Stmt::Break)) && count_gotos_body(body, 0x200) == 0
+        }));
+    }
+
+    #[test]
+    fn an_attributed_linear_goto_dispatch_becomes_an_attributed_switch() {
+        let mut body = linear_goto_dispatch();
+        let mut next = 0x3000;
+        for statement in &mut body {
+            attribute_control_tree(statement, &mut next);
+        }
+        let mut expected = OriginSet::empty();
+        for statement in &body[..body.len() - 1] {
+            collect_origins(statement, &mut expected);
+        }
+        let mut function = Function {
+            name: "attributed_fsm".into(),
+            entry_va: 0x1000,
+            body,
+        };
+
+        recover_switches(&mut function);
+
+        assert!(matches!(function.body[0].semantic(), Stmt::Switch { .. }));
+        assert_eq!(function.body[0].origins(), Some(&expected));
+    }
+
+    #[test]
+    fn gcc_nested_nonzero_partition_keeps_its_inline_zero_case() {
+        let mut f = Function {
+            name: "fsm".into(),
+            entry_va: 0x1000,
+            body: linear_goto_dispatch_with_inline_zero(),
+        };
+
+        recover_switches(&mut f);
+
+        let Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } = &f.body[0]
+        else {
+            panic!("expected a switch, got:\n{:#?}", f.body);
+        };
+        assert_eq!(*discriminant, reg("state"));
+        assert_eq!(
+            cases
+                .iter()
+                .filter_map(|(value, _)| *value)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert!(default.is_none());
+        assert_eq!(cases[0].1, vec![assign("ret", 0)]);
+        assert!(goto_targets(&f.body).is_empty());
+    }
+
+    #[test]
+    fn nested_nonzero_partition_with_a_second_discriminant_is_refused() {
+        let mut body = linear_goto_dispatch_with_inline_zero();
+        let Stmt::If { then_body, .. } = &mut body[4] else {
+            panic!("expected nested partition");
+        };
+        let Stmt::If { cond, .. } = &mut then_body[0] else {
+            panic!("expected nested equality");
+        };
+        *cond = cmp(CmpOp::Eq, unsigned_i32("other"), Expr::Const(1));
+        let mut f = Function {
+            name: "not_a_switch".into(),
+            entry_va: 0x1000,
+            body,
+        };
+        let before = f.clone();
+
+        recover_switches(&mut f);
+
+        assert_eq!(f, before);
+    }
+
+    #[test]
+    fn an_external_goto_into_a_linear_case_blocks_recovery() {
+        let mut body = linear_goto_dispatch();
+        body.insert(0, Stmt::Goto { target: 0x100 });
+        let mut f = Function {
+            name: "fsm".into(),
+            entry_va: 0x1000,
+            body,
+        };
+        recover_switches(&mut f);
+        assert!(!matches!(f.body.get(1), Some(Stmt::Switch { .. })));
+    }
+
+    #[test]
+    fn a_fallthrough_linear_case_blocks_recovery() {
+        let mut body = linear_goto_dispatch();
+        let case_zero_goto = body
+            .iter()
+            .position(|statement| matches!(statement, Stmt::Label(0x100)))
+            .expect("case zero label")
+            + 2;
+        body.remove(case_zero_goto);
+        let mut f = Function {
+            name: "fsm".into(),
+            entry_va: 0x1000,
+            body,
+        };
+        recover_switches(&mut f);
+        assert!(!matches!(f.body.first(), Some(Stmt::Switch { .. })));
+    }
+
+    #[test]
+    fn the_order_gcc_actually_emits_is_recovered() {
+        let mut f = Function {
+            name: "dispatch".into(),
+            entry_va: 0x1000,
+            body: vec![gcc_ladder_case_first(8), Stmt::Return { value: None }],
+        };
+        recover_switches(&mut f);
+        let Stmt::Switch { cases, default, .. } = &f.body[0] else {
+            panic!("expected a switch, got:\n{:#?}", f.body[0]);
+        };
+        assert_eq!(cases.len(), 8);
+        assert_eq!(default.as_ref().unwrap(), &vec![assign("ret", -1)]);
+        assert!(goto_targets(&f.body).is_empty(), "no goto should survive");
+    }
+
+    #[test]
+    fn the_real_lifted_signed_greater_encoding_is_recovered() {
+        let mut f = Function {
+            name: "dispatch".into(),
+            entry_va: 0x1000,
+            body: vec![real_lifted_gcc_ladder(8), Stmt::Return { value: None }],
+        };
+        recover_switches(&mut f);
+        let Stmt::Switch { cases, default, .. } = &f.body[0] else {
+            panic!(
+                "expected the real lifted comparison tree to become a switch:\n{:#?}",
+                f.body[0]
+            );
+        };
+        assert_eq!(cases.len(), 8);
+        assert_eq!(default.as_ref().unwrap(), &vec![assign("ret", -1)]);
+        assert!(goto_targets(&f.body).is_empty());
+    }
+
+    #[test]
+    fn identical_cloned_default_returns_are_recovered() {
+        let expected_default = vec![
+            assign("ret", -1),
+            Stmt::Return {
+                value: Some(Expr::Const(-1)),
+            },
+        ];
+        let mut f = Function {
+            name: "dispatch".into(),
+            entry_va: 0x1000,
+            body: vec![real_lifted_gcc_ladder_with_cloned_defaults(8)],
+        };
+
+        recover_switches(&mut f);
+
+        let Stmt::Switch { cases, default, .. } = &f.body[0] else {
+            panic!(
+                "expected cloned defaults to remain one switch default:\n{:#?}",
+                f.body[0]
+            );
+        };
+        assert_eq!(cases.len(), 8);
+        assert_eq!(default.as_ref(), Some(&expected_default));
+    }
+
+    #[test]
+    fn linear_terminal_cloned_defaults_are_recovered() {
+        let expected_default = vec![
+            assign("ret", -1),
+            Stmt::Return {
+                value: Some(Expr::Const(-1)),
+            },
+        ];
+        let mut f = Function {
+            name: "dispatch".into(),
+            entry_va: 0x1000,
+            body: vec![
+                real_lifted_gcc_ladder_with_linear_cloned_defaults(8),
+                Stmt::Return {
+                    value: Some(reg("ret")),
+                },
+            ],
+        };
+
+        recover_switches(&mut f);
+
+        let Stmt::Switch { cases, default, .. } = &f.body[0] else {
+            panic!(
+                "expected linear cloned defaults to remain one switch default:\n{:#?}",
+                f.body[0]
+            );
+        };
+        assert_eq!(cases.len(), 8);
+        assert_eq!(default.as_ref(), Some(&expected_default));
+    }
+
+    #[test]
+    fn linear_terminal_defaults_with_a_nontrivial_suffix_are_not_rewritten() {
+        let mut f = Function {
+            name: "dispatch".into(),
+            entry_va: 0x1000,
+            body: vec![
+                real_lifted_gcc_ladder_with_linear_cloned_defaults(8),
+                assign("observable_after_tree", 1),
+                Stmt::Return {
+                    value: Some(reg("ret")),
+                },
+            ],
+        };
+
+        recover_switches(&mut f);
+
+        assert!(
+            !matches!(f.body[0], Stmt::Switch { .. }),
+            "an early-return default cannot be merged with a path that still has work: {:#?}",
+            f.body
+        );
+    }
+
+    #[test]
+    fn a_gcc_comparison_ladder_becomes_a_switch() {
+        let mut f = Function {
+            name: "dispatch".into(),
+            entry_va: 0x1000,
+            body: vec![gcc_ladder(8), Stmt::Return { value: None }],
+        };
+        recover_switches(&mut f);
+        let Stmt::Switch {
+            cases,
+            default,
+            discriminant,
+        } = &f.body[0]
+        else {
+            panic!("expected a switch, got:\n{:#?}", f.body[0]);
+        };
+        assert_eq!(*discriminant, reg("arg0"));
+        assert_eq!(cases.len(), 8, "one case per equality test");
+        let mut ks: Vec<i64> = cases.iter().filter_map(|(k, _)| *k).collect();
+        ks.sort();
+        assert_eq!(ks, (0..8).collect::<Vec<_>>());
+        assert_eq!(default.as_ref().unwrap(), &vec![assign("ret", -1)]);
+    }
+
+    /// The label the prune arms jumped to is consumed with them — an orphan would
+    /// render as a stray `L_11a9: ;`.
+    #[test]
+    fn the_shared_default_label_is_consumed() {
+        let mut f = Function {
+            name: "dispatch".into(),
+            entry_va: 0x1000,
+            body: vec![gcc_ladder(8), Stmt::Return { value: None }],
+        };
+        recover_switches(&mut f);
+        assert!(
+            goto_targets(&f.body).is_empty(),
+            "no goto should survive the rewrite"
+        );
+        fn has_label(body: &[Stmt]) -> bool {
+            body.iter().any(|s| match s {
+                Stmt::Label(_) => true,
+                Stmt::Switch { cases, default, .. } => {
+                    cases.iter().any(|(_, b)| has_label(b))
+                        || default.as_ref().is_some_and(|b| has_label(b))
+                }
+                _ => false,
+            })
+        }
+        assert!(!has_label(&f.body), "the orphaned label must be gone");
+    }
+
+    /// Below the threshold an if/else tree is what the source looks like too.
+    #[test]
+    fn a_short_ladder_is_left_alone() {
+        let mut f = Function {
+            name: "small".into(),
+            entry_va: 0x1000,
+            body: vec![gcc_ladder(2)],
+        };
+        let before = f.clone();
+        recover_switches(&mut f);
+        assert_eq!(f, before);
+    }
+
+    /// Two different values tested in one tree is not a switch.
+    #[test]
+    fn a_tree_testing_two_values_is_not_a_switch() {
+        let mut f = Function {
+            name: "mixed".into(),
+            entry_va: 0x1000,
+            body: vec![Stmt::If {
+                cond: cmp(CmpOp::Eq, reg("arg0"), Expr::Const(1)),
+                then_body: vec![assign("ret", 1)],
+                else_body: Some(vec![Stmt::If {
+                    cond: cmp(CmpOp::Eq, reg("arg1"), Expr::Const(2)),
+                    then_body: vec![assign("ret", 2)],
+                    else_body: Some(vec![Stmt::If {
+                        cond: cmp(CmpOp::Eq, reg("arg0"), Expr::Const(3)),
+                        then_body: vec![assign("ret", 3)],
+                        else_body: Some(vec![Stmt::If {
+                            cond: cmp(CmpOp::Eq, reg("arg0"), Expr::Const(4)),
+                            then_body: vec![assign("ret", 4)],
+                            else_body: Some(vec![assign("ret", -1)]),
+                        }]),
+                    }]),
+                }]),
+            }],
+        };
+        let before = f.clone();
+        recover_switches(&mut f);
+        assert_eq!(f, before, "arg1 in the middle disqualifies the tree");
+    }
+
+    /// A repeated constant means the tree is not a case analysis.
+    #[test]
+    fn a_repeated_constant_is_not_a_switch() {
+        let mut f = Function {
+            name: "dup".into(),
+            entry_va: 0x1000,
+            body: vec![Stmt::If {
+                cond: cmp(CmpOp::Eq, reg("arg0"), Expr::Const(1)),
+                then_body: vec![assign("ret", 1)],
+                else_body: Some(vec![Stmt::If {
+                    cond: cmp(CmpOp::Eq, reg("arg0"), Expr::Const(2)),
+                    then_body: vec![assign("ret", 2)],
+                    else_body: Some(vec![Stmt::If {
+                        cond: cmp(CmpOp::Eq, reg("arg0"), Expr::Const(3)),
+                        then_body: vec![assign("ret", 3)],
+                        else_body: Some(vec![Stmt::If {
+                            cond: cmp(CmpOp::Eq, reg("arg0"), Expr::Const(1)),
+                            then_body: vec![assign("ret", 9)],
+                            else_body: Some(vec![assign("ret", -1)]),
+                        }]),
+                    }]),
+                }]),
+            }],
+        };
+        let before = f.clone();
+        recover_switches(&mut f);
+        assert_eq!(f, before);
+    }
+
+    /// A prune that already excluded a constant makes a later `== that constant`
+    /// UNREACHABLE. A `switch` dispatches on equality alone and would take that
+    /// arm, so the rewrite would change the answer. gcc's binary search never
+    /// emits this; the matcher must not rely on that.
+    #[test]
+    fn an_unreachable_case_blocks_the_rewrite() {
+        const L: u64 = 0x11a9;
+        // if (5 < v) { default } else if (v == 7) { ... } — v == 7 is dead code in
+        // the tree and live in a switch.
+        let mut inner = Stmt::Goto { target: L };
+        for k in [7i64, 3, 2, 1] {
+            inner = Stmt::If {
+                cond: cmp(CmpOp::Eq, reg("arg0"), Expr::Const(k)),
+                then_body: vec![assign("ret", 100 + k)],
+                else_body: Some(vec![inner]),
+            };
+        }
+        let mut f = Function {
+            name: "unreachable".into(),
+            entry_va: 0x1000,
+            body: vec![Stmt::If {
+                cond: cmp(CmpOp::Slt, Expr::Const(5), reg("arg0")),
+                then_body: vec![Stmt::Label(L), assign("ret", -1)],
+                else_body: Some(vec![inner]),
+            }],
+        };
+        let before = f.clone();
+        recover_switches(&mut f);
+        assert_eq!(
+            f, before,
+            "`v == 7` is unreachable under `v <= 5`; a switch would take it"
+        );
+    }
+
+    /// The same tree with every constant inside the pruned range IS a switch —
+    /// the reachability check must not simply reject anything with a prune.
+    #[test]
+    fn cases_inside_the_pruned_range_still_recover() {
+        const L: u64 = 0x11a9;
+        let mut inner = Stmt::Goto { target: L };
+        for k in [4i64, 3, 2, 1] {
+            inner = Stmt::If {
+                cond: cmp(CmpOp::Eq, reg("arg0"), Expr::Const(k)),
+                then_body: vec![assign("ret", 100 + k)],
+                else_body: Some(vec![inner]),
+            };
+        }
+        let mut f = Function {
+            name: "bounded".into(),
+            entry_va: 0x1000,
+            body: vec![Stmt::If {
+                cond: cmp(CmpOp::Slt, Expr::Const(5), reg("arg0")),
+                then_body: vec![Stmt::Label(L), assign("ret", -1)],
+                else_body: Some(vec![inner]),
+            }],
+        };
+        recover_switches(&mut f);
+        let Stmt::Switch { cases, .. } = &f.body[0] else {
+            panic!("expected a switch, got:\n{:#?}", f.body[0]);
+        };
+        assert_eq!(cases.len(), 4);
+    }
+
+    /// An UNSIGNED prune is not reasoned about in signed space, so those trees are
+    /// left alone rather than rewritten on a bound that may not hold.
+    #[test]
+    fn an_unsigned_prune_is_not_rewritten() {
+        const L: u64 = 0x11a9;
+        let mut inner = Stmt::Goto { target: L };
+        for k in [4i64, 3, 2, 1] {
+            inner = Stmt::If {
+                cond: cmp(CmpOp::Eq, reg("arg0"), Expr::Const(k)),
+                then_body: vec![assign("ret", 100 + k)],
+                else_body: Some(vec![inner]),
+            };
+        }
+        let mut f = Function {
+            name: "unsigned_prune".into(),
+            entry_va: 0x1000,
+            body: vec![Stmt::If {
+                cond: cmp(CmpOp::Ult, Expr::Const(5), reg("arg0")),
+                then_body: vec![Stmt::Label(L), assign("ret", -1)],
+                else_body: Some(vec![inner]),
+            }],
+        };
+        let before = f.clone();
+        recover_switches(&mut f);
+        assert_eq!(f, before);
+    }
+
+    /// A `goto` from OUTSIDE the tree into the default arm must keep its target.
+    /// Dropping the label unconditionally would dangle that jump — the renderer
+    /// pins an orphaned target past the end of the function, so it would still
+    /// compile while branching to the wrong place.
+    #[test]
+    fn an_external_jump_into_the_default_arm_keeps_its_label() {
+        const L: u64 = 0x11a9;
+        let mut f = Function {
+            name: "dispatch".into(),
+            entry_va: 0x1000,
+            body: vec![
+                // Something before the ladder jumps straight into its default arm.
+                Stmt::If {
+                    cond: cmp(CmpOp::Eq, reg("arg1"), Expr::Const(0)),
+                    then_body: vec![Stmt::Goto { target: L }],
+                    else_body: None,
+                },
+                gcc_ladder(8),
+                Stmt::Return { value: None },
+            ],
+        };
+        recover_switches(&mut f);
+        let Stmt::Switch { default, .. } = &f.body[1] else {
+            panic!("expected a switch, got:\n{:#?}", f.body[1]);
+        };
+        let d = default.as_ref().expect("a default arm");
+        assert!(
+            d.iter().any(|s| matches!(s, Stmt::Label(l) if *l == L)),
+            "the externally-referenced label must survive inside the default arm:\n{d:#?}"
+        );
+        assert!(
+            goto_targets(&f.body).contains(&L),
+            "the external goto itself must survive"
+        );
+    }
+
+    /// A label that something OUTSIDE the ladder still jumps to must survive.
+    #[test]
+    fn a_label_reached_from_outside_is_kept() {
+        const L: u64 = 0x2000;
+        let mut f = Function {
+            name: "outside".into(),
+            entry_va: 0x1000,
+            body: vec![
+                Stmt::Goto { target: L },
+                Stmt::Label(L),
+                Stmt::Return { value: None },
+            ],
+        };
+        let before = f.clone();
+        recover_switches(&mut f);
+        assert_eq!(f, before, "a live label must not be pruned");
+    }
+
+    /// A ladder nested inside a loop is still recovered.
+    #[test]
+    fn a_ladder_inside_a_loop_is_recovered() {
+        let mut f = Function {
+            name: "looped".into(),
+            entry_va: 0x1000,
+            body: vec![Stmt::While {
+                cond: Expr::Const(1),
+                body: vec![gcc_ladder(8)],
+            }],
+        };
+        recover_switches(&mut f);
+        let Stmt::While { body, .. } = &f.body[0] else {
+            panic!("expected the loop to survive");
+        };
+        assert!(
+            matches!(body[0], Stmt::Switch { .. }),
+            "expected a switch inside the loop, got:\n{:#?}",
+            body[0]
+        );
+    }
+
+    #[test]
+    fn an_existing_switchs_conditional_join_goto_becomes_break_at_the_final_boundary() {
+        const JOIN: u64 = 0x2000;
+        let mut f = Function {
+            name: "joined".into(),
+            entry_va: 0x1000,
+            body: vec![
+                Stmt::Switch {
+                    discriminant: reg("arg0"),
+                    cases: vec![(
+                        Some(0),
+                        vec![Stmt::If {
+                            cond: reg("arg1"),
+                            then_body: vec![Stmt::Goto { target: JOIN }],
+                            else_body: Some(vec![assign("ret", 7)]),
+                        }],
+                    )],
+                    default: None,
+                },
+                Stmt::Label(JOIN),
+                Stmt::Return {
+                    value: Some(reg("ret")),
+                },
+            ],
+        };
+
+        recover_existing_switch_join_breaks(&mut f);
+
+        let Stmt::Switch { cases, .. } = &f.body[0] else {
+            panic!("switch must survive");
+        };
+        let Stmt::If { then_body, .. } = &cases[0].1[0] else {
+            panic!("conditional case must survive");
+        };
+        assert_eq!(then_body, &[Stmt::Break]);
+    }
+
+    #[test]
+    fn an_attributed_switchs_conditional_join_goto_becomes_an_attributed_break() {
+        const JOIN: u64 = 0x2000;
+        let mut f = Function {
+            name: "attributed_joined".into(),
+            entry_va: 0x1000,
+            body: vec![
+                Stmt::Switch {
+                    discriminant: reg("arg0"),
+                    cases: vec![(
+                        Some(0),
+                        vec![Stmt::If {
+                            cond: reg("arg1"),
+                            then_body: vec![
+                                Stmt::Goto { target: JOIN }.with_origins(OriginSet::one(0x1010))
+                            ],
+                            else_body: Some(vec![assign("ret", 7)]),
+                        }
+                        .with_origins(OriginSet::one(0x100c))],
+                    )],
+                    default: None,
+                }
+                .with_origins(OriginSet::one(0x1008)),
+                Stmt::Label(JOIN).with_origins(OriginSet::one(JOIN)),
+                Stmt::Return {
+                    value: Some(reg("ret")),
+                },
+            ],
+        };
+
+        recover_existing_switch_join_breaks(&mut f);
+
+        let Stmt::Switch { cases, .. } = f.body[0].semantic() else {
+            panic!("switch must survive");
+        };
+        let Stmt::If { then_body, .. } = cases[0].1[0].semantic() else {
+            panic!("conditional case must survive");
+        };
+        assert!(matches!(then_body[0].semantic(), Stmt::Break));
+        assert_eq!(
+            then_body[0].origins(),
+            Some(&OriginSet::one(0x1010)),
+            "the break must retain the machine goto that justified it"
+        );
+    }
+
+    #[test]
+    fn an_effect_between_switch_and_label_blocks_join_break_recovery() {
+        const JOIN: u64 = 0x2000;
+        let mut f = Function {
+            name: "not_adjacent".into(),
+            entry_va: 0x1000,
+            body: vec![
+                Stmt::Switch {
+                    discriminant: reg("arg0"),
+                    cases: vec![(Some(0), vec![Stmt::Goto { target: JOIN }])],
+                    default: None,
+                },
+                assign("ret", 9),
+                Stmt::Label(JOIN),
+            ],
+        };
+        let before = f.clone();
+
+        recover_existing_switch_join_breaks(&mut f);
+
+        assert_eq!(f, before, "the goto skips the intervening assignment");
+    }
+
+    #[test]
+    fn a_nested_loop_transfer_is_not_misrendered_as_a_switch_break() {
+        const JOIN: u64 = 0x2000;
+        let mut f = Function {
+            name: "nested".into(),
+            entry_va: 0x1000,
+            body: vec![
+                Stmt::Switch {
+                    discriminant: reg("arg0"),
+                    cases: vec![(
+                        Some(0),
+                        vec![Stmt::While {
+                            cond: Expr::Const(1),
+                            body: vec![Stmt::Goto { target: JOIN }],
+                        }],
+                    )],
+                    default: None,
+                },
+                Stmt::Label(JOIN),
+            ],
+        };
+
+        recover_existing_switch_join_breaks(&mut f);
+
+        let Stmt::Switch { cases, .. } = &f.body[0] else {
+            panic!("switch must survive");
+        };
+        let Stmt::While { body, .. } = &cases[0].1[0] else {
+            panic!("nested loop must survive");
+        };
+        assert_eq!(body, &[Stmt::Goto { target: JOIN }]);
+    }
+}

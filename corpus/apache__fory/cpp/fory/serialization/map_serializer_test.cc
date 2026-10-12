@@ -1,0 +1,1124 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+#include "fory/serialization/fory.h"
+#include <gtest/gtest.h>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <variant>
+#include <vector>
+
+using namespace fory::serialization;
+
+struct ZeroKey {
+  int id{};
+  bool operator<(const ZeroKey &other) const { return id < other.id; }
+};
+
+namespace fory {
+namespace serialization {
+
+template <> struct Serializer<ZeroKey> {
+  static constexpr TypeId type_id = TypeId::EXT;
+
+  static void write_type_info(WriteContext &ctx) {
+    auto type_info = ctx.type_resolver().get_type_info<ZeroKey>();
+    if (!type_info.ok()) {
+      ctx.set_error(std::move(type_info).error());
+      return;
+    }
+    auto result = ctx.write_any_type_info(type_info.value()->type_id,
+                                          std::type_index(typeid(ZeroKey)));
+    if (!result.ok()) {
+      ctx.set_error(std::move(result).error());
+    }
+  }
+
+  static void read_type_info(ReadContext &ctx) {
+    (void)ctx.read_any_type_info(ctx.error());
+  }
+
+  static void write(const ZeroKey &value, WriteContext &ctx, RefMode ref_mode,
+                    bool write_type, bool = false) {
+    write_not_null_ref_flag(ctx, ref_mode);
+    if (write_type) {
+      write_type_info(ctx);
+    }
+    write_data(value, ctx);
+  }
+
+  static void write_data(const ZeroKey &, WriteContext &) {}
+  static void write_data_generic(const ZeroKey &value, WriteContext &ctx,
+                                 bool) {
+    write_data(value, ctx);
+  }
+
+  static ZeroKey read(ReadContext &ctx, RefMode ref_mode, bool read_type) {
+    if (!read_null_only_flag(ctx, ref_mode)) {
+      return {};
+    }
+    if (read_type) {
+      (void)ctx.read_any_type_info(ctx.error());
+    }
+    return {};
+  }
+
+  static ZeroKey read_data(ReadContext &) { return {}; }
+  static ZeroKey read_data_generic(ReadContext &ctx, bool) {
+    return read_data(ctx);
+  }
+  static ZeroKey read_with_type_info(ReadContext &ctx, RefMode ref_mode,
+                                     const TypeInfo &) {
+    return read(ctx, ref_mode, false);
+  }
+};
+
+} // namespace serialization
+} // namespace fory
+
+struct RemoteMapV1 {
+  int32_t value{};
+  int32_t removed{};
+  FORY_STRUCT(RemoteMapV1, value, removed);
+};
+
+struct RemoteMapV2 {
+  int32_t value{};
+  FORY_STRUCT(RemoteMapV2, value);
+};
+
+// Helper function to test roundtrip serialization
+template <typename T> void test_map_roundtrip(const T &original) {
+  // Create Fory instance with default config
+  auto fory = Fory::builder().xlang(true).compatible(false).build();
+
+  // Serialize
+  auto serialize_result = fory.serialize(original);
+  ASSERT_TRUE(serialize_result.ok())
+      << "Serialization failed: " << serialize_result.error().message();
+  auto bytes = serialize_result.value();
+
+  // Deserialize
+  auto deserialize_result = fory.deserialize<T>(bytes.data(), bytes.size());
+  ASSERT_TRUE(deserialize_result.ok())
+      << "Deserialization failed: " << deserialize_result.error().message();
+  auto deserialized = deserialize_result.value();
+
+  // Compare
+  EXPECT_EQ(original, deserialized);
+}
+
+// ============================================================================
+// Basic Map Tests
+// ============================================================================
+
+TEST(MapSerializerTest, EmptyMapRoundtrip) {
+  test_map_roundtrip(std::map<std::string, int32_t>{});
+  test_map_roundtrip(std::unordered_map<std::string, int32_t>{});
+}
+
+TEST(MapSerializerTest, SingleEntryMapRoundtrip) {
+  test_map_roundtrip(std::map<std::string, int32_t>{{"one", 1}});
+  test_map_roundtrip(std::unordered_map<std::string, int32_t>{{"one", 1}});
+}
+
+TEST(MapSerializerTest, SmallMapRoundtrip) {
+  std::map<std::string, int32_t> map{
+      {"one", 1}, {"two", 2}, {"three", 3}, {"four", 4}, {"five", 5}};
+  test_map_roundtrip(map);
+
+  std::unordered_map<std::string, int32_t> umap{
+      {"one", 1}, {"two", 2}, {"three", 3}, {"four", 4}, {"five", 5}};
+  test_map_roundtrip(umap);
+}
+
+TEST(MapSerializerTest, LargeMapRoundtrip) {
+  // Test chunking behavior with more than 255 entries
+  std::map<int32_t, std::string> map;
+  for (int i = 0; i < 300; ++i) {
+    map[i] = "value_" + std::to_string(i);
+  }
+  test_map_roundtrip(map);
+}
+
+TEST(MapSerializerTest, MapIntToStringRoundtrip) {
+  std::map<int32_t, std::string> map{{1, "one"}, {2, "two"}, {3, "three"}};
+  test_map_roundtrip(map);
+}
+
+TEST(MapSerializerTest, MapStringToVectorRoundtrip) {
+  std::map<std::string, std::vector<int32_t>> map{
+      {"first", {1, 2, 3}}, {"second", {4, 5, 6}}, {"third", {7, 8, 9}}};
+  test_map_roundtrip(map);
+}
+
+TEST(MapSerializerTest, NestedMapRoundtrip) {
+  std::map<std::string, std::map<std::string, int32_t>> nested{
+      {"group1", {{"a", 1}, {"b", 2}}}, {"group2", {{"c", 3}, {"d", 4}}}};
+  test_map_roundtrip(nested);
+}
+
+TEST(MapSerializerTest, NestedMapElementRoundtrip) {
+  std::vector<std::map<std::string, int32_t>> ordered{{{"a", 1}, {"b", 2}},
+                                                      {{"c", 3}, {"d", 4}}};
+  test_map_roundtrip(ordered);
+  std::vector<std::unordered_map<std::string, int32_t>> unordered{
+      {{"a", 1}, {"b", 2}}, {{"c", 3}, {"d", 4}}};
+  test_map_roundtrip(unordered);
+}
+
+struct MapsInStruct {
+  std::map<int, std::string> map{};
+  std::unordered_map<std::string, std::string> unordered_map{};
+
+  auto operator==(const MapsInStruct &rhs) const -> bool {
+    return map == rhs.map && unordered_map == rhs.unordered_map;
+  }
+
+  FORY_STRUCT(MapsInStruct, map, unordered_map);
+};
+
+TEST(MapSerializerTest, UnorderedMapInStruct) {
+  MapsInStruct original{};
+  original.map[1] = "1";
+  original.map[2] = "2";
+  original.unordered_map["1"] = "2";
+  original.unordered_map["2"] = "2";
+
+  // Create Fory instance with default config
+  auto fory = Fory::builder().xlang(true).compatible(true).build();
+
+  fory.register_struct<MapsInStruct>(0);
+
+  // Serialize
+  auto serialize_result = fory.serialize(original);
+  ASSERT_TRUE(serialize_result.ok())
+      << "Serialization failed: " << serialize_result.error().message();
+  auto bytes = serialize_result.value();
+
+  // Deserialize
+  auto deserialize_result =
+      fory.deserialize<MapsInStruct>(bytes.data(), bytes.size());
+  ASSERT_TRUE(deserialize_result.ok())
+      << "Deserialization failed: " << deserialize_result.error().message();
+  auto deserialized = deserialize_result.value();
+
+  // Compare
+  EXPECT_EQ(original, deserialized);
+}
+
+// ============================================================================
+// Map with Optional Values (Polymorphic-like behavior)
+// ============================================================================
+
+TEST(MapSerializerTest, MapWithOptionalValues) {
+  // Config with ref tracking enabled for nullability
+  auto fory =
+      Fory::builder().xlang(true).compatible(false).track_ref(true).build();
+
+  std::map<std::string, std::optional<int32_t>> map{
+      {"has_value", 42}, {"no_value", std::nullopt}, {"another_value", 100}};
+
+  // Serialize
+  auto serialize_result = fory.serialize(map);
+  ASSERT_TRUE(serialize_result.ok())
+      << "Serialization error: " << serialize_result.error().to_string();
+  auto bytes = serialize_result.value();
+
+  // Deserialize
+  auto deserialize_result =
+      fory.deserialize<std::map<std::string, std::optional<int32_t>>>(
+          bytes.data(), bytes.size());
+  ASSERT_TRUE(deserialize_result.ok());
+  auto deserialized = deserialize_result.value();
+
+  // Verify
+  ASSERT_EQ(map.size(), deserialized.size());
+  EXPECT_EQ(map["has_value"], deserialized["has_value"]);
+  EXPECT_EQ(map["no_value"], deserialized["no_value"]);
+  EXPECT_EQ(map["another_value"], deserialized["another_value"]);
+}
+
+// ============================================================================
+// Map with Shared Pointers (True Polymorphic References)
+// ============================================================================
+
+TEST(MapSerializerTest, MapWithSharedPtrValues) {
+  // Config with ref tracking enabled
+  auto fory =
+      Fory::builder().xlang(true).compatible(false).track_ref(true).build();
+
+  auto ptr1 = std::make_shared<int32_t>(42);
+  auto ptr2 = std::make_shared<int32_t>(100);
+
+  std::map<std::string, std::shared_ptr<int32_t>> map{
+      {"first", ptr1}, {"second", ptr2}, {"third", ptr1} // ptr1 shared
+  };
+
+  // Serialize
+  auto serialize_result = fory.serialize(map);
+  ASSERT_TRUE(serialize_result.ok());
+  auto bytes = serialize_result.value();
+
+  // Deserialize
+  auto deserialize_result =
+      fory.deserialize<std::map<std::string, std::shared_ptr<int32_t>>>(
+          bytes.data(), bytes.size());
+  ASSERT_TRUE(deserialize_result.ok());
+  auto deserialized = deserialize_result.value();
+
+  // Verify values
+  ASSERT_EQ(map.size(), deserialized.size());
+  EXPECT_EQ(*deserialized["first"], 42);
+  EXPECT_EQ(*deserialized["second"], 100);
+  EXPECT_EQ(*deserialized["third"], 42);
+
+  // Verify reference sharing (they should point to the same object after
+  // deserialization)
+  EXPECT_EQ(deserialized["first"].get(), deserialized["third"].get());
+  EXPECT_NE(deserialized["first"].get(), deserialized["second"].get());
+}
+
+TEST(MapSerializerTest, MapWithNullSharedPtrValues) {
+  // Config with ref tracking enabled
+  auto fory =
+      Fory::builder().xlang(true).compatible(false).track_ref(true).build();
+
+  std::map<std::string, std::shared_ptr<std::string>> map{
+      {"valid", std::make_shared<std::string>("hello")},
+      {"null", nullptr},
+      {"another", std::make_shared<std::string>("world")}};
+
+  // Serialize
+  auto serialize_result = fory.serialize(map);
+  ASSERT_TRUE(serialize_result.ok());
+  auto bytes = serialize_result.value();
+
+  // Deserialize
+  auto deserialize_result =
+      fory.deserialize<std::map<std::string, std::shared_ptr<std::string>>>(
+          bytes.data(), bytes.size());
+  ASSERT_TRUE(deserialize_result.ok());
+  auto deserialized = deserialize_result.value();
+
+  // Verify
+  ASSERT_EQ(map.size(), deserialized.size());
+  ASSERT_NE(deserialized["valid"], nullptr);
+  EXPECT_EQ(*deserialized["valid"], "hello");
+  EXPECT_EQ(deserialized["null"], nullptr);
+  ASSERT_NE(deserialized["another"], nullptr);
+  EXPECT_EQ(*deserialized["another"], "world");
+}
+
+TEST(MapSerializerTest, MapWithCircularReferences) {
+  // This tests that circular references within map values are handled correctly
+  auto fory =
+      Fory::builder().xlang(true).compatible(false).track_ref(true).build();
+
+  auto shared_value = std::make_shared<int32_t>(999);
+
+  std::map<int32_t, std::shared_ptr<int32_t>> map{{1, shared_value},
+                                                  {2, shared_value},
+                                                  {3, shared_value},
+                                                  {4, shared_value}};
+
+  // Serialize
+  auto serialize_result = fory.serialize(map);
+  ASSERT_TRUE(serialize_result.ok());
+  auto bytes = serialize_result.value();
+
+  // Deserialize
+  auto deserialize_result =
+      fory.deserialize<std::map<int32_t, std::shared_ptr<int32_t>>>(
+          bytes.data(), bytes.size());
+  ASSERT_TRUE(deserialize_result.ok());
+  auto deserialized = deserialize_result.value();
+
+  // Verify all point to same object
+  ASSERT_EQ(deserialized.size(), 4u);
+  EXPECT_EQ(*deserialized[1], 999);
+  EXPECT_EQ(deserialized[1].get(), deserialized[2].get());
+  EXPECT_EQ(deserialized[2].get(), deserialized[3].get());
+  EXPECT_EQ(deserialized[3].get(), deserialized[4].get());
+}
+
+TEST(MapSerializerTest, NullChunksPreserveSharedRefs) {
+  auto fory =
+      Fory::builder().xlang(true).compatible(false).track_ref(true).build();
+
+  auto first = std::make_shared<int32_t>(11);
+  auto second = std::make_shared<int32_t>(22);
+  std::map<std::shared_ptr<int32_t>, std::shared_ptr<int32_t>> map;
+  map.emplace(first, nullptr);
+  map.emplace(second, first);
+  map.emplace(nullptr, second);
+
+  auto bytes = fory.serialize(map);
+  ASSERT_TRUE(bytes.ok()) << bytes.error().to_string();
+  auto result = fory.deserialize<
+      std::map<std::shared_ptr<int32_t>, std::shared_ptr<int32_t>>>(
+      bytes->data(), bytes->size());
+  ASSERT_TRUE(result.ok()) << result.error().to_string();
+  ASSERT_EQ(result->size(), 3u);
+
+  std::shared_ptr<int32_t> null_value_key;
+  std::shared_ptr<int32_t> null_key_value;
+  std::shared_ptr<int32_t> pair_key;
+  std::shared_ptr<int32_t> pair_value;
+  for (const auto &[key, value] : *result) {
+    if (!key) {
+      null_key_value = value;
+    } else if (!value) {
+      null_value_key = key;
+    } else {
+      pair_key = key;
+      pair_value = value;
+    }
+  }
+
+  ASSERT_TRUE(null_value_key);
+  ASSERT_TRUE(null_key_value);
+  ASSERT_TRUE(pair_key);
+  ASSERT_TRUE(pair_value);
+  EXPECT_EQ(null_value_key.get(), pair_value.get());
+  EXPECT_EQ(null_key_value.get(), pair_key.get());
+}
+
+TEST(MapSerializerTest, NullSideNestedOwnerPreservesRefs) {
+  auto writer =
+      Fory::builder().xlang(true).compatible(true).track_ref(true).build();
+  auto reader =
+      Fory::builder().xlang(true).compatible(true).track_ref(true).build();
+  using WriterMap = std::map<std::optional<int32_t>, std::shared_ptr<int32_t>>;
+  using ReaderMap =
+      std::map<std::optional<int32_t>, std::optional<std::shared_ptr<int32_t>>>;
+  using WriterRoot = std::tuple<WriterMap, int32_t>;
+  using ReaderRoot = std::tuple<ReaderMap, int32_t>;
+  auto shared = std::make_shared<int32_t>(17);
+  WriterMap original{{std::nullopt, shared}, {1, shared}};
+  auto bytes = writer.serialize(WriterRoot{std::move(original), 11});
+  ASSERT_TRUE(bytes.ok()) << bytes.error().to_string();
+
+  auto decoded = reader.deserialize<ReaderRoot>(*bytes);
+  ASSERT_TRUE(decoded.ok()) << decoded.error().to_string();
+  const ReaderMap &map = std::get<0>(*decoded);
+  ASSERT_EQ(map.size(), 2U);
+  ASSERT_TRUE(map.at(std::nullopt).has_value());
+  ASSERT_TRUE(map.at(1).has_value());
+  ASSERT_TRUE(*map.at(std::nullopt));
+  EXPECT_EQ(**map.at(std::nullopt), 17);
+  EXPECT_EQ(*map.at(std::nullopt), *map.at(1));
+  EXPECT_EQ(std::get<1>(*decoded), 11);
+
+  using WriterKeyMap =
+      std::map<std::shared_ptr<int32_t>, std::shared_ptr<int32_t>>;
+  using ReaderKeyMap = std::map<std::optional<std::shared_ptr<int32_t>>,
+                                std::shared_ptr<int32_t>>;
+  using WriterKeyRoot = std::tuple<WriterKeyMap, int32_t>;
+  using ReaderKeyRoot = std::tuple<ReaderKeyMap, int32_t>;
+  auto first_key = std::make_shared<int32_t>(23);
+  auto second_key = std::make_shared<int32_t>(29);
+  if (second_key < first_key) {
+    std::swap(first_key, second_key);
+  }
+  WriterKeyMap key_original;
+  key_original.emplace(first_key, nullptr);
+  key_original.emplace(second_key, first_key);
+  auto key_bytes = writer.serialize(WriterKeyRoot{std::move(key_original), 13});
+  ASSERT_TRUE(key_bytes.ok()) << key_bytes.error().to_string();
+
+  auto key_decoded = reader.deserialize<ReaderKeyRoot>(*key_bytes);
+  ASSERT_TRUE(key_decoded.ok()) << key_decoded.error().to_string();
+  const ReaderKeyMap &key_map = std::get<0>(*key_decoded);
+  ASSERT_EQ(key_map.size(), 2U);
+  std::shared_ptr<int32_t> null_value_key;
+  std::shared_ptr<int32_t> alias_value;
+  for (const auto &[key, value] : key_map) {
+    ASSERT_TRUE(key.has_value());
+    ASSERT_TRUE(*key);
+    if (value) {
+      alias_value = value;
+    } else {
+      null_value_key = *key;
+    }
+  }
+  ASSERT_TRUE(null_value_key);
+  ASSERT_TRUE(alias_value);
+  EXPECT_EQ(null_value_key, alias_value);
+  EXPECT_EQ(std::get<1>(*key_decoded), 13);
+}
+
+// ============================================================================
+// Protocol Compliance Tests
+// ============================================================================
+
+TEST(MapSerializerTest, ChunkSizeBoundary) {
+  // Test behavior at chunk size boundary (255 entries)
+  std::map<int32_t, int32_t> map;
+  for (int i = 0; i < 255; ++i) {
+    map[i] = i * 2;
+  }
+  test_map_roundtrip(map);
+}
+
+TEST(MapSerializerTest, MultipleChunks) {
+  // Test multiple chunks (256+ entries)
+  std::map<int32_t, int32_t> map;
+  for (int i = 0; i < 512; ++i) {
+    map[i] = i * 2;
+  }
+  test_map_roundtrip(map);
+}
+
+TEST(MapSerializerTest, VerifyChunkedEncoding) {
+  // This test verifies the chunked encoding format
+  auto fory = Fory::builder().xlang(true).compatible(false).build();
+
+  std::map<int32_t, int32_t> map{{1, 10}, {2, 20}, {3, 30}};
+
+  auto serialize_result = fory.serialize(map);
+  ASSERT_TRUE(serialize_result.ok());
+  auto bytes = serialize_result.value();
+
+  // The format should be:
+  // - Header (4 bytes)
+  // - TypeId (1 byte for MAP)
+  // - Map length as varuint32
+  // - Chunk header (1 byte)
+  // - Chunk size (1 byte) = 3
+  // - Type info for key (if needed)
+  // - Type info for value (if needed)
+  // - Key-value pairs (3 pairs)
+
+  // Just verify we can deserialize it back correctly
+  auto deserialize_result =
+      fory.deserialize<std::map<int32_t, int32_t>>(bytes.data(), bytes.size());
+  ASSERT_TRUE(deserialize_result.ok());
+  auto deserialized = deserialize_result.value();
+  EXPECT_EQ(map, deserialized);
+}
+
+TEST(MapSerializerTest, SameTypeUsesRemoteReadBinding) {
+  auto writer =
+      Fory::builder().xlang(true).compatible(true).track_ref(true).build();
+  auto reader =
+      Fory::builder().xlang(true).compatible(true).track_ref(true).build();
+  auto owner_reader =
+      Fory::builder().xlang(true).compatible(true).track_ref(true).build();
+  ASSERT_TRUE(writer.register_struct<RemoteMapV1>("remote", "MapValue").ok());
+  ASSERT_TRUE(reader.register_struct<RemoteMapV2>("remote", "MapValue").ok());
+  ASSERT_TRUE(
+      owner_reader.register_struct<RemoteMapV2>("remote", "MapValue").ok());
+  using WriterMap =
+      std::map<std::optional<int32_t>, std::shared_ptr<RemoteMapV1>>;
+  using ReaderMap = std::map<int32_t, RemoteMapV2>;
+  using WriterRoot = std::tuple<WriterMap, int32_t>;
+  using ReaderRoot = std::tuple<ReaderMap, int32_t>;
+  WriterMap original;
+  original.emplace(std::nullopt,
+                   std::make_shared<RemoteMapV1>(RemoteMapV1{13, 130}));
+  original.emplace(1, std::make_shared<RemoteMapV1>(RemoteMapV1{7, 70}));
+  original.emplace(2, std::make_shared<RemoteMapV1>(RemoteMapV1{9, 90}));
+  auto bytes = writer.serialize(WriterRoot{std::move(original), 11});
+  ASSERT_TRUE(bytes.ok()) << bytes.error().to_string();
+
+  auto values = reader.deserialize<ReaderRoot>(*bytes);
+  ASSERT_TRUE(values.ok()) << values.error().to_string();
+  const ReaderMap &map = std::get<0>(*values);
+  ASSERT_EQ(map.size(), 3U);
+  EXPECT_EQ(map.at(0).value, 13);
+  EXPECT_EQ(map.at(1).value, 7);
+  EXPECT_EQ(map.at(2).value, 9);
+  EXPECT_EQ(std::get<1>(*values), 11);
+
+  using OwnerMap =
+      std::map<std::optional<int32_t>, std::shared_ptr<RemoteMapV2>>;
+  using OwnerRoot = std::tuple<OwnerMap, int32_t>;
+  auto owners = owner_reader.deserialize<OwnerRoot>(*bytes);
+  ASSERT_TRUE(owners.ok()) << owners.error().to_string();
+  const OwnerMap &owner_map = std::get<0>(*owners);
+  ASSERT_EQ(owner_map.size(), 3U);
+  ASSERT_TRUE(owner_map.at(std::nullopt));
+  ASSERT_TRUE(owner_map.at(1));
+  ASSERT_TRUE(owner_map.at(2));
+  EXPECT_EQ(owner_map.at(std::nullopt)->value, 13);
+  EXPECT_EQ(owner_map.at(1)->value, 7);
+  EXPECT_EQ(owner_map.at(2)->value, 9);
+  EXPECT_EQ(std::get<1>(*owners), 11);
+}
+
+// ============================================================================
+// Edge Cases
+// ============================================================================
+
+TEST(MapSerializerTest, MapWithEmptyStringKeys) {
+  std::map<std::string, int32_t> map{{"", 0}, {"a", 1}, {"", 2}};
+  // Note: std::map will only have one entry with key ""
+  test_map_roundtrip(map);
+}
+
+TEST(MapSerializerTest, MapWithDuplicateValues) {
+  std::map<int32_t, std::string> map{
+      {1, "same"}, {2, "same"}, {3, "same"}, {4, "different"}};
+  test_map_roundtrip(map);
+}
+
+TEST(MapSerializerTest, UnorderedMapOrdering) {
+  // Verify that unordered_map serialization/deserialization works
+  // even though iteration order may differ
+  std::unordered_map<int32_t, std::string> map;
+  for (int i = 0; i < 50; ++i) {
+    map[i] = "value_" + std::to_string(i);
+  }
+
+  auto fory = Fory::builder().xlang(true).compatible(false).build();
+
+  auto serialize_result = fory.serialize(map);
+  ASSERT_TRUE(serialize_result.ok());
+  auto bytes = serialize_result.value();
+
+  auto deserialize_result =
+      fory.deserialize<std::unordered_map<int32_t, std::string>>(bytes.data(),
+                                                                 bytes.size());
+  ASSERT_TRUE(deserialize_result.ok());
+  auto deserialized = deserialize_result.value();
+
+  // Compare element by element (order doesn't matter)
+  EXPECT_EQ(map.size(), deserialized.size());
+  for (const auto &[key, value] : map) {
+    EXPECT_EQ(deserialized[key], value);
+  }
+}
+
+// ============================================================================
+// Polymorphic Types Tests - Virtual Base Classes
+// ============================================================================
+
+// Define polymorphic base and derived classes for testing
+namespace polymorphic_test {
+
+// Base class for polymorphic keys
+struct BaseKey {
+  int32_t id = 0;
+
+  BaseKey() = default;
+  explicit BaseKey(int32_t id) : id(id) {}
+  virtual ~BaseKey() = default;
+
+  virtual std::string type_name() const = 0;
+
+  bool operator<(const BaseKey &other) const { return id < other.id; }
+  bool operator==(const BaseKey &other) const {
+    return id == other.id && type_name() == other.type_name();
+  }
+
+  FORY_STRUCT(BaseKey, id);
+};
+
+struct DerivedKeyA : public BaseKey {
+  std::string data;
+
+  DerivedKeyA() = default;
+  DerivedKeyA(int32_t id, std::string data)
+      : BaseKey(id), data(std::move(data)) {}
+
+  std::string type_name() const override { return "DerivedKeyA"; }
+  FORY_STRUCT(DerivedKeyA, FORY_BASE(BaseKey), data);
+};
+
+struct DerivedKeyB : public BaseKey {
+  double value = 0.0;
+
+  DerivedKeyB() = default;
+  DerivedKeyB(int32_t id, double value) : BaseKey(id), value(value) {}
+
+  std::string type_name() const override { return "DerivedKeyB"; }
+  FORY_STRUCT(DerivedKeyB, FORY_BASE(BaseKey), value);
+};
+
+// Base class for polymorphic values
+struct BaseValue {
+  std::string name;
+
+  BaseValue() = default;
+  explicit BaseValue(std::string name) : name(std::move(name)) {}
+  virtual ~BaseValue() = default;
+
+  virtual int32_t get_priority() const = 0;
+  virtual std::string type_name() const = 0;
+
+  bool operator==(const BaseValue &other) const {
+    return name == other.name && get_priority() == other.get_priority() &&
+           type_name() == other.type_name();
+  }
+
+  FORY_STRUCT(BaseValue, name);
+};
+
+struct DerivedValueX : public BaseValue {
+  int32_t priority = 0;
+
+  DerivedValueX() = default;
+  DerivedValueX(std::string name, int32_t priority)
+      : BaseValue(std::move(name)), priority(priority) {}
+
+  int32_t get_priority() const override { return priority; }
+  std::string type_name() const override { return "DerivedValueX"; }
+  FORY_STRUCT(DerivedValueX, FORY_BASE(BaseValue), priority);
+};
+
+struct DerivedValueY : public BaseValue {
+  int32_t priority = 0;
+  std::vector<std::string> tags;
+
+  DerivedValueY() = default;
+  DerivedValueY(std::string name, int32_t priority,
+                std::vector<std::string> tags)
+      : BaseValue(std::move(name)), priority(priority), tags(std::move(tags)) {}
+
+  int32_t get_priority() const override { return priority; }
+  std::string type_name() const override { return "DerivedValueY"; }
+  FORY_STRUCT(DerivedValueY, FORY_BASE(BaseValue), priority, tags);
+};
+
+} // namespace polymorphic_test
+
+// Type IDs for polymorphic types
+constexpr uint32_t DERIVED_KEY_A_TYPE_ID = 1000;
+constexpr uint32_t DERIVED_KEY_B_TYPE_ID = 1001;
+constexpr uint32_t DERIVED_VALUE_X_TYPE_ID = 1002;
+constexpr uint32_t DERIVED_VALUE_Y_TYPE_ID = 1003;
+
+TEST(MapSerializerTest, RejectsUnrelatedPolymorphicValue) {
+  using namespace polymorphic_test;
+
+  for (bool compatible : {false, true}) {
+    SCOPED_TRACE(compatible);
+    auto fory = Fory::builder()
+                    .xlang(true)
+                    .compatible(compatible)
+                    .track_ref(true)
+                    .build();
+    ASSERT_TRUE(fory.register_struct<DerivedKeyA>(DERIVED_KEY_A_TYPE_ID).ok());
+
+    std::map<int32_t, std::shared_ptr<BaseKey>> values;
+    values.emplace(1, std::make_shared<DerivedKeyA>(1, "unrelated"));
+    auto bytes = fory.serialize(values);
+    ASSERT_TRUE(bytes.ok()) << bytes.error().to_string();
+
+    auto rejected =
+        fory.deserialize<std::map<int32_t, std::shared_ptr<BaseValue>>>(
+            bytes->data(), bytes->size());
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.error().code(), fory::ErrorCode::TypeError);
+  }
+}
+
+// Test map with polymorphic value types (most common case)
+TEST(MapSerializerTest, PolymorphicValueTypes) {
+  using namespace polymorphic_test;
+
+  auto fory =
+      Fory::builder().xlang(true).compatible(true).track_ref(true).build();
+
+  // Register concrete derived types for polymorphic serialization
+  ASSERT_TRUE(
+      fory.register_struct<DerivedValueX>(DERIVED_VALUE_X_TYPE_ID).ok());
+  ASSERT_TRUE(
+      fory.register_struct<DerivedValueY>(DERIVED_VALUE_Y_TYPE_ID).ok());
+
+  // Create map with different derived value types
+  std::map<int32_t, std::shared_ptr<BaseValue>> map;
+  map[1] = std::make_shared<DerivedValueX>("first", 10);
+  map[2] = std::make_shared<DerivedValueY>(
+      "second", 20, std::vector<std::string>{"tag1", "tag2"});
+  map[3] = std::make_shared<DerivedValueX>("third", 30);
+
+  // Serialize
+  auto serialize_result = fory.serialize(map);
+  ASSERT_TRUE(serialize_result.ok())
+      << "Serialization failed: " << serialize_result.error().message();
+  auto bytes = serialize_result.value();
+
+  // Deserialize
+  auto deserialize_result =
+      fory.deserialize<std::map<int32_t, std::shared_ptr<BaseValue>>>(
+          bytes.data(), bytes.size());
+  ASSERT_TRUE(deserialize_result.ok())
+      << "Deserialization failed: " << deserialize_result.error().message();
+  auto deserialized = deserialize_result.value();
+
+  // Verify size
+  ASSERT_EQ(map.size(), deserialized.size());
+
+  // Verify first entry (DerivedValueX)
+  ASSERT_NE(deserialized[1], nullptr);
+  EXPECT_EQ(deserialized[1]->name, "first");
+  EXPECT_EQ(deserialized[1]->get_priority(), 10);
+  EXPECT_EQ(deserialized[1]->type_name(), "DerivedValueX");
+
+  // Verify second entry (DerivedValueY)
+  ASSERT_NE(deserialized[2], nullptr);
+  EXPECT_EQ(deserialized[2]->name, "second");
+  EXPECT_EQ(deserialized[2]->get_priority(), 20);
+  EXPECT_EQ(deserialized[2]->type_name(), "DerivedValueY");
+  auto *derived_y = dynamic_cast<DerivedValueY *>(deserialized[2].get());
+  ASSERT_NE(derived_y, nullptr);
+  EXPECT_EQ(derived_y->tags.size(), 2u);
+  EXPECT_EQ(derived_y->tags[0], "tag1");
+  EXPECT_EQ(derived_y->tags[1], "tag2");
+
+  // Verify third entry (DerivedValueX)
+  ASSERT_NE(deserialized[3], nullptr);
+  EXPECT_EQ(deserialized[3]->name, "third");
+  EXPECT_EQ(deserialized[3]->get_priority(), 30);
+  EXPECT_EQ(deserialized[3]->type_name(), "DerivedValueX");
+}
+
+// Test map with polymorphic key types
+TEST(MapSerializerTest, PolymorphicKeyTypes) {
+  using namespace polymorphic_test;
+
+  auto fory =
+      Fory::builder().xlang(true).compatible(true).track_ref(true).build();
+
+  // Register concrete derived types for polymorphic serialization
+  ASSERT_TRUE(fory.register_struct<DerivedKeyA>(DERIVED_KEY_A_TYPE_ID).ok());
+  ASSERT_TRUE(fory.register_struct<DerivedKeyB>(DERIVED_KEY_B_TYPE_ID).ok());
+
+  // Create map with different derived key types
+  std::map<std::shared_ptr<BaseKey>, std::string> map;
+  map[std::make_shared<DerivedKeyA>(1, "key_a")] = "value_a";
+  map[std::make_shared<DerivedKeyB>(2, 3.14)] = "value_b";
+  map[std::make_shared<DerivedKeyA>(3, "key_c")] = "value_c";
+
+  // Serialize
+  auto serialize_result = fory.serialize(map);
+  ASSERT_TRUE(serialize_result.ok())
+      << "Serialization failed: " << serialize_result.error().message();
+  auto bytes = serialize_result.value();
+
+  // Deserialize
+  auto deserialize_result =
+      fory.deserialize<std::map<std::shared_ptr<BaseKey>, std::string>>(
+          bytes.data(), bytes.size());
+  ASSERT_TRUE(deserialize_result.ok())
+      << "Deserialization failed: " << deserialize_result.error().message();
+  auto deserialized = deserialize_result.value();
+
+  // Verify size
+  ASSERT_EQ(map.size(), deserialized.size());
+
+  // Note: Since keys are polymorphic pointers, we need to iterate and verify
+  // content We can't directly index by key like map[key] because pointer
+  // addresses differ
+  std::vector<std::pair<std::shared_ptr<BaseKey>, std::string>> des_vec(
+      deserialized.begin(), deserialized.end());
+
+  ASSERT_EQ(des_vec.size(), 3u);
+
+  // Verify keys are properly deserialized with correct derived types
+  int key_a_count = 0;
+  int key_b_count = 0;
+
+  for (const auto &[key, value] : des_vec) {
+    ASSERT_NE(key, nullptr);
+    if (key->type_name() == "DerivedKeyA") {
+      key_a_count++;
+      auto *derived_a = dynamic_cast<DerivedKeyA *>(key.get());
+      ASSERT_NE(derived_a, nullptr);
+      EXPECT_FALSE(derived_a->data.empty());
+    } else if (key->type_name() == "DerivedKeyB") {
+      key_b_count++;
+      auto *derived_b = dynamic_cast<DerivedKeyB *>(key.get());
+      ASSERT_NE(derived_b, nullptr);
+      EXPECT_EQ(derived_b->value, 3.14);
+    }
+  }
+
+  EXPECT_EQ(key_a_count, 2);
+  EXPECT_EQ(key_b_count, 1);
+}
+
+// Test map with both polymorphic keys and values
+TEST(MapSerializerTest, PolymorphicKeyAndValueTypes) {
+  using namespace polymorphic_test;
+
+  auto fory =
+      Fory::builder().xlang(true).compatible(true).track_ref(true).build();
+
+  // Register concrete derived types for polymorphic serialization
+  ASSERT_TRUE(fory.register_struct<DerivedKeyA>(DERIVED_KEY_A_TYPE_ID).ok());
+  ASSERT_TRUE(fory.register_struct<DerivedKeyB>(DERIVED_KEY_B_TYPE_ID).ok());
+  ASSERT_TRUE(
+      fory.register_struct<DerivedValueX>(DERIVED_VALUE_X_TYPE_ID).ok());
+  ASSERT_TRUE(
+      fory.register_struct<DerivedValueY>(DERIVED_VALUE_Y_TYPE_ID).ok());
+
+  // Create map with polymorphic keys and values
+  std::map<std::shared_ptr<BaseKey>, std::shared_ptr<BaseValue>> map;
+  map[std::make_shared<DerivedKeyA>(1, "alpha")] =
+      std::make_shared<DerivedValueX>("value_x1", 100);
+  map[std::make_shared<DerivedKeyB>(2, 2.71)] = std::make_shared<DerivedValueY>(
+      "value_y1", 200, std::vector<std::string>{"a", "b"});
+  map[std::make_shared<DerivedKeyA>(3, "beta")] =
+      std::make_shared<DerivedValueX>("value_x2", 300);
+
+  // Serialize
+  auto serialize_result = fory.serialize(map);
+  ASSERT_TRUE(serialize_result.ok())
+      << "Serialization failed: " << serialize_result.error().message();
+  auto bytes = serialize_result.value();
+
+  // Deserialize
+  auto deserialize_result = fory.deserialize<
+      std::map<std::shared_ptr<BaseKey>, std::shared_ptr<BaseValue>>>(
+      bytes.data(), bytes.size());
+  ASSERT_TRUE(deserialize_result.ok())
+      << "Deserialization failed: " << deserialize_result.error().message();
+  auto deserialized = deserialize_result.value();
+
+  // Verify size
+  ASSERT_EQ(map.size(), deserialized.size());
+
+  // Verify all entries
+  for (const auto &[key, value] : deserialized) {
+    ASSERT_NE(key, nullptr);
+    ASSERT_NE(value, nullptr);
+
+    // Verify key-value type combinations
+    if (key->type_name() == "DerivedKeyA") {
+      auto *derived_key = dynamic_cast<DerivedKeyA *>(key.get());
+      ASSERT_NE(derived_key, nullptr);
+      EXPECT_FALSE(derived_key->data.empty());
+
+      // DerivedKeyA should map to DerivedValueX in this test
+      EXPECT_EQ(value->type_name(), "DerivedValueX");
+    } else if (key->type_name() == "DerivedKeyB") {
+      auto *derived_key = dynamic_cast<DerivedKeyB *>(key.get());
+      ASSERT_NE(derived_key, nullptr);
+      EXPECT_EQ(derived_key->value, 2.71);
+
+      // DerivedKeyB should map to DerivedValueY in this test
+      EXPECT_EQ(value->type_name(), "DerivedValueY");
+    }
+  }
+}
+
+// Test polymorphic types with null values
+TEST(MapSerializerTest, PolymorphicTypesWithNulls) {
+  using namespace polymorphic_test;
+
+  auto fory =
+      Fory::builder().xlang(true).compatible(true).track_ref(true).build();
+
+  // Register concrete derived types for polymorphic serialization
+  ASSERT_TRUE(
+      fory.register_struct<DerivedValueX>(DERIVED_VALUE_X_TYPE_ID).ok());
+  ASSERT_TRUE(
+      fory.register_struct<DerivedValueY>(DERIVED_VALUE_Y_TYPE_ID).ok());
+
+  // Create map with some null polymorphic values
+  std::map<int32_t, std::shared_ptr<BaseValue>> map;
+  map[1] = std::make_shared<DerivedValueX>("first", 10);
+  map[2] = nullptr; // Null value
+  map[3] = std::make_shared<DerivedValueY>("third", 30,
+                                           std::vector<std::string>{"t1"});
+  map[4] = nullptr; // Another null value
+  map[5] = std::make_shared<DerivedValueX>("fifth", 50);
+
+  // Serialize
+  auto serialize_result = fory.serialize(map);
+  ASSERT_TRUE(serialize_result.ok())
+      << "Serialization failed: " << serialize_result.error().message();
+  auto bytes = serialize_result.value();
+
+  // Deserialize
+  auto deserialize_result =
+      fory.deserialize<std::map<int32_t, std::shared_ptr<BaseValue>>>(
+          bytes.data(), bytes.size());
+  ASSERT_TRUE(deserialize_result.ok())
+      << "Deserialization failed: " << deserialize_result.error().message();
+  auto deserialized = deserialize_result.value();
+
+  // Verify
+  ASSERT_EQ(deserialized.size(), 5u);
+  ASSERT_NE(deserialized[1], nullptr);
+  EXPECT_EQ(deserialized[1]->name, "first");
+  EXPECT_EQ(deserialized[2], nullptr);
+  ASSERT_NE(deserialized[3], nullptr);
+  EXPECT_EQ(deserialized[3]->name, "third");
+  EXPECT_EQ(deserialized[4], nullptr);
+  ASSERT_NE(deserialized[5], nullptr);
+  EXPECT_EQ(deserialized[5]->name, "fifth");
+}
+
+// Test polymorphic types with shared references
+TEST(MapSerializerTest, PolymorphicTypesWithSharedReferences) {
+  using namespace polymorphic_test;
+
+  auto fory =
+      Fory::builder().xlang(true).compatible(true).track_ref(true).build();
+
+  // Register concrete derived types for polymorphic serialization
+  ASSERT_TRUE(
+      fory.register_struct<DerivedValueX>(DERIVED_VALUE_X_TYPE_ID).ok());
+  ASSERT_TRUE(
+      fory.register_struct<DerivedValueY>(DERIVED_VALUE_Y_TYPE_ID).ok());
+
+  // Create shared polymorphic values
+  auto shared_value1 = std::make_shared<DerivedValueX>("shared_x", 999);
+  auto shared_value2 = std::make_shared<DerivedValueY>(
+      "shared_y", 888, std::vector<std::string>{"shared"});
+
+  // Create map with shared references
+  std::map<int32_t, std::shared_ptr<BaseValue>> map;
+  map[1] = shared_value1;
+  map[2] = shared_value2;
+  map[3] = shared_value1; // Same as key 1
+  map[4] = std::make_shared<DerivedValueX>("unique", 777);
+  map[5] = shared_value2; // Same as key 2
+  map[6] = shared_value1; // Same as key 1 and 3
+
+  // Serialize
+  auto serialize_result = fory.serialize(map);
+  ASSERT_TRUE(serialize_result.ok())
+      << "Serialization failed: " << serialize_result.error().message();
+  auto bytes = serialize_result.value();
+
+  // Deserialize
+  auto deserialize_result =
+      fory.deserialize<std::map<int32_t, std::shared_ptr<BaseValue>>>(
+          bytes.data(), bytes.size());
+  ASSERT_TRUE(deserialize_result.ok())
+      << "Deserialization failed: " << deserialize_result.error().message();
+  auto deserialized = deserialize_result.value();
+
+  // Verify size
+  ASSERT_EQ(deserialized.size(), 6u);
+
+  // Verify shared references are preserved
+  // Keys 1, 3, 6 should point to the same object
+  EXPECT_EQ(deserialized[1].get(), deserialized[3].get());
+  EXPECT_EQ(deserialized[1].get(), deserialized[6].get());
+  EXPECT_EQ(deserialized[1]->name, "shared_x");
+  EXPECT_EQ(deserialized[1]->get_priority(), 999);
+
+  // Keys 2, 5 should point to the same object
+  EXPECT_EQ(deserialized[2].get(), deserialized[5].get());
+  EXPECT_EQ(deserialized[2]->name, "shared_y");
+  EXPECT_EQ(deserialized[2]->get_priority(), 888);
+
+  // Key 4 should be unique
+  EXPECT_NE(deserialized[4].get(), deserialized[1].get());
+  EXPECT_NE(deserialized[4].get(), deserialized[2].get());
+  EXPECT_EQ(deserialized[4]->name, "unique");
+  EXPECT_EQ(deserialized[4]->get_priority(), 777);
+}
+
+// Test large map with polymorphic values (tests chunking with polymorphic
+// types)
+TEST(MapSerializerTest, LargeMapWithPolymorphicValues) {
+  using namespace polymorphic_test;
+
+  auto fory =
+      Fory::builder().xlang(true).compatible(true).track_ref(true).build();
+
+  // Register concrete derived types for polymorphic serialization
+  ASSERT_TRUE(
+      fory.register_struct<DerivedValueX>(DERIVED_VALUE_X_TYPE_ID).ok());
+  ASSERT_TRUE(
+      fory.register_struct<DerivedValueY>(DERIVED_VALUE_Y_TYPE_ID).ok());
+
+  // Create a large map with alternating polymorphic types
+  std::map<int32_t, std::shared_ptr<BaseValue>> map;
+  for (int i = 0; i < 300; ++i) {
+    if (i % 2 == 0) {
+      map[i] = std::make_shared<DerivedValueX>("value_x_" + std::to_string(i),
+                                               i * 10);
+    } else {
+      map[i] = std::make_shared<DerivedValueY>(
+          "value_y_" + std::to_string(i), i * 20,
+          std::vector<std::string>{"tag_" + std::to_string(i)});
+    }
+  }
+
+  // Serialize
+  auto serialize_result = fory.serialize(map);
+  ASSERT_TRUE(serialize_result.ok())
+      << "Serialization failed: " << serialize_result.error().message();
+  auto bytes = serialize_result.value();
+
+  // Deserialize
+  auto deserialize_result =
+      fory.deserialize<std::map<int32_t, std::shared_ptr<BaseValue>>>(
+          bytes.data(), bytes.size());
+  ASSERT_TRUE(deserialize_result.ok())
+      << "Deserialization failed: " << deserialize_result.error().message();
+  auto deserialized = deserialize_result.value();
+
+  // Verify
+  ASSERT_EQ(deserialized.size(), 300u);
+
+  // Spot check a few entries
+  ASSERT_NE(deserialized[0], nullptr);
+  EXPECT_EQ(deserialized[0]->type_name(), "DerivedValueX");
+  EXPECT_EQ(deserialized[0]->name, "value_x_0");
+
+  ASSERT_NE(deserialized[1], nullptr);
+  EXPECT_EQ(deserialized[1]->type_name(), "DerivedValueY");
+  EXPECT_EQ(deserialized[1]->name, "value_y_1");
+
+  ASSERT_NE(deserialized[299], nullptr);
+  EXPECT_EQ(deserialized[299]->type_name(), "DerivedValueY");
+  EXPECT_EQ(deserialized[299]->name, "value_y_299");
+}
+
+TEST(MapSerializerTest, UnbackedEntryBudget) {
+  auto fory = Fory::builder()
+                  .xlang(true)
+                  .compatible(false)
+                  .track_ref(false)
+                  .max_unbacked_container_items(3)
+                  .build();
+  ASSERT_TRUE(fory.register_extension_type<ZeroKey>(901).ok());
+
+  std::map<ZeroKey, ZeroKey> values;
+  for (int i = 0; i < 4; ++i) {
+    values.emplace(ZeroKey{i}, ZeroKey{i});
+  }
+  auto bytes = fory.serialize(values);
+  ASSERT_TRUE(bytes.ok()) << bytes.error().to_string();
+  auto rejected = fory.deserialize<std::map<ZeroKey, ZeroKey>>(*bytes);
+  EXPECT_FALSE(rejected.ok());
+
+  values.erase(ZeroKey{3});
+  bytes = fory.serialize(values);
+  ASSERT_TRUE(bytes.ok()) << bytes.error().to_string();
+  auto allowed = fory.deserialize<std::map<ZeroKey, ZeroKey>>(*bytes);
+  EXPECT_TRUE(allowed.ok()) << allowed.error().to_string();
+}
+
+int main(int argc, char **argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

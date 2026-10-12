@@ -1,0 +1,1064 @@
+//! Use-def index over an `LlirFunction`.
+//!
+//! For each LLIR op this module records:
+//! * the VReg it *writes* (the def, if any), and
+//! * the VRegs it *reads* (the uses).
+//!
+//! From those primitive relations it builds two small maps:
+//! * [`UseDefIndex::defs_by_reg`] — for each VReg, every `(block_idx, instr_idx)`
+//!   position where it is written.
+//! * [`UseDefIndex::uses_by_reg`] — for each VReg, every position where it is
+//!   read, annotated with the position of the most recent preceding def within
+//!   the same basic block (intra-block reaching-definitions).
+//!
+//! Scope is intentionally small: v1 handles register-level VRegs only and does
+//! intra-block reaching analysis. Inter-block data flow is left for the SSA
+//! pass (task #17), which naturally lifts this into a dominator-frontier-based
+//! algorithm.
+
+use std::collections::HashMap;
+
+use crate::ir::types::{CallTarget, LlirFunction, MemOp, Op, VReg, Value};
+
+#[derive(Clone, Copy)]
+enum ProvenInputAuthority<'a> {
+    Exact(&'a crate::ir::value_number::ValueIdentities),
+    PlainLlir,
+}
+
+fn same_machine_register(left: &VReg, right: &VReg) -> bool {
+    match (left, right) {
+        (VReg::Phys(left), VReg::Phys(right)) => {
+            let left = crate::ir::abi::ssa_base(left);
+            let right = crate::ir::abi::ssa_base(right);
+            crate::ir::ssa::parent64(left).unwrap_or(left)
+                == crate::ir::ssa::parent64(right).unwrap_or(right)
+        }
+        _ => left == right,
+    }
+}
+
+fn same_machine_register_with_identities(
+    left: &VReg,
+    right: &VReg,
+    authority: ProvenInputAuthority<'_>,
+) -> bool {
+    let identities = match authority {
+        ProvenInputAuthority::Exact(identities) => identities,
+        ProvenInputAuthority::PlainLlir => return same_machine_register(left, right),
+    };
+    let Some(left) = identities.unambiguous_physical_base(left) else {
+        return false;
+    };
+    let Some(right) = identities.unambiguous_physical_base(right) else {
+        return false;
+    };
+    crate::ir::ssa::parent64(left).unwrap_or(left)
+        == crate::ir::ssa::parent64(right).unwrap_or(right)
+}
+
+/// Whether a use reported by [`def_uses`] is positive source-level evidence.
+///
+/// Calls conservatively report every ABI argument register as a may-use so
+/// liveness and DCE cannot delete a real argument setup.  Those may-uses are
+/// not all proof that the caller has corresponding parameters.  A recovered
+/// callee contract records the proven subset separately; exact contracts prove
+/// every listed argument.  Indirect call targets and all non-call operands are
+/// genuine reads.
+pub fn use_is_proven_input(op: &Op, use_index: usize) -> bool {
+    use_is_proven_input_impl(op, use_index, ProvenInputAuthority::PlainLlir)
+}
+
+/// Identity-aware form of [`use_is_proven_input`].
+pub fn use_is_proven_input_with_identities(
+    op: &Op,
+    use_index: usize,
+    identities: &crate::ir::value_number::ValueIdentities,
+) -> bool {
+    use_is_proven_input_impl(op, use_index, ProvenInputAuthority::Exact(identities))
+}
+
+fn use_is_proven_input_impl(
+    op: &Op,
+    use_index: usize,
+    authority: ProvenInputAuthority<'_>,
+) -> bool {
+    let Op::Call { target, effects } = op else {
+        return true;
+    };
+    let target_uses = usize::from(matches!(target, CallTarget::Indirect(Value::Reg(_))));
+    if use_index < target_uses {
+        return true;
+    }
+    let Some(effects) = effects else {
+        return false;
+    };
+    let Some(argument) = effects.args.get(use_index - target_uses) else {
+        return false;
+    };
+    effects.args_are_exact
+        || effects
+            .proven_args
+            .iter()
+            .any(|proven| same_machine_register_with_identities(proven, argument, authority))
+}
+
+/// Address of an op within a function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct InstrAddr {
+    pub block_idx: usize,
+    pub instr_idx: usize,
+}
+
+/// A read with its intra-block reaching def (if any).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Use {
+    /// Where the read happens.
+    pub at: InstrAddr,
+    /// Position of the most recent def of this VReg within the same block,
+    /// or `None` when the value enters the block from outside.
+    pub reaching_def: Option<InstrAddr>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct UseDefIndex {
+    pub defs_by_reg: HashMap<VReg, Vec<InstrAddr>>,
+    pub uses_by_reg: HashMap<VReg, Vec<Use>>,
+}
+
+fn reads_of_value(v: &Value, out: &mut Vec<VReg>) {
+    if let Value::Reg(r) = v {
+        out.push(r.clone());
+    }
+}
+
+fn reads_of_memop(m: &MemOp, out: &mut Vec<VReg>) {
+    if let Some(b) = &m.base {
+        out.push(b.clone());
+    }
+    if let Some(i) = &m.index {
+        out.push(i.clone());
+    }
+}
+
+/// Shared handle to the register an operation defines.
+///
+/// The read-side mirror of [`def_mut`], and the single source of truth for the
+/// `def` half of [`def_uses`]. A borrowing accessor exists because a `VReg` owns
+/// a `String` for the physical-register spelling, so the cloning form allocates
+/// on every call — and the SSA renamer, the bit-demand fixed point and value
+/// numbering all ask this question once per instruction per sweep.
+pub fn def_ref(op: &Op) -> Option<&VReg> {
+    match op {
+        Op::Assign { dst, .. }
+        | Op::Undef { dst, .. }
+        | Op::Bin { dst, .. }
+        | Op::Un { dst, .. }
+        | Op::Cmp { dst, .. }
+        | Op::Load { dst, .. }
+        | Op::CondLoad { dst, .. }
+        | Op::ZExt { dst, .. }
+        | Op::SExt { dst, .. }
+        | Op::Trunc { dst, .. }
+        | Op::Extract { dst, .. }
+        | Op::Concat { dst, .. }
+        | Op::Ite { dst, .. } => Some(dst),
+        Op::Call { effects, .. } => effects.as_ref().and_then(|effects| effects.result.as_ref()),
+        Op::Intrinsic { outs, .. } => outs.first().map(|(register, _)| register),
+        Op::Store { .. }
+        | Op::CondStore { .. }
+        | Op::IndirectJump { .. }
+        | Op::CondJump { .. }
+        | Op::CondReturn { .. }
+        | Op::CondReturnValue { .. }
+        | Op::Jump { .. }
+        | Op::ReturnValue { .. }
+        | Op::Return
+        | Op::Nop
+        | Op::Unknown { .. } => None,
+    }
+}
+
+/// Visit every register an operation reads, in the source order [`def_uses`]
+/// enumerates, borrowing rather than cloning.
+///
+/// This is the definition of that order: [`def_uses`] is written in terms of it,
+/// so a consumer that walks uses without allocating cannot drift from one that
+/// collects them.
+pub fn for_each_use(op: &Op, mut f: impl FnMut(&VReg)) {
+    fn of_value<'a>(v: &'a Value, f: &mut impl FnMut(&'a VReg)) {
+        if let Value::Reg(r) = v {
+            f(r);
+        }
+    }
+    fn of_memop<'a>(m: &'a MemOp, f: &mut impl FnMut(&'a VReg)) {
+        if let Some(b) = &m.base {
+            f(b);
+        }
+        if let Some(i) = &m.index {
+            f(i);
+        }
+    }
+    match op {
+        Op::Assign { src, .. } => of_value(src, &mut f),
+        Op::Undef { .. } => {}
+        Op::Bin { lhs, rhs, .. } => {
+            of_value(lhs, &mut f);
+            of_value(rhs, &mut f);
+        }
+        Op::IndirectJump { target, index } => {
+            of_value(target, &mut f);
+            if let Some(index) = index {
+                of_value(index, &mut f);
+            }
+        }
+        Op::Un { src, .. } => of_value(src, &mut f),
+        Op::Cmp { lhs, rhs, .. } => {
+            of_value(lhs, &mut f);
+            of_value(rhs, &mut f);
+        }
+        Op::Load { addr, .. } => of_memop(addr, &mut f),
+        Op::CondLoad {
+            cond,
+            addr,
+            fallback,
+            ..
+        } => {
+            f(cond);
+            of_memop(addr, &mut f);
+            of_value(fallback, &mut f);
+        }
+        Op::Store { addr, src } => {
+            of_memop(addr, &mut f);
+            of_value(src, &mut f);
+        }
+        Op::CondStore {
+            cond, addr, src, ..
+        } => {
+            f(cond);
+            of_memop(addr, &mut f);
+            of_value(src, &mut f);
+        }
+        Op::CondJump { cond, .. } | Op::CondReturn { cond, .. } => f(cond),
+        Op::CondReturnValue { cond, value, .. } => {
+            f(cond);
+            of_value(value, &mut f);
+        }
+        Op::Call { target, effects } => {
+            if let CallTarget::Indirect(v) = target {
+                of_value(v, &mut f);
+            }
+            if let Some(e) = effects {
+                for argument in &e.args {
+                    f(argument);
+                }
+            }
+        }
+        Op::ReturnValue { value } => of_value(value, &mut f),
+        Op::ZExt { src, .. } | Op::SExt { src, .. } | Op::Trunc { src, .. } => {
+            of_value(src, &mut f)
+        }
+        Op::Extract { src, .. } => of_value(src, &mut f),
+        Op::Concat { hi, lo, .. } => {
+            of_value(hi, &mut f);
+            of_value(lo, &mut f);
+        }
+        Op::Ite { cond, t, e, .. } => {
+            f(cond);
+            of_value(t, &mut f);
+            of_value(e, &mut f);
+        }
+        Op::Intrinsic { ins, .. } => {
+            for v in ins {
+                of_value(v, &mut f);
+            }
+        }
+        Op::Jump { .. } | Op::Return | Op::Nop | Op::Unknown { .. } => {}
+    }
+}
+
+/// How many registers an operation reads — [`for_each_use`] without the values.
+pub fn use_count(op: &Op) -> usize {
+    let mut count = 0;
+    for_each_use(op, |_| count += 1);
+    count
+}
+
+/// Visit every register an operation writes, in the order [`defs_uses`]
+/// enumerates them, borrowing rather than cloning.
+///
+/// [`defs_uses`] is written in terms of this, so the complete def surface has
+/// one definition and a non-allocating walk cannot drift from a collecting one.
+pub fn for_each_def(op: &Op, mut f: impl FnMut(&VReg)) {
+    match op {
+        Op::Intrinsic { outs, .. } => {
+            for (register, _) in outs {
+                f(register);
+            }
+        }
+        _ => {
+            if let Some(definition) = def_ref(op) {
+                f(definition);
+            }
+        }
+    }
+}
+
+/// Return `(def, uses)` for a given op.
+///
+/// `def` is the VReg written (at most one per LLIR op — three-address form).
+/// `uses` lists every VReg read, in source order, possibly with duplicates.
+pub fn def_uses(op: &Op) -> (Option<VReg>, Vec<VReg>) {
+    let mut uses = Vec::new();
+    for_each_use(op, |register| uses.push(register.clone()));
+    (def_ref(op).cloned(), uses)
+}
+
+#[cfg(test)]
+fn def_uses_reference_shapes(op: &Op) -> (Option<VReg>, Vec<VReg>) {
+    let mut uses = Vec::new();
+    let def = match op {
+        Op::Assign { dst, src } => {
+            reads_of_value(src, &mut uses);
+            Some(dst.clone())
+        }
+        Op::Undef { dst, .. } => Some(dst.clone()),
+        Op::Bin { dst, lhs, rhs, .. } => {
+            reads_of_value(lhs, &mut uses);
+            reads_of_value(rhs, &mut uses);
+            Some(dst.clone())
+        }
+        // Reads the computed target, defines nothing. Getting this wrong in the
+        // other direction — as `Op::Call` did — let dead-code elimination believe
+        // the dispatch produced a value, so the index computation was kept alive
+        // only as the argument of a phantom call.
+        Op::IndirectJump { target, index } => {
+            reads_of_value(target, &mut uses);
+            if let Some(index) = index {
+                reads_of_value(index, &mut uses);
+            }
+            None
+        }
+        Op::Un { dst, src, .. } => {
+            reads_of_value(src, &mut uses);
+            Some(dst.clone())
+        }
+        Op::Cmp { dst, lhs, rhs, .. } => {
+            reads_of_value(lhs, &mut uses);
+            reads_of_value(rhs, &mut uses);
+            Some(dst.clone())
+        }
+        Op::Load { dst, addr } => {
+            reads_of_memop(addr, &mut uses);
+            Some(dst.clone())
+        }
+        Op::CondLoad {
+            dst,
+            cond,
+            addr,
+            fallback,
+            ..
+        } => {
+            uses.push(cond.clone());
+            reads_of_memop(addr, &mut uses);
+            reads_of_value(fallback, &mut uses);
+            Some(dst.clone())
+        }
+        Op::Store { addr, src } => {
+            reads_of_memop(addr, &mut uses);
+            reads_of_value(src, &mut uses);
+            None
+        }
+        Op::CondStore {
+            cond, addr, src, ..
+        } => {
+            uses.push(cond.clone());
+            reads_of_memop(addr, &mut uses);
+            reads_of_value(src, &mut uses);
+            None
+        }
+        Op::CondJump { cond, .. } | Op::CondReturn { cond, .. } => {
+            uses.push(cond.clone());
+            None
+        }
+        Op::CondReturnValue { cond, value, .. } => {
+            uses.push(cond.clone());
+            reads_of_value(value, &mut uses);
+            None
+        }
+        Op::Call { target, effects } => {
+            if let CallTarget::Indirect(v) = target {
+                reads_of_value(v, &mut uses);
+            }
+            // A call is an instruction like any other: it defines the ABI's return
+            // register and reads the ABI's argument registers. Reporting nothing (as
+            // this did before `CallEffects` existed) told every consumer that the
+            // return register survived the call, so a post-call read took the
+            // pre-call value, and it made the argument setup look dead — which is why
+            // `fib` used its own argument in place of the returned value.
+            match effects {
+                Some(e) => {
+                    uses.extend(e.args.iter().cloned());
+                    e.result.clone()
+                }
+                // Not annotated (see `abi::annotate_calls`): report what is certain
+                // rather than guessing at an ABI.
+                None => None,
+            }
+        }
+        Op::ReturnValue { value } => {
+            reads_of_value(value, &mut uses);
+            None
+        }
+        Op::ZExt { dst, src, .. }
+        | Op::SExt { dst, src, .. }
+        | Op::Trunc { dst, src, .. }
+        | Op::Extract { dst, src, .. } => {
+            reads_of_value(src, &mut uses);
+            Some(dst.clone())
+        }
+        Op::Concat { dst, hi, lo } => {
+            reads_of_value(hi, &mut uses);
+            reads_of_value(lo, &mut uses);
+            Some(dst.clone())
+        }
+        Op::Ite {
+            dst, cond, t, e, ..
+        } => {
+            uses.push(cond.clone());
+            reads_of_value(t, &mut uses);
+            reads_of_value(e, &mut uses);
+            Some(dst.clone())
+        }
+        Op::Intrinsic { ins, outs, .. } => {
+            for v in ins {
+                reads_of_value(v, &mut uses);
+            }
+            // Three-address def model returns at most one def; report the first
+            // output. TODO(exec-engine): extend for multi-output intrinsics once
+            // the lifter emits them (Phase 0.7 / Phase 2).
+            outs.first().map(|(r, _)| r.clone())
+        }
+        Op::Jump { .. } | Op::Return | Op::Nop | Op::Unknown { .. } => None,
+    };
+    (def, uses)
+}
+
+/// Return every register definition and every register use of an operation.
+///
+/// [`def_uses`] is the compatibility surface for legacy three-address
+/// consumers and therefore exposes only the first definition.  MIR and every
+/// new data-flow consumer must use this complete surface: an intrinsic may
+/// write multiple independent values, and dropping outputs after index zero
+/// makes later reads look like live-ins.
+pub fn defs_uses(op: &Op) -> (Vec<VReg>, Vec<VReg>) {
+    let mut definitions = Vec::new();
+    for_each_def(op, |register| definitions.push(register.clone()));
+    let mut uses = Vec::new();
+    for_each_use(op, |register| uses.push(register.clone()));
+    (definitions, uses)
+}
+
+/// Mutable handle to the register an operation defines.
+///
+/// This is the write-side sibling of [`def_uses`]; keeping the operation-shape
+/// knowledge together prevents IR rewrites from growing a divergent def table.
+pub fn def_mut(op: &mut Op) -> Option<&mut VReg> {
+    match op {
+        Op::Assign { dst, .. }
+        | Op::Undef { dst, .. }
+        | Op::Bin { dst, .. }
+        | Op::Un { dst, .. }
+        | Op::Cmp { dst, .. }
+        | Op::Load { dst, .. }
+        | Op::CondLoad { dst, .. }
+        | Op::ZExt { dst, .. }
+        | Op::SExt { dst, .. }
+        | Op::Trunc { dst, .. }
+        | Op::Extract { dst, .. }
+        | Op::Concat { dst, .. }
+        | Op::Ite { dst, .. } => Some(dst),
+        Op::Call { effects, .. } => effects.as_mut().and_then(|effects| effects.result.as_mut()),
+        Op::Intrinsic { outs, .. } => outs.first_mut().map(|(register, _)| register),
+        Op::Store { .. }
+        | Op::CondStore { .. }
+        | Op::IndirectJump { .. }
+        | Op::CondJump { .. }
+        | Op::CondReturn { .. }
+        | Op::CondReturnValue { .. }
+        | Op::Jump { .. }
+        | Op::ReturnValue { .. }
+        | Op::Return
+        | Op::Nop
+        | Op::Unknown { .. } => None,
+    }
+}
+
+/// Build a use-def index for `lf` performing intra-block reaching-definitions.
+pub fn compute_use_def(lf: &LlirFunction) -> UseDefIndex {
+    let mut idx = UseDefIndex::default();
+
+    for (bi, block) in lf.blocks.iter().enumerate() {
+        // `last_def_in_block` is the reaching-def cursor — we update it as we
+        // walk the block linearly.
+        let mut last_def_in_block: HashMap<VReg, InstrAddr> = HashMap::new();
+
+        for (ii, ins) in block.instrs.iter().enumerate() {
+            let at = InstrAddr {
+                block_idx: bi,
+                instr_idx: ii,
+            };
+            let (def, uses) = def_uses(&ins.op);
+
+            // Record uses before def so a self-reference (x = x + 1) reads the
+            // previous def, not its own write.
+            for u in uses {
+                let reaching_def = last_def_in_block.get(&u).copied();
+                idx.uses_by_reg
+                    .entry(u)
+                    .or_default()
+                    .push(Use { at, reaching_def });
+            }
+
+            if let Some(d) = def {
+                idx.defs_by_reg.entry(d.clone()).or_default().push(at);
+                last_def_in_block.insert(d, at);
+            }
+        }
+    }
+
+    idx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::types::{BinOp, CallTarget, CmpOp, Flag, LlirBlock, LlirInstr, Op};
+
+    /// One operation of every shape `def_uses` distinguishes, with a register
+    /// in each operand position that can hold one — plus the variants that
+    /// make an operand optional, since those are where an order or a count can
+    /// silently drift.
+    fn every_op_shape() -> Vec<Op> {
+        use crate::ir::types::{CallEffects, MemOp, UnOp, VReg, Value, Width};
+        let r = |n: &str| VReg::phys(n);
+        let v = |n: &str| Value::Reg(VReg::phys(n));
+        let mem = |base: Option<&str>, index: Option<&str>| {
+            MemOp::plain(base.map(r), index.map(r), 1, 8, 8)
+        };
+        vec![
+            Op::Assign {
+                dst: r("rax"),
+                src: v("rbx"),
+            },
+            Op::Assign {
+                dst: r("rax"),
+                src: Value::Const(7),
+            },
+            Op::Undef {
+                dst: r("rax"),
+                reason: "test".into(),
+            },
+            Op::Bin {
+                dst: r("rax"),
+                op: BinOp::Add,
+                lhs: v("rbx"),
+                rhs: v("rcx"),
+            },
+            Op::Bin {
+                dst: r("rax"),
+                op: BinOp::And,
+                lhs: v("rbx"),
+                rhs: Value::Const(0xff),
+            },
+            Op::Bin {
+                dst: r("rax"),
+                op: BinOp::Or,
+                lhs: Value::Const(1),
+                rhs: v("rcx"),
+            },
+            Op::Un {
+                dst: r("rax"),
+                op: UnOp::Not,
+                src: v("rbx"),
+            },
+            Op::Cmp {
+                dst: VReg::Flag(Flag::Z),
+                op: CmpOp::Eq,
+                lhs: v("rbx"),
+                rhs: Value::Const(0),
+            },
+            Op::Load {
+                dst: r("rax"),
+                addr: mem(Some("rbx"), Some("rcx")),
+            },
+            Op::Load {
+                dst: r("rax"),
+                addr: mem(None, Some("rcx")),
+            },
+            Op::Load {
+                dst: r("rax"),
+                addr: mem(Some("rbx"), None),
+            },
+            Op::CondLoad {
+                dst: r("rax"),
+                cond: VReg::Flag(Flag::Z),
+                inverted: false,
+                addr: mem(Some("rbx"), Some("rcx")),
+                fallback: v("rdx"),
+            },
+            Op::Store {
+                addr: mem(Some("rbx"), None),
+                src: v("rdx"),
+            },
+            Op::CondStore {
+                cond: VReg::Flag(Flag::Z),
+                inverted: true,
+                addr: mem(Some("rbx"), Some("rcx")),
+                src: Value::Const(3),
+            },
+            Op::Jump { target: 0x1000 },
+            Op::IndirectJump {
+                target: v("rax"),
+                index: Some(v("rcx")),
+            },
+            Op::IndirectJump {
+                target: v("rax"),
+                index: None,
+            },
+            Op::CondJump {
+                cond: VReg::Flag(Flag::Z),
+                target: 0x1000,
+                inverted: false,
+            },
+            Op::CondReturn {
+                cond: VReg::Flag(Flag::C),
+                inverted: false,
+            },
+            Op::CondReturnValue {
+                cond: VReg::Flag(Flag::C),
+                inverted: false,
+                value: v("rax"),
+            },
+            Op::Call {
+                target: CallTarget::Direct(0x2000),
+                effects: None,
+            },
+            Op::Call {
+                target: CallTarget::Indirect(v("r11")),
+                effects: Some(CallEffects {
+                    result: Some(r("rax")),
+                    args: vec![r("rdi"), r("rsi")],
+                    ..CallEffects::default()
+                }),
+            },
+            Op::Call {
+                target: CallTarget::Direct(0x2000),
+                effects: Some(CallEffects {
+                    result: None,
+                    args: vec![r("rdi")],
+                    ..CallEffects::default()
+                }),
+            },
+            Op::ReturnValue { value: v("rax") },
+            Op::Return,
+            Op::Nop,
+            Op::ZExt {
+                dst: r("rax"),
+                src: v("ebx"),
+                from: Width::W32,
+                to: Width::W64,
+            },
+            Op::SExt {
+                dst: r("rax"),
+                src: v("ebx"),
+                from: Width::W32,
+                to: Width::W64,
+            },
+            Op::Trunc {
+                dst: r("eax"),
+                src: v("rbx"),
+                from: Width::W64,
+                to: Width::W32,
+            },
+            Op::Extract {
+                dst: r("eax"),
+                src: v("rbx"),
+                hi: 63,
+                lo: 32,
+            },
+            Op::Concat {
+                dst: r("rax"),
+                hi: v("edx"),
+                lo: v("eax"),
+            },
+            Op::Ite {
+                dst: r("rax"),
+                cond: VReg::Flag(Flag::Z),
+                t: v("rbx"),
+                e: Value::Const(0),
+                width: Width::W64,
+            },
+            Op::Intrinsic {
+                name: "cpuid".into(),
+                ins: vec![v("rax"), Value::Const(0)],
+                outs: vec![(r("rax"), Width::W64), (r("rbx"), Width::W64)],
+                reads_mem: false,
+                writes_mem: false,
+            },
+            Op::Unknown {
+                mnemonic: "ud2".into(),
+            },
+        ]
+    }
+
+    /// The borrowing walkers must agree with the shape table `def_uses` was
+    /// originally written as — same def, same uses, same ORDER, same count.
+    ///
+    /// `def_uses` is now written in terms of `for_each_use`/`def_ref`, so this
+    /// is what stops that rewrite from having quietly changed an operand order
+    /// (which would misalign every SSA use index) or dropped an operand.
+    #[test]
+    fn borrowing_walkers_match_the_original_def_uses_shape_table() {
+        for op in every_op_shape() {
+            let (reference_def, reference_uses) = def_uses_reference_shapes(&op);
+            let (def, uses) = def_uses(&op);
+            assert_eq!(def, reference_def, "def mismatch for {op:?}");
+            assert_eq!(uses, reference_uses, "uses mismatch for {op:?}");
+
+            assert_eq!(def_ref(&op).cloned(), reference_def, "def_ref for {op:?}");
+            assert_eq!(use_count(&op), reference_uses.len(), "use_count for {op:?}");
+            let mut walked = Vec::new();
+            for_each_use(&op, |register| walked.push(register.clone()));
+            assert_eq!(walked, reference_uses, "for_each_use order for {op:?}");
+
+            let mut definitions = Vec::new();
+            for_each_def(&op, |register| definitions.push(register.clone()));
+            assert_eq!(definitions, defs_uses(&op).0, "for_each_def for {op:?}");
+        }
+    }
+
+    fn mk_lf(blocks: Vec<Vec<Op>>) -> LlirFunction {
+        let mut out = Vec::new();
+        for (i, ops) in blocks.into_iter().enumerate() {
+            out.push(LlirBlock {
+                start_va: 0x1000 + (i as u64) * 0x100,
+                end_va: 0x1100 + (i as u64) * 0x100,
+                instrs: ops
+                    .into_iter()
+                    .enumerate()
+                    .map(|(j, op)| LlirInstr {
+                        va: 0x1000 + (i as u64) * 0x100 + (j as u64) * 4,
+                        op,
+                    })
+                    .collect(),
+                succs: vec![],
+            })
+        }
+        LlirFunction {
+            entry_va: 0x1000,
+            blocks: out,
+        }
+    }
+
+    #[test]
+    fn def_uses_returns_def_and_all_uses() {
+        let op = Op::Bin {
+            dst: VReg::phys("rax"),
+            op: BinOp::Add,
+            lhs: Value::Reg(VReg::phys("rax")),
+            rhs: Value::Reg(VReg::phys("rbx")),
+        };
+        let (def, uses) = def_uses(&op);
+        assert_eq!(def, Some(VReg::phys("rax")));
+        assert_eq!(uses, vec![VReg::phys("rax"), VReg::phys("rbx")]);
+    }
+
+    #[test]
+    fn store_has_no_def_but_records_uses() {
+        let op = Op::Store {
+            addr: MemOp {
+                base: Some(VReg::phys("rsp")),
+                index: None,
+                scale: 0,
+                disp: 0,
+                size: 8,
+                ..Default::default()
+            },
+            src: Value::Reg(VReg::phys("rax")),
+        };
+        let (def, uses) = def_uses(&op);
+        assert!(def.is_none());
+        assert_eq!(uses, vec![VReg::phys("rsp"), VReg::phys("rax")]);
+    }
+
+    #[test]
+    fn call_indirect_records_register_use() {
+        let op = Op::Call {
+            target: CallTarget::Indirect(Value::Reg(VReg::phys("rax"))),
+            effects: None,
+        };
+        let (def, uses) = def_uses(&op);
+        // Unannotated: report only what is certain (the indirect target is read).
+        assert!(def.is_none());
+        assert_eq!(uses, vec![VReg::phys("rax")]);
+    }
+
+    #[test]
+    fn an_annotated_call_defines_the_return_register_and_reads_the_arguments() {
+        // The whole point: a call participates in def/use like any other instruction.
+        // Reporting nothing told every consumer the return register survived the call.
+        let op = Op::Call {
+            target: CallTarget::Direct(0x2000),
+            effects: Some(crate::ir::abi::call_effects(
+                crate::ir::call_args::CallConv::SysVAmd64,
+            )),
+        };
+        let (def, uses) = def_uses(&op);
+        assert_eq!(def, Some(VReg::phys("rax")), "a call defines its result");
+        assert_eq!(
+            uses.len(),
+            6,
+            "and reads the ABI argument registers: {uses:?}"
+        );
+        assert_eq!(uses[0], VReg::phys("rdi"));
+    }
+
+    #[test]
+    fn an_indirect_annotated_call_reads_its_target_as_well_as_the_arguments() {
+        let op = Op::Call {
+            target: CallTarget::Indirect(Value::Reg(VReg::phys("r11"))),
+            effects: Some(crate::ir::abi::call_effects(
+                crate::ir::call_args::CallConv::Aarch64,
+            )),
+        };
+        let (def, uses) = def_uses(&op);
+        assert_eq!(def, Some(VReg::phys("x0")));
+        assert!(uses.contains(&VReg::phys("r11")), "target: {uses:?}");
+        assert!(uses.contains(&VReg::phys("x7")), "args: {uses:?}");
+    }
+
+    #[test]
+    fn proven_call_input_rejects_matching_display_names_with_different_identities() {
+        let proven = VReg::phys("rdi#looks_proven");
+        let argument = VReg::phys("edi#also_looks_proven");
+        let op = Op::Call {
+            target: CallTarget::Direct(0x2000),
+            effects: Some(crate::ir::types::CallEffects {
+                args: vec![argument.clone()],
+                proven_args: vec![proven.clone()],
+                ..Default::default()
+            }),
+        };
+        let mut identities = crate::ir::value_number::ValueIdentities::default();
+        identities.record(
+            proven,
+            crate::ir::ssa::SsaValue {
+                base: VReg::phys("rax"),
+                version: 1,
+            },
+        );
+        identities.record(
+            argument,
+            crate::ir::ssa::SsaValue {
+                base: VReg::phys("rsi"),
+                version: 2,
+            },
+        );
+
+        assert!(!use_is_proven_input_with_identities(&op, 0, &identities,));
+    }
+
+    #[test]
+    fn self_referential_bin_reads_previous_def_not_its_own() {
+        // %rax = rbx
+        // %rax = rax + 5    ← uses prior def at instr 0
+        let lf = mk_lf(vec![vec![
+            Op::Assign {
+                dst: VReg::phys("rax"),
+                src: Value::Reg(VReg::phys("rbx")),
+            },
+            Op::Bin {
+                dst: VReg::phys("rax"),
+                op: BinOp::Add,
+                lhs: Value::Reg(VReg::phys("rax")),
+                rhs: Value::Const(5),
+            },
+        ]]);
+        let idx = compute_use_def(&lf);
+        let rax_uses = idx.uses_by_reg.get(&VReg::phys("rax")).unwrap();
+        assert_eq!(rax_uses.len(), 1, "exactly one read of rax");
+        let u = &rax_uses[0];
+        assert_eq!(
+            u.at,
+            InstrAddr {
+                block_idx: 0,
+                instr_idx: 1
+            }
+        );
+        assert_eq!(
+            u.reaching_def,
+            Some(InstrAddr {
+                block_idx: 0,
+                instr_idx: 0
+            }),
+            "read must resolve to the earlier def at instr 0",
+        );
+    }
+
+    #[test]
+    fn use_before_def_has_no_reaching_def() {
+        // First op reads rbx which has never been defined in this function.
+        let lf = mk_lf(vec![vec![Op::Assign {
+            dst: VReg::phys("rax"),
+            src: Value::Reg(VReg::phys("rbx")),
+        }]]);
+        let idx = compute_use_def(&lf);
+        let rbx_uses = idx.uses_by_reg.get(&VReg::phys("rbx")).unwrap();
+        assert_eq!(rbx_uses.len(), 1);
+        assert!(rbx_uses[0].reaching_def.is_none());
+    }
+
+    #[test]
+    fn defs_by_reg_captures_every_write() {
+        let lf = mk_lf(vec![vec![
+            Op::Assign {
+                dst: VReg::phys("rax"),
+                src: Value::Const(1),
+            },
+            Op::Assign {
+                dst: VReg::phys("rax"),
+                src: Value::Const(2),
+            },
+            Op::Assign {
+                dst: VReg::phys("rbx"),
+                src: Value::Const(3),
+            },
+        ]]);
+        let idx = compute_use_def(&lf);
+        assert_eq!(idx.defs_by_reg.get(&VReg::phys("rax")).unwrap().len(), 2);
+        assert_eq!(idx.defs_by_reg.get(&VReg::phys("rbx")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn width_change_ops_def_and_use() {
+        use crate::ir::types::Width;
+        let op = Op::ZExt {
+            dst: VReg::phys("rax"),
+            src: Value::Reg(VReg::phys("eax")),
+            from: Width::W32,
+            to: Width::W64,
+        };
+        let (def, uses) = def_uses(&op);
+        assert_eq!(def, Some(VReg::phys("rax")));
+        assert_eq!(uses, vec![VReg::phys("eax")]);
+    }
+
+    #[test]
+    fn ite_reads_cond_and_both_arms() {
+        use crate::ir::types::Width;
+        let op = Op::Ite {
+            dst: VReg::phys("rax"),
+            cond: VReg::Flag(Flag::Z),
+            t: Value::Reg(VReg::phys("rbx")),
+            e: Value::Reg(VReg::phys("rcx")),
+            width: Width::W64,
+        };
+        let (def, uses) = def_uses(&op);
+        assert_eq!(def, Some(VReg::phys("rax")));
+        assert_eq!(
+            uses,
+            vec![VReg::Flag(Flag::Z), VReg::phys("rbx"), VReg::phys("rcx")]
+        );
+    }
+
+    #[test]
+    fn intrinsic_reads_ins_defs_first_out() {
+        use crate::ir::types::Width;
+        let op = Op::Intrinsic {
+            name: "cpuid".into(),
+            ins: vec![Value::Reg(VReg::phys("eax"))],
+            outs: vec![
+                (VReg::phys("eax"), Width::W32),
+                (VReg::phys("edx"), Width::W32),
+            ],
+            reads_mem: false,
+            writes_mem: false,
+        };
+        let (def, uses) = def_uses(&op);
+        assert_eq!(def, Some(VReg::phys("eax")));
+        assert_eq!(uses, vec![VReg::phys("eax")]);
+    }
+
+    #[test]
+    fn cmp_def_is_flag_not_operand() {
+        let lf = mk_lf(vec![vec![Op::Cmp {
+            dst: VReg::Flag(Flag::Z),
+            op: CmpOp::Eq,
+            lhs: Value::Reg(VReg::phys("rax")),
+            rhs: Value::Const(0),
+        }]]);
+        let idx = compute_use_def(&lf);
+        assert!(idx.defs_by_reg.get(&VReg::Flag(Flag::Z)).is_some());
+        // rax is a read; it should show up in uses, not defs.
+        assert!(idx.defs_by_reg.get(&VReg::phys("rax")).is_none());
+        assert!(idx.uses_by_reg.get(&VReg::phys("rax")).is_some());
+    }
+
+    #[test]
+    fn reaching_defs_do_not_cross_block_boundaries() {
+        // Block 0: %rax = 1
+        // Block 1: %rbx = rax    ← no reaching def in block 1
+        let lf = mk_lf(vec![
+            vec![Op::Assign {
+                dst: VReg::phys("rax"),
+                src: Value::Const(1),
+            }],
+            vec![Op::Assign {
+                dst: VReg::phys("rbx"),
+                src: Value::Reg(VReg::phys("rax")),
+            }],
+        ]);
+        let idx = compute_use_def(&lf);
+        let rax_uses = idx.uses_by_reg.get(&VReg::phys("rax")).unwrap();
+        assert_eq!(rax_uses.len(), 1);
+        assert!(
+            rax_uses[0].reaching_def.is_none(),
+            "intra-block analysis must not see a def in block 0 from block 1",
+        );
+    }
+
+    #[test]
+    fn works_on_real_lifted_function() {
+        use crate::analysis::cfg::{analyze_functions_bytes, Budgets};
+        use crate::core::binary::Arch;
+        use crate::ir::lift_function::lift_function_from_bytes;
+        let path = std::path::Path::new(
+            "samples/binaries/platforms/linux/amd64/export/native/gcc/O2/hello-gcc-O2",
+        );
+        if !path.exists() {
+            return;
+        }
+        let data = std::fs::read(path).unwrap();
+        let (funcs, _cg) = analyze_functions_bytes(
+            &data,
+            &Budgets {
+                max_functions: 1,
+                max_blocks: 64,
+                max_instructions: 1000,
+                timeout_ms: 500,
+                total_timeout_ms: 0,
+            },
+        );
+        let lf = lift_function_from_bytes(&data, &funcs[0], Arch::X86_64).unwrap();
+        let idx = compute_use_def(&lf);
+        // On any non-trivial function rsp is both defined (push/sub adjust it)
+        // and read (stores / memory addressing), so it must appear in both
+        // maps.
+        assert!(
+            idx.defs_by_reg.contains_key(&VReg::phys("rsp"))
+                || idx.uses_by_reg.contains_key(&VReg::phys("rsp")),
+            "expected rsp to appear somewhere in the use-def index",
+        );
+    }
+}

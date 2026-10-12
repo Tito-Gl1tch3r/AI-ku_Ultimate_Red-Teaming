@@ -1,0 +1,82 @@
+from __future__ import annotations
+
+from enum import Enum
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
+import uuid
+
+
+def _gen_id() -> str:
+    return uuid.uuid4().hex
+
+
+class NodeKind(str, Enum):
+    file = "file"
+    artifact = "artifact"
+    evidence = "evidence"
+    function = "function"
+    string = "string"
+    import_sym = "import"
+    note = "note"
+    hash = "hash"
+    ioc = "ioc"
+    java_archive = "java_archive"
+    java_package = "java_package"
+    java_class = "java_class"
+    java_method = "java_method"
+    java_field = "java_field"
+    java_annotation = "java_annotation"
+    java_resource = "java_resource"
+    java_bytecode = "java_bytecode"
+    java_cfg = "java_cfg"
+    java_xref = "java_xref"
+    java_call_graph = "java_call_graph"
+    java_mapping = "java_mapping"
+    java_sensitive_sink = "java_sensitive_sink"
+    java_entrypoint = "java_entrypoint"
+    java_framework = "java_framework"
+    java_reachability = "java_reachability"
+    java_config_key = "java_config_key"
+    java_secret = "java_secret"
+    java_suspicious_blob = "java_suspicious_blob"
+    java_dependency = "java_dependency"
+    java_build_system = "java_build_system"
+    java_compile_result = "java_compile_result"
+    java_source_tree = "java_source_tree"
+    java_decompile_unit = "java_decompile_unit"
+    java_decompile_archive = "java_decompile_archive"
+    java_source_ast = "java_source_ast"
+    java_source_project_index = "java_source_project_index"
+    java_repair_result = "java_repair_result"
+    java_abi_comparison = "java_abi_comparison"
+    java_recovery_validation = "java_recovery_validation"
+    java_recovery_project = "java_recovery_project"
+    java_recovery_report = "java_recovery_report"
+    java_config_correlation = "java_config_correlation"
+    java_risk_finding = "java_risk_finding"
+    java_agent_context = "java_agent_context"
+    pe_resource = "pe_resource"
+
+
+class Node(BaseModel):
+    id: str = Field(default_factory=_gen_id)
+    kind: NodeKind
+    label: str
+    text: Optional[str] = None
+    props: Dict[str, Any] = Field(default_factory=dict)
+    tags: List[str] = Field(default_factory=list)
+
+
+class Edge(BaseModel):
+    id: str = Field(default_factory=_gen_id)
+    src: str
+    dst: str
+    kind: str
+    props: Dict[str, Any] = Field(default_factory=dict)
+
+
+class KBView(BaseModel):
+    """A focused view of the KB for prompt/context construction."""
+
+    nodes: List[Node]
+    edges: List[Edge]

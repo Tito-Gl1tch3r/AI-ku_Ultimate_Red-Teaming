@@ -1,0 +1,279 @@
+package sqlite.quickstart.model;
+
+import com.abubusoft.kripton.AbstractMapper;
+import com.abubusoft.kripton.annotation.BindMap;
+import com.abubusoft.kripton.escape.StringEscapeUtils;
+import com.abubusoft.kripton.xml.EventType;
+import com.abubusoft.kripton.xml.XMLParser;
+import com.abubusoft.kripton.xml.XMLSerializer;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
+
+/**
+ * This class is binder map for Company
+ *
+ * @see Company
+ */
+@BindMap(Company.class)
+public class CompanyBindMap extends AbstractMapper<Company> {
+  @Override
+  public int serializeOnJackson(Company object, JsonGenerator jacksonSerializer) throws Exception {
+    jacksonSerializer.writeStartObject();
+    int fieldCount=0;
+
+    // Serialized Field:
+
+    // field bs (mapped with "bs")
+    if (object.bs!=null)  {
+      fieldCount++;
+      jacksonSerializer.writeStringField("bs", object.bs);
+    }
+
+    // field catchPhrase (mapped with "catchPhrase")
+    if (object.catchPhrase!=null)  {
+      fieldCount++;
+      jacksonSerializer.writeStringField("catchPhrase", object.catchPhrase);
+    }
+
+    // field name (mapped with "name")
+    if (object.name!=null)  {
+      fieldCount++;
+      jacksonSerializer.writeStringField("name", object.name);
+    }
+
+    jacksonSerializer.writeEndObject();
+    return fieldCount;
+  }
+
+  @Override
+  public int serializeOnJacksonAsString(Company object, JsonGenerator jacksonSerializer) throws
+      Exception {
+    jacksonSerializer.writeStartObject();
+    int fieldCount=0;
+
+    // Serialized Field:
+
+    // field bs (mapped with "bs")
+    if (object.bs!=null)  {
+      fieldCount++;
+      jacksonSerializer.writeStringField("bs", object.bs);
+    }
+
+    // field catchPhrase (mapped with "catchPhrase")
+    if (object.catchPhrase!=null)  {
+      fieldCount++;
+      jacksonSerializer.writeStringField("catchPhrase", object.catchPhrase);
+    }
+
+    // field name (mapped with "name")
+    if (object.name!=null)  {
+      fieldCount++;
+      jacksonSerializer.writeStringField("name", object.name);
+    }
+
+    jacksonSerializer.writeEndObject();
+    return fieldCount;
+  }
+
+  /**
+   * method for xml serialization
+   */
+  @Override
+  public void serializeOnXml(Company object, XMLSerializer xmlSerializer,
+      EventType currentEventType) throws Exception {
+    if (currentEventType == EventType.START_DOCUMENT) {
+      xmlSerializer.writeStartElement("company");
+    }
+
+    // Persisted fields:
+
+    // field bs (mapped with "bs")
+    if (object.bs!=null) {
+      xmlSerializer.writeStartElement("bs");
+      xmlSerializer.writeCharacters(StringEscapeUtils.escapeXml10(object.bs));
+      xmlSerializer.writeEndElement();
+    }
+
+    // field catchPhrase (mapped with "catchPhrase")
+    if (object.catchPhrase!=null) {
+      xmlSerializer.writeStartElement("catchPhrase");
+      xmlSerializer.writeCharacters(StringEscapeUtils.escapeXml10(object.catchPhrase));
+      xmlSerializer.writeEndElement();
+    }
+
+    // field name (mapped with "name")
+    if (object.name!=null) {
+      xmlSerializer.writeStartElement("name");
+      xmlSerializer.writeCharacters(StringEscapeUtils.escapeXml10(object.name));
+      xmlSerializer.writeEndElement();
+    }
+
+    if (currentEventType == EventType.START_DOCUMENT) {
+      xmlSerializer.writeEndElement();
+    }
+  }
+
+  /**
+   * parse with jackson
+   */
+  @Override
+  public Company parseOnJackson(JsonParser jacksonParser) throws Exception {
+    Company instance = new Company();
+    String fieldName;
+    if (jacksonParser.currentToken() == null) {
+      jacksonParser.nextToken();
+    }
+    if (jacksonParser.currentToken() != JsonToken.START_OBJECT) {
+      jacksonParser.skipChildren();
+      return instance;
+    }
+    while (jacksonParser.nextToken() != JsonToken.END_OBJECT) {
+      fieldName = jacksonParser.getCurrentName();
+      jacksonParser.nextToken();
+
+      // Parse fields:
+      switch (fieldName) {
+          case "bs":
+            // field bs (mapped with "bs")
+            if (jacksonParser.currentToken()!=JsonToken.VALUE_NULL) {
+              instance.bs=jacksonParser.getText();
+            }
+          break;
+          case "catchPhrase":
+            // field catchPhrase (mapped with "catchPhrase")
+            if (jacksonParser.currentToken()!=JsonToken.VALUE_NULL) {
+              instance.catchPhrase=jacksonParser.getText();
+            }
+          break;
+          case "name":
+            // field name (mapped with "name")
+            if (jacksonParser.currentToken()!=JsonToken.VALUE_NULL) {
+              instance.name=jacksonParser.getText();
+            }
+          break;
+          default:
+            jacksonParser.skipChildren();
+          break;}
+    }
+    return instance;
+  }
+
+  /**
+   * parse with jackson
+   */
+  @Override
+  public Company parseOnJacksonAsString(JsonParser jacksonParser) throws Exception {
+    Company instance = new Company();
+    String fieldName;
+    if (jacksonParser.getCurrentToken() == null) {
+      jacksonParser.nextToken();
+    }
+    if (jacksonParser.getCurrentToken() != JsonToken.START_OBJECT) {
+      jacksonParser.skipChildren();
+      return instance;
+    }
+    while (jacksonParser.nextToken() != JsonToken.END_OBJECT) {
+      fieldName = jacksonParser.getCurrentName();
+      jacksonParser.nextToken();
+
+      // Parse fields:
+      switch (fieldName) {
+          case "bs":
+            // field bs (mapped with "bs")
+            if (jacksonParser.currentToken()!=JsonToken.VALUE_NULL) {
+              instance.bs=jacksonParser.getText();
+            }
+          break;
+          case "catchPhrase":
+            // field catchPhrase (mapped with "catchPhrase")
+            if (jacksonParser.currentToken()!=JsonToken.VALUE_NULL) {
+              instance.catchPhrase=jacksonParser.getText();
+            }
+          break;
+          case "name":
+            // field name (mapped with "name")
+            if (jacksonParser.currentToken()!=JsonToken.VALUE_NULL) {
+              instance.name=jacksonParser.getText();
+            }
+          break;
+          default:
+            jacksonParser.skipChildren();
+          break;}
+    }
+    return instance;
+  }
+
+  /**
+   * parse xml
+   */
+  @Override
+  public Company parseOnXml(XMLParser xmlParser, EventType currentEventType) throws Exception {
+    Company instance = new Company();
+    EventType eventType = currentEventType;
+    boolean read=true;
+
+    if (currentEventType == EventType.START_DOCUMENT) {
+      eventType = xmlParser.next();
+    } else {
+      eventType = xmlParser.getEventType();
+    }
+    String currentTag = xmlParser.getName();
+    String elementName = currentTag;
+    // No attributes found
+
+    //sub-elements
+    while (xmlParser.hasNext() && elementName!=null) {
+      if (read) {
+        eventType = xmlParser.next();
+      } else {
+        eventType = xmlParser.getEventType();
+      }
+      read=true;
+      switch(eventType) {
+          case START_TAG:
+            currentTag = xmlParser.getName();
+            switch(currentTag) {
+                case "bs":
+                  // property bs (mapped on "bs")
+                  instance.bs=StringEscapeUtils.unescapeXml(xmlParser.getElementText());
+                break;
+                case "catchPhrase":
+                  // property catchPhrase (mapped on "catchPhrase")
+                  instance.catchPhrase=StringEscapeUtils.unescapeXml(xmlParser.getElementText());
+                break;
+                case "name":
+                  // property name (mapped on "name")
+                  instance.name=StringEscapeUtils.unescapeXml(xmlParser.getElementText());
+                break;
+                default:
+                  xmlParser.skipChildren();
+                break;
+              }
+            break;
+            case END_TAG:
+              if (elementName.equals(xmlParser.getName())) {
+                currentTag = elementName;
+                elementName = null;
+              }
+            break;
+            case CDSECT:
+            case TEXT:
+              // no property is binded to VALUE o CDATA break;
+            default:
+            break;
+        }
+      }
+      // if document is empty, the element is null
+      if (currentEventType == EventType.START_DOCUMENT && eventType == EventType.END_DOCUMENT) {
+          return null;
+        } else {
+          return instance;
+        }
+      }
+
+      @Override
+      public void init() {
+        // binding maps initialization 
+      }
+    }

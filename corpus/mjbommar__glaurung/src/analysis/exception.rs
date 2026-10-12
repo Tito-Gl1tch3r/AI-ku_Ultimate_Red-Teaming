@@ -1,0 +1,1315 @@
+//! ELF/Itanium exception call-site recovery.
+//!
+//! Normal control-flow discovery cannot reach C++ landing pads: the transfer
+//! from a protected call to its handler is driven by `.eh_frame` and the
+//! function's language-specific data area (LSDA), not by a branch instruction.
+//! This module recovers those authoritative exceptional edges without treating
+//! arbitrary unreachable bytes as code.
+
+use gimli::{BaseAddresses, CieOrFde, EhFrame, Pointer, UnwindSection};
+use object::{Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationTarget};
+
+/// Semantic class of the first action attached to a landing pad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExceptionAction {
+    /// A typed handler (`catch (T)`) is present.
+    Catch,
+    /// Cleanup-only landing pad, including a zero action-table selector.
+    Cleanup,
+    /// A negative type filter (legacy exception specification).
+    ExceptionSpec,
+    /// The action bytes were malformed or used an unsupported encoding.
+    Unknown,
+}
+
+/// Source-level C++ type proven by an LSDA type-table relocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchType {
+    /// Itanium ABI fundamental typeinfo symbol `_ZTIi`.
+    Int,
+}
+
+/// One LSDA-proven exceptional transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExceptionCallSite {
+    /// FDE/function start address.
+    pub function_start: u64,
+    /// Inclusive start of the protected machine-code interval.
+    pub protected_start: u64,
+    /// Exclusive end of the protected machine-code interval.
+    pub protected_end: u64,
+    /// Landing-pad entry address.
+    pub landing_pad: u64,
+    /// First action attached to the landing pad.
+    pub action: ExceptionAction,
+    /// Typed catch operand, when its typeinfo relocation is unambiguous.
+    pub catch_type: Option<CatchType>,
+    /// Address of the indirect typeinfo slot named by the LSDA.
+    pub type_info_location: Option<u64>,
+}
+
+/// Recover every ELF/Itanium exception call site with a concrete landing pad.
+///
+/// Malformed CFI or LSDA data is ignored record-by-record. This is analysis
+/// metadata from an untrusted binary, so no parse failure may panic or create a
+/// guessed edge.
+pub fn extract_exception_call_sites(data: &[u8]) -> Vec<ExceptionCallSite> {
+    let object = match crate::decompile::profile::parse_object(data) {
+        Ok(object) => object,
+        Err(_) => return Vec::new(),
+    };
+    let endian = if object.is_little_endian() {
+        gimli::RunTimeEndian::Little
+    } else {
+        gimli::RunTimeEndian::Big
+    };
+    let address_size = if object.is_64() { 8 } else { 4 };
+    let mut out = Vec::new();
+    if let Some(eh_section) = object.section_by_name(".eh_frame") {
+        if let Ok(eh_data) = eh_section.uncompressed_data() {
+            let eh_frame = EhFrame::new(&eh_data, endian);
+            let mut bases = BaseAddresses::default().set_eh_frame(eh_section.address());
+            if let Some(section) = object.section_by_name(".eh_frame_hdr") {
+                bases = bases.set_eh_frame_hdr(section.address());
+            }
+            if let Some(section) = object.section_by_name(".text") {
+                bases = bases.set_text(section.address());
+            }
+            if let Some(section) = object
+                .section_by_name(".got")
+                .or_else(|| object.section_by_name(".got.plt"))
+            {
+                bases = bases.set_got(section.address());
+            }
+
+            let mut entries = eh_frame.entries(&bases);
+            while let Ok(Some(entry)) = entries.next() {
+                let CieOrFde::Fde(partial) = entry else {
+                    continue;
+                };
+                let Ok(fde) = partial.parse(EhFrame::cie_from_offset) else {
+                    continue;
+                };
+                let Some(lsda_va) = fde.lsda().and_then(direct_pointer) else {
+                    continue;
+                };
+                let Some((section_data, section_va)) = section_containing_va(&object, lsda_va)
+                else {
+                    continue;
+                };
+                let Ok(offset) = usize::try_from(lsda_va - section_va) else {
+                    continue;
+                };
+                let Some(lsda) = section_data.get(offset..) else {
+                    continue;
+                };
+                out.extend(parse_lsda(
+                    lsda,
+                    lsda_va,
+                    fde.initial_address(),
+                    address_size,
+                    endian,
+                ));
+            }
+        }
+    }
+    out.extend(extract_arm_ehabi_call_sites(&object, endian));
+    for site in &mut out {
+        site.catch_type = site
+            .type_info_location
+            .and_then(|location| catch_type_at_relocation(&object, location));
+    }
+    out.sort_by_key(|site| (site.function_start, site.protected_start, site.landing_pad));
+    out.dedup();
+    if std::env::var_os("GLAURUNG_DUMP_PASSES").is_some() && !out.is_empty() {
+        eprintln!("[exception-sites] {out:#?}");
+    }
+    out
+}
+
+/// Recover the language-specific data embedded after a generic ARM EHABI
+/// unwind descriptor.
+///
+/// ARM32 GCC does not emit C++ landing-pad metadata in `.eh_frame`; it uses an
+/// `.ARM.exidx` entry whose second PREL31 word points at `.ARM.extab`.  In the
+/// generic model the first extab word names the personality routine, the next
+/// word contains a count plus unwind opcodes, and the ordinary Itanium LSDA
+/// begins after that word and its counted continuations.
+fn extract_arm_ehabi_call_sites(
+    object: &object::read::File<'_>,
+    endian: gimli::RunTimeEndian,
+) -> Vec<ExceptionCallSite> {
+    let Some(exidx) = object.section_by_name(".ARM.exidx") else {
+        return Vec::new();
+    };
+    let Some(extab) = object.section_by_name(".ARM.extab") else {
+        return Vec::new();
+    };
+    let Ok(exidx_data) = exidx.uncompressed_data() else {
+        return Vec::new();
+    };
+    let Ok(extab_data) = extab.uncompressed_data() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (index, entry) in exidx_data.chunks_exact(8).enumerate() {
+        let entry_va = exidx.address().saturating_add((index * 8) as u64);
+        let function_word = read_u32(entry, endian);
+        let descriptor_word = read_u32(&entry[4..], endian);
+        let Some(function_start) = resolve_prel31(entry_va, function_word) else {
+            continue;
+        };
+        // EXIDX_CANTUNWIND and inline compact descriptors carry no handler data.
+        if descriptor_word == 1 || descriptor_word & 0x8000_0000 != 0 {
+            continue;
+        }
+        let Some(extab_va) = resolve_prel31(entry_va.saturating_add(4), descriptor_word) else {
+            continue;
+        };
+        let Ok(extab_offset) = usize::try_from(extab_va.saturating_sub(extab.address())) else {
+            continue;
+        };
+        let Some(lsda_offset) = generic_arm_extab_lsda_offset(&extab_data, extab_offset, endian)
+        else {
+            continue;
+        };
+        let Some(lsda) = extab_data.get(lsda_offset..) else {
+            continue;
+        };
+        out.extend(parse_lsda(
+            lsda,
+            extab.address().saturating_add(lsda_offset as u64),
+            function_start,
+            4,
+            endian,
+        ));
+    }
+    out
+}
+
+fn generic_arm_extab_lsda_offset(
+    extab: &[u8],
+    offset: usize,
+    endian: gimli::RunTimeEndian,
+) -> Option<usize> {
+    let first = read_u32(extab.get(offset..offset.checked_add(4)?)?, endian);
+    // Bit 31 selects a compact-model descriptor, which has no generic LSDA
+    // layout. A clear bit is a PREL31 personality pointer.
+    if first & 0x8000_0000 != 0 {
+        return None;
+    }
+    let unwind = read_u32(
+        extab.get(offset.checked_add(4)?..offset.checked_add(8)?)?,
+        endian,
+    );
+    let continuation_words = (unwind >> 24) as usize;
+    offset
+        .checked_add(8)?
+        .checked_add(continuation_words.checked_mul(4)?)
+}
+
+fn read_u32(bytes: &[u8], endian: gimli::RunTimeEndian) -> u32 {
+    let array: [u8; 4] = bytes[..4].try_into().expect("four-byte slice");
+    match endian {
+        gimli::RunTimeEndian::Little => u32::from_le_bytes(array),
+        gimli::RunTimeEndian::Big => u32::from_be_bytes(array),
+    }
+}
+
+fn resolve_prel31(place: u64, encoded: u32) -> Option<u64> {
+    let displacement = ((encoded << 1) as i32) >> 1;
+    if displacement >= 0 {
+        place.checked_add(displacement as u64)
+    } else {
+        place.checked_sub(displacement.unsigned_abs() as u64)
+    }
+}
+
+fn catch_type_at_relocation(object: &object::read::File<'_>, location: u64) -> Option<CatchType> {
+    let relocations = object.dynamic_relocations()?;
+    for (place, relocation) in relocations {
+        if place != location {
+            continue;
+        }
+        let RelocationTarget::Symbol(index) = relocation.target() else {
+            continue;
+        };
+        let symbol = object.dynamic_symbol_table()?.symbol_by_index(index).ok()?;
+        return match symbol.name().ok()?.split('@').next()? {
+            "_ZTIi" => Some(CatchType::Int),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// One function interval proven by an `.eh_frame` FDE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EhFrameFunction {
+    /// FDE `initial_location` — an authoritative function entry point.
+    pub start: u64,
+    /// FDE `address_range` — the exact byte length of the function.
+    pub end: u64,
+}
+
+/// Every function interval described by `.eh_frame`.
+///
+/// This is the strongest function-boundary evidence available in a stripped
+/// ELF, and essentially every Linux binary of the last fifteen years carries it:
+/// `-fasynchronous-unwind-tables` is the default on x86-64 and AArch64 because
+/// the C++ unwinder and `backtrace()` need it, so it survives `strip`.
+///
+/// It is *sound but incomplete*. Every FDE start is a real function entry, so a
+/// seed taken from here never invents a function. But hand-written assembly and
+/// anything built `-fno-asynchronous-unwind-tables` (Alpine's `busybox`, which
+/// ships a 4-byte `.eh_frame`) has no FDE, so absence proves nothing and this
+/// cannot be the only discovery source.
+///
+/// Distinct from [`extract_exception_call_sites`], which walks the same table
+/// but keeps only FDEs carrying an LSDA — a small minority, and none at all in a
+/// C program. That is why exception recovery being wired up did not give
+/// discovery these boundaries for free.
+pub fn eh_frame_functions(data: &[u8]) -> Vec<EhFrameFunction> {
+    let Ok(object) = crate::decompile::profile::parse_object(data) else {
+        // Not an object we can parse at all. The ELF program headers might
+        // still be readable, but nothing downstream could use the answer.
+        return Vec::new();
+    };
+    eh_frame_functions_in(&object, data)
+}
+
+/// [`eh_frame_functions`] over an object the caller has already parsed.
+///
+/// `ProgramImage` builds this index during its own single parse; reopening the
+/// file to read the same section table is pure duplicate work. `data` is the
+/// image bytes `object` was parsed from, needed for the program-header fallback
+/// below — `object`'s own segment view exposes only `PT_LOAD`.
+pub(crate) fn eh_frame_functions_in(
+    object: &object::read::File<'_>,
+    data: &[u8],
+) -> Vec<EhFrameFunction> {
+    let from_sections = eh_frame_functions_from_sections(object);
+    if !from_sections.is_empty() {
+        return from_sections;
+    }
+    // No section header table, or one with no usable `.eh_frame` in it. The
+    // unwinder does not need either, so neither do we: `PT_GNU_EH_FRAME` is a
+    // program header and survives `sstrip` and most packers.
+    eh_frame_functions_from_program_headers(data)
+}
+
+/// The ordinary path: `.eh_frame` located by section name.
+///
+/// Preferred whenever it yields anything, because the section header gives the
+/// table an exact end, and `.text`/`.got` bases for the pointer encodings that
+/// need them.
+fn eh_frame_functions_from_sections(object: &object::read::File<'_>) -> Vec<EhFrameFunction> {
+    let Some(eh_section) = object.section_by_name(".eh_frame") else {
+        return Vec::new();
+    };
+    let Ok(eh_data) = eh_section.uncompressed_data() else {
+        return Vec::new();
+    };
+    let endian = if object.is_little_endian() {
+        gimli::RunTimeEndian::Little
+    } else {
+        gimli::RunTimeEndian::Big
+    };
+    let eh_frame = EhFrame::new(&eh_data, endian);
+    let mut bases = BaseAddresses::default().set_eh_frame(eh_section.address());
+    if let Some(section) = object.section_by_name(".eh_frame_hdr") {
+        bases = bases.set_eh_frame_hdr(section.address());
+    }
+    if let Some(section) = object.section_by_name(".text") {
+        bases = bases.set_text(section.address());
+    }
+    if let Some(section) = object
+        .section_by_name(".got")
+        .or_else(|| object.section_by_name(".got.plt"))
+    {
+        bases = bases.set_got(section.address());
+    }
+
+    let mut out = Vec::new();
+    let mut entries = eh_frame.entries(&bases);
+    while let Ok(Some(entry)) = entries.next() {
+        let CieOrFde::Fde(partial) = entry else {
+            continue;
+        };
+        let Ok(fde) = partial.parse(EhFrame::cie_from_offset) else {
+            continue;
+        };
+        let start = fde.initial_address();
+        let len = fde.len();
+        // A zero-length FDE describes no code; a terminator run produces one.
+        if len == 0 {
+            continue;
+        }
+        let Some(end) = start.checked_add(len) else {
+            continue;
+        };
+        out.push(EhFrameFunction { start, end });
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The fallback path: `.eh_frame` reached through `PT_GNU_EH_FRAME`.
+///
+/// This is what `_Unwind_Find_FDE` does. The segment *is* `.eh_frame_hdr`, and
+/// its `eh_frame_ptr` field gives the address of `.eh_frame`; both are readable
+/// with no section header table at all.
+///
+/// Driven by the header's binary-search table rather than by a linear walk of
+/// `.eh_frame`. That matters for soundness, not just for speed. Without a
+/// section header there is no exact end for `.eh_frame`, so a linear walk has
+/// to be bounded by the enclosing segment, and it would then depend on the
+/// four-byte zero terminator to stop before the `.note` data that follows —
+/// a terminator that a linker is under no obligation to emit and that a packer
+/// may well have dropped. The table, by contrast, states how many FDEs there
+/// are and where each one is, so every read here is bounded by a count the
+/// image itself declares and checked against the segment before it happens.
+///
+/// Returns nothing at all — never a partial or approximate answer — for any
+/// image whose header does not parse, whose `eh_frame_ptr` does not land in a
+/// loadable segment, or which has been truncated below what the headers claim.
+/// Individual malformed FDEs are skipped; discovery treats what comes back
+/// here as *proven*, so a guess would be worse than a gap.
+fn eh_frame_functions_from_program_headers(data: &[u8]) -> Vec<EhFrameFunction> {
+    use crate::formats::elf::eh_frame_segment::ProgramHeaderView;
+
+    let Some(view) = ProgramHeaderView::parse(data) else {
+        return Vec::new();
+    };
+    let Some(hdr_span) = view.eh_frame_hdr() else {
+        return Vec::new();
+    };
+    let endian = if view.is_little_endian() {
+        gimli::RunTimeEndian::Little
+    } else {
+        gimli::RunTimeEndian::Big
+    };
+
+    // `.eh_frame_hdr`'s own pointers are encoded relative to itself, so its
+    // base has to be set before anything in it can be decoded.
+    let bases = BaseAddresses::default().set_eh_frame_hdr(hdr_span.address);
+    let Ok(hdr) = gimli::EhFrameHdr::new(hdr_span.bytes, endian).parse(&bases, view.address_size())
+    else {
+        return Vec::new();
+    };
+    let Some(eh_frame_va) = direct_pointer(hdr.eh_frame_ptr()) else {
+        // An indirect `eh_frame_ptr` points through relocated process memory,
+        // which a file-only analysis cannot dereference.
+        return Vec::new();
+    };
+    let Some(frame_span) = view.mapped_from(eh_frame_va) else {
+        return Vec::new();
+    };
+    // An empty table is not a table; `gimli` reports that as `None`.
+    let Some(table) = hdr.table() else {
+        return Vec::new();
+    };
+
+    let bases = bases.set_eh_frame(eh_frame_va);
+    let eh_frame = EhFrame::new(frame_span.bytes, endian);
+    let mut out = Vec::new();
+    let mut entries = table.iter(&bases);
+    while let Ok(Some((_initial_location, fde_pointer))) = entries.next() {
+        let Some(fde_va) = direct_pointer(fde_pointer) else {
+            continue;
+        };
+        // Offset arithmetic done here rather than through
+        // `EhHdrTable::pointer_to_offset`, which subtracts without checking and
+        // would panic in a debug build on a table entry pointing below
+        // `.eh_frame`.
+        let Some(offset) = fde_va.checked_sub(eh_frame_va) else {
+            continue;
+        };
+        let Ok(offset) = usize::try_from(offset) else {
+            continue;
+        };
+        if offset >= frame_span.bytes.len() {
+            continue;
+        }
+        let Ok(fde) = eh_frame.fde_from_offset(
+            &bases,
+            gimli::EhFrameOffset(offset),
+            EhFrame::cie_from_offset,
+        ) else {
+            continue;
+        };
+        let start = fde.initial_address();
+        let len = fde.len();
+        if len == 0 {
+            continue;
+        }
+        let Some(end) = start.checked_add(len) else {
+            continue;
+        };
+        out.push(EhFrameFunction { start, end });
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Clone an LLIR graph and add only its LSDA-proven exceptional successors.
+///
+/// The normal graph remains the input to region structuring. This augmented
+/// view is for SSA/dataflow so catch definitions can reach shared joins without
+/// teaching every normal CFG consumer that a throw is an ordinary branch.
+pub fn with_exceptional_successors(
+    function: &crate::ir::types::LlirFunction,
+    sites: &[ExceptionCallSite],
+) -> crate::ir::types::LlirFunction {
+    let mut augmented = function.clone();
+    // Site order, not set order: a block protected by two call sites gets its
+    // landing pads in LSDA table order, and successor order feeds phi operand
+    // order. `exceptional_edges` shares the predicate below but not this loop.
+    for site in sites {
+        let Some(source_va) = exceptional_source(function, site) else {
+            continue;
+        };
+        let Some(source) = augmented
+            .blocks
+            .iter_mut()
+            .find(|block| block.start_va == source_va)
+        else {
+            continue;
+        };
+        if !source.succs.contains(&site.landing_pad) {
+            source.succs.push(site.landing_pad);
+        }
+    }
+    augmented
+}
+
+/// The block whose exceptional successor `site` proves, if this function has one.
+fn exceptional_source(
+    function: &crate::ir::types::LlirFunction,
+    site: &ExceptionCallSite,
+) -> Option<u64> {
+    let owned = |va: u64| function.blocks.iter().any(|block| block.start_va == va);
+    if site.function_start != function.entry_va && !owned(site.function_start) {
+        return None;
+    }
+    if !owned(site.landing_pad) {
+        return None;
+    }
+    function
+        .blocks
+        .iter()
+        .find(|block| site.protected_start >= block.start_va && site.protected_end == block.end_va)
+        .map(|block| block.start_va)
+}
+
+/// The `(source block start VA, landing pad VA)` pairs [`with_exceptional_successors`]
+/// would add.
+///
+/// Separated from the augmentation so the same proof can be used to *label* the
+/// edges as well as create them. An augmented successor with no branch behind it
+/// is otherwise indistinguishable from a fallthrough, and
+/// [`crate::ir::cfg_edges::classify`] was labelling it as one — a handler
+/// entered by unwinding presented as the block running off its own end.
+///
+/// Ordered so iteration never depends on FDE order.
+pub fn exceptional_edges(
+    function: &crate::ir::types::LlirFunction,
+    sites: &[ExceptionCallSite],
+) -> std::collections::BTreeSet<(u64, u64)> {
+    sites
+        .iter()
+        .filter_map(|site| Some((exceptional_source(function, site)?, site.landing_pad)))
+        .collect()
+}
+
+fn direct_pointer(pointer: Pointer) -> Option<u64> {
+    match pointer {
+        Pointer::Direct(value) => Some(value),
+        // An indirect LSDA address points through relocated process memory.
+        // A file-only analysis cannot dereference it soundly.
+        Pointer::Indirect(_) => None,
+    }
+}
+
+fn section_containing_va<'data>(
+    object: &object::read::File<'data>,
+    va: u64,
+) -> Option<(std::borrow::Cow<'data, [u8]>, u64)> {
+    object.sections().find_map(|section| {
+        let start = section.address();
+        let end = start.checked_add(section.size())?;
+        if !(start..end).contains(&va) {
+            return None;
+        }
+        section.uncompressed_data().ok().map(|data| (data, start))
+    })
+}
+
+fn parse_lsda(
+    data: &[u8],
+    lsda_va: u64,
+    function_start: u64,
+    address_size: u8,
+    endian: gimli::RunTimeEndian,
+) -> Vec<ExceptionCallSite> {
+    let mut reader = LsdaReader::new(data, lsda_va, address_size, endian);
+    let Some(lpstart_encoding) = reader.read_u8() else {
+        return Vec::new();
+    };
+    let lpstart = if lpstart_encoding == 0xff {
+        function_start
+    } else {
+        let Some(value) = reader.read_encoded_pointer(lpstart_encoding, function_start) else {
+            return Vec::new();
+        };
+        value
+    };
+
+    let Some(ttype_encoding) = reader.read_u8() else {
+        return Vec::new();
+    };
+    let type_table_base = if ttype_encoding == 0xff {
+        None
+    } else {
+        let Some(offset) = reader.read_uleb128() else {
+            return Vec::new();
+        };
+        let Ok(offset) = usize::try_from(offset) else {
+            return Vec::new();
+        };
+        reader.pos.checked_add(offset)
+    };
+    let Some(call_site_encoding) = reader.read_u8() else {
+        return Vec::new();
+    };
+    let Some(call_site_length) = reader.read_uleb128() else {
+        return Vec::new();
+    };
+    let Ok(call_site_length) = usize::try_from(call_site_length) else {
+        return Vec::new();
+    };
+    let Some(table_end) = reader.pos.checked_add(call_site_length) else {
+        return Vec::new();
+    };
+    if table_end > data.len() {
+        return Vec::new();
+    }
+    let action_table = table_end;
+    let mut out = Vec::new();
+    while reader.pos < table_end {
+        let Some(start) = reader.read_encoded_offset(call_site_encoding) else {
+            return Vec::new();
+        };
+        let Some(length) = reader.read_encoded_offset(call_site_encoding) else {
+            return Vec::new();
+        };
+        let Some(landing) = reader.read_encoded_offset(call_site_encoding) else {
+            return Vec::new();
+        };
+        let Some(action_offset) = reader.read_uleb128() else {
+            return Vec::new();
+        };
+        if reader.pos > table_end {
+            return Vec::new();
+        }
+        if landing == 0 || length == 0 {
+            continue;
+        }
+        let Some(protected_start) = function_start.checked_add(start) else {
+            continue;
+        };
+        let Some(protected_end) = protected_start.checked_add(length) else {
+            continue;
+        };
+        let Some(landing_pad) = lpstart.checked_add(landing) else {
+            continue;
+        };
+        let (action, type_filter) = parse_action(data, action_table, action_offset);
+        let type_info_location = type_filter.and_then(|filter| {
+            read_type_info_location(
+                data,
+                lsda_va,
+                type_table_base?,
+                ttype_encoding,
+                filter,
+                address_size,
+                endian,
+            )
+        });
+        out.push(ExceptionCallSite {
+            function_start,
+            protected_start,
+            protected_end,
+            landing_pad,
+            action,
+            catch_type: None,
+            type_info_location,
+        });
+    }
+    out
+}
+
+fn parse_action(data: &[u8], action_table: usize, offset: u64) -> (ExceptionAction, Option<u64>) {
+    if offset == 0 {
+        return (ExceptionAction::Cleanup, None);
+    }
+    let Ok(offset) = usize::try_from(offset) else {
+        return (ExceptionAction::Unknown, None);
+    };
+    let Some(relative) = offset.checked_sub(1) else {
+        return (ExceptionAction::Unknown, None);
+    };
+    let Some(pos) = action_table.checked_add(relative) else {
+        return (ExceptionAction::Unknown, None);
+    };
+    let Some(rest) = data.get(pos..) else {
+        return (ExceptionAction::Unknown, None);
+    };
+    let mut reader = LsdaReader::new(rest, 0, 8, gimli::RunTimeEndian::Little);
+    match reader.read_sleb128() {
+        Some(value) if value > 0 => (ExceptionAction::Catch, u64::try_from(value).ok()),
+        Some(0) => (ExceptionAction::Cleanup, None),
+        Some(_) => (ExceptionAction::ExceptionSpec, None),
+        None => (ExceptionAction::Unknown, None),
+    }
+}
+
+fn read_type_info_location(
+    data: &[u8],
+    lsda_va: u64,
+    table_base: usize,
+    encoding: u8,
+    filter: u64,
+    address_size: u8,
+    endian: gimli::RunTimeEndian,
+) -> Option<u64> {
+    let width = match encoding & 0x0f {
+        0x00 => usize::from(address_size),
+        0x02 | 0x0a => 2,
+        0x03 | 0x0b => 4,
+        0x04 | 0x0c => 8,
+        _ => return None,
+    };
+    let distance = usize::try_from(filter).ok()?.checked_mul(width)?;
+    let entry = table_base.checked_sub(distance)?;
+    let rest = data.get(entry..)?;
+    let mut reader = LsdaReader::new(
+        rest,
+        lsda_va.checked_add(entry as u64)?,
+        address_size,
+        endian,
+    );
+    reader.read_encoded_pointer_location(encoding)
+}
+
+struct LsdaReader<'data> {
+    data: &'data [u8],
+    pos: usize,
+    base_va: u64,
+    address_size: u8,
+    endian: gimli::RunTimeEndian,
+}
+
+impl<'data> LsdaReader<'data> {
+    fn new(
+        data: &'data [u8],
+        base_va: u64,
+        address_size: u8,
+        endian: gimli::RunTimeEndian,
+    ) -> Self {
+        Self {
+            data,
+            pos: 0,
+            base_va,
+            address_size,
+            endian,
+        }
+    }
+
+    fn read_u8(&mut self) -> Option<u8> {
+        let value = *self.data.get(self.pos)?;
+        self.pos += 1;
+        Some(value)
+    }
+
+    fn read_uint(&mut self, width: usize) -> Option<u64> {
+        let end = self.pos.checked_add(width)?;
+        let bytes = self.data.get(self.pos..end)?;
+        self.pos = end;
+        let mut value = 0_u64;
+        match self.endian {
+            gimli::RunTimeEndian::Little => {
+                for (shift, byte) in bytes.iter().enumerate() {
+                    value |= u64::from(*byte) << (shift * 8);
+                }
+            }
+            gimli::RunTimeEndian::Big => {
+                for byte in bytes {
+                    value = (value << 8) | u64::from(*byte);
+                }
+            }
+        }
+        Some(value)
+    }
+
+    fn read_sint(&mut self, width: usize) -> Option<i64> {
+        let value = self.read_uint(width)?;
+        let shift = 64_u32.checked_sub((width * 8) as u32)?;
+        Some(((value << shift) as i64) >> shift)
+    }
+
+    fn read_uleb128(&mut self) -> Option<u64> {
+        let mut value = 0_u64;
+        for shift in (0..64).step_by(7) {
+            let byte = self.read_u8()?;
+            let payload = u64::from(byte & 0x7f);
+            if shift == 63 && payload > 1 {
+                return None;
+            }
+            value |= payload.checked_shl(shift)?;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn read_sleb128(&mut self) -> Option<i64> {
+        let mut value = 0_u64;
+        let mut shift = 0_u32;
+        loop {
+            if shift >= 64 {
+                return None;
+            }
+            let byte = self.read_u8()?;
+            value |= u64::from(byte & 0x7f).checked_shl(shift)?;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                if shift < 64 && byte & 0x40 != 0 {
+                    value |= (!0_u64).checked_shl(shift)?;
+                }
+                return Some(value as i64);
+            }
+        }
+    }
+
+    fn read_encoded_scalar(&mut self, encoding: u8) -> Option<i128> {
+        match encoding & 0x0f {
+            0x00 => self.read_uint(self.address_size as usize).map(i128::from),
+            0x01 => self.read_uleb128().map(i128::from),
+            0x02 => self.read_uint(2).map(i128::from),
+            0x03 => self.read_uint(4).map(i128::from),
+            0x04 => self.read_uint(8).map(i128::from),
+            0x09 => self.read_sleb128().map(i128::from),
+            0x0a => self.read_sint(2).map(i128::from),
+            0x0b => self.read_sint(4).map(i128::from),
+            0x0c => self.read_sint(8).map(i128::from),
+            _ => None,
+        }
+    }
+
+    fn read_encoded_offset(&mut self, encoding: u8) -> Option<u64> {
+        if encoding == 0xff || encoding & 0xf0 != 0 {
+            return None;
+        }
+        u64::try_from(self.read_encoded_scalar(encoding)?).ok()
+    }
+
+    fn read_encoded_pointer(&mut self, encoding: u8, function_start: u64) -> Option<u64> {
+        if encoding == 0xff || encoding & 0x80 != 0 {
+            return None;
+        }
+        if encoding & 0x70 == 0x50 {
+            let width = self.address_size as usize;
+            let current_va = self.base_va.checked_add(self.pos as u64)?;
+            let aligned_va = current_va.checked_add(width as u64 - 1)? & !(width as u64 - 1);
+            self.pos = usize::try_from(aligned_va.checked_sub(self.base_va)?).ok()?;
+        }
+        let field_va = self.base_va.checked_add(self.pos as u64)?;
+        let raw = self.read_encoded_scalar(encoding)?;
+        let base = match encoding & 0x70 {
+            0x00 | 0x50 => 0_i128,
+            0x10 => i128::from(field_va),
+            // LPStart funcrel is useful and has an unambiguous base here.
+            0x40 => i128::from(function_start),
+            // textrel/datarel require section bases not carried by an LSDA.
+            _ => return None,
+        };
+        u64::try_from(base.checked_add(raw)?).ok()
+    }
+
+    fn read_encoded_pointer_location(&mut self, encoding: u8) -> Option<u64> {
+        let encoding = encoding & !0x80;
+        if encoding == 0xff {
+            return None;
+        }
+        let field_va = self.base_va.checked_add(self.pos as u64)?;
+        let raw = self.read_encoded_scalar(encoding)?;
+        let base = match encoding & 0x70 {
+            0x00 | 0x50 => 0_i128,
+            0x10 => i128::from(field_va),
+            _ => return None,
+        };
+        u64::try_from(base.checked_add(raw)?).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        eh_frame_functions, generic_arm_extab_lsda_offset, parse_lsda, resolve_prel31,
+        with_exceptional_successors, ExceptionAction, ExceptionCallSite,
+    };
+
+    #[test]
+    fn arm_ehabi_generic_descriptor_locates_its_real_lsda_bytes() {
+        // First eight bytes of GCC's generic descriptor for the ARMv7 O2 C++
+        // fixture: PREL31 __gxx_personality_v0, then zero continuation words.
+        let descriptor = [0x78, 0xfc, 0xff, 0x7f, 0x00, 0x84, 0x02, 0x00];
+        assert_eq!(
+            generic_arm_extab_lsda_offset(&descriptor, 0, gimli::RunTimeEndian::Little),
+            Some(8)
+        );
+        assert_eq!(resolve_prel31(0xd60, 0x7fff_fdf0), Some(0xb50));
+        assert_eq!(resolve_prel31(0xd64, 0x7fff_ffd0), Some(0xd34));
+    }
+    use crate::ir::types::{LlirBlock, LlirFunction};
+    use object::Object;
+
+    #[test]
+    fn clang_o0_typed_catch_call_site_is_recovered() {
+        let bytes = [
+            0xff, 0x9b, 0x11, 0x01, 0x08, 0x0e, 0x05, 0x2b, 0x01, 0x13, 0x64, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x2c, 0x1c, 0x00, 0x00,
+        ];
+
+        let sites = parse_lsda(&bytes, 0x2464, 0x1360, 8, gimli::RunTimeEndian::Little);
+
+        assert_eq!(
+            sites,
+            vec![ExceptionCallSite {
+                function_start: 0x1360,
+                protected_start: 0x136e,
+                protected_end: 0x1373,
+                landing_pad: 0x138b,
+                action: ExceptionAction::Catch,
+                catch_type: None,
+                type_info_location: Some(0x40a0),
+            }]
+        );
+    }
+
+    #[test]
+    fn clang_o2_inlined_throw_landing_pad_is_recovered() {
+        let bytes = [
+            0xff, 0x9b, 0x15, 0x01, 0x0c, 0x00, 0x1d, 0x00, 0x00, 0x1d, 0x11, 0x2e, 0x01, 0x2e,
+            0x16, 0x00, 0x00, 0x01, 0x00, 0x00, 0x44, 0x1e, 0x00, 0x00,
+        ];
+
+        let sites = parse_lsda(&bytes, 0x21f0, 0x11c0, 8, gimli::RunTimeEndian::Little);
+
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].protected_start, 0x11dd);
+        assert_eq!(sites[0].protected_end, 0x11ee);
+        assert_eq!(sites[0].landing_pad, 0x11ee);
+        assert_eq!(sites[0].action, ExceptionAction::Catch);
+    }
+
+    #[test]
+    fn malformed_lsda_is_rejected_without_partial_edges() {
+        let truncated = [0xff, 0x9b, 0x11, 0x01, 0x40, 0x0e];
+
+        assert!(
+            parse_lsda(&truncated, 0x1000, 0x2000, 8, gimli::RunTimeEndian::Little,).is_empty()
+        );
+    }
+
+    #[test]
+    fn exceptional_successor_augments_only_the_protected_call_block() {
+        let function = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![
+                LlirBlock {
+                    start_va: 0x1000,
+                    end_va: 0x1010,
+                    instrs: Vec::new(),
+                    succs: vec![0x1010],
+                },
+                LlirBlock {
+                    start_va: 0x1010,
+                    end_va: 0x1020,
+                    instrs: Vec::new(),
+                    succs: Vec::new(),
+                },
+                LlirBlock {
+                    start_va: 0x1030,
+                    end_va: 0x1040,
+                    instrs: Vec::new(),
+                    succs: Vec::new(),
+                },
+            ],
+        };
+        let sites = [ExceptionCallSite {
+            function_start: 0x1000,
+            protected_start: 0x100b,
+            protected_end: 0x1010,
+            landing_pad: 0x1030,
+            action: ExceptionAction::Catch,
+            catch_type: None,
+            type_info_location: None,
+        }];
+
+        let augmented = with_exceptional_successors(&function, &sites);
+
+        assert_eq!(function.blocks[0].succs, vec![0x1010]);
+        assert_eq!(augmented.blocks[0].succs, vec![0x1010, 0x1030]);
+        assert!(augmented.blocks[1].succs.is_empty());
+        assert!(augmented.blocks[2].succs.is_empty());
+    }
+
+    #[test]
+    fn exceptional_successor_accepts_an_owned_split_chunk_fde() {
+        let function = LlirFunction {
+            entry_va: 0x1000,
+            blocks: vec![
+                LlirBlock {
+                    start_va: 0x1000,
+                    end_va: 0x1010,
+                    instrs: Vec::new(),
+                    succs: Vec::new(),
+                },
+                LlirBlock {
+                    start_va: 0x0900,
+                    end_va: 0x0910,
+                    instrs: Vec::new(),
+                    succs: vec![0x0950],
+                },
+                LlirBlock {
+                    start_va: 0x0920,
+                    end_va: 0x0930,
+                    instrs: Vec::new(),
+                    succs: Vec::new(),
+                },
+                LlirBlock {
+                    start_va: 0x0950,
+                    end_va: 0x0960,
+                    instrs: Vec::new(),
+                    succs: Vec::new(),
+                },
+            ],
+        };
+        let sites = [ExceptionCallSite {
+            function_start: 0x0900,
+            protected_start: 0x0908,
+            protected_end: 0x0910,
+            landing_pad: 0x0920,
+            action: ExceptionAction::Catch,
+            catch_type: Some(super::CatchType::Int),
+            type_info_location: Some(0x4000),
+        }];
+
+        let augmented = with_exceptional_successors(&function, &sites);
+
+        assert_eq!(augmented.blocks[1].succs, vec![0x0950, 0x0920]);
+        assert!(
+            augmented.blocks[1].succs.contains(&sites[0].landing_pad),
+            "an LSDA FDE rooted at an owned cold chunk belongs to the merged function"
+        );
+    }
+
+    /// The exceptional edge exists in a real binary, and until now nothing named
+    /// it as one.
+    ///
+    /// `with_exceptional_successors` appends the landing pad to a protected call
+    /// block's successor list, and that augmented graph is used only for SSA. The
+    /// appended successor has no branch behind it, so the edge classifier — which
+    /// reads the terminator — labelled it from position: a second `Linear` out of a
+    /// block that already runs off its end somewhere else. Two "runs off its end"
+    /// edges out of one block cannot both be true, and the false one said control
+    /// reaches a catch handler by falling into it.
+    ///
+    /// Checked on a real g++ C++ binary rather than a synthetic graph, because the
+    /// point is that the shape occurs.
+    #[test]
+    fn a_real_landing_pad_edge_is_exceptional_and_was_previously_a_second_fallthrough() {
+        use crate::ir::cfg_edges::{classify, classify_with_exceptions, EdgeKind};
+        use std::path::Path;
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("samples")
+            .join("containers")
+            .join("hello-cpp-g++-O0");
+        if !path.exists() {
+            eprintln!("skipping: {} absent", path.display());
+            return;
+        }
+        let data = std::fs::read(&path).expect("read fixture");
+        let sites = super::extract_exception_call_sites(&data);
+        assert!(
+            !sites.is_empty(),
+            "a g++ C++ binary must carry LSDA call sites"
+        );
+
+        let budgets = crate::analysis::cfg::Budgets {
+            max_functions: 256,
+            max_blocks: 512,
+            max_instructions: 80_000,
+            timeout_ms: 8000,
+            total_timeout_ms: 0,
+        };
+        let (funcs, _cg) = crate::analysis::cfg::analyze_functions_bytes(&data, &budgets);
+
+        let (mut checked, mut abutting, mut unexplained) = (0usize, 0usize, 0usize);
+        for function in &funcs {
+            let Ok(lf) = crate::ir::lift_function::lift_function_from_bytes(
+                &data,
+                function,
+                crate::core::binary::Arch::X86_64,
+            ) else {
+                continue;
+            };
+            let proven = super::exceptional_edges(&lf, &sites);
+            if proven.is_empty() {
+                continue;
+            }
+            let augmented = with_exceptional_successors(&lf, &sites);
+            let index: std::collections::HashMap<u64, usize> = augmented
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (b.start_va, i))
+                .collect();
+            let succs: Vec<Vec<usize>> = augmented
+                .blocks
+                .iter()
+                .map(|b| {
+                    b.succs
+                        .iter()
+                        .filter_map(|va| index.get(va).copied())
+                        .collect()
+                })
+                .collect();
+
+            let typed = classify_with_exceptions(&augmented, &succs, |_, _| false, &proven);
+            let untyped = classify(&augmented, &succs, |_, _| false);
+            for &(source_va, pad_va) in &proven {
+                let (Some(&from), Some(&to)) = (index.get(&source_va), index.get(&pad_va)) else {
+                    continue;
+                };
+                let typed_kind = typed[from]
+                    .iter()
+                    .find(|edge| edge.to == to)
+                    .map(|edge| edge.kind);
+                assert_eq!(
+                    typed_kind,
+                    Some(EdgeKind::Exceptional),
+                    "{source_va:#x} -> {pad_va:#x} is proven by the LSDA"
+                );
+                let untyped_kind = untyped[from]
+                    .iter()
+                    .find(|edge| edge.to == to)
+                    .map(|edge| edge.kind);
+                match untyped_kind {
+                    // Adjacency cannot tell these apart: the landing pad starts
+                    // exactly where the protected block ends, so "runs off its
+                    // end into the handler" is indistinguishable from the truth
+                    // by position. Only the LSDA separates them.
+                    Some(EdgeKind::Linear) | Some(EdgeKind::Fallthrough) => {
+                        assert_eq!(
+                            augmented.blocks[from].end_va, pad_va,
+                            "{source_va:#x} -> {pad_va:#x} was read as sequential flow \
+                             without abutting the handler"
+                        );
+                        abutting += 1;
+                    }
+                    // The rest are the shape this work exists for: a protected
+                    // call block that already has a real fallthrough. Both edges
+                    // used to be `Linear` — one block running off its end into
+                    // two different places.
+                    Some(EdgeKind::Unknown) => {
+                        let sequential_siblings = untyped[from]
+                            .iter()
+                            .filter(|edge| {
+                                matches!(edge.kind, EdgeKind::Linear | EdgeKind::Fallthrough)
+                            })
+                            .count();
+                        assert_eq!(
+                            sequential_siblings, 1,
+                            "{source_va:#x} keeps exactly one order-derived edge; the \
+                             handler edge is the one that used to duplicate it"
+                        );
+                        unexplained += 1;
+                    }
+                    other => panic!(
+                        "{source_va:#x} -> {pad_va:#x} classified {other:?} without the LSDA"
+                    ),
+                }
+                // And the un-augmented graph — the one region structuring is
+                // actually built over — does not contain the edge at all. That is
+                // why exceptional control flow has never been structurable.
+                assert!(
+                    !lf.blocks[from].succs.contains(&pad_va),
+                    "the structuring graph unexpectedly already carries {pad_va:#x}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "no protected call block was found in {} — the sample or the recovery changed",
+            path.display()
+        );
+        assert!(
+            unexplained > 0,
+            "no protected call block with a real fallthrough was found: the shape this \
+             classification exists for is absent from the sample"
+        );
+        eprintln!(
+            "[exceptional-edges] {checked} LSDA-proven edge(s): {unexplained} would have been \
+             a second sequential edge out of the same block, {abutting} abut the handler"
+        );
+    }
+
+    /// `.eh_frame` must yield the real function starts of a stripped binary.
+    ///
+    /// Checked against the DWARF in the unstripped twin, which is the same
+    /// bytes: stripping removes symbols but moves no code, so every
+    /// `DW_AT_low_pc` must appear as an FDE start.
+    #[test]
+    fn eh_frame_functions_recover_real_starts() {
+        use std::path::Path;
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("samples")
+            .join("containers")
+            .join("hello-cpp-g++-O0");
+        if !path.exists() {
+            eprintln!("skipping eh_frame fixture test: {} absent", path.display());
+            return;
+        }
+        let data = std::fs::read(&path).expect("read fixture");
+        let funcs = eh_frame_functions(&data);
+
+        assert!(
+            funcs.len() >= 5,
+            "expected several FDEs in a real C++ binary, got {}",
+            funcs.len()
+        );
+        for f in &funcs {
+            assert!(f.end > f.start, "FDE {f:?} has non-positive length");
+        }
+        // Intervals must not overlap: each describes one function's extent, and
+        // overlapping ranges would make them useless as lifting bounds.
+        let mut sorted = funcs.clone();
+        sorted.sort_unstable();
+        for pair in sorted.windows(2) {
+            assert!(
+                pair[0].end <= pair[1].start,
+                "overlapping FDE intervals {:?} and {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // The entry point is generated code with unwind info in every glibc
+        // link, so it anchors the result to something externally checkable.
+        let obj = crate::decompile::profile::parse_object(&*data).expect("parse");
+        let entry = obj.entry();
+        assert!(
+            funcs.iter().any(|f| f.start <= entry && entry < f.end),
+            "entry point {entry:#x} is not covered by any FDE"
+        );
+    }
+}
+
+#[cfg(test)]
+mod section_header_independence_tests {
+    use super::{eh_frame_functions, EhFrameFunction};
+
+    /// One variant of the corpus built by `tools/realistic_corpus.py`.
+    fn corpus(variant: &str) -> Option<Vec<u8>> {
+        let path = format!(
+            "{}/tests/realistic_corpus/build/corpus.{variant}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read(path).ok()
+    }
+
+    /// The whole point: the same FDE intervals with and without section headers.
+    ///
+    /// `sstrip` removes only the section header table. The program headers, the
+    /// loadable segments and the executable bytes are byte-identical, and
+    /// `PT_GNU_EH_FRAME` — which is what the unwinder itself follows — is still
+    /// there. Any difference between these two answers is this module reading
+    /// metadata that no loader reads.
+    ///
+    /// Asserted as equality, not as "non-empty on both": a test that only
+    /// pinned stability would pass on the broken code, because today the
+    /// section-less answer is empty and empty is perfectly stable.
+    #[test]
+    fn the_same_functions_are_found_with_and_without_a_section_header_table() {
+        let (Some(sectioned), Some(sectionless)) = (corpus("strip"), corpus("sstrip")) else {
+            eprintln!("corpus not built; run tools/realistic_corpus.py");
+            return;
+        };
+        let with: Vec<EhFrameFunction> = eh_frame_functions(&sectioned);
+        let without: Vec<EhFrameFunction> = eh_frame_functions(&sectionless);
+        assert!(
+            !with.is_empty(),
+            "found no FDEs at all on an ordinary stripped binary — this test \
+             discriminates nothing if the sectioned path is broken too"
+        );
+        assert_eq!(
+            with,
+            without,
+            "{} FDE intervals with section headers, {} without",
+            with.len(),
+            without.len()
+        );
+    }
+
+    /// Absence of a readable table must stay absence, not become a guess.
+    ///
+    /// A program-header fallback reads `PT_GNU_EH_FRAME` and follows a pointer
+    /// out of it into the mapped image. Every step of that is attacker-supplied
+    /// on hostile input, so a header that does not parse has to produce nothing.
+    #[test]
+    fn malformed_input_yields_nothing_rather_than_a_guess() {
+        assert!(eh_frame_functions(&[]).is_empty());
+        assert!(eh_frame_functions(b"not an elf at all").is_empty());
+        assert!(eh_frame_functions(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0]).is_empty());
+    }
+
+    /// A truncated image must not report FDEs its bytes do not contain.
+    ///
+    /// Truncation is the realistic corruption: a carved sample, a partial
+    /// download, a packer that lied about its sizes. The program headers still
+    /// describe an `.eh_frame_hdr` that is no longer there, and the fallback
+    /// must notice rather than read whatever happens to sit at that offset.
+    #[test]
+    fn a_truncated_image_yields_no_fdes_it_cannot_prove() {
+        let Some(full) = corpus("sstrip") else {
+            eprintln!("corpus not built; run tools/realistic_corpus.py");
+            return;
+        };
+        // `PT_GNU_EH_FRAME` on this corpus covers 0x3138..0x344c and the
+        // `.eh_frame` it points at starts at 0x3450, so these cuts walk the
+        // failure forward: no headers, no `.eh_frame_hdr` at all, a header cut
+        // in half, and — the interesting one — a *complete* header whose
+        // `eh_frame_ptr` lands in a segment the file no longer holds.
+        for keep in [0x100usize, 0x1000, 0x3000, 0x3140, 0x3460, 0x3800] {
+            let truncated = &full[..keep.min(full.len())];
+            let found = eh_frame_functions(truncated);
+            assert!(
+                found.is_empty(),
+                "truncated to {keep:#x} bytes and still reported {} FDEs \
+                 (first {:?}) — a fallback that reads past the end of the file \
+                 is worse than no fallback",
+                found.len(),
+                found.first()
+            );
+        }
+    }
+}

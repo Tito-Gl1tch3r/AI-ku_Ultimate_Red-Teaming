@@ -1,0 +1,818 @@
+//! The semantic pass schedule that runs before DecBench rendering.
+//!
+//! Everything here changes definitions, uses, value identities, or control-flow
+//! representation. The passes used to run *inside* `render_decbench_typed`,
+//! which made that renderer impure: the AST that was checked or dumped was not
+//! the AST that was printed, so def-before-use verification against it produced
+//! false positives on correct functions and had to be reverted. Running them as
+//! a named pass whose output is the thing rendered is what makes the emitted C
+//! verifiable — see [`crate::ir::verify_defs`].
+//!
+//! This module is the schedule, not the transformations: with the exception of
+//! parameter-spill coalescing (`super::param_spills`) and the return folds that
+//! remain in `super`, every step is a call into a sibling `crate::ir::*` pass.
+//! What lives here is the *order*, the bounded fixpoints, and the comments
+//! recording why a pass has to run before or after another one.
+
+use super::param_spills::{coalesce_named_param_spills, coalesce_param_spills, drop_self_stores};
+#[cfg(test)]
+use super::{
+    fold_exhaustive_if_returns, fold_exhaustive_switch_returns, fold_returns,
+    remove_redundant_return_constant_assignments,
+};
+use super::{
+    fold_exhaustive_if_returns_with_identities, fold_exhaustive_switch_returns_with_identities,
+    fold_returns_with_identities, remove_redundant_return_constant_assignments_with_identities,
+    Function,
+};
+
+/// Why a bounded semantic fixpoint stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixpointTermination {
+    /// A complete round changed nothing.
+    Quiescent,
+    /// Every permitted round changed the function, so the safety bound fired.
+    BoundReached,
+}
+
+/// Auditable outcome of one bounded fixpoint invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixpointReport {
+    pub rounds: usize,
+    pub firing_rounds: usize,
+    pub termination: FixpointTermination,
+}
+
+impl FixpointTermination {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Quiescent => "quiescent",
+            Self::BoundReached => "bound_reached",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AstPreparationReport {
+    pub copies_and_constants: FixpointReport,
+    pub forward_regions_and_loops: FixpointReport,
+}
+
+#[derive(Clone, Copy)]
+enum PreparationAuthority<'a> {
+    Identities(&'a crate::ir::value_number::ValueIdentities),
+    #[cfg(test)]
+    LegacySpelling,
+}
+
+/// Run a semantic cleanup round until it stops firing or reaches its bound.
+///
+/// The callback must never under-report a mutation. Over-reporting is safe but
+/// consumes another bounded round and is visible in the returned report.
+pub fn run_bounded_fixpoint(max_rounds: usize, mut round: impl FnMut() -> bool) -> FixpointReport {
+    let mut report = FixpointReport {
+        rounds: 0,
+        firing_rounds: 0,
+        termination: FixpointTermination::BoundReached,
+    };
+    for _ in 0..max_rounds {
+        report.rounds += 1;
+        if !round() {
+            report.termination = FixpointTermination::Quiescent;
+            return report;
+        }
+        report.firing_rounds += 1;
+    }
+    report
+}
+
+/// Remove comments that describe an already-consumed machine frame.
+///
+/// Prologue recovery has done its semantic job once stack slots, parameters,
+/// and returns have been reconstructed. Keeping its marker in source-oriented
+/// C makes an ordinary function look partly lowered. Other comments—including
+/// incompleteness, canary, exception, and unknown-instruction markers—remain.
+pub(crate) fn drop_machine_frame_comments(body: &mut Vec<super::Stmt>) {
+    fn is_frame_marker(text: &str) -> bool {
+        [
+            "x86-64 prologue:",
+            "x86-64 epilogue:",
+            "aarch64 prologue:",
+            "aarch64 epilogue:",
+            "arm32 prologue:",
+            "arm32 epilogue:",
+            "cdecl32 prologue:",
+            "cdecl32 epilogue:",
+        ]
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+    }
+
+    for statement in body.iter_mut() {
+        let owned_frame_marker = statement.origins().is_some()
+            && matches!(statement.semantic(), super::Stmt::Comment(text) if is_frame_marker(text));
+        if owned_frame_marker {
+            *statement.semantic_mut() = super::Stmt::Nop;
+            continue;
+        }
+        match statement.semantic_mut() {
+            super::Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                drop_machine_frame_comments(then_body);
+                if let Some(else_body) = else_body {
+                    drop_machine_frame_comments(else_body);
+                }
+            }
+            super::Stmt::While { body, .. } | super::Stmt::DoWhile { body, .. } => {
+                drop_machine_frame_comments(body)
+            }
+            super::Stmt::For {
+                init, step, body, ..
+            } => {
+                if matches!(init.semantic(), super::Stmt::Comment(text) if is_frame_marker(text)) {
+                    *init.semantic_mut() = super::Stmt::Nop;
+                }
+                drop_machine_frame_comments(body);
+                if matches!(step.semantic(), super::Stmt::Comment(text) if is_frame_marker(text)) {
+                    *step.semantic_mut() = super::Stmt::Nop;
+                }
+            }
+            super::Stmt::Switch { cases, default, .. } => {
+                for (_, body) in cases {
+                    drop_machine_frame_comments(body);
+                }
+                if let Some(default) = default {
+                    drop_machine_frame_comments(default);
+                }
+            }
+            super::Stmt::TryCatch { try_body, catches } => {
+                drop_machine_frame_comments(try_body);
+                for catch in catches {
+                    drop_machine_frame_comments(&mut catch.body);
+                }
+            }
+            _ => {}
+        }
+    }
+    body.retain(
+        |statement| !matches!(statement, super::Stmt::Comment(text) if is_frame_marker(text)),
+    );
+}
+
+/// Run copy propagation and constant folding to their bounded fixpoint.
+///
+/// Copy propagation exposes algebraic flag identities, while folding those
+/// identities changes use counts and exposes new one-use copies. Iterate the
+/// monotone pair to a small bounded fixpoint: x86 partial-register returns need
+/// three rounds (fold the observed mask, inline the parent, delete the now-dead
+/// pre-loop copy). Four is a defensive bound, not an unbounded optimiser loop;
+/// all transformations strictly remove a copy or expression layer and ordinary
+/// functions settle after one round.
+///
+/// # Why the passes report instead of the loop comparing
+///
+/// This used to read `let before = owned.clone(); ...; if owned == before`,
+/// which deep-cloned the entire function and structurally compared it once per
+/// round. That was ~30% of the fixpoint's cost, and a quarter of it was
+/// provably wasted: the fourth round clones and compares to decide something
+/// the loop bound has already decided.
+///
+/// Both passes now answer the question directly. The contract they hold is
+/// documented on [`crate::ir::copy_prop::propagate_copies`] and on
+/// `const_fold`'s `rewrite`: a pass may over-report (an extra round over a body
+/// already at its fixed point re-derives the same body, so the output is
+/// unchanged) and must never under-report, because a `false` over a body that
+/// was edited stops the loop early and silently changes the emitted C.
+///
+/// Note the answers are combined with a NON-short-circuiting `||` over two
+/// separately bound results: both passes must run every round, and `a() || b()`
+/// would skip `fold_constants` on any round where propagation reported first.
+///
+/// `benches/ir_dataflow.rs` calls this function rather than restating the loop,
+/// so the bench cannot drift from the schedule it claims to measure.
+#[cfg(test)]
+pub fn settle_copies_and_constants(owned: &mut Function) -> FixpointReport {
+    settle_copies_and_constants_with_authority(owned, PreparationAuthority::LegacySpelling)
+}
+
+/// Run the production copy/constant fixpoint with authoritative value identity.
+pub fn settle_copies_and_constants_with_identities(
+    owned: &mut Function,
+    identities: &crate::ir::value_number::ValueIdentities,
+) -> FixpointReport {
+    settle_copies_and_constants_with_authority(owned, PreparationAuthority::Identities(identities))
+}
+
+fn settle_copies_and_constants_with_authority(
+    owned: &mut Function,
+    authority: PreparationAuthority<'_>,
+) -> FixpointReport {
+    run_bounded_fixpoint(4, || {
+        let copies_changed = match authority {
+            PreparationAuthority::Identities(identities) => {
+                crate::ir::copy_prop::propagate_copies_with_identities(owned, identities)
+            }
+            #[cfg(test)]
+            PreparationAuthority::LegacySpelling => crate::ir::copy_prop::propagate_copies(owned),
+        };
+        let constants_changed = match authority {
+            PreparationAuthority::Identities(identities) => {
+                crate::ir::const_fold::fold_constants_with_identities(owned, identities)
+            }
+            #[cfg(test)]
+            PreparationAuthority::LegacySpelling => crate::ir::const_fold::fold_constants(owned),
+        };
+        copies_changed || constants_changed
+    })
+}
+
+/// The explicit AST transformation that precedes DecBench rendering.
+///
+/// These nineteen steps change *definitions, uses, value identities, or control-flow
+/// representation* — they are
+/// semantic pipeline operations, not formatting:
+///
+/// 1. `default_return_to_reg` gives a bare `return` its ABI return register, so
+///    an always-non-void rendering emits `return ret;` instead of the
+///    value-losing `return 0;`;
+/// 2. `coalesce_param_spills` folds a parameter's spill slot back into the
+///    parameter, so the emitted C uses `argN` directly instead of a redundant
+///    `local_X = argN` copy (which recompiles to stack traffic the original never
+///    emits);
+/// 3. `copy_prop::propagate_copies` and `const_fold::fold_constants` run to a
+///    small local fixpoint: mask folding can turn a twice-read partial-register
+///    parent into a one-use copy, and propagating that copy exposes the final
+///    comparison identity.
+/// 4. `select_fold::collapse_assignment_diamonds` turns a proven two-arm,
+///    same-destination diamond into one pure select expression, then the narrow
+///    promoted-select propagator removes an adjacent one-use stack temporary.
+/// 5. `guarded_call::materialize_false_edges` makes the zero-valued
+///    false edge of an exact `value != 0` guarded call overwrite explicit,
+///    preserving lazy evaluation while recovering both reaching values.
+/// 6. `lazy_call_select::collapse_lazy_call_diamonds` moves a proven
+///    value-producing call into its original lazy assignment arm without
+///    duplicating or speculating the call.
+/// 7. `select_fold::recover_guarded_select_returns` turns an initialized result,
+///    one guarded select overwrite, and its joined return back into terminating
+///    nested returns when the initializer is a pure register view.
+/// 8. `select_fold::fold_boolean_masks` renders an exact comparison-derived
+///    `0`/`-1` select as arithmetic negation, avoiding fake source-level control
+///    flow without changing the mask value.
+/// 9. `copy_prop::propagate_adjacent_guard_values` folds a physical scratch's
+///    immediately adjacent, sole eager guard use without claiming that physical
+///    role is globally SSA.
+/// 10. `copy_prop::propagate_adjacent_overwritten_values` carries one pure,
+///    immediately consumed value into the assignment that overwrites the same
+///    physical scratch without treating that scratch as globally SSA.
+/// 11. `terminal_loop::recover_terminal_self_loops` turns an exact terminal
+///    machine `label; goto label` into a source-level infinite loop while
+///    retaining the label for any incoming structured edge.
+/// 12. `label_prune::recover_forward_exit_regions` turns exact forward skips to
+///    an adjacent join into guarded continuations, including a tail loop exit
+///    that is provably the source-level `break`.
+/// 13. `loop_form::recover_linear_latched_do_whiles` turns a uniquely owned
+///    `label; body; if (condition) goto label` into the exact source-level
+///    `do { body } while (condition)` form.
+/// 14. `loop_form::recover_head_tested_whiles` turns the conservative constant-bound
+///    countdown `while (1) { if (exit) break; body }` into
+///    `while (!exit) { body }` only when folding has made the exit guard first.
+/// 15. `label_prune::inline_terminal_goto_tails` duplicates only straight-line,
+///    uniquely labelled return tails at their goto sites, recovering ordinary
+///    early returns without inventing or reordering an effect.
+/// 16. `switch_ladder::recover_switches` runs before select formation and again
+///    after loop/copy recovery, converting proven comparison ladders into
+///    `switch` nodes without losing a two-case tail to a ternary expression.
+/// 17. `guarded_switch::collapse_range_guards` removes a compiler range-check
+///    wrapper only when its unsigned domain and every switch label prove that
+///    the wrapper cannot select a case the switch would not select itself.
+/// 18. `loop_form::promote_for_loops` combines an adjacent initializer, exact head
+///    guard, and unconditional same-variable unit increment into a `for` node.
+/// 19. `fold_exhaustive_if_returns` and `fold_exhaustive_switch_returns` move an
+///    immediately joined result return into proven terminating arms. Exhaustive
+///    `if`/`switch` regions lose the join entirely; a one-sided `if` becomes an
+///    early return followed by the original false-path fallthrough.
+///
+/// They used to run *inside* `render_decbench_typed`, which made that renderer
+/// impure: the AST that was checked or dumped was not the AST that was printed,
+/// so def-before-use verification against it produced false positives on correct
+/// functions and had to be reverted. Running them here, as a named pass whose
+/// output is the thing rendered, makes the emitted C verifiable — see
+/// [`crate::ir::verify_defs`].
+#[cfg(test)]
+pub fn prepare_for_decbench(f: &Function) -> Function {
+    prepare_for_decbench_with_output(f, crate::ir::types_recover::RecoveredOutputKind::Unknown)
+}
+
+/// Prepare an already value-numbered AST with authoritative identity facts.
+///
+/// `pointer_width` is explicit because this library boundary has no target or
+/// calling-convention context of its own.
+pub fn prepare_for_decbench_with_identities(
+    f: &Function,
+    pointer_width: u8,
+    identities: &crate::ir::value_number::ValueIdentities,
+) -> Function {
+    prepare_for_decbench_with_output_and_protected_locals_and_report(
+        f,
+        crate::ir::types_recover::RecoveredOutputKind::Unknown,
+        &std::collections::HashSet::new(),
+        pointer_width,
+        identities,
+    )
+    .0
+}
+
+/// Prepare DecBench output with the recovered source-level output contract.
+/// Unknown/direct outputs retain the compatibility behavior; proven void
+/// outputs erase incidental return-register residue before any source-level
+/// folding runs.
+#[cfg(test)]
+pub fn prepare_for_decbench_with_output(
+    f: &Function,
+    output_kind: crate::ir::types_recover::RecoveredOutputKind,
+) -> Function {
+    prepare_for_decbench_with_output_and_protected_locals(
+        f,
+        output_kind,
+        &std::collections::HashSet::new(),
+        8,
+    )
+}
+
+/// Prepare output while preserving debug-proven source-local identities.
+///
+/// Source locals may be initialized from a parameter without being that
+/// parameter's home storage. The protected set is deliberately internal-slot
+/// names: semantic passes retain those names until the final presentation
+/// boundary, where authoritative source spellings are applied.
+#[cfg(test)]
+pub(crate) fn prepare_for_decbench_with_output_and_protected_locals(
+    f: &Function,
+    output_kind: crate::ir::types_recover::RecoveredOutputKind,
+    protected_locals: &std::collections::HashSet<String>,
+    pointer_width: u8,
+) -> Function {
+    prepare_for_decbench_with_authority(
+        f,
+        output_kind,
+        protected_locals,
+        pointer_width,
+        PreparationAuthority::LegacySpelling,
+    )
+    .0
+}
+
+pub(crate) fn prepare_for_decbench_with_output_and_protected_locals_and_report(
+    f: &Function,
+    output_kind: crate::ir::types_recover::RecoveredOutputKind,
+    protected_locals: &std::collections::HashSet<String>,
+    pointer_width: u8,
+    identities: &crate::ir::value_number::ValueIdentities,
+) -> (Function, AstPreparationReport) {
+    prepare_for_decbench_with_authority(
+        f,
+        output_kind,
+        protected_locals,
+        pointer_width,
+        PreparationAuthority::Identities(identities),
+    )
+}
+
+fn prepare_for_decbench_with_authority(
+    f: &Function,
+    output_kind: crate::ir::types_recover::RecoveredOutputKind,
+    protected_locals: &std::collections::HashSet<String>,
+    pointer_width: u8,
+    authority: PreparationAuthority<'_>,
+) -> (Function, AstPreparationReport) {
+    let mut owned = f.clone();
+    if output_kind == crate::ir::types_recover::RecoveredOutputKind::Void {
+        crate::ir::direct_output::clear_return_values(&mut owned);
+        match authority {
+            PreparationAuthority::Identities(identities) => {
+                crate::ir::direct_output::prune_void_entry_result_restores_with_identities(
+                    &mut owned, identities,
+                )
+            }
+            #[cfg(test)]
+            PreparationAuthority::LegacySpelling => {
+                crate::ir::direct_output::prune_void_entry_result_restores(&mut owned)
+            }
+        }
+    } else {
+        match authority {
+            PreparationAuthority::Identities(identities) => {
+                crate::ir::direct_output::materialize_direct_output_with_identities(
+                    &mut owned, identities,
+                )
+            }
+            #[cfg(test)]
+            PreparationAuthority::LegacySpelling => {
+                crate::ir::direct_output::materialize_direct_output(&mut owned)
+            }
+        }
+    }
+    match authority {
+        PreparationAuthority::Identities(identities) => {
+            coalesce_param_spills(&mut owned.body, protected_locals, identities)
+        }
+        #[cfg(test)]
+        PreparationAuthority::LegacySpelling => {}
+    }
+    crate::ir::label_prune::prune_unreachable_tails(&mut owned);
+    // Copy propagation exposes algebraic flag identities, while folding those
+    // identities changes use counts and exposes new one-use copies. Iterate the
+    // monotone pair to a small bounded fixpoint — see the function's own docs.
+    let copies_and_constants = settle_copies_and_constants_with_authority(&mut owned, authority);
+    // Folding can prove that an initially composite narrow-register rebuild is
+    // exactly its incoming argument (`(arg & ~255) | (arg & 255) == arg`). Run
+    // the same guarded home analysis again so byte/halfword parameter spills
+    // exposed only at the fixpoint do not survive as fake source locals.
+    match authority {
+        PreparationAuthority::Identities(identities) => {
+            coalesce_named_param_spills(&mut owned.body, protected_locals, identities)
+        }
+        #[cfg(test)]
+        PreparationAuthority::LegacySpelling => {}
+    }
+    // A spill carried through a scratch can become `arg0 = arg0` only after
+    // the copy fixpoint. The earlier coalescing cleanup cannot see it yet.
+    drop_self_stores(&mut owned.body);
+    // Propagation can expose a casted result copy directly before its return.
+    // Collapse it before exhaustive-switch joining so the lossless cast chain
+    // can be carried into each arm instead of blocking source-level returns.
+    // A proven-void function deliberately had its return operands erased
+    // above; folding here would recreate one from incidental ABI result-register
+    // plumbing such as Clang's `push rax` / `pop rax` stack adjustment.
+    if output_kind != crate::ir::types_recover::RecoveredOutputKind::Void {
+        match authority {
+            PreparationAuthority::Identities(identities) => {
+                fold_returns_with_identities(&mut owned.body, identities)
+            }
+            #[cfg(test)]
+            PreparationAuthority::LegacySpelling => fold_returns(&mut owned.body),
+        }
+    }
+    // Copy propagation and the second constant fold can replace a flag read in
+    // a condition with its recovered comparison. Prune the now-dead definition
+    // before shape recovery: otherwise a redundant `sf_N = ...` remains before
+    // an exit guard and blocks exact while/for/select recognition.
+    crate::ir::dce::prune_overwritten_flags(&mut owned);
+    crate::ir::dce::prune_dead_flags(&mut owned);
+    match authority {
+        PreparationAuthority::Identities(identities) => {
+            crate::ir::copy_prop::propagate_adjacent_promoted_values_with_identities(
+                &mut owned, identities,
+            )
+        }
+        #[cfg(test)]
+        PreparationAuthority::LegacySpelling => {
+            crate::ir::copy_prop::propagate_adjacent_promoted_values(&mut owned)
+        }
+    }
+    match authority {
+        PreparationAuthority::Identities(identities) => {
+            crate::ir::copy_prop::propagate_adjacent_guard_values_with_identities(
+                &mut owned, identities,
+            )
+        }
+        #[cfg(test)]
+        PreparationAuthority::LegacySpelling => {
+            crate::ir::copy_prop::propagate_adjacent_guard_values(&mut owned)
+        }
+    }
+    // The run-local propagators above clear their environment at every
+    // control-flow boundary, so an ABI copy made in the entry block and read
+    // inside a loop survives as a declared local no matter how few reads it
+    // has. That is the ordinary shape of -O2 output. This pass folds only the
+    // provably free case: a name assigned exactly once, from a cast chain over
+    // a never-written parameter.
+    crate::ir::guard_chain::collapse_shared_exit_guard_ladders(&mut owned);
+    crate::ir::guard_chain::collapse_shared_assignment_guards(&mut owned);
+    crate::ir::guard_chain::collapse_redundant_copy_nested_guards(&mut owned);
+    crate::ir::guard_chain::collapse_nested_terminal_return_guards(&mut owned);
+    // Region recovery may clone a comparison tree's shared default into
+    // sequential terminal guards. Recover that switch before two-case tails
+    // become `Select` expressions and erase the final equality arms. The
+    // second invocation below remains necessary because select/copy folding can
+    // expose ladders whose discriminant was not yet syntactically uniform.
+    crate::ir::switch_ladder::recover_switches(&mut owned);
+    crate::ir::select_fold::collapse_assignment_diamonds(&mut owned);
+    crate::ir::guarded_call::materialize_false_edges(&mut owned);
+    crate::ir::lazy_call_select::collapse_lazy_call_diamonds_with_pointer_width(
+        &mut owned,
+        pointer_width,
+    );
+    crate::ir::select_fold::recover_guarded_select_returns(&mut owned);
+    crate::ir::select_fold::fold_boolean_masks(&mut owned);
+    // Runs after every producer of `Select`, including the lifters. ARM32
+    // predicated execution emits the guard twice — `(C ? (C ? x : prior) : y)` —
+    // and the inner alternative is unreachable because the enclosing arm already
+    // decided `C`. Dominance, not definedness: the arm being dropped may well be
+    // a defined value, it simply cannot be selected.
+    match authority {
+        PreparationAuthority::Identities(identities) => {
+            crate::ir::copy_prop::propagate_adjacent_promoted_values_with_identities(
+                &mut owned, identities,
+            )
+        }
+        #[cfg(test)]
+        PreparationAuthority::LegacySpelling => {
+            crate::ir::copy_prop::propagate_adjacent_promoted_values(&mut owned)
+        }
+    }
+    match authority {
+        PreparationAuthority::Identities(identities) => {
+            crate::ir::copy_prop::propagate_adjacent_guard_values_with_identities(
+                &mut owned, identities,
+            )
+        }
+        #[cfg(test)]
+        PreparationAuthority::LegacySpelling => {
+            crate::ir::copy_prop::propagate_adjacent_guard_values(&mut owned)
+        }
+    }
+    match authority {
+        PreparationAuthority::Identities(identities) => {
+            crate::ir::copy_prop::propagate_adjacent_overwritten_values_with_identities(
+                &mut owned, identities,
+            )
+        }
+        #[cfg(test)]
+        PreparationAuthority::LegacySpelling => {
+            crate::ir::copy_prop::propagate_adjacent_overwritten_values(&mut owned)
+        }
+    }
+    crate::ir::terminal_loop::recover_terminal_self_loops(&mut owned);
+    // Recover shared return epilogues before general forward joins. Otherwise a
+    // goto from a loop to `return -1` is faithfully but less clearly rendered
+    // as `break; ... return -1` instead of the exact early return.
+    crate::ir::label_prune::inline_terminal_goto_tails(&mut owned);
+    // A forward join may contain a still-linearised inner loop, while removing
+    // that join can in turn expose the enclosing linear latch. Two bounded
+    // rounds recover inner loop -> forward join -> outer loop without relaxing
+    // either pass's internal-label rejection.
+    let forward_regions_and_loops = run_bounded_fixpoint(2, || {
+        let exits_changed = crate::ir::label_prune::recover_forward_exit_regions(&mut owned);
+        let loops_changed = crate::ir::loop_form::recover_linear_latched_do_whiles(&mut owned);
+        exits_changed || loops_changed
+    });
+    // Forward-region recovery can be the step that finally turns a linear
+    // call/constant join into an ordinary two-arm assignment. Form the lazy
+    // select now, then MOVE its effectful scratch value into an adjacent sole
+    // consumer. Ordinary copy propagation may duplicate pure expressions, but
+    // an Expr::Call must retain exactly one evaluation.
+    crate::ir::select_fold::collapse_assignment_diamonds(&mut owned);
+    match authority {
+        PreparationAuthority::Identities(identities) => {
+            crate::ir::copy_prop::move_adjacent_effectful_scratch_values_with_identities(
+                &mut owned, identities,
+            )
+        }
+        #[cfg(test)]
+        PreparationAuthority::LegacySpelling => {
+            crate::ir::copy_prop::move_adjacent_effectful_scratch_values(&mut owned)
+        }
+    }
+    // Inlining a shared terminal epilogue can leave its old fallthrough
+    // assignment after an explicit return. Remove that newly unreachable tail
+    // before exact sentinel-loop matching; it is not an effect the candidate
+    // should have to tolerate, but it also must not block a faithful rewrite.
+    crate::ir::label_prune::prune_unreachable_tails(&mut owned);
+    crate::ir::loop_form::recover_head_tested_whiles(&mut owned);
+    crate::ir::loop_form::recover_guarded_do_whiles(&mut owned);
+    crate::ir::loop_form::recover_sentinel_search_loops(&mut owned);
+    crate::ir::guard_chain::collapse_adjacent_break_guards(&mut owned);
+    crate::ir::guard_chain::collapse_nested_terminal_return_guards(&mut owned);
+    // Before rendering and before widening (which already understands `Switch`):
+    // a gcc -O0 comparison ladder is a `switch`, not a nest of `if`s and `goto`s.
+    crate::ir::switch_ladder::recover_switches(&mut owned);
+    match authority {
+        PreparationAuthority::Identities(identities) => {
+            crate::ir::guarded_switch::collapse_range_guards_with_identities(&mut owned, identities)
+        }
+        #[cfg(test)]
+        PreparationAuthority::LegacySpelling => {
+            crate::ir::guarded_switch::collapse_range_guards(&mut owned)
+        }
+    }
+    // Removing a proven range guard can make a prefix copy dominate the switch
+    // directly. Carry only those aliases into the switch arms. A general late
+    // copy-propagation rerun is unsound here: loops have already been recovered,
+    // and a pre-loop snapshot may depend on a value changed by the loop body.
+    match authority {
+        PreparationAuthority::Identities(identities) => {
+            crate::ir::copy_prop::propagate_switch_entry_copies_with_identities(
+                &mut owned, identities,
+            )
+        }
+        #[cfg(test)]
+        PreparationAuthority::LegacySpelling => {
+            crate::ir::copy_prop::propagate_switch_entry_copies(&mut owned)
+        }
+    }
+    match authority {
+        PreparationAuthority::Identities(identities) => {
+            fold_exhaustive_if_returns_with_identities(&mut owned, identities);
+            fold_exhaustive_switch_returns_with_identities(&mut owned, identities);
+        }
+        #[cfg(test)]
+        PreparationAuthority::LegacySpelling => {
+            fold_exhaustive_if_returns(&mut owned);
+            fold_exhaustive_switch_returns(&mut owned);
+        }
+    }
+    match authority {
+        PreparationAuthority::Identities(identities) => {
+            crate::ir::loop_form::promote_for_loops_with_identities(&mut owned, identities)
+        }
+        #[cfg(test)]
+        PreparationAuthority::LegacySpelling => crate::ir::loop_form::promote_for_loops(&mut owned),
+    }
+    // Loop promotion can expose sequential terminal guards that were nested in
+    // the recovered CFG during the earlier pass. Fuse that final exact shape
+    // as well; the transformation is adjacency-checked and idempotent.
+    crate::ir::guard_chain::collapse_adjacent_break_guards(&mut owned);
+    crate::ir::guard_chain::collapse_redundant_copy_nested_guards(&mut owned);
+    crate::ir::guard_chain::collapse_adjacent_matching_return_guards(&mut owned);
+    crate::ir::guard_chain::collapse_matching_terminal_return_guard(&mut owned);
+    // Late copy/guard folding can make an entry-owned do-while's initial and
+    // latch predicates structurally identical only after the first loop-form
+    // pass. The recovery is exact and idempotent; rerun it on the final AST so
+    // phi-coalesced cursors retain their source-level pre-test.
+    crate::ir::loop_form::recover_guarded_do_whiles(&mut owned);
+    crate::ir::latch_predicate::fold_latched_predicates(&mut owned);
+    // A verified join can remain after several closing braces. Branch-final
+    // gotos to that exact lexical successor carry no control information and
+    // only make otherwise structured output look unstructured.
+    crate::ir::label_prune::prune_structured_fallthrough_gotos(&mut owned);
+    match authority {
+        PreparationAuthority::Identities(identities) => {
+            remove_redundant_return_constant_assignments_with_identities(
+                &mut owned.body,
+                identities,
+            )
+        }
+        #[cfg(test)]
+        PreparationAuthority::LegacySpelling => {
+            remove_redundant_return_constant_assignments(&mut owned.body)
+        }
+    }
+    // Return normalization above is what can finally turn two machine-shaped
+    // `result = literal; return result` arms into adjacent identical source
+    // returns. Fuse at that newly exposed boundary as well.
+    crate::ir::guard_chain::collapse_adjacent_matching_return_guards(&mut owned);
+    drop_machine_frame_comments(&mut owned.body);
+    // A call result consumed exactly once by the immediately following scalar
+    // assignment is a source expression, not a standalone temporary. Move the
+    // call into that consumer after control flow is final so no transformation
+    // can duplicate or reorder the effect.
+    match authority {
+        PreparationAuthority::Identities(identities) => {
+            crate::ir::lazy_call_select::fold_adjacent_single_use_call_results_with_identities(
+                &mut owned,
+                pointer_width,
+                identities,
+            )
+        }
+        #[cfg(test)]
+        PreparationAuthority::LegacySpelling => {
+            crate::ir::lazy_call_select::fold_adjacent_single_use_call_results(
+                &mut owned,
+                pointer_width,
+            )
+        }
+    }
+    // Calls are effects even when their ABI result is ignored. Remove only the
+    // unused destination identity so source output says `puts("...");` rather
+    // than inventing `var0 = puts("...");` and a declaration for `var0`.
+    crate::ir::dead_stores::drop_globally_unused_call_results(&mut owned);
+    // Clang -O0's unobserved `main` return slot is machine bookkeeping, not a
+    // source local. Drop only pure writes to unread anonymous promoted slots;
+    // authoritative debug locals remain protected.
+    match authority {
+        PreparationAuthority::Identities(identities) => {
+            crate::ir::direct_output::prune_unread_promoted_locals_with_identities(
+                &mut owned,
+                protected_locals,
+                identities,
+            )
+        }
+        #[cfg(test)]
+        PreparationAuthority::LegacySpelling => {
+            crate::ir::direct_output::prune_unread_promoted_locals(&mut owned, protected_locals)
+        }
+    }
+    if output_kind == crate::ir::types_recover::RecoveredOutputKind::Void {
+        crate::ir::direct_output::prune_void_fallthrough_return(&mut owned);
+    }
+    (
+        owned,
+        AstPreparationReport {
+            copies_and_constants,
+            forward_regions_and_loops,
+        },
+    )
+}
+
+#[cfg(test)]
+mod fixpoint_tests {
+    use super::{
+        drop_machine_frame_comments, run_bounded_fixpoint,
+        settle_copies_and_constants_with_identities, FixpointReport, FixpointTermination,
+    };
+    use crate::ir::ast::{Expr, Function, OriginSet, Stmt};
+    use crate::ir::types::VReg;
+    use crate::ir::value_number::ValueIdentities;
+
+    #[test]
+    fn bounded_fixpoint_records_quiescent_termination_and_firings() {
+        let mut remaining_changes: usize = 2;
+        let report = run_bounded_fixpoint(8, || {
+            let changed = remaining_changes != 0;
+            remaining_changes = remaining_changes.saturating_sub(1);
+            changed
+        });
+
+        assert_eq!(
+            report,
+            FixpointReport {
+                rounds: 3,
+                firing_rounds: 2,
+                termination: FixpointTermination::Quiescent,
+            }
+        );
+    }
+
+    #[test]
+    fn bounded_fixpoint_records_that_the_safety_bound_fired() {
+        let report = run_bounded_fixpoint(3, || true);
+
+        assert_eq!(
+            report,
+            FixpointReport {
+                rounds: 3,
+                firing_rounds: 3,
+                termination: FixpointTermination::BoundReached,
+            }
+        );
+    }
+
+    #[test]
+    fn attributed_machine_frame_markers_become_owned_inert_nodes() {
+        let owner = OriginSet::one(0x1010);
+        let nested_owner = OriginSet::one(0x1020);
+        let mut body = vec![
+            Stmt::Comment("x86-64 prologue: frame".into()).with_origins(owner.clone()),
+            Stmt::While {
+                cond: crate::ir::ast::Expr::Const(1),
+                body: vec![Stmt::Comment("x86-64 epilogue: frame".into())
+                    .with_origins(nested_owner.clone())],
+            },
+            Stmt::Comment("ordinary analyst note".into()),
+        ];
+
+        drop_machine_frame_comments(&mut body);
+
+        assert!(matches!(body[0].semantic(), Stmt::Nop));
+        assert_eq!(body[0].origins(), Some(&owner));
+        let Stmt::While { body: nested, .. } = body[1].semantic() else {
+            panic!("loop disappeared: {body:#?}");
+        };
+        assert!(matches!(nested[0].semantic(), Stmt::Nop));
+        assert_eq!(nested[0].origins(), Some(&nested_owner));
+        assert!(matches!(body[2].semantic(), Stmt::Comment(_)));
+    }
+
+    #[test]
+    fn preparation_fixpoint_uses_promoted_storage_identity() {
+        let object = "opaque-frame-object".to_string();
+        let mut identities = ValueIdentities::default();
+        identities.attach_promoted_stack_objects([&object]);
+        let mut function = Function {
+            name: "owned_storage".to_string(),
+            entry_va: 0,
+            body: vec![
+                Stmt::Assign {
+                    dst: VReg::phys(&object),
+                    src: Expr::Const(7),
+                },
+                Stmt::Return { value: None },
+            ],
+        };
+
+        settle_copies_and_constants_with_identities(&mut function, &identities);
+
+        assert_eq!(function.body.len(), 2);
+        assert!(matches!(
+            &function.body[0],
+            Stmt::Assign {
+                dst: VReg::Phys(destination),
+                src: Expr::Const(7),
+            } if destination == &object
+        ));
+    }
+}

@@ -1,0 +1,373 @@
+//! Section type for file-format organizational units.
+//!
+//! Sections represent file-format organizational units in binary analysis.
+//! They correspond to sections in executable formats like ELF, PE, etc.
+
+#[cfg(feature = "python-ext")]
+use pyo3::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+
+use crate::core::address::{Address, AddressKind};
+use crate::core::address_range::AddressRange;
+
+/// Permission flags for sections (simplified bit operations)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "python-ext", pyclass)]
+pub struct SectionPerms {
+    /// Raw permission bits: read=1, write=2, execute=4
+    pub bits: u8,
+}
+
+impl SectionPerms {
+    /// Create a new SectionPerms instance (pure Rust)
+    pub fn new(read: bool, write: bool, execute: bool) -> Self {
+        let mut bits = 0u8;
+        if read {
+            bits |= 1;
+        }
+        if write {
+            bits |= 2;
+        }
+        if execute {
+            bits |= 4;
+        }
+        Self { bits }
+    }
+
+    /// Check if section has read permission
+    pub fn has_read(&self) -> bool {
+        (self.bits & 1) != 0
+    }
+
+    /// Check if section has write permission
+    pub fn has_write(&self) -> bool {
+        (self.bits & 2) != 0
+    }
+
+    /// Check if section has execute permission
+    pub fn has_execute(&self) -> bool {
+        (self.bits & 4) != 0
+    }
+
+    /// Check if section is readable and writable (data section)
+    pub fn is_data(&self) -> bool {
+        self.has_read() && self.has_write() && !self.has_execute()
+    }
+
+    /// Check if section is readable and executable (code section)
+    pub fn is_code(&self) -> bool {
+        self.has_read() && self.has_execute() && !self.has_write()
+    }
+
+    /// Check if section is read-only
+    pub fn is_readonly(&self) -> bool {
+        self.has_read() && !self.has_write() && !self.has_execute()
+    }
+}
+
+#[cfg(feature = "python-ext")]
+#[pymethods]
+impl SectionPerms {
+    /// String representation for display
+    fn __str__(&self) -> String {
+        format!("{}", self)
+    }
+
+    /// Python constructor
+    #[new]
+    #[pyo3(signature = (read, write, execute))]
+    fn new_py(read: bool, write: bool, execute: bool) -> Self {
+        Self::new(read, write, execute)
+    }
+
+    // Methods exposed to Python
+    #[pyo3(name = "has_read")]
+    fn has_read_py(&self) -> bool {
+        (self.bits & 1) != 0
+    }
+    #[pyo3(name = "has_write")]
+    fn has_write_py(&self) -> bool {
+        (self.bits & 2) != 0
+    }
+    #[pyo3(name = "has_execute")]
+    fn has_execute_py(&self) -> bool {
+        (self.bits & 4) != 0
+    }
+    #[pyo3(name = "is_code")]
+    fn is_code_py(&self) -> bool {
+        self.has_read_py() && self.has_execute_py() && !self.has_write_py()
+    }
+    #[pyo3(name = "is_data")]
+    fn is_data_py(&self) -> bool {
+        self.has_read_py() && self.has_write_py() && !self.has_execute_py()
+    }
+    #[pyo3(name = "is_readonly")]
+    fn is_readonly_py(&self) -> bool {
+        self.has_read_py() && !self.has_write_py() && !self.has_execute_py()
+    }
+}
+
+impl fmt::Display for SectionPerms {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut perms = String::new();
+        perms.push(if self.has_read() { 'r' } else { '-' });
+        perms.push(if self.has_write() { 'w' } else { '-' });
+        perms.push(if self.has_execute() { 'x' } else { '-' });
+        write!(f, "{}", perms)
+    }
+}
+
+/// Section type as a string (simplified for now)
+pub type SectionType = String;
+
+/// File-format organizational unit
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "python-ext", pyclass)]
+pub struct Section {
+    /// Unique identifier for the section
+    pub id: String,
+    /// Section name (e.g., ".text", ".data")
+    pub name: String,
+    /// Virtual address range where section is mapped
+    pub range: AddressRange,
+    /// Optional memory permissions for the section
+    pub perms: Option<SectionPerms>,
+    /// Format-specific flags
+    pub flags: u64,
+    /// Optional section type
+    pub section_type: Option<SectionType>,
+    /// File offset where section data begins
+    pub file_offset: Address,
+}
+
+impl Section {
+    /// Create a new Section instance (pure Rust)
+    pub fn new(
+        id: String,
+        name: String,
+        range: AddressRange,
+        file_offset: Address,
+        perms: Option<SectionPerms>,
+        flags: u64,
+        section_type: Option<SectionType>,
+    ) -> Result<Self, String> {
+        // Basic validation
+        if file_offset.kind != AddressKind::FileOffset {
+            return Err("file_offset must have AddressKind::FileOffset".to_string());
+        }
+
+        // For sections, range can be VA or RVA depending on format
+        if range.start.kind != AddressKind::VA && range.start.kind != AddressKind::RVA {
+            return Err(
+                "range addresses must have AddressKind::VA or AddressKind::RVA for sections"
+                    .to_string(),
+            );
+        }
+
+        Ok(Self {
+            id,
+            name,
+            range,
+            perms,
+            flags,
+            section_type,
+            file_offset,
+        })
+    }
+
+    /// Get the section size in bytes
+    pub fn size(&self) -> u64 {
+        self.range.size
+    }
+
+    /// Check if section is a code section (readable and executable)
+    pub fn is_code_section(&self) -> bool {
+        self.perms.as_ref().map(|p| p.is_code()).unwrap_or(false)
+    }
+
+    /// Check if section is a data section (readable and writable)
+    pub fn is_data_section(&self) -> bool {
+        self.perms.as_ref().map(|p| p.is_data()).unwrap_or(false)
+    }
+
+    /// Check if section is read-only
+    pub fn is_readonly(&self) -> bool {
+        self.perms
+            .as_ref()
+            .map(|p| p.is_readonly())
+            .unwrap_or(false)
+    }
+
+    /// Check if section contains executable code
+    pub fn is_executable(&self) -> bool {
+        self.perms
+            .as_ref()
+            .map(|p| p.has_execute())
+            .unwrap_or(false)
+    }
+
+    /// Check if section is writable
+    pub fn is_writable(&self) -> bool {
+        self.perms.as_ref().map(|p| p.has_write()).unwrap_or(false)
+    }
+
+    /// Get a human-readable description of the section
+    pub fn description(&self) -> String {
+        let perms_str = self
+            .perms
+            .as_ref()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "---".to_string());
+        let type_str = self
+            .section_type
+            .as_ref()
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        format!(
+            "Section '{}' ({}, size: {} bytes, perms: {}, type: {})",
+            self.name,
+            self.id,
+            self.size(),
+            perms_str,
+            type_str
+        )
+    }
+}
+
+#[cfg(feature = "python-ext")]
+#[pymethods]
+impl Section {
+    /// Create a new Section instance (Python constructor)
+    #[new]
+    #[pyo3(signature = (id, name, range, file_offset, perms=None, flags=0, section_type=None))]
+    pub fn new_py(
+        id: String,
+        name: String,
+        range: AddressRange,
+        file_offset: Address,
+        perms: Option<SectionPerms>,
+        flags: u64,
+        section_type: Option<SectionType>,
+    ) -> PyResult<Self> {
+        Self::new(id, name, range, file_offset, perms, flags, section_type)
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+    }
+
+    /// String representation for display
+    fn __str__(&self) -> String {
+        format!("{}", self)
+    }
+
+    // Property getters
+    #[getter]
+    fn id(&self) -> &str {
+        &self.id
+    }
+    #[getter]
+    fn name(&self) -> &str {
+        &self.name
+    }
+    #[getter]
+    fn range(&self) -> AddressRange {
+        self.range.clone()
+    }
+    #[getter]
+    fn perms(&self) -> Option<SectionPerms> {
+        self.perms
+    }
+    #[getter]
+    fn flags(&self) -> u64 {
+        self.flags
+    }
+    #[getter]
+    fn section_type(&self) -> Option<String> {
+        self.section_type.clone()
+    }
+    #[getter]
+    fn file_offset(&self) -> Address {
+        self.file_offset.clone()
+    }
+
+    // Query helpers
+    #[pyo3(name = "size")]
+    fn size_py(&self) -> u64 {
+        self.range.size
+    }
+    #[pyo3(name = "is_code_section")]
+    fn is_code_section_py(&self) -> bool {
+        self.perms.as_ref().map(|p| p.is_code()).unwrap_or(false)
+    }
+    #[pyo3(name = "is_data_section")]
+    fn is_data_section_py(&self) -> bool {
+        self.perms.as_ref().map(|p| p.is_data()).unwrap_or(false)
+    }
+    #[pyo3(name = "is_readonly")]
+    fn is_readonly_py(&self) -> bool {
+        self.perms
+            .as_ref()
+            .map(|p| p.is_readonly())
+            .unwrap_or(false)
+    }
+    #[pyo3(name = "is_executable")]
+    fn is_executable_py(&self) -> bool {
+        self.perms
+            .as_ref()
+            .map(|p| p.has_execute())
+            .unwrap_or(false)
+    }
+    #[pyo3(name = "is_writable")]
+    fn is_writable_py(&self) -> bool {
+        self.perms.as_ref().map(|p| p.has_write()).unwrap_or(false)
+    }
+    #[pyo3(name = "description")]
+    fn description_py(&self) -> String {
+        self.description()
+    }
+}
+
+impl fmt::Display for Section {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Section '{}' ({})", self.name, self.id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::address::{Address, AddressKind};
+
+    #[test]
+    fn test_section_perms_creation() {
+        let perms = SectionPerms::new(true, false, true);
+        assert!(perms.has_read());
+        assert!(!perms.has_write());
+        assert!(perms.has_execute());
+        assert_eq!(format!("{}", perms), "r-x");
+    }
+
+    #[test]
+    fn test_section_creation() {
+        let start = Address::new(AddressKind::VA, 0x400000, 64, None, None).unwrap();
+        let range = AddressRange::new(start, 0x1000, Some(0x1000)).unwrap();
+        let file_offset = Address::new(AddressKind::FileOffset, 0x1000, 64, None, None).unwrap();
+        let perms = SectionPerms::new(true, false, true);
+        let section_type = "PROGBITS".to_string();
+
+        let section = Section::new(
+            "text_section".to_string(),
+            ".text".to_string(),
+            range,
+            file_offset,
+            Some(perms),
+            0x6, // ALLOC | EXEC
+            Some(section_type),
+        )
+        .unwrap();
+
+        assert_eq!(section.id, "text_section");
+        assert_eq!(section.name, ".text");
+        assert_eq!(section.size(), 0x1000);
+        assert!(section.is_code_section());
+    }
+}

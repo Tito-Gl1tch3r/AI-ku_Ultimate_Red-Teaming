@@ -1,0 +1,577 @@
+//! Translation of glaurung's [`Expr`] IR into `axeyum-ir` terms.
+//!
+//! [`Translator`] walks one expression DAG against a shared [`TermArena`],
+//! memoizing by [`ExprId`] so a shared subexpression is built once, and
+//! interning each symbolic input as a `SymbolId` recorded in `sym_map` for
+//! model lift-back. Widths follow glaurung's `Expr` exactly; nothing here
+//! widens, narrows or folds on its own.
+//!
+//! Both entry points live here because both construct a [`Translator`]
+//! directly: `translate_query` for the query-plus-symbol-map shape the one-shot
+//! and snapshot backends want, `translate_path` for the bare arena-plus-terms
+//! shape the unsat-proof path wants.
+
+use super::*;
+
+use crate::exec::concrete::{shift_reduction, ShiftReduction, DIVIDE_BY_ZERO_QUOTIENT};
+use crate::ir::types::Width;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct StableExprId(usize);
+
+/// Exact pool-independent expression identity within one retained arena.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum StableExprNode {
+    Const {
+        value: u128,
+        width: Width,
+    },
+    Sym {
+        id: u32,
+        width: Width,
+    },
+    Bin {
+        op: BinOp,
+        a: StableExprId,
+        b: StableExprId,
+        width: Width,
+    },
+    Un {
+        op: UnOp,
+        a: StableExprId,
+        width: Width,
+    },
+    Cmp {
+        op: CmpOp,
+        a: StableExprId,
+        b: StableExprId,
+        width: Width,
+    },
+    ZExt {
+        a: StableExprId,
+        from: Width,
+        to: Width,
+    },
+    SExt {
+        a: StableExprId,
+        from: Width,
+        to: Width,
+    },
+    Trunc {
+        a: StableExprId,
+        to: Width,
+    },
+    Extract {
+        a: StableExprId,
+        hi: u16,
+        lo: u16,
+    },
+    Concat {
+        hi: StableExprId,
+        lo: StableExprId,
+        hi_w: Width,
+        lo_w: Width,
+    },
+    Ite {
+        c: StableExprId,
+        t: StableExprId,
+        e: StableExprId,
+        width: Width,
+    },
+}
+
+/// Session-local mapping from exact Glaurung structure to arena-owned terms.
+/// It is dropped with the arena, so cached `TermId`s cannot cross sessions.
+#[derive(Debug, Default)]
+pub(super) struct StableTermCache {
+    nodes: HashMap<StableExprNode, StableExprId>,
+    terms: HashMap<StableExprId, TermId>,
+    assertions: HashMap<(StableExprId, bool), TermId>,
+}
+
+impl StableTermCache {
+    fn intern(&mut self, node: StableExprNode) -> StableExprId {
+        if let Some(id) = self.nodes.get(&node) {
+            return *id;
+        }
+        let id = StableExprId(self.nodes.len());
+        self.nodes.insert(node, id);
+        id
+    }
+
+    pub(super) fn stats(&self) -> (usize, usize, usize) {
+        (self.nodes.len(), self.terms.len(), self.assertions.len())
+    }
+}
+
+pub(super) fn translate_query(
+    pool: &ExprPool,
+    asserts: &[Assert],
+    arena: &mut TermArena,
+) -> Result<TranslatedQuery, IrError> {
+    let mut translator = Translator {
+        pool,
+        arena,
+        memo: HashMap::new(),
+        semantic_memo: HashMap::new(),
+        stable_cache: None,
+        sym_map: Vec::new(),
+        stable_term_hits: 0,
+        stable_assertion_hits: 0,
+    };
+    let mut assertions = Vec::with_capacity(asserts.len());
+    for &(expr, expected) in asserts {
+        assertions.push(translator.translate_assert(expr, expected)?);
+    }
+    Ok(TranslatedQuery {
+        assertions,
+        exprs: translator.memo.len(),
+        sym_map: translator.sym_map,
+        stable_term_hits: translator.stable_term_hits,
+        stable_assertion_hits: translator.stable_assertion_hits,
+    })
+}
+
+pub(super) fn translate_query_cached(
+    pool: &ExprPool,
+    asserts: &[Assert],
+    arena: &mut TermArena,
+    stable_cache: &mut StableTermCache,
+) -> Result<TranslatedQuery, IrError> {
+    let mut translator = Translator {
+        pool,
+        arena,
+        memo: HashMap::new(),
+        semantic_memo: HashMap::new(),
+        stable_cache: Some(stable_cache),
+        sym_map: Vec::new(),
+        stable_term_hits: 0,
+        stable_assertion_hits: 0,
+    };
+    let mut assertions = Vec::with_capacity(asserts.len());
+    for &(expr, expected) in asserts {
+        assertions.push(translator.translate_assert(expr, expected)?);
+    }
+    Ok(TranslatedQuery {
+        assertions,
+        exprs: translator.memo.len(),
+        sym_map: translator.sym_map,
+        stable_term_hits: translator.stable_term_hits,
+        stable_assertion_hits: translator.stable_assertion_hits,
+    })
+}
+
+pub(super) fn translate_path(
+    pool: &ExprPool,
+    asserts: &[Assert],
+) -> Result<(TermArena, Vec<TermId>), IrError> {
+    let mut arena = TermArena::new();
+    let assert_terms = {
+        let mut translator = Translator {
+            pool,
+            arena: &mut arena,
+            memo: HashMap::new(),
+            semantic_memo: HashMap::new(),
+            stable_cache: None,
+            sym_map: Vec::new(),
+            stable_term_hits: 0,
+            stable_assertion_hits: 0,
+        };
+        let mut terms = Vec::with_capacity(asserts.len());
+        for &(expression, expected) in asserts {
+            terms.push(translator.translate_assert(expression, expected)?);
+        }
+        terms
+    };
+    Ok((arena, assert_terms))
+}
+
+/// Translates glaurung's hash-consed BV IR into `axeyum-ir` terms, memoized
+/// on `ExprId` so shared subterms are built once (preserving glaurung's
+/// interning into axeyum's arena). Every `Expr` node maps to an axeyum
+/// `BitVec` term; Bool is touched only at the three boundaries described in
+/// `docs/architecture/solver/interface-mapping.md` (Cmp lift, Ite cond,
+/// assert truthiness).
+pub(super) struct Translator<'a> {
+    pool: &'a ExprPool,
+    arena: &'a mut TermArena,
+    memo: HashMap<ExprId, TermId>,
+    semantic_memo: HashMap<ExprId, StableExprId>,
+    stable_cache: Option<&'a mut StableTermCache>,
+    sym_map: Vec<(u32, SymbolId)>,
+    stable_term_hits: usize,
+    stable_assertion_hits: usize,
+}
+
+impl<'a> Translator<'a> {
+    /// Build the Bool assertion term for `(e, expected)`, mirroring z3's
+    /// truthiness lowering: `e != 0` when expected, `e == 0` otherwise.
+    fn translate_assert(&mut self, e: ExprId, expected: bool) -> Result<TermId, IrError> {
+        let semantic = self.semantic_id_if_cached(e);
+        if let Some(term) = semantic.and_then(|id| {
+            self.stable_cache
+                .as_deref()
+                .and_then(|cache| cache.assertions.get(&(id, expected)).copied())
+        }) {
+            self.record_symbols(e)?;
+            self.stable_assertion_hits = self.stable_assertion_hits.saturating_add(1);
+            return Ok(term);
+        }
+        let t = self.translate(e)?;
+        let w = self.pool.width_of(e).bits() as u32;
+        let zero = self.arena.bv_const(w, 0)?;
+        let is_zero = self.arena.eq(t, zero)?; // Bool: e == 0
+        let assertion = if expected {
+            self.arena.not(is_zero) // Bool: e != 0
+        } else {
+            Ok(is_zero)
+        }?;
+        if let (Some(cache), Some(id)) = (self.stable_cache.as_deref_mut(), semantic) {
+            cache.assertions.insert((id, expected), assertion);
+        }
+        Ok(assertion)
+    }
+
+    /// The shift distance reduced to `width`, exactly as
+    /// `crate::exec::Concrete` reduces it. The decision is
+    /// [`shift_reduction`]'s; only the rendering is axeyum's.
+    fn reduce_shift_distance(&mut self, distance: TermId, width: Width) -> Result<TermId, IrError> {
+        let bits = width.bits() as u32;
+        match shift_reduction(width) {
+            ShiftReduction::Mask(mask) => {
+                let m = self.arena.bv_const(bits, mask)?;
+                self.arena.bv_and(distance, m)
+            }
+            ShiftReduction::Modulo(modulus) => {
+                let m = self.arena.bv_const(bits, modulus)?;
+                self.arena.bv_urem(distance, m)
+            }
+            ShiftReduction::Passthrough => Ok(distance),
+        }
+    }
+
+    /// Translate a glaurung `ExprId` to an axeyum `BitVec` term.
+    fn translate(&mut self, id: ExprId) -> Result<TermId, IrError> {
+        if let Some(&t) = self.memo.get(&id) {
+            return Ok(t);
+        }
+        let semantic = self.semantic_id_if_cached(id);
+        if let Some(term) = semantic.and_then(|stable| {
+            self.stable_cache
+                .as_deref()
+                .and_then(|cache| cache.terms.get(&stable).copied())
+        }) {
+            self.record_symbols(id)?;
+            self.memo.insert(id, term);
+            self.stable_term_hits = self.stable_term_hits.saturating_add(1);
+            return Ok(term);
+        }
+        // Clone the node so the immutable pool borrow is released before we
+        // mutate the arena / recurse.
+        let node = self.pool.get(id).clone();
+        let t = match node {
+            Expr::Const { value, width } => {
+                let w = width.bits() as u32;
+                if w > 128 {
+                    self.arena.wide_bv_const(WideUint::from_u128(value, w))
+                } else {
+                    // Mask to width, matching glaurung's `ExprPool::constant`
+                    // and z3_backend (both drop bits above the width).
+                    // axeyum's `bv_const` strictly rejects an over-wide value,
+                    // so masking keeps the two backends behaviorally identical.
+                    let masked = if w >= 128 {
+                        value
+                    } else {
+                        value & ((1u128 << w) - 1)
+                    };
+                    self.arena.bv_const(w, masked)?
+                }
+            }
+            Expr::Sym { id: sid, width } => {
+                let symid = self.record_symbol(sid, width)?;
+                self.arena.var(symid)
+            }
+            Expr::Bin { op, a, b, width } => {
+                // Coerce both operands to the node width, exactly as
+                // z3_backend does: glaurung's lifter emits width-mismatched
+                // operands and relies on the solver to normalize. axeyum
+                // strictly requires a shared sort, so we MUST coerce here.
+                let tw = width.bits() as u32;
+                let ta = self.translate_coerced(a, tw)?;
+                let tb = self.translate_coerced(b, tw)?;
+                match op {
+                    BinOp::Add => self.arena.bv_add(ta, tb)?,
+                    BinOp::Sub => self.arena.bv_sub(ta, tb)?,
+                    BinOp::Mul => self.arena.bv_mul(ta, tb)?,
+                    // glaurung Div is unsigned, and `bv_udiv` by zero is
+                    // all-ones while `crate::exec::Concrete` yields
+                    // `DIVIDE_BY_ZERO_QUOTIENT`. Guard it so the solver is
+                    // asked about the function the executor runs: an `unsat`
+                    // carries no model, so nothing downstream can replay away a
+                    // miter that was unsatisfiable only because the two
+                    // disagreed. Term-for-term the same shape as z3_backend and
+                    // `ExprPool::render_bin`.
+                    BinOp::Div => {
+                        let zero = self.arena.bv_const(tw, 0)?;
+                        let fault = self.arena.bv_const(tw, DIVIDE_BY_ZERO_QUOTIENT)?;
+                        let quotient = self.arena.bv_udiv(ta, tb)?;
+                        let divides_by_zero = self.arena.eq(tb, zero)?;
+                        self.arena.ite(divides_by_zero, fault, quotient)?
+                    }
+                    BinOp::And => self.arena.bv_and(ta, tb)?,
+                    BinOp::Or => self.arena.bv_or(ta, tb)?,
+                    BinOp::Xor => self.arena.bv_xor(ta, tb)?,
+                    // SMT-LIB shifts saturate once the distance reaches the
+                    // operand width; x86 `shl`/`shr`/`sar` and A64
+                    // `LSLV`/`LSRV`/`ASRV` take it modulo the width, and so
+                    // does the executor. `shift_reduction` is the one
+                    // definition of that rule; this renders its answer in
+                    // axeyum's API.
+                    BinOp::Shl => {
+                        let distance = self.reduce_shift_distance(tb, width)?;
+                        self.arena.bv_shl(ta, distance)?
+                    }
+                    BinOp::Shr => {
+                        let distance = self.reduce_shift_distance(tb, width)?;
+                        self.arena.bv_lshr(ta, distance)? // logical
+                    }
+                    BinOp::Sar => {
+                        let distance = self.reduce_shift_distance(tb, width)?;
+                        self.arena.bv_ashr(ta, distance)? // arithmetic
+                    }
+                    // Source-level `&&` / `||` are NOT bitvector ALU ops. They
+                    // booleanize both operands and yield 1 or 0 at the node
+                    // width. This mirrors `ExprPool::render_smtlib` term for
+                    // term -- `(ite (and (distinct a 0) (distinct b 0))
+                    // (_ bv1 W) (_ bv0 W))` -- and that identity is load
+                    // bearing: `ordered_replay` re-renders every imported
+                    // native assertion pack through the text bridge and
+                    // rejects the pack unless the two hash to the same
+                    // constraint, so a divergent lowering here would not be a
+                    // silent disagreement, it would break replay outright.
+                    //
+                    // Note the coercion order matters. `ta`/`tb` are already
+                    // narrowed/widened to `tw`, and truncation can turn a
+                    // non-zero value into zero, so the `!= 0` test must come
+                    // after the coercion exactly as the text renderer does it.
+                    BinOp::LogicalAnd | BinOp::LogicalOr => {
+                        let zero = self.arena.bv_const(tw, 0)?;
+                        let a_true = {
+                            let a_zero = self.arena.eq(ta, zero)?;
+                            self.arena.not(a_zero)?
+                        };
+                        let b_true = {
+                            let b_zero = self.arena.eq(tb, zero)?;
+                            self.arena.not(b_zero)?
+                        };
+                        let joined = if matches!(op, BinOp::LogicalAnd) {
+                            self.arena.and(a_true, b_true)?
+                        } else {
+                            self.arena.or(a_true, b_true)?
+                        };
+                        let one = self.arena.bv_const(tw, 1)?;
+                        self.arena.ite(joined, one, zero)?
+                    }
+                }
+            }
+            Expr::Un { op, a, .. } => {
+                let ta = self.translate(a)?;
+                match op {
+                    UnOp::Not => self.arena.bv_not(ta)?,
+                    UnOp::Neg => self.arena.bv_neg(ta)?,
+                }
+            }
+            Expr::Cmp { op, a, b, width } => {
+                // Cmp.width is the operand (comparison) width; coerce both.
+                let tw = width.bits() as u32;
+                let ta = self.translate_coerced(a, tw)?;
+                let tb = self.translate_coerced(b, tw)?;
+                let boolt = match op {
+                    CmpOp::Eq => self.arena.eq(ta, tb)?,
+                    CmpOp::Ne => {
+                        let e = self.arena.eq(ta, tb)?;
+                        self.arena.not(e)?
+                    }
+                    CmpOp::Ult => self.arena.bv_ult(ta, tb)?,
+                    CmpOp::Ule => self.arena.bv_ule(ta, tb)?,
+                    CmpOp::Slt => self.arena.bv_slt(ta, tb)?,
+                    CmpOp::Sle => self.arena.bv_sle(ta, tb)?,
+                };
+                // Lift Bool -> BitVec(1) so it composes like glaurung expects.
+                self.bv1_of_bool(boolt)?
+            }
+            Expr::ZExt { a, from, to } => {
+                let ta = self.translate_coerced(a, from.bits() as u32)?;
+                let by = (to.bits() as u32).saturating_sub(from.bits() as u32);
+                self.arena.zero_ext(by, ta)?
+            }
+            Expr::SExt { a, from, to } => {
+                let ta = self.translate_coerced(a, from.bits() as u32)?;
+                let by = (to.bits() as u32).saturating_sub(from.bits() as u32);
+                self.arena.sign_ext(by, ta)?
+            }
+            Expr::Trunc { a, to } => {
+                // Ensure the source is at least `to` bits, then take low bits.
+                let tw = to.bits() as u32;
+                let ta = self.translate_coerced(a, tw)?;
+                self.arena.extract(tw.saturating_sub(1), 0, ta)?
+            }
+            Expr::Extract { a, hi, lo } => {
+                // glaurung's `hi` is EXCLUSIVE (result width = hi - lo, byte
+                // extract of a 64-bit value is hi=64,lo=56); axeyum/SMT
+                // `extract(H,L)` is INCLUSIVE. glaurung's own z3/SMT lowering
+                // uses `hi - 1` as the inclusive top index -- mirror it. Also
+                // ensure the source is >= hi bits wide before extracting.
+                let ta = self.translate_coerced(a, hi as u32)?;
+                self.arena
+                    .extract((hi as u32).saturating_sub(1), lo as u32, ta)?
+            }
+            Expr::Concat { hi, lo, hi_w, lo_w } => {
+                let th = self.translate_coerced(hi, hi_w.bits() as u32)?;
+                let tl = self.translate_coerced(lo, lo_w.bits() as u32)?;
+                // SMT-LIB concat(a,b): a is the high half. glaurung Concat{hi,lo}.
+                self.arena.concat(th, tl)?
+            }
+            Expr::Ite { c, t, e, width } => {
+                let tw = width.bits() as u32;
+                let bc = self.to_bool(c)?;
+                let tt = self.translate_coerced(t, tw)?;
+                let te = self.translate_coerced(e, tw)?;
+                self.arena.ite(bc, tt, te)?
+            }
+        };
+        self.memo.insert(id, t);
+        if let (Some(cache), Some(stable)) = (self.stable_cache.as_deref_mut(), semantic) {
+            cache.terms.insert(stable, t);
+        }
+        Ok(t)
+    }
+
+    fn semantic_id_if_cached(&mut self, id: ExprId) -> Option<StableExprId> {
+        self.stable_cache.as_ref()?;
+        Some(self.semantic_id(id))
+    }
+
+    fn semantic_id(&mut self, id: ExprId) -> StableExprId {
+        if let Some(stable) = self.semantic_memo.get(&id) {
+            return *stable;
+        }
+        let node = match self.pool.get(id).clone() {
+            Expr::Const { value, width } => StableExprNode::Const { value, width },
+            Expr::Sym { id, width } => StableExprNode::Sym { id, width },
+            Expr::Bin { op, a, b, width } => StableExprNode::Bin {
+                op,
+                a: self.semantic_id(a),
+                b: self.semantic_id(b),
+                width,
+            },
+            Expr::Un { op, a, width } => StableExprNode::Un {
+                op,
+                a: self.semantic_id(a),
+                width,
+            },
+            Expr::Cmp { op, a, b, width } => StableExprNode::Cmp {
+                op,
+                a: self.semantic_id(a),
+                b: self.semantic_id(b),
+                width,
+            },
+            Expr::ZExt { a, from, to } => StableExprNode::ZExt {
+                a: self.semantic_id(a),
+                from,
+                to,
+            },
+            Expr::SExt { a, from, to } => StableExprNode::SExt {
+                a: self.semantic_id(a),
+                from,
+                to,
+            },
+            Expr::Trunc { a, to } => StableExprNode::Trunc {
+                a: self.semantic_id(a),
+                to,
+            },
+            Expr::Extract { a, hi, lo } => StableExprNode::Extract {
+                a: self.semantic_id(a),
+                hi,
+                lo,
+            },
+            Expr::Concat { hi, lo, hi_w, lo_w } => StableExprNode::Concat {
+                hi: self.semantic_id(hi),
+                lo: self.semantic_id(lo),
+                hi_w,
+                lo_w,
+            },
+            Expr::Ite { c, t, e, width } => StableExprNode::Ite {
+                c: self.semantic_id(c),
+                t: self.semantic_id(t),
+                e: self.semantic_id(e),
+                width,
+            },
+        };
+        let stable = self
+            .stable_cache
+            .as_deref_mut()
+            .expect("semantic IDs are requested only with a stable cache")
+            .intern(node);
+        self.semantic_memo.insert(id, stable);
+        stable
+    }
+
+    fn record_symbols(&mut self, root: ExprId) -> Result<(), IrError> {
+        let mut symbols = BTreeMap::new();
+        self.pool.collect_syms(root, &mut symbols);
+        for (id, width) in symbols {
+            self.record_symbol(id, width)?;
+        }
+        Ok(())
+    }
+
+    fn record_symbol(&mut self, id: u32, width: Width) -> Result<SymbolId, IrError> {
+        if let Some((_, symbol)) = self.sym_map.iter().find(|(existing, _)| *existing == id) {
+            return Ok(*symbol);
+        }
+        let name = ExprPool::sym_name(id, width);
+        let symbol = self
+            .arena
+            .declare(&name, Sort::BitVec(width.bits() as u32))?;
+        self.sym_map.push((id, symbol));
+        Ok(symbol)
+    }
+
+    /// Translate `id`, then coerce it to `target` bits (zero-extend if
+    /// narrower, truncate low bits if wider) -- mirroring z3_backend's
+    /// `coerce`, so width-mismatched operands from the lifter are normalized
+    /// to a shared sort before axeyum's strict builders see them.
+    fn translate_coerced(&mut self, id: ExprId, target: u32) -> Result<TermId, IrError> {
+        let t = self.translate(id)?;
+        let cur = self.pool.width_of(id).bits() as u32;
+        self.coerce(t, cur, target)
+    }
+
+    /// Coerce term `t` (currently `cur` bits) to `target` bits.
+    fn coerce(&mut self, t: TermId, cur: u32, target: u32) -> Result<TermId, IrError> {
+        if cur == target {
+            Ok(t)
+        } else if cur < target {
+            self.arena.zero_ext(target - cur, t)
+        } else {
+            self.arena.extract(target.saturating_sub(1), 0, t)
+        }
+    }
+
+    /// Lift a Bool term to a BitVec(1): `ite(b, 1, 0)`.
+    fn bv1_of_bool(&mut self, b: TermId) -> Result<TermId, IrError> {
+        let one = self.arena.bv_const(1, 1)?;
+        let zero = self.arena.bv_const(1, 0)?;
+        self.arena.ite(b, one, zero)
+    }
+
+    /// Convert a glaurung BV condition to an axeyum Bool: `c != 0`.
+    fn to_bool(&mut self, c: ExprId) -> Result<TermId, IrError> {
+        let tc = self.translate(c)?;
+        let w = self.pool.width_of(c).bits() as u32;
+        let zero = self.arena.bv_const(w, 0)?;
+        let is_zero = self.arena.eq(tc, zero)?;
+        self.arena.not(is_zero)
+    }
+}

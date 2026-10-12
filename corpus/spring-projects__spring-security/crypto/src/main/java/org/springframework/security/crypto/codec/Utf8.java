@@ -1,0 +1,89 @@
+/*
+ * Copyright 2004-present the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.springframework.security.crypto.codec;
+
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+
+import org.jspecify.annotations.Nullable;
+
+/**
+ * UTF-8 Charset encoder/decoder.
+ * <p>
+ * For internal use only.
+ *
+ * @author Luke Taylor
+ */
+public final class Utf8 {
+
+	private static final Charset CHARSET = StandardCharsets.UTF_8;
+
+	private Utf8() {
+	}
+
+	/**
+	 * Get the bytes of the String in UTF-8 encoded form.
+	 */
+	public static byte[] encode(CharSequence string) {
+		if (string == null) {
+			throw new IllegalArgumentException("String cannot be null");
+		}
+		try {
+			ByteBuffer bytes = CHARSET.newEncoder().encode(CharBuffer.wrap(string));
+			byte[] bytesCopy = new byte[bytes.limit()];
+			System.arraycopy(bytes.array(), 0, bytesCopy, 0, bytes.limit());
+			return bytesCopy;
+		}
+		catch (CharacterCodingException ex) {
+			throw new IllegalArgumentException("Encoding failed", ex);
+		}
+	}
+
+	/**
+	 * Decode the bytes in UTF-8 form into a String.
+	 */
+	public static String decode(byte[] bytes) {
+		try {
+			return CHARSET.newDecoder().decode(ByteBuffer.wrap(bytes)).toString();
+		}
+		catch (CharacterCodingException ex) {
+			throw new IllegalArgumentException("Decoding failed", ex);
+		}
+	}
+
+	/**
+	 * Constant time comparison to prevent against timing attacks.
+	 * @param expected the expected {@link CharSequence}
+	 * @param actual the actual {@link CharSequence}
+	 * @return true if {@code expected} and {@code actual} are equal, false otherwise
+	 * @since 5.7.26
+	 */
+	public static boolean isEqual(@Nullable CharSequence expected, @Nullable CharSequence actual) {
+		byte[] expectedBytes = bytesUtf8(expected);
+		byte[] actualBytes = bytesUtf8(actual);
+		return MessageDigest.isEqual(expectedBytes, actualBytes);
+	}
+
+	private static byte @Nullable [] bytesUtf8(@Nullable CharSequence s) {
+		return (s != null) ? Utf8.encode(s) : null;
+	}
+
+}

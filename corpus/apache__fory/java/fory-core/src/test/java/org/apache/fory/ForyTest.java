@@ -1,0 +1,983 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.fory;
+
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertNull;
+import static org.testng.Assert.assertThrows;
+import static org.testng.Assert.assertTrue;
+
+import com.google.common.collect.HashBasedTable;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import java.io.Serializable;
+import java.lang.invoke.MethodHandles;
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.nio.ByteBuffer;
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.StringTokenizer;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.UUID;
+import java.util.WeakHashMap;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import org.apache.fory.annotation.Expose;
+import org.apache.fory.annotation.Ignore;
+import org.apache.fory.builder.Generated;
+import org.apache.fory.config.ForyBuilder;
+import org.apache.fory.context.MetaReadContext;
+import org.apache.fory.context.MetaWriteContext;
+import org.apache.fory.context.ReadContext;
+import org.apache.fory.context.WriteContext;
+import org.apache.fory.exception.ForyException;
+import org.apache.fory.exception.InsecureException;
+import org.apache.fory.exception.SerializationException;
+import org.apache.fory.memory.MemoryBuffer;
+import org.apache.fory.memory.MemoryUtils;
+import org.apache.fory.reflect.ReflectionUtils;
+import org.apache.fory.resolver.TypeResolver;
+import org.apache.fory.serializer.ArraySerializersTest;
+import org.apache.fory.serializer.EnumSerializerTest;
+import org.apache.fory.serializer.ExceptionSerializers;
+import org.apache.fory.serializer.ObjectSerializer;
+import org.apache.fory.serializer.ReplaceResolveSerializer;
+import org.apache.fory.serializer.Serializer;
+import org.apache.fory.test.bean.BeanA;
+import org.apache.fory.test.bean.Struct;
+import org.apache.fory.type.Descriptor;
+import org.apache.fory.type.TypeUtils;
+import org.apache.fory.util.DateTimeUtils;
+import org.testng.Assert;
+import org.testng.annotations.DataProvider;
+import org.testng.annotations.Test;
+
+public class ForyTest extends ForyTestBase {
+  @DataProvider(name = "xlangConfig")
+  public static Object[][] xlangConfig() {
+    return new Object[][] {{false}, {true}};
+  }
+
+  @Test
+  public void typedDeserializeRejectsOutOfBandRootHeaderWithoutBuffers() {
+    Fory fory = Fory.builder().withXlang(false).withCompatible(false).build();
+    byte[] bytes = fory.serialize(7);
+    bytes[0] |= 0x02;
+    assertThrows(IllegalArgumentException.class, () -> fory.deserialize(bytes, Integer.class));
+  }
+
+  @Test
+  public void testReverseComparatorSerializer() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    Comparator<Integer> comparator = Comparator.reverseOrder();
+    Serializer<?> serializer =
+        fory.getTypeResolver().getTypeInfo(comparator.getClass()).getSerializer();
+    assertTrue(serializer instanceof ReplaceResolveSerializer);
+    Comparator<Integer> roundTrip =
+        (Comparator<Integer>) fory.deserialize(fory.serialize(comparator));
+    Assert.assertEquals(roundTrip.getClass(), comparator.getClass());
+    Assert.assertEquals(roundTrip.compare(1, 2), comparator.compare(1, 2));
+    Comparator<Integer> copy = fory.copy(comparator);
+    Assert.assertEquals(copy.getClass(), comparator.getClass());
+    Assert.assertEquals(copy.compare(2, 1), comparator.compare(2, 1));
+  }
+
+  @Test
+  public void testRegistrationFreezesOnUse() {
+    byte[] bytes = newNativeFory().serialize(1);
+
+    Fory writer = newNativeFory();
+    writer.serialize(1);
+    assertRegistrationFrozen(writer);
+
+    Fory reader = newNativeFory();
+    reader.deserialize(bytes);
+    assertRegistrationFrozen(reader);
+
+    Fory copier = newNativeFory();
+    copier.copy(1);
+    assertRegistrationFrozen(copier);
+  }
+
+  private static Fory newNativeFory() {
+    return Fory.builder()
+        .withXlang(false)
+        .requireClassRegistration(false)
+        .withCompatible(false)
+        .build();
+  }
+
+  private static void assertRegistrationFrozen(Fory fory) {
+    assertThrows(ForyException.class, () -> fory.register(BeanA.class));
+    assertThrows(
+        ForyException.class, () -> fory.registerSerializer(BeanA.class, ObjectSerializer.class));
+  }
+
+  @Test(dataProvider = "crossLanguageReferenceTrackingConfig")
+  public void primitivesTest(boolean referenceTracking, boolean xlang) {
+    Fory fory1 =
+        Fory.builder()
+            .withXlang(xlang)
+            .withRefTracking(referenceTracking)
+            .requireClassRegistration(false)
+            .withCompatible(xlang)
+            .build();
+    Fory fory2 =
+        Fory.builder()
+            .withXlang(xlang)
+            .withRefTracking(referenceTracking)
+            .requireClassRegistration(false)
+            .withCompatible(xlang)
+            .build();
+    assertEquals(true, serDe(fory1, fory2, true));
+    assertEquals(Byte.MAX_VALUE, serDe(fory1, fory2, Byte.MAX_VALUE));
+    assertEquals(Short.MAX_VALUE, serDe(fory1, fory2, Short.MAX_VALUE));
+    assertEquals(Integer.MAX_VALUE, serDe(fory1, fory2, Integer.MAX_VALUE));
+    assertEquals(Long.MAX_VALUE, serDe(fory1, fory2, Long.MAX_VALUE));
+    assertEquals(Float.MAX_VALUE, serDe(fory1, fory2, Float.MAX_VALUE));
+    assertEquals(Double.MAX_VALUE, serDe(fory1, fory2, Double.MAX_VALUE));
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void basicTest(boolean referenceTracking) {
+    ForyBuilder builder =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTracking)
+            .requireClassRegistration(false)
+            .withCompatible(false);
+    Fory fory1 = builder.build();
+    Fory fory2 = builder.build();
+    assertEquals("str", serDe(fory1, fory2, "str"));
+    assertEquals("str", serDe(fory1, fory2, new StringBuilder("str")).toString());
+    assertEquals("str", serDe(fory1, fory2, new StringBuffer("str")).toString());
+    assertEquals(EnumSerializerTest.EnumFoo.A, serDe(fory1, fory2, EnumSerializerTest.EnumFoo.A));
+    assertEquals(EnumSerializerTest.EnumFoo.B, serDe(fory1, fory2, EnumSerializerTest.EnumFoo.B));
+    assertEquals(
+        EnumSerializerTest.EnumSubClass.A, serDe(fory1, fory2, EnumSerializerTest.EnumSubClass.A));
+    assertEquals(
+        EnumSerializerTest.EnumSubClass.B, serDe(fory1, fory2, EnumSerializerTest.EnumSubClass.B));
+    assertEquals(BigInteger.valueOf(100), serDe(fory1, fory2, BigInteger.valueOf(100)));
+    assertEquals(BigDecimal.valueOf(100, 2), serDe(fory1, fory2, BigDecimal.valueOf(100, 2)));
+    java.sql.Date sqlDate = new java.sql.Date(System.currentTimeMillis());
+    assertEquals(sqlDate, serDe(fory1, fory2, sqlDate));
+    LocalDate localDate = LocalDate.now();
+    assertEquals(localDate, serDe(fory1, fory2, localDate));
+    Date utilDate = new Date();
+    assertEquals(utilDate, serDe(fory1, fory2, utilDate));
+    Timestamp timestamp = new Timestamp(System.currentTimeMillis());
+    assertEquals(timestamp, serDe(fory1, fory2, timestamp));
+    Instant instant = DateTimeUtils.truncateInstantToMicros(Instant.now());
+    assertEquals(instant, serDe(fory1, fory2, instant));
+
+    ArraySerializersTest.testPrimitiveArray(fory1, fory2);
+
+    assertEquals(Arrays.asList(1, 2), serDe(fory1, fory2, Arrays.asList(1, 2)));
+    List<String> arrayList = Arrays.asList("str", "str");
+    assertEquals(arrayList, serDe(fory1, fory2, arrayList));
+    assertEquals(new LinkedList<>(arrayList), serDe(fory1, fory2, new LinkedList<>(arrayList)));
+    assertEquals(new HashSet<>(arrayList), serDe(fory1, fory2, new HashSet<>(arrayList)));
+    TreeSet<String> treeSet = new TreeSet<>(Comparator.naturalOrder());
+    treeSet.add("str1");
+    treeSet.add("str2");
+    assertEquals(treeSet, serDe(fory1, fory2, treeSet));
+
+    HashMap<String, Integer> hashMap = new HashMap<>();
+    hashMap.put("k1", 1);
+    hashMap.put("k2", 2);
+    assertEquals(hashMap, serDe(fory1, fory2, hashMap));
+    assertEquals(new LinkedHashMap<>(hashMap), serDe(fory1, fory2, new LinkedHashMap<>(hashMap)));
+    TreeMap<String, Integer> treeMap = new TreeMap<>(Comparator.naturalOrder());
+    treeMap.putAll(hashMap);
+    assertEquals(treeMap, serDe(fory1, fory2, treeMap));
+    assertEquals(Collections.EMPTY_LIST, serDe(fory1, fory2, Collections.EMPTY_LIST));
+    assertEquals(Collections.EMPTY_SET, serDe(fory1, fory2, Collections.EMPTY_SET));
+    assertEquals(Collections.EMPTY_MAP, serDe(fory1, fory2, Collections.EMPTY_MAP));
+    assertEquals(
+        Collections.singletonList("str"), serDe(fory1, fory2, Collections.singletonList("str")));
+    assertEquals(Collections.singleton("str"), serDe(fory1, fory2, Collections.singleton("str")));
+    assertEquals(
+        Collections.singletonMap("k", 1), serDe(fory1, fory2, Collections.singletonMap("k", 1)));
+  }
+
+  @Test(dataProvider = "xlangConfig")
+  public void testSerializationToBuffer(boolean xlang) {
+    Fory fory1 =
+        Fory.builder()
+            .withXlang(xlang)
+            .requireClassRegistration(false)
+            .withCompatible(xlang)
+            .build();
+    Fory fory2 =
+        Fory.builder()
+            .withXlang(xlang)
+            .requireClassRegistration(false)
+            .withCompatible(xlang)
+            .build();
+    MemoryBuffer buffer = MemoryUtils.buffer(64);
+    assertSerializationToBuffer(fory1, fory2, buffer);
+  }
+
+  @Test(dataProvider = "xlangConfig")
+  public void testSerializationSlicedBuffer(boolean xlang) {
+    Fory fory1 =
+        Fory.builder()
+            .withXlang(xlang)
+            .requireClassRegistration(false)
+            .withCompatible(xlang)
+            .build();
+    Fory fory2 =
+        Fory.builder()
+            .withXlang(xlang)
+            .requireClassRegistration(false)
+            .withCompatible(xlang)
+            .build();
+    MemoryBuffer buffer0 = MemoryUtils.buffer(64);
+    buffer0.writeInt64(-1);
+    buffer0.writeInt64(-1);
+    buffer0.readInt64();
+    buffer0.readInt64();
+    MemoryBuffer buffer = buffer0.slice(8);
+    assertSerializationToBuffer(fory1, fory2, buffer);
+  }
+
+  public void assertSerializationToBuffer(Fory fory1, Fory fory2, MemoryBuffer buffer) {
+    if (fory1.getConfig().isXlang()) {
+      fory1.register(EnumSerializerTest.EnumFoo.class);
+      fory2.register(EnumSerializerTest.EnumFoo.class);
+      fory1.register(EnumSerializerTest.EnumSubClass.class);
+      fory2.register(EnumSerializerTest.EnumSubClass.class);
+    }
+
+    assertEquals(true, serDeCheckIndex(fory1, fory2, buffer, true));
+    assertEquals(Byte.MAX_VALUE, serDeCheckIndex(fory1, fory2, buffer, Byte.MAX_VALUE));
+    assertEquals(Short.MAX_VALUE, serDeCheckIndex(fory1, fory2, buffer, Short.MAX_VALUE));
+    assertEquals("str", serDeCheckIndex(fory1, fory2, buffer, "str"));
+    assertEquals("str", serDeCheckIndex(fory1, fory2, buffer, new StringBuilder("str")).toString());
+    assertEquals(
+        EnumSerializerTest.EnumFoo.A,
+        serDeCheckIndex(fory1, fory2, buffer, EnumSerializerTest.EnumFoo.A));
+    assertEquals(
+        EnumSerializerTest.EnumSubClass.A,
+        serDeCheckIndex(fory1, fory2, buffer, EnumSerializerTest.EnumSubClass.A));
+    assertTrue(
+        Arrays.equals(
+            new boolean[] {false, true},
+            (boolean[]) serDeCheckIndex(fory1, fory2, buffer, new boolean[] {false, true})));
+    assertEquals(
+        new byte[] {1, 1}, (byte[]) serDeCheckIndex(fory1, fory2, buffer, new byte[] {1, 1}));
+    assertEquals(Arrays.asList(1, 2), serDe(fory1, fory2, buffer, Arrays.asList(1, 2)));
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void serializeBeanTest(boolean referenceTracking) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTracking)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    BeanA beanA = BeanA.createBeanA(2);
+    byte[] bytes = fory.serialize(beanA);
+    Object o = fory.deserialize(bytes);
+    assertEquals(beanA, o);
+  }
+
+  @Test
+  public void testSerializeException() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(true)
+            .requireClassRegistration(true)
+            .withCompatible(false)
+            .build();
+    Exception value = new Exception("test-serialize-exception");
+    Exception copy = serDe(fory, value);
+    Assert.assertEquals(
+        fory.getTypeResolver().getSerializerClass(Exception.class),
+        ExceptionSerializers.ExceptionSerializer.class);
+    Assert.assertEquals(copy.getMessage(), value.getMessage());
+    Assert.assertEquals(copy.getStackTrace()[0], value.getStackTrace()[0]);
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void registerTest(boolean referenceTracking) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTracking)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    fory.register(BeanA.class);
+    BeanA beanA = BeanA.createBeanA(2);
+    assertEquals(beanA, serDe(fory, beanA));
+  }
+
+  @EqualsAndHashCode
+  static class A implements Serializable {
+    public Object f1 = 1;
+    public Object f2 = 1;
+    private Object f3 = "str";
+
+    Object getF3() {
+      return f3;
+    }
+
+    void setF3(Object f3) {
+      this.f3 = f3;
+    }
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void testDirectBuffer(boolean referenceTracking) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTracking)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    MemoryBuffer buffer = MemoryUtils.wrap(ByteBuffer.allocateDirect(1024));
+    fory.serialize(buffer, new A());
+    assertNull(buffer.getHeapMemory());
+
+    Object obj = fory.deserialize(buffer);
+    assertEquals(new A(), obj);
+  }
+
+  public static class Outer {
+    private long x;
+    private Inner inner;
+
+    private static class Inner {
+      int y;
+    }
+  }
+
+  @Test
+  public void testSerializePrivateBean() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withCodegen(false)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    Outer outer = new Outer();
+    outer.inner = new Outer.Inner();
+    fory.deserialize(fory.serialize(outer));
+    assertTrue(fory.getTypeResolver().getSerializer(Outer.class) instanceof ObjectSerializer);
+    assertTrue(fory.getTypeResolver().getSerializer(Outer.Inner.class) instanceof ObjectSerializer);
+  }
+
+  @Test
+  public void testSerializePrivateBeanJIT() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withCodegen(true)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    Outer outer = new Outer();
+    outer.inner = new Outer.Inner();
+    fory.deserialize(fory.serialize(outer));
+    assertTrue(fory.getTypeResolver().getSerializer(Outer.class) instanceof Generated);
+    assertTrue(fory.getTypeResolver().getSerializer(Outer.Inner.class) instanceof Generated);
+  }
+
+  @Data
+  public static class PackageLevelBean {
+    public long f1;
+    private long f2;
+  }
+
+  @Test
+  public void testSerializePackageLevelBean() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withCodegen(false)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    PackageLevelBean o = new PackageLevelBean();
+    o.f1 = 10;
+    o.f2 = 1;
+    serDeCheckSerializer(fory, o, "Object");
+  }
+
+  @Test
+  public void testSerializePackageLevelBeanJIT() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withCodegen(true)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    PackageLevelBean o = new PackageLevelBean();
+    o.f1 = 10;
+    o.f2 = 1;
+    serDeCheckSerializer(fory, o, "PackageLevelBean");
+  }
+
+  static class B {
+    int f1;
+  }
+
+  static class C extends B {
+    int f1;
+  }
+
+  @Test(dataProvider = "javaFory")
+  public void testDuplicateFields(Fory fory) {
+    C c = new C();
+    ((B) c).f1 = 100;
+    c.f1 = -100;
+    assertEquals(((B) c).f1, 100);
+    assertEquals(c.f1, -100);
+    C newC = (C) serDe(fory, c);
+    assertEquals(newC.f1, c.f1);
+    assertEquals(((B) newC).f1, ((B) c).f1);
+  }
+
+  @Test(dataProvider = "crossLanguageReferenceTrackingConfig")
+  public void testGuava(boolean referenceTracking, boolean xlang) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(xlang)
+            .withRefTracking(referenceTracking)
+            .requireClassRegistration(false)
+            .withCompatible(xlang)
+            .build();
+    Assert.assertEquals(serDe(fory, ImmutableList.of(1)), ImmutableList.of(1));
+    Assert.assertEquals(serDe(fory, ImmutableList.of(1, 2)), ImmutableList.of(1, 2));
+    Assert.assertEquals(serDe(fory, ImmutableList.of(1, 2, "str")), ImmutableList.of(1, 2, "str"));
+    Assert.assertEquals(
+        serDe(fory, ImmutableMap.of(1, 2, "k", "v")), ImmutableMap.of(1, 2, "k", "v"));
+  }
+
+  @Test(dataProvider = "enableCodegen")
+  public void testSerializeJDKObject(boolean enableCodegen) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withJdkClassSerializableCheck(false)
+            .requireClassRegistration(false)
+            .withCodegen(enableCodegen)
+            .withCompatible(false)
+            .build();
+    StringTokenizer tokenizer = new StringTokenizer("abc,1,23", ",");
+    assertEquals(serDe(fory, tokenizer).countTokens(), tokenizer.countTokens());
+  }
+
+  @Test
+  public void testJDKSerializableCheck() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(true)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    serDe(fory, ByteBuffer.allocate(32));
+    serDe(fory, ByteBuffer.allocateDirect(32));
+    assertThrows(InsecureException.class, () -> fory.serialize(new Thread()));
+    assertThrows(InsecureException.class, () -> fory.serialize(MethodHandles.lookup()));
+  }
+
+  @Test
+  public void testClassRegistration() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .requireClassRegistration(true)
+            .withCompatible(false)
+            .build();
+    class A {}
+    assertThrows(InsecureException.class, () -> fory.serialize(new A()));
+    Fory fory1 =
+        Fory.builder()
+            .withXlang(false)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    serDe(fory1, new A());
+  }
+
+  @Data
+  private static class IgnoreFields {
+    @Ignore int f1;
+    @Ignore long f2;
+    long f3;
+
+    IgnoreFields(int f1, long f2, long f3) {
+      this.f1 = f1;
+      this.f2 = f2;
+      this.f3 = f3;
+    }
+
+    IgnoreFields(long f3) {
+      this.f3 = f3;
+    }
+  }
+
+  @Test
+  public void testIgnoreFields() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    IgnoreFields o = serDe(fory, new IgnoreFields(1, 2, 3));
+    assertEquals(0, o.f1);
+    assertEquals(0, o.f2);
+    assertEquals(3, o.f3);
+  }
+
+  @Data
+  private static class ExposeFields {
+    @Expose int f1;
+    @Expose long f2;
+    long f3;
+    @Expose ImmutableMap<String, Integer> map1;
+    ImmutableMap<String, Integer> map2;
+
+    ExposeFields(
+        int f1,
+        long f2,
+        long f3,
+        ImmutableMap<String, Integer> map1,
+        ImmutableMap<String, Integer> map2) {
+      this.f1 = f1;
+      this.f2 = f2;
+      this.f3 = f3;
+      this.map1 = map1;
+      this.map2 = map2;
+    }
+
+    ExposeFields(int f1, long f2, ImmutableMap<String, Integer> map1) {
+      this.f1 = f1;
+      this.f2 = f2;
+      this.map1 = map1;
+    }
+  }
+
+  @Test
+  public void testExposeFields() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    ImmutableMap<String, Integer> map1 = ImmutableMap.of("1", 1);
+    ImmutableMap<String, Integer> map2 = ImmutableMap.of("2", 2);
+    ExposeFields o = serDe(fory, new ExposeFields(1, 2, 3, map1, map2));
+    assertEquals(1, o.f1);
+    assertEquals(2, o.f2);
+    assertEquals(0, o.f3);
+    assertEquals(o.map1, map1);
+    assertNull(o.map2);
+  }
+
+  @Data
+  private static class ExposeFields2 {
+    @Expose int f1;
+    @Ignore long f2;
+    long f3;
+
+    ExposeFields2(int f1, long f2, long f3) {
+      this.f1 = f1;
+      this.f2 = f2;
+      this.f3 = f3;
+    }
+  }
+
+  @Test
+  public void testExposeFields2() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    assertThrowsCause(RuntimeException.class, () -> serDe(fory, new ExposeFields2(1, 2, 3)));
+  }
+
+  @Test(timeOut = 60_000)
+  public void testClassGC() {
+    WeakHashMap<Object, Boolean> map = new WeakHashMap<>();
+    foryGC(map);
+    Thread.currentThread().setContextClassLoader(getClass().getClassLoader());
+    Descriptor.clearDescriptorCache();
+    TestUtils.triggerOOMForSoftGC(
+        () -> {
+          System.out.printf("Wait map keys %s gc.\n", map.keySet());
+          return !map.isEmpty();
+        });
+    Thread.currentThread().setContextClassLoader(getClass().getClassLoader());
+  }
+
+  private void foryGC(WeakHashMap<Object, Boolean> map) {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    Class<?> structClass1 = Struct.createStructClass("TestClassGC", 1, false);
+    System.out.println(structClass1.hashCode());
+    Object struct1 = Struct.createPOJO(structClass1);
+    serDe(fory, struct1);
+    Class<? extends Serializer> serializerClass =
+        fory.getTypeResolver().getSerializerClass(structClass1);
+    assertTrue(serializerClass.getName().contains("Codec"));
+    map.put(fory, true);
+    System.out.println(fory.hashCode());
+    map.put(struct1, true);
+    map.put(structClass1, true);
+    System.out.println(structClass1.hashCode());
+  }
+
+  @Test
+  public void testSerializeDeserializeApis() {
+    Fory fory =
+        Fory.builder()
+            .requireClassRegistration(false)
+            .withXlang(false)
+            .withCompatible(false)
+            .build();
+    BeanA beanA = BeanA.createBeanA(2);
+    assertEquals(fory.deserialize(fory.serialize(beanA), BeanA.class), beanA);
+    assertEquals(fory.deserialize(fory.serialize(beanA)), beanA);
+    assertEquals(
+        fory.deserialize(MemoryBuffer.fromByteArray(fory.serialize(beanA)), BeanA.class), beanA);
+  }
+
+  @Data
+  static class DomainObject {
+    UUID id;
+  }
+
+  static class UUIDSerializer extends Serializer<UUID> {
+    public UUIDSerializer(TypeResolver typeResolver) {
+      super(typeResolver.getConfig(), UUID.class);
+    }
+
+    @Override
+    public UUID read(ReadContext readContext) {
+      return new UUID(readContext.getBuffer().readInt64(), readContext.getBuffer().readInt64());
+    }
+
+    @Override
+    public void write(WriteContext writeContext, UUID value) {
+      MemoryBuffer buffer = writeContext.getBuffer();
+      buffer.writeInt64(value.getMostSignificantBits());
+      buffer.writeInt64(value.getLeastSignificantBits());
+    }
+  }
+
+  @Test
+  public void testRegisterPrivateSerializer() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(true)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    fory.registerSerializer(UUID.class, new UUIDSerializer(fory.getTypeResolver()));
+    DomainObject obj = new DomainObject();
+    obj.id = UUID.randomUUID();
+    serDeCheckSerializer(fory, obj, "Codec");
+  }
+
+  @Test
+  public void testCircularReferenceStackOverflowMessage() {
+    class A {
+      A f;
+    }
+    A a = new A();
+    a.f = a;
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(false)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    try {
+      fory.serialize(a);
+      throw new IllegalStateException("SerializationException not raised.");
+    } catch (SerializationException e) {
+      Throwable ex = e.getCause();
+      Assert.assertTrue(ex.getMessage().contains("reference"));
+    }
+  }
+
+  @Test
+  public void testPkgAccessLevelParentClass() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(true)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    HashBasedTable<Object, Object, Object> table = HashBasedTable.create(2, 4);
+    table.put("r", "c", 100);
+    serDeCheckSerializer(fory, table, "HashBasedTableSerializer");
+  }
+
+  @Data
+  static class PrintReadObject {
+    public PrintReadObject() {
+      throw new RuntimeException();
+    }
+
+    public PrintReadObject(boolean b) {}
+  }
+
+  @Test
+  public void testPrintReadObjectsWhenFailed() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(true)
+            .withCodegen(false)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    PrintReadObject o = new PrintReadObject(true);
+    try {
+      serDe(fory, ImmutableList.of(ImmutableList.of("a", "b"), o));
+      Assert.fail();
+    } catch (ForyException e) {
+      Assert.assertTrue(e.getMessage().contains("[a, b]"));
+    }
+  }
+
+  @Test
+  public void testNullObjSerAndDe() {
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(true)
+            .requireClassRegistration(false)
+            .withMetaShare(true)
+            .withCompatible(false)
+            .build();
+    MetaWriteContext metaWriteContext = new MetaWriteContext();
+    MetaReadContext metaReadContext = new MetaReadContext();
+    fory.setMetaWriteContext(metaWriteContext);
+    byte[] bytes = fory.serialize(null);
+    fory.setMetaReadContext(metaReadContext);
+    Object obj = fory.deserialize(bytes);
+    assertNull(obj);
+  }
+
+  @Test
+  public void testResetBufferToSizeLimit() {
+    final int minBufferBytes = 64;
+    final int limitInBytes = 1024;
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .withBufferSizeLimitBytes(limitInBytes)
+            .withCompatible(false)
+            .build();
+
+    final byte[] smallPayload = new byte[0];
+    final byte[] serializedSmall = fory.serialize(smallPayload);
+    assertEquals(getDefaultWriteBuffer(fory).size(), minBufferBytes);
+
+    fory.deserialize(serializedSmall);
+    assertEquals(getDefaultWriteBuffer(fory).size(), minBufferBytes);
+
+    final byte[] largePayload = new byte[limitInBytes * 2];
+    final byte[] serializedLarge = fory.serialize(largePayload);
+    assertEquals(getDefaultWriteBuffer(fory).size(), limitInBytes);
+
+    fory.deserialize(serializedLarge);
+    assertEquals(getDefaultWriteBuffer(fory).size(), limitInBytes);
+  }
+
+  private static MemoryBuffer getDefaultWriteBuffer(Fory fory) {
+    return (MemoryBuffer) ReflectionUtils.getObjectFieldValue(fory, "buffer");
+  }
+
+  @EqualsAndHashCode
+  static class Struct1 {
+    int f1;
+    String f2;
+
+    public Struct1(int f1, String f2) {
+      this.f1 = f1;
+      this.f2 = f2;
+    }
+  }
+
+  static class Struct2 {
+    int f1;
+    String f2;
+    double f3;
+  }
+
+  @Test
+  public void testStructMapping() {
+    ThreadSafeFory fory1 =
+        Fory.builder().withXlang(false).withCompatible(true).buildThreadSafeFory();
+    ThreadSafeFory fory2 =
+        Fory.builder().withXlang(false).withCompatible(true).buildThreadSafeFory();
+    fory1.register(Struct1.class);
+    fory2.register(Struct2.class);
+    Struct1 struct1 = new Struct1(10, "abc");
+    Struct2 struct2 = (Struct2) fory2.deserialize(fory1.serialize(struct1));
+    Assert.assertEquals(struct2.f1, struct1.f1);
+    Assert.assertEquals(struct2.f2, struct1.f2);
+    struct1 = (Struct1) fory1.deserialize(fory2.serialize(struct2));
+    Assert.assertEquals(struct1.f1, struct2.f1);
+    Assert.assertEquals(struct1.f2, struct2.f2);
+  }
+
+  private Object maxDepthData() {
+    List<Object> list = new ArrayList<>();
+    for (int i = 0; i < 6; i++) {
+      List<Object> list1 = new ArrayList<>();
+      list1.add("abc");
+      list1.add(list);
+      list = list1;
+    }
+    return list;
+  }
+
+  @Test
+  public void testMaxDepth() {
+    byte[] bytes =
+        Fory.builder()
+            .withXlang(false)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build()
+            .serialize(maxDepthData());
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .requireClassRegistration(false)
+            .withName("fory1")
+            .withMaxDepth(3)
+            .withCompatible(false)
+            .build();
+    assertThrows(InsecureException.class, () -> fory.deserialize(bytes));
+  }
+
+  static class MaxDepth {
+    int f1;
+    Object f2;
+
+    MaxDepth(int f1, Object f2) {
+      this.f1 = f1;
+      this.f2 = f2;
+    }
+  }
+
+  @Test(dataProvider = "referenceTrackingConfig")
+  public void testInterpretedPolymorphicFieldDepth(boolean referenceTracking) {
+    Fory writer =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTracking)
+            .withCodegen(false)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build();
+    Fory reader =
+        Fory.builder()
+            .withXlang(false)
+            .withRefTracking(referenceTracking)
+            .withCodegen(false)
+            .requireClassRegistration(false)
+            .withMaxDepth(4)
+            .withCompatible(false)
+            .build();
+
+    MaxDepth shallow = nestedMaxDepth(2);
+    MaxDepth shallowCopy = (MaxDepth) reader.deserialize(writer.serialize(shallow));
+    assertEquals(shallowCopy.f1, shallow.f1);
+    assertThrows(
+        InsecureException.class, () -> reader.deserialize(writer.serialize(nestedMaxDepth(12))));
+  }
+
+  private static MaxDepth nestedMaxDepth(int levels) {
+    Object value = "leaf";
+    for (int i = levels; i > 0; i--) {
+      value = new MaxDepth(i, value);
+    }
+    return (MaxDepth) value;
+  }
+
+  @Test
+  public void testMaxDepthCodegen() {
+    assertTrue(TypeUtils.hasExpandableLeafs(MaxDepth.class));
+    MaxDepth maxDepth =
+        new MaxDepth(
+            1, new MaxDepth(2, new MaxDepth(3, new MaxDepth(4, new MaxDepth(5, maxDepthData())))));
+    byte[] bytes =
+        Fory.builder()
+            .withXlang(false)
+            .requireClassRegistration(false)
+            .withCompatible(false)
+            .build()
+            .serialize(maxDepth);
+    Fory fory =
+        Fory.builder()
+            .withXlang(false)
+            .requireClassRegistration(false)
+            .withName("fory2")
+            .withMaxDepth(3)
+            .withCompatible(false)
+            .build();
+    assertThrows(InsecureException.class, () -> fory.deserialize(bytes));
+  }
+}

@@ -1,0 +1,179 @@
+#!/bin/bash
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+set -e
+export ENABLE_FORY_DEBUG_OUTPUT=0
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+DOCS_DIR="$SCRIPT_DIR/../../docs/benchmarks/object-serialization/xlang/swift"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# Defaults
+DATA=""
+SERIALIZER=""
+DURATION="3"
+OUTPUT_JSON="results/benchmark_results.json"
+EXTERNAL_OUTPUT_JSON="results/external_benchmark_results.json"
+EXTERNAL=false
+NO_REPORT=false
+COPY_DOCS=true
+
+usage() {
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Build and run Swift benchmarks"
+    echo ""
+    echo "Options:"
+    echo "  --data <struct|sample|mediacontent|structlist|samplelist|mediacontentlist>"
+    echo "                               Filter benchmark by data type"
+    echo "  --serializer <fory|protobuf|json>"
+    echo "                               Filter benchmark by serializer"
+    echo "  --duration <seconds>         Minimum time to run each benchmark (default: 3)"
+    echo "  --external                   Also run isolated external-type benchmarks"
+    echo "  --no-report                  Skip Python report generation"
+    echo "  --no-copy-docs               Skip copying report/plots into docs/benchmarks/object-serialization/xlang/swift"
+    echo "  --help                       Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  $0"
+    echo "  $0 --data struct"
+    echo "  $0 --serializer protobuf"
+    echo "  $0 --data sample --serializer json --duration 5"
+    echo "  $0 --external --duration 5"
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --data)
+            DATA="$2"
+            shift 2
+            ;;
+        --serializer)
+            SERIALIZER="$2"
+            shift 2
+            ;;
+        --duration)
+            DURATION="$2"
+            shift 2
+            ;;
+        --external)
+            EXTERNAL=true
+            shift
+            ;;
+        --no-report)
+            NO_REPORT=true
+            shift
+            ;;
+        --no-copy-docs)
+            COPY_DOCS=false
+            shift
+            ;;
+        --help|-h)
+            usage
+            ;;
+        *)
+            echo -e "${RED}Unknown option: $1${NC}"
+            usage
+            ;;
+    esac
+done
+
+if [[ "${FORY_BENCH_SCHEMA_MISMATCH:-0}" == "1" && "$SERIALIZER" != "fory" ]]; then
+    echo -e "${RED}FORY_BENCH_SCHEMA_MISMATCH=1 supports only Fory benchmarks; rerun with --serializer fory.${NC}"
+    exit 1
+fi
+
+mkdir -p results
+
+echo -e "${GREEN}=== Fory Swift Benchmark ===${NC}"
+echo ""
+
+echo -e "${YELLOW}Building ordinary benchmark...${NC}"
+swift build -c release --product swift-benchmark
+echo -e "${GREEN}Build complete!${NC}"
+echo ""
+
+echo -e "${YELLOW}Running ordinary benchmark...${NC}"
+ARGS=("--duration" "$DURATION" "--output" "$OUTPUT_JSON")
+if [[ -n "$DATA" ]]; then
+    ARGS+=("--data" "$DATA")
+fi
+if [[ -n "$SERIALIZER" ]]; then
+    ARGS+=("--serializer" "$SERIALIZER")
+fi
+
+swift run -c release --skip-build swift-benchmark "${ARGS[@]}"
+echo -e "${GREEN}Benchmark complete!${NC}"
+
+if [[ "$EXTERNAL" == true ]]; then
+    echo ""
+    echo -e "${YELLOW}Building isolated external-type benchmark...${NC}"
+    swift build -c release --product swift-external-benchmark
+    echo -e "${GREEN}External-type build complete!${NC}"
+    echo ""
+    echo -e "${YELLOW}Running external-type benchmark...${NC}"
+    swift run -c release --skip-build swift-external-benchmark \
+        --duration "$DURATION" \
+        --output "$EXTERNAL_OUTPUT_JSON"
+    echo -e "${GREEN}External-type benchmark complete!${NC}"
+fi
+
+if [[ "$NO_REPORT" == true ]]; then
+    echo ""
+    echo -e "${YELLOW}Skipping report generation (--no-report).${NC}"
+    echo -e "JSON output: ${OUTPUT_JSON}"
+    if [[ "$EXTERNAL" == true ]]; then
+        echo -e "External JSON output: ${EXTERNAL_OUTPUT_JSON}"
+    fi
+    exit 0
+fi
+
+echo ""
+echo -e "${YELLOW}Generating report...${NC}"
+if ! command -v python3 >/dev/null 2>&1; then
+    echo -e "${RED}python3 is required for report generation${NC}"
+    exit 1
+fi
+
+if ! python3 -c "import matplotlib, numpy" >/dev/null 2>&1; then
+    echo -e "${RED}matplotlib and numpy are required for report generation${NC}"
+    exit 1
+fi
+
+REPORT_ARGS=("--json-file" "$OUTPUT_JSON" "--output-dir" "results")
+if [[ "$EXTERNAL" == true ]]; then
+    REPORT_ARGS+=("--external-json-file" "$EXTERNAL_OUTPUT_JSON")
+fi
+python3 benchmark_report.py "${REPORT_ARGS[@]}"
+if [[ "$COPY_DOCS" == true ]]; then
+    mkdir -p "$DOCS_DIR"
+    cp results/README.md "$DOCS_DIR/README.md"
+    cp results/throughput.png "$DOCS_DIR/throughput.png"
+    echo -e "${GREEN}Copied report and throughput plot to: ${DOCS_DIR}${NC}"
+fi
+echo -e "${GREEN}Report generated: ${SCRIPT_DIR}/results/README.md${NC}"
+if [[ "$COPY_DOCS" == true ]]; then
+    echo -e "Docs sync: ${DOCS_DIR}"
+fi

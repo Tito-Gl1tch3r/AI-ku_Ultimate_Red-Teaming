@@ -1,0 +1,878 @@
+from __future__ import annotations
+
+import shutil
+import subprocess
+import zipfile
+from pathlib import Path
+from hashlib import sha256
+
+import pytest
+
+import glaurung as g
+
+
+def _compile_attribute_class(tmp_path: Path) -> Path:
+    if shutil.which("javac") is None:
+        pytest.skip("javac is required for generated Java fixture")
+    src = tmp_path / "src"
+    out = tmp_path / "classes"
+    src.mkdir()
+    out.mkdir()
+    source = src / "AttributeFixture.java"
+    source.write_text(
+        """
+import java.io.IOException;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+
+enum AttributeMode {
+    ALPHA,
+    BETA
+}
+
+@Retention(RetentionPolicy.RUNTIME)
+@interface AttributeTag {
+    String value();
+    Class<?> type() default String.class;
+    AttributeMode mode() default AttributeMode.ALPHA;
+    String[] flags() default {};
+}
+
+@AttributeTag(value = "class-level", type = Integer.class, mode = AttributeMode.BETA, flags = {"fast", "safe"})
+public class AttributeFixture {
+    @AttributeTag("method-level")
+    public static int checked(String input) throws IOException {
+        int base = input.length();
+        if (base == 0) {
+            throw new IOException("empty");
+        }
+        int total = base + 7;
+        return total;
+    }
+
+    public static int guarded(String input) {
+        try {
+            return Integer.parseInt(input);
+        } catch (NumberFormatException ex) {
+            return -1;
+        }
+    }
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["javac", "-g", "--release", "17", "-d", str(out), str(source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out / "AttributeFixture.class"
+
+
+def _compile_structure_classes(tmp_path: Path) -> Path:
+    if shutil.which("javac") is None:
+        pytest.skip("javac is required for generated Java fixture")
+    src = tmp_path / "structure-src"
+    out = tmp_path / "structure-classes"
+    src.mkdir()
+    out.mkdir()
+    source = src / "StructureFixture.java"
+    source.write_text(
+        """
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.RECORD_COMPONENT)
+@interface ComponentTag {}
+
+public class StructureFixture {
+    public static class StaticInner {}
+    public class MemberInner {}
+
+    public void makeLocal() {
+        class LocalThing {}
+        new LocalThing();
+    }
+}
+
+record StructureRecord(@ComponentTag String hash, long size) {}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["javac", "-g", "--release", "17", "-d", str(out), str(source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out
+
+
+def _compile_sealed_classes(tmp_path: Path) -> Path:
+    if shutil.which("javac") is None:
+        pytest.skip("javac is required for generated Java fixture")
+    src = tmp_path / "sealed-src"
+    out = tmp_path / "sealed-classes"
+    src.mkdir()
+    out.mkdir()
+    source = src / "Shape.java"
+    source.write_text(
+        """
+public sealed interface Shape permits Circle, Square {}
+
+final class Circle implements Shape {}
+
+non-sealed class Square implements Shape {}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["javac", "-g", "--release", "17", "-d", str(out), str(source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out
+
+
+def _compile_module_classes(tmp_path: Path) -> Path:
+    if shutil.which("javac") is None:
+        pytest.skip("javac is required for generated Java fixture")
+    src = tmp_path / "module-src"
+    out = tmp_path / "module-classes"
+    src.mkdir()
+    out.mkdir()
+    (src / "module-info.java").write_text(
+        """
+module com.example.fixture {
+    requires java.logging;
+    exports com.example.api;
+    opens com.example.internal;
+    uses com.example.api.Service;
+    provides com.example.api.Service with com.example.internal.ServiceImpl;
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    api = src / "com" / "example" / "api"
+    internal = src / "com" / "example" / "internal"
+    api.mkdir(parents=True)
+    internal.mkdir(parents=True)
+    (api / "Service.java").write_text(
+        "package com.example.api; public interface Service { String name(); }\n",
+        encoding="utf-8",
+    )
+    (internal / "ServiceImpl.java").write_text(
+        """
+package com.example.internal;
+
+public class ServiceImpl implements com.example.api.Service {
+    public String name() { return "fixture"; }
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            "javac",
+            "-g",
+            "--release",
+            "17",
+            "-d",
+            str(out),
+            str(src / "module-info.java"),
+            str(api / "Service.java"),
+            str(internal / "ServiceImpl.java"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out
+
+
+def _compile_module_jar(tmp_path: Path) -> Path:
+    if shutil.which("jar") is None:
+        pytest.skip("jar is required for generated Java module fixture")
+    class_dir = _compile_module_classes(tmp_path)
+    jar_path = tmp_path / "fixture-module.jar"
+    subprocess.run(
+        [
+            "jar",
+            "--create",
+            "--file",
+            str(jar_path),
+            "--main-class",
+            "com.example.internal.ServiceImpl",
+            "-C",
+            str(class_dir),
+            ".",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return jar_path
+
+
+def _compile_lambda_class(tmp_path: Path) -> Path:
+    if shutil.which("javac") is None:
+        pytest.skip("javac is required for generated Java fixture")
+    src = tmp_path / "lambda-src"
+    out = tmp_path / "lambda-classes"
+    src.mkdir()
+    out.mkdir()
+    source = src / "LambdaFixture.java"
+    source.write_text(
+        """
+public class LambdaFixture {
+    public Runnable makeTask() {
+        return () -> System.out.println("lambda");
+    }
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["javac", "-g", "--release", "17", "-d", str(out), str(source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out / "LambdaFixture.class"
+
+
+def _compile_type_annotation_classes(tmp_path: Path) -> Path:
+    if shutil.which("javac") is None:
+        pytest.skip("javac is required for generated Java fixture")
+    src = tmp_path / "type-annotation-src"
+    out = tmp_path / "type-annotation-classes"
+    src.mkdir()
+    out.mkdir()
+    source = src / "TypeAnnotationFixture.java"
+    source.write_text(
+        """
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target({ElementType.TYPE_USE, ElementType.TYPE_PARAMETER})
+@interface TypeUseTag {}
+
+public class TypeAnnotationFixture<@TypeUseTag T> {
+    public @TypeUseTag String value;
+
+    public @TypeUseTag String method(@TypeUseTag String input) {
+        @TypeUseTag String local = input;
+        return local;
+    }
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["javac", "-g", "--release", "17", "-d", str(out), str(source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out
+
+
+def _compile_generic_class(tmp_path: Path) -> Path:
+    if shutil.which("javac") is None:
+        pytest.skip("javac is required for generated Java fixture")
+    src = tmp_path / "generic-src"
+    out = tmp_path / "generic-classes"
+    src.mkdir()
+    out.mkdir()
+    source = src / "GenericFixture.java"
+    source.write_text(
+        """
+import java.util.List;
+import java.util.Map;
+
+public class GenericFixture<T extends Number> {
+    public List<String> names;
+
+    public Map<String, T> lookup(List<T> values) {
+        return Map.of();
+    }
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["javac", "-g", "--release", "17", "-d", str(out), str(source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out / "GenericFixture.class"
+
+
+def _compile_field_attribute_class(tmp_path: Path) -> Path:
+    if shutil.which("javac") is None:
+        pytest.skip("javac is required for generated Java fixture")
+    src = tmp_path / "field-attribute-src"
+    out = tmp_path / "field-attribute-classes"
+    src.mkdir()
+    out.mkdir()
+    source = src / "FieldAttributeFixture.java"
+    source.write_text(
+        """
+@Deprecated
+public class FieldAttributeFixture {
+    @Deprecated
+    public static final int ANSWER = 42;
+
+    public static final String NAME = "glaurung";
+    public static final long BIG = 123456789L;
+    public static final double RATIO = 1.5d;
+    public int mutable;
+
+    @Deprecated
+    public void oldMethod() {}
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["javac", "-g", "--release", "17", "-d", str(out), str(source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out / "FieldAttributeFixture.class"
+
+
+def _add_source_debug_extension(class_bytes: bytes, payload: bytes) -> bytes:
+    data = bytearray(class_bytes)
+    cp_count = int.from_bytes(data[8:10], "big")
+    p = 10
+    i = 1
+    while i < cp_count:
+        tag = data[p]
+        p += 1
+        if tag == 1:
+            length = int.from_bytes(data[p : p + 2], "big")
+            p += 2 + length
+        elif tag in {3, 4, 9, 10, 11, 12, 17, 18}:
+            p += 4
+        elif tag in {5, 6}:
+            p += 8
+            i += 1
+        elif tag in {7, 8, 16, 19, 20}:
+            p += 2
+        elif tag == 15:
+            p += 3
+        else:
+            raise AssertionError(f"unexpected constant-pool tag {tag}")
+        i += 1
+
+    name = b"SourceDebugExtension"
+    new_entry = b"\x01" + len(name).to_bytes(2, "big") + name
+    source_debug_name_index = cp_count
+    data[8:10] = (cp_count + 1).to_bytes(2, "big")
+    data[p:p] = new_entry
+    p += len(new_entry)
+
+    p += 6
+    interfaces_count = int.from_bytes(data[p : p + 2], "big")
+    p += 2 + 2 * interfaces_count
+    p = _skip_member_table(data, p)
+    p = _skip_member_table(data, p)
+    class_attribute_count = int.from_bytes(data[p : p + 2], "big")
+    data[p : p + 2] = (class_attribute_count + 1).to_bytes(2, "big")
+    data.extend(source_debug_name_index.to_bytes(2, "big"))
+    data.extend(len(payload).to_bytes(4, "big"))
+    data.extend(payload)
+    return bytes(data)
+
+
+def _skip_member_table(data: bytearray, p: int) -> int:
+    count = int.from_bytes(data[p : p + 2], "big")
+    p += 2
+    for _ in range(count):
+        attribute_count = int.from_bytes(data[p + 6 : p + 8], "big")
+        p += 8
+        for _ in range(attribute_count):
+            length = int.from_bytes(data[p + 2 : p + 6], "big")
+            p += 6 + length
+    return p
+
+
+def _compile_parameter_metadata_classes(tmp_path: Path) -> Path:
+    if shutil.which("javac") is None:
+        pytest.skip("javac is required for generated Java fixture")
+    src = tmp_path / "parameter-src"
+    out = tmp_path / "parameter-classes"
+    src.mkdir()
+    out.mkdir()
+    source = src / "ParameterFixture.java"
+    source.write_text(
+        """
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target({ElementType.PARAMETER, ElementType.METHOD})
+@interface ParamTag {
+    String value() default "fallback";
+}
+
+public class ParameterFixture {
+    public void handle(@ParamTag("path") String path, int count) {}
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            "javac",
+            "-g",
+            "-parameters",
+            "--release",
+            "17",
+            "-d",
+            str(out),
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out
+
+
+def test_parse_java_class_recovers_source_exceptions_and_local_variables(
+    tmp_path: Path,
+) -> None:
+    class_file = _compile_attribute_class(tmp_path)
+
+    info = getattr(g, "analysis").parse_java_class_bytes(class_file.read_bytes())
+
+    assert info is not None
+    assert info["source_file"] == "AttributeFixture.java"
+    checked = next(method for method in info["methods"] if method["name"] == "checked")
+    assert checked["exceptions"] == ["java/io/IOException"]
+    locals_by_name = {item["name"]: item for item in checked["code"]["local_variables"]}
+    assert locals_by_name["input"]["descriptor"] == "Ljava/lang/String;"
+    assert locals_by_name["input"]["index"] == 0
+    assert locals_by_name["base"]["descriptor"] == "I"
+    assert locals_by_name["total"]["descriptor"] == "I"
+
+
+def test_parse_java_class_recovers_generic_signatures(tmp_path: Path) -> None:
+    class_file = _compile_generic_class(tmp_path)
+
+    info = getattr(g, "analysis").parse_java_class_bytes(class_file.read_bytes())
+
+    assert info is not None
+    assert info["signature"] == "<T:Ljava/lang/Number;>Ljava/lang/Object;"
+    names = next(field for field in info["fields"] if field["name"] == "names")
+    assert names["signature"] == "Ljava/util/List<Ljava/lang/String;>;"
+    lookup = next(method for method in info["methods"] if method["name"] == "lookup")
+    assert lookup["signature"] == (
+        "(Ljava/util/List<TT;>;)Ljava/util/Map<Ljava/lang/String;TT;>;"
+    )
+
+
+def test_parse_java_class_recovers_parameter_metadata_and_annotation_defaults(
+    tmp_path: Path,
+) -> None:
+    class_dir = _compile_parameter_metadata_classes(tmp_path)
+    java_analysis = getattr(g, "analysis")
+
+    fixture = java_analysis.parse_java_class_bytes(
+        (class_dir / "ParameterFixture.class").read_bytes()
+    )
+    annotation = java_analysis.parse_java_class_bytes(
+        (class_dir / "ParamTag.class").read_bytes()
+    )
+
+    assert fixture is not None
+    handle = next(method for method in fixture["methods"] if method["name"] == "handle")
+    assert handle["method_parameters"] == [
+        {"name": "path", "access_flags": 0},
+        {"name": "count", "access_flags": 0},
+    ]
+    assert len(handle["parameter_annotations"]) == 2
+    assert handle["parameter_annotations"][0]["parameter_index"] == 0
+    assert handle["parameter_annotations"][0]["annotations"][0]["descriptor"] == (
+        "LParamTag;"
+    )
+    assert handle["parameter_annotations"][0]["annotations"][0]["elements"] == [
+        {
+            "name": "value",
+            "value": {
+                "tag": "s",
+                "kind": "const",
+                "value": "path",
+            },
+        }
+    ]
+    assert handle["parameter_annotations"][1] == {
+        "parameter_index": 1,
+        "annotations": [],
+    }
+
+    assert annotation is not None
+    value = next(
+        method for method in annotation["methods"] if method["name"] == "value"
+    )
+    assert value["annotation_default"] == {
+        "tag": "s",
+        "kind": "const",
+        "value": "fallback",
+    }
+
+
+def test_parse_java_class_recovers_inner_record_and_nest_metadata(
+    tmp_path: Path,
+) -> None:
+    class_dir = _compile_structure_classes(tmp_path)
+    java_analysis = getattr(g, "analysis")
+
+    outer = java_analysis.parse_java_class_bytes(
+        (class_dir / "StructureFixture.class").read_bytes()
+    )
+    local = java_analysis.parse_java_class_bytes(
+        (class_dir / "StructureFixture$1LocalThing.class").read_bytes()
+    )
+    record = java_analysis.parse_java_class_bytes(
+        (class_dir / "StructureRecord.class").read_bytes()
+    )
+
+    assert outer is not None
+    inner_classes = {
+        (
+            item["inner_class"],
+            item.get("outer_class"),
+            item.get("inner_name"),
+        )
+        for item in outer["inner_classes"]
+    }
+    assert (
+        "StructureFixture$StaticInner",
+        "StructureFixture",
+        "StaticInner",
+    ) in inner_classes
+    assert (
+        "StructureFixture$MemberInner",
+        "StructureFixture",
+        "MemberInner",
+    ) in inner_classes
+    assert any(
+        inner_class.endswith("$1LocalThing")
+        and outer_class is None
+        and inner_name == "LocalThing"
+        for inner_class, outer_class, inner_name in inner_classes
+    )
+    assert "StructureFixture$StaticInner" in outer["nest_members"]
+    assert "StructureFixture$MemberInner" in outer["nest_members"]
+
+    assert local is not None
+    assert local["nest_host"] == "StructureFixture"
+    assert local["enclosing_method"] == {
+        "class_name": "StructureFixture",
+        "method_name": "makeLocal",
+        "method_descriptor": "()V",
+    }
+
+    assert record is not None
+    assert record["super_class"] == "java/lang/Record"
+    assert [item["name"] for item in record["record_components"]] == ["hash", "size"]
+    assert record["record_components"][0]["descriptor"] == "Ljava/lang/String;"
+    assert record["record_components"][0]["annotations"][0]["descriptor"] == (
+        "LComponentTag;"
+    )
+    assert record["record_components"][1]["descriptor"] == "J"
+
+
+def test_parse_java_class_recovers_permitted_subclasses(tmp_path: Path) -> None:
+    class_dir = _compile_sealed_classes(tmp_path)
+    java_analysis = getattr(g, "analysis")
+
+    shape = java_analysis.parse_java_class_bytes(
+        (class_dir / "Shape.class").read_bytes()
+    )
+    circle = java_analysis.parse_java_class_bytes(
+        (class_dir / "Circle.class").read_bytes()
+    )
+
+    assert shape is not None
+    assert shape["permitted_subclasses"] == ["Circle", "Square"]
+    assert circle is not None
+    assert circle["permitted_subclasses"] == []
+
+
+def test_parse_java_class_recovers_module_info(tmp_path: Path) -> None:
+    class_dir = _compile_module_classes(tmp_path)
+    java_analysis = getattr(g, "analysis")
+
+    module_info = java_analysis.parse_java_class_bytes(
+        (class_dir / "module-info.class").read_bytes()
+    )
+
+    assert module_info is not None
+    module = module_info["module"]
+    assert module["name"] == "com.example.fixture"
+    assert module["version"] is None
+    assert {item["module"] for item in module["requires"]} >= {
+        "java.base",
+        "java.logging",
+    }
+    assert module["exports"][0]["package"] == "com/example/api"
+    assert module["opens"][0]["package"] == "com/example/internal"
+    assert module["uses"] == ["com/example/api/Service"]
+    assert module["provides"] == [
+        {
+            "service": "com/example/api/Service",
+            "implementations": ["com/example/internal/ServiceImpl"],
+        }
+    ]
+
+
+def test_parse_java_class_recovers_module_main_class_and_packages(
+    tmp_path: Path,
+) -> None:
+    jar_path = _compile_module_jar(tmp_path)
+    java_analysis = getattr(g, "analysis")
+
+    with zipfile.ZipFile(jar_path) as zf:
+        module_info = java_analysis.parse_java_class_bytes(zf.read("module-info.class"))
+
+    assert module_info is not None
+    module = module_info["module"]
+    assert module["main_class"] == "com/example/internal/ServiceImpl"
+    assert set(module["packages"]) >= {
+        "com/example/api",
+        "com/example/internal",
+    }
+
+
+def test_parse_java_class_recovers_type_annotation_counts(tmp_path: Path) -> None:
+    class_dir = _compile_type_annotation_classes(tmp_path)
+    java_analysis = getattr(g, "analysis")
+
+    info = java_analysis.parse_java_class_bytes(
+        (class_dir / "TypeAnnotationFixture.class").read_bytes()
+    )
+
+    assert info is not None
+    assert info["runtime_visible_type_annotation_count"] >= 1
+    assert info["type_annotation_count"] >= 1
+    value = next(field for field in info["fields"] if field["name"] == "value")
+    assert value["runtime_visible_type_annotation_count"] >= 1
+    assert value["type_annotation_count"] >= 1
+    method = next(method for method in info["methods"] if method["name"] == "method")
+    assert method["runtime_visible_type_annotation_count"] >= 1
+    assert method["type_annotation_count"] >= 1
+    assert method["code"]["runtime_visible_type_annotation_count"] >= 1
+    assert method["code"]["type_annotation_count"] >= 1
+
+
+def test_parse_java_class_recovers_bootstrap_method_count(tmp_path: Path) -> None:
+    class_file = _compile_lambda_class(tmp_path)
+    java_analysis = getattr(g, "analysis")
+
+    info = java_analysis.parse_java_class_bytes(class_file.read_bytes())
+
+    assert info is not None
+    assert info["bootstrap_method_count"] > 0
+    make_task = next(
+        method for method in info["methods"] if method["name"] == "makeTask"
+    )
+    assert make_task["code"] is not None
+    assert any(xref["kind"] == "invokedynamic" for xref in make_task["code"]["xrefs"])
+
+
+def test_parse_java_class_recovers_constant_pool_code_and_bootstrap_summaries(
+    tmp_path: Path,
+) -> None:
+    class_file = _compile_lambda_class(tmp_path)
+    java_analysis = getattr(g, "analysis")
+
+    info = java_analysis.parse_java_class_bytes(class_file.read_bytes())
+
+    assert info is not None
+    constant_pool = info["constant_pool"]
+    assert constant_pool["total_slots"] > 0
+    assert constant_pool["populated_entries"] > 0
+    assert constant_pool["utf8_count"] > 0
+    assert constant_pool["class_count"] > 0
+    assert constant_pool["methodref_count"] > 0
+    assert constant_pool["method_handle_count"] > 0
+    assert constant_pool["method_type_count"] > 0
+    assert constant_pool["invoke_dynamic_count"] > 0
+
+    assert len(info["bootstrap_methods"]) == info["bootstrap_method_count"]
+    assert any(
+        bootstrap["reference_owner"] == "java/lang/invoke/LambdaMetafactory"
+        and bootstrap["reference_name"] == "metafactory"
+        and bootstrap["reference_kind_name"] == "invoke_static"
+        and bootstrap["argument_count"] > 0
+        for bootstrap in info["bootstrap_methods"]
+    )
+
+    make_task = next(
+        method for method in info["methods"] if method["name"] == "makeTask"
+    )
+    code = make_task["code"]
+    assert code["instruction_count"] == len(code["instructions"])
+    assert code["instruction_count"] > 0
+    assert code["unknown_instruction_count"] == 0
+
+
+def test_parse_java_class_recovers_source_debug_extension_metadata(
+    tmp_path: Path,
+) -> None:
+    class_file = _compile_lambda_class(tmp_path)
+    payload = b"SMAP\nGenerated.java\nJava\n*S Java\n*F\n+ 1 Generated.java\nGenerated.java\n*E\n"
+    patched = _add_source_debug_extension(class_file.read_bytes(), payload)
+    java_analysis = getattr(g, "analysis")
+
+    info = java_analysis.parse_java_class_bytes(patched)
+
+    assert info is not None
+    assert info["source_debug_extension_length"] == len(payload)
+    assert info["source_debug_extension_sha256"] == sha256(payload).hexdigest()
+    assert "SourceDebugExtension" in info["attribute_names"]
+
+
+def test_parse_java_class_recovers_attributes_deprecated_and_constant_values(
+    tmp_path: Path,
+) -> None:
+    class_file = _compile_field_attribute_class(tmp_path)
+    java_analysis = getattr(g, "analysis")
+
+    info = java_analysis.parse_java_class_path(str(class_file))
+
+    assert info is not None
+    assert info["class_name"] == "FieldAttributeFixture"
+    assert info["attribute_count"] >= 2
+    assert "Deprecated" in info["attribute_names"]
+    assert "SourceFile" in info["attribute_names"]
+    assert info["is_deprecated"] is True
+    assert info["is_synthetic"] is False
+
+    fields = {field["name"]: field for field in info["fields"]}
+    assert fields["ANSWER"]["constant_value"] == {
+        "kind": "int",
+        "value": "42",
+    }
+    assert fields["NAME"]["constant_value"] == {
+        "kind": "string",
+        "value": "glaurung",
+    }
+    assert fields["BIG"]["constant_value"] == {
+        "kind": "long",
+        "value": "123456789",
+    }
+    assert fields["RATIO"]["constant_value"] == {
+        "kind": "double",
+        "value": "1.5",
+    }
+    assert fields["ANSWER"]["attribute_count"] >= 3
+    assert fields["ANSWER"]["is_deprecated"] is True
+    assert fields["ANSWER"]["is_synthetic"] is False
+    assert "ConstantValue" in fields["ANSWER"]["attribute_names"]
+    assert "Deprecated" in fields["ANSWER"]["attribute_names"]
+    assert fields["mutable"]["constant_value"] is None
+
+    old_method = next(
+        method for method in info["methods"] if method["name"] == "oldMethod"
+    )
+    assert old_method["attribute_count"] >= 2
+    assert old_method["is_deprecated"] is True
+    assert old_method["is_synthetic"] is False
+    assert "Deprecated" in old_method["attribute_names"]
+    assert old_method["code"]["attribute_count"] >= 1
+    assert "LineNumberTable" in old_method["code"]["attribute_names"]
+
+
+def test_parse_java_class_recovers_exception_handlers(tmp_path: Path) -> None:
+    class_file = _compile_attribute_class(tmp_path)
+
+    info = getattr(g, "analysis").parse_java_class_bytes(class_file.read_bytes())
+
+    assert info is not None
+    guarded = next(method for method in info["methods"] if method["name"] == "guarded")
+    code = guarded["code"]
+    assert code["exception_table_len"] == 1
+    assert code["stack_map_frame_count"] > 0
+    assert len(code["exception_handlers"]) == 1
+    handler = code["exception_handlers"][0]
+    assert handler["catch_type"] == "java/lang/NumberFormatException"
+    assert handler["start_pc"] == 0
+    assert handler["end_pc"] > handler["start_pc"]
+    assert handler["handler_pc"] >= handler["end_pc"]
+
+
+def test_parse_java_class_recovers_runtime_visible_annotations(
+    tmp_path: Path,
+) -> None:
+    class_file = _compile_attribute_class(tmp_path)
+
+    info = getattr(g, "analysis").parse_java_class_bytes(class_file.read_bytes())
+
+    assert info is not None
+    class_tag = next(
+        annotation
+        for annotation in info["annotations"]
+        if annotation["descriptor"] == "LAttributeTag;"
+    )
+    assert class_tag["visibility"] == "runtime_visible"
+    elements = {item["name"]: item["value"] for item in class_tag["elements"]}
+    assert elements["value"] == {
+        "tag": "s",
+        "kind": "const",
+        "value": "class-level",
+    }
+    assert elements["type"] == {
+        "tag": "c",
+        "kind": "class",
+        "value": "Ljava/lang/Integer;",
+    }
+    assert elements["mode"] == {
+        "tag": "e",
+        "kind": "enum",
+        "type_name": "LAttributeMode;",
+        "const_name": "BETA",
+    }
+    assert elements["flags"] == {
+        "tag": "[",
+        "kind": "array",
+        "values": [
+            {"tag": "s", "kind": "const", "value": "fast"},
+            {"tag": "s", "kind": "const", "value": "safe"},
+        ],
+    }
+
+    checked = next(method for method in info["methods"] if method["name"] == "checked")
+    method_tag = next(
+        annotation
+        for annotation in checked["annotations"]
+        if annotation["descriptor"] == "LAttributeTag;"
+    )
+    method_elements = {item["name"]: item["value"] for item in method_tag["elements"]}
+    assert method_elements["value"]["value"] == "method-level"

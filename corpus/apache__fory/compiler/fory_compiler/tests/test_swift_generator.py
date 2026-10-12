@@ -1,0 +1,453 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+from pathlib import Path
+
+import pytest
+
+from fory_compiler.frontend.fdl.lexer import Lexer
+from fory_compiler.frontend.fdl.parser import Parser
+from fory_compiler.generators.base import GeneratorOptions
+from fory_compiler.generators.swift import SwiftGenerator
+from fory_compiler.ir.validator import SchemaValidator
+
+
+def parse_schema(source: str):
+    schema = Parser(Lexer(source).tokenize()).parse()
+    validator = SchemaValidator(schema)
+    assert validator.validate(), validator.errors
+    return schema
+
+
+def generate_swift(source: str, swift_namespace_style=None) -> str:
+    schema = parse_schema(source)
+    generator = SwiftGenerator(
+        schema,
+        GeneratorOptions(
+            output_dir=Path("/tmp"),
+            swift_namespace_style=swift_namespace_style,
+        ),
+    )
+    files = generator.generate()
+    assert len(files) == 1
+    return files[0].content
+
+
+def test_swift_generator_emits_field_ids_and_encodings():
+    source = """
+    package demo;
+
+    message Scalar [id=100] {
+        fixed int32 fixed_value = 1;
+        int32 varint_value = 2;
+        tagged uint64 tagged_value = 3;
+    }
+    """
+    content = generate_swift(source)
+    assert "public enum Demo" in content
+    assert "@ForyStruct" in content
+    assert "@ForyField(id: 1, encoding: .fixed)" in content
+    assert "@ForyField(id: 2)" in content
+    assert "@ForyField(id: 3, encoding: .tagged)" in content
+    assert "try fory.register(Demo.Scalar.self, id: 100)" in content
+
+
+def test_swift_generator_emits_nested_field_encoding_hints():
+    source = """
+    package demo;
+
+    message Nested [id=100] {
+        list<fixed int32> fixed_values = 1;
+        list<fixed uint64> fixed_unsigned_values = 2;
+        map<fixed int32, tagged uint64> indexed_values = 3;
+        list<optional fixed int32> maybe_fixed_values = 4;
+        list<optional uint64> maybe_unsigned_values = 5;
+        map<string, optional float16> maybe_float_values = 6;
+        bfloat16 bfloat_value = 7;
+        array<int32> dense_values = 8;
+        map<string, array<uint8>> bytes_by_name = 9;
+    }
+
+    union Event [id=101] {
+        fixed uint64 deleted = 0;
+        list<fixed int32> many = 1;
+        map<fixed int32, string> fixed_keys = 2;
+        array<int32> dense = 3;
+    }
+    """
+    content = generate_swift(source)
+    assert "@ListField(element: .int32(encoding: .fixed))" in content
+    assert "@ListField(element: .uint64(encoding: .fixed))" in content
+    assert "@ListField(element: .int32(nullable: true, encoding: .fixed))" in content
+    assert "@ListField(element: .uint64(nullable: true))" in content
+    assert "public var fixedUnsignedValues: [UInt64] = []" in content
+    assert "public var maybeFixedValues: [Int32?] = []" in content
+    assert "public var maybeUnsignedValues: [UInt64?] = []" in content
+    assert "public var maybeFloatValues: [String: Float16?] = [:]" in content
+    assert "public var bfloatValue: BFloat16 = BFloat16()" in content
+    assert "bfloatValue: BFloat16 = BFloat16()" in content
+    assert "public var denseValues: [Int32] = []" in content
+    assert "public var bytesByName: [String: [UInt8]] = [:]" in content
+    assert (
+        "@MapField(key: .int32(encoding: .fixed), value: .uint64(encoding: .tagged))"
+        in content
+    )
+    assert "@MapField(key: .string, value: .float16)" in content
+    assert "@ArrayField(element: .int32())" in content
+    assert "@MapField(key: .string, value: .array(element: .uint8))" in content
+    assert "@ForyUnion" in content
+    assert "@ForyCase(id: 0, payload: .uint64(encoding: .fixed))" in content
+    assert (
+        "@ForyCase(id: 1, payload: .list(element: .int32(encoding: .fixed)))" in content
+    )
+    assert (
+        "@ForyCase(id: 2, payload: .map(key: .int32(encoding: .fixed), value: .string))"
+        in content
+    )
+    assert "@ForyCase(id: 3, payload: .array(element: .int32()))" in content
+
+
+def test_swift_generator_emits_tagged_union_case_ids():
+    source = """
+    package demo;
+
+    message Node [id=100] {
+        string id = 1;
+    }
+
+    union Animal [id=101] {
+        Node node = 3;
+        string note = 7;
+    }
+    """
+    content = generate_swift(source)
+    assert "@ForyUnion" in content
+    assert "public enum Animal: Equatable" in content
+    assert "@ForyUnknownCase" in content
+    assert "case unknown(UnknownCase)" in content
+    assert "@ForyCase(id: 3)" in content
+    assert "case node(Demo.Node)" in content
+    assert "@ForyCase(id: 7, payload: .string)" in content
+    assert "case note(String)" in content
+    assert "try fory.register(Demo.Animal.self, id: 101)" in content
+
+
+def test_swift_native_defaults():
+    source = """
+    package demo;
+
+    enum State [id=100] {
+        STATE_READY = 0;
+        STATE_BUSY = 1;
+    }
+
+    message User [id=101] {
+        string name = 1;
+    }
+
+    union Value [id=102] {
+        User user = 1;
+        string text = 2;
+    }
+
+    message Holder [id=103] {
+        State state = 1;
+        User user = 2;
+        Value value = 3;
+    }
+    """
+    content = generate_swift(source)
+    assert "public var state: Demo.State = Demo.State.ready" in content
+    assert "public var user: Demo.User? = nil" in content
+    assert "public var value: Demo.Value = Demo.Value.user(Demo.User())" in content
+
+
+def test_swift_nested_defaults():
+    source = """
+    package demo;
+
+    message Envelope [id=100] {
+        enum State [id=101] {
+            STATE_READY = 0;
+            STATE_BUSY = 1;
+        }
+
+        union Inner [id=102] {
+            State state = 1;
+        }
+
+        union Outer [id=103] {
+            Inner inner = 1;
+        }
+
+        Outer value = 1;
+    }
+    """
+    content = generate_swift(source)
+    assert (
+        "public var value: Demo.Envelope.Outer = "
+        "Demo.Envelope.Outer.inner("
+        "Demo.Envelope.Inner.state(Demo.Envelope.State.ready))"
+    ) in content
+
+
+def test_swift_recursive_union():
+    source = """
+    package demo;
+
+    union Chain [id=100] {
+        string end = 1;
+        Chain next = 2;
+    }
+
+    message Holder [id=101] {
+        Chain value = 1;
+    }
+    """
+    content = generate_swift(source)
+    assert "public indirect enum Chain: Equatable {" in content
+    assert 'public var value: Demo.Chain = Demo.Chain.end("")' in content
+
+
+def test_swift_default_cycle():
+    source = """
+    package demo;
+
+    union Chain [id=100] {
+        Chain next = 1;
+        string end = 2;
+    }
+    """
+    with pytest.raises(
+        ValueError,
+        match=r"Swift generated default is recursive: Demo\.Chain -> Demo\.Chain",
+    ):
+        generate_swift(source)
+
+
+def test_swift_value_cycle():
+    source = """
+    package demo;
+
+    message Left [id=100] {
+        Right right = 1;
+    }
+
+    message Right [id=101] {
+        Left left = 1;
+    }
+    """
+    with pytest.raises(
+        ValueError,
+        match=r"Swift value message Demo\.Left is recursively stored",
+    ):
+        generate_swift(source)
+
+
+def test_swift_union_field_preserves_synthesized_equatable():
+    source = """
+    package demo;
+
+    union Choice [id=100] {
+        string note = 1;
+    }
+
+    message Holder [id=101] {
+        Choice choice = 1;
+        optional Choice optional_choice = 2;
+    }
+    """
+    content = generate_swift(source)
+    assert "public enum Choice: Equatable" in content
+    assert "public struct Holder: Equatable" in content
+
+
+def test_swift_generator_supports_decimal_fields_and_unions():
+    source = """
+    package demo;
+
+    message Money [id=100] {
+        decimal amount = 1;
+    }
+
+    union Value [id=101] {
+        decimal amount = 1;
+        Money money = 2;
+    }
+    """
+    content = generate_swift(source)
+    assert "public var amount: Decimal = Decimal.zero" in content
+    assert "case amount(Decimal)" in content
+
+
+def test_swift_generator_maps_date_to_local_date():
+    source = """
+    package demo;
+
+    message Temporal [id=100] {
+        date day = 1;
+        timestamp instant = 2;
+        duration elapsed = 3;
+    }
+
+    union Value [id=101] {
+        date day = 1;
+        timestamp instant = 2;
+        duration elapsed = 3;
+    }
+    """
+    content = generate_swift(source)
+    assert "@ForyField(id: 1)" in content
+    assert "@ForyField(id: 2)" in content
+    assert "@ForyField(id: 3)" in content
+    assert "public var day: LocalDate = LocalDate()" in content
+    assert "public var instant: Date = Date(timeIntervalSince1970: 0)" in content
+    assert "public var elapsed: Duration = Duration.zero" in content
+    assert "case day(LocalDate)" in content
+    assert "case instant(Date)" in content
+    assert "case elapsed(Duration)" in content
+
+
+def test_swift_generator_uses_class_for_ref_targets_and_weak_fields():
+    source = """
+    package tree;
+
+    message TreeNode [id=2251833438] {
+        string id = 1;
+        list<ref TreeNode> children = 2;
+        ref(weak=true) TreeNode parent = 3;
+    }
+
+    message TreeRoot [id=2251833439] {
+        TreeNode root = 1;
+    }
+    """
+    content = generate_swift(source)
+    assert "public final class TreeNode" in content
+    assert "public weak var parent: Tree.TreeNode?" in content
+    assert "public var children: [Tree.TreeNode] = []" in content
+    assert "public struct TreeRoot" in content
+
+
+def test_swift_generator_output_path_uses_package_segments():
+    source = """
+    package demo.foo;
+
+    message User [id=1] {
+        string name = 1;
+    }
+    """
+    schema = parse_schema(source)
+    generator = SwiftGenerator(schema, GeneratorOptions(output_dir=Path("/tmp")))
+    generated = generator.generate()[0]
+    assert generated.path == "demo/foo/demo_foo.swift"
+
+
+def test_swift_generator_uses_package_leaf_when_source_stem_differs():
+    source = """
+    package any_example_pb;
+
+    message AnyInner [id=300] {
+        string name = 1;
+    }
+    """
+    schema = parse_schema(source)
+    schema.source_file = "/tmp/any_example.proto"
+    generator = SwiftGenerator(schema, GeneratorOptions(output_dir=Path("/tmp")))
+    generated = generator.generate()[0]
+    assert generated.path == "any_example_pb/any_example_pb.swift"
+
+
+def test_swift_generator_renames_namespace_when_colliding_with_type_name():
+    source = """
+    package graph;
+
+    message Node [id=1] {
+        string id = 1;
+    }
+
+    message Graph [id=2] {
+        list<Node> nodes = 1;
+    }
+    """
+    content = generate_swift(source)
+    assert "public enum GraphNamespace" in content
+    assert "public struct Graph" in content
+    assert "public var nodes: [GraphNamespace.Node] = []" in content
+
+
+def test_swift_generator_no_namespace_wrapper_when_package_empty():
+    source = """
+    message User [id=1] {
+        string name = 1;
+    }
+    """
+    content = generate_swift(source)
+    assert "public enum Generated" not in content
+    assert "public struct User" in content
+    assert "try ForyModule.getFory().serialize(self)" in content
+    assert "try fory.register(User.self, id: 1)" in content
+
+
+def test_swift_generator_supports_flatten_namespace_style_option():
+    source = """
+    package demo.foo;
+    option swift_namespace_style = "flatten";
+
+    message User [id=1] {
+        string name = 1;
+    }
+
+    message Group [id=2] {
+        User user = 1;
+    }
+    """
+    content = generate_swift(source)
+    assert "public enum Demo {" not in content
+    assert "public struct Demo_Foo_User" in content
+    assert "public struct Demo_Foo_Group" in content
+    assert "public var user: Demo_Foo_User" in content
+    assert "public enum Demo_Foo_ForyModule" in content
+    assert "try Demo_Foo_ForyModule.getFory().serialize(self)" in content
+
+
+def test_swift_generator_supports_explicit_enum_namespace_style_option():
+    source = """
+    package demo.foo;
+    option swift_namespace_style = "enum";
+
+    message User [id=1] {
+        string name = 1;
+    }
+    """
+    content = generate_swift(source)
+    assert "public enum Demo {" in content
+    assert "public struct User" in content
+
+
+def test_swift_generator_cli_option_overrides_schema_namespace_style():
+    source = """
+    package demo.foo;
+    option swift_namespace_style = "enum";
+
+    message User [id=1] {
+        string name = 1;
+    }
+    """
+    content = generate_swift(source, swift_namespace_style="flatten")
+    assert "public enum Demo {" not in content
+    assert "public struct Demo_Foo_User" in content

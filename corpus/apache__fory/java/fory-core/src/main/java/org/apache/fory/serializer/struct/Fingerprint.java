@@ -1,0 +1,310 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.fory.serializer.struct;
+
+import java.util.ArrayList;
+import java.util.List;
+import org.apache.fory.Fory;
+import org.apache.fory.annotation.ForyField;
+import org.apache.fory.collection.BoolList;
+import org.apache.fory.collection.Float32List;
+import org.apache.fory.collection.Float64List;
+import org.apache.fory.collection.Int16List;
+import org.apache.fory.collection.Int32List;
+import org.apache.fory.collection.Int64List;
+import org.apache.fory.collection.Int8List;
+import org.apache.fory.collection.UInt16List;
+import org.apache.fory.collection.UInt32List;
+import org.apache.fory.collection.UInt64List;
+import org.apache.fory.collection.UInt8List;
+import org.apache.fory.logging.Logger;
+import org.apache.fory.logging.LoggerFactory;
+import org.apache.fory.meta.FieldTypes;
+import org.apache.fory.reflect.ReflectionUtils;
+import org.apache.fory.resolver.TypeInfo;
+import org.apache.fory.resolver.TypeResolver;
+import org.apache.fory.type.Descriptor;
+import org.apache.fory.type.TypeUtils;
+import org.apache.fory.type.Types;
+import org.apache.fory.util.Utils;
+
+public class Fingerprint {
+  private static final Logger LOG = LoggerFactory.getLogger(Fingerprint.class);
+
+  /**
+   * Computes the fingerprint string for a struct type used in schema versioning.
+   *
+   * <p><b>Fingerprint Format:</b>
+   *
+   * <p>Each field contributes: {@code
+   * <field_id_or_name>,<type_id>,<ref>,<nullable>[<nested_type_fingerprint>];}
+   *
+   * <p>Fields with tag IDs are sorted numerically by tag ID. Fields without tag IDs are sorted by
+   * snake_case name.
+   *
+   * <p><b>Field Components:</b>
+   *
+   * <ul>
+   *   <li><b>field_id_or_name</b>: Tag ID as string if configured via {@link ForyField#id()} (e.g.,
+   *       "0", "1"), otherwise snake_case field name
+   *   <li><b>type_id</b>: Fory TypeId as decimal string (e.g., "4" for INT32)
+   *   <li><b>ref</b>: "1" if reference tracking enabled, "0" otherwise
+   *   <li><b>nullable</b>: "1" if null flag is written, "0" otherwise
+   * </ul>
+   *
+   * <p><b>Example fingerprints:</b>
+   *
+   * <ul>
+   *   <li>With tag IDs: "0,4,0,0;1,4,0,1;2,9,0,1;"
+   *   <li>With field names: "age,4,0,0;name,9,0,1;"
+   * </ul>
+   *
+   * <p>The fingerprint is used to compute a hash for struct schema versioning. Different
+   * nullable/ref settings will produce different fingerprints, ensuring schema compatibility is
+   * properly validated.
+   *
+   * @param fory the Fory instance for type resolution
+   * @param descriptors the sorted list of field descriptors
+   * @return the fingerprint string
+   */
+  public static String computeStructFingerprint(Fory fory, List<Descriptor> descriptors) {
+    return computeStructFingerprint(fory.getTypeResolver(), descriptors);
+  }
+
+  public static String computeStructFingerprint(
+      TypeResolver resolver, List<Descriptor> descriptors) {
+    // Build fingerprint info for each field
+    List<FingerprintField> fieldInfos = new ArrayList<>(descriptors.size());
+    for (Descriptor descriptor : descriptors) {
+      Class<?> rawType = descriptor.getTypeRef().getRawType();
+      FieldTypes.FieldType fieldType = FieldTypes.buildFieldType(resolver, descriptor);
+      int typeId =
+          fieldType != null ? fingerprintTypeId(fieldType) : getTypeId(resolver, descriptor);
+
+      // Get field identifier: tag ID if configured, otherwise snake_case name
+      String fieldIdentifier;
+      int fieldId = -1;
+      if (descriptor.hasForyFieldId()) {
+        fieldId = descriptor.getForyFieldId();
+        fieldIdentifier = String.valueOf(fieldId);
+      } else {
+        fieldIdentifier = descriptor.getSnakeCaseName();
+      }
+
+      // Descriptor owns the normalized top-level ref bit from @Ref or generated metadata.
+      char ref = descriptor.isTrackingRef() ? '1' : '0';
+
+      // Get nullable flag:
+      // - Primitives are always non-nullable
+      // - For xlang: default is false (except Optional types, boxed types), and @Nullable
+      //   marks the field wrapper nullable
+      // - For native: use descriptor.isNullable() which defaults to true for non-primitives
+      char nullable;
+      if (rawType.isPrimitive()) {
+        nullable = '0';
+      } else if (resolver.isCrossLanguage()) {
+        // For xlang: nullable defaults to false, except for Optional types, boxed types
+        // If @ForyField annotation is present, descriptor.isNullable() still carries @Nullable.
+        if (descriptor.hasForyField()) {
+          nullable = descriptor.isNullable() ? '1' : '0';
+        } else if (descriptor.isNullable()) {
+          nullable = '1';
+        } else {
+          // Default: Optional types, boxed primitives are nullable
+          nullable = (TypeUtils.isOptionalType(rawType) || TypeUtils.isBoxed(rawType)) ? '1' : '0';
+        }
+      } else {
+        nullable = descriptor.isNullable() ? '1' : '0';
+      }
+
+      StringBuilder fieldFingerprint =
+          new StringBuilder().append(typeId).append(',').append(ref).append(',').append(nullable);
+      if (fieldType != null) {
+        appendNestedFingerprint(fieldFingerprint, fieldType);
+      }
+      fieldInfos.add(new FingerprintField(fieldIdentifier, fieldId, fieldFingerprint.toString()));
+    }
+
+    fieldInfos.sort(FingerprintField::compareTo);
+
+    // Build fingerprint string
+    StringBuilder builder = new StringBuilder();
+    for (FingerprintField info : fieldInfos) {
+      builder.append(info.identifier).append(',').append(info.fingerprint).append(';');
+    }
+    String fingerprint = builder.toString();
+    if (Utils.DEBUG_OUTPUT_ENABLED) {
+      LOG.info(
+          "Fingerprint string for {} is: {}", Descriptor.getDeclareClass(descriptors), fingerprint);
+    }
+    return fingerprint;
+  }
+
+  private static final class FingerprintField {
+    private final String identifier;
+    private final int fieldId;
+    private final String fingerprint;
+
+    private FingerprintField(String identifier, int fieldId, String fingerprint) {
+      this.identifier = identifier;
+      this.fieldId = fieldId;
+      this.fingerprint = fingerprint;
+    }
+
+    private static int compareTo(FingerprintField left, FingerprintField right) {
+      boolean leftTagged = left.fieldId >= 0;
+      boolean rightTagged = right.fieldId >= 0;
+      if (leftTagged && rightTagged) {
+        int result = Integer.compare(left.fieldId, right.fieldId);
+        if (result != 0) {
+          return result;
+        }
+        return left.identifier.compareTo(right.identifier);
+      }
+      if (leftTagged) {
+        return -1;
+      }
+      if (rightTagged) {
+        return 1;
+      }
+      return left.identifier.compareTo(right.identifier);
+    }
+  }
+
+  private static void appendNestedFingerprint(
+      StringBuilder builder, FieldTypes.FieldType fieldType) {
+    if (fieldType instanceof FieldTypes.CollectionFieldType) {
+      FieldTypes.CollectionFieldType collectionFieldType =
+          (FieldTypes.CollectionFieldType) fieldType;
+      builder.append('[');
+      appendFieldTypeFingerprint(builder, collectionFieldType.getElementType(), false, false);
+      builder.append(']');
+      return;
+    }
+    if (fieldType instanceof FieldTypes.MapFieldType) {
+      FieldTypes.MapFieldType mapFieldType = (FieldTypes.MapFieldType) fieldType;
+      builder.append('[');
+      appendFieldTypeFingerprint(builder, mapFieldType.getKeyType(), false, false);
+      builder.append('|');
+      appendFieldTypeFingerprint(builder, mapFieldType.getValueType(), false, false);
+      builder.append(']');
+    }
+  }
+
+  private static void appendFieldTypeFingerprint(
+      StringBuilder builder,
+      FieldTypes.FieldType fieldType,
+      boolean includeRef,
+      boolean includeNullable) {
+    builder
+        .append(fingerprintTypeId(fieldType))
+        .append(',')
+        .append(includeRef && fieldType.trackingRef() ? '1' : '0')
+        .append(',')
+        .append(includeNullable && fieldType.nullable() ? '1' : '0');
+    appendNestedFingerprint(builder, fieldType);
+  }
+
+  private static int fingerprintTypeId(FieldTypes.FieldType fieldType) {
+    int typeId = fieldType.getTypeId();
+    if (typeId == Types.UNKNOWN) {
+      return Types.UNKNOWN;
+    }
+    if (Types.isUnionType(typeId)
+        || typeId == Types.ENUM
+        || typeId == Types.NAMED_ENUM
+        || typeId == Types.STRUCT
+        || typeId == Types.COMPATIBLE_STRUCT
+        || typeId == Types.NAMED_STRUCT
+        || typeId == Types.NAMED_COMPATIBLE_STRUCT
+        || typeId == Types.EXT
+        || typeId == Types.NAMED_EXT) {
+      return Types.UNKNOWN;
+    }
+    return typeId;
+  }
+
+  private static int getTypeId(TypeResolver resolver, Descriptor descriptor) {
+    Class<?> cls = descriptor.getTypeRef().getRawType();
+    Integer primitiveListTypeId = getPrimitiveListTypeId(cls);
+    if (primitiveListTypeId != null) {
+      return primitiveListTypeId;
+    }
+    if (resolver.isSet(cls)) {
+      return Types.SET;
+    } else if (resolver.isCollection(cls)) {
+      return Types.LIST;
+    } else if (resolver.isMap(cls)) {
+      return Types.MAP;
+    } else {
+      if (ReflectionUtils.isAbstract(cls) || cls.isInterface() || cls.isEnum()) {
+        return Types.UNKNOWN;
+      }
+      TypeInfo typeInfo = resolver.getTypeInfo(cls, false);
+      if (typeInfo == null) {
+        return Types.UNKNOWN;
+      }
+      int typeId = Types.getDescriptorTypeId(resolver, descriptor);
+      // union must also be set to `UNKNOWN`, we can't know a type is union at compile-time for some
+      // languages.
+      if (Types.isUserDefinedType((byte) typeId)) {
+        return Types.UNKNOWN;
+      }
+      return typeId;
+    }
+  }
+
+  private static Integer getPrimitiveListTypeId(Class<?> cls) {
+    if (cls == BoolList.class) {
+      return Types.BOOL_ARRAY;
+    }
+    if (cls == Int8List.class) {
+      return Types.INT8_ARRAY;
+    }
+    if (cls == Int16List.class) {
+      return Types.INT16_ARRAY;
+    }
+    if (cls == Int32List.class) {
+      return Types.INT32_ARRAY;
+    }
+    if (cls == Int64List.class) {
+      return Types.INT64_ARRAY;
+    }
+    if (cls == UInt8List.class) {
+      return Types.UINT8_ARRAY;
+    }
+    if (cls == UInt16List.class) {
+      return Types.UINT16_ARRAY;
+    }
+    if (cls == UInt32List.class) {
+      return Types.UINT32_ARRAY;
+    }
+    if (cls == UInt64List.class) {
+      return Types.UINT64_ARRAY;
+    }
+    if (cls == Float32List.class) {
+      return Types.FLOAT32_ARRAY;
+    }
+    if (cls == Float64List.class) {
+      return Types.FLOAT64_ARRAY;
+    }
+    return null;
+  }
+}

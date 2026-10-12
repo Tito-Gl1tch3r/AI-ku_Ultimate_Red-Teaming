@@ -1,0 +1,352 @@
+//! Spelling one register occurrence at one SSA version.
+//!
+//! Everything here answers a single question -- what does this register
+//! operand render as, given the version SSA proved for it -- and the only
+//! reason any of it changes is a change to that naming scheme or to the
+//! `Op` set the traversal must cover.
+
+use crate::ir::ssa::SsaValue;
+use crate::ir::types::{LlirFunction, Op, VReg, Value};
+use crate::ir::use_def::def_ref;
+
+use super::keep_bare::KeepBare;
+use super::temp_remap::TempRemap;
+
+/// Immutable context threaded through the tagging recursion.
+pub(crate) struct VnCtx<'a> {
+    keep: KeepBare,
+    temps: TempRemap,
+    structural: Vec<&'static str>,
+    ssa: &'a crate::ir::ssa::SsaInfo,
+}
+
+impl<'a> VnCtx<'a> {
+    /// Assemble the tagging context for `lf`.
+    ///
+    /// The structural-register set is derived from `lf` rather than passed in:
+    /// it is a property of this function's frame and has no other consumer.
+    pub(crate) fn new(
+        lf: &LlirFunction,
+        keep: KeepBare,
+        temps: TempRemap,
+        ssa: &'a crate::ir::ssa::SsaInfo,
+    ) -> Self {
+        Self {
+            keep,
+            temps,
+            structural: structural_registers(lf),
+            ssa,
+        }
+    }
+}
+
+fn canonical_phys_name(name: &str) -> &str {
+    crate::ir::ssa::parent64(name).unwrap_or(name)
+}
+
+/// Registers that genuinely establish this function's machine frame must keep
+/// bare names so stack-slot promotion can recognise them.  A callee-saved frame
+/// register is not automatically a frame pointer: optimized code may use `rbp`
+/// as an ordinary loop value after saving it in the prologue.  In that case its
+/// distinct writes need SSA names like every other data register.
+fn structural_registers(lf: &LlirFunction) -> Vec<&'static str> {
+    fn frame_family_is_structural(
+        lf: &LlirFunction,
+        frame_names: &[&str],
+        stack_names: &[&str],
+    ) -> bool {
+        let mut saw_definition = false;
+        for block in &lf.blocks {
+            for instruction in &block.instrs {
+                let Some(VReg::Phys(definition)) = def_ref(&instruction.op) else {
+                    continue;
+                };
+                if !frame_names.contains(&canonical_phys_name(definition)) {
+                    continue;
+                }
+                saw_definition = true;
+                let is_stack_register = |value: &Value| matches!(value, Value::Reg(VReg::Phys(name)) if stack_names.contains(&canonical_phys_name(name)));
+                let establishes_frame = match &instruction.op {
+                    Op::Assign { src, .. } => is_stack_register(src),
+                    Op::Bin { op, lhs, rhs, .. }
+                        if matches!(
+                            op,
+                            crate::ir::types::BinOp::Add | crate::ir::types::BinOp::Sub
+                        ) =>
+                    {
+                        (is_stack_register(lhs) && matches!(rhs, Value::Const(_)))
+                            || (matches!(op, crate::ir::types::BinOp::Add)
+                                && matches!(lhs, Value::Const(_))
+                                && is_stack_register(rhs))
+                    }
+                    _ => false,
+                };
+                if establishes_frame {
+                    return true;
+                }
+            }
+        }
+        // A live-in frame base has no local definition. Preserve the historical
+        // spelling so callers that lift a range inside a function still recover
+        // its frame-relative storage.
+        !saw_definition
+    }
+
+    // A list of static names, not a `HashSet<String>`: every member is a
+    // literal, there are at most nine, and value keying asks whether a register is
+    // structural once per operand — a scan of nine short strings beats hashing
+    // one, and it drops the owned copies entirely.
+    let mut structural: Vec<&'static str> = vec!["rsp", "esp", "sp"];
+    if frame_family_is_structural(lf, &["rbp", "ebp", "bp"], &["rsp", "esp", "sp"]) {
+        structural.extend(["rbp", "ebp", "bp"]);
+    }
+    if frame_family_is_structural(lf, &["x29", "w29", "fp"], &["sp"]) {
+        structural.extend(["x29", "w29", "fp"]);
+    }
+    structural
+}
+
+/// The internal key of a register at a given SSA version.
+///
+/// Ordinary physical-register values receive a snapshot-owned opaque key.
+/// Version zero, structural registers, and deliberately kept-bare values retain
+/// their canonical machine spelling. Reused temporaries are remapped to their
+/// split id.
+pub(crate) fn key_value(v: &mut VReg, version: u32, ctx: &VnCtx<'_>) {
+    match v {
+        VReg::Phys(n) => {
+            // Canonicalize a GP sub-register to its 64-bit parent so a value
+            // written as `%rax` and read back as `%eax` (or vice versa) renders
+            // as ONE name at the shared SSA version — otherwise the two views get
+            // distinct names and the read dangles.
+            //
+            // `parent64` returns a `&'static str`, so the canonical spelling
+            // costs nothing to look at. Only the decision to REWRITE `n`
+            // allocates: this used to build the canonical `String` (plus a
+            // second copy as a `KeepBare` probe key) for every register
+            // operand, including the common case where the register is already
+            // canonical and stays bare, where nothing needed to be written.
+            let parent = crate::ir::ssa::parent64(n);
+            let canon: &str = parent.unwrap_or(n.as_str());
+            let stays_bare = version == 0
+                || ctx.structural.contains(&canon)
+                || ctx.keep.contains(canon, version);
+            let renamed = if stays_bare {
+                // entry-def / live-in / structural / kept-bare: the canonical
+                // spelling, which is already in place unless this is a
+                // sub-register view.
+                parent.map(str::to_string)
+            } else {
+                let identity = SsaValue {
+                    base: VReg::phys(canon),
+                    version,
+                };
+                Some(
+                    ctx.ssa
+                        .value_id(&identity)
+                        .expect("numbered physical value must have a snapshot-owned value ID")
+                        .opaque_name(),
+                )
+            };
+            if let Some(renamed) = renamed {
+                *n = renamed;
+            }
+        }
+        VReg::Temp(base) => {
+            if let Some(&nid) = ctx.temps.get(&(*base, version)) {
+                *base = nid;
+            }
+        }
+        VReg::Flag(flag) => {
+            *v = VReg::FlagValue {
+                flag: *flag,
+                version,
+            };
+        }
+        VReg::FlagValue {
+            version: current, ..
+        } => *current = version,
+    }
+}
+
+/// Apply the exact SSA identity of one use.
+///
+/// The base matters as much as the version: an x86 `ax` read may resolve to
+/// `rax#10`. Keeping the raw view spelling would manufacture a distinct
+/// `ax#10` variable that no instruction defines.
+fn tag_use_phys(v: &mut VReg, value: Option<&SsaValue>, ctx: &VnCtx<'_>) {
+    if let Some(value) = value {
+        *v = value.base.clone();
+        key_value(v, value.version, ctx);
+    }
+}
+
+/// Apply the exact SSA identity of one definition.
+fn key_definition(v: &mut VReg, value: Option<&SsaValue>, ctx: &VnCtx<'_>) {
+    if let Some(value) = value {
+        *v = value.base.clone();
+        key_value(v, value.version, ctx);
+    }
+}
+
+/// Rewrite a `Value`'s register (if any) to the identity at `use_values[*ui]`,
+/// advancing the use cursor exactly as `def_uses` enumerated it.
+fn tag_value(v: &mut Value, use_values: &[Option<SsaValue>], ui: &mut usize, ctx: &VnCtx<'_>) {
+    if let Value::Reg(r) = v {
+        tag_use_phys(r, use_values.get(*ui).and_then(Option::as_ref), ctx);
+        *ui += 1;
+    }
+}
+
+fn tag_memop_uses(
+    m: &mut crate::ir::types::MemOp,
+    use_values: &[Option<SsaValue>],
+    ui: &mut usize,
+    ctx: &VnCtx<'_>,
+) {
+    if let Some(b) = &mut m.base {
+        tag_use_phys(b, use_values.get(*ui).and_then(Option::as_ref), ctx);
+        *ui += 1;
+    }
+    if let Some(idx) = &mut m.index {
+        tag_use_phys(idx, use_values.get(*ui).and_then(Option::as_ref), ctx);
+        *ui += 1;
+    }
+}
+
+/// Apply the def version and the ordered use versions to one op's registers.
+/// The use order mirrors `use_def::def_uses` exactly (memory base before index,
+/// operands left-to-right), so the SSA `use_versions` line up by index.
+pub(crate) fn tag_op(
+    op: &mut Op,
+    def_values: &[Option<SsaValue>],
+    use_values: &[Option<SsaValue>],
+    ctx: &VnCtx<'_>,
+) {
+    let mut ui = 0usize;
+    let def_value = def_values.first().and_then(Option::as_ref);
+    match op {
+        Op::Assign { dst, src } => {
+            tag_value(src, use_values, &mut ui, ctx);
+            key_definition(dst, def_value, ctx);
+        }
+        Op::Undef { dst, .. } => key_definition(dst, def_value, ctx),
+        Op::Bin { dst, lhs, rhs, .. } => {
+            tag_value(lhs, use_values, &mut ui, ctx);
+            tag_value(rhs, use_values, &mut ui, ctx);
+            key_definition(dst, def_value, ctx);
+        }
+        // Computed target plus an optional normalized switch index, no def —
+        // mirrors `use_def::def_uses`.
+        Op::IndirectJump { target, index } => {
+            tag_value(target, use_values, &mut ui, ctx);
+            if let Some(index) = index {
+                tag_value(index, use_values, &mut ui, ctx);
+            }
+        }
+        Op::Un { dst, src, .. } => {
+            tag_value(src, use_values, &mut ui, ctx);
+            key_definition(dst, def_value, ctx);
+        }
+        Op::Cmp { dst, lhs, rhs, .. } => {
+            tag_value(lhs, use_values, &mut ui, ctx);
+            tag_value(rhs, use_values, &mut ui, ctx);
+            key_definition(dst, def_value, ctx);
+        }
+        Op::Load { dst, addr } => {
+            tag_memop_uses(addr, use_values, &mut ui, ctx);
+            key_definition(dst, def_value, ctx);
+        }
+        Op::CondLoad {
+            dst,
+            cond,
+            addr,
+            fallback,
+            ..
+        } => {
+            tag_use_phys(cond, use_values.first().and_then(Option::as_ref), ctx);
+            ui = 1;
+            tag_memop_uses(addr, use_values, &mut ui, ctx);
+            tag_value(fallback, use_values, &mut ui, ctx);
+            key_definition(dst, def_value, ctx);
+        }
+        Op::Store { addr, src } => {
+            tag_memop_uses(addr, use_values, &mut ui, ctx);
+            tag_value(src, use_values, &mut ui, ctx);
+        }
+        Op::CondStore {
+            cond, addr, src, ..
+        } => {
+            tag_use_phys(cond, use_values.first().and_then(Option::as_ref), ctx);
+            ui = 1;
+            tag_memop_uses(addr, use_values, &mut ui, ctx);
+            tag_value(src, use_values, &mut ui, ctx);
+        }
+        Op::CondJump { cond, .. } | Op::CondReturn { cond, .. } => {
+            tag_use_phys(cond, use_values.first().and_then(Option::as_ref), ctx);
+        }
+        Op::CondReturnValue { cond, value, .. } => {
+            tag_use_phys(cond, use_values.first().and_then(Option::as_ref), ctx);
+            ui = 1;
+            tag_value(value, use_values, &mut ui, ctx);
+        }
+        // A call's effects must be renamed like any other operand. They are the only
+        // place the op records its result and its argument reads, so leaving them at
+        // the raw ABI names desynchronises them from the renamed def/use they describe:
+        // the post-call read becomes `var4` while the call still claims to write
+        // `rax`, and the AST then has a value nobody defines.
+        Op::Call { target, effects } => {
+            if let crate::ir::types::CallTarget::Indirect(v) = target {
+                tag_value(v, use_values, &mut ui, ctx);
+            }
+            if let Some(e) = effects {
+                for a in e.args.iter_mut() {
+                    tag_use_phys(a, use_values.get(ui).and_then(Option::as_ref), ctx);
+                    ui += 1;
+                }
+                if let Some(r) = e.result.as_mut() {
+                    key_definition(r, def_value, ctx);
+                }
+            }
+        }
+        Op::ReturnValue { value } => tag_value(value, use_values, &mut ui, ctx),
+        Op::ZExt { dst, src, .. }
+        | Op::SExt { dst, src, .. }
+        | Op::Trunc { dst, src, .. }
+        | Op::Extract { dst, src, .. } => {
+            tag_value(src, use_values, &mut ui, ctx);
+            key_definition(dst, def_value, ctx);
+        }
+        Op::Concat { dst, hi, lo } => {
+            tag_value(hi, use_values, &mut ui, ctx);
+            tag_value(lo, use_values, &mut ui, ctx);
+            key_definition(dst, def_value, ctx);
+        }
+        Op::Ite {
+            dst, cond, t, e, ..
+        } => {
+            // def_uses order: cond, then t, then e.
+            tag_use_phys(cond, use_values.first().and_then(Option::as_ref), ctx);
+            ui = 1;
+            tag_value(t, use_values, &mut ui, ctx);
+            tag_value(e, use_values, &mut ui, ctx);
+            key_definition(dst, def_value, ctx);
+        }
+        // Intrinsic outputs are positional SSA definitions. This includes
+        // effect-only operations, scalar VFP operations, and multi-output
+        // instructions such as `cpuid`.
+        Op::Intrinsic { ins, outs, .. } => {
+            for input in ins {
+                tag_value(input, use_values, &mut ui, ctx);
+            }
+            for (output_index, (output, _)) in outs.iter_mut().enumerate() {
+                key_definition(
+                    output,
+                    def_values.get(output_index).and_then(Option::as_ref),
+                    ctx,
+                );
+            }
+        }
+        Op::Jump { .. } | Op::Return | Op::Nop | Op::Unknown { .. } => {}
+    }
+}
